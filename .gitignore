@@ -27,3 +27,9 @@ docs/remediation/AGENT-BRIEF.md
 *.jsonl
 .env
 .env.*
+
+# Lokale Arbeitsnotizen (Analyse, Handoff, Planungsentwürfe) – nicht Teil des Projekts
+/TELEGRAM_TRANSPORT_PLAN.md
+/project_handoff.md
+/goal.md
+/hardening-suggestive-inspiration.md
