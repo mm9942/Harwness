@@ -2524,6 +2524,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-fsutil"
+version = "0.2.0"
+
+[[package]]
 name = "harw-home"
 version = "0.2.0"
 dependencies = [
@@ -3080,6 +3084,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "harw-runtime"
+version = "0.2.0"
 
 [[package]]
 name = "harw-sandbox"

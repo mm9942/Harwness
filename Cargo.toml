@@ -99,6 +99,10 @@ members = [
     "harw-lens",
     "harw-tool-lens",
     "harw-web",
+
+    # === Remediation (Plan P0–P3) ===
+    "harw-fsutil",
+    "harw-runtime",
     "xtask",
 ]
 
