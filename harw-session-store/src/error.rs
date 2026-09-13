@@ -1,0 +1,161 @@
+//! Error type for the append-only transcript store.
+//!
+//! Spec: `docs/design/knowledge-surfaces.md` §1.4 and the
+//! `harw-session-store` row of `docs/design/crates-inventory.md`.
+//! `#[derive(HarwError)]` emits `Display`, `std::error::Error` (with
+//! `source()` wired through `#[from]` variants) and the `SessionStoreResult<T>`
+//! alias (the enum name ends in `Error`). No `anyhow`/`thiserror`.
+
+use harw_job_runtime::JobState;
+use harw_macros::HarwError;
+use harw_types::{CgroupId, FindingId, ItemId, SessionId, WorkId};
+
+/// Central error class of the session-store layer (emits `SessionStoreResult<T>`).
+#[derive(Debug, HarwError)]
+pub enum SessionStoreError {
+    /// Filesystem I/O failure; defers `Display`/`source()` to the inner error.
+    #[from]
+    Io(std::io::Error),
+
+    /// JSON encode/decode failure; defers `Display`/`source()` to the inner error.
+    #[from]
+    Serde(serde_json::Error),
+
+    /// Another writer holds the advisory lock on this session's transcript file.
+    #[msg("transcript for session '{session}' is locked by another writer")]
+    LockContended { session: SessionId },
+
+    /// A JSONL line could not be decoded into a `TranscriptRecord`.
+    #[msg("corrupt transcript record: {detail}")]
+    CorruptRecord { detail: String },
+
+    /// No transcript file exists for the requested session.
+    #[msg("no transcript found for session '{session}'")]
+    NotFound { session: SessionId },
+
+    /// A record passed to a whole-session rewrite belongs to another session.
+    #[msg("rewrite for session '{expected}' received a record for '{actual}'")]
+    SessionMismatch {
+        expected: SessionId,
+        actual: SessionId,
+    },
+
+    #[msg("transcript session id component is unsafe for filesystem storage: '{0}'")]
+    UnsafeTranscriptPath(String),
+
+    /// A skeleton code path whose durable-I/O body is not yet wired.
+    #[msg("session-store operation not yet implemented: {0}")]
+    NotYetImplemented(String),
+
+    #[msg("approval '{request}' already exists for session '{session}'")]
+    ApprovalAlreadyExists { session: SessionId, request: ItemId },
+
+    #[msg("approval '{request}' was not found for session '{session}'")]
+    ApprovalNotFound { session: SessionId, request: ItemId },
+
+    #[msg("approval '{request}' has already been resolved")]
+    ApprovalAlreadyResolved { request: ItemId },
+
+    #[msg("approval actor does not match request '{request}'")]
+    ApprovalActorMismatch { request: ItemId },
+
+    #[msg("approval id component is unsafe for filesystem storage: '{0}'")]
+    UnsafeApprovalPath(String),
+
+    #[msg("child lease for '{child}' already exists")]
+    ChildLeaseAlreadyExists { child: SessionId },
+
+    #[msg("child lease for '{child}' was not found")]
+    ChildLeaseNotFound { child: SessionId },
+
+    #[msg("child lease for '{child}' has already completed")]
+    ChildLeaseAlreadyCompleted { child: SessionId },
+
+    #[msg("child lease store lock is contended")]
+    ChildLeaseLockContended,
+
+    #[msg("child lease id component is unsafe for filesystem storage: '{0}'")]
+    UnsafeChildLeasePath(String),
+
+    /// Node AW5-05 (`FreezeStore`). Keyed by `(cgroup, finding, frozen_at)`,
+    /// never `cgroup` alone — see `freeze.rs` module docs.
+    #[msg("freeze for cgroup '{cgroup}' / finding '{finding}' at {frozen_at} already exists")]
+    FreezeAlreadyExists {
+        cgroup: CgroupId,
+        finding: FindingId,
+        frozen_at: jiff::Timestamp,
+    },
+
+    #[msg("freeze for cgroup '{cgroup}' / finding '{finding}' at {frozen_at} was not found")]
+    FreezeNotFound {
+        cgroup: CgroupId,
+        finding: FindingId,
+        frozen_at: jiff::Timestamp,
+    },
+
+    #[msg(
+        "freeze for cgroup '{cgroup}' / finding '{finding}' at {frozen_at} has already been resolved"
+    )]
+    FreezeAlreadyResolved {
+        cgroup: CgroupId,
+        finding: FindingId,
+        frozen_at: jiff::Timestamp,
+    },
+
+    #[msg("freeze store lock is contended")]
+    FreezeLockContended,
+
+    #[msg("freeze id component is unsafe for filesystem storage: '{0}'")]
+    UnsafeFreezePath(String),
+
+    #[msg("job '{work_id}' already exists")]
+    JobAlreadyExists { work_id: WorkId },
+
+    #[msg("job '{work_id}' was not found")]
+    JobNotFound { work_id: WorkId },
+
+    #[msg("job '{work_id}' is locked by another writer")]
+    JobLockContended { work_id: WorkId },
+
+    #[msg("job id component is unsafe for filesystem storage: '{0}'")]
+    UnsafeJobPath(String),
+
+    #[msg("job '{work_id}' record is corrupt: {detail}")]
+    CorruptJob { work_id: WorkId, detail: String },
+
+    #[msg("job '{work_id}' is not claimable from state {state:?}")]
+    JobNotClaimable { work_id: WorkId, state: JobState },
+
+    #[msg("job '{work_id}' cannot be cancelled from state {state:?}")]
+    JobNotCancellable { work_id: WorkId, state: JobState },
+
+    #[msg("job '{work_id}' is not eligible until {not_before}")]
+    JobNotEligible {
+        work_id: WorkId,
+        not_before: jiff::Timestamp,
+    },
+
+    #[msg("job '{work_id}' already has a terminal state {state:?}")]
+    JobAlreadyTerminal { work_id: WorkId, state: JobState },
+
+    #[msg("lease token does not match current lease for job '{work_id}'")]
+    LeaseTokenMismatch { work_id: WorkId },
+
+    #[msg("lease for job '{work_id}' expired at {expired_at}")]
+    JobLeaseExpired {
+        work_id: WorkId,
+        expired_at: jiff::Timestamp,
+    },
+
+    #[msg("job '{work_id}' lease epoch is exhausted")]
+    JobLeaseEpochExhausted { work_id: WorkId },
+
+    #[msg("job lease TTL must be positive")]
+    InvalidJobLeaseTtl,
+
+    #[msg("job cancellation reason must not be empty")]
+    InvalidJobCancellationReason,
+
+    #[msg("job '{work_id}' lifecycle transition failed: {detail}")]
+    JobRuntime { work_id: WorkId, detail: String },
+}

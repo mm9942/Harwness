@@ -1,0 +1,27 @@
+GOLDEN RENDER — harwness.context.curate@1
+===========================================
+STATUS: von Hand aus der Renderlogik abgeleitet (kein Renderer gelaufen).
+Siehe `explore.golden.txt` für die Methodik.
+
+Aufgelöste Sektionsreihenfolge (base zuerst, dann curate):
+  1. task.objective          strength=must-include  detail=full     trust=instruction  [von base]
+  2. history.tail            strength=must-include  detail=summary  trust=evidence     [von base]
+  3. knowledge.candidates    strength=must-include  detail=full     trust=data         [von curate]
+  4. memory.palace_index     strength=must-include  detail=summary  trust=evidence     [von curate]
+
+Ausschluss (Union): credential.*, secret.*, sibling_transcripts,
+full_parent_transcript (base) + web.fetch_allowlist (curate)
+
+--- Gerenderter Turn-Kontext (Platzhalter-Inhalt) ---
+
+## task.objective [instruction]
+<vollständiger Auftragstext des aktuellen Turns>
+
+## history.tail [evidence]
+<zusammengefasster jüngster Verlauf der letzten Turns, gemäß HISTORY_TAIL_GUARANTEED_GROUPS vollständig, älteres ggf. bereits als [ref] verkürzt>
+
+## knowledge.candidates [data]
+<vollständiger, unverifizierter Kandidat — niedrigste Vertrauensstufe, wird von der Deckenprüfung entsprechend behandelt>
+
+## memory.palace_index [evidence]
+<zusammengefasster Überblick über bereits vorhandene Gedächtniseinträge>

@@ -1,0 +1,5 @@
+error: `tool_schema` doppelt angegeben
+ --> tests/compile_fail/30_tool_schema_duplicate.rs:8:5
+  |
+8 |     tool_schema = harw_tools::ToolSpec;
+  |     ^^^^^^^^^^^

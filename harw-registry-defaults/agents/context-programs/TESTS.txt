@@ -1,0 +1,95 @@
+Prüfungen für die Programmbibliothek (AW6-05) — hier dokumentiert, weil dieser
+Knoten keine Rust-Module besitzen darf (nur `.toml`-Definitionen unter
+`harw-registry-defaults/agents/context-programs/**`) und `cargo` nicht
+ausführen darf. Die tatsächliche Ausführung ist Sache des zentralen,
+sequenziellen Verifikationslaufs (siehe Bericht).
+
+1. Alle zehn Dateien laden über die Verzeichniskonvention und ergeben den
+   erwarteten abgeleiteten Namen (Dateistamm):
+     base.toml            -> "base"
+     explore.toml         -> "explore"
+     research-deps.toml   -> "research-deps"
+     research-web.toml    -> "research-web"
+     plan.toml            -> "plan"
+     implement.toml       -> "implement"
+     review.toml          -> "review"
+     triage.toml          -> "triage"
+     curate.toml          -> "curate"
+     orchestrate.toml     -> "orchestrate"
+   Prüfmethode (sobald der zentrale Verzeichnis-Loader aus AW6-00 existiert):
+   Loader über `harw-registry-defaults/agents/` laufen lassen, Namen-Menge
+   gegen obige Liste per `assert_eq!` (als `BTreeSet`, ordnungsunabhängig)
+   vergleichen.
+
+2. Keine Namenskollision mit bestehenden Rollen-Definitionen. Geprüft von
+   Hand gegen den aktuellen Baum (`agents/*.toml`, Stand dieses Knotens):
+   analyst, explorer, planner, researcher-deps, researcher-web, worker-base —
+   keiner der zehn neuen Namen (Punkt 1) ist darunter. Automatisiert zu
+   prüfen, sobald der Loader existiert: `assert!` auf Disjunktheit der beiden
+   Namensmengen (Rollen vs. Kontextprogramme), da beide laut AW6-00-Konvention
+   denselben Namensraum unter `agents/` teilen (außer `family/`, `families/`,
+   `organization/`).
+
+3. Alle neun (explore, research-deps, research-web, plan, implement, review,
+   triage, curate, orchestrate) lösen tatsächlich über `extends` auf `base`
+   auf — keines steht für sich. Prüfmethode: `resolve_context_program` auf
+   jede der neun IDs anwenden und `resolved.trace.steps` auf einen `"base"`-
+   Schritt mit `source == "harwness.context.base@1"` prüfen (nicht nur, dass
+   irgendein `"base"`-Schritt existiert — der muss exakt auf `base.toml`
+   zeigen). Zusätzlich: jede der beiden von `base` ererbten Sektionen
+   (`task.objective`, `history.tail`) muss in `resolved.sections` vorkommen
+   (ggf. namensgleich überschrieben, siehe Punkt 4) — ein Programm, das eine
+   der beiden Basissektionen komplett verliert, hat die Vererbung nicht
+   tatsächlich durchlaufen, sondern umgangen.
+
+4. "Kein abgeleitetes Programm überschreitet seine Basis" — DIESER PUNKT IST
+   VON DER `[context]`-GRAMMATIK NICHT ERZWUNGEN, siehe die ausführliche
+   Begründung im Kopfkommentar von `base.toml` und im Abschlussbericht dieses
+   Knotens. `extends` ist strukturell additiv (`merge_section`/
+   `append_unique`), nicht restriktiv; ein Schnitt (`MergeOp::Intersect`)
+   existiert in dieser Kaskade nur für `patch.exclude.*`, nicht für
+   `sections`/`must_include`, und `patch` wirkt ohnehin nur auf
+   Overlay-Layer mit identischer `id`, nicht auf die erstmalige
+   `extends`-Deklaration eines Kindes. Was stattdessen tatsächlich geprüft
+   werden kann und sollte, sobald ein Loader existiert:
+     a) Jede der neun `exclude`-Listen ist eine Obermenge der `exclude`-Liste
+        von `base` (`credential.*`, `secret.*`, `sibling_transcripts`,
+        `full_parent_transcript`) — das ist die Richtung, in der "nie
+        weniger streng als die Basis" tatsächlich strukturell gilt
+        (`append_unique` kann nur hinzufügen).
+     b) Keine der neun Definitionen deklariert `exclude`-Einträge, die einen
+        von der Basis ererbten `exclude`-Eintrag aufheben würden (per
+        Konstruktion durch `append_unique` bereits ausgeschlossen — als
+        Regressionstest trotzdem sinnvoll, falls die Kaskade sich ändert).
+     c) Für jede namensgleiche Überschreibung einer Basissektion (in dieser
+        Bibliothek: `history.tail` in research-web/review [auf `references`
+        gesenkt] bzw. in plan/triage [auf `full` angehoben]) von Hand
+        gegenprüfen, dass die Absenkung/Anhebung dokumentiert und begründet
+        ist (siehe Kopfkommentar der jeweiligen Datei) — eine automatisierte
+        "Trust darf nie sinken"-Prüfung wäre technisch möglich
+        (`TrustClass::trust_rank` vergleichen), ist hier aber nicht
+        einschlägig, da `trust` in keiner der neun Überschreibungen geändert
+        wird (nur `detail`).
+
+5. Ladereihenfolge ist stabil: `worker-base` (Rolle) zuerst, dann
+   alphabetisch nach abgeleitetem Namen, unabhängig von Dateisystem-
+   reihenfolge. Für die zehn Dateien dieses Knotens bedeutet das folgende
+   erwartete Position innerhalb der Gesamtliste aller `agents/**`-Dateien
+   (`worker-base` steht laut AW6-00-Konvention immer zuerst, unabhängig von
+   seiner alphabetischen Position; alles danach — inklusive der zehn Namen
+   dieses Knotens — rein alphabetisch nach abgeleitetem Namen):
+     worker-base,
+     analyst, base, curate, explore, explorer, implement, orchestrate, plan,
+     planner, research-deps, research-web, researcher-deps, researcher-web,
+     review, triage
+   Prüfmethode: Loader-Ausgabe als `Vec<String>` einsammeln, mit obiger
+   Liste per `assert_eq!` vergleichen.
+
+6. Ein Golden Render je Programm (neun, siehe `golden/*.golden.txt`) —
+   JEDE dieser Dateien ist von Hand aus der Renderlogik abgeleitet, nicht
+   durch einen tatsächlichen Lauf erzeugt (siehe Statuszeile in jeder
+   Golden-Datei). Zentral nachzuziehen: sobald ein Renderer für
+   `ResolvedContextProgramDefinition` existiert, echten Output erzeugen und
+   gegen diese Dateien diffen; bei Abweichung die Golden-Datei aktualisieren
+   und den Diff im entsprechenden Commit begründen (wie bei
+   `trybuild`-`.stderr`-Dateien).

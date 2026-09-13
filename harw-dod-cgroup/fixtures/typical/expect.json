@@ -1,0 +1,56 @@
+{
+  "now": "1970-01-01T00:00:00Z",
+  "reading": {
+    "samples": [
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "memory_current_bytes_system_slice",
+        "value": 104857600.0
+      },
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "memory_max_bytes_system_slice",
+        "value": 1073741824.0
+      },
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "pids_current_system_slice",
+        "value": 42.0
+      },
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "cpu_usage_usec_system_slice",
+        "value": 123456.0
+      },
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "memory_current_bytes_user_slice",
+        "value": 52428800.0
+      },
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "memory_max_bytes_user_slice",
+        "value": 2147483648.0
+      },
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "pids_current_user_slice",
+        "value": 7.0
+      },
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "cpu_usage_usec_user_slice",
+        "value": 9000.0
+      }
+    ],
+    "events": []
+  }
+}

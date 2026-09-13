@@ -1,0 +1,65 @@
+# Eingebaute Coding-Family (§14 DSL-Spec) — der Rollenvorrat des Clans `coding`
+# der eingebauten Default-Organisation.
+#
+# ══════════════════════════════════════════════════════════════════════════════
+# WICHTIG — es gibt heute keine eingebaute Rolle, die Code schreibt.
+# ══════════════════════════════════════════════════════════════════════════════
+# `harw_registry_defaults::profile::role_names::ALL` enthält genau fünf Rollen:
+# `explorer`, `researcher-deps`, `researcher-web`, `planner`, `analyst`. Alle
+# fünf sind read-only: jede führt `fs.write` und `shell.exec` in `forbidden`,
+# und `planner`/`explorer`/`analyst` tragen zusätzlich `may_write_code = false`
+# in ihrer eigenen Definition.
+#
+# Dieses Roster nennt deshalb die Rollen, die die Coding-Spur heute *bedienen*,
+# nicht die, die sie ausführen: `planner` erzeugt den Planvorschlag, aus dem
+# Coding-Knoten entstehen, `explorer` belegt den Ist-Zustand des Codes, den ein
+# Coding-Knoten verändern soll. Sobald eine schreibende Rolle in `role_names`
+# aufgenommen wird, gehört ihre `harwness.agent.<rolle>@1`-ID hierher — und der
+# Test `test_coding_family_lists_only_roles_that_exist_in_role_names` bricht
+# nicht, weil er gegen `role_names::ALL` prüft, nicht gegen eine feste Liste.
+#
+# Frei erfundene IDs stehen hier bewusst *nicht*: eine Family, die eine
+# nicht existierende Rolle erlaubt, verspricht eine Fähigkeit, die die Runtime
+# beim Spawn nicht einlösen kann.
+#
+# TOML-Reihenfolge wie in `research.toml`: `invariants` steht vor der ersten
+# Tabellenüberschrift, sonst landet es in `[orchestrators]`.
+
+schema = "harwness.family/v1"
+id = "harwness.family.coding@1"
+version = "1.0.0"
+name = "Harwness Coding Family"
+
+# Familienweite Invarianten:
+#   * `disjoint_write_sets` — die Zelle des Coding-Clans fährt
+#     `write_partition = "required"`; zwei Kinder derselben Welle dürfen
+#     niemals denselben Pfad schreiben.
+#   * `children_never_pause` — `worker-base.toml` setzt `allow_pause = false`.
+#   * `plan_is_authoritative` — `planner.toml` trägt `may_change_plan = false`:
+#     ein Kind schlägt vor, der autoritative Plan wird nur vom Orchestrator
+#     mutiert.
+invariants = [
+  "disjoint_write_sets",
+  "children_never_pause",
+  "plan_is_authoritative",
+]
+
+# Der Planer führt die Coding-Spur an: er ist die einzige eingebaute Rolle mit
+# den `plan`- und `goal`-Operationen auf ihrer Werkzeugoberfläche.
+[orchestrators]
+allowed = ["harwness.agent.planner@1"]
+
+# Siehe den Block oben: beides sind read-only Rollen. Sie sind hier, weil sie
+# die Coding-Spur vorbereiten — nicht, weil sie Code schreiben.
+[workers]
+allowed = [
+  "harwness.agent.planner@1",
+  "harwness.agent.explorer@1",
+]
+
+# `write_partition` wiederholt hier die Politik der Zelle als Familien-Vorgabe:
+# eine Zelle, die diese Familie benutzt, darf sie verschärfen, aber nicht
+# lockern.
+[defaults]
+write_partition = "required"
+return_contract = "harwness.return.plan-proposal@1"

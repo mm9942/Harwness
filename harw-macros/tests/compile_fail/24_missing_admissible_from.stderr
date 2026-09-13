@@ -1,0 +1,5 @@
+error: Aktion `FreezeCgroup` hat kein `admissible_from: [...]`; eine Aktion ohne Zulässigkeitsregel ist eine Lücke in der Eskalationsleiter
+  --> tests/compile_fail/24_missing_admissible_from.rs:10:5
+   |
+10 |     FreezeCgroup {
+   |     ^^^^^^^^^^^^

@@ -1,0 +1,34 @@
+[package]
+name = "harw-lens-source"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-lens-types = { path = "../harw-lens-types" }
+harw-lens-chunk = { path = "../harw-lens-chunk" }
+harw-lens-store = { path = "../harw-lens-store" }
+harw-lens-index = { path = "../harw-lens-index" }
+harw-lens-embed = { path = "../harw-lens-embed" }
+harw-home = { path = "../harw-home" }
+# `KnowledgeArtifact`, `ArtifactKind`, `KnowledgeIndex`, `VisibilityScope` —
+# read-only consumer. No cycle: `harw-knowledge/Cargo.toml` depends on no
+# Lens crate (checked at AW5-08 time; see this crate's `//!` block).
+harw-knowledge = { path = "../harw-knowledge" }
+harw-types = { path = "../harw-types" }
+harw-macros = { path = "../harw-macros" }
+# Trägt den Nullzähler `lens_remote_embed_on_operator_only` (AW7-05):
+# `build_index` erhöht ihn über `NullCounter::violated`, wenn ein
+# `operator-only`-Sichtbarkeits-Bucket einem Embedder mit
+# `Locality::Remote` zugewiesen würde.
+harw-observe = { path = "../harw-observe" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# Only needed to build `Frontmatter` fixtures in tests (`jiff::Timestamp::now`).
+jiff = { workspace = true }
+
+[lints]
+workspace = true

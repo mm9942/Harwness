@@ -1,0 +1,31 @@
+[package]
+name = "harw-core-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-types = { path = "../harw-types" }
+harw-sandbox = { path = "../harw-sandbox" }
+harw-operations = { path = "../harw-operations" }
+harw-core = { path = "../harw-core" }
+harw-extension-api = { path = "../harw-extension-api" }
+# Return-Contract-Validierung der Kind-Ergebnisse (ResearchFinding, ReturnEnvelope).
+harw-research = { path = "../harw-research" }
+# Return-Contract-Validierung des vierten Arms: `SecurityVerdict`
+# (`harwness.security-verdict/v1`, AW6-02). Bewusst NICHT
+# `harw-dod-warden-proto`: dieser Adapter darf aus einem Verdikt keine
+# `WardenAction` bauen können (siehe `agent_tool.rs`, `ChildReturnContract`).
+harw-dod-signals = { path = "../harw-dod-signals" }
+serde_json = "1.0.150"
+tracing = "0.1.44"
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros"] }
+# Nur für Tests: eine gefrorene Agent-IR bauen bzw. eine ChildRegistryFactory
+# implementieren, um die Contract-Auflösung über den OpContext zu prüfen.
+harw-agent-dsl = { path = "../harw-agent-dsl" }
+harw-catalog = { path = "../harw-catalog" }
+
+[lints]
+workspace = true

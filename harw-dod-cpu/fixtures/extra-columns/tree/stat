@@ -1,0 +1,9 @@
+cpu  100 20 30 400 50 6 7 0 0 0 11 22
+cpu0 100 20 30 400 50 6 7 0 0 0 11 22
+intr 500 0 0
+ctxt 90000
+btime 1700000000
+processes 500
+procs_running 1
+procs_blocked 0
+softirq 10 2 3 0 0 0 0 0 5 0 0

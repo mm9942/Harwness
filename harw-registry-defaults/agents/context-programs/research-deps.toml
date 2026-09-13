@@ -1,0 +1,64 @@
+# Kontextprogramm für Abhängigkeits-Recherche (Rolle: `researcher-deps`).
+#
+# WOFÜR: beantwortet "wie verhält sich diese Abhängigkeit wirklich" aus dem
+# lokal bereits entpackten Registry-Quellcode und `Cargo.lock` — nie aus dem
+# Netz, nie aus dem Modellgedächtnis (siehe `researcher-deps.toml`,
+# `[research] primary_sources_required = true`). Unterscheidet sich von
+# `explore` durch die Quelle (fremder, unveränderlicher Abhängigkeits-Code
+# statt eigener Arbeitsbaum) und von `research-web` durch das Fehlen jedes
+# Netzzugriffs.
+#
+# `extends = base`: `task.objective`/`history.tail` unverändert (Standard-
+# Verlaufsbedarf — eine Dependency-Recherche ist meist eine in sich
+# geschlossene Frage ohne langen Gesprächsbezug, aber auch keiner, der
+# History besonders knapp halten müsste).
+#
+# ZUSÄTZLICHE SEKTIONEN:
+#   - `task.read_scope` (full/data, must-include): hier die Grenze auf den
+#     entpackten Abhängigkeits-Quellbaum (`~/.cargo/registry/src/...` bzw.
+#     das Äquivalent dieses Workspace) statt auf den Arbeitsbaum — dieselbe
+#     Begründung wie bei `explore`: eine gekürzte Grenze ist keine Grenze.
+#   - `deps.lockfile_index` (summary, evidence, must-include): die relevante
+#     Teilmenge aus `Cargo.lock` (Name, exakte Version, Feature-Flags der
+#     fraglichen Crate) — das ist der Ankerpunkt, gegen den jede Aussage
+#     über "wie verhält sich Version X" verifizierbar bleibt. `summary` statt
+#     `full`: ein komplettes `Cargo.lock` eines großen Workspace ist über-
+#     wiegend für die aktuelle Frage irrelevantes Rauschen; die Sektion
+#     liefert die gefilterte Teilmenge, nicht die Rohdatei. `must-include`,
+#     weil ohne sie jede Versionsaussage unbelegt (spekulativ) wäre — genau
+#     das, was diese Rolle verhindern soll.
+#
+# `DetailMode::References` wird hier bewusst NICHT verwendet: die
+# Nachlade-Kappe für Verweise (`context.load`, `harw_tools::context_load`)
+# lohnt sich für lange, seltene Inhalte (Historie, Diffs) — der
+# Lockfile-Ausschnitt ist von vornherein klein gehalten (`summary`), ein
+# Verweis darauf würde die Fixkosten (UUID + 64-Zeichen-Digest, siehe
+# `harw-context/src/reference.rs`) draufschlagen, ohne echten Spareffekt.
+#
+# ZUSÄTZLICHER AUSSCHLUSS: `web.*` — verdoppelt strukturell, was die Rolle
+# ohnehin nicht als Werkzeug hat (`researcher-deps.toml` verweigert
+# `web.fetch`/`web.docs_rs`/`web.crates_io`), macht aber auch auf
+# Kontextebene explizit, dass keine Web-Fundstelle je in diesen Kontext
+# gelangen darf — Werkzeugverweigerung und Kontextausschluss sind zwei
+# unabhängige Kontrollen, die hier bewusst beide gezogen werden.
+
+schema = "harwness.context/v1"
+id = "harwness.context.research-deps@1"
+version = "1.0.0"
+extends = { id = "harwness.context.base@1" }
+
+# `exclude` steht bewusst vor `[[sections]]` — siehe Kommentar in `base.toml`
+# zum TOML-Fallstrick mit Array-of-Tables.
+exclude = ["web.*"]
+
+[[sections]]
+name = "task.read_scope"
+strength = "must-include"
+detail = "full"
+trust = "data"
+
+[[sections]]
+name = "deps.lockfile_index"
+strength = "must-include"
+detail = "summary"
+trust = "evidence"

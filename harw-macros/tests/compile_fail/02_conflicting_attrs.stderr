@@ -1,0 +1,5 @@
+error: widersprüchliche #[raw(...)]-Attribute an Feld 'text': first, join
+ --> tests/compile_fail/02_conflicting_attrs.rs:9:5
+  |
+9 |     text: Option<String>,
+  |     ^^^^

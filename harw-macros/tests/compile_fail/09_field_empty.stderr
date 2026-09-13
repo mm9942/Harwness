@@ -1,0 +1,5 @@
+error: Feldname darf nicht leer sein
+ --> tests/compile_fail/09_field_empty.rs:4:33
+  |
+4 |     let _ = harw_macros::field!("");
+  |                                 ^^

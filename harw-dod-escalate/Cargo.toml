@@ -1,0 +1,51 @@
+[package]
+name = "harw-dod-escalate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# `ApprovalActor` (wer autorisiert hat) — dieselbe Kennung, die
+# `AuthorizationProof::authorized_by` bereits verlangt, statt eine zweite
+# Identitätsdarstellung zu erfinden.
+harw-types = { path = "../harw-types" }
+# `#[derive(harw_macros::HarwError)]` für `error.rs`. Kein `warden_actions!` —
+# diese Crate erzeugt keine Aktionstypen, sie autorisiert nur bereits von
+# `harw-dod-warden-proto` deklarierte.
+harw-macros = { path = "../harw-macros" }
+# `Finding<Triaged>`, `Finding<RuleChecked>`, `Verdict`, `triage` — die
+# Berechtigung, ein `Finding<Triaged>` zu besitzen, kann ausschließlich diese
+# Crate herstellen (siehe `lib.rs`-Moduldoku).
+harw-dod-rules = { path = "../harw-dod-rules" }
+# `Severity`/`Hardness` — Felder von `Finding<S>`, auf denen `Ladder::stage_for`
+# die Aufstiegsregel auswertet. Keine zusätzliche Gewichtsklasse: `harw-dod-rules`
+# hängt bereits auf diese Crate.
+harw-dod-signals = { path = "../harw-dod-signals" }
+# `ProposedAction`/`WardenAction`/`AuthorizationProof`/`EscalationStage`/
+# `WardenActionRequest` — das Wire-Vokabular zum Warden. Von Hand geschrieben
+# dort, nicht über `warden_actions!` (siehe dessen `lib.rs`-Moduldoku,
+# Abschnitt „Prüfung 2: harw-tools") — diese Crate zieht deshalb kein
+# `harw-tools`.
+harw-dod-warden-proto = { path = "../harw-dod-warden-proto" }
+# `FreezeStore`/`Freeze`/`FreezeResolution` (AW5-05) — diese Crate ist der
+# dokumentierte Aufrufer von `FreezeStore::reconcile_expired` beim Start
+# (siehe `harw-session-store/src/freeze.rs`-Moduldoku, Abschnitt „Expiry").
+harw-session-store = { path = "../harw-session-store" }
+jiff = { workspace = true }
+
+[dev-dependencies]
+# Nur für Tests: baut einen `serde_json::Error`, um den `#[from]`-Pfad von
+# `EscalateError::ActionEncoding` (wrappt `WardenProtoError`) ohne echte
+# Digestbildungspanne auszulösen.
+serde_json = { workspace = true }
+# Nur für Tests: baut über `EgressFlowRule` ein echtes `Finding<Triaged>`,
+# statt einen privaten Konstruktor zu umgehen — `harw-dod-rules` selbst
+# verwendet dieselbe Crate für dasselbe Muster in seinen eigenen Doctests.
+harw-sandbox = { path = "../harw-sandbox" }
+# Nur für Tests: ein `FreezeStore` braucht ein Wurzelverzeichnis; `tempfile`
+# ist dieselbe Crate, die `harw-session-store` selbst für seine `FreezeStore`-
+# Doctests/Tests verwendet.
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

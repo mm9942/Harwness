@@ -1,0 +1,36 @@
+[package]
+name = "harw-observe-otlp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# harw-macros ist Baseline jeder Crate für den einen Fehlertyp (Kopfteil
+# "Fehler": `#[derive(harw_macros::HarwError)]`); ohne sie gäbe es keinen
+# Weg, `OtlpError` ohne anyhow/thiserror zu bauen.
+harw-macros = { path = "../harw-macros" }
+harw-observe = { path = "../harw-observe" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+jiff = { workspace = true }
+
+# Echter HTTP-Transport (`crate::http_transport::HttpTransport`), AW7-02.
+# Dieselbe HTTP-Bibliothek und dieselben Versionsangaben wie
+# harw-mcp-server/Cargo.toml und harw-web/Cargo.toml (Serverseite: "server",
+# "http1") -- hier nur die Client-seitigen Feature-Flags derselben, bereits
+# im Baum aufgelösten Crates ("client"/"client-legacy"). `hyper`,
+# `hyper-util`, `http-body-util`, `bytes` und `tokio` stehen in genau diesen
+# Versionsangaben bereits im Workspace (harw-mcp-server, harw-web,
+# harw-provider-http via `reqwest`s eigenem `hyper`-Client) -- diese Zeilen
+# fügen dem Cargo.lock **keine neue Crate** hinzu, nur zusätzliche Features
+# auf bereits aufgelösten Paketen (siehe crate-doc, Abschnitt "Die
+# HTTP-Bibliothek"). Kein `reqwest` (zusätzliche, größere Fläche) und keine
+# TLS-Bibliothek (siehe crate-doc, Abschnitt "TLS").
+hyper = { version = "1", features = ["client"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "tokio"] }
+http-body-util = { version = "0.1" }
+bytes = "1"
+tokio = { version = "1", features = ["rt", "net", "time", "sync"] }
+
+[lints]
+workspace = true

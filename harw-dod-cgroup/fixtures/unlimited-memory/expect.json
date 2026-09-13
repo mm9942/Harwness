@@ -1,0 +1,32 @@
+{
+  "now": "1970-01-01T00:00:00Z",
+  "reading": {
+    "samples": [
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "memory_current_bytes_workload_slice",
+        "value": 204800.0
+      },
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "memory_max_bytes_workload_slice",
+        "value": 1.8446744073709552e+19
+      },
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "pids_current_workload_slice",
+        "value": 15.0
+      },
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "cpu_usage_usec_workload_slice",
+        "value": 42.0
+      }
+    ],
+    "events": []
+  }
+}

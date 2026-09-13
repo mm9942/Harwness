@@ -1,0 +1,28 @@
+GOLDEN RENDER — harwness.context.triage@1
+===========================================
+STATUS: von Hand aus der Renderlogik abgeleitet (kein Renderer gelaufen).
+Siehe `explore.golden.txt` für die Methodik.
+
+Aufgelöste Sektionsreihenfolge (base zuerst, dann triage; `history.tail`
+überschrieben):
+  1. task.objective     strength=must-include  detail=full  trust=instruction  [von base]
+  2. history.tail       strength=must-include  detail=full  trust=evidence     [überschrieben von triage]
+  3. error.trace        strength=must-include  detail=full  trust=evidence     [von triage]
+  4. task.read_scope    strength=must-include  detail=full  trust=data         [von triage]
+
+Ausschluss (Union): credential.*, secret.*, sibling_transcripts,
+full_parent_transcript (base) + plan.* (triage)
+
+--- Gerenderter Turn-Kontext (Platzhalter-Inhalt) ---
+
+## task.objective [instruction]
+<vollständiger Auftragstext des aktuellen Turns>
+
+## history.tail [evidence, full]
+<vollständiger jüngster Verlauf, keine [ref]-Kürzung>
+
+## error.trace [evidence]
+<vollständige Fehlermeldung/Stacktrace/fehlgeschlagene Prüfungsausgabe>
+
+## task.read_scope [data]
+<vollständige Glob-/Verzeichnisliste des erlaubten Lesebereichs>

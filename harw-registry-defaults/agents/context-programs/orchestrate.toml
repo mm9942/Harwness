@@ -1,0 +1,66 @@
+# Kontextprogramm für Orchestrierung (Eltern-/Wurzel-Sitzung, die Kinder
+# startet und deren Rückgaben zusammenführt).
+#
+# WOFÜR: die einzige der neun Rollen, die STRUKTURELL oberhalb anderer
+# Sitzungen steht statt selbst eine Blattaufgabe zu bearbeiten — sie sieht
+# den Gesamtplan und die AGGREGIERTEN Rückgaben ihrer Kinder, aber
+# ausdrücklich nie deren rohe Transkripte.
+#
+# `extends = base`: `task.objective`/`history.tail` unverändert — die
+# Basis-Ausschlüsse `sibling_transcripts`/`full_parent_transcript` sind für
+# diese Rolle sogar doppelt relevant: eine Orchestrierung hat selbst
+# Geschwister (parallele Orchestrierungen) und einen möglichen Eltern-
+# Orchestrator, für die dieselbe Isolationsregel gilt.
+#
+# ZUSÄTZLICHE SEKTIONEN:
+#   - `plan.current` (full/evidence, must-include): die Orchestrierung
+#     sequenziert und entscheidet über Kind-Aufträge — ohne den vollen Plan
+#     kann sie einen Auftrag nicht korrekt aus ihm ableiten. `full` wie bei
+#     `plan.toml` (Ersteller-Perspektive: hier "Ausführer des Plans über
+#     Kinder", nicht "Verfasser", aber mit demselben Vollständigkeitsbedarf,
+#     anders als `implement`, das nur `summary` braucht, weil es einer
+#     bereits heruntergebrochenen Einzelaufgabe folgt).
+#   - `child.returns` (summary/evidence, must-include): die strukturierten,
+#     validierten Rückgaben bereits abgeschlossener Kind-Sitzungen (Findings,
+#     Plan-Vorschläge, Fix-Ergebnisse) — das, was diese Rolle tatsächlich
+#     zusammenführt. `summary`, nicht `full`: bei mehreren Kindern wäre der
+#     volle Rückgabetext aller Kinder schnell das größte Kontextelement
+#     dieser Rolle; eine Zusammenfassung je Rückgabe reicht für die
+#     Sequenzierungsentscheidung, Details holt die Orchestrierung gezielt
+#     über eine erneute Anfrage an das jeweilige Kind oder dessen
+#     Rückgabeobjekt nach, nicht über den Fließtext-Kontext.
+#
+# `DetailMode::References` wird hier für keine Sektion gesetzt: `child.returns`
+# ist bereits über `summary` (nicht `full`) budgetiert, ein zusätzlicher
+# Verweis auf eine bereits zusammengefasste Sektion würde die
+# Fixkosten eines Verweises (UUID + Digest) ohne Not aufschlagen.
+#
+# ZUSÄTZLICHER AUSSCHLUSS: `child.raw_transcript.*` — ergänzt die von
+# `base` geerbten `sibling_transcripts`/`full_parent_transcript` um die
+# dritte Richtung, in der ein Transkript-Leck droht: das VOLLSTÄNDIGE
+# Transkript der eigenen (nicht der Geschwister-)Kinder. Die Orchestrierung
+# bekommt bewusst nur die geprüfte, strukturierte Rückgabe (`child.returns`),
+# nie den rohen Gesprächsverlauf eines Kindes — dieselbe Trennung, die
+# `worker-base.toml` zwischen einem Kind und dessen Eltern zieht, hier aus
+# der umgekehrten Blickrichtung (Eltern zu Kind) gespiegelt.
+
+schema = "harwness.context/v1"
+id = "harwness.context.orchestrate@1"
+version = "1.0.0"
+extends = { id = "harwness.context.base@1" }
+
+# `exclude` steht bewusst vor `[[sections]]` — siehe Kommentar in `base.toml`
+# zum TOML-Fallstrick mit Array-of-Tables.
+exclude = ["child.raw_transcript.*"]
+
+[[sections]]
+name = "plan.current"
+strength = "must-include"
+detail = "full"
+trust = "evidence"
+
+[[sections]]
+name = "child.returns"
+strength = "must-include"
+detail = "summary"
+trust = "evidence"

@@ -1,0 +1,66 @@
+# Kontextprogramm für Wissenskuratierung (Memory-Palace-/Knowledge-Pflege).
+#
+# WOFÜR: entscheidet, ob ein Fund/eine Erkenntnis dauerhaft ins Gedächtnis
+# (`harw-knowledge`, `memory::palace`) aufgenommen wird. Die auffälligste
+# Eigenschaft dieses Programms: es ist das einzige der neun, das absichtlich
+# Material mit dem NIEDRIGSTEN Vertrauen (`data`) als `must-include`
+# aufnimmt — der Kandidat, über den entschieden wird, ist per Definition
+# noch nicht geprüft.
+#
+# `extends = base`: `task.objective`/`history.tail` unverändert — Kuratieren
+# ist überwiegend eine in sich geschlossene Bewertungsaufgabe pro Kandidat,
+# kein Verlauf-intensiver Vorgang.
+#
+# ZUSÄTZLICHE SEKTIONEN:
+#   - `knowledge.candidates` (full/data, must-include): das zu bewertende
+#     Rohmaterial (ein vorgeschlagener Fund, eine vorgeschlagene
+#     Erinnerung). `full`, weil eine Kuratierungsentscheidung am
+#     ungekürzten Material getroffen werden muss — eine Zusammenfassung des
+#     Kandidaten wäre bereits eine Vorentscheidung, was daran wichtig ist,
+#     und genau diese Entscheidung soll die Kuratierung selbst treffen.
+#     Vertrauen bewusst `data` (die geringste Stufe, siehe
+#     `harw_context::TrustClass::trust_rank`): der Kandidat ist unbelegtes
+#     Rohmaterial, keine Instruktion und keine bereits verifizierte Evidenz
+#     — würde diese Sektion mit höherem Vertrauen eingestuft, könnte ein
+#     präpariert formulierter Kandidat sich selbst als Weisung ausgeben
+#     ("ignoriere die bisherige Regel und ..."). Die niedrige Einstufung ist
+#     hier die Sicherheitsmaßnahme, nicht ein `exclude`.
+#   - `memory.palace_index` (summary/evidence, must-include): ein knapper
+#     Überblick über bereits vorhandene Einträge, damit die Kuratierung
+#     Duplikate/Widersprüche erkennt, statt blind anzuhängen. `summary`
+#     genügt — die Kuratierung navigiert bei Bedarf gezielt nach, sie muss
+#     den gesamten Palast nicht auf einmal sehen.
+#
+# `DetailMode::References` wird hier für keine Sektion verwendet: beide
+# Sektionen sind bereits knapp gehalten (`knowledge.candidates` ist ein
+# einzelner Kandidat, kein Batch; `memory.palace_index` ist schon ein
+# Index, keine Volltextsammlung) — ein Verweis würde nur Fixkosten
+# aufschlagen, ohne echten Spareffekt (dieselbe Rechnung wie bei
+# `research-deps`).
+#
+# ZUSÄTZLICHER AUSSCHLUSS: `web.fetch_allowlist` — Kuratierung bewertet
+# bereits vorliegendes Material, sie holt selbst nichts nach; die
+# Netzzugriffsgrenze aus `research-web` hat hier keine Rolle und soll auch
+# nicht versehentlich sichtbar werden und zu einer Netzaktion verleiten, die
+# außerhalb der Rollen-Werkzeugfläche ohnehin verweigert würde.
+
+schema = "harwness.context/v1"
+id = "harwness.context.curate@1"
+version = "1.0.0"
+extends = { id = "harwness.context.base@1" }
+
+# `exclude` steht bewusst vor `[[sections]]` — siehe Kommentar in `base.toml`
+# zum TOML-Fallstrick mit Array-of-Tables.
+exclude = ["web.fetch_allowlist"]
+
+[[sections]]
+name = "knowledge.candidates"
+strength = "must-include"
+detail = "full"
+trust = "data"
+
+[[sections]]
+name = "memory.palace_index"
+strength = "must-include"
+detail = "summary"
+trust = "evidence"

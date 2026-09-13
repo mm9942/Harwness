@@ -1,0 +1,5 @@
+error: Glob-Muster darf nicht leer sein
+  --> tests/compile_fail/22_empty_glob_pattern.rs:13:21
+   |
+13 |     #[source(glob = "", parse = "i64", metric = "temperature_celsius")]
+   |                     ^^

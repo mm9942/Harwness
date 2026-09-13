@@ -1,0 +1,7 @@
+error: warden_actions! darf keine leere Deklaration sein – erwartet wird mindestens `authorization_proof = <Pfad>;` und eine Aktion
+ --> tests/compile_fail/29_empty_declaration.rs:5:1
+  |
+5 | warden_actions! {}
+  | ^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `warden_actions` (in Nightly builds, run with -Z macro-backtrace for more info)

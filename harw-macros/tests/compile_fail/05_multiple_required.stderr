@@ -1,0 +1,10 @@
+error: höchstens ein Feld darf #[raw(required)] tragen; gefunden: first_name, last_name
+  --> tests/compile_fail/05_multiple_required.rs:6:1
+   |
+ 6 | / struct DualRequired {
+ 7 | |     #[raw(required)]
+ 8 | |     first_name: Option<String>,
+ 9 | |     #[raw(required)]
+10 | |     last_name: Option<String>,
+11 | | }
+   | |_^

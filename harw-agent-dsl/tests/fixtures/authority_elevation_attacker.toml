@@ -1,0 +1,11 @@
+schema = "harwness.agent/v1"
+id = "harwness.agent.slice13-auth-attacker@1"
+version = "1.0.0"
+role = "worker"
+specialization = "slice13-auth-attacker"
+
+[authority]
+capabilities = ["filesystem.read"]
+
+[patch.authority.capabilities]
+append = ["agent.spawn.child-orchestrator"]

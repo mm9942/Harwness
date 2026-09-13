@@ -1,0 +1,61 @@
+# Kontextprogramm für read-only Erkundung (Rolle: `explorer` u. ä.).
+#
+# WOFÜR: ein Erkunder beantwortet "wo im Baum steht das, was tut es wirklich"
+# — er braucht seinen Lesebereich und einen groben Strukturüberblick, aber
+# weder den Plan noch fremde Werkzeugflächen. Unterscheidet sich vom
+# Nachbarn `research-deps` dadurch, dass er den ARBEITSBAUM liest, nicht den
+# entpackten Abhängigkeits-Quellcode einer bestimmten Crate-Version.
+#
+# `extends = base` bringt `task.objective` (full/instruction) und
+# `history.tail` (summary/evidence) unverändert mit (siehe `base.toml` zur
+# additiven Natur von `extends` — keine dieser beiden Sektionen kann hier
+# entfernt werden, nur überschrieben; hier bleibt beides beim Basis-Default,
+# weil ein Erkunder weder mehr Verlauf noch weniger Auftrag braucht als der
+# Standardfall).
+#
+# ZUSÄTZLICHE SEKTIONEN:
+#   - `task.read_scope` (full/data, must-include): die Glob-/Verzeichnisgrenze,
+#     innerhalb derer der Erkunder lesen darf. `full`, weil eine gekürzte
+#     Grenze ihren Zweck verfehlt — ein Erkunder, der seine eigene Grenze nur
+#     zusammengefasst kennt, kann sie nicht zuverlässig einhalten. Vertrauen
+#     `data`, nicht `instruction`: die Grenze selbst ist keine Handlungsan-
+#     weisung, sondern eine vom Aufrufer gesetzte Randbedingung.
+#   - `repo.tree` (summary, evidence): ein knapper Strukturüberblick
+#     (Verzeichnis-/Modulbaum) als Orientierung, bevor gezielt gelesen wird.
+#     `summary` statt `full`: der volle Baum eines mittelgroßen Rust-
+#     Workspace sprengt das Budget, ohne dass der Erkunder je den gesamten
+#     Baum auf einmal braucht — er navigiert iterativ über eigene
+#     Werkzeugaufrufe (`fs.list`/`fs.glob`), diese Sektion liefert nur den
+#     Startpunkt. Nicht `must-include`: fehlt sie unter Budgetdruck, kann der
+#     Erkunder sie durch einen eigenen `fs.list`-Aufruf ersetzen — anders als
+#     `task.read_scope`, ohne die er gar nicht sicher arbeiten dürfte.
+#
+# `DetailMode::References` wird hier für KEINE Sektion gesetzt: der Erkunder
+# selbst erzeugt in seinem eigenen Rückgabewert Belege (Findings), er ist
+# nicht der Ort, an dem gespart wird — seine Eingabe ist ohnehin schon knapp
+# (Auftrag, Grenze, Kurzüberblick).
+#
+# ZUSÄTZLICHER AUSSCHLUSS: `plan.*` — ein reiner Erkunder soll nicht auf den
+# Plan schielen und implizit planerische Aussagen treffen; das ist die
+# Aufgabe von `plan`. Trennt Zuständigkeit exakt an der Rollen-Grenze.
+
+schema = "harwness.context/v1"
+id = "harwness.context.explore@1"
+version = "1.0.0"
+extends = { id = "harwness.context.base@1" }
+
+# `exclude` steht bewusst vor `[[sections]]` — siehe Kommentar in `base.toml`
+# zum TOML-Fallstrick mit Array-of-Tables.
+exclude = ["plan.*"]
+
+[[sections]]
+name = "task.read_scope"
+strength = "must-include"
+detail = "full"
+trust = "data"
+
+[[sections]]
+name = "repo.tree"
+strength = "normal"
+detail = "summary"
+trust = "evidence"

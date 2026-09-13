@@ -1,0 +1,236 @@
+//! Fehlertyp von `harw-dod-warden-proto` (Contract-Master §H.1: ein
+//! Fehlertyp je Crate).
+//!
+//! # Verantwortungsbereich
+//! [`WardenProtoError`] deckt die beiden Fehlerpfade ab, die innerhalb
+//! dieser Crate selbst entstehen können: die kanonische Kodierung einer
+//! [`crate::action::WardenAction`] für die Belegbindung
+//! ([`WardenProtoError::ActionEncoding`], siehe `action.rs`,
+//! `content_digest`), und eine fehlgeschlagene Beleg-/Zulässigkeitsprüfung
+//! ([`WardenProtoError::ProofMismatch`], [`WardenProtoError::NotAdmissibleAtStage`],
+//! siehe `proof.rs`, `authorizes`/`verify`).
+//!
+//! # Dieser Typ verlässt den Prozess nie
+//! `WardenProtoError` implementiert absichtlich **kein** `Serialize` — er
+//! geht nie über die Leitung. Er ist außerdem strukturell dafür ungeeignet:
+//! [`WardenProtoError::ActionEncoding`] trägt einen `serde_json::Error`, der
+//! selbst kein `Serialize` implementiert. Was über die Leitung geht, ist
+//! [`crate::denial::Denial`] — eine feldlose, inhaltsfreie Kategorie.
+//! [`WardenProtoError::as_denial`] ist die einzige Brücke zwischen beiden:
+//! sie bildet einen `WardenProtoError` auf die passende `Denial`-Kategorie
+//! ab (oder `None`, wenn der Fehler keine geschäftslogische Ablehnung ist,
+//! sondern eine interne Kodierungspanne) und lässt dabei jedes Detail
+//! fallen. Diese Abbildung ist der Ort, an dem „inhaltsfrei" tatsächlich
+//! durchgesetzt wird — nicht (nur) die Wortwahl der `Display`-Meldung.
+//!
+//! # Warum `ProofMismatch` trotzdem ein Feld trägt, das nirgends erscheint
+//! [`MismatchAspect`] sagt, WELCHER Teil eines Belegs nicht passte (Befund
+//! oder Aktion) — aber `WardenProtoError::ProofMismatch`s `#[msg(...)]`
+//! interpoliert es nicht. Das ist beabsichtigt, nicht übersehen: die
+//! `Display`-Meldung bleibt so formuliert, dass ein Aufrufer, der sie
+//! unbedacht weiterreicht (z. B. in eine Log-Zeile, die den
+//! Vertrauensbereich verlässt), trotzdem nichts Feinkörniges preisgibt. Der
+//! Wert bleibt für lokalen, im Prozess bleibenden Code erreichbar — über
+//! Pattern-Matching auf die Variante, nie über die Meldung selbst. Diese
+//! Crate bindet sich damit an dieselbe Disziplin, die
+//! [`crate::denial::Denial`] strukturell erzwingt: mehr Information zu
+//! *besitzen* als zu *sagen*.
+//!
+//! # Nebenläufigkeit
+//! `WardenProtoError` trägt keinen inneren Zustand außer den Fehlerdaten
+//! selbst; kein Locking, keine geteilten Ressourcen. Nicht `Clone` (ein
+//! `serde_json::Error` ist es selbst nicht), ansonsten unproblematisch aus
+//! jedem Thread erreichbar.
+//!
+//! # Examples
+//! ```rust
+//! use harw_dod_warden_proto::error::WardenProtoError;
+//!
+//! fn describe(err: &WardenProtoError) -> String {
+//!     err.to_string()
+//! }
+//! ```
+
+use std::fmt;
+
+use crate::denial::Denial;
+
+/// Welcher Teil eines [`crate::proof::AuthorizationProof`] nicht zur
+/// angeforderten Aktion passte.
+///
+/// # Description
+/// Rein interne Diagnoseinformation (siehe `error.rs`-Moduldoku, Abschnitt
+/// „Warum `ProofMismatch` trotzdem ein Feld trägt"). Nie serialisiert, nie
+/// in eine `Display`-Meldung interpoliert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MismatchAspect {
+    /// [`crate::proof::AuthorizationProof::finding`] stimmt nicht mit dem
+    /// geprüften Befund überein.
+    Finding,
+    /// [`crate::proof::AuthorizationProof::bound_action`] stimmt nicht mit
+    /// dem Inhaltsdigest der geprüften Aktion überein.
+    Action,
+}
+
+/// Fehler dieser Crate.
+///
+/// # Description
+/// Siehe Moduldoku für die vollständige Begründung jeder Variante und dafür,
+/// warum dieser Typ nie serialisiert wird.
+///
+/// # Errors
+/// Wird über `?`/[`std::convert::From`] (für [`Self::ActionEncoding`]) oder
+/// von Hand (für [`Self::ProofMismatch`], [`Self::NotAdmissibleAtStage`]) in
+/// [`crate::proof::AuthorizationProof`] und [`crate::action::WardenAction`]
+/// erzeugt.
+#[derive(harw_macros::HarwError)]
+pub enum WardenProtoError {
+    /// Die kanonische JSON-Kodierung einer [`crate::action::WardenAction`]
+    /// für die Digest-Bildung (siehe `action.rs`, `content_digest`) ist
+    /// fehlgeschlagen.
+    #[msg("failed to encode a warden action for content-addressed binding: {0}")]
+    #[from]
+    ActionEncoding(serde_json::Error),
+
+    /// Der Autorisierungsbeleg ist nicht an die geprüfte Aktion/den
+    /// geprüften Befund gebunden (siehe `proof.rs`, `authorizes`). Welcher
+    /// Aspekt genau abweicht, steht in [`MismatchAspect`] — bewusst nicht in
+    /// dieser Meldung (siehe Moduldoku).
+    #[msg("authorization proof does not authorize the requested action")]
+    ProofMismatch(MismatchAspect),
+
+    /// Die Aktion ist ab der im Beleg genannten Eskalationsstufe nicht
+    /// zulässig (siehe [`crate::action::WardenAction::is_admissible_from`]).
+    #[msg("action is not admissible at the proof's escalation stage")]
+    NotAdmissibleAtStage,
+}
+
+/// Formatiert `WardenProtoError` über seine [`std::fmt::Display`]-Meldung.
+///
+/// # Description
+/// `#[derive(harw_macros::HarwError)]` erzeugt kein `Debug` (siehe
+/// `harw-macros/src/error.rs`, `expand_harw_error`) — diese Impl schließt die
+/// Lücke, indem sie an `Display` delegiert, statt eine zweite, mit `Display`
+/// potenziell auseinanderlaufende Formatierung zu pflegen (Contract-Master
+/// §H.1-Konvention: eine Formatierung, keine Duplikation).
+impl fmt::Debug for WardenProtoError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl WardenProtoError {
+    /// Bildet diesen Fehler auf die inhaltsfreie Ablehnungskategorie ab, die
+    /// über die Leitung an den Eskalationsleiter zurückgeht.
+    ///
+    /// # Description
+    /// Die einzige Stelle, an der Detail bewusst fallen gelassen wird, bevor
+    /// eine Aussage den Prozess verlässt (siehe Moduldoku). Eine
+    /// [`Self::ActionEncoding`]-Panne ist keine geschäftslogische Ablehnung
+    /// — sie zeigt einen internen Defekt an (z. B. ein nicht kodierbares
+    /// Feld) und wird deshalb nicht auf eine `Denial` abgebildet; der
+    /// Aufrufer muss sie gesondert behandeln (z. B. als harten Fehler
+    /// loggen, nicht als normale Ablehnung an den Aufrufer zurückgeben).
+    ///
+    /// # Returns
+    /// `Some(Denial)` für eine geschäftslogische Ablehnung, `None` für eine
+    /// interne Kodierungspanne.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_dod_warden_proto::denial::Denial;
+    /// use harw_dod_warden_proto::error::{MismatchAspect, WardenProtoError};
+    ///
+    /// let err = WardenProtoError::ProofMismatch(MismatchAspect::Finding);
+    /// assert_eq!(err.as_denial(), Some(Denial::ProofMismatch));
+    /// ```
+    #[must_use]
+    pub fn as_denial(&self) -> Option<Denial> {
+        match self {
+            Self::ProofMismatch(_) => Some(Denial::ProofMismatch),
+            Self::NotAdmissibleAtStage => Some(Denial::NotAdmissibleAtStage),
+            Self::ActionEncoding(_) => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as _;
+
+    use super::{MismatchAspect, WardenProtoError, WardenProtoResult};
+    use crate::denial::Denial;
+
+    fn sample_json_error() -> serde_json::Error {
+        serde_json::from_str::<serde_json::Value>("not json").unwrap_err()
+    }
+
+    #[test]
+    fn test_action_encoding_display_interpolates_inner_message() {
+        let err = WardenProtoError::from(sample_json_error());
+        let display = err.to_string();
+        assert!(display.starts_with("failed to encode a warden action for content-addressed binding:"));
+    }
+
+    #[test]
+    fn test_action_encoding_source_returns_inner_error() {
+        let err: WardenProtoError = sample_json_error().into();
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn test_proof_mismatch_display_is_content_free_regardless_of_aspect() {
+        let finding = WardenProtoError::ProofMismatch(MismatchAspect::Finding).to_string();
+        let action = WardenProtoError::ProofMismatch(MismatchAspect::Action).to_string();
+        assert_eq!(finding, action);
+        assert_eq!(finding, "authorization proof does not authorize the requested action");
+    }
+
+    #[test]
+    fn test_proof_mismatch_source_is_none() {
+        let err = WardenProtoError::ProofMismatch(MismatchAspect::Action);
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn test_not_admissible_at_stage_display_and_source() {
+        let err = WardenProtoError::NotAdmissibleAtStage;
+        assert_eq!(err.to_string(), "action is not admissible at the proof's escalation stage");
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn test_debug_delegates_to_display() {
+        let err = WardenProtoError::NotAdmissibleAtStage;
+        assert_eq!(format!("{err:?}"), err.to_string());
+
+        let err = WardenProtoError::ProofMismatch(MismatchAspect::Finding);
+        assert_eq!(format!("{err:?}"), err.to_string());
+    }
+
+    #[test]
+    fn test_as_denial_maps_business_errors_and_drops_internal_ones() {
+        assert_eq!(
+            WardenProtoError::ProofMismatch(MismatchAspect::Finding).as_denial(),
+            Some(Denial::ProofMismatch)
+        );
+        assert_eq!(
+            WardenProtoError::ProofMismatch(MismatchAspect::Action).as_denial(),
+            Some(Denial::ProofMismatch)
+        );
+        assert_eq!(
+            WardenProtoError::NotAdmissibleAtStage.as_denial(),
+            Some(Denial::NotAdmissibleAtStage)
+        );
+        assert_eq!(WardenProtoError::from(sample_json_error()).as_denial(), None);
+    }
+
+    #[test]
+    fn test_warden_proto_result_alias_carries_warden_proto_error() {
+        fn always_fails() -> WardenProtoResult<()> {
+            Err(WardenProtoError::NotAdmissibleAtStage)
+        }
+
+        assert!(always_fails().is_err());
+    }
+}

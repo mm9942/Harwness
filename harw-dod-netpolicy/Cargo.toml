@@ -1,0 +1,20 @@
+[package]
+name = "harw-dod-netpolicy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-sandbox = { path = "../harw-sandbox" }
+harw-dod-cap = { path = "../harw-dod-cap" }
+harw-macros = { path = "../harw-macros" }
+serde = { workspace = true }
+# Nicht Teil der öffentlichen API dieser Crate: Werkzeug, mit dem
+# `plan_for_scope` den öffentlichen `serde`-Wire-Vertrag von
+# `harw_sandbox::EgressTarget` ausliest (siehe `src/plan.rs`) und mit dem der
+# `NetPlan`-Serde-Rundlauf getestet wird.
+serde_json = { workspace = true }
+ipnet = { workspace = true }
+
+[lints]
+workspace = true

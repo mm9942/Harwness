@@ -1,0 +1,5 @@
+error: Aktion `FreezeCgroup` hat kein `audit = "..."`; eine Aktion ohne Audit-Namen ist ein Eingriff ohne Spur
+ --> tests/compile_fail/25_missing_audit.rs:9:5
+  |
+9 |     FreezeCgroup {
+  |     ^^^^^^^^^^^^

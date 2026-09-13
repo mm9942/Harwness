@@ -1,0 +1,75 @@
+[package]
+name = "harw-ops"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-operations = { path = "../harw-operations" }
+harw-macros = { path = "../harw-macros" }
+harw-types = { path = "../harw-types" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+harw-config = { path = "../harw-config" }
+harw-home = { path = "../harw-home" }
+harw-memory = { path = "../harw-memory" }
+harw-model-catalog = { path = "../harw-model-catalog" }
+harw-provider = { path = "../harw-provider" }
+harw-session-store = { path = "../harw-session-store" }
+harw-job-runtime = { path = "../harw-job-runtime" }
+harw-extension-api = { path = "../harw-extension-api" }
+harw-tool-shell = { path = "../harw-tool-shell" }
+harw-tools = { path = "../harw-tools" }
+jiff = { workspace = true }
+# Wellen-Fortschritt des `analyze`-Fan-outs (Spans je Ebene, Events je Kind).
+tracing = "0.1.44"
+harw-core = { path = "../harw-core" }
+# Planungs-Fläche (`/plan`, `/goal`): Kern-Typen und Store-Trait aus harw-plan,
+# die Kontext-Anbindung (`OpContextPlanExt`) und der Controller aus der Bridge.
+harw-plan = { path = "../harw-plan" }
+harw-plan-bridge = { path = "../harw-plan-bridge" }
+# Strukturierte Kind-Rückgaben: `explore`/`research_*` parsen und validieren
+# `ResearchFinding`, `analyze` legt sie über den FindingStore ab.
+harw-research = { path = "../harw-research" }
+# `analyze` baut den Crate-Graphen des Workspaces (leaf-first Ebenen) ohne
+# cargo-Subprozess — read-only Kinder haben kein `ExecuteProcess`.
+harw-code-graph = { path = "../harw-code-graph" }
+# Rollennamen (`role_names::EXPLORER` …) als Single Source of Truth für
+# `Surface::AgentTool.child_name`; kein Zyklus, weil registry-defaults die
+# Tool-Provider zusammenbaut und keine Operationen kennt.
+harw-registry-defaults = { path = "../harw-registry-defaults" }
+# Fan-out aus einer Operation heraus (`analyze`): Kind-Kontext und
+# Return-Contract-Auflösung laufen über die Core-Bridge.
+harw-core-bridge = { path = "../harw-core-bridge" }
+# Autoritätsreduktion für Kind-Sandboxes (`SandboxSpec::restrict`) — bislang
+# nur Testabhängigkeit, jetzt auf dem Produktivpfad von `explore`/`analyze`.
+harw-sandbox = { path = "../harw-sandbox" }
+# `harw_plan::PlanNode`/`EvidenceRef`/`Goal` datieren in `time::OffsetDateTime`;
+# diese Crate muss dieselbe Zeitachse benutzen, damit die Typen identisch sind.
+# Version bewusst identisch zu harw-plan/harw-plan-bridge gepinnt.
+time = "0.3.53"
+# AW5-09: `/context-proposal`-Prüffläche (list/view/accept/reject) über
+# `ContextProposal` (AW5-09). Kein Zyklus: `harw-knowledge` hängt nicht von
+# `harw-ops` ab.
+harw-knowledge = { path = "../harw-knowledge" }
+# Bestätigungsfläche (`approval.pending`/`approval.resolve`, UI-06-Folgeknoten):
+# `security::pending_approval`/`security::resolve_approval`, `PeerCredentials`
+# und `ApprovalActorResolver` stammen aus `harw-web`. Kein Zyklus: `harw-web`
+# hängt nicht von `harw-ops` ab (geprüft).
+harw-web = { path = "../harw-web" }
+
+[features]
+# Forwards to harw-provider's ChatGPT OAuth flag so `--features chatgpt-oauth`
+# on this crate actually enables the corresponding cfg in harw-provider.
+chatgpt-oauth = ["harw-provider/chatgpt-oauth"]
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros"] }
+secrecy = "0.8"
+# AW5-09: `context_proposal.rs`-Tests bauen einen `DefinitionId`
+# (`harwness.context.base@1`) als Fixture. Kein Zyklus: `harw-agent-dsl`
+# hängt nicht von `harw-ops` ab (geprüft).
+harw-agent-dsl = { path = "../harw-agent-dsl" }
+
+[lints]
+workspace = true

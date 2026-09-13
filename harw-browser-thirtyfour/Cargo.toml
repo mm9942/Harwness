@@ -1,0 +1,24 @@
+[package]
+name = "harw-browser-thirtyfour"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait = "0.1.89"
+base64 = "0.22.1"
+futures-util = "0.3.32"
+harw-browser = { path = "../harw-browser" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.10"
+thirtyfour = { version = "0.37.2", default-features = false, features = ["reqwest", "rustls", "manager", "bidi", "component"] }
+tokio = { version = "1.53.0", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+url = { version = "2.5.8", features = ["serde"] }
+uuid = { version = "1.24.0", features = ["v4", "serde"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+
+[lints]
+workspace = true

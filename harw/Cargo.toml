@@ -1,0 +1,30 @@
+[package]
+name = "harw"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "HARW SDK facade — the single crate external users depend on."
+
+[dev-dependencies]
+cargo_metadata = "0.23.1"
+time = "0.3.45"
+tokio = { version = "1.52.4", features = ["rt", "macros", "sync"] }
+
+[dependencies]
+harw-extension-api = { path = "../harw-extension-api" }
+harw-operations = { path = "../harw-operations" }
+harw-ops = { path = "../harw-ops" }
+harw-agent-dsl = { path = "../harw-agent-dsl" }
+harw-core = { path = "../harw-core" }
+harw-provider = { path = "../harw-provider" }
+harw-model-catalog = { path = "../harw-model-catalog" }
+harw-registry-defaults = { path = "../harw-registry-defaults" }
+harw-types = { path = "../harw-types" }
+harw-plan = { path = "../harw-plan" }
+harw-plan-bridge = { path = "../harw-plan-bridge" }
+harw-research = { path = "../harw-research" }
+harw-code-graph = { path = "../harw-code-graph" }
+harw-sandbox = { path = "../harw-sandbox" }
+
+[lints]
+workspace = true

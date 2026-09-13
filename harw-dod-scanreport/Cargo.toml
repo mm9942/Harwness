@@ -1,0 +1,43 @@
+[package]
+name = "harw-dod-scanreport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Zugriffsvokabular: Capability, ReadScope, SensorHandle, SensorError (der
+# einzige Fehlertyp, den diese Crate zurückgibt — siehe `src/lib.rs`).
+harw-dod-cap = { path = "../harw-dod-cap" }
+# Datenvokabular: `trait Sensor`, `SensorReading`, `SecurityEvent`,
+# `EventKind`, `Hardness`.
+harw-dod-signals = { path = "../harw-dod-signals" }
+# Die einzige Dateisystem-Naht dieser Crate: `read_to_string`, `glob::glob`.
+harw-dod-readfs = { path = "../harw-dod-readfs" }
+# Benennt `scan_reports_dir(home)` — nur Pfadauflösung, kein Anlegen.
+harw-home = { path = "../harw-home" }
+# `SensorId`.
+harw-types = { path = "../harw-types" }
+# Vorgegebene Pfadabhängigkeit dieses Knotens (Vertrag). Diese Crate deckt
+# ihre Fehlerfläche vollständig über das bereits inhaltsfreie
+# `harw_dod_cap::SensorError` ab und erfindet keine eigene Fehlermenge —
+# siehe `src/lib.rs`, Abschnitt „Fehler" — deshalb bleibt der Import
+# ungenutzt.
+harw-macros = { path = "../harw-macros" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+jiff = { workspace = true }
+
+[dev-dependencies]
+# Fixture-Harness (`sensor_suite!`, vollständig implementiert in
+# `harw-dod-fixtures/src/macros.rs`). Es greift hier trotzdem nicht: es
+# verlangt `From<harw_dod_cap::SensorHandle<harw_dod_cap::Bound>>` als
+# einzigen Konstruktionsweg, aber `ScanReportSensor` konstruiert sich über
+# `ScanReportSensor::for_home(id, &roots.home)` (Bequemlichkeitskonstruktor
+# über `harw_home::paths::scan_reports_dir`, siehe `src/sensor.rs`) statt
+# über `From` — die sechs Prüfungen sind deshalb unten von Hand geschrieben
+# (siehe `src/sensor.rs`, Testmodul).
+harw-dod-fixtures = { path = "../harw-dod-fixtures" }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

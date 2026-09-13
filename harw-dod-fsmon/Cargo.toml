@@ -1,0 +1,33 @@
+[package]
+name = "harw-dod-fsmon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Zugriffsvokabular: `Capability`, `ReadScope`, `SensorHandle`, `SensorError`.
+harw-dod-cap = { path = "../harw-dod-cap" }
+# Datenvokabular: `SecurityEvent`, `EventKind`, `Actor`, `trait Sensor`.
+harw-dod-signals = { path = "../harw-dod-signals" }
+# Die einzige Dateisystem-Naht für privilegienlose Lesezugriffe (loginuid).
+harw-dod-readfs = { path = "../harw-dod-readfs" }
+# Kennungen: `SensorId`.
+harw-types = { path = "../harw-types" }
+# `#[derive(harw_macros::HarwError)]` für `error.rs`.
+harw-macros = { path = "../harw-macros" }
+# Zeitachse für `SecurityEvent::observed_at` (injiziert, nie selbst gelesen).
+jiff = { workspace = true }
+
+[dev-dependencies]
+# Fixture-Harness für Sensor-Crates. Zum Zeitpunkt dieses Knotens (AW4-02a)
+# noch ein leeres Gerüst ohne `sensor_suite!` (Knoten AW2-05 folgt parallel):
+# diese Crate schreibt ihre Prüfungen deshalb von Hand, bleibt aber bereits
+# auf die künftige Abhängigkeit verdrahtet.
+harw-dod-fixtures = { path = "../harw-dod-fixtures" }
+tempfile = { workspace = true }
+# Nur für den Inhaltsfreiheits-Test in `shape.rs` (serialisiert ein geformtes
+# `SecurityEvent` und prüft, dass kein Dateiinhalt darin auftaucht).
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,28 @@
+GOLDEN RENDER — harwness.context.plan@1
+=========================================
+STATUS: von Hand aus der Renderlogik abgeleitet (kein Renderer gelaufen).
+Siehe `explore.golden.txt` für die Methodik.
+
+Aufgelöste Sektionsreihenfolge (base zuerst, dann plan; `history.tail`
+überschrieben):
+  1. task.objective     strength=must-include  detail=full  trust=instruction  [von base]
+  2. history.tail       strength=must-include  detail=full  trust=evidence     [überschrieben von plan]
+  3. goal.invariants    strength=must-include  detail=full  trust=instruction  [von plan]
+  4. plan.current       strength=must-include  detail=full  trust=evidence     [von plan]
+
+Ausschluss (Union): credential.*, secret.*, sibling_transcripts,
+full_parent_transcript (base) + web.* (plan)
+
+--- Gerenderter Turn-Kontext (Platzhalter-Inhalt) ---
+
+## task.objective [instruction]
+<vollständiger Auftragstext des aktuellen Turns>
+
+## history.tail [evidence, full]
+<vollständiger jüngster Verlauf, keine [ref]-Kürzung>
+
+## goal.invariants [instruction]
+<vollständige Liste der Ziel-Randbedingungen>
+
+## plan.current [evidence]
+<vollständiger, autoritativer Plan>

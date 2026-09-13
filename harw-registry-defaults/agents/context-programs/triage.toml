@@ -1,0 +1,74 @@
+# Kontextprogramm für Fehler-Triage (Debug-/Fehlerzerlegung).
+#
+# WOFÜR: zerlegt eine Störung in tragfähige Fehlersegmente, bevor überhaupt
+# ein Fix versucht wird (vgl. `error-decomposition-agent`-artige Aufgaben).
+# Der Kontextbedarf ist eigen: nicht der Plan, nicht der Diff (der existiert
+# bei einer Regression oft noch gar nicht), sondern das exakte
+# Fehlersignal und der exakte Ablauf, der dorthin geführt hat.
+#
+# `extends = base`: `task.objective` unverändert. `history.tail` wird auf
+# `full` angehoben (siehe unten, wie bei `plan`, aber aus anderem Grund).
+#
+# ÜBERSCHRIEBENE BASIS-SEKTION:
+#   - `history.tail`: `detail` auf `full` angehoben. BEGRÜNDUNG: Triage
+#     rekonstruiert eine Kausalkette ("welcher Aufruf hat den Zustand
+#     erzeugt, der dann fehlschlug") — genau die Reihenfolge- und
+#     Wortlaut-Details, die eine Zusammenfassung oder ein Verweis
+#     verwischen bzw. erst nach einem zusätzlichen `context.load`-Aufruf
+#     wiederherstellen würden. Anders als bei `plan` (wo es um die jüngste
+#     Entscheidung geht) kann die relevante Ursache hier auch weiter
+#     zurückliegen als der garantierte Schwanz — das behebt diese Basis-
+#     Überschreibung nicht (der Schwanz bleibt ein Schwanz), macht aber
+#     wenigstens den jüngeren Teil der Kausalkette ohne Nachladeschritt
+#     verfügbar. KOSTEN: wie bei `plan` — mehr Budget, kein Sparpotenzial
+#     durch Verweise; hier zusätzlich gerechtfertigt, weil ein
+#     Nachladeschritt mitten in einer Ursachensuche die Fehlersuche aktiv
+#     verlangsamt statt nur zu verzögern.
+#
+# ZUSÄTZLICHE SEKTIONEN:
+#   - `error.trace` (full/evidence, must-include): das eigentliche
+#     Fehlersignal (Panik-/Fehlermeldung, Stacktrace, fehlgeschlagene
+#     Prüfungsausgabe). `full`, ausdrücklich nicht `summary`: eine
+#     zusammengefasste Fehlermeldung verliert regelmäßig genau die
+#     Zeilennummer oder den Diskriminanten-Wert, an dem sich die
+#     eigentliche Ursache entscheidet.
+#   - `task.read_scope` (full/data, must-include): wie bei `explore` — Triage
+#     braucht Lesezugriff auf den betroffenen Bereich, um das Fehlersignal
+#     im Code zu verorten.
+#
+# `DetailMode::References` wird hier für KEINE Sektion verwendet — Triage ist
+# der Gegenpol zu `research-web`/`review`: hier zählt die exakte, ungekürzte
+# Spur, nicht die Kostenersparnis.
+#
+# ZUSÄTZLICHER AUSSCHLUSS: `plan.*` — eine Triage stellt fest, WAS
+# fehlschlägt und WARUM, nicht, wie es behoben werden soll; das ist
+# nachgelagert (Fix-Entscheidung, außerhalb dieses Programms) und würde die
+# Ursachensuche mit Lösungsvorurteilen kontaminieren, wenn der Plan schon im
+# selben Kontext sichtbar wäre.
+
+schema = "harwness.context/v1"
+id = "harwness.context.triage@1"
+version = "1.0.0"
+extends = { id = "harwness.context.base@1" }
+
+# `exclude` steht bewusst vor `[[sections]]` — siehe Kommentar in `base.toml`
+# zum TOML-Fallstrick mit Array-of-Tables.
+exclude = ["plan.*"]
+
+[[sections]]
+name = "history.tail"
+strength = "must-include"
+detail = "full"
+trust = "evidence"
+
+[[sections]]
+name = "error.trace"
+strength = "must-include"
+detail = "full"
+trust = "evidence"
+
+[[sections]]
+name = "task.read_scope"
+strength = "must-include"
+detail = "full"
+trust = "data"

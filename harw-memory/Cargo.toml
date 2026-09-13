@@ -1,0 +1,26 @@
+[package]
+name = "harw-memory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-types = { path = "../harw-types" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+tracing = "0.1.44"
+time = { version = "0.3.44", features = ["serde", "formatting", "parsing", "macros"] }
+# AW3-03: Quellenbindung `MemoryContextProvider` liefert `harw_context::Fragment`
+# statt des alten `ContextFragment` (nur label+content). Kein Zyklus:
+# `harw-context` und `harw-extension-api` hängen beide nicht (auch nicht
+# transitiv) von harw-memory ab — geprüft an ihren jeweiligen Cargo.toml.
+harw-context = { path = "../harw-context" }
+harw-extension-api = { path = "../harw-extension-api" }
+harw-lens-types = { path = "../harw-lens-types" }
+jiff = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.24.0"
+
+[lints]
+workspace = true

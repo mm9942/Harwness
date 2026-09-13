@@ -1,0 +1,5 @@
+error: unbekannter level `verbose`; erwartet: trace, debug, info, warn, error
+ --> tests/compile_fail/17_traced_invalid_level.rs:4:31
+  |
+4 | #[harw_macros::traced(level = "verbose")]
+  |                               ^^^^^^^^^

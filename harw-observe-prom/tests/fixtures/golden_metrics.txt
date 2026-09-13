@@ -1,0 +1,10 @@
+# TYPE harw_bytes_read_total counter
+harw_bytes_read_total{path="line1\nquote\"and\\slash"} 1024
+# TYPE harw_child_admitted_total counter
+harw_child_admitted_total{clan="research",role="explorer"} 42
+harw_child_admitted_total{clan="research",role="guard"} 7
+# TYPE harw_jobs_completed_total counter
+harw_jobs_completed_total{status="error"} 2
+harw_jobs_completed_total{status="ok"} 10
+# TYPE harw_queue_depth gauge
+harw_queue_depth 3.5

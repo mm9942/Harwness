@@ -1,0 +1,5 @@
+error: Feldtyp `String` ist nicht in der Positivliste zulässiger Werttypen – insbesondere `String` ist nicht erlaubt: ein Feld, in das ein Modell freien Text schreiben kann, ist der Weg, auf dem eine Modellausgabe zu einem Befehl wird; erlaubt sind: ActionId, BaselineId, CgroupId, ChannelId, FindingId, HostId, ItemId, PeerId, SensorId, SessionId, TenantId, ThreadId, ThreadRef, ToolCallId, TurnId, WorkId, WorkspaceId (aus harw-types), die Ganzzahltypen u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, `bool`, sowie `Vec<T>` für jeden dieser Typen
+  --> tests/compile_fail/26_string_field_rejected.rs:13:14
+   |
+13 |         cmd: String,
+   |              ^^^^^^

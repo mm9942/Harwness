@@ -1,0 +1,55 @@
+[package]
+name = "harw-dod-rules"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Daten-Vokabular der Beobachtungsseite: `HostSample`, `SecurityEvent`,
+# `EventKind`, `Severity`, `Hardness`. `Finding<S>` lebt bewusst in dieser
+# Crate und nicht dort — siehe `src/finding.rs` Moduldoku für die Begründung
+# (Contract-Master-Korrektur §G.1).
+harw-dod-signals = { path = "../harw-dod-signals" }
+# `EgressFlow`-Regel: `NetworkScope::allows`/`allows_addr`, statt die
+# Bereichsprüfung ein zweites Mal zu schreiben.
+harw-sandbox = { path = "../harw-sandbox" }
+# `FindingId` (Identität ab `RuleChecked`) und `Confidence` (Zielskala von
+# `epistemic_confidence_for`).
+harw-types = { path = "../harw-types" }
+# Quelltyp der einzigen echten Konvertierung dieser Crate:
+# `epistemic_confidence_for`. Kein Zyklus: `harw-research` hängt nur auf
+# `harw-macros`/`harw-types`/serde/jiff.
+harw-research = { path = "../harw-research" }
+jiff = { workspace = true }
+# `LockedPackage`/`parse_lockfile`/`find_locked` (Knoten AW7-06, Intel-Scout):
+# der bereits gelandete, einzige `Cargo.lock`-Parser des Baums (siehe
+# `src/advisory.rs` Moduldoku) — kein zweiter Lockfile-Parser hier. Kein
+# Zyklus: `harw-code-graph` hängt nur auf `serde`, `toml`, `harw-macros`,
+# `harw-types` (dessen `Cargo.toml` geprüft) — keine Rückkante auf
+# `harw-dod-rules`.
+harw-code-graph = { path = "../harw-code-graph" }
+# `VersionReq`/`Version`: korrekte numerische Versionsbereichsprüfung statt
+# eines Zeichenkettenvergleichs (`1.10.0` < `1.9.0` als String, aber nicht als
+# Version) — siehe `src/advisory.rs` Moduldoku.
+semver = { workspace = true }
+
+[dev-dependencies]
+# Nur für Tests: baut einen `NetworkScope` mit einem `Cidr`-Ziel über dessen
+# öffentliche `Deserialize`-Implementierung (`harw_sandbox::NetworkScope`
+# bietet keinen anderen öffentlichen Konstruktor für ein `Cidr`-Ziel).
+serde_json = { workspace = true }
+# Nur für Tests/Doctest: `crate::rules::baseline_deviation` konstruiert dort
+# bequem einen `harw_knowledge::artifact::ArtifactId`, um zu zeigen, dass er
+# `Baseline::new`s `impl std::fmt::Display`-Schranke erfüllt (siehe
+# `src/baseline.rs` Moduldoku, Abschnitt „Der gewählte Weg"). Bewusst
+# `[dev-dependencies]`, nicht `[dependencies]`: das hält die gesamte
+# `harw-knowledge`-Kette (inkl. `harw-model-catalog` → `reqwest`/`tokio`)
+# aus jedem produktiven Konsumenten dieser Crate heraus, namentlich
+# `harw-sentinel` — genau die Kante, die geschnitten wurde. Kein Zyklus:
+# `harw-knowledge` hängt seinerseits (produktiv) auf `harw-dod-rules`, aber
+# Dev-Dependency-Zyklen sind in Cargo ausdrücklich unterstützt — sie fließen
+# nie in den produktiven Abhängigkeitsgraphen ein.
+harw-knowledge = { path = "../harw-knowledge" }
+
+[lints]
+workspace = true

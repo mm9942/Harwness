@@ -1,0 +1,5 @@
+error: #[raw(nth = 0)] ist im Struct-Pfad nicht erlaubt; benutze #[raw(first)]. Achtung — im Enum-Pfad (#[raw(subcommand)]) ist `nth` dagegen 0-basiert relativ zu den Tokens nach dem Subcommand: dort ist `nth = 0` gültig und meint das Token direkt nach dem Subcommand
+ --> tests/compile_fail/07_nth_zero.rs:7:17
+  |
+7 |     #[raw(nth = 0)]
+  |                 ^

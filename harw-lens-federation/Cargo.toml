@@ -1,0 +1,27 @@
+[package]
+name = "harw-lens-federation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-lens-types = { path = "../harw-lens-types" }
+harw-lens-index = { path = "../harw-lens-index" }
+harw-lens-embed = { path = "../harw-lens-embed" }
+harw-lens-rank = { path = "../harw-lens-rank" }
+harw-lens-query = { path = "../harw-lens-query" }
+harw-macros = { path = "../harw-macros" }
+
+[dev-dependencies]
+# Nur zum Bauen physischer Fixturindizes in Tests (`build_index`,
+# `CHUNKER_VERSION`) -- wie schon `harw-lens-query/tests/round_trip.rs` es
+# tut. Keine Zyklusgefahr: `harw-lens-source` hat keine (Dev-)Abhaengigkeit
+# zurueck auf `harw-lens-federation`.
+harw-lens-source = { path = "../harw-lens-source" }
+harw-knowledge = { path = "../harw-knowledge" }
+harw-types = { path = "../harw-types" }
+tempfile = { workspace = true }
+jiff = { workspace = true }
+
+[lints]
+workspace = true

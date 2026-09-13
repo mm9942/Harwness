@@ -1,0 +1,23 @@
+[package]
+name = "harw-provider-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-config = { path = "../harw-config" }
+harw-core = { path = "../harw-core" }
+harw-provider = { path = "../harw-provider" }
+harw-tools = { path = "../harw-tools" }
+harw-types = { path = "../harw-types" }
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+secrecy = "0.10.3"
+serde_json = "1.0.150"
+tracing = "0.1.44"
+
+[dev-dependencies]
+tokio = { version = "1.52.3", features = ["macros", "rt"] }
+
+[lints]
+workspace = true

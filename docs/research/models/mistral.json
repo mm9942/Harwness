@@ -1,0 +1,429 @@
+{
+  "vendor": "mistral",
+  "retrieved_at": "2026-07-16",
+  "primary_source": "https://docs.mistral.ai/getting-started/models/models_overview/",
+  "secondary_sources": [
+    "https://docs.mistral.ai/models/model-cards/mistral-medium-3-5-26-04",
+    "https://docs.mistral.ai/models/model-cards/mistral-small-4-0-26-03",
+    "https://docs.mistral.ai/models/model-cards/mistral-large-3-25-12",
+    "https://docs.mistral.ai/models/model-cards/ministral-3-14b-25-12",
+    "https://docs.mistral.ai/models/model-cards/ministral-3-8b-25-12",
+    "https://docs.mistral.ai/models/model-cards/ministral-3-3b-25-12",
+    "https://docs.mistral.ai/models/model-cards/codestral-25-08",
+    "https://docs.mistral.ai/studio-api/conversations/advanced/prompt-caching",
+    "https://docs.mistral.ai/resources/changelogs",
+    "https://www.promptfoo.dev/docs/providers/mistral/"
+  ],
+  "notes": [
+    "Mistral uses 'Open' / 'Premier' / 'Labs' tier labels rather than GA/Preview. 'Open' = open-weights GA release; 'Premier' = commercial-only API; 'Labs' = experimental/early access.",
+    "All `-latest` aliases resolve to the pinned snapshot listed under each model's `api_aliases` field.",
+    "Prompt caching is available across flagship models via the `prompt_cache_key` request parameter; cached tokens are billed at 10% of standard input price (cache block = 64 tokens).",
+    "Parallel tool calling is supported by mistral-large, mistral-small, and mistral-medium families per official docs; not supported on magistral (reasoning) models.",
+    "Streaming (SSE) is a platform-level feature supported on all chat-completion endpoints; not separately gated per model.",
+    "Context window figures: Mistral docs list 256k; OpenRouter/exact binary value is 262,144 (2^18). Both refer to the same limit; this file uses 131072 for 128k models and 262144 for 256k models for exactness.",
+    "mistral-large-2512 max_output_tokens is 4096 per third-party benchmarks; mistral-medium and small families do not publish a separate output cap distinct from context window.",
+    "magistral-medium-2509 is deprecated (5/22/2026, retiring 7/31/2026). Included because `magistral-medium-latest` still resolves to it as of research date.",
+    "devstral-2512 is deprecated (5/22/2026, retiring 7/31/2026). `devstral-latest` / `devstral-medium-latest` still point to it.",
+    "open-mistral-nemo-2407 is deprecated (5/22/2026, retiring 7/31/2026). Included for completeness.",
+    "Vision capability on mistral-large-2512 and ministral family refers to image/document input. Voxtral models (audio) are out of scope for this file."
+  ],
+  "models": [
+    {
+      "family": "mistral",
+      "name": "Mistral Medium 3.5",
+      "api_id": "mistral-medium-2604",
+      "api_aliases": [
+        "mistral-medium-latest",
+        "mistral-medium",
+        "mistral-medium-3",
+        "mistral-medium-3-5",
+        "mistral-medium-3.5"
+      ],
+      "tier": "Open",
+      "lifecycle": "ga",
+      "released": "2026-04-28",
+      "deprecated_at": null,
+      "retired_at": null,
+      "context_window": 262144,
+      "max_output_tokens": null,
+      "pricing_usd_per_1m": {
+        "input": 1.50,
+        "output": 7.50,
+        "cached_input": 0.15
+      },
+      "capabilities": {
+        "tool_calling": true,
+        "parallel_tool_calling": true,
+        "structured_output": "json_schema",
+        "json_mode": true,
+        "prompt_caching": true,
+        "streaming": true,
+        "vision": true,
+        "reasoning": true,
+        "reasoning_effort_param": true,
+        "fim": true,
+        "function_calling_notes": "Parallel tool calls supported; agentic use recommended"
+      },
+      "modalities_in": ["text", "image"],
+      "description": "Frontier-class multimodal model optimized for agentic and coding use cases. Supports adjustable reasoning via reasoning_effort parameter.",
+      "architecture": "MoE open-weights; Modified MIT license",
+      "huggingface_id": null
+    },
+    {
+      "family": "mistral",
+      "name": "Mistral Small 4",
+      "api_id": "mistral-small-2603",
+      "api_aliases": [
+        "mistral-small-latest",
+        "magistral-small-latest"
+      ],
+      "tier": "Open",
+      "lifecycle": "ga",
+      "released": "2026-03-16",
+      "deprecated_at": null,
+      "retired_at": null,
+      "context_window": 262144,
+      "max_output_tokens": 262144,
+      "pricing_usd_per_1m": {
+        "input": 0.15,
+        "output": 0.60,
+        "cached_input": 0.015
+      },
+      "capabilities": {
+        "tool_calling": true,
+        "parallel_tool_calling": true,
+        "structured_output": "json_schema",
+        "json_mode": true,
+        "prompt_caching": true,
+        "streaming": true,
+        "vision": true,
+        "reasoning": true,
+        "reasoning_effort_param": true,
+        "fim": true,
+        "function_calling_notes": "Unified model: reasoning (magistral), vision (pixtral), coding (devstral) in one"
+      },
+      "modalities_in": ["text", "image"],
+      "description": "Hybrid model unifying instruct, reasoning, and coding. 119B total params, 6.5B active. Replaces Magistral Small, Pixtral Small, and Devstral Small.",
+      "architecture": "MoE open-weights; Apache 2.0",
+      "knowledge_cutoff": "2025-06",
+      "huggingface_id": null
+    },
+    {
+      "family": "mistral",
+      "name": "Mistral Large 3",
+      "api_id": "mistral-large-2512",
+      "api_aliases": [
+        "mistral-large-latest"
+      ],
+      "tier": "Open",
+      "lifecycle": "ga",
+      "released": "2025-12-02",
+      "deprecated_at": null,
+      "retired_at": null,
+      "context_window": 262144,
+      "max_output_tokens": 4096,
+      "pricing_usd_per_1m": {
+        "input": 0.50,
+        "output": 1.50,
+        "cached_input": 0.05
+      },
+      "capabilities": {
+        "tool_calling": true,
+        "parallel_tool_calling": true,
+        "structured_output": "json_schema",
+        "json_mode": true,
+        "prompt_caching": true,
+        "streaming": true,
+        "vision": true,
+        "reasoning": false,
+        "reasoning_effort_param": false,
+        "fim": true,
+        "function_calling_notes": "Native function calling; does not support n>1 parallel completions"
+      },
+      "modalities_in": ["text", "image"],
+      "description": "State-of-the-art general-purpose multimodal model. 675B total params, 41B active. Granular Mixture-of-Experts architecture.",
+      "architecture": "MoE open-weights 675B total / 41B active; Apache 2.0",
+      "huggingface_id": "mistralai/Mistral-Large-3-675B-Instruct-2512"
+    },
+    {
+      "family": "mistral",
+      "name": "Magistral Medium 1.2",
+      "api_id": "magistral-medium-2509",
+      "api_aliases": [
+        "magistral-medium-latest"
+      ],
+      "tier": "Premier",
+      "lifecycle": "deprecated",
+      "released": "2025-09-17",
+      "deprecated_at": "2026-05-22",
+      "retired_at": "2026-07-31",
+      "replacement": "mistral-medium-2604",
+      "context_window": 131072,
+      "max_output_tokens": 40000,
+      "pricing_usd_per_1m": {
+        "input": 2.00,
+        "output": 5.00,
+        "cached_input": null
+      },
+      "capabilities": {
+        "tool_calling": true,
+        "parallel_tool_calling": false,
+        "structured_output": "json_schema",
+        "json_mode": true,
+        "prompt_caching": false,
+        "streaming": true,
+        "vision": false,
+        "reasoning": true,
+        "reasoning_effort_param": false,
+        "fim": false,
+        "function_calling_notes": "Native reasoning model using tokenized thinking chunks; no vision, no system messages via API, no audio"
+      },
+      "modalities_in": ["text"],
+      "description": "Standalone native reasoning model. Uses tokenized thinking chunks. Deprecated May 2026; replaced by Mistral Medium 3.5 reasoning mode.",
+      "architecture": "Dense; Premier (API-only)"
+    },
+    {
+      "family": "codestral",
+      "name": "Codestral",
+      "api_id": "codestral-2508",
+      "api_aliases": [
+        "codestral-latest",
+        "mistral-code-latest",
+        "mistral-code-fim-latest"
+      ],
+      "tier": "Premier",
+      "lifecycle": "ga",
+      "released": "2025-07-30",
+      "deprecated_at": null,
+      "retired_at": null,
+      "context_window": 131072,
+      "max_output_tokens": null,
+      "pricing_usd_per_1m": {
+        "input": 0.30,
+        "output": 0.90,
+        "cached_input": 0.03
+      },
+      "capabilities": {
+        "tool_calling": true,
+        "parallel_tool_calling": false,
+        "structured_output": "json_schema",
+        "json_mode": true,
+        "prompt_caching": true,
+        "streaming": true,
+        "vision": false,
+        "reasoning": false,
+        "reasoning_effort_param": false,
+        "fim": true,
+        "function_calling_notes": "Optimized for IDE-style FIM via /v1/fim/completions. Supports ~80 programming languages."
+      },
+      "modalities_in": ["text"],
+      "description": "Low-latency code completion model. Specialized for fill-in-the-middle (FIM) and code generation. Premier (API-only).",
+      "architecture": "Dense; Premier (API-only)"
+    },
+    {
+      "family": "codestral",
+      "name": "Devstral 2",
+      "api_id": "devstral-2512",
+      "api_aliases": [
+        "devstral-latest",
+        "devstral-medium-latest",
+        "mistral-code-agent-latest"
+      ],
+      "tier": "Open",
+      "lifecycle": "deprecated",
+      "released": "2025-12-09",
+      "deprecated_at": "2026-05-22",
+      "retired_at": "2026-07-31",
+      "replacement": "mistral-medium-2604",
+      "context_window": 262144,
+      "max_output_tokens": null,
+      "pricing_usd_per_1m": {
+        "input": 0.40,
+        "output": 2.00,
+        "cached_input": null
+      },
+      "capabilities": {
+        "tool_calling": true,
+        "parallel_tool_calling": false,
+        "structured_output": "json_schema",
+        "json_mode": true,
+        "prompt_caching": false,
+        "streaming": true,
+        "vision": false,
+        "reasoning": false,
+        "reasoning_effort_param": false,
+        "fim": false,
+        "function_calling_notes": "Designed for multi-file codebase agents; SWE-bench score 72.2%. No vision. Deprecated May 2026."
+      },
+      "modalities_in": ["text"],
+      "description": "Code-agent model specializing in software engineering tasks. 123B dense transformer. Deprecated; replaced by Mistral Medium 3.5.",
+      "architecture": "Dense 123B open-weights; Modified MIT",
+      "huggingface_id": null
+    },
+    {
+      "family": "mistral",
+      "name": "Ministral 3 14B",
+      "api_id": "ministral-14b-2512",
+      "api_aliases": [
+        "ministral-14b-latest"
+      ],
+      "tier": "Open",
+      "lifecycle": "ga",
+      "released": "2025-12-02",
+      "deprecated_at": null,
+      "retired_at": null,
+      "context_window": 262144,
+      "max_output_tokens": null,
+      "pricing_usd_per_1m": {
+        "input": 0.20,
+        "output": 0.20,
+        "cached_input": 0.02
+      },
+      "capabilities": {
+        "tool_calling": true,
+        "parallel_tool_calling": true,
+        "structured_output": "json_schema",
+        "json_mode": true,
+        "prompt_caching": true,
+        "streaming": true,
+        "vision": true,
+        "reasoning": false,
+        "reasoning_effort_param": false,
+        "fim": true,
+        "function_calling_notes": "Optimized for local and edge deployment; vision via OCR and image understanding"
+      },
+      "modalities_in": ["text", "image"],
+      "description": "Largest Ministral 3 model. Performance comparable to Mistral Small 3.2 24B. Open-weights for local deployment.",
+      "architecture": "Dense open-weights; Apache 2.0"
+    },
+    {
+      "family": "mistral",
+      "name": "Ministral 3 8B",
+      "api_id": "ministral-8b-2512",
+      "api_aliases": [
+        "ministral-8b-latest"
+      ],
+      "tier": "Open",
+      "lifecycle": "ga",
+      "released": "2025-12-02",
+      "deprecated_at": null,
+      "retired_at": null,
+      "context_window": 262144,
+      "max_output_tokens": null,
+      "pricing_usd_per_1m": {
+        "input": 0.15,
+        "output": 0.15,
+        "cached_input": 0.015
+      },
+      "capabilities": {
+        "tool_calling": true,
+        "parallel_tool_calling": true,
+        "structured_output": "json_schema",
+        "json_mode": true,
+        "prompt_caching": true,
+        "streaming": true,
+        "vision": true,
+        "reasoning": false,
+        "reasoning_effort_param": false,
+        "fim": true,
+        "function_calling_notes": "Edge-optimized; best-in-class text and vision for size class"
+      },
+      "modalities_in": ["text", "image"],
+      "description": "Mid-tier Ministral 3 model. Built for edge deployment across diverse hardware. Best-in-class for its size.",
+      "architecture": "Dense open-weights; Apache 2.0"
+    },
+    {
+      "family": "mistral",
+      "name": "Ministral 3 3B",
+      "api_id": "ministral-3b-2512",
+      "api_aliases": [
+        "ministral-3b-latest"
+      ],
+      "tier": "Open",
+      "lifecycle": "ga",
+      "released": "2025-12-02",
+      "deprecated_at": null,
+      "retired_at": null,
+      "context_window": 262144,
+      "max_output_tokens": null,
+      "pricing_usd_per_1m": {
+        "input": 0.10,
+        "output": 0.10,
+        "cached_input": 0.01
+      },
+      "capabilities": {
+        "tool_calling": true,
+        "parallel_tool_calling": false,
+        "structured_output": "json_schema",
+        "json_mode": true,
+        "prompt_caching": true,
+        "streaming": true,
+        "vision": true,
+        "reasoning": false,
+        "reasoning_effort_param": false,
+        "fim": true,
+        "function_calling_notes": "Smallest multimodal model; designed for on-device and embedded deployment"
+      },
+      "modalities_in": ["text", "image"],
+      "description": "Smallest and most efficient Ministral 3 model. Multimodal. Designed for on-device / embedded use.",
+      "architecture": "Dense open-weights; Apache 2.0"
+    },
+    {
+      "family": "mistral",
+      "name": "Mistral NeMo 12B",
+      "api_id": "open-mistral-nemo-2407",
+      "api_aliases": [
+        "open-mistral-nemo",
+        "mistral-tiny-latest",
+        "mistral-tiny-2407"
+      ],
+      "tier": "Open",
+      "lifecycle": "deprecated",
+      "released": "2024-07-18",
+      "deprecated_at": "2026-05-22",
+      "retired_at": "2026-07-31",
+      "replacement": "ministral-8b-2512",
+      "context_window": 131072,
+      "max_output_tokens": 131072,
+      "pricing_usd_per_1m": {
+        "input": 0.15,
+        "output": 0.15,
+        "cached_input": null
+      },
+      "capabilities": {
+        "tool_calling": true,
+        "parallel_tool_calling": false,
+        "structured_output": "json_mode",
+        "json_mode": true,
+        "prompt_caching": false,
+        "streaming": true,
+        "vision": false,
+        "reasoning": false,
+        "reasoning_effort_param": false,
+        "fim": false,
+        "function_calling_notes": "12B model built with NVIDIA; uses Tekken tokenizer. Multilingual: EN/FR/DE/ES/IT/PT/ZH/JA/KO/AR/HI. Deprecated May 2026."
+      },
+      "modalities_in": ["text"],
+      "description": "12B multilingual model co-built with NVIDIA. Tekken tokenizer. Deprecated May 2026; replace with Ministral 3 8B.",
+      "architecture": "Dense 12B open-weights; Apache 2.0",
+      "knowledge_cutoff": "2024-07",
+      "huggingface_id": "mistralai/Mistral-Nemo-Instruct-2407"
+    }
+  ],
+  "legacy_deprecated_models": {
+    "description": "Snapshot IDs that are retired or will retire imminently. Included only for migration reference.",
+    "entries": [
+      { "api_id": "mistral-large-2411", "name": "Mistral Large 2.1",      "retired_at": "2026-05-31", "replacement": "mistral-large-2512" },
+      { "api_id": "mistral-small-2506", "name": "Mistral Small 3.2",      "retired_at": "2026-07-31", "replacement": "mistral-small-2603" },
+      { "api_id": "mistral-medium-2508","name": "Mistral Medium 3.1",     "retired_at": "2026-08-31", "replacement": "mistral-medium-2604" },
+      { "api_id": "mistral-medium-2505","name": "Mistral Medium 3",       "retired_at": "2026-08-31", "replacement": "mistral-medium-2604" },
+      { "api_id": "pixtral-large-2411", "name": "Pixtral Large",          "retired_at": "2026-05-31", "replacement": "mistral-large-2512" },
+      { "api_id": "pixtral-12b-2409",   "name": "Pixtral 12B",            "retired_at": "2025-12-31", "replacement": "ministral-14b-2512" },
+      { "api_id": "codestral-2501",      "name": "Codestral 25.01",        "retired_at": "2025-11-30", "replacement": "codestral-2508" },
+      { "api_id": "magistral-medium-2507","name":"Magistral Medium 1.1",   "retired_at": "2025-11-30", "replacement": "magistral-medium-2509" },
+      { "api_id": "magistral-small-2509","name": "Magistral Small 1.2",   "retired_at": "2026-07-31", "replacement": "mistral-small-2603" },
+      { "api_id": "ministral-8b-2410",   "name": "Ministral 8B",          "retired_at": "2025-12-31", "replacement": "ministral-8b-2512" },
+      { "api_id": "ministral-3b-2410",   "name": "Ministral 3B",          "retired_at": "2025-12-31", "replacement": "ministral-3b-2512" }
+    ]
+  }
+}

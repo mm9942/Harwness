@@ -1,0 +1,72 @@
+//! `harw-core` — das Gravity Well des Harness.
+//!
+//! Hier wohnt die `AgentSession`-FSM, der Turn-Loop und die
+//! Session-Orchestrierung. Der Core redet NIE direkt mit einem Terminal:
+//! jede Ausgabe läuft über `SessionEvent`s.
+//!
+//! Session-level tool/instructions/context filtering is exposed through
+//! [`activation::SessionActivation`] and [`activation::ToolProfile`].
+
+#![forbid(unsafe_code)]
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
+pub mod activation;
+pub mod admission;
+pub mod child_controller;
+pub mod context_budget;
+pub mod durable_job_runner;
+pub mod error;
+pub mod execution_registry;
+pub mod history;
+pub mod history_tail;
+pub mod mcp_http;
+pub mod mcp_runtime;
+pub mod mode;
+pub mod model;
+pub mod policy;
+pub mod session;
+pub mod session_manager;
+pub mod state_store;
+pub mod testing;
+pub mod turn_loop;
+
+pub use activation::{SessionActivation, ToolProfile};
+pub use admission::{
+    AdmissionContext, JobAdmissionError, JobAdmissionPolicy, JobAdmissionService, JobIntent,
+    ResolvedAdmission,
+};
+pub use child_controller::{
+    AgentBudget, BudgetDimension, ChildLimits, ChildRecord, ChildRegistryFactory, ChildRunResult,
+    ExpiredChild, FanoutRequest, JoinSemantics, ManagedAgentSpawner,
+};
+pub use context_budget::{ContextAssembly, ContextBudget};
+pub use durable_job_runner::{DurableJobRunner, DurableJobRunnerError};
+pub use error::{CoreError, CoreResult};
+pub use execution_registry::{
+    CancellationResult, ExecutionControl, ExecutionRegistryError, JobExecutionRegistry,
+};
+pub use harw_protocol::ToolCallResult;
+pub use history::{ConversationHistory, ModelMessage};
+pub use history_tail::{render_history_tail, HistoryTailRender, HISTORY_TAIL_GUARANTEED_GROUPS, HISTORY_TAIL_SECTION};
+pub use mcp_http::{McpHttpError, McpHttpResult, StreamableHttpMcpClient};
+pub use mcp_runtime::{
+    DEFAULT_STREAMABLE_HTTP_MCP_PORT, StreamableHttpMcpPlan, plan_stdio_mcp,
+    plan_streamable_http_mcp, spawn_stdio_mcp,
+};
+pub use mode::InteractionMode;
+pub use model::{
+    EchoModelProvider, ModelError, ModelFuture, ModelProvider, ModelRequest, ModelResponse,
+};
+pub use policy::ConfigApprovalPolicy;
+pub use session::{
+    AgentSession, PendingApproval, PendingHandoff, SessionState, SpawnContext, TurnHandle,
+    TurnRejection,
+};
+pub use session_manager::SessionManager;
+pub use state_store::{InMemoryStateStore, SessionThreadMapper, StateStore, TranscriptStateStore};
+pub use testing::RecordingModelProvider;
+pub use turn_loop::{
+    ApprovalResolution, TurnInput, TurnOutcome, resume_after_approval,
+    resume_after_approval_durable, resume_after_child, resume_after_child_durable, run_turn,
+    run_turn_durable,
+};

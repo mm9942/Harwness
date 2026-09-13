@@ -1,0 +1,32 @@
+GOLDEN RENDER — harwness.context.review@1
+===========================================
+STATUS: von Hand aus der Renderlogik abgeleitet (kein Renderer gelaufen).
+Siehe `explore.golden.txt` für die Methodik.
+
+Aufgelöste Sektionsreihenfolge (base zuerst, dann review; `history.tail`
+überschrieben):
+  1. task.objective      strength=must-include  detail=full        trust=instruction  [von base]
+  2. history.tail        strength=must-include  detail=references  trust=evidence     [überschrieben von review]
+  3. diff.changeset      strength=must-include  detail=full        trust=evidence     [von review]
+  4. goal.invariants     strength=must-include  detail=summary     trust=instruction  [von review]
+
+Ausschluss (Union): credential.*, secret.*, sibling_transcripts,
+full_parent_transcript (base) + plan.current (review)
+
+--- Gerenderter Turn-Kontext (Platzhalter-Inhalt) ---
+
+## task.objective [instruction]
+<vollständiger Auftragstext des aktuellen Turns>
+
+## history.tail [evidence, references]
+[ref] section="history.tail" label="<Turn-Label>" trust=Evidence stability=<Stable|Volatile>
+ origin="<Herkunftsquelle>"@<Zeitstempel> cost=CostEstimate(<n>)
+ digest=b3:<hex> (load via context.load)
+<garantierter Schwanz (HISTORY_TAIL_GUARANTEED_GROUPS) bleibt vollständig gerendert,
+ kein [ref] für die jüngsten Gruppen>
+
+## diff.changeset [evidence]
+<vollständiger Änderungsdiff, ungekürzt>
+
+## goal.invariants [instruction]
+<zusammengefasste Liste der Ziel-Randbedingungen>

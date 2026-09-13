@@ -1,0 +1,53 @@
+[package]
+name = "harw-registry-defaults"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-agent-dsl = { path = "../harw-agent-dsl" }
+harw-extension-api = { path = "../harw-extension-api" }
+harw-instructions = { path = "../harw-instructions" }
+harw-project-discovery = { path = "../harw-project-discovery" }
+harw-tool-deps = { path = "../harw-tool-deps" }
+harw-tool-fs = { path = "../harw-tool-fs" }
+harw-tool-lens = { path = "../harw-tool-lens" }
+harw-tool-shell = { path = "../harw-tool-shell" }
+harw-tool-web = { path = "../harw-tool-web" }
+harw-browser = { path = "../harw-browser", optional = true }
+harw-browser-thirtyfour = { path = "../harw-browser-thirtyfour", optional = true }
+harw-tool-browser = { path = "../harw-tool-browser", optional = true }
+# Verzeichniseinbettung für `embedded_agents`: bettet den Baum unter `agents/`
+# zur Bauzeit ein, damit das Inventar der eingebauten Definitionen aus dem
+# Dateisystem folgt statt aus einer per Hand gepflegten `include_str!`-Liste
+# (AW6-00). Eine feste Liste hätte fünf spätere Knoten in drei Wellen auf
+# dieselbe Rust-Datei verwiesen, obwohl ihre Definitionen als TOML-Dateien
+# längst unabhängig nebeneinander liegen.
+include_dir = { workspace = true }
+# Zeitstempel für die Auflösungs-Traces der eingebauten Agentendefinitionen:
+# `harw_agent_dsl::resolve::resolve_definition` verlangt eine
+# `time::OffsetDateTime`. Die Versionszeile ist bewusst identisch zu
+# harw-agent-dsl/Cargo.toml, damit im Workspace nur eine `time`-Auflösung
+# existiert.
+time = "0.3.53"
+# Die eingebetteten Family- und Organisationsdefinitionen werden hier geparst:
+# `harw-agent-dsl` bietet mit `parse::parse_toml` nur einen Parser für
+# Agentendefinitionen und re-exportiert `toml` nicht. Die Versionszeile ist
+# bewusst identisch zu harw-agent-dsl/Cargo.toml, damit im Workspace nur eine
+# `toml`-Auflösung existiert.
+toml = "1.1.3"
+
+[features]
+# Opt-in surface for the Harwness browser tool set (`browser.open`,
+# `browser.observe`, `browser.find`, `browser.act`, `browser.wait`,
+# `browser.events`, `browser.close`). Disabled by default so the standard
+# binary stays lean and never links the WebDriver/thirtyfour adapter.
+# Enabling it does not require a running WebDriver: `FirefoxHost::new`
+# constructs the host without starting any process; the driver is only
+# started lazily on the first `browser.open` dispatch, at which point a
+# missing WebDriver surfaces as a normal tool execution error rather than
+# breaking default startup.
+browser = ["dep:harw-browser", "dep:harw-tool-browser", "dep:harw-browser-thirtyfour"]
+
+[lints]
+workspace = true

@@ -1,0 +1,431 @@
+//! eBPF-Sonde, Push-Only — Knoten **AW7-01d**.
+//!
+//! # Zweck
+//! Dieses Binary ist die eine privilegierte eBPF-Sonde des
+//! Ausbauprogramms: es lädt die beiden geerbten eBPF-Programme
+//! (Prozessstart über `harw-dod-procmon`, Verbindungszustand über
+//! `harw-dod-flow`) über einen injizierten `harw_dod_bpf::BpfLoader`, formt
+//! ihre Rohereignisse zu `harw_dod_signals::SecurityEvent`s und sendet sie
+//! an `harw-sentinel`. Es hat **keinen** Empfangspfad — siehe Abschnitt
+//! „Push-Only" unten.
+//!
+//! # Die eine Fähigkeit: `CAP_BPF`
+//! `harw_dod_cap::Capability::LoadBpfProgram`, Klasse
+//! `harw_dod_cap::CapabilityClass::Bpf` — die einzige erhöhte Fähigkeit, für
+//! die dieses Binary existiert. Beide Sensoren dieser Sonde
+//! (`harw_dod_procmon::ProcmonSensor` und der lokale
+//! [`sensors::FlowSensor`]) tragen exakt diese eine Fähigkeit, keine
+//! zweite. Produktiv liefe dieser Prozess mit `CAP_BPF`; im heutigen Stand
+//! kommt der Prozess nie so weit, dass diese Fähigkeit tatsächlich gebraucht
+//! würde (siehe unten, Abschnitt „Stand der eBPF-Bindung").
+//!
+//! # Push-Only: woran man die Eigenschaft erkennt, und wie sie erzwungen ist
+//! Ein Prozess mit `CAP_BPF`, der Nachrichten **annimmt**, ist ein
+//! Angriffsziel; einer, der nur **sendet**, ist keins. Diese Eigenschaft ist
+//! hier keine Konvention, sondern eine Typ-Eigenschaft:
+//! [`sink::EventSink`] hat genau eine Methode (`send`), die ausschließlich
+//! Daten **entgegennimmt** — es gibt kein `poll_command`, kein
+//! `set_watch_from`, keine Methode, über die der Sentinel diesem Prozess
+//! etwas mitteilen könnte, und weder [`sink::SentinelSink`] noch irgendein
+//! anderer Typ dieser Crate bindet einen Socket, der eingehende Verbindungen
+//! annehmen könnte — es gibt nur `connect()`, nie eine
+//! Lauschstellen-Funktion. `src/push_only_guard.rs` macht das
+//! quelltextlich **prüfbar**, nicht nur behauptet: es durchsucht jede
+//! Implementierungsdatei dieser Crate (außer sich selbst) nach den beiden
+//! Bezeichnern, die einen Empfangspfad ausmachen würden — der
+//! Unix-Socket-Empfangsfunktion und der Funktion, die einen Puffer bis zum
+//! Streamende einliest. Ein späterer Leser bestätigt die Zusage, indem er
+//! genau diese eine, kurze Datei liest, nicht den gesamten Quelltext dieser
+//! Crate. Dieselbe Bauweise wie `harw-probe-fs/src/push_only_guard.rs` —
+//! dasselbe Konsumentenpaar (privilegierte Sonde → unprivilegierter
+//! Sentinel), dieselbe strukturelle Zusage, unabhängig für dieses Binary neu
+//! aufgebaut, nicht importiert (jede der drei privilegierten Sonden dieses
+//! Programms trägt ihre eigene, in ihrem eigenen Quelltext geprüfte Kopie).
+//!
+//! # Die Landlock-Asymmetrie
+//! Ein unprivilegierter Sammler (`harw-sentinel`), der ohne Landlock läuft,
+//! ist ein Sammler ohne zusätzliche Schranke — hinnehmbar, weil sein
+//! Berechtigungsumfang von vornherein klein ist (er hält keine einzige
+//! erhöhte Fähigkeit). Ein Prozess mit `CAP_BPF` ohne Schranke ist etwas
+//! anderes: dort ist Landlock nicht eine von mehreren Verteidigungslinien,
+//! sondern die einzige, die den tatsächlichen Dateisystemzugriff dieses
+//! Prozesses gegen sein volles Berechtigungsvermögen einschränkt. [`run`]
+//! ruft deshalb [`landlock::enforce_fs_scope`] vor jedem weiteren
+//! privilegierten Schritt auf und bricht bei jedem Ausgang außer
+//! vollständiger Durchsetzung hart ab — Entscheidung Nr. 4 des
+//! Architekturberichts dieses Programms, und dieselbe Asymmetrie, die
+//! `harw-probe-fs` bereits für sich trifft. Siehe [`landlock`]-Moduldoku für
+//! die vollständige Begründung, insbesondere dafür, warum diese Sonde eine
+//! einfache Wurzelliste statt eines `harw_dod_cap::ReadScope` entgegennimmt.
+//!
+//! # Das `SensorId`-Schema
+//! `harw_dod_signals::SecurityEvent::sensor` ist die **einzige**
+//! Herkunftsangabe, die beim Sentinel ankommt — jedes über
+//! [`sink::EventSink::send`] geschobene Ereignis landet dort (über
+//! `harw_dod_sentinel::Sentinel::record_external_event(&mut self, event:
+//! SecurityEvent)`, den Weg, den die Gegenseite inzwischen für genau diesen
+//! Zweck bekommen hat) ohne einen zusätzlichen Transportkanal, der die
+//! Herkunft noch einmal trüge. Diese Sonde hostet **zwei** logische
+//! Sensoren (Prozessstart, Verbindung), multiplext über **eine**
+//! Push-Only-Verbindung — das Schema muss deshalb sowohl das Binary als
+//! auch den internen Teilsensor benennen:
+//!
+//! - `probe-bpf-procmon-0` (Vorgabe, `--sensor-id-procmon`) für
+//!   Prozessstart-Ereignisse.
+//! - `probe-bpf-flow-0` (Vorgabe, `--sensor-id-flow`) für
+//!   Verbindungs-Ereignisse.
+//!
+//! Muster: `<binary>-<teilsensor>-<instanz>`, angelehnt an das bereits im
+//! Workspace etablierte `<art>-<n>` (`harw-sentinel`s `cpu-0`, `thermal-0`,
+//! `listener-0`, `workspace-drift-0`, `sentinel-landlock`;
+//! `harw-probe-fs`s `fsmon-0`), aber mit dem Präfix `probe-bpf-`, weil
+//! **ein** Binary hier **zwei** unterscheidbare Ereignisarten über **eine**
+//! flache `SensorId`-Namensfläche meldet — ohne das Präfix wären
+//! `procmon-0`/`flow-0` mit einer künftigen eigenständigen Sensor-Crate
+//! gleichen Namens verwechselbar. Beide Kennungen sind über
+//! `--sensor-id-procmon`/`--sensor-id-flow` überschreibbar, falls ein
+//! Betreiber mehrere Instanzen dieser Sonde nebeneinander betreibt (z. B.
+//! je Netzwerk-Namensraum).
+//!
+//! # Mein Urteil zur Schnittstellen-Unstimmigkeit: `harw-dod-procmon` vs.
+//! `harw-dod-flow`
+//! Siehe [`sensors`]-Moduldoku für die vollständige Begründung — hier nur
+//! die Kurzfassung, weil dieses Modul der Ort ist, an dem ein Leser zuerst
+//! sucht. `harw-dod-procmon` implementiert `harw_dod_signals::Sensor`;
+//! `harw-dod-flow` implementiert ihn bewusst nicht und bietet stattdessen
+//! `observe()`. Als der einzige echte Aufrufer beider Crates halte ich
+//! `harw-dod-procmon`s Form für die richtige: sie lässt sich mit einer
+//! einzigen, generischen Zeile ansteuern
+//! (`Vec<Arc<dyn Sensor>>`/`sensor.poll(now)`, siehe [`collect`]), während
+//! `harw-dod-flow` ohne einen eigenen Adapter einen zweiten, andersartigen
+//! Ansteuerungspfad verlangt hätte. Der von `harw-dod-flow` angeführte
+//! Grund (`harw_dod_fixtures::sensor_suite!` ließe sich durch einen Sensor
+//! austricksen, der `handle.scope()` nie anfasst) ist real, aber bereits von
+//! `harw-dod-procmon` selbst gelöst: dieselbe Beobachtung, aber die
+//! gegenteilige Konsequenz — `Sensor` implementieren, `sensor_suite!`
+//! bewusst nicht verwenden, stattdessen ehrliche, von Hand geschriebene
+//! Tests liefern. Diese Sonde kann `harw-dod-flow` nicht ändern (außerhalb
+//! ihres Schreibbereichs) und baut deshalb lokal [`sensors::FlowSensor`] —
+//! einen Adapter, der die Unstimmigkeit an genau der einen Stelle auffängt,
+//! an der sie sonst jeden künftigen Aufrufer dieser Sonde getroffen hätte.
+//!
+//! # Stand der eBPF-Bindung: weiterhin nicht gebaut
+//! `harw-dod-bpf` (Knoten AW7-01a) liefert den `BpfLoader`-Trait und den
+//! Formungsteil, aber keine reale, Linux-spezifische Implementierung —
+//! dessen eigene Moduldoku benennt diesen Knoten ausdrücklich als den Ort,
+//! an dem sie entstehen sollte, „wo die erhöhte Berechtigung ohnehin sitzt
+//! und `cargo` tatsächlich laufen darf". `cargo` darf in diesem Knoten aber
+//! gerade **nicht** laufen — die wichtigste Regel dieser Aufgabe. Ein realer
+//! Ladeteil bräuchte `aya`, eine neue, in dieser Sitzung nicht kompilier-
+//! oder verifizierbare Abhängigkeit, ausgerechnet im privilegierten Teil
+//! dieses Programms. [`real_loader::build_real_loader`] liefert deshalb
+//! einen dokumentierten Platzhalter, der immer fehlschlägt — der einzige
+//! verbleibende, tatsächlich unfertige Teil dieses Knotens. Der Betrieb ist
+//! heute ausschließlich über `harw_dod_bpf::fixture::FixtureBpfLoader`
+//! möglich (siehe [`sensors`]- und [`collect`]-Modultests): jeder Teil der
+//! Sammel- und Sendelogik ist damit bereits vollständig, ohne Kernel und
+//! ohne Berechtigungen, geprüft.
+//!
+//! # Fehler
+//! Kommandozeilenfehler sind `clap::Error`, direkt in [`main`] behandelt.
+//! Jeder Fehler aus [`run`] ist ein [`error::ProbeError`] — siehe dessen
+//! Moduldoku für die vollständige Varianteneinteilung.
+//!
+//! # Nebenläufigkeit
+//! [`run`] läuft im Hauptthread; [`collect::run_forever`] startet keinen
+//! weiteren Thread — beide Sensoren werden sequenziell im selben Thread
+//! gepollt (siehe [`collect`]-Moduldoku). `harw_dod_signals::Sensor` und
+//! `harw_dod_bpf::BpfLoader` sind `Send + Sync`, was diese Sonde nicht
+//! ausnutzt, aber nicht verhindert.
+//!
+//! # Examples
+//! ```text
+//! $ harw-probe-bpf --log info \
+//!     --sentinel-socket /run/harw-sentinel.sock \
+//!     --egress-allow-cidr 10.0.0.0/8
+//! ```
+
+#![forbid(unsafe_code)]
+
+mod cli;
+mod collect;
+mod error;
+mod landlock;
+mod real_loader;
+mod sensors;
+mod sink;
+
+#[cfg(test)]
+mod push_only_guard;
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::sync::Arc;
+
+use clap::Parser as _;
+use harw_dod_bpf::BpfProgramSource;
+use harw_dod_signals::Sensor;
+use harw_sandbox::{EgressTarget, NetworkScope};
+use harw_types::SensorId;
+
+use cli::{Cli, LogLevel};
+use error::ProbeError;
+
+/// Einstiegspunkt.
+///
+/// # Description
+/// Parst die Kommandozeile ohne `clap::Parser::parse` (das bei einem Fehler
+/// oder `--help`/`--version` selbst `std::process::exit` aufriefe und diese
+/// Funktion nie zu ihrem eigenen `ExitCode` zurückkehren ließe),
+/// initialisiert `tracing` und delegiert an [`run`].
+///
+/// # Returns
+/// `ExitCode::SUCCESS` nur, wenn [`run`] regulär zurückkehrt (heute
+/// unerreichbar, siehe Moduldoku „Stand der eBPF-Bindung"). `ExitCode::FAILURE`
+/// bei jedem Fehlerpfad — Kommandozeile, Landlock-Schranke, fehlender
+/// eBPF-Loader, fehlender Sentinel.
+fn main() -> ExitCode {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => {
+            if matches!(
+                err.kind(),
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+            ) {
+                print!("{err}");
+                return ExitCode::SUCCESS;
+            }
+            eprint!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    init_tracing(cli.log);
+
+    match run(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            tracing::error!(error = %err, "harw-probe-bpf exiting");
+            eprintln!("harw-probe-bpf: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Initialisiert den globalen `tracing`-Subscriber.
+///
+/// # Description
+/// Muss genau einmal aufgerufen werden, als erste Anweisung nach dem
+/// Parsen der Kommandozeile. Die angeforderte Stufe wird unverändert
+/// verwendet, nie stillschweigend reduziert — siehe [`cli::LogLevel`]-
+/// Moduldoku für die Begründung, warum ein ungültiger Rohwert diese
+/// Funktion nie erreicht.
+///
+/// # Arguments
+/// - `level` (`cli::LogLevel`): die über `--log` angeforderte Stufe.
+///
+/// # Panics
+/// Panics, falls bereits ein globaler Subscriber installiert ist (nur
+/// erreichbar, wenn diese Funktion zweimal aufgerufen wird — ein
+/// Programmierfehler).
+fn init_tracing(level: LogLevel) {
+    use tracing_subscriber::EnvFilter;
+
+    let filter =
+        EnvFilter::try_new(level.as_filter_directive()).unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .init();
+}
+
+/// Führt den eigentlichen Sondenbetrieb aus.
+///
+/// # Description
+/// Reihenfolge: sich **zuerst** mit dem Sentinel verbinden (ein
+/// Dateisystempfad-Zugriff, der nach einer Landlock-Regel scheitern könnte,
+/// falls der Socket-Pfad nicht im gewährten Bereich liegt — Muster:
+/// `harw-sentinel::main::run`, `harw-probe-fs::main::run`, die ihre eigenen
+/// Sockets ebenfalls vor `restrict_self` binden bzw. verbinden), **dann**
+/// über Landlock selbst einschränken (harter Abbruch bei jedem Ausgang
+/// außer vollständiger Durchsetzung, siehe [`landlock`]-Moduldoku), **dann**
+/// die reale eBPF-Ladeschicht aufbauen (siehe [`real_loader`]-Moduldoku:
+/// das Konstruieren selbst greift weder auf den Kernel noch auf
+/// Berechtigungen zu und schlägt deshalb nie fehl) und erst danach die
+/// beiden Sensoren
+/// registrieren und die Sammelschleife starten.
+///
+/// # Arguments
+/// - `cli` (`cli::Cli`): die geparste Kommandozeile.
+///
+/// # Errors
+/// [`error::ProbeError::SentinelConnectFailed`] wenn der Sentinel nicht
+/// erreichbar ist; [`error::ProbeError::LandlockUnavailable`] wenn Landlock
+/// den Ausschnitt nicht vollständig durchsetzt;
+/// [`error::ProbeError::BpfLoad`] wenn ein `load`-Aufruf auf dem realen
+/// Ladeteil scheitert — etwa auf einem Host ohne `CAP_BPF` oder mit einem
+/// Objekt, das dem in `RealBpfLoader`s Moduldoku beschriebenen Vertrag nicht
+/// folgt.
+fn run(cli: Cli) -> Result<(), ProbeError> {
+    let sink = sink::build_sentinel_sink(&cli.sentinel_socket)?;
+    tracing::info!(path = %cli.sentinel_socket.display(), "connected to sentinel");
+
+    let fs_roots = fs_scope_roots(&cli);
+    landlock::enforce_fs_scope(&fs_roots)?;
+
+    let procmon_source = program_source(cli.procmon_program_path.clone());
+    let procmon_loader = real_loader::build_real_loader()?;
+    let procmon_sensor = sensors::build_procmon_sensor(
+        procmon_loader,
+        SensorId::from_str(cli.sensor_id_procmon.clone()),
+        procmon_source,
+    )?;
+
+    let flow_source = program_source(cli.flow_program_path.clone());
+    let flow_loader = real_loader::build_real_loader()?;
+    let scope = network_scope(&cli);
+    let flow_sensor = sensors::build_flow_sensor(
+        flow_loader,
+        SensorId::from_str(cli.sensor_id_flow.clone()),
+        flow_source,
+        scope,
+    )?;
+
+    let sensor_list: Vec<Arc<dyn Sensor>> = vec![Arc::new(procmon_sensor), Arc::new(flow_sensor)];
+    tracing::info!(sensor_count = sensor_list.len(), "sensors registered");
+
+    collect::run_forever(&sensor_list, sink.as_ref())
+}
+
+/// Baut die Landlock-Wurzelliste dieses Prozesses.
+///
+/// # Description
+/// Beide Sensoren dieser Sonde lesen nie über einen `ReadScope` — ihre
+/// einzige Quelle ist der injizierte `harw_dod_bpf::BpfLoader` (siehe
+/// [`sensors`]-Moduldoku). Der einzige Dateisystemzugriff, den dieser
+/// Prozess je braucht, sind die optionalen eBPF-Programmpfade; diese
+/// Funktion sammelt deren Elternverzeichnisse. Ohne konfigurierte Pfade ist
+/// das Ergebnis leer — die korrekte, maximal enge Voreinstellung.
+///
+/// # Arguments
+/// - `cli` (`&cli::Cli`): die geparste Kommandozeile.
+///
+/// # Returns
+/// Die Liste der Elternverzeichnisse konfigurierter Programmpfade, ohne
+/// Duplikate zu entfernen (Landlock verkraftet doppelte Regeln
+/// unproblematisch).
+fn fs_scope_roots(cli: &Cli) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for path in [&cli.procmon_program_path, &cli.flow_program_path].into_iter().flatten() {
+        if let Some(parent) = path.parent() {
+            roots.push(parent.to_path_buf());
+        }
+    }
+    roots
+}
+
+/// Baut die `harw_dod_bpf::BpfProgramSource` für einen optionalen
+/// Programmpfad.
+///
+/// # Arguments
+/// - `path` (`Option<std::path::PathBuf>`): der über `--procmon-program-path`
+///   bzw. `--flow-program-path` konfigurierte Pfad.
+///
+/// # Returns
+/// [`harw_dod_bpf::BpfProgramSource::Path`], wenn `path` gesetzt ist, sonst
+/// ein leerer, eingebetteter Platzhalterrumpf
+/// ([`harw_dod_bpf::BpfProgramSource::Embedded`]) — siehe
+/// [`real_loader`]-Moduldoku für die Begründung, warum in dieser Lieferung
+/// ohnehin kein realer Lader existiert, der einen Rumpf tatsächlich
+/// verwenden würde.
+fn program_source(path: Option<PathBuf>) -> BpfProgramSource {
+    match path {
+        Some(path) => BpfProgramSource::Path(path),
+        None => BpfProgramSource::Embedded(std::borrow::Cow::Borrowed(&[])),
+    }
+}
+
+/// Baut den `harw_sandbox::NetworkScope`, den [`sensors::FlowSensor`] gegen
+/// jede beobachtete Verbindung prüft.
+///
+/// # Arguments
+/// - `cli` (`&cli::Cli`): die geparste Kommandozeile.
+///
+/// # Returns
+/// Einen `NetworkScope` aus den über `--egress-allow-cidr` konfigurierten
+/// Netzen. Ohne Angabe ein leerer Scope, der jede ausgehende Verbindung
+/// meldet — siehe [`cli`]-Moduldoku für die Begründung, warum
+/// `Host`/`DnsSuffix`-Ziele hier nicht angeboten werden.
+fn network_scope(cli: &Cli) -> NetworkScope {
+    let targets: Vec<EgressTarget> = cli.egress_allow_cidr.iter().cloned().map(EgressTarget::Cidr).collect();
+    NetworkScope::from_targets(targets)
+}
+
+#[cfg(test)]
+mod tests {
+    // `main`/`run` selbst werden hier bewusst nicht getestet: `run` würde
+    // einen echten Socket verbinden und ein echtes Landlock-Ruleset binden
+    // — beides nach Aufgabenstellung untersagt. Jede darin verkettete
+    // Teilfunktion ist einzeln geprüft: `cli::Cli::try_parse_from` in
+    // `cli.rs`, `sensors::build_procmon_sensor`/`build_flow_sensor` und
+    // `FlowSensor::poll` in `sensors.rs`, `collect::run_once`/`run_forever`
+    // in `collect.rs` (mit `FixtureBpfLoader`), `real_loader::build_real_loader`
+    // in `real_loader.rs`. Zusammen decken sie jeden Schritt von `run` ab,
+    // ohne dass ein Test dieser Crate einen echten Socket öffnet, ein
+    // echtes Landlock bindet oder echtes eBPF lädt.
+
+    use super::{fs_scope_roots, network_scope, program_source};
+    use harw_dod_bpf::BpfProgramSource;
+    use ipnet::IpNet;
+    use std::path::PathBuf;
+
+    fn minimal_cli() -> super::Cli {
+        use clap::Parser as _;
+        super::Cli::try_parse_from(["harw-probe-bpf", "--sentinel-socket", "/run/harw-sentinel.sock"])
+            .expect("minimal valid arguments")
+    }
+
+    #[test]
+    fn test_program_source_defaults_to_embedded_placeholder_when_no_path_given() {
+        assert!(matches!(program_source(None), BpfProgramSource::Embedded(_)));
+    }
+
+    #[test]
+    fn test_program_source_uses_path_when_given() {
+        let path = PathBuf::from("/opt/harw/procmon.bpf.o");
+        assert!(matches!(program_source(Some(path)), BpfProgramSource::Path(_)));
+    }
+
+    #[test]
+    fn test_fs_scope_roots_is_empty_without_configured_program_paths() {
+        let cli = minimal_cli();
+        assert!(fs_scope_roots(&cli).is_empty());
+    }
+
+    #[test]
+    fn test_fs_scope_roots_collects_parent_directories_of_configured_paths() {
+        let mut cli = minimal_cli();
+        cli.procmon_program_path = Some(PathBuf::from("/opt/harw/bpf/procmon.o"));
+        cli.flow_program_path = Some(PathBuf::from("/opt/harw/bpf/flow.o"));
+
+        let roots = fs_scope_roots(&cli);
+        assert_eq!(roots, vec![PathBuf::from("/opt/harw/bpf"), PathBuf::from("/opt/harw/bpf")]);
+    }
+
+    #[test]
+    fn test_network_scope_is_empty_without_configured_cidrs() {
+        let cli = minimal_cli();
+        let scope = network_scope(&cli);
+        assert!(!scope.allows_addr(std::net::IpAddr::from([127, 0, 0, 1])));
+    }
+
+    #[test]
+    fn test_network_scope_allows_a_configured_cidr() {
+        let mut cli = minimal_cli();
+        cli.egress_allow_cidr = vec!["10.0.0.0/24".parse::<IpNet>().expect("valid test CIDR literal")];
+        let scope = network_scope(&cli);
+        assert!(scope.allows_addr(std::net::IpAddr::from([10, 0, 0, 5])));
+        assert!(!scope.allows_addr(std::net::IpAddr::from([203, 0, 113, 9])));
+    }
+}

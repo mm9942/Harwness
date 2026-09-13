@@ -1,0 +1,56 @@
+{
+  "now": "1970-01-01T00:00:00Z",
+  "reading": {
+    "samples": [
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "rx_bytes_lo",
+        "value": 733258.0
+      },
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "rx_packets_lo",
+        "value": 5340.0
+      },
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "rx_errs_lo",
+        "value": 0.0
+      },
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "rx_drop_lo",
+        "value": 0.0
+      },
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "tx_bytes_lo",
+        "value": 733258.0
+      },
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "tx_packets_lo",
+        "value": 5340.0
+      },
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "tx_errs_lo",
+        "value": 0.0
+      },
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "tx_drop_lo",
+        "value": 0.0
+      }
+    ],
+    "events": []
+  }
+}

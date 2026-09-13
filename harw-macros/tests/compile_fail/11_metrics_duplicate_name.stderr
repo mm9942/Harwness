@@ -1,0 +1,5 @@
+error: Metrik `A` ist in dieser Deklaration bereits doppelt vergeben
+ --> tests/compile_fail/11_metrics_duplicate_name.rs:5:5
+  |
+5 |     A: gauge, unit = count, labels = [], cardinality = single, name = "harw_b";
+  |     ^

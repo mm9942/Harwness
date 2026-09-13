@@ -1,0 +1,27 @@
+{
+  "name": "harw-webui",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Next.js-Schale der Harwness Control Plane (Knoten UI-01). Route-Gruppen fuer Chat/Sessions/Plan/Telemetry/Security/Admin gehoeren UI-02..07 und werden bewusst noch nicht importiert.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "next": "latest",
+    "react": "latest",
+    "react-dom": "latest"
+  },
+  "devDependencies": {
+    "typescript": "latest",
+    "@types/node": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "vitest": "latest",
+    "jsdom": "latest"
+  }
+}

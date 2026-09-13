@@ -1,0 +1,160 @@
+[workspace]
+resolver = "2"
+members = [
+    "harw-agent-dsl",
+    "harw-code-graph",
+    "harw-config",
+    "harw-home",
+    "harw-plan",
+    "harw-types",
+    "harw-protocol",
+    "harw-research",
+    "harw-macros",
+    "harw-tools",
+    "harw-operations",
+    "harw-ops",
+    "harw-extension-api",
+    "harw-sandbox",
+    "harw-catalog",
+    "harw-core",
+    "harw-provider",
+    "harw-provider-http",
+    "harw-model-catalog",
+    "harw-install",
+    # Phase 1 — new crates (dependency-ordered):
+    "harw-secrets",
+    "harw-oauth",
+    "harw-session-store",
+    "harw-memory",
+    "harw-core-bridge",
+    "harw-job-runtime",
+    "harw-knowledge",
+    "harw-channel",
+    "harw-channel-telegram",
+    "harw-channel-telegram-transport",
+    "harw-mcp-server",
+    # Wave J — coding-agent tool surface + baseline instructions + project discovery:
+    "harw-tool-fs",
+    "harw-tool-deps",
+    "harw-tool-web",
+    "harw-tool-shell",
+    "harw-browser",
+    "harw-browser-thirtyfour",
+    "harw-tool-browser",
+    "harw-channel-browser",
+    "harw-instructions",
+    "harw-project-discovery",
+    "harw-plan-bridge",
+    "harw-registry-defaults",
+    "harw-tui",
+    "harw-cli",
+    "harw",
+
+    # === Ausbauprogramm AW0–AW7: Telemetrie, Kontext, DoD, Lens, Control Plane ===
+    "harw-observe",
+    "harw-observe-file",
+    "harw-observe-prom",
+    "harw-observe-otlp",
+    "harw-context",
+    "harw-dod-cap",
+    "harw-dod-signals",
+    "harw-dod-readfs",
+    "harw-dod-netlink",
+    "harw-dod-fixtures",
+    "harw-dod-thermal",
+    "harw-dod-cpu",
+    "harw-dod-memory",
+    "harw-dod-blockio",
+    "harw-dod-netcounters",
+    "harw-dod-gpu",
+    "harw-dod-cgroup",
+    "harw-dod-listener",
+    "harw-dod-authlog",
+    "harw-dod-scanreport",
+    "harw-dod-workspace",
+    "harw-dod-sentinel",
+    "harw-dod-fsmon",
+    "harw-dod-rules",
+    "harw-dod-netpolicy",
+    "harw-dod-warden-proto",
+    "harw-dod-warden",
+    "harw-dod-escalate",
+    "harw-dod-bpf",
+    "harw-dod-procmon",
+    "harw-dod-flow",
+    "harw-dod",
+    "harw-sentinel",
+    "harw-probe-fs",
+    "harw-probe-bpf",
+    "harw-warden",
+    "harw-lens-types",
+    "harw-lens-rank",
+    "harw-lens-chunk",
+    "harw-lens-store",
+    "harw-lens-index",
+    "harw-lens-embed",
+    "harw-lens-source",
+    "harw-lens-query",
+    "harw-lens-federation",
+    "harw-lens",
+    "harw-tool-lens",
+    "harw-web",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+
+# Genau eine Fassung je geteilter Abhängigkeit. Ohne diesen Abschnitt stand
+# `jiff` in fünf Schreibweisen und drei Fassungen im Baum (0.2 / 0.2.28 /
+# 0.2.32); bei rund fünfzig neuen Crates, die ausnahmslos `jiff` benutzen
+# sollen, ist das ein Multiplikator statt einer Nachlässigkeit.
+[workspace.dependencies]
+# Zeitachse. Die eine erlaubte Pre-1.0-Abhängigkeit in öffentlichen Signaturen
+# (Doktrin D5, präzisiert): kleine Typfläche, ein relevanter Typ.
+jiff = { version = "0.2.32", features = ["serde"] }
+
+# Serialisierung.
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+toml = "1.1.3"
+
+# Inhaltsadressierung: ContentDigest, ChunkDigest, SecurityEvidence.
+blake3 = "1.8.7"
+
+# Netzmengen. Trägt den Cidr-Zweig von NetworkScope::EgressTarget.
+ipnet = { version = "2.12.1", features = ["serde"] }
+
+# Dateien und Nebenläufigkeit — Store-Mechanik nach dem ChildLeaseStore-Muster.
+fs4 = "1.1.0"
+tempfile = "3.27.0"
+
+# Beobachtung.
+tracing = "0.1.44"
+
+# Syscalls ohne libc: fanotify im Dateisystem-Wächter.
+rustix = "1.1.4"
+
+# Verzeichniseinbettung: Registry-Definitionen als Dateien statt als Rust-Liste.
+include_dir = "0.7.4"
+
+# Versionsvergleich. Ein Versionssprung in einer Abhängigkeit ist ein
+# Sicherheitssignal; ihn als Zeichenkette zu vergleichen verwechselt
+# 0.2.9 mit 0.2.10.
+semver = { version = "1.0.28", features = ["serde"] }
+
+# `forbid` statt `deny`: nicht per `#[allow]` überstimmbar. Die Regel stand
+# vorher als Attribut in jeder Crate einzeln und fehlte deshalb in acht von
+# fünfundvierzig. Eine Regel, die pro Crate wiederholt werden muss, wird pro
+# Crate vergessen.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+lto = "thin"
+codegen-units = 16
+
+[profile.dev]
+opt-level = 0

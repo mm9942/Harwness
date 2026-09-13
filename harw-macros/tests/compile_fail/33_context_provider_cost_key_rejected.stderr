@@ -1,0 +1,5 @@
+error: unknown `context_provider` attribute field; expected `name`, `struct_name`, `namespace`, or `trust`
+ --> tests/compile_fail/33_context_provider_cost_key_rejected.rs:7:20
+  |
+7 | #[context_provider(cost = BytesOverFour)]
+  |                    ^^^^

@@ -1,0 +1,98 @@
+# harw-probe-fs.service -- Knoten AW7-03, Klasse CAP_SYS_ADMIN.
+#
+# Gehoert zwingend nach /etc/systemd/system/, NIE nach
+# ~/.config/systemd/user/ -- eine Nutzerinstanz kann keine Capabilities
+# vergeben (siehe harw-install::dod_units-Moduldoku).
+#
+# Landlock-Asymmetrie (Entscheidung Nr. 4): dieses Binary bricht beim Start
+# HART ab, wenn Landlock den deklarierten ReadScope nicht vollstaendig
+# durchsetzen kann (harw-probe-fs/src/landlock.rs::enforce_read_scope, nur
+# RulesetStatus::FullyEnforced zaehlt) -- ein Prozess mit CAP_SYS_ADMIN ohne
+# wirksame Selbstbeschraenkung darf nicht laufen. Diese Unit erzwingt
+# deshalb nichts zusaetzlich; das Binary selbst ist der harte Torwaechter.
+#
+# harw-probe-fs/src/main.rs::run() verbindet sich ZUERST zum Sentinel-Socket
+# (sink::build_sentinel_sink), ERST DANACH bindet es Landlock -- ein
+# Socket-Pfad, der ausserhalb des spaeter gebundenen Bereichs liegt, waere
+# sonst nach der Selbstbeschraenkung nicht mehr erreichbar. Ein fehlender
+# Sentinel beim Start ist ein harter Fehler (ProbeError::SentinelConnectFailed),
+# ebenso jeder spaetere Sende-Fehlschlag (collect::run_forever stoppt beim
+# ersten dauerhaften Fehler) -- Restart=on-failure unten holt diesen Prozess
+# nach einem Sentinel-Neustart automatisch zurueck, sobald der Socket wieder
+# existiert.
+
+[Unit]
+Description=harw-probe-fs -- fanotify-Sonde, Push-Only (AW4-02b)
+Documentation=man:harw-probe-fs(1)
+After=harw-sentinel.service
+Wants=harw-sentinel.service
+# Wants=+After=, bewusst NICHT Requires=/BindsTo=: ein Requires= (erst recht
+# ein BindsTo=) risse diese Sonde mit, sobald harw-sentinel.service neu
+# gestartet wird (Wartung, Absturz-Neustart) -- nicht gewollt. Diese Sonde
+# hat bereits eine eigene, im Binary selbst verankerte Reaktion auf einen
+# verschwundenen Sentinel: der naechste Sendeversuch scheitert hart
+# (SentinelSendFailed), der Prozess beendet sich, und Restart=on-failure
+# startet ihn neu -- er verbindet sich beim naechsten Start erneut zum
+# (dann wieder laufenden) Sentinel. Ein systemd-seitiges Mitreissen wuerde
+# diese bereits vorhandene, feinere Reaktion nur verdoppeln.
+
+[Service]
+Type=simple
+User=harw-probe-fs
+Group=harw-probe-fs
+SupplementaryGroups=harw-ipc
+# Mitgliedschaft in harw-ipc: das Sentinel-Runtime-Verzeichnis
+# (/run/harw, Modus 0770, siehe harw-sentinel.service) ist nur fuer diese
+# Gruppe betretbar; der Socket selbst erhaelt ueber UMask=0002 der
+# Sentinel-Unit Gruppenschreibrecht.
+ExecStart=/usr/local/bin/harw-probe-fs --log info --scope-root /srv/harw/watched --sentinel-socket /run/harw/sentinel.sock
+# --scope-root ist ein Platzhalter fuer das tatsaechlich zu ueberwachende
+# Verzeichnis (Pflichtparameter, wiederholbar, siehe cli.rs) -- ein
+# Betreiber ersetzt/ergaenzt ihn ueber ein Drop-in
+# (/etc/systemd/system/harw-probe-fs.service.d/*.conf), ohne diese Unit zu
+# aendern.
+Restart=on-failure
+RestartSec=5
+
+# -- Haertung: jede Direktive einzeln begruendet --
+NoNewPrivileges=yes
+# Verhindert den Erwerb weiterer Faehigkeiten ueber exec() (z. B. durch ein
+# setuid-Hilfsprogramm) -- diese Sonde ruft nie ein fremdes Programm auf,
+# aber diese Direktive kostet nichts und schliesst genau diesen Weg.
+ProtectSystem=strict
+# Diese Sonde SCHREIBT nirgends im Dateisystem -- sie beobachtet
+# (fanotify) und sendet (Unix-Socket). "strict" macht den gesamten
+# Nicht-API-Baum read-only; die beobachteten --scope-root-Verzeichnisse
+# bleiben dabei LESBAR (nur nicht mehr beschreibbar durch diesen Prozess
+# selbst -- fanotify beobachtet fremde Schreibzugriffe, es fuehrt keine
+# eigenen aus).
+ProtectHome=yes
+# Diese Sonde liest kein echtes Nutzerverzeichnis; --scope-root zeigt auf
+# ueberwachte Anwendungsdaten, nicht auf $HOME.
+PrivateTmp=yes
+# Diese Sonde schreibt nie nach /tmp.
+ProtectKernelModules=yes
+# fanotify ist ein Syscall-Interface, kein Kernel-Modul-Zugriff.
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+# Diese Sonde schreibt nie in cgroup-Kontrolldateien -- das ist
+# ausschliesslich harw-warden's Aufgabe.
+RestrictAddressFamilies=AF_UNIX
+# Push-only zum Sentinel ueber genau einen SOCK_SEQPACKET-Unix-Socket
+# (sink.rs::SentinelSink) -- kein TCP/UDP, kein Netlink. Siehe
+# src/push_only_guard.rs fuer die quelltextliche Zusage, dass dieses
+# Binary nie einen Empfangspfad eroeffnet.
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=CAP_SYS_ADMIN
+AmbientCapabilities=CAP_SYS_ADMIN
+# Genau die eine Faehigkeit dieser Klasse -- die einzige, die
+# fanotify_mark() auf beliebigen Zielen erlaubt (siehe main.rs-Moduldoku,
+# Abschnitt "Berechtigungsklasse"). Nicht CAP_BPF (das ist die andere
+# Sonde) und nicht mehr als das, "weil es bequemer waere".
+
+[Install]
+WantedBy=multi-user.target

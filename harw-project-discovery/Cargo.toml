@@ -1,0 +1,18 @@
+[package]
+name = "harw-project-discovery"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-extension-api = { path = "../harw-extension-api" }
+harw-macros = { path = "../harw-macros" }
+harw-types = { path = "../harw-types" }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[lints]
+workspace = true

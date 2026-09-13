@@ -1,0 +1,28 @@
+GOLDEN RENDER — harwness.context.research-deps@1
+==================================================
+STATUS: von Hand aus der Renderlogik abgeleitet (kein Renderer gelaufen).
+Siehe `explore.golden.txt` für die Methodik dieser Ableitung; hier nicht
+wiederholt.
+
+Aufgelöste Sektionsreihenfolge (base zuerst, dann research-deps):
+  1. task.objective         strength=must-include  detail=full     trust=instruction   [von base]
+  2. history.tail           strength=must-include  detail=summary  trust=evidence      [von base]
+  3. task.read_scope        strength=must-include  detail=full     trust=data          [von research-deps]
+  4. deps.lockfile_index    strength=must-include  detail=summary  trust=evidence      [von research-deps]
+
+Ausschluss (Union, base zuerst): credential.*, secret.*, sibling_transcripts,
+full_parent_transcript (alle von base) + web.* (von research-deps)
+
+--- Gerenderter Turn-Kontext (Platzhalter-Inhalt) ---
+
+## task.objective [instruction]
+<vollständiger Auftragstext des aktuellen Turns>
+
+## history.tail [evidence]
+<zusammengefasster jüngster Verlauf der letzten Turns, gemäß HISTORY_TAIL_GUARANTEED_GROUPS vollständig, älteres ggf. bereits als [ref] verkürzt>
+
+## task.read_scope [data]
+<vollständige Glob-/Verzeichnisliste des erlaubten Lesebereichs>
+
+## deps.lockfile_index [evidence]
+<gefilterter Cargo.lock-Auszug: Name, exakte Version, Feature-Flags>

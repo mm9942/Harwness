@@ -1,0 +1,35 @@
+[package]
+name = "harw-tool-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-extension-api = { path = "../harw-extension-api" }
+harw-macros = { path = "../harw-macros" }
+harw-sandbox = { path = "../harw-sandbox" }
+harw-tools = { path = "../harw-tools" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Übernommen aus harw-core/Cargo.toml (identische Zeile) — eine zweite
+# reqwest-Konfiguration im Workspace würde die Feature-Vereinigung aufweichen.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Feature-Satz wie harw-core; `time` trägt die Gesamt-Deadline in `fetch.rs`.
+tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
+# Version wie harw-secrets/harw-catalog (0.10.x ist im Workspace dominant).
+sha2 = "0.10.9"
+tracing = "0.1.44"
+# `scraper` und `htmd` sind neu für den Workspace: weder in Cargo.lock noch im
+# Registry-Cache auflösbar. Die Versionszeilen sind Platzhalter, bis die
+# Hauptsitzung `cargo add scraper` / `cargo add htmd` ausführt. Danach die API
+# von `htmd::convert` gegen docs.rs prüfen — einziger Berührungspunkt ist
+# `crate::fetch::html_to_markdown`.
+scraper = "0.23"  # TODO(cargo add): Version nicht aus Cargo.lock belegbar
+htmd = "0.2"  # TODO(cargo add): Version nicht aus Cargo.lock belegbar
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+
+[lints]
+workspace = true

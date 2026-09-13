@@ -1,0 +1,13 @@
+error[E0599]: no method named `redact` found for struct `Plain` in the current scope
+  --> tests/compile_fail/15_traced_argument_without_redact.rs:16:1
+   |
+12 | struct Plain {
+   | ------------ method `redact` not found for this struct
+...
+16 | #[harw_macros::traced(fields(x))]
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method not found in `Plain`
+   |
+   = help: items from traits can only be used if the trait is implemented and in scope
+   = note: the following trait defines an item `redact`, perhaps you need to implement it:
+           candidate #1: `Redact`
+   = note: this error originates in the attribute macro `harw_macros::traced` (in Nightly builds, run with -Z macro-backtrace for more info)

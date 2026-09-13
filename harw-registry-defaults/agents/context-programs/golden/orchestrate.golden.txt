@@ -1,0 +1,27 @@
+GOLDEN RENDER — harwness.context.orchestrate@1
+================================================
+STATUS: von Hand aus der Renderlogik abgeleitet (kein Renderer gelaufen).
+Siehe `explore.golden.txt` für die Methodik.
+
+Aufgelöste Sektionsreihenfolge (base zuerst, dann orchestrate):
+  1. task.objective    strength=must-include  detail=full     trust=instruction  [von base]
+  2. history.tail      strength=must-include  detail=summary  trust=evidence     [von base]
+  3. plan.current      strength=must-include  detail=full     trust=evidence     [von orchestrate]
+  4. child.returns     strength=must-include  detail=summary  trust=evidence     [von orchestrate]
+
+Ausschluss (Union): credential.*, secret.*, sibling_transcripts,
+full_parent_transcript (base) + child.raw_transcript.* (orchestrate)
+
+--- Gerenderter Turn-Kontext (Platzhalter-Inhalt) ---
+
+## task.objective [instruction]
+<vollständiger Auftragstext des aktuellen Turns>
+
+## history.tail [evidence]
+<zusammengefasster jüngster Verlauf der letzten Turns, gemäß HISTORY_TAIL_GUARANTEED_GROUPS vollständig, älteres ggf. bereits als [ref] verkürzt>
+
+## plan.current [evidence]
+<vollständiger, autoritativer Plan>
+
+## child.returns [evidence]
+<zusammengefasste, strukturierte Rückgaben bereits abgeschlossener Kinder — keine rohen Kind-Transkripte>

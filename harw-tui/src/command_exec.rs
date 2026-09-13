@@ -1,0 +1,934 @@
+//! Ausführung von `/command`-Eingaben in der Chat-TUI über die
+//! Operation-Adapter-Pipeline (`harw-operations` / `harw-ops`).
+//!
+//! # Verantwortung
+//! Dieses Modul stellt [`execute_command_as`] bereit — eine async Funktion, die
+//! eine abgeschickte `/command`-Zeile klassifiziert ([`crate::classify_input`])
+//! und, im Fall einer `Invocation::Command`, den passenden
+//! [`harw_operations::adapter::CommandAdapter`] aus der übergebenen Adapter-Liste
+//! sucht und dispatcht. Das lokale, statische `/command`-Popup
+//! ([`crate::registry::CommandRegistry`]) bleibt davon unberührt — es dient
+//! ausschließlich der Autocomplete-Anzeige in `app.rs`.
+//!
+//! # Verantwortungsgrenze
+//! Das Modul führt selbst **keine** Operationslogik aus — jede `/command`-Zeile
+//! wird 1:1 an `CommandAdapter::dispatch` (und damit an `Operation::run` in
+//! `harw-ops`) delegiert. Für `/help` wird eine frische
+//! [`harw_operations::registry::OperationRegistry`] aus der Adapter-Liste
+//! rekonstruiert und in den [`ServiceMap`] des jeweiligen `OpContext` gelegt,
+//! da `HelpOperation` die Registry als Service benötigt, um alle Ops
+//! aufzulisten (`harw-ops/src/help.rs`). Alle anderen Ops benötigen keine
+//! Services.
+//!
+//! # Berechtigungen
+//! Jeder Dispatch führt eine explizite Caller-Stufe mit. Ein Adapter wird nur
+//! ausgeführt, wenn seine deklarierte [`harw_operations::PermissionTier`] die
+//! Caller-Stufe nicht überschreitet. Die lokale TUI nennt ihre privilegierte
+//! Konsole an der Composition Root ausdrücklich `Owner`; andere Surfaces müssen
+//! ihre eigene, niedrigere Stufe übergeben.
+//!
+//! # Nebenläufigkeit
+//! `execute_command_as` ist `async` und ruft `CommandAdapter::dispatch` (ebenfalls
+//! `async`) auf. Der Aufrufer (`run_loop` in `app.rs`) awaitet die Funktion im
+//! `current_thread`-Tokio-Runtime des Chat-Loops.
+//!
+//! # Fehler
+//! Erzeugt keine eigenen Fehlertypen. Klassifizierungsfehler
+//! ([`crate::CommandError`]) und Dispatch-Fehler ([`harw_operations::OpError`])
+//! werden in menschenlesbaren Text umgesetzt.
+
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use harw_operations::adapter::CommandAdapter;
+use harw_operations::registry::OperationRegistry;
+use harw_operations::{OpContext, PermissionTier, ServiceMap, SharedSessionController};
+use harw_sandbox::SandboxSpec;
+use harw_types::{SessionId, TurnId};
+
+use crate::Invocation;
+use crate::session_controller::TuiSessionController;
+
+/// Bündelt die optionalen/langlebigen Services, die eine `/command`-Ausführung
+/// benötigt.
+///
+/// # Beschreibung
+/// `runtime_config`, `memory`, `controller` und `job_store` gehören fachlich
+/// zusammen: sie werden von der Composition Root stets gemeinsam durchgereicht
+/// und wandern 1:1 in [`build_services`]. Das Bündeln in dieser Struct hält
+/// [`execute_command`] und [`execute_command_as`] unter der clippy-Grenze von
+/// sieben Parametern, ohne die einzelnen Felder künstlich zu verstecken.
+///
+/// # Felder
+/// - `runtime_config` (`Option<&Arc<harw_config::ResolvedConfig>>`): Optionaler,
+///   von der Composition Root aufgelöster Laufzeit-Config-Snapshot. Wenn
+///   vorhanden, wird genau dieser `Arc` für `/model` und `/provider` als Service
+///   bereitgestellt.
+/// - `memory` (`Option<&Arc<dyn harw_memory::Memory>>`): Optionales Memory-Backend.
+/// - `controller` (`&Arc<TuiSessionController>`): Der langlebige Session-Controller,
+///   der in die `ServiceMap` eingetragen wird. Zustandsänderungen (z.B. über
+///   `/effort` oder `/model`) überleben so den Aufruf und sind beim nächsten
+///   Turn sichtbar.
+/// - `job_store` (`Option<&Arc<harw_session_store::JobStore>>`): Optionaler
+///   dauerhafter Job-Store.
+pub(crate) struct CommandServices<'a> {
+    pub(crate) runtime_config: Option<&'a Arc<harw_config::ResolvedConfig>>,
+    pub(crate) memory: Option<&'a Arc<dyn harw_memory::Memory>>,
+    pub(crate) controller: &'a Arc<TuiSessionController>,
+    pub(crate) job_store: Option<&'a Arc<harw_session_store::JobStore>>,
+}
+
+/// Führt eine abgeschickte `/command`-Zeile über die Operation-Adapter-Pipeline
+/// aus und liefert das Ergebnis als Anzeigetext.
+///
+/// This owner-tier compatibility wrapper is compiled only for this module's
+/// source-local tests. Production callers must use [`execute_command_as`] and
+/// provide their explicit permission tier.
+///
+/// # Beschreibung
+/// Klassifiziert `raw_line` via [`crate::classify_input`]:
+/// - [`Invocation::Command`] → Pfad `/{name}` in `adapters` suchen. Gefunden:
+///   [`OpContext`] bauen (Session-ID geklont, frische [`TurnId`], Sandbox
+///   geklont, Services siehe unten) und [`CommandAdapter::dispatch`] awaiten.
+///   `Ok(output)` liefert `output.text`; `Err(error)` wird als
+///   `"Fehler: {error}"` gerendert. Nicht gefunden: `"Unbekannter Command: {path}"`.
+/// - [`Invocation::Shell`] / [`Invocation::ShellRepeat`]: ehrlicher
+///   „noch nicht verfügbar"-Hinweis (keine Shell-Ausführung in diesem Build).
+/// - [`Invocation::Note`]: `"Notiz: {text}"`.
+/// - [`Invocation::Mention`]: `"@{target}: {body}"`.
+/// - [`Invocation::Chat`]: unverändert durchgereicht.
+///
+/// # Argumente
+/// - `adapters` (`&[CommandAdapter]`): alle `/`-Command-Adapter, gebaut aus der
+///   `OperationRegistry` in `run_chat_tui` (`CommandAdapter::from_operation`).
+/// - `sandbox` (`&SandboxSpec`): Authority-Boundary; wird pro Dispatch geklont
+///   in den `OpContext` übernommen.
+/// - `session_id` (`&SessionId`): Stabile Session-ID; wird pro Dispatch geklont.
+/// - `raw_line` (`&str`): die abgeschickte Rohzeile (inkl. führendem `/`, `!`,
+///   `#` bzw. `@`).
+/// - `services` (`&CommandServices<'_>`): siehe [`CommandServices`].
+///
+/// # Rückgabe
+/// Ein (ggf. mehrzeiliger, durch `\n` getrennter) Ausgabetext für die Historie.
+///
+/// # Nebenläufigkeit
+/// `async`; awaitet genau einen `CommandAdapter::dispatch`-Aufruf, falls ein
+/// Command gefunden wurde. Keine eigenen Locks oder geteilten Zustände.
+#[cfg(test)]
+async fn execute_command(
+    adapters: &[CommandAdapter],
+    sandbox: &SandboxSpec,
+    session_id: &SessionId,
+    raw_line: &str,
+    services: &CommandServices<'_>,
+) -> String {
+    execute_command_as(
+        adapters,
+        sandbox,
+        session_id,
+        PermissionTier::Owner,
+        raw_line,
+        services,
+    )
+    .await
+}
+
+/// Executes a command as an explicitly bounded caller.
+///
+/// This is the permission-enforcing variant used by composition roots. The
+/// test-only compatibility wrapper [`execute_command`] represents the local
+/// owner console in source-local tests.
+///
+/// # Argumente
+/// - `services` (`&CommandServices<'_>`): siehe [`CommandServices`].
+pub(crate) async fn execute_command_as(
+    adapters: &[CommandAdapter],
+    sandbox: &SandboxSpec,
+    session_id: &SessionId,
+    caller_permission: PermissionTier,
+    raw_line: &str,
+    services: &CommandServices<'_>,
+) -> String {
+    let invocation = match crate::classify_input(raw_line) {
+        Ok(invocation) => invocation,
+        Err(error) => return format!("Eingabe abgelehnt: {error}"),
+    };
+
+    match invocation {
+        Invocation::Command { name, raw_args } => {
+            let path = format!("/{name}");
+            // Canonical paths take precedence over aliases. Keep the fallback
+            // separate rather than combining predicates in one `find`: a malformed
+            // adapter list must not let an earlier alias shadow a later canonical
+            // command and thereby change its permission boundary.
+            let adapter = adapters
+                .iter()
+                .find(|adapter| adapter.path() == path)
+                .or_else(|| {
+                    adapters.iter().find(|adapter| {
+                        adapter
+                            .operation()
+                            .meta()
+                            .aliases
+                            .iter()
+                            .any(|alias| *alias == name)
+                    })
+                });
+
+            match adapter {
+                Some(adapter) => {
+                    // Authorize before building services or creating an execution
+                    // context. Use the permission copied into the adapter when it
+                    // was registered so authorization remains tied to the command
+                    // dispatch surface selected above.
+                    let required = adapter.permission();
+                    if required > caller_permission {
+                        return format!(
+                            "Berechtigung verweigert: {path} erfordert {required:?}; aktuelle Stufe ist {caller_permission:?}"
+                        );
+                    }
+                    let service_map = build_services(
+                        adapters,
+                        services.runtime_config,
+                        services.memory,
+                        services.controller,
+                        services.job_store,
+                    );
+                    let ctx = OpContext::new(
+                        session_id.clone(),
+                        TurnId::new(),
+                        sandbox.clone(),
+                        service_map,
+                    );
+                    match adapter.dispatch(&ctx, raw_args).await {
+                        Ok(output) => output.text,
+                        Err(error) => format!("Fehler: {error}"),
+                    }
+                }
+                None => format!("Unbekannter Command: {path}"),
+            }
+        }
+        Invocation::Shell(command) => {
+            format!("Shell-Ausführung ist noch nicht verfügbar: {command}")
+        }
+        Invocation::ShellRepeat => "Shell-Wiederholung ist noch nicht verfügbar.".to_owned(),
+        Invocation::Note(note) => format!("Notiz: {note}"),
+        Invocation::Mention { target, body } => format!("@{target}: {body}"),
+        Invocation::Chat(text) => text,
+    }
+}
+
+/// Baut die [`ServiceMap`] für einen einzelnen `CommandAdapter::dispatch`-Aufruf.
+///
+/// # Beschreibung
+/// Die meisten Ops in `harw-ops` benötigen keine Services (leere `ServiceMap`
+/// genügt). `HelpOperation` (`harw-ops/src/help.rs`) liest jedoch eine
+/// [`OperationRegistry`] aus `ctx.service::<OperationRegistry>()`, um alle
+/// registrierten Ops aufzulisten. Da `OperationRegistry` weder `Clone` noch von
+/// außen aus einer bestehenden Instanz kopierbar ist, wird hier pro Aufruf eine
+/// frische Registry aus den `Arc<dyn Operation>`-Referenzen der übergebenen
+/// Adapter rekonstruiert (Operationen werden dedupliziert nach
+/// `operation_name()`, damit Ops mit mehreren `Surface::Command`-Einträgen
+/// nicht doppelt in `/help` erscheinen).
+///
+/// Der übergebe `controller` wird als [`SharedSessionController`]
+/// (`Arc<dyn SessionController>`) in die Map eingetragen. Da `TypeId` den
+/// **statischen** Typ bestimmt, muss der Upcast explizit vor dem `insert`
+/// erfolgen — so verwenden alle Calls in `harw-ops` (effort, model, provider),
+/// die via `ctx.service::<SharedSessionController>()` auflösen, denselben
+/// `TypeId`-Schlüssel.
+///
+/// # Argumente
+/// - `adapters` (`&[CommandAdapter]`): Quelle der zu registrierenden
+///   Operationen (via [`CommandAdapter::operation`]).
+/// - `runtime_config` (`Option<&Arc<harw_config::ResolvedConfig>>`): Optionaler
+///   aufgelöster Laufzeit-Config-Snapshot. Der vorhandene Arc wird für
+///   `/model`- und `/provider`-Ops in die `ServiceMap` geklont.
+/// - `memory` (`Option<&Arc<dyn harw_memory::Memory>>`): Optionales
+///   Memory-Backend für `/memory`-Ops.
+/// - `controller` (`&Arc<TuiSessionController>`): Langlebiger Controller aus
+///   `ChatApp`; wird als `SharedSessionController` eingetragen, damit der Zustand
+///   über mehrere `execute_command`-Aufrufe hinweg erhalten bleibt.
+///
+/// # Rückgabe
+/// Eine [`ServiceMap`] mit [`OperationRegistry`], [`SharedSessionController`]
+/// sowie optionalem `Arc<harw_config::ResolvedConfig>` und `Arc<dyn Memory>`.
+///
+/// # Spec
+/// harw-tui Design §session_controller — build_services long-lived controller.
+pub(crate) fn build_services(
+    adapters: &[CommandAdapter],
+    runtime_config: Option<&Arc<harw_config::ResolvedConfig>>,
+    memory: Option<&Arc<dyn harw_memory::Memory>>,
+    controller: &Arc<TuiSessionController>,
+    job_store: Option<&Arc<harw_session_store::JobStore>>,
+) -> ServiceMap {
+    let mut registry = OperationRegistry::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for adapter in adapters {
+        if seen.insert(adapter.operation_name()) {
+            registry.register(Arc::clone(adapter.operation()));
+        }
+    }
+    let mut services = ServiceMap::new();
+    services.insert(registry);
+    if let Some(config) = runtime_config {
+        services.insert(Arc::clone(config));
+    }
+    if let Some(mem) = memory {
+        // Als `Arc<dyn Memory>` (nicht als konkreten Typ) registrieren, damit die
+        // `/memory`-Op über `ctx.service::<Arc<dyn Memory>>()` fündig wird.
+        services.insert(Arc::clone(mem));
+    }
+    if let Some(store) = job_store {
+        services.insert(Arc::clone(store));
+    }
+    // Upcast zu Arc<dyn SessionController> VOR dem insert, damit TypeId::of::<SharedSessionController>()
+    // mit dem Schlüssel übereinstimmt, den harw-ops-Handler-Code via
+    // `ctx.service::<SharedSessionController>()` nachschlägt.
+    // Der explizite `as`-Cast erzwingt den Fat-Pointer-Upcast von Arc<Concrete>
+    // zu Arc<dyn SessionController> — Arc::clone würde den konkreten Typ beibehalten.
+    let shared: SharedSessionController = Arc::clone(controller) as SharedSessionController;
+    services.insert(shared);
+    services
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    use harw_operations::adapter::CommandAdapter;
+    use harw_operations::registry::OperationRegistry;
+    use harw_operations::{
+        CommandVisibility, OpContext, OpFuture, OpInput, OpOutput, Operation, OperationCategory,
+        OperationDomain, OperationMeta, PermissionTier, Surface,
+    };
+    use harw_sandbox::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
+    use harw_types::{SessionId, TenantId, WorkspaceId};
+
+    use crate::session_controller::TuiSessionController;
+
+    use super::CommandServices;
+
+    /// Baut alle 16 `harw-ops`-Adapter über die echte Registrierungsfunktion.
+    fn adapters() -> Vec<CommandAdapter> {
+        let mut registry = OperationRegistry::new();
+        harw_ops::register_all(&mut registry);
+        registry
+            .iter()
+            .flat_map(|op| CommandAdapter::from_operation(Arc::clone(op)))
+            .collect()
+    }
+
+    /// Baut eine gültige Test-`SandboxSpec` gegen ein eindeutiges Temp-Verzeichnis.
+    fn test_sandbox() -> (SandboxSpec, PathBuf) {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "harw-tui-command-exec-test-{}-{}",
+            std::process::id(),
+            id
+        ));
+        std::fs::create_dir_all(root.join("workspace")).expect("temp workspace dir");
+        let registry = WorkspaceRegistry::build(
+            &root,
+            [WorkspaceRegistration {
+                tenant: TenantId::from_str("tui-test"),
+                workspace: WorkspaceId::from_str("workspace"),
+                root: PathBuf::from("workspace"),
+            }],
+        )
+        .expect("workspace registry build");
+        let binding = registry
+            .resolve(
+                &TenantId::from_str("tui-test"),
+                &WorkspaceId::from_str("workspace"),
+            )
+            .expect("resolve workspace binding");
+        let sandbox = SandboxSpec::from_resolved(
+            binding,
+            PermissionSet::from_policy([Permission::ReadWorkspace, Permission::WriteWorkspace]),
+        );
+        (sandbox, root)
+    }
+
+    /// Baut einen frischen langlebigen Test-Controller.
+    fn test_controller() -> Arc<TuiSessionController> {
+        Arc::new(TuiSessionController::new())
+    }
+
+    struct CountingOperation {
+        meta: OperationMeta,
+        meta_reads: AtomicUsize,
+        dispatches: AtomicUsize,
+    }
+
+    impl CountingOperation {
+        fn protected_alias() -> Self {
+            Self {
+                meta: OperationMeta {
+                    name: "test.protected",
+                    summary: "Test-only protected command.",
+                    domain: OperationDomain::Misc,
+                    permission: PermissionTier::Operator,
+                    surfaces: vec![Surface::Command {
+                        path: "/protected",
+                        visibility: CommandVisibility::TuiOnly,
+                    }],
+                    aliases: &["guard"],
+                    category: OperationCategory::Misc,
+                    args_schema: None,
+                },
+                meta_reads: AtomicUsize::new(0),
+                dispatches: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Operation for CountingOperation {
+        fn meta(&self) -> &OperationMeta {
+            self.meta_reads.fetch_add(1, Ordering::Relaxed);
+            &self.meta
+        }
+
+        fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
+            self.dispatches.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async {
+                Ok(OpOutput {
+                    text: "dispatched".to_owned(),
+                })
+            })
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 1. /help lists all commands via the Operation-Adapter pipeline
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_help_lists_registered_operations() {
+        let adapters = adapters();
+        let (sandbox, tmp) = test_sandbox();
+        let session_id = SessionId::new();
+
+        let output = super::execute_command(
+            &adapters,
+            &sandbox,
+            &session_id,
+            "/help",
+            &CommandServices {
+                runtime_config: None,
+                memory: None,
+                controller: &test_controller(),
+                job_store: None,
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(tmp).ok();
+
+        for name in &["help", "status", "ps", "stop", "model"] {
+            assert!(
+                output.contains(name),
+                "missing op {name} in help output; got: {output}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 2. /status runs the real StatusOperation and embeds the session id
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_status_embeds_session_id() {
+        let adapters = adapters();
+        let (sandbox, tmp) = test_sandbox();
+        let session_id = SessionId::new();
+
+        let output = super::execute_command(
+            &adapters,
+            &sandbox,
+            &session_id,
+            "/status",
+            &CommandServices {
+                runtime_config: None,
+                memory: None,
+                controller: &test_controller(),
+                job_store: None,
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(tmp).ok();
+
+        assert!(
+            output.contains(session_id.as_str()),
+            "expected session id {session_id} in status output; got: {output}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 3. Unknown command returns an honest "unknown" message
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_unknown_command_returns_honest_message() {
+        let adapters = adapters();
+        let (sandbox, tmp) = test_sandbox();
+        let session_id = SessionId::new();
+
+        let output = super::execute_command(
+            &adapters,
+            &sandbox,
+            &session_id,
+            "/gibtsnicht",
+            &CommandServices {
+                runtime_config: None,
+                memory: None,
+                controller: &test_controller(),
+                job_store: None,
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(tmp).ok();
+
+        assert_eq!(output, "Unbekannter Command: /gibtsnicht");
+    }
+
+    // -----------------------------------------------------------------------
+    // 4. Shell invocation renders the "not yet available" message
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_shell_not_available() {
+        let adapters = adapters();
+        let (sandbox, tmp) = test_sandbox();
+        let session_id = SessionId::new();
+
+        let output = super::execute_command(
+            &adapters,
+            &sandbox,
+            &session_id,
+            "!ls -la",
+            &CommandServices {
+                runtime_config: None,
+                memory: None,
+                controller: &test_controller(),
+                job_store: None,
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(tmp).ok();
+
+        assert_eq!(
+            output, "Shell-Ausführung ist noch nicht verfügbar: ls -la",
+            "unexpected shell output; got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shell_repeat_not_available() {
+        let adapters = adapters();
+        let (sandbox, tmp) = test_sandbox();
+        let session_id = SessionId::new();
+
+        let output = super::execute_command(
+            &adapters,
+            &sandbox,
+            &session_id,
+            "!!",
+            &CommandServices {
+                runtime_config: None,
+                memory: None,
+                controller: &test_controller(),
+                job_store: None,
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(tmp).ok();
+
+        assert_eq!(
+            output, "Shell-Wiederholung ist noch nicht verfügbar.",
+            "unexpected shell-repeat output; got: {output}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. Plain text is passed through as chat
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_plain_text_is_chat() {
+        let adapters = adapters();
+        let (sandbox, tmp) = test_sandbox();
+        let session_id = SessionId::new();
+
+        let output = super::execute_command(
+            &adapters,
+            &sandbox,
+            &session_id,
+            "hallo welt",
+            &CommandServices {
+                runtime_config: None,
+                memory: None,
+                controller: &test_controller(),
+                job_store: None,
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(tmp).ok();
+
+        assert_eq!(output, "hallo welt");
+    }
+
+    // -----------------------------------------------------------------------
+    // 6. Note and mention prefixes render as before
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_note_prefix_renders_note() {
+        let adapters = adapters();
+        let (sandbox, tmp) = test_sandbox();
+        let session_id = SessionId::new();
+
+        let output = super::execute_command(
+            &adapters,
+            &sandbox,
+            &session_id,
+            "#this is a note",
+            &CommandServices {
+                runtime_config: None,
+                memory: None,
+                controller: &test_controller(),
+                job_store: None,
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(tmp).ok();
+
+        assert_eq!(output, "Notiz: this is a note");
+    }
+
+    #[tokio::test]
+    async fn test_mention_renders_correctly() {
+        let adapters = adapters();
+        let (sandbox, tmp) = test_sandbox();
+        let session_id = SessionId::new();
+
+        let output = super::execute_command(
+            &adapters,
+            &sandbox,
+            &session_id,
+            "@alice hello there",
+            &CommandServices {
+                runtime_config: None,
+                memory: None,
+                controller: &test_controller(),
+                job_store: None,
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(tmp).ok();
+
+        assert_eq!(output, "@alice: hello there");
+    }
+
+    // -----------------------------------------------------------------------
+    // 7. /model list dispatches raw_args through to the operation
+    //    The source-local owner wrapper still exercises its Owner tier.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn owner_wrapper_dispatches_operator_command_without_error() {
+        let adapters = adapters();
+        let (sandbox, tmp) = test_sandbox();
+        let session_id = SessionId::new();
+
+        let output = super::execute_command(
+            &adapters,
+            &sandbox,
+            &session_id,
+            "/model list",
+            &CommandServices {
+                runtime_config: None,
+                memory: None,
+                controller: &test_controller(),
+                job_store: None,
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(tmp).ok();
+
+        assert!(
+            !output.starts_with("Unbekannter Command"),
+            "/model must be a known command; got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn observer_cannot_dispatch_an_operator_command() {
+        let adapters = adapters();
+        let (sandbox, tmp) = test_sandbox();
+        let session_id = SessionId::new();
+
+        let output = super::execute_command_as(
+            &adapters,
+            &sandbox,
+            &session_id,
+            harw_operations::PermissionTier::Observer,
+            "/model list",
+            &CommandServices {
+                runtime_config: None,
+                memory: None,
+                controller: &test_controller(),
+                job_store: None,
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(tmp).ok();
+
+        assert_eq!(
+            output,
+            "Berechtigung verweigert: /model erfordert Operator; aktuelle Stufe ist Observer"
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_alias_does_not_build_services_or_dispatch() {
+        let operation = Arc::new(CountingOperation::protected_alias());
+        let adapters = CommandAdapter::from_operation(operation.clone());
+        operation.meta_reads.store(0, Ordering::Relaxed);
+
+        let (sandbox, tmp) = test_sandbox();
+        let output = super::execute_command_as(
+            &adapters,
+            &sandbox,
+            &SessionId::new(),
+            PermissionTier::Observer,
+            "/guard",
+            &CommandServices {
+                runtime_config: None,
+                memory: None,
+                controller: &test_controller(),
+                job_store: None,
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(tmp).ok();
+
+        assert_eq!(
+            output,
+            "Berechtigung verweigert: /guard erfordert Operator; aktuelle Stufe ist Observer"
+        );
+        assert_eq!(
+            operation.meta_reads.load(Ordering::Relaxed),
+            1,
+            "denied alias lookup may inspect metadata once, but must not build services"
+        );
+        assert_eq!(
+            operation.dispatches.load(Ordering::Relaxed),
+            0,
+            "a denied alias must not dispatch its operation"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 8. Empty adapter list is honest about missing commands
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_empty_adapters_reports_unknown_for_any_command() {
+        let (sandbox, tmp) = test_sandbox();
+        let session_id = SessionId::new();
+
+        let output = super::execute_command(
+            &[],
+            &sandbox,
+            &session_id,
+            "/status",
+            &CommandServices {
+                runtime_config: None,
+                memory: None,
+                controller: &test_controller(),
+                job_store: None,
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(tmp).ok();
+
+        assert_eq!(output, "Unbekannter Command: /status");
+    }
+
+    // -----------------------------------------------------------------------
+    // 9. Alias dispatches to the same operation as the canonical command
+    //    Proves that the adapter list is the single source of truth:
+    //    no separate alias table is consulted.
+    // -----------------------------------------------------------------------
+
+    /// `alias_dispatches_to_same_handler_as_canonical`:
+    /// Executes `/m` (alias) and `/model` (canonical) and asserts both produce
+    /// non-"unknown" output, meaning both routes reach the same Operation.
+    /// The test also verifies that the `CommandRegistry` and the adapter
+    /// resolve to the same canonical spec name, confirming a single truth source.
+    #[tokio::test]
+    async fn alias_dispatches_to_same_handler_as_canonical() {
+        use crate::CommandRegistry;
+
+        let adapters = adapters();
+        let (sandbox, tmp) = test_sandbox();
+        let session_id = SessionId::new();
+        let controller = test_controller();
+
+        // Both the alias and the canonical form must reach the model operation.
+        let output_alias = super::execute_command(
+            &adapters,
+            &sandbox,
+            &session_id,
+            "/m",
+            &CommandServices {
+                runtime_config: None,
+                memory: None,
+                controller: &controller,
+                job_store: None,
+            },
+        )
+        .await;
+        let output_canonical = super::execute_command(
+            &adapters,
+            &sandbox,
+            &session_id,
+            "/model",
+            &CommandServices {
+                runtime_config: None,
+                memory: None,
+                controller: &controller,
+                job_store: None,
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(tmp).ok();
+
+        assert!(
+            !output_alias.starts_with("Unbekannter Command"),
+            "alias '/m' must resolve to the model operation, got: {output_alias}"
+        );
+        assert!(
+            !output_canonical.starts_with("Unbekannter Command"),
+            "canonical '/model' must resolve to the model operation, got: {output_canonical}"
+        );
+
+        // Verify that CommandRegistry (the discovery/autocomplete side) and the
+        // adapter lookup (the execution side) agree on the same canonical name.
+        let registry = CommandRegistry::built_in();
+        let spec_via_alias = registry
+            .find("m")
+            .expect("'m' must be findable in CommandRegistry");
+        let spec_via_canonical = registry
+            .find("model")
+            .expect("'model' must be findable in CommandRegistry");
+        assert_eq!(
+            spec_via_alias.name.as_str(),
+            spec_via_canonical.name.as_str(),
+            "CommandRegistry.find('m') and CommandRegistry.find('model') \
+             must map to the same canonical spec name"
+        );
+
+        // Cross-check: the adapter that handles the alias must be the model
+        // operation — verify by canonical path.
+        let model_adapter = adapters
+            .iter()
+            .find(|a| a.path() == "/model")
+            .expect("a /model adapter must exist");
+        let alias_resolves_same_op = model_adapter.operation().meta().aliases.contains(&"m");
+        assert!(
+            alias_resolves_same_op,
+            "the /model adapter's OperationMeta must declare 'm' as an alias"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 10. Long-lived controller survives two build_services calls
+    //     Proves that Arc + ServiceMap no longer clobbers state between commands.
+    // -----------------------------------------------------------------------
+
+    /// `long_lived_controller_survives_two_build_services_calls`:
+    /// Baut einen `Arc<TuiSessionController>`, setzt `reasoning_effort` auf `High`,
+    /// ruft `build_services` zweimal auf und prüft, dass der Wert nach beiden Aufrufen
+    /// erhalten bleibt — d.h. kein frischer Controller mehr pro Aufruf erzeugt wird.
+    #[test]
+    fn test_long_lived_controller_survives_two_build_services_calls() {
+        use harw_operations::{SessionController, SharedSessionController};
+        use harw_types::ReasoningEffort;
+
+        let adapters = adapters();
+        let controller = Arc::new(TuiSessionController::new());
+
+        // Setze einen Nicht-Default-Effort auf den langlebigen Controller.
+        controller
+            .set_reasoning_effort(Some(ReasoningEffort::High))
+            .expect("set_reasoning_effort must succeed");
+
+        // Erster build_services-Aufruf — klont den Controller-Arc in die ServiceMap.
+        let services1 = super::build_services(&adapters, None, None, &controller, None);
+        // Abruf via SharedSessionController-TypeId (Arc<dyn SessionController>).
+        let retrieved1 = services1
+            .get::<SharedSessionController>()
+            .expect("SharedSessionController must be in ServiceMap after first call");
+        assert_eq!(
+            retrieved1.snapshot().reasoning_effort,
+            Some(ReasoningEffort::High),
+            "first build_services call must expose the pre-set reasoning effort"
+        );
+
+        // Zweiter build_services-Aufruf — derselbe Arc, keine neue Allokation.
+        let services2 = super::build_services(&adapters, None, None, &controller, None);
+        let retrieved2 = services2
+            .get::<SharedSessionController>()
+            .expect("SharedSessionController must be in ServiceMap after second call");
+        assert_eq!(
+            retrieved2.snapshot().reasoning_effort,
+            Some(ReasoningEffort::High),
+            "second build_services call must still see the original reasoning effort — \
+             the long-lived Arc was not replaced by a fresh controller"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 11. Resolved runtime config keeps its composition-root Arc identity
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_services_preserves_resolved_config_arc() {
+        let adapters = adapters();
+        let controller = test_controller();
+        let runtime_config = Arc::new(harw_config::ResolvedConfig::default());
+
+        let services =
+            super::build_services(&adapters, Some(&runtime_config), None, &controller, None);
+        let retrieved = services
+            .get::<Arc<harw_config::ResolvedConfig>>()
+            .expect("ResolvedConfig Arc must be present when supplied");
+
+        assert!(
+            Arc::ptr_eq(retrieved, &runtime_config),
+            "ServiceMap must retain the exact Arc resolved by the composition root"
+        );
+    }
+
+    #[test]
+    fn build_services_preserves_durable_job_store_arc() {
+        let adapters = adapters();
+        let controller = test_controller();
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(harw_session_store::JobStore::new(temp.path()));
+
+        let services = super::build_services(&adapters, None, None, &controller, Some(&store));
+        let resolved = services
+            .get::<Arc<harw_session_store::JobStore>>()
+            .expect("durable job store must be available to command operations");
+
+        assert!(Arc::ptr_eq(resolved, &store));
+    }
+}

@@ -1,0 +1,5 @@
+error: Metrikname `harw_data_read_total` mit dieser Einheit muss `_bytes` im Namen enthalten
+ --> tests/compile_fail/13_metrics_unit_bytes_missing_suffix.rs:4:81
+  |
+4 |     DATA_READ: counter, unit = bytes, labels = [], cardinality = single, name = "harw_data_read_total";
+  |                                                                                 ^^^^^^^^^^^^^^^^^^^^^^

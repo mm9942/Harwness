@@ -1,0 +1,569 @@
+{
+  "vendor": "meta",
+  "verified_at": "2026-07-16",
+  "primary_sources": [
+    {
+      "url": "https://ai.meta.com/blog/llama-4-multimodal-intelligence/",
+      "title": "The Llama 4 herd: The beginning of a new era of natively multimodal AI innovation",
+      "type": "official_blog"
+    },
+    {
+      "url": "https://huggingface.co/blog/llama4-release",
+      "title": "Welcome Llama 4 Maverick & Scout on Hugging Face",
+      "type": "hf_blog"
+    },
+    {
+      "url": "https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct",
+      "title": "meta-llama/Llama-4-Scout-17B-16E-Instruct Model Card",
+      "type": "hf_model_card"
+    },
+    {
+      "url": "https://huggingface.co/meta-llama/Llama-4-Maverick-17B-128E",
+      "title": "meta-llama/Llama-4-Maverick-17B-128E Model Card",
+      "type": "hf_model_card"
+    },
+    {
+      "url": "https://huggingface.co/meta-llama/Meta-Llama-3.3-70B-Instruct",
+      "title": "meta-llama/Meta-Llama-3.3-70B-Instruct Model Card",
+      "type": "hf_model_card"
+    },
+    {
+      "url": "https://www.llama.com/docs/model-cards-and-prompt-formats/llama4/",
+      "title": "Llama 4 Model Cards and Prompt Formats",
+      "type": "official_docs"
+    },
+    {
+      "url": "https://www.llama.com/docs/model-cards-and-prompt-formats/llama3_3/",
+      "title": "Llama 3.3 Model Cards and Prompt Formats",
+      "type": "official_docs"
+    },
+    {
+      "url": "https://console.groq.com/docs/models",
+      "title": "Groq Supported Models",
+      "type": "provider_docs"
+    },
+    {
+      "url": "https://www.together.ai/blog/llama-4",
+      "title": "Together AI partners with Meta to offer Llama 4",
+      "type": "provider_blog"
+    },
+    {
+      "url": "https://fireworks.ai/blog/llama4-maverick",
+      "title": "Optimizing Llama 4 Maverick on Fireworks AI",
+      "type": "provider_blog"
+    },
+    {
+      "url": "https://www.cerebras.ai/press-release/llama4PR",
+      "title": "Cerebras Launches World's Fastest Inference for Meta Llama 4",
+      "type": "provider_press"
+    },
+    {
+      "url": "https://inference-docs.cerebras.ai/models/overview",
+      "title": "Cerebras Inference Model Catalog",
+      "type": "provider_docs"
+    }
+  ],
+  "releases": [
+    {
+      "family": "llama",
+      "version": "4-scout-17b-16e",
+      "variant": "instruct",
+      "lifecycle": "ga",
+      "released": "2025-04-05",
+      "architecture": "moe",
+      "active_params_b": 17,
+      "total_params_b": 109,
+      "num_experts": 16,
+      "native_context_window": 10000000,
+      "max_output_tokens": null,
+      "modalities": ["text", "image"],
+      "quantization_native": "bf16",
+      "license": "Llama 4 Community License",
+      "hf_id": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+      "hf_base_id": "meta-llama/Llama-4-Scout-17B-16E",
+      "notes": "Fits on single H100 with int4 quantization. iRoPE architecture enables 10M context. EU distribution restricted.",
+      "sources": [
+        {"url": "https://ai.meta.com/blog/llama-4-multimodal-intelligence/"},
+        {"url": "https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct"},
+        {"url": "https://huggingface.co/blog/llama4-release"}
+      ],
+      "provider_offerings": [
+        {
+          "provider_id": "groq",
+          "endpoint_model_id": "meta-llama/llama-4-scout-17b-16e-instruct",
+          "status": "preview",
+          "context_window": 131072,
+          "max_completion_tokens": 8192,
+          "quantization": null,
+          "notes": "Groq caps context at 131k (vs 10M native). Preview tier only — not for production. ~750 t/sec.",
+          "sources": [
+            {"url": "https://console.groq.com/docs/models"},
+            {"url": "https://console.groq.com/docs/model/meta-llama/llama-4-maverick-17b-128e-instruct"}
+          ]
+        },
+        {
+          "provider_id": "together",
+          "endpoint_model_id": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+          "status": "ga",
+          "context_window": 327680,
+          "max_completion_tokens": null,
+          "quantization": "fp16",
+          "notes": "Together AI launched at 300k context with plans to expand toward 10M. FP16 precision.",
+          "sources": [
+            {"url": "https://www.together.ai/models/llama-4-scout"},
+            {"url": "https://www.together.ai/blog/llama-4"}
+          ]
+        },
+        {
+          "provider_id": "fireworks",
+          "endpoint_model_id": "accounts/fireworks/models/llama4-scout-instruct-basic",
+          "status": "ga",
+          "context_window": 1048576,
+          "max_completion_tokens": null,
+          "quantization": "fp8",
+          "notes": "Fireworks supports ~1M context for Scout. FP8 via FireOptimizer.",
+          "sources": [
+            {"url": "https://fireworks.ai/models/fireworks/llama4-scout-instruct-basic"},
+            {"url": "https://fireworks.ai/blog/llama4-maverick"}
+          ]
+        },
+        {
+          "provider_id": "cerebras",
+          "endpoint_model_id": "llama-4-scout-17b-16e-instruct",
+          "status": "ga",
+          "context_window": null,
+          "max_completion_tokens": null,
+          "quantization": null,
+          "notes": "Available on Cerebras Cloud. ~2600 t/sec (19x faster than GPU per Artificial Analysis). Dedicated endpoint HF ID: meta-llama/Llama-4-Scout-17B-16E-Instruct.",
+          "sources": [
+            {"url": "https://www.cerebras.ai/press-release/llama4PR"},
+            {"url": "https://inference-docs.cerebras.ai/dedicated/overview"}
+          ]
+        }
+      ]
+    },
+    {
+      "family": "llama",
+      "version": "4-maverick-17b-128e",
+      "variant": "instruct",
+      "lifecycle": "ga",
+      "released": "2025-04-05",
+      "architecture": "moe",
+      "active_params_b": 17,
+      "total_params_b": 400,
+      "num_experts": 128,
+      "native_context_window": 1000000,
+      "max_output_tokens": null,
+      "modalities": ["text", "image"],
+      "quantization_native": "bf16_and_fp8",
+      "license": "Llama 4 Community License",
+      "hf_id": "meta-llama/Llama-4-Maverick-17B-128E",
+      "hf_instruct_id": "meta-llama/Llama-4-Maverick-17B-128E-Instruct",
+      "hf_original_id": "meta-llama/Llama-4-Maverick-17B-128E-Original",
+      "notes": "Original checkpoint for llama-stack. EU distribution restricted. Beats GPT-4o and Gemini 2.0 Flash on LMSYS Arena (1417 ELO). BF16 and FP8 weights available.",
+      "sources": [
+        {"url": "https://ai.meta.com/blog/llama-4-multimodal-intelligence/"},
+        {"url": "https://huggingface.co/meta-llama/Llama-4-Maverick-17B-128E-Original"},
+        {"url": "https://huggingface.co/blog/llama4-release"}
+      ],
+      "provider_offerings": [
+        {
+          "provider_id": "groq",
+          "endpoint_model_id": "meta-llama/llama-4-maverick-17b-128e-instruct",
+          "status": "deprecated",
+          "context_window": 131072,
+          "max_completion_tokens": null,
+          "quantization": null,
+          "notes": "Deprecated on Groq Feb 20 2026. Migration target: openai/gpt-oss-120b. Was preview-tier only.",
+          "sources": [
+            {"url": "https://console.groq.com/docs/model/meta-llama/llama-4-maverick-17b-128e-instruct"},
+            {"url": "https://console.groq.com/docs/deprecations"}
+          ]
+        },
+        {
+          "provider_id": "together",
+          "endpoint_model_id": "meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+          "status": "ga",
+          "context_window": 500000,
+          "max_completion_tokens": null,
+          "quantization": "fp8",
+          "notes": "Together AI launched at 500k context. FP8 quantization.",
+          "sources": [
+            {"url": "https://www.together.ai/blog/llama-4"},
+            {"url": "https://www.together.ai/models-providers/meta"}
+          ]
+        },
+        {
+          "provider_id": "fireworks",
+          "endpoint_model_id": "accounts/fireworks/models/llama4-maverick-instruct-basic",
+          "status": "ga",
+          "context_window": 1000000,
+          "max_completion_tokens": null,
+          "quantization": "fp8",
+          "notes": "FP8 via FireOptimizer. 145 t/sec streaming on H200. FireAttention for chunked local attention.",
+          "sources": [
+            {"url": "https://fireworks.ai/blog/llama4-maverick"}
+          ]
+        },
+        {
+          "provider_id": "cerebras",
+          "endpoint_model_id": "meta-llama/Llama-4-Maverick-17B-128E-Instruct",
+          "status": "ga",
+          "context_window": null,
+          "max_completion_tokens": null,
+          "quantization": null,
+          "notes": "Dedicated endpoint. ~2522 t/sec per Artificial Analysis (world record for 400B class). Uses dedicated endpoint format, not shared cloud ID.",
+          "sources": [
+            {"url": "https://www.cerebras.ai/press-release/maverick"},
+            {"url": "https://inference-docs.cerebras.ai/dedicated/overview"}
+          ]
+        }
+      ]
+    },
+    {
+      "family": "llama",
+      "version": "4-behemoth",
+      "variant": "base",
+      "lifecycle": "unreleased",
+      "released": null,
+      "architecture": "moe",
+      "active_params_b": 288,
+      "total_params_b": 2000,
+      "num_experts": 16,
+      "native_context_window": null,
+      "max_output_tokens": null,
+      "modalities": ["text"],
+      "quantization_native": null,
+      "license": null,
+      "hf_id": null,
+      "notes": "Teacher model used for co-distillation of Scout and Maverick. Not publicly released as of 2026-07. Outperforms GPT-4.5, Claude Sonnet 3.7, Gemini 2.0 Pro on STEM benchmarks per Meta claims. Requires multi-node GPU clusters.",
+      "sources": [
+        {"url": "https://ai.meta.com/blog/llama-4-multimodal-intelligence/"},
+        {"url": "https://serenitiesai.com/articles/llama-4-behemoth-maverick-scout-review-2026"}
+      ],
+      "provider_offerings": []
+    },
+    {
+      "family": "llama",
+      "version": "3.3-70b",
+      "variant": "instruct",
+      "lifecycle": "ga",
+      "released": "2024-12-05",
+      "architecture": "dense_transformer",
+      "active_params_b": 70,
+      "total_params_b": 70,
+      "num_experts": null,
+      "native_context_window": 128000,
+      "max_output_tokens": 2048,
+      "modalities": ["text"],
+      "quantization_native": null,
+      "license": "Llama 3 Community License",
+      "hf_id": "meta-llama/Meta-Llama-3.3-70B-Instruct",
+      "notes": "Instruct-only release (no pretrained base published). GQA architecture. Multilingual: EN/DE/FR/IT/PT/HI/ES/TH. Knowledge cutoff Dec 2023. Matches Llama 3.1 405B quality at 70B size.",
+      "sources": [
+        {"url": "https://huggingface.co/meta-llama/Meta-Llama-3.3-70B-Instruct"},
+        {"url": "https://www.llama.com/docs/model-cards-and-prompt-formats/llama3_3/"},
+        {"url": "https://ai.meta.com/blog/meta-llama-3-1/"}
+      ],
+      "provider_offerings": [
+        {
+          "provider_id": "groq",
+          "endpoint_model_id": "llama-3.3-70b-versatile",
+          "status": "deprecated",
+          "context_window": 131072,
+          "max_completion_tokens": 32768,
+          "quantization": null,
+          "notes": "Deprecated Jun 17 2026. Migration target: openai/gpt-oss-120b or qwen/qwen3.6-27b. ~280 t/sec. Also: llama-3.3-70b-specdec (speculative decoding variant, 8k context).",
+          "sources": [
+            {"url": "https://console.groq.com/docs/models"},
+            {"url": "https://console.groq.com/docs/deprecations"},
+            {"url": "https://console.groq.com/docs/model/llama-3.3-70b-versatile"}
+          ]
+        },
+        {
+          "provider_id": "together",
+          "endpoint_model_id": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+          "status": "ga",
+          "context_window": 131072,
+          "max_completion_tokens": null,
+          "quantization": null,
+          "notes": "Free tier also available: meta-llama/Llama-3.3-70B-Instruct-Turbo-Free. Pricing ~$1.04/M tokens (May 2026).",
+          "sources": [
+            {"url": "https://www.together.ai/models/llama-3-3-70b"},
+            {"url": "https://www.together.ai/blog/llama-3-3"}
+          ]
+        },
+        {
+          "provider_id": "fireworks",
+          "endpoint_model_id": "accounts/fireworks/models/llama-v3p3-70b-instruct",
+          "status": "ga",
+          "context_window": 131072,
+          "max_completion_tokens": null,
+          "quantization": null,
+          "notes": "$0.90/M tokens serverless.",
+          "sources": [
+            {"url": "https://fireworks.ai/models/fireworks/llama-v3p3-70b-instruct"}
+          ]
+        },
+        {
+          "provider_id": "cerebras",
+          "endpoint_model_id": "llama-3.3-70b",
+          "status": "deprecated",
+          "context_window": null,
+          "max_completion_tokens": null,
+          "quantization": null,
+          "notes": "Deprecated on Cerebras public cloud in favor of gpt-oss-120b. llama3.1-70b alias automatically upgraded to llama-3.3-70b during transition period. Dedicated endpoint: meta-llama/Llama-3.3-70B-Instruct. ~2100 t/sec when active.",
+          "sources": [
+            {"url": "https://inference-docs.cerebras.ai/models/overview"},
+            {"url": "https://inference-docs.cerebras.ai/support/deprecation"}
+          ]
+        }
+      ]
+    },
+    {
+      "family": "llama",
+      "version": "3.1-405b",
+      "variant": "instruct",
+      "lifecycle": "ga",
+      "released": "2024-07-23",
+      "architecture": "dense_transformer",
+      "active_params_b": 405,
+      "total_params_b": 405,
+      "num_experts": null,
+      "native_context_window": 131072,
+      "max_output_tokens": null,
+      "modalities": ["text"],
+      "quantization_native": null,
+      "license": "Llama 3 Community License",
+      "hf_id": "meta-llama/Meta-Llama-3.1-405B-Instruct",
+      "notes": "Largely superseded by Llama 3.3 70B for most tasks (similar quality, lower cost). Still used for research requiring max dense-model scale. Requires 8x A100 80GB at Q4 (~243 GB VRAM).",
+      "sources": [
+        {"url": "https://ai.meta.com/blog/meta-llama-3-1/"},
+        {"url": "https://huggingface.co/blog/llama31"}
+      ],
+      "provider_offerings": [
+        {
+          "provider_id": "groq",
+          "endpoint_model_id": null,
+          "status": "not_offered",
+          "context_window": null,
+          "max_completion_tokens": null,
+          "quantization": null,
+          "notes": "Groq does not host Llama 3.1 405B. Hardware constraints; Groq focuses on smaller models for speed.",
+          "sources": [
+            {"url": "https://console.groq.com/docs/models"}
+          ]
+        },
+        {
+          "provider_id": "together",
+          "endpoint_model_id": "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo",
+          "status": "ga",
+          "context_window": 130815,
+          "max_completion_tokens": null,
+          "quantization": "fp8",
+          "notes": "FP8 precision. Slight context cap vs 131072 native.",
+          "sources": [
+            {"url": "https://www.together.ai/models/llama-3-1-405b"}
+          ]
+        },
+        {
+          "provider_id": "fireworks",
+          "endpoint_model_id": "accounts/fireworks/models/llama-v3p1-405b-instruct",
+          "status": "ga",
+          "context_window": 131072,
+          "max_completion_tokens": null,
+          "quantization": "fp8",
+          "notes": "Served in FP8 on AMD Instinct MI300 and NVIDIA H100. Closely matches reference implementation.",
+          "sources": [
+            {"url": "https://fireworks.ai/models/fireworks/llama-v3p1-405b-instruct"},
+            {"url": "https://fireworks.ai/blog/introducing-llama3-1-405b-on-fireworks"}
+          ]
+        },
+        {
+          "provider_id": "cerebras",
+          "endpoint_model_id": null,
+          "status": "not_offered",
+          "context_window": null,
+          "max_completion_tokens": null,
+          "quantization": null,
+          "notes": "Cerebras public cloud does not list Llama 3.1 405B. Available only via dedicated endpoint arrangements.",
+          "sources": [
+            {"url": "https://inference-docs.cerebras.ai/models/overview"}
+          ]
+        }
+      ]
+    },
+    {
+      "family": "llama",
+      "version": "3.1-70b",
+      "variant": "instruct",
+      "lifecycle": "legacy",
+      "released": "2024-07-23",
+      "architecture": "dense_transformer",
+      "active_params_b": 70,
+      "total_params_b": 70,
+      "num_experts": null,
+      "native_context_window": 131072,
+      "max_output_tokens": null,
+      "modalities": ["text"],
+      "quantization_native": null,
+      "license": "Llama 3 Community License",
+      "hf_id": "meta-llama/Meta-Llama-3.1-70B-Instruct",
+      "notes": "Superseded by Llama 3.3 70B (same VRAM, better benchmarks). Groq deprecated in favor of 3.3 70B. Legacy status — still hosted by providers but not recommended for new deployments.",
+      "sources": [
+        {"url": "https://ai.meta.com/blog/meta-llama-3-1/"},
+        {"url": "https://huggingface.co/meta-llama/Llama-3.1-70B-Instruct"}
+      ],
+      "provider_offerings": [
+        {
+          "provider_id": "groq",
+          "endpoint_model_id": null,
+          "status": "deprecated",
+          "context_window": null,
+          "max_completion_tokens": null,
+          "quantization": null,
+          "notes": "Deprecated by Groq Dec 2024 in favor of llama-3.3-70b-versatile.",
+          "sources": [
+            {"url": "https://console.groq.com/docs/deprecations"}
+          ]
+        },
+        {
+          "provider_id": "together",
+          "endpoint_model_id": "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+          "status": "ga",
+          "context_window": 131072,
+          "max_completion_tokens": null,
+          "quantization": "fp8",
+          "notes": "FP8 precision.",
+          "sources": [
+            {"url": "https://www.together.ai/models/llama-3-1-70b"}
+          ]
+        },
+        {
+          "provider_id": "fireworks",
+          "endpoint_model_id": "accounts/fireworks/models/llama-v3p1-70b-instruct",
+          "status": "ga",
+          "context_window": 131072,
+          "max_completion_tokens": null,
+          "quantization": null,
+          "notes": "$0.90/M tokens serverless.",
+          "sources": [
+            {"url": "https://fireworks.ai/models/fireworks/llama-v3p1-70b-instruct"}
+          ]
+        },
+        {
+          "provider_id": "cerebras",
+          "endpoint_model_id": "llama3.1-70b",
+          "status": "deprecated",
+          "context_window": null,
+          "max_completion_tokens": null,
+          "quantization": null,
+          "notes": "Aliased to llama-3.3-70b during transition. Alias no longer maintained.",
+          "sources": [
+            {"url": "https://inference-docs.cerebras.ai/support/change-log"}
+          ]
+        }
+      ]
+    },
+    {
+      "family": "llama",
+      "version": "3.1-8b",
+      "variant": "instruct",
+      "lifecycle": "ga",
+      "released": "2024-07-23",
+      "architecture": "dense_transformer",
+      "active_params_b": 8,
+      "total_params_b": 8,
+      "num_experts": null,
+      "native_context_window": 131072,
+      "max_output_tokens": null,
+      "modalities": ["text"],
+      "quantization_native": null,
+      "license": "Llama 3 Community License",
+      "hf_id": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+      "notes": "Still widely used for edge/consumer GPU deployments and fine-tuning. Large community fine-tune ecosystem. Qwen 3 8B now outperforms on most benchmarks but Llama 3.1 8B retains ecosystem advantage.",
+      "sources": [
+        {"url": "https://ai.meta.com/blog/meta-llama-3-1/"},
+        {"url": "https://huggingface.co/meta-llama/Llama-3.1-70B"}
+      ],
+      "provider_offerings": [
+        {
+          "provider_id": "groq",
+          "endpoint_model_id": "llama-3.1-8b-instant",
+          "status": "deprecated",
+          "context_window": 131072,
+          "max_completion_tokens": 131072,
+          "quantization": null,
+          "notes": "Deprecated Jun 17 2026. Migration target: openai/gpt-oss-20b. ~560 t/sec when active.",
+          "sources": [
+            {"url": "https://console.groq.com/docs/models"},
+            {"url": "https://console.groq.com/docs/model/llama-3.1-8b-instant"}
+          ]
+        },
+        {
+          "provider_id": "together",
+          "endpoint_model_id": "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+          "status": "ga",
+          "context_window": 131072,
+          "max_completion_tokens": null,
+          "quantization": null,
+          "notes": null,
+          "sources": [
+            {"url": "https://www.together.ai/models-providers/meta"}
+          ]
+        },
+        {
+          "provider_id": "fireworks",
+          "endpoint_model_id": "accounts/fireworks/models/llama-v3p1-8b-instruct",
+          "status": "ga",
+          "context_window": 131072,
+          "max_completion_tokens": null,
+          "quantization": null,
+          "notes": null,
+          "sources": [
+            {"url": "https://docs.fireworks.ai/models/overview"}
+          ]
+        },
+        {
+          "provider_id": "cerebras",
+          "endpoint_model_id": null,
+          "status": "not_offered",
+          "context_window": null,
+          "max_completion_tokens": null,
+          "quantization": null,
+          "notes": "Cerebras public cloud focuses on larger models. 8B not listed.",
+          "sources": [
+            {"url": "https://inference-docs.cerebras.ai/models/overview"}
+          ]
+        }
+      ]
+    }
+  ],
+  "unresolved_questions": [
+    {
+      "id": "uq-1",
+      "question": "Llama 4 Maverick instruct HuggingFace ID — the instruct-tuned HF model card ID is not definitively confirmed as meta-llama/Llama-4-Maverick-17B-128E-Instruct vs meta-llama/Llama-4-Maverick-17B-128E. The -Original suffix denotes the llama-stack checkpoint. Needs direct HF page verification.",
+      "confidence": "medium"
+    },
+    {
+      "id": "uq-2",
+      "question": "Cerebras exact context window for Llama 4 Scout/Maverick not documented publicly in the model catalog page (only dedicated endpoint references). Requires authenticated API introspection.",
+      "confidence": "low"
+    },
+    {
+      "id": "uq-3",
+      "question": "Llama 4 Behemoth: no public HF ID, no context window, no release date confirmed as of 2026-07-16. Still listed as in-training.",
+      "confidence": "confirmed_gap"
+    },
+    {
+      "id": "uq-4",
+      "question": "Together AI context window for Llama 4 Scout: launched at 327,680 (300k) with stated intent to expand toward 10M. Current cap as of 2026-07 not verified.",
+      "confidence": "medium"
+    },
+    {
+      "id": "uq-5",
+      "question": "Groq deprecation status of llama-3.3-70b-versatile and llama-3.1-8b-instant: second-hand source (community post) reports Jun 17 2026 deprecation. Official deprecations page should be checked directly.",
+      "confidence": "medium"
+    }
+  ]
+}

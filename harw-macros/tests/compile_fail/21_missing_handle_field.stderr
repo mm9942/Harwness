@@ -1,0 +1,5 @@
+error: SensorSource erfordert ein Feld `handle: harw_dod_cap::SensorHandle<harw_dod_cap::Bound>`
+  --> tests/compile_fail/21_missing_handle_field.rs:11:8
+   |
+11 | struct ThermalSensor {
+   |        ^^^^^^^^^^^^^

@@ -1,0 +1,23 @@
+[package]
+name = "harw-observe-file"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# harw-macros ist Baseline jeder Crate für den einen Fehlertyp
+# (Kopfteil "Fehler": `#[derive(harw_macros::HarwError)]`), nicht Teil der
+# für harw-observe-file explizit aufgezählten Liste, aber ohne sie gäbe es
+# keinen Weg, `ObserveFileError` ohne anyhow/thiserror zu bauen.
+harw-macros = { path = "../harw-macros" }
+harw-observe = { path = "../harw-observe" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+jiff = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

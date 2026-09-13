@@ -1,0 +1,18 @@
+[package]
+name = "harw-context"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+jiff = { workspace = true }
+harw-types = { path = "../harw-types" }
+harw-lens-types = { path = "../harw-lens-types" }
+harw-macros = { path = "../harw-macros" }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

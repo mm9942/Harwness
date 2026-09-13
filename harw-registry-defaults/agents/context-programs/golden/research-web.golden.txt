@@ -1,0 +1,32 @@
+GOLDEN RENDER — harwness.context.research-web@1
+=================================================
+STATUS: von Hand aus der Renderlogik abgeleitet (kein Renderer gelaufen).
+Siehe `explore.golden.txt` für die Methodik.
+
+Aufgelöste Sektionsreihenfolge (base zuerst, dann research-web; `history.tail`
+wird von research-web überschrieben — gleiche Position, geänderter `detail`):
+  1. task.objective          strength=must-include  detail=full        trust=instruction  [von base]
+  2. history.tail            strength=must-include  detail=references  trust=evidence     [überschrieben von research-web]
+  3. task.read_scope         strength=must-include  detail=full        trust=data         [von research-web]
+  4. web.fetch_allowlist     strength=must-include  detail=full        trust=instruction  [von research-web]
+
+Ausschluss (Union): credential.*, secret.*, sibling_transcripts,
+full_parent_transcript (base) + deps.lockfile_index (research-web)
+
+--- Gerenderter Turn-Kontext (Platzhalter-Inhalt) ---
+
+## task.objective [instruction]
+<vollständiger Auftragstext des aktuellen Turns>
+
+## history.tail [evidence, references]
+[ref] section="history.tail" label="<Turn-Label>" trust=Evidence stability=<Stable|Volatile>
+ origin="<Herkunftsquelle>"@<Zeitstempel> cost=CostEstimate(<n>)
+ digest=b3:<hex> (load via context.load)
+<garantierter Schwanz (HISTORY_TAIL_GUARANTEED_GROUPS) bleibt vollständig gerendert,
+ kein [ref] für die jüngsten Gruppen>
+
+## task.read_scope [data]
+<vollständige Glob-/Verzeichnisliste des erlaubten Lesebereichs>
+
+## web.fetch_allowlist [instruction]
+<vollständige Liste erreichbarer Hosts gemäß Sandbox-Allowlist>

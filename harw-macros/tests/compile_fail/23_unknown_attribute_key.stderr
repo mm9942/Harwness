@@ -1,0 +1,5 @@
+error: unbekannter sensor-Schlüssel; erwartet: capability, id, metrics, error
+  --> tests/compile_fail/23_unknown_attribute_key.rs:10:5
+   |
+10 |     bogus = "x",
+   |     ^^^^^

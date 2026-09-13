@@ -1,0 +1,5 @@
+error: context_provider namespace `My.Namespace` contains invalid character 'M'; allowed characters are [a-z0-9_]
+ --> tests/compile_fail/31_context_provider_invalid_namespace_char.rs:6:32
+  |
+6 | #[context_provider(namespace = "My.Namespace")]
+  |                                ^^^^^^^^^^^^^^

@@ -1,0 +1,54 @@
+# Kontextprogramm für Implementierungsarbeit (schreibende Coding-Worker).
+#
+# WOFÜR: schreibt Code innerhalb eines vom Plan vorgegebenen Auftrags. Der
+# einzige der neun, dessen Kontext auf tatsächliches Schreiben zielt statt
+# auf Lesen/Bewerten/Vorschlagen — die Programmbibliothek regelt hier nicht,
+# WAS geschrieben werden darf (das ist `[tools]`/`[work]` der Rollen-
+# Definition), sondern nur, welche Sektionen der Umsetzer zwingend sieht.
+#
+# `extends = base`: `task.objective`/`history.tail` unverändert — Standard-
+# Bedarf; eine Umsetzungsaufgabe braucht weder mehr noch weniger Verlauf als
+# die Basis annimmt, weil der eigentliche Auftrag ohnehin bereits in
+# `task.objective` fixiert ist.
+#
+# ZUSÄTZLICHE SEKTIONEN:
+#   - `task.read_scope` (full/data, must-include): dieselbe Begründung wie
+#     bei `explore` — eine gekürzte Schreib-/Lesegrenze ist keine Grenze,
+#     hier sogar sicherheitsrelevanter, weil diese Rolle tatsächlich
+#     schreibt.
+#   - `plan.current` (summary/evidence, must-include): der Umsetzer muss
+#     wissen, welchem Plan er folgt, aber nicht dessen vollständige
+#     Begründungskette — anders als `plan` selbst, der den Plan gerade
+#     ERARBEITET, liest `implement` ihn nur als bereits fixierte Vorgabe.
+#     `summary` genügt hier, wo `plan.toml` `full` braucht (siehe dort für
+#     den Unterschied: Ersteller vs. Ausführender derselben Sektion).
+#
+# KEINE `references`-Sektion: eine Implementierungssitzung braucht in aller
+# Regel wenig, aber hochwertigen Kontext (Auftrag, Grenze, Plan) — keine der
+# Basissektionen ist hier so groß, dass eine Kappung sich lohnen würde.
+#
+# ZUSÄTZLICHER AUSSCHLUSS: `web.*` — Implementierung arbeitet mit dem, was
+# Recherche und Planung bereits beigebracht haben; ein eigener Netzzugriff
+# im selben Turn würde die in `research-web` gezogene Grenze (einzige Rolle
+# mit Netzzugang) unterlaufen.
+
+schema = "harwness.context/v1"
+id = "harwness.context.implement@1"
+version = "1.0.0"
+extends = { id = "harwness.context.base@1" }
+
+# `exclude` steht bewusst vor `[[sections]]` — siehe Kommentar in `base.toml`
+# zum TOML-Fallstrick mit Array-of-Tables.
+exclude = ["web.*"]
+
+[[sections]]
+name = "task.read_scope"
+strength = "must-include"
+detail = "full"
+trust = "data"
+
+[[sections]]
+name = "plan.current"
+strength = "must-include"
+detail = "summary"
+trust = "evidence"

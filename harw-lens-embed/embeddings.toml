@@ -1,0 +1,65 @@
+# Embedding-Katalog für `harw-lens-embed` (Knoten AW4-07).
+#
+# Wird über `include_str!` zur Kompilierzeit in `EmbeddingCatalog::load_default`
+# eingebettet -- kein Dateisystemzugriff zur Laufzeit.
+#
+# Jeder `[[model]]`-Eintrag trägt drei getrennte statische Schichten:
+#   - `model.spec`       -- was das Modell IST (unveränderlich)
+#   - `model.descriptor` -- wie man es BENUTZT (Präfixe, Normalisierung)
+#   - `model.runtime`    -- was zur Laufzeit GILT (Backend, Ort, Stapelgröße)
+# Die vierte Schicht, `ObservedBehavior` (was gemessen wurde), steht
+# absichtlich nicht in dieser Datei -- sie ist anfangs leer und wird zur
+# Laufzeit befüllt, nie statisch vorgegeben.
+#
+# `roles` bindet ein Modell an die `EmbeddingRole`-Werte, für die `route` es
+# in Betracht zieht.
+#
+# Das zweite `[[model]]` unten trägt seit Knoten AW7-06 den echten Modellnamen
+# eines existierenden OpenAI-kompatiblen Einbettungsmodells
+# (`text-embedding-3-large`, 3072 Dimensionen) statt eines generischen
+# Platzhalters -- sein `model.runtime.backend`-Wert
+# (`http-embed-openai-compatible`) beschreibt den Transport, den
+# `src/http_backend.rs::HttpEmbedBackend` implementiert. Der Katalogeintrag
+# beschreibt nur, WAS das Modell ist und WOFÜR es zuständig ist; er
+# konstruiert selbst keinen `Embedder` -- das bleibt Sache des Aufrufers
+# (siehe `HttpEmbedBackend::new`, das Basis-URL und API-Key entgegennimmt,
+# die kein `embeddings.toml`-Feld tragen kann, ohne ein Geheimnis in eine
+# eingebettete Datei zu schreiben).
+
+[[model]]
+roles = ["code", "confidential"]
+
+[model.spec]
+name = "local-minilm-l6-v2"
+dimensions = 384
+metric = "cosine"
+max_input_chars = 2048
+
+[model.descriptor]
+document_prefix = "passage: "
+query_prefix = "query: "
+normalize = true
+
+[model.runtime]
+backend = "onnx-local"
+locality = "local"
+batch_size = 32
+
+[[model]]
+roles = ["prose", "query"]
+
+[model.spec]
+name = "text-embedding-3-large"
+dimensions = 3072
+metric = "cosine"
+max_input_chars = 8192
+
+[model.descriptor]
+document_prefix = "passage: "
+query_prefix = "query: "
+normalize = false
+
+[model.runtime]
+backend = "http-embed-openai-compatible"
+locality = "remote"
+batch_size = 64

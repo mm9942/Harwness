@@ -1,0 +1,853 @@
+//! Ablage der Recherche-Ergebnisse als lesbare Markdown-Artefakte.
+//!
+//! # Verantwortungsbereich
+//! Der [`FindingStore`] besitzt das Verzeichnis `<HARW_HOME>/plans` und legt
+//! dort pro Plan und Frage genau eine Datei ab:
+//! `<root>/<plan_id>/research/<question_id>.md`. Jede Datei besteht aus
+//!
+//! 1. YAML-Frontmatter (`question_id`, `confidence`, `produced_by`,
+//!    `produced_at`, `evidence_count`) — maschinell auswertbar, ohne die Datei
+//!    ganz zu parsen;
+//! 2. einem Markdown-Körper für Menschen (Conclusion, Evidenzliste mit
+//!    Locators, verifizierte Versionen, Constraints, Kompatibilitätsnotizen,
+//!    offene Fragen);
+//! 3. einem kanonischen JSON-Block zwischen zwei Sentinel-Kommentaren, aus dem
+//!    [`FindingStore::read`] das [`ResearchFinding`] verlustfrei rekonstruiert.
+//!
+//! Punkt 3 ist der Grund, warum `read` kein Prosa-Parsing betreibt: die
+//! Markdown-Darstellung ist für Menschen da und darf sich ändern, die
+//! Rundreise hängt an der JSON-Kopie.
+//!
+//! # Untrusted Input
+//! `plan_id` und `question_id` stammen aus Modell-Ausgaben. Beide werden über
+//! [`sanitize_component`] auf ein einzelnes, harmloses Pfadsegment reduziert
+//! (kein `/`, kein `..`, kein Nullbyte, keine Leerzeichen, Länge gedeckelt).
+//! Ein Pfad kann den Store-Root damit nicht verlassen.
+//!
+//! # Exportierte Typen
+//! [`FindingStore`], [`finding_locator`], [`offset_from_timestamp`].
+//!
+//! # Concurrency
+//! [`FindingStore`] ist ein unveränderlicher Werttyp (`Send + Sync`); alle
+//! Methoden nehmen `&self`. Schreibvorgänge laufen über
+//! `harw_knowledge::store::write_atomic` (Temp-Datei + `rename`), sind also
+//! gegenüber gleichzeitigen Lesern atomar.
+//!
+//! # Fehler
+//! [`PlanBridgeError::Io`], [`PlanBridgeError::Research`],
+//! [`PlanBridgeError::Json`].
+//!
+//! # Examples
+//! ```rust,no_run
+//! use harw_plan_bridge::FindingStore;
+//!
+//! let store = FindingStore::new("/tmp/harw-home/plans");
+//! match store.list("p-1") {
+//!     Ok(question_ids) => println!("{} Findings abgelegt", question_ids.len()),
+//!     Err(error) => eprintln!("Findings nicht lesbar: {error}"),
+//! }
+//! ```
+
+use std::path::{Path, PathBuf};
+
+use harw_plan::{EvidenceKind, EvidenceRef};
+use harw_research::{Confidence, ResearchError, ResearchFinding, parse_finding, validate_finding};
+use time::OffsetDateTime;
+
+use crate::error::{PlanBridgeError, map_knowledge_error};
+
+/// Obergrenze für ein einzelnes Pfadsegment nach der Sanitisierung.
+const MAX_COMPONENT_LEN: usize = 128;
+
+/// Ersatzname, wenn eine ID nach dem Trimmen leer ist.
+const BLANK_COMPONENT: &str = "_";
+
+/// Unterverzeichnis je Plan, in dem die Findings liegen.
+const RESEARCH_DIR: &str = "research";
+
+/// Beginn des kanonischen JSON-Blocks.
+const JSON_BEGIN: &str = "<!-- harw-plan-bridge:finding-json:begin -->";
+
+/// Ende des kanonischen JSON-Blocks.
+const JSON_END: &str = "<!-- harw-plan-bridge:finding-json:end -->";
+
+/// Reduziert eine Modell-gelieferte ID auf ein einzelnes, harmloses Pfadsegment.
+///
+/// # Description
+/// Genau zwei Regeln, damit das Ergebnis prüfbar bleibt:
+///
+/// 1. Jedes Zeichen außerhalb von `[A-Za-z0-9._-]` — insbesondere `/`, `\`,
+///    `:` und Nullbytes — wird durch `-` ersetzt. Damit kann das Ergebnis
+///    keinen Verzeichnistrenner mehr enthalten und ist immer *ein* Segment.
+/// 2. Beginnt das Ergebnis mit `.`, wird ein `_` vorangestellt. Damit sind
+///    weder `.` noch `..` (Traversal) noch ein verstecktes Dotfile
+///    darstellbar; ein `..` *innerhalb* eines längeren Namens ist harmlos,
+///    weil nur ein vollständiges `..`-Segment traversiert.
+///
+/// Die Länge wird auf [`MAX_COMPONENT_LEN`] gekappt (zuzüglich des
+/// eventuellen `_`-Präfixes). Die Funktion ist total: eine leere oder nur aus
+/// Leerzeichen bestehende Eingabe ergibt [`BLANK_COMPONENT`].
+///
+/// # Arguments
+/// - `raw` (`&str`): die ungeprüfte ID aus einer Modell-Ausgabe.
+///
+/// # Returns
+/// Ein nicht-leeres Pfadsegment ohne Separatoren, das weder `.` noch `..` ist.
+fn sanitize_component(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return BLANK_COMPONENT.to_owned();
+    }
+
+    let mut out: String = trimmed
+        .chars()
+        .take(MAX_COMPONENT_LEN)
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+
+    if out.starts_with('.') {
+        out.insert(0, '_');
+    }
+
+    // Invariante: `trimmed` war nicht leer, also enthält `out` mindestens ein
+    // Zeichen. Der Zweig ist reine Absicherung gegen künftige Änderungen.
+    if out.is_empty() {
+        return BLANK_COMPONENT.to_owned();
+    }
+    out
+}
+
+/// Baut den relativen Lokator eines Finding-Artefakts.
+///
+/// # Description
+/// Der Lokator ist genau der Pfad relativ zum Store-Root, unter dem
+/// [`FindingStore::write`] die Datei ablegt. Er ist rein berechenbar (keine
+/// I/O), damit der [`crate::controller::PlanController`] denselben Lokator
+/// bilden kann, ohne den Store zu kennen.
+///
+/// # Arguments
+/// - `plan_id` (`&str`): Plan-Bezeichner (wird sanitisiert).
+/// - `question_id` (`&str`): Frage-Bezeichner (wird sanitisiert).
+///
+/// # Returns
+/// `"<plan_id>/research/<question_id>.md"` mit sanitisierten Segmenten.
+///
+/// # Examples
+/// ```rust
+/// use harw_plan_bridge::finding_locator;
+/// assert_eq!(
+///     finding_locator("p-1", "../../etc/passwd"),
+///     "p-1/research/_..-..-etc-passwd.md"
+/// );
+/// ```
+#[must_use]
+pub fn finding_locator(plan_id: &str, question_id: &str) -> String {
+    format!(
+        "{}/{RESEARCH_DIR}/{}.md",
+        sanitize_component(plan_id),
+        sanitize_component(question_id)
+    )
+}
+
+/// Konvertiert einen `jiff::Timestamp` in ein `time::OffsetDateTime` (UTC).
+///
+/// # Description
+/// `harw-research` datiert Findings mit `jiff`, `harw-plan` datiert Evidenz mit
+/// `time`. Dies ist die einzige Konvertierungsstelle im Crate. Ein Zeitpunkt
+/// außerhalb des von `time` darstellbaren Bereichs fällt auf
+/// `OffsetDateTime::UNIX_EPOCH` zurück, statt zu panicken — ein
+/// unrepräsentierbarer Zeitstempel darf keinen Prozess beenden.
+///
+/// # Arguments
+/// - `timestamp` (`jiff::Timestamp`): der Quellzeitpunkt.
+///
+/// # Returns
+/// Das äquivalente `OffsetDateTime` in UTC.
+#[must_use]
+pub fn offset_from_timestamp(timestamp: jiff::Timestamp) -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp_nanos(timestamp.as_nanosecond())
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH)
+}
+
+/// Serialisiert eine [`Confidence`] als stabilen Frontmatter-Wert.
+fn confidence_label(confidence: Confidence) -> &'static str {
+    match confidence {
+        Confidence::Low => "low",
+        Confidence::Medium => "medium",
+        Confidence::High => "high",
+        Confidence::Verified => "verified",
+    }
+}
+
+/// Maskiert einen Wert für die Verwendung in einfach gequoteten YAML-Skalaren.
+fn yaml_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Dateiablage für Recherche-Ergebnisse unterhalb von `<HARW_HOME>/plans`.
+///
+/// # Description
+/// Ein reiner Pfadhalter — der Store hält keinen Zustand und keine offenen
+/// Handles. Alle Methoden leiten den Zielpfad deterministisch aus `plan_id`
+/// und `question_id` ab (siehe [`finding_locator`]).
+///
+/// # Concurrency
+/// `Send + Sync`; gleichzeitige Schreiber auf verschiedene Fragen stören sich
+/// nicht, gleichzeitige Schreiber auf dieselbe Frage gewinnen atomar
+/// (letzter `rename` gewinnt, nie eine halb geschriebene Datei).
+#[derive(Debug, Clone)]
+pub struct FindingStore {
+    /// Wurzelverzeichnis, üblicherweise `<HARW_HOME>/plans`.
+    root: PathBuf,
+}
+
+impl FindingStore {
+    /// Erzeugt einen Store über dem angegebenen Plan-Verzeichnis.
+    ///
+    /// # Arguments
+    /// - `plans_dir` (`impl Into<PathBuf>`): Wurzel, üblicherweise
+    ///   `<HARW_HOME>/plans`. Das Verzeichnis muss nicht existieren; es wird
+    ///   beim ersten Schreiben angelegt.
+    ///
+    /// # Returns
+    /// Einen einsatzbereiten [`FindingStore`].
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_plan_bridge::FindingStore;
+    /// let store = FindingStore::new("/tmp/plans");
+    /// assert_eq!(store.root().to_string_lossy(), "/tmp/plans");
+    /// ```
+    pub fn new(plans_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            root: plans_dir.into(),
+        }
+    }
+
+    /// Erzeugt einen Store über `<home>/plans`.
+    ///
+    /// # Description
+    /// Bequemer Einstieg für Composition-Roots, die bereits ein
+    /// HARW-Home-Verzeichnis aufgelöst haben. Nutzt
+    /// `harw_home::paths::plans_dir`, damit die Layout-Entscheidung an genau
+    /// einer Stelle lebt.
+    ///
+    /// # Arguments
+    /// - `home` (`&Path`): das HARW-Home-Verzeichnis.
+    ///
+    /// # Returns
+    /// Einen [`FindingStore`] über `<home>/plans`.
+    #[must_use]
+    pub fn from_home(home: &Path) -> Self {
+        Self::new(harw_home::paths::plans_dir(home))
+    }
+
+    /// Gibt das Wurzelverzeichnis des Stores zurück.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Absoluter Pfad des Artefakts einer Frage.
+    ///
+    /// # Arguments
+    /// - `plan_id` (`&str`): Plan-Bezeichner (wird sanitisiert).
+    /// - `question_id` (`&str`): Frage-Bezeichner (wird sanitisiert).
+    ///
+    /// # Returns
+    /// `<root>/<plan_id>/research/<question_id>.md`.
+    #[must_use]
+    pub fn path_for(&self, plan_id: &str, question_id: &str) -> PathBuf {
+        self.root
+            .join(sanitize_component(plan_id))
+            .join(RESEARCH_DIR)
+            .join(format!("{}.md", sanitize_component(question_id)))
+    }
+
+    /// Schreibt ein Finding als Markdown-Artefakt (atomar).
+    ///
+    /// # Description
+    /// Validiert das Finding zunächst über
+    /// [`harw_research::validate_finding`] — ein Artefakt, das den
+    /// Recherche-Vertrag verletzt, wird gar nicht erst abgelegt. Danach wird
+    /// das Dokument (Frontmatter + Prosa + kanonisches JSON) gerendert und
+    /// über `harw_knowledge::store::write_atomic` per Temp-Datei und `rename`
+    /// eingesetzt.
+    ///
+    /// # Arguments
+    /// - `plan_id` (`&str`): Plan, zu dem das Finding gehört (wird sanitisiert).
+    /// - `finding` (`&ResearchFinding`): das abzulegende Ergebnis.
+    ///
+    /// # Returns
+    /// Den absoluten Pfad der geschriebenen Datei.
+    ///
+    /// # Errors
+    /// - [`PlanBridgeError::Research`]: wenn `validate_finding` das Finding
+    ///   ablehnt (leere Pflichtfelder, fehlende Evidenz bei Confidence
+    ///   `>= Medium`).
+    /// - [`PlanBridgeError::Json`]: wenn das Finding nicht serialisierbar ist.
+    /// - [`PlanBridgeError::Io`]: bei Fehlern beim Anlegen des Verzeichnisses
+    ///   oder beim atomaren Ersetzen der Datei.
+    ///
+    /// # Concurrency
+    /// Sicher aus mehreren Threads; der `rename` am Ende ist atomar.
+    pub fn write(
+        &self,
+        plan_id: &str,
+        finding: &ResearchFinding,
+    ) -> Result<PathBuf, PlanBridgeError> {
+        validate_finding(finding)?;
+
+        let path = self.path_for(plan_id, finding.question_id.as_str());
+        let document = render_document(finding)?;
+        harw_knowledge::store::write_atomic(&path, &document).map_err(map_knowledge_error)?;
+
+        tracing::debug!(
+            plan_id = plan_id,
+            question_id = %finding.question_id,
+            path = %path.display(),
+            "Finding-Artefakt geschrieben"
+        );
+        Ok(path)
+    }
+
+    /// Liest ein zuvor geschriebenes Finding zurück.
+    ///
+    /// # Description
+    /// Rekonstruiert das [`ResearchFinding`] aus dem kanonischen JSON-Block
+    /// des Artefakts, nicht aus der Prosa. Das Ergebnis ist bitgenau das
+    /// Objekt, das [`FindingStore::write`] übergeben bekam.
+    ///
+    /// # Arguments
+    /// - `plan_id` (`&str`): Plan-Bezeichner (wird sanitisiert).
+    /// - `question_id` (`&str`): Frage-Bezeichner (wird sanitisiert).
+    ///
+    /// # Returns
+    /// Das rekonstruierte [`ResearchFinding`].
+    ///
+    /// # Errors
+    /// - [`PlanBridgeError::Io`]: wenn die Datei fehlt oder nicht lesbar ist.
+    /// - [`PlanBridgeError::Research`]: wenn die Sentinel-Marken des
+    ///   kanonischen Blocks fehlen (`ResearchError::SchemaMismatch`) oder das
+    ///   JSON den Recherche-Vertrag verletzt.
+    pub fn read(
+        &self,
+        plan_id: &str,
+        question_id: &str,
+    ) -> Result<ResearchFinding, PlanBridgeError> {
+        let path = self.path_for(plan_id, question_id);
+        let raw = std::fs::read_to_string(&path)?;
+        let block = extract_canonical_block(&raw, &path)?;
+        let finding = parse_finding(block)?;
+        Ok(finding)
+    }
+
+    /// Listet die Frage-Bezeichner aller abgelegten Findings eines Plans.
+    ///
+    /// # Description
+    /// Liest `<root>/<plan_id>/research/` und liefert die Dateinamen ohne die
+    /// `.md`-Endung. Symlinks und Unterverzeichnisse werden übersprungen — ein
+    /// untergeschobener Link soll den Store nicht nach außen führen. Existiert
+    /// das Verzeichnis nicht, ist das Ergebnis leer (kein Fehler): ein Plan
+    /// ohne Recherche ist ein gültiger Zustand.
+    ///
+    /// # Arguments
+    /// - `plan_id` (`&str`): Plan-Bezeichner (wird sanitisiert).
+    ///
+    /// # Returns
+    /// Die Frage-Bezeichner, aufsteigend sortiert (deterministisch).
+    ///
+    /// # Errors
+    /// - [`PlanBridgeError::Io`]: wenn das Verzeichnis existiert, aber nicht
+    ///   gelesen werden kann.
+    pub fn list(&self, plan_id: &str) -> Result<Vec<String>, PlanBridgeError> {
+        let dir = self
+            .root
+            .join(sanitize_component(plan_id))
+            .join(RESEARCH_DIR);
+        if !dir.is_dir() {
+            return Ok(Vec::new());
+        }
+
+        let mut ids = Vec::new();
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) {
+                ids.push(stem.to_owned());
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
+    /// Erzeugt den [`EvidenceRef`], der an den Plan-Knoten gehängt wird.
+    ///
+    /// # Description
+    /// `kind` ist [`EvidenceKind::Finding`], `locator` der relative Pfad des
+    /// Artefakts (siehe [`finding_locator`]) und `attached_at` der
+    /// Produktionszeitpunkt des Findings — nicht die aktuelle Systemzeit,
+    /// damit die TTL-Prüfung in `harw_plan::graph::missing_explorations` das
+    /// tatsächliche Alter der Recherche sieht.
+    ///
+    /// # Arguments
+    /// - `plan_id` (`&str`): Plan-Bezeichner (wird sanitisiert).
+    /// - `finding` (`&ResearchFinding`): das belegende Ergebnis.
+    /// - `actor` (`&str`): Akteur, der die Evidenz anhängt (runtime-gesetzt,
+    ///   nicht aus der Modell-Ausgabe).
+    ///
+    /// # Returns
+    /// Den fertigen [`EvidenceRef`].
+    ///
+    /// # Concurrency
+    /// Rein funktional, keine I/O.
+    #[must_use]
+    pub fn evidence_for(
+        &self,
+        plan_id: &str,
+        finding: &ResearchFinding,
+        actor: &str,
+    ) -> EvidenceRef {
+        evidence_for_finding(plan_id, finding, actor)
+    }
+}
+
+/// Freie Variante von [`FindingStore::evidence_for`] für reine Aufrufer.
+///
+/// # Description
+/// Der [`crate::controller::PlanController`] darf keine I/O machen und damit
+/// auch keinen [`FindingStore`] halten. Er benutzt deshalb diese Funktion —
+/// identisches Ergebnis, kein Store nötig.
+///
+/// # Arguments
+/// - `plan_id` (`&str`): Plan-Bezeichner (wird sanitisiert).
+/// - `finding` (`&ResearchFinding`): das belegende Ergebnis.
+/// - `actor` (`&str`): Akteur, der die Evidenz anhängt.
+///
+/// # Returns
+/// Den [`EvidenceRef`] mit `kind = Finding`.
+#[must_use]
+pub fn evidence_for_finding(plan_id: &str, finding: &ResearchFinding, actor: &str) -> EvidenceRef {
+    EvidenceRef {
+        kind: EvidenceKind::Finding,
+        locator: finding_locator(plan_id, finding.question_id.as_str()),
+        attached_at: offset_from_timestamp(finding.produced_at),
+        actor: actor.to_owned(),
+        // Der Lokator zeigt auf die von `FindingStore::write` gerenderte
+        // Markdown-Datei (Frontmatter + Prosa + JSON-Block); diese Bytes
+        // liegen hier nicht vor, nur die strukturierten Rohdaten des Findings.
+        digest: None,
+    }
+}
+
+/// Rendert das vollständige Markdown-Dokument eines Findings.
+///
+/// # Errors
+/// [`PlanBridgeError::Json`], wenn das Finding nicht serialisierbar ist.
+fn render_document(finding: &ResearchFinding) -> Result<String, PlanBridgeError> {
+    let canonical = serde_json::to_string_pretty(finding)?;
+    let mut out = String::with_capacity(canonical.len() * 2);
+
+    // ── Frontmatter ──────────────────────────────────────────────────────
+    out.push_str("---\n");
+    out.push_str("question_id: ");
+    out.push_str(&yaml_quote(finding.question_id.as_str()));
+    out.push('\n');
+    out.push_str("confidence: ");
+    out.push_str(confidence_label(finding.confidence));
+    out.push('\n');
+    out.push_str("produced_by: ");
+    out.push_str(&yaml_quote(&finding.produced_by));
+    out.push('\n');
+    out.push_str("produced_at: ");
+    out.push_str(&yaml_quote(&finding.produced_at.to_string()));
+    out.push('\n');
+    out.push_str(&format!("evidence_count: {}\n", finding.evidence.len()));
+    out.push_str("---\n\n");
+
+    // ── Körper ───────────────────────────────────────────────────────────
+    out.push_str(&format!("# Finding {}\n\n", finding.question_id));
+    out.push_str("## Conclusion\n\n");
+    out.push_str(finding.conclusion.trim());
+    out.push_str("\n\n");
+
+    push_section(
+        &mut out,
+        "Evidenz",
+        finding.evidence.iter().map(|source| {
+            let excerpt = source.excerpt.trim();
+            if excerpt.is_empty() {
+                format!("`{}` (abgerufen {})", source.locator, source.retrieved_at)
+            } else {
+                format!(
+                    "`{}` (abgerufen {}) — {excerpt}",
+                    source.locator, source.retrieved_at
+                )
+            }
+        }),
+    );
+
+    push_section(
+        &mut out,
+        "Verifizierte Versionen",
+        finding.verified_versions.iter().map(|version| {
+            format!(
+                "`{} = \"{}\"` (geprüft gegen {})",
+                version.crate_name, version.version, version.verified_against
+            )
+        }),
+    );
+
+    push_section(&mut out, "Constraints", finding.constraints.iter().cloned());
+    push_section(
+        &mut out,
+        "Kompatibilität",
+        finding.compatibility_notes.iter().cloned(),
+    );
+    push_section(
+        &mut out,
+        "Offene Fragen",
+        finding.unresolved_questions.iter().cloned(),
+    );
+
+    // ── Kanonischer Block ────────────────────────────────────────────────
+    out.push_str("## Kanonisch\n\n");
+    out.push_str(JSON_BEGIN);
+    out.push_str("\n```json\n");
+    out.push_str(&canonical);
+    out.push_str("\n```\n");
+    out.push_str(JSON_END);
+    out.push('\n');
+
+    Ok(out)
+}
+
+/// Hängt eine Markdown-Liste an, sofern sie mindestens einen Eintrag hat.
+fn push_section(out: &mut String, heading: &str, items: impl Iterator<Item = String>) {
+    let entries: Vec<String> = items.collect();
+    if entries.is_empty() {
+        return;
+    }
+    out.push_str(&format!("## {heading}\n\n"));
+    for entry in entries {
+        out.push_str("- ");
+        out.push_str(entry.trim());
+        out.push('\n');
+    }
+    out.push('\n');
+}
+
+/// Schneidet den kanonischen JSON-Block aus einem Artefakt heraus.
+///
+/// # Errors
+/// [`PlanBridgeError::Research`] mit `SchemaMismatch`, wenn eine Sentinel-Marke
+/// fehlt oder in falscher Reihenfolge steht.
+fn extract_canonical_block<'a>(raw: &'a str, path: &Path) -> Result<&'a str, PlanBridgeError> {
+    let schema_error =
+        |reason: String| PlanBridgeError::Research(ResearchError::SchemaMismatch { reason });
+
+    let start = raw.find(JSON_BEGIN).ok_or_else(|| {
+        schema_error(format!(
+            "Finding-Artefakt '{}' hat keinen kanonischen JSON-Block",
+            path.display()
+        ))
+    })?;
+    let after_begin = start + JSON_BEGIN.len();
+    let end = raw[after_begin..]
+        .find(JSON_END)
+        .map(|offset| after_begin + offset)
+        .ok_or_else(|| {
+            schema_error(format!(
+                "Finding-Artefakt '{}' hat einen unbeendeten kanonischen JSON-Block",
+                path.display()
+            ))
+        })?;
+
+    Ok(raw[after_begin..end].trim())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harw_research::{QuestionId, SourceClass, SourceReference, VersionReference};
+
+    fn timestamp() -> jiff::Timestamp {
+        match "2026-08-27T10:00:00Z".parse::<jiff::Timestamp>() {
+            Ok(ts) => ts,
+            // Ein festes Literal kann nicht scheitern; der Zweig hält den Test
+            // frei von `unwrap()`.
+            Err(_) => jiff::Timestamp::UNIX_EPOCH,
+        }
+    }
+
+    fn finding(question_id: &str) -> ResearchFinding {
+        ResearchFinding {
+            question_id: QuestionId::new(question_id),
+            conclusion: "jiff 0.2.32 ist die aktuelle Version.".to_owned(),
+            evidence: vec![SourceReference {
+                kind: SourceClass::CargoRegistrySource,
+                locator: "crates.io/crates/jiff".to_owned(),
+                retrieved_at: timestamp(),
+                digest: None,
+                excerpt: "version = \"0.2.32\"".to_owned(),
+            }],
+            verified_versions: vec![VersionReference {
+                crate_name: "jiff".to_owned(),
+                version: "0.2.32".to_owned(),
+                msrv: Some("1.85".to_owned()),
+                features: vec!["serde".to_owned()],
+                verified_against: "crates.io".to_owned(),
+            }],
+            constraints: vec!["MSRV 1.85".to_owned()],
+            compatibility_notes: vec!["nicht mit chrono mischen".to_owned()],
+            unresolved_questions: vec![],
+            confidence: Confidence::High,
+            produced_by: "explorer-1".to_owned(),
+            produced_at: timestamp(),
+        }
+    }
+
+    fn temp_store(label: &str) -> (FindingStore, tempfile::TempDir) {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(error) => panic!("Temp-Verzeichnis für '{label}' anlegen: {error}"),
+        };
+        (FindingStore::new(dir.path().join("plans")), dir)
+    }
+
+    #[test]
+    fn test_sanitize_component_strips_separators_and_traversal() {
+        assert_eq!(sanitize_component("../../etc/passwd"), "_..-..-etc-passwd");
+        assert_eq!(sanitize_component("a/b"), "a-b");
+        assert_eq!(sanitize_component("a\\b"), "a-b");
+        // Führendes `_`, weil die Dotfile-Regel auch hier greift: `%` wird zu
+        // `-`, der Rest beginnt mit `..` — und ein Ergebnis, das mit `.` anfängt,
+        // wäre ein Dotfile. Diese Erwartung war zuvor veraltet und widersprach
+        // `test_sanitize_component_never_yields_dot_or_dotdot_or_dotfile`.
+        assert_eq!(sanitize_component("..%2f..%2fetc"), "_..-2f..-2fetc");
+        assert_eq!(sanitize_component("   "), BLANK_COMPONENT);
+        assert_eq!(sanitize_component(""), BLANK_COMPONENT);
+        assert_eq!(sanitize_component("q-1"), "q-1");
+        assert_eq!(sanitize_component("q_1.v2"), "q_1.v2");
+    }
+
+    #[test]
+    fn test_sanitize_component_never_yields_dot_or_dotdot_or_dotfile() {
+        // `..%2f..%2fetc` und `../x` stehen hier, weil genau sie in
+        // `test_sanitize_component_strips_separators_and_traversal` eine
+        // veraltete Erwartung hatten. Die Regel gehört in **diesen** Test —
+        // eine feste Erwartung dort veraltet, eine Invariante hier nicht.
+        for hostile in [
+            ".",
+            "..",
+            ".ssh",
+            "...",
+            " .. ",
+            "..%2f..%2fetc",
+            "../x",
+            "..\\x",
+            "./.",
+        ] {
+            let sanitized = sanitize_component(hostile);
+            assert_ne!(sanitized, ".", "'{hostile}' wurde zu '.'");
+            assert_ne!(sanitized, "..", "'{hostile}' wurde zu '..'");
+            assert!(
+                !sanitized.starts_with('.'),
+                "'{hostile}' wurde zum Dotfile '{sanitized}'"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sanitize_component_caps_length() {
+        let long = "x".repeat(MAX_COMPONENT_LEN * 3);
+        assert_eq!(sanitize_component(&long).len(), MAX_COMPONENT_LEN);
+    }
+
+    #[test]
+    fn test_sanitize_component_removes_nul_and_control_bytes() {
+        assert_eq!(sanitize_component("a\0b\nc"), "a-b-c");
+    }
+
+    #[test]
+    fn test_path_for_never_escapes_the_root() {
+        let store = FindingStore::new("/srv/plans");
+        let path = store.path_for("../../root", "../../../etc/shadow");
+
+        assert!(
+            path.starts_with("/srv/plans"),
+            "Pfad entkommt dem Root: {}",
+            path.display()
+        );
+        // Entscheidend ist nicht die Abwesenheit der Zeichenfolge "..",
+        // sondern die Abwesenheit einer `..`-*Komponente*: nur die
+        // traversiert.
+        assert!(
+            !path
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir)),
+            "Traversal-Komponente übrig: {}",
+            path.display()
+        );
+        // Und zwischen Root und Datei liegen exakt drei Segmente:
+        // <plan_id>/research/<question_id>.md
+        let relative = match path.strip_prefix("/srv/plans") {
+            Ok(relative) => relative,
+            Err(error) => panic!("strip_prefix schlug fehl: {error}"),
+        };
+        assert_eq!(relative.components().count(), 3);
+    }
+
+    #[test]
+    fn test_write_then_read_roundtrips_the_finding() {
+        let (store, _dir) = temp_store("roundtrip");
+        let original = finding("q-1");
+
+        let path = match store.write("p-1", &original) {
+            Ok(path) => path,
+            Err(error) => panic!("write schlug fehl: {error}"),
+        };
+        assert!(path.exists());
+
+        let restored = match store.read("p-1", "q-1") {
+            Ok(restored) => restored,
+            Err(error) => panic!("read schlug fehl: {error}"),
+        };
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn test_write_with_malicious_ids_stays_inside_the_root() {
+        let (store, _dir) = temp_store("malicious");
+        let mut hostile = finding("../../../etc/passwd");
+        hostile.question_id = QuestionId::new("../../../etc/passwd");
+
+        let path = match store.write("../../outside", &hostile) {
+            Ok(path) => path,
+            Err(error) => panic!("write schlug fehl: {error}"),
+        };
+        assert!(
+            path.starts_with(store.root()),
+            "Artefakt liegt außerhalb des Roots: {}",
+            path.display()
+        );
+
+        // Und es ist unter denselben (sanitisierten) IDs wieder lesbar.
+        let restored = match store.read("../../outside", "../../../etc/passwd") {
+            Ok(restored) => restored,
+            Err(error) => panic!("read schlug fehl: {error}"),
+        };
+        assert_eq!(restored.question_id, hostile.question_id);
+    }
+
+    #[test]
+    fn test_document_contains_frontmatter_and_readable_body() {
+        let document = match render_document(&finding("q-1")) {
+            Ok(document) => document,
+            Err(error) => panic!("render schlug fehl: {error}"),
+        };
+        assert!(document.starts_with("---\n"));
+        assert!(document.contains("question_id: 'q-1'"));
+        assert!(document.contains("confidence: high"));
+        assert!(document.contains("evidence_count: 1"));
+        assert!(document.contains("## Conclusion"));
+        assert!(document.contains("crates.io/crates/jiff"));
+        assert!(document.contains("## Constraints"));
+        assert!(document.contains(JSON_BEGIN));
+        assert!(document.contains(JSON_END));
+    }
+
+    #[test]
+    fn test_read_reports_schema_mismatch_without_canonical_block() {
+        let (store, _dir) = temp_store("broken");
+        let path = store.path_for("p-1", "q-broken");
+        if let Some(parent) = path.parent() {
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                panic!("Verzeichnis anlegen: {error}");
+            }
+        }
+        if let Err(error) = std::fs::write(&path, "---\nquestion_id: 'q'\n---\n\nnur Prosa\n") {
+            panic!("Datei schreiben: {error}");
+        }
+
+        match store.read("p-1", "q-broken") {
+            Err(PlanBridgeError::Research(ResearchError::SchemaMismatch { .. })) => {}
+            other => panic!("erwartet SchemaMismatch, bekommen: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_write_rejects_a_finding_that_violates_the_contract() {
+        let (store, _dir) = temp_store("invalid");
+        let mut invalid = finding("q-1");
+        invalid.conclusion = "   ".to_owned();
+
+        match store.write("p-1", &invalid) {
+            Err(PlanBridgeError::Research(ResearchError::EmptyField { field })) => {
+                assert_eq!(field, "conclusion");
+            }
+            other => panic!("erwartet EmptyField, bekommen: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_list_is_sorted_and_empty_for_an_unknown_plan() {
+        let (store, _dir) = temp_store("list");
+        assert!(match store.list("p-unknown") {
+            Ok(ids) => ids.is_empty(),
+            Err(error) => panic!("list schlug fehl: {error}"),
+        });
+
+        for id in ["q-c", "q-a", "q-b"] {
+            if let Err(error) = store.write("p-1", &finding(id)) {
+                panic!("write schlug fehl: {error}");
+            }
+        }
+        match store.list("p-1") {
+            Ok(ids) => assert_eq!(ids, vec!["q-a", "q-b", "q-c"]),
+            Err(error) => panic!("list schlug fehl: {error}"),
+        }
+    }
+
+    #[test]
+    fn test_evidence_for_uses_the_relative_locator_and_production_time() {
+        let (store, _dir) = temp_store("evidence");
+        let source = finding("q-1");
+        let evidence = store.evidence_for("p-1", &source, "runtime");
+
+        assert_eq!(evidence.kind, EvidenceKind::Finding);
+        assert_eq!(evidence.locator, "p-1/research/q-1.md");
+        assert_eq!(evidence.actor, "runtime");
+        assert_eq!(evidence.attached_at, offset_from_timestamp(timestamp()));
+    }
+
+    #[test]
+    fn test_finding_locator_matches_the_store_path() {
+        let store = FindingStore::new("/srv/plans");
+        let path = store.path_for("p-1", "q-1");
+        let relative = finding_locator("p-1", "q-1");
+        assert!(
+            path.ends_with(&relative),
+            "{} vs {relative}",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn test_offset_from_timestamp_matches_unix_seconds() {
+        let converted = offset_from_timestamp(timestamp());
+        assert_eq!(converted.unix_timestamp(), timestamp().as_second());
+    }
+}

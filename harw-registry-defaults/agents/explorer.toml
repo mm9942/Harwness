@@ -1,0 +1,48 @@
+# Eingebauter Explore-Worker (AP W3-04) — Registry-Profil `ReadOnlyExplore`.
+#
+# Liest den Workspace und den entpackten Dependency-Quellcode, um eine Frage zu
+# belegen. Er schreibt nichts und startet keinen Subprozess.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.explorer@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "explorer"
+
+name = "Explorer"
+description = "Read-only Erkundung von Workspace und Dependency-Quellen; liefert belegte Funde."
+
+[work]
+mode = "read-only-exploration"
+may_write_code = false
+may_research_web = false
+
+# Die zugelassene Werkzeugoberflaeche. `forbidden` benennt die verweigerten
+# Werkzeuge ausdruecklich, damit ein Konsument die Ablehnung begruenden kann,
+# statt nur "nicht in admitted" zu melden.
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+]
+forbidden = ["fs.write", "shell.exec", "web.fetch", "web.docs_rs", "web.crates_io"]
+
+[spawn]
+max_depth = 1
+
+[spawn.budget]
+max_tokens = 60000
+max_tool_calls = 40
+max_wall_secs = 180
+
+[return]
+contract = "harwness.return.research-finding@1"

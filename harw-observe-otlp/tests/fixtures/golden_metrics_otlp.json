@@ -1,0 +1,93 @@
+{
+  "resourceMetrics": [
+    {
+      "resource": {
+        "attributes": [
+          {
+            "key": "service.name",
+            "value": { "stringValue": "harw-sentinel" }
+          }
+        ]
+      },
+      "scopeMetrics": [
+        {
+          "scope": { "name": "harw-observe-otlp" },
+          "metrics": [
+            {
+              "name": "harw_admitted_total",
+              "unit": "count",
+              "sum": {
+                "dataPoints": [
+                  {
+                    "startTimeUnixNano": "0",
+                    "timeUnixNano": "0",
+                    "asInt": "42"
+                  }
+                ],
+                "aggregationTemporality": 2,
+                "isMonotonic": true
+              }
+            },
+            {
+              "name": "harw_child_admitted_total",
+              "unit": "count",
+              "sum": {
+                "dataPoints": [
+                  {
+                    "attributes": [
+                      { "key": "clan", "value": { "stringValue": "research" } },
+                      { "key": "role", "value": { "stringValue": "explorer" } }
+                    ],
+                    "startTimeUnixNano": "0",
+                    "timeUnixNano": "0",
+                    "asInt": "42"
+                  },
+                  {
+                    "attributes": [
+                      { "key": "clan", "value": { "stringValue": "research" } },
+                      { "key": "role", "value": { "stringValue": "guard" } }
+                    ],
+                    "startTimeUnixNano": "0",
+                    "timeUnixNano": "0",
+                    "asInt": "7"
+                  }
+                ],
+                "aggregationTemporality": 2,
+                "isMonotonic": true
+              }
+            },
+            {
+              "name": "harw_latency_seconds",
+              "unit": "seconds",
+              "histogram": {
+                "dataPoints": [
+                  {
+                    "startTimeUnixNano": "0",
+                    "timeUnixNano": "0",
+                    "count": "1",
+                    "sum": 1.23,
+                    "min": 1.23,
+                    "max": 1.23
+                  }
+                ],
+                "aggregationTemporality": 1
+              }
+            },
+            {
+              "name": "harw_queue_depth",
+              "unit": "count",
+              "gauge": {
+                "dataPoints": [
+                  {
+                    "timeUnixNano": "0",
+                    "asDouble": 3.5
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,202 @@
+{
+  "vendor": "xai",
+  "family": "grok",
+  "retrieved": "2026-07-16",
+  "openai_compatible_endpoint": "https://api.x.ai/v1",
+  "notes": [
+    "Model IDs are identical between the native xAI API and the OpenAI-compatible endpoint.",
+    "Aliases follow the pattern: <modelname> = latest stable, <modelname>-latest = latest (may change), <modelname>-<date> = pinned release.",
+    "logprobs and top_logprobs are silently ignored on grok-4.20 and newer.",
+    "Eight legacy models (grok-3, grok-4, grok-4-fast, grok-4-0709, grok-code-fast-1, grok-imagine-image-pro, etc.) retired May 15 2026; legacy code-model requests route to grok-build-0.1."
+  ],
+  "models": [
+    {
+      "api_id": "grok-4.5",
+      "aliases": ["grok-4.5-latest", "grok-build-latest"],
+      "display_name": "Grok 4.5",
+      "status": "GA",
+      "released": "2026-07-08",
+      "context_window_tokens": 500000,
+      "max_output_tokens": null,
+      "knowledge_cutoff": "2026-02-01",
+      "modalities": {
+        "input": ["text", "image"],
+        "output": ["text"]
+      },
+      "vision": true,
+      "tool_calling": true,
+      "structured_outputs": true,
+      "reasoning": {
+        "supported": true,
+        "cannot_be_disabled": true,
+        "effort_values": ["low", "medium", "high"],
+        "default_effort": "high",
+        "api_param_native_sdk": "reasoning_effort",
+        "api_param_openai_compat": "reasoning.effort"
+      },
+      "rate_limits": {
+        "requests_per_second": 150,
+        "tokens_per_minute": 50000000
+      },
+      "pricing_usd_per_1m_tokens": {
+        "input_le_200k_prompt": 2.00,
+        "input_gt_200k_prompt": 4.00,
+        "cached_input_le_200k": 0.50,
+        "cached_input_gt_200k": 1.00,
+        "output_le_200k_prompt": 6.00,
+        "output_gt_200k_prompt": 12.00
+      },
+      "regions": ["us-east-1", "us-west-2"],
+      "eu_available": false,
+      "recommended_for": ["code", "chat", "agentic_tasks", "knowledge_work", "STEM_reasoning"],
+      "notes": "Flagship model as of 2026-07-08. V9 architecture, 1.5T parameters, mixture-of-experts. Not yet available in EU API console at launch. Benchmarks: Terminal-Bench 2.1 83.3%, SWE-Bench Pro 64.7%, DeepSWE 62.0%."
+    },
+    {
+      "api_id": "grok-build-0.1",
+      "aliases": [],
+      "display_name": "Grok Build 0.1",
+      "status": "public_beta",
+      "released": "2026-05-29",
+      "context_window_tokens": 256000,
+      "max_output_tokens": null,
+      "knowledge_cutoff": null,
+      "modalities": {
+        "input": ["text", "image"],
+        "output": ["text"]
+      },
+      "vision": true,
+      "tool_calling": true,
+      "structured_outputs": null,
+      "reasoning": {
+        "supported": true,
+        "cannot_be_disabled": true,
+        "effort_values": ["low", "medium", "high"],
+        "default_effort": "high",
+        "api_param_native_sdk": "reasoning_effort",
+        "api_param_openai_compat": "reasoning.effort",
+        "note": "none value is rejected"
+      },
+      "pricing_usd_per_1m_tokens": {
+        "input": 1.00,
+        "output": 2.00
+      },
+      "recommended_for": ["agentic_coding", "multi_step_coding_workflows"],
+      "legacy_redirect_from": ["grok-code-fast-1"],
+      "integrations": ["Cursor", "Kilo Code", "OpenCode", "MCP"],
+      "notes": "Purpose-built coding model for agentic workflows (apply patches, run tests, iterate). Early access from 2026-05-19; public beta API from 2026-05-29. Replaced grok-code-fast-1 which was retired 2026-05-15."
+    },
+    {
+      "api_id": "grok-4.3",
+      "aliases": [],
+      "display_name": "Grok 4.3",
+      "status": "GA",
+      "released": "2026-04-30",
+      "context_window_tokens": 1000000,
+      "max_output_tokens": null,
+      "knowledge_cutoff": null,
+      "modalities": {
+        "input": ["text", "image", "video"],
+        "output": ["text"]
+      },
+      "vision": true,
+      "tool_calling": true,
+      "structured_outputs": null,
+      "reasoning": {
+        "supported": true,
+        "non_reasoning_mode_available": true,
+        "note": "Supports both reasoning and non-reasoning mode"
+      },
+      "pricing_usd_per_1m_tokens": {
+        "input": 1.25,
+        "output": 2.50
+      },
+      "eu_available": true,
+      "recommended_for": ["chat", "EU_region_fallback"],
+      "notes": "Previous flagship. Native video input. Recommended as EU fallback while grok-4.5 is not yet EU-available. Became canonical chat-model alias on 2026-05-01."
+    },
+    {
+      "api_id": "grok-4.20-0309-reasoning",
+      "aliases": [],
+      "display_name": "Grok 4.20 (Reasoning, 2026-03-09)",
+      "status": "GA",
+      "released": "2026-03-09",
+      "context_window_tokens": 1000000,
+      "max_output_tokens": null,
+      "knowledge_cutoff": null,
+      "modalities": {
+        "input": ["text"],
+        "output": ["text"]
+      },
+      "vision": null,
+      "tool_calling": true,
+      "structured_outputs": null,
+      "reasoning": {
+        "supported": true,
+        "mode": "reasoning_only"
+      },
+      "notes": "Pinned dated release of the Grok 4.20 reasoning variant. Part of the four-agent architecture launch (February 2026). logprobs/top_logprobs silently ignored."
+    },
+    {
+      "api_id": "grok-4.20-0309-non-reasoning",
+      "aliases": [],
+      "display_name": "Grok 4.20 (Non-Reasoning, 2026-03-09)",
+      "status": "GA",
+      "released": "2026-03-09",
+      "context_window_tokens": 1000000,
+      "max_output_tokens": null,
+      "knowledge_cutoff": null,
+      "modalities": {
+        "input": ["text"],
+        "output": ["text"]
+      },
+      "vision": null,
+      "tool_calling": true,
+      "structured_outputs": null,
+      "reasoning": {
+        "supported": false,
+        "mode": "non_reasoning"
+      },
+      "notes": "Fast non-reasoning counterpart to grok-4.20-0309-reasoning. logprobs/top_logprobs silently ignored."
+    },
+    {
+      "api_id": "grok-4.20-multi-agent-0309",
+      "aliases": ["grok-4.20-multi-agent"],
+      "display_name": "Grok 4.20 Multi-Agent (2026-03-09)",
+      "status": "GA",
+      "released": "2026-03-09",
+      "context_window_tokens": 1000000,
+      "max_output_tokens": null,
+      "knowledge_cutoff": null,
+      "modalities": {
+        "input": ["text"],
+        "output": ["text"]
+      },
+      "vision": null,
+      "tool_calling": true,
+      "structured_outputs": null,
+      "reasoning": {
+        "supported": true,
+        "effort_values": ["low", "medium", "high", "xhigh"],
+        "default_effort": "high",
+        "note": "reasoning_effort controls number of collaborating agents, not reasoning depth. xhigh activates all four sub-agents."
+      },
+      "notes": "Four-agent architecture: Grok (coordinator), Harper (research), Benjamin (logic/math), Lucas (contrarian). Runs agents in parallel."
+    }
+  ],
+  "retired_models": [
+    { "api_id": "grok-3", "retired": "2026-05-15", "redirects_to": "grok-4.3" },
+    { "api_id": "grok-4", "retired": "2026-05-15", "redirects_to": "grok-4.3" },
+    { "api_id": "grok-4-fast", "retired": "2026-05-15", "redirects_to": "grok-4.3" },
+    { "api_id": "grok-4-0709", "retired": "2026-05-15", "redirects_to": "grok-4.3" },
+    { "api_id": "grok-code-fast-1", "retired": "2026-05-15", "redirects_to": "grok-build-0.1" },
+    { "api_id": "grok-imagine-image-pro", "retired": "2026-05-15", "redirects_to": null }
+  ],
+  "sources": [
+    { "url": "https://docs.x.ai/developers/models", "description": "Official xAI model catalog" },
+    { "url": "https://docs.x.ai/developers/models/grok-4.5", "description": "Grok 4.5 model detail page" },
+    { "url": "https://docs.x.ai/developers/grok-4-5", "description": "Grok 4.5 API guide" },
+    { "url": "https://docs.x.ai/developers/model-capabilities/text/reasoning", "description": "Reasoning effort docs" },
+    { "url": "https://mungomash.com/ai/grok/versions/", "description": "Grok version history tracker" },
+    { "url": "https://www.llmreference.com/model-family/grok-4", "description": "Grok 4 family LLM reference" }
+  ]
+}

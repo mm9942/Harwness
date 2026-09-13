@@ -1,0 +1,51 @@
+[package]
+name = "harw-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Einzige Autoritätsquelle: die Registry, `Surface`, `WebAdapter`,
+# `OpContext`, `PermissionTier`, `ApprovalPolicy`. harw-web definiert selbst
+# keine Operation — siehe lib.rs-Moduldoku „kein zweiter Autoritätspfad".
+harw-operations = { path = "../harw-operations" }
+# `TrustClass` — die Vertrauensklasse, die die Oberfläche braucht, um AW4-01s
+# Zwei-Block-Trennung sichtbar zu machen (siehe events.rs-Moduldoku „Woher
+# die Klasse kommt — und wo sie verloren geht").
+harw-context = { path = "../harw-context" }
+# `#[derive(HarwError)]` für `src/error.rs` — dieselbe hausinterne
+# Fehler-Ableitung wie in harw-sentinel/src/ipc.rs, kein thiserror/anyhow.
+harw-macros = { path = "../harw-macros" }
+
+# Peer-Identifikation über SO_PEERCRED ohne unsafe — dieselbe Crate und
+# dasselbe Feature wie in harw-sentinel/Cargo.toml, dessen ipc.rs das Muster
+# vormacht (rustix::net::sockopt::socket_peercred).
+rustix = { workspace = true, features = ["net"] }
+
+# HTTP-Stack: identisch zu harw-mcp-server/Cargo.toml (Streamable-HTTP-
+# Vorbild dieses Knotens) — dieselben Versionsangaben, damit im Workspace
+# keine zweite HTTP-Bibliothek und keine zweite Versionsauflösung entsteht.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }
+http-body-util = { version = "0.1", features = ["channel"] }
+bytes = "1"
+tokio = { version = "1", features = ["rt", "net", "sync", "macros", "io-util", "time"] }
+
+# Der Genehmigungsbegriff ist durabel und existiert bereits: `ApprovalRecord`,
+# `ApprovalStore`, die Zustandsübergänge im Dateisuffix. `src/security.rs`
+# löst einen Datensatz auf, es erfindet keinen zweiten Speicher.
+harw-session-store = { path = "../harw-session-store" }
+# `ApprovalActor` -- wer entschieden hat. Wird aus den Peer-Credentials
+# abgeleitet, nie aus dem Anfragerumpf.
+harw-types = { path = "../harw-types" }
+jiff = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

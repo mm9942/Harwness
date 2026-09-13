@@ -1,0 +1,5 @@
+error: `missing` ist kein Argument dieser Funktion; #[traced(fields(...))] darf nur vorhandene Parameternamen referenzieren
+ --> tests/compile_fail/18_traced_fields_not_an_argument.rs:5:30
+  |
+5 | #[harw_macros::traced(fields(missing))]
+  |                              ^^^^^^^

@@ -1,0 +1,235 @@
+{
+  "vendor": "moonshot",
+  "family": ["kimi", "moonshot-v1"],
+  "as_of": "2026-07-16",
+  "sources": [
+    "https://platform.kimi.ai/docs/models",
+    "https://platform.kimi.ai/docs/intro",
+    "https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart",
+    "https://platform.kimi.ai/docs/guide/kimi-k2-7-code-quickstart",
+    "https://github.com/MoonshotAI/Kimi-K2",
+    "https://github.com/MoonshotAI/Kimi-K2/blob/main/docs/tool_call_guidance.md",
+    "https://openrouter.ai/moonshotai/kimi-k2.6",
+    "https://openrouter.ai/moonshotai/kimi-k2.7-code",
+    "https://developers.cloudflare.com/workers-ai/models/kimi-k2.6/",
+    "https://developers.cloudflare.com/workers-ai/models/kimi-k2.7-code/",
+    "https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-moonshot-ai-kimi-k2-5.html",
+    "https://devops.com/moonshot-ais-kimi-k2-7-code-targets-token-efficiency-in-agentic-coding/",
+    "https://llm-stats.com/models/kimi-k2.7-code"
+  ],
+  "api": {
+    "base_url": "https://api.moonshot.ai/v1",
+    "platform_console": "https://platform.kimi.ai",
+    "api_key_env": "MOONSHOT_API_KEY",
+    "openai_compatible": true,
+    "note": "platform.kimi.ai (formerly platform.moonshot.ai, 301-redirects) is the web console only. All programmatic calls go to api.moonshot.ai/v1. No separate international endpoint — single global endpoint."
+  },
+  "models": {
+    "active": [
+      {
+        "id": "kimi-k2.7-code",
+        "family": "kimi",
+        "release_date": "2026-06-12",
+        "status": "active",
+        "description": "Coding-focused successor to K2.6. Moonshot's most capable coding model. Thinking mode is always on (cannot be disabled).",
+        "architecture": "MoE, 1T total params, 32B active per token, 384 experts (8 active + 1 shared), MLA attention, MoonViT 400M vision encoder",
+        "context_window_tokens": 262144,
+        "max_output_tokens": 131072,
+        "modalities": ["text", "image", "video"],
+        "tool_calling": true,
+        "tool_calling_notes": "Supports function calling (up to 128 functions). tool_choice: auto, none, required, or specific function. Thinking mode forces tool_choice to auto or none only.",
+        "thinking_mode": "always_on",
+        "reasoning_token_reduction_vs_k26": "~30%",
+        "benchmarks": {
+          "SWE_Bench_Pro": null,
+          "SWE_Bench_Verified": null,
+          "KimiCodeBench_v2_vs_k26": "+21.8%"
+        },
+        "pricing_per_1m_tokens": {
+          "input_cache_miss": 0.95,
+          "input_cache_hit": 0.19,
+          "output": 4.00,
+          "currency": "USD"
+        },
+        "variants": [
+          {
+            "id": "kimi-k2.7-code",
+            "description": "Standard throughput"
+          },
+          {
+            "id": "kimi-k2.7-code-highspeed",
+            "description": "High-speed variant, ~180 tokens/s, up to 260 tokens/s in short-context scenarios"
+          }
+        ]
+      },
+      {
+        "id": "kimi-k2.6",
+        "family": "kimi",
+        "release_date": "2026-04-20",
+        "status": "active",
+        "recommended_migration_target": true,
+        "description": "Current flagship open-weight model. Multimodal, agentic, supports thinking and non-thinking modes. All previous K2 and kimi-latest users directed here.",
+        "architecture": "MoE, 1T total params, 32B active per token, 384 experts (8 active + 1 shared), 61 layers, 64 attention heads, MLA, SwiGLU, MoonViT 400M vision encoder",
+        "context_window_tokens": 262144,
+        "max_output_tokens": {
+          "note": "Varies by platform. Official quickstart example uses max_tokens=32768 (1024*32). Third-party (Apiyi) cites 98304. OpenRouter cites 262144. Treat 32768 as safe conservative limit for production; official hard cap not published.",
+          "conservative_safe": 32768,
+          "third_party_reported_max": 262144
+        },
+        "modalities": ["text", "image", "video"],
+        "tool_calling": true,
+        "tool_calling_notes": "Supports function calling (up to 128 functions). In thinking mode, tool_choice limited to auto or none. Built-in $web_search incompatible with thinking mode — disable thinking to use it. Tool calls wrapped with special tokens in raw format.",
+        "thinking_mode": "optional",
+        "agent_swarm": {
+          "max_sub_agents": 300,
+          "max_coordinated_steps": 4000
+        },
+        "benchmarks": {
+          "SWE_Bench_Pro": 58.6,
+          "SWE_Bench_Verified": 80.2,
+          "TerminalBench_2_0": 66.7,
+          "LiveCodeBench_v6": 89.6
+        },
+        "pricing_per_1m_tokens": {
+          "note": "See platform.kimi.ai/pricing/chat for current rates"
+        },
+        "license": "Modified MIT"
+      },
+      {
+        "id": "kimi-k2.5",
+        "family": "kimi",
+        "release_date": "2026-01",
+        "status": "active",
+        "description": "Previous generation flagship. Supports visual and text input, thinking and non-thinking modes, dialogue and Agent tasks. Agent Swarm capacity: 100 sub-agents, 1500 steps.",
+        "context_window_tokens": 262144,
+        "max_output_tokens": {
+          "note": "AWS Bedrock lists 16384; likely platform-specific constraint. Actual limit higher but not officially published.",
+          "bedrock_reported": 16384
+        },
+        "modalities": ["text", "image"],
+        "tool_calling": true,
+        "thinking_mode": "optional",
+        "agent_swarm": {
+          "max_sub_agents": 100,
+          "max_coordinated_steps": 1500
+        }
+      },
+      {
+        "id": "moonshot-v1-8k",
+        "family": "moonshot-v1",
+        "status": "active",
+        "description": "Legacy text-only model. 8k context. No vision.",
+        "context_window_tokens": 8192,
+        "modalities": ["text"],
+        "tool_calling": null,
+        "note": "V1 variants differ only in context length, not model capability."
+      },
+      {
+        "id": "moonshot-v1-32k",
+        "family": "moonshot-v1",
+        "status": "active",
+        "description": "Legacy text-only model. 32k context. No vision.",
+        "context_window_tokens": 32768,
+        "modalities": ["text"],
+        "tool_calling": null
+      },
+      {
+        "id": "moonshot-v1-128k",
+        "family": "moonshot-v1",
+        "status": "active",
+        "description": "Legacy text-only model. 128k context. No vision.",
+        "context_window_tokens": 131072,
+        "modalities": ["text"],
+        "tool_calling": null
+      },
+      {
+        "id": "moonshot-v1-8k-vision-preview",
+        "family": "moonshot-v1",
+        "status": "active",
+        "description": "Legacy vision model. 8k context.",
+        "context_window_tokens": 8192,
+        "modalities": ["text", "image"],
+        "tool_calling": null
+      },
+      {
+        "id": "moonshot-v1-32k-vision-preview",
+        "family": "moonshot-v1",
+        "status": "active",
+        "description": "Legacy vision model. 32k context.",
+        "context_window_tokens": 32768,
+        "modalities": ["text", "image"],
+        "tool_calling": null
+      },
+      {
+        "id": "moonshot-v1-128k-vision-preview",
+        "family": "moonshot-v1",
+        "status": "active",
+        "description": "Legacy vision model. 128k context.",
+        "context_window_tokens": 131072,
+        "modalities": ["text", "image"],
+        "tool_calling": null
+      }
+    ],
+    "deprecated": [
+      {
+        "id": "kimi-k2-turbo-preview",
+        "deprecated_on": "2026-05-25",
+        "migrate_to": "kimi-k2.6"
+      },
+      {
+        "id": "kimi-k2-0905-preview",
+        "deprecated_on": "2026-05-25",
+        "migrate_to": "kimi-k2.6"
+      },
+      {
+        "id": "kimi-k2-0711-preview",
+        "deprecated_on": "2026-05-25",
+        "migrate_to": "kimi-k2.6"
+      },
+      {
+        "id": "kimi-k2-thinking",
+        "deprecated_on": "2026-05-25",
+        "migrate_to": "kimi-k2.6"
+      },
+      {
+        "id": "kimi-k2-thinking-turbo",
+        "deprecated_on": "2026-05-25",
+        "migrate_to": "kimi-k2.6"
+      },
+      {
+        "id": "kimi-latest",
+        "deprecated_on": "2026-01-28",
+        "migrate_to": "kimi-k2.6"
+      },
+      {
+        "id": "kimi-thinking-preview",
+        "note": "Was the K1.5 era thinking model",
+        "deprecated_on": "2025-11-11",
+        "migrate_to": "kimi-k2.6"
+      }
+    ]
+  },
+  "upcoming": {
+    "id": "kimi-k3",
+    "status": "leaked_not_announced",
+    "as_of": "2026-07-16",
+    "leaked_launch_signal": "2026-07-15 (promotion page briefly appeared on Kimi Open Platform, then removed)",
+    "reported_specs_unconfirmed": {
+      "total_parameters": "2.5T+",
+      "context_window_tokens": 1000000,
+      "architecture": "new MoE, possibly incorporating KDA hybrid attention"
+    },
+    "official_confirmation": false,
+    "note": "No official model card, benchmarks, API ID, pricing, or weights published as of 2026-07-16. Track platform.kimi.ai for announcement."
+  },
+  "k1_5_status": {
+    "note": "Kimi K1.5 (released 2025-01-20) had API exposure via kimi-thinking-preview which was deprecated 2025-11-11. K1.5 is effectively superseded and has no active API model ID. No separate published deprecation date for K1.5 base; it was never exposed as a standalone API model ID."
+  },
+  "agentic_capabilities_summary": {
+    "tool_calling": "Supported on K2.5, K2.6, K2.7-Code via OpenAI-compatible function-calling interface. Max 128 functions per call.",
+    "thinking_mode": "K2.6/K2.5: optional (enable/disable per request). K2.7-Code: always on.",
+    "agent_swarm": "K2.6 supports up to 300 domain-specialized sub-agents with 4000 coordinated steps. K2.5: 100 sub-agents, 1500 steps.",
+    "vision": "K2.5, K2.6, K2.7-Code support text + image + video input via MoonViT 400M encoder.",
+    "coding_benchmark_leader": "K2.7-Code: SWE-Bench best-in-class at time of release for open-weight coding models."
+  }
+}

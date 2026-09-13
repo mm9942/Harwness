@@ -1,0 +1,30 @@
+[package]
+name = "harw-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-types = { path = "../harw-types" }
+harw-sandbox = { path = "../harw-sandbox" }
+harw-macros = { path = "../harw-macros" }
+# AW5-07: `context.load` (`context_load.rs`) resolves `DetailMode::References`
+# load keys (`SectionName`/`FragmentLabel`) and enforces the same
+# `ContextBudgetSpec`/`TrustClass` vocabulary the montage uses — no second,
+# parallel truth about section names or trust ranks.
+harw-context = { path = "../harw-context" }
+# AW5-07: `context.load`'s per-turn load cap is expressed in the same cost
+# unit (`CostEstimate`) as `harw_context::Fragment::cost`.
+harw-lens-types = { path = "../harw-lens-types" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+tracing = "0.1.44"
+
+[dev-dependencies]
+# AW5-07 tests build `harw_context::FragmentOrigin` values directly, which
+# carry a `jiff::Timestamp`.
+jiff = { workspace = true }
+
+[lints]
+workspace = true

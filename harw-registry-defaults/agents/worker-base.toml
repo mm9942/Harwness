@@ -1,0 +1,45 @@
+# Gemeinsame Basis aller eingebauten read-only Worker (AP W3-04).
+#
+# Format nach `harw-agent-dsl/tests/fixtures/minimal.toml`: `schema`, `id`,
+# `version`, `role` und `specialization` sind Pflichtfelder von
+# `RawAgentDefinition`; `name`, `description`, `extends` und `mixins` sind
+# optional.
+#
+# WICHTIG — Aufgabenteilung zwischen Basis und Kind:
+# `harw_agent_dsl::resolve` fuehrt Basis- und Kind-Tabellen mit
+# `merge_tables` zusammen. Dort gewinnt ein bereits vorhandener Schluessel:
+# Definiert die Basis eine Sektion, wird die gleichnamige Sektion des Kindes
+# vollstaendig verworfen (nur *Arrays auf oberster Ebene* werden vereinigt,
+# keine Arrays innerhalb einer Tabelle). Deshalb gilt hier:
+#
+#   * Die Basis besitzt `[lifecycle]` und `[context]` — beide sind fuer alle
+#     fuenf eingebauten Rollen identisch.
+#   * Jede Rolle besitzt `[tools]`, `[spawn]` und `[return]` — dort weichen die
+#     Rollen voneinander ab, also darf die Basis diese Sektionen nicht fuehren.
+#
+# Jede Sektion hat damit genau einen Definierer; es gibt keine stillschweigend
+# verworfene zweite Wahrheit.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.worker-base@1"
+version = "1.0.0"
+role = "worker"
+specialization = "worker-base"
+
+name = "Harwness Worker Base"
+description = "Gemeinsame Lebenszyklus- und Kontextregeln aller eingebauten read-only Worker."
+
+# `allow_pause = false` ist eine Sperre, kein Hinweis: ein read-only Kind hat
+# keinen Kanal, ueber den je eine Freigabe eintreffen koennte. Erreicht es einen
+# Punkt, an dem es pausieren muesste, bricht die Runtime fail-closed ab, statt
+# unbegrenzt zu warten.
+[lifecycle]
+allow_pause = false
+allow_rerun = true
+max_attempts = 2
+
+# Kontextmontage: das Kind sieht seinen Auftrag und seinen Lesebereich, aber
+# niemals das Elterntranskript oder die Transkripte seiner Geschwister.
+[context]
+must_include = ["task.objective", "task.read_scope", "new.trigger_return"]
+exclude = ["full_parent_transcript", "sibling_transcripts"]

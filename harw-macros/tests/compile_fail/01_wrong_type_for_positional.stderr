@@ -1,0 +1,5 @@
+error: #[raw(first)] verlangt Option<String>
+ --> tests/compile_fail/01_wrong_type_for_positional.rs:8:11
+  |
+8 |     name: String,
+  |           ^^^^^^

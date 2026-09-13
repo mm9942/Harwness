@@ -1,0 +1,16 @@
+[package]
+name = "harw-instructions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-extension-api = { path = "../harw-extension-api" }
+harw-macros = { path = "../harw-macros" }
+harw-types = { path = "../harw-types" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[lints]
+workspace = true

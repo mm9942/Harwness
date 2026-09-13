@@ -1,0 +1,5 @@
+schema = "harwness.agent/v1"
+id = "harwness.agent.slice13-minimal@1"
+version = "1.0.0"
+role = "worker"
+specialization = "slice13-minimal"

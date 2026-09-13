@@ -1,0 +1,103 @@
+# harw-sentinel.service -- Knoten AW7-03, Klasse "unprivilegiert".
+#
+# Gehoert nach /etc/systemd/system/ (Systemverwaltung), NICHT nach
+# ~/.config/systemd/user/ -- siehe harw-install::dod_units-Moduldoku,
+# Abschnitt "Wohin die Units gehoeren", fuer die volle Begruendung. Der
+# Sentinel selbst braucht keine Capability, aber er ist die Gegenstelle der
+# drei privilegierten Sonden, die ihrerseits zwingend Systemunits sind --
+# eine Nutzerinstanz kann keine Capabilities vergeben, und ein konsistentes
+# Bereitstellungsverfahren fuer alle vier Binaries ist einfacher zu warten
+# als zwei verschiedene (System- und Nutzerinstanz gemischt).
+#
+# Landlock-Asymmetrie (Entscheidung Nr. 4): dieses Binary DEGRADIERT bei
+# fehlender Landlock-Unterstuetzung (SensorDegraded-Ereignis, siehe
+# harw-sentinel/src/sandbox.rs-Moduldoku) statt hart abzubrechen -- diese
+# Unit erzwingt deshalb keine Landlock-Vorbedingung; das Binary entscheidet
+# das selbst und bleibt auch ohne Landlock nuetzlich.
+
+[Unit]
+Description=harw-sentinel -- unprivilegierte Sammelstelle (AW2-19)
+Documentation=man:harw-sentinel(1)
+After=network.target
+# Kein Requires=/Wants= auf die drei Sonden: der Sentinel ist die passive
+# Gegenstelle. Er nimmt Verbindungen entgegen und funktioniert unveraendert,
+# wenn nie eine Sonde startet (harw-sentinel::main, spawn_ipc_if_available
+# ist best effort) -- eine Abhaengigkeit in diese Richtung gaebe es nicht zu
+# begruenden.
+
+[Service]
+Type=simple
+User=harw-sentinel
+Group=harw-sentinel
+# Eigener, unprivilegierter Systemnutzer -- die Kontoanlage selbst ist
+# Installationslogik (sysusers.d/useradd), nicht Teil dieser Unit.
+
+UMask=0002
+# harw-sentinel/src/ipc.rs::IpcListener::bind() setzt keinen expliziten
+# Dateimodus auf den erzeugten SOCK_SEQPACKET-Socket -- der tatsaechliche
+# Modus ergibt sich ausschliesslich aus dem Prozess-UMask. Mit dem
+# systemd-Standard 0022 entstuende der Socket mit 0755: keine Gruppe haette
+# Schreibzugriff, und jede der drei Sonden (andere Systemnutzer, siehe deren
+# Units) schlaege beim connect() fehl, obwohl das Verzeichnis selbst
+# zugaenglich waere. 0002 ergibt 0775 -- Mitglieder der Gruppe harw-ipc
+# (siehe RuntimeDirectory unten) erhalten Schreibrecht auf den Socket.
+RuntimeDirectory=harw
+RuntimeDirectoryMode=0770
+# 0770: nur Mitglieder der Gruppe harw-ipc duerfen das Verzeichnis
+# ueberhaupt betreten -- der Socket traegt selbst keine Authentifizierung
+# ausser dem, was das Dateisystem hier durchsetzt (anders als beim Warden,
+# dessen Gegenstelle SO_PEERCRED liest).
+StateDirectory=harw-sentinel
+# Traegt den Telemetrie-Sink (harw_observe_file::FileSink, siehe
+# harw-sentinel::main::run) -- erzeugt /var/lib/harw-sentinel, von systemd
+# bereits mit den Rechten von User=/Group= angelegt.
+ExecStart=/usr/local/bin/harw-sentinel --log info --home /var/lib/harw-sentinel --socket /run/harw/sentinel.sock
+Restart=on-failure
+RestartSec=5
+
+# -- Haertung: jede Direktive einzeln begruendet --
+NoNewPrivileges=yes
+# Dieser Prozess haelt ohnehin keine einzige Faehigkeit (siehe
+# harw-sentinel::main-Moduldoku, "Das erste vollstaendig unprivilegierte
+# Binary") -- diese Direktive schuetzt gegen eine kuenftige Regression
+# (z. B. ein versehentlich gesetztes File-Capability-Bit auf dem Binary),
+# nicht gegen einen heute bestehenden Zustand.
+ProtectSystem=strict
+# Das Binary schreibt ausschliesslich unter StateDirectory/RuntimeDirectory
+# (beide oben deklariert, von systemd automatisch von "strict"
+# ausgenommen). /proc und /sys/class/thermal -- die tatsaechlichen
+# Sensor-Lesebereiche, siehe harw-sentinel::sandbox::default_roots -- liegen
+# unter den API-Dateisystemen, die "strict" laut systemd.exec(5) unangetastet
+# laesst; diese Direktive nimmt den Sensoren also nichts weg.
+ProtectHome=yes
+# Keiner der drei Sensoren (CpuSensor, ListenerSensor, ThermalSensor) und
+# kein IPC-Codepfad liest ein echtes Nutzerverzeichnis; der
+# WorkspaceDriftSensor beobachtet den konfigurierten Cargo-Workspace, nicht
+# $HOME.
+PrivateTmp=yes
+# Kein Sensor und kein Codepfad dieses Binaries schreibt nach /tmp.
+ProtectKernelModules=yes
+# Kein Sensor laedt oder befragt Kernel-Module.
+ProtectKernelTunables=yes
+# Betrifft /proc/sys, /sys/fs, /sys/kernel -- keiner der drei Sensoren liest
+# dort; /sys/class/thermal bleibt laut systemd.exec(5) unberuehrt.
+ProtectControlGroups=yes
+# Dieser Prozess schreibt nie in cgroup-Kontrolldateien -- das ist
+# ausschliesslich harw-warden's Aufgabe.
+RestrictAddressFamilies=AF_UNIX
+# Jeder Netzwerkzugriff dieses Binaries ist der lokale
+# SOCK_SEQPACKET-IPC-Socket (harw-sentinel::ipc) -- kein TCP/UDP, kein
+# Netlink.
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Leer, wie es die Klasse "unprivilegiert" verlangt (siehe
+# harw-sentinel::sensors::all_unprivileged) -- dieser Prozess haelt keine
+# einzige Kernel-Faehigkeit.
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,37 @@
+# AW2-02 Attacker-Fixture: eine Kinddefinition, die eine höhere
+# Vertrauensklasse für ihre Kontext-Decke verlangt, als ihr Elternteil
+# zulässt.
+#
+# Folgt derselben Form wie
+# `harw-agent-dsl/tests/fixtures/authority_elevation_attacker.toml`
+# (Schema-Kopf, `id`, `role`, `specialization`) — hier erweitert um eine
+# `[context_ceiling]`-Sektion statt eines `[patch.authority.capabilities]`-
+# Patches. Die geforderte Sektion (`history.tail`) ist exakt die, die der
+# Elternteil auch selbst führt; einzig `max_trust` eskaliert von der vom
+# Elternteil erlaubten Obergrenze auf die höchste Vertrauensklasse
+# (`Instruction`, siehe `harw_context::TrustClass::trust_rank`).
+#
+# `harw-core` hat (Stand des Knotens AW2-02) noch keinen Pfad, der eine
+# Kind-Deckenforderung aus einer Agent-Definition wie dieser parst —
+# `SpawnInput::ceiling` wird bislang ausschließlich in Rust gesetzt
+# (Model-Handoff / `harw-cli` / `harw-tui`). Die behauptete Zusicherung
+# dieser Fixture — "ein Kind, das eine weitere Decke verlangt, wird
+# abgewiesen, nicht stillschweigend beschnitten" — wird deshalb in
+# `harw-core/src/child_controller.rs`, Test
+# `context_escalation_attacker_fixture_is_rejected`, gegen eine in Rust
+# nachgebaute `ContextCeiling` mit denselben Werten geprüft, über
+# `ManagedAgentSpawner::admit` und `ManagedAgentSpawner::cut_ceiling`.
+# Sobald ein Parser existiert, der `[context_ceiling]` direkt in ein
+# `harw_context::ContextCeiling` auflöst, kann jener Test durch echtes
+# Parsen dieser Datei ersetzt werden, ohne die geprüfte Zusicherung zu
+# ändern.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.context-escalation-attacker@1"
+version = "1.0.0"
+role = "worker"
+specialization = "context-escalation-attacker"
+
+[context_ceiling]
+sections = ["history.tail"]
+max_trust = "instruction"

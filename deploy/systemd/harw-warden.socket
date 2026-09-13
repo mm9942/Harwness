@@ -1,0 +1,42 @@
+# harw-warden.socket -- Knoten AW7-03.
+#
+# Erzeugt genau EINEN Aktivierungs-Deskriptor -- harw-warden/src/systemd.rs
+# ::acquire_listen_socket() verlangt das hart (WardenBinError::
+# UnexpectedListenFdCount, wenn LISTEN_FDS != 1 oder sd_listen_fds::get()
+# nicht genau einen Eintrag liefert). Diese Unit traegt deshalb genau EINE
+# Listen*=-Zeile -- eine zweite (z. B. ein zusaetzlicher Diagnose-Socket)
+# waere fuer dieses Binary ein harter Startfehler, kein harmloser Zuwachs.
+
+[Unit]
+Description=harw-warden Aktivierungssocket (SOCK_SEQPACKET, genau ein Deskriptor)
+Documentation=man:harw-warden(1)
+
+[Socket]
+ListenSequentialPacket=/run/harw/warden.sock
+# ListenSequentialPacket=, nicht ListenStream=: harw-warden erwartet einen
+# SOCK_SEQPACKET-Socket (siehe harw-warden::ipc-Moduldoku, "ein
+# SOCK_SEQPACKET-Unix-Socket mit SO_PEERCRED") -- ListenStream=/
+# ListenDatagram= erzeugten einen anderen Socket-Typ, den das Binary beim
+# ersten accept()/recv() nicht wie erwartet lesen koennte.
+SocketUser=harw-warden
+SocketGroup=harw-warden
+SocketMode=0660
+# Nur der Warden-Nutzer selbst und seine Gruppe duerfen sich verbinden --
+# SO_PEERCRED liest dennoch bei jeder Verbindung die tatsaechliche
+# Peer-Identitaet (siehe harw-warden::ipc-Moduldoku, "Warum SO_PEERCRED,
+# nicht ein Token im Rumpf"); dieser Dateimodus ist eine zusaetzliche,
+# grobere Vorfilterung auf Betriebssystemebene, kein Ersatz fuer die
+# eigentliche Pruefung im Binary.
+RemoveOnStop=yes
+Accept=no
+# Accept=no: systemd uebergibt den EINEN lauschenden Socket unveraendert an
+# den Dienstprozess (Type=simple, ein einziger LISTEN_FDS-Eintrag) --
+# harw-warden::ipc::serve_forever() ruft selbst wiederholt accept() in
+# einer Schleife auf. Accept=yes wuerde stattdessen fuer JEDE Verbindung
+# einen eigenen Dienstprozess mit einem eigenen, bereits akzeptierten
+# Deskriptor starten -- ein voellig anderes, mit acquire_listen_socket()
+# unvereinbares Modell (das erwartet den lauschenden Socket selbst, nicht
+# eine bereits angenommene Verbindung).
+
+[Install]
+WantedBy=sockets.target

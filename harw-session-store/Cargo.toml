@@ -1,0 +1,28 @@
+[package]
+name = "harw-session-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-types = { path = "../harw-types" }
+harw-macros = { path = "../harw-macros" }
+harw-job-runtime = { path = "../harw-job-runtime" }
+# AW1-01: ChildLeaseRecord carries a TraceContext (frozen wire form,
+# docs/aw-contract-master.md §A.4). Path dependency only — no version pin.
+harw-observe = { path = "../harw-observe" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+jiff = { workspace = true }
+fs4 = "1.1.0"
+tempfile = "3.27.0"
+
+# External deps — parent resolves exact versions via `cargo add` (no invented pins).
+# TODO(parent cargo add): jiff --features serde     # jiff::Timestamp (serde feature required — TranscriptRecord derives Serialize/Deserialize)
+# TODO(parent cargo add): fs4                       # advisory exclusive file lock for durable JSONL append
+# TODO(parent cargo add): tempfile                  # atomic-rename (persist()) durability for full-file rewrites
+# TODO(parent cargo add): serde_norway              # YAML frontmatter codec (reserved for future transcript sidecars)
+# TODO(parent cargo add): uuid --features v7        # time-ordered record identities (reserved; see drift notes)
+
+[lints]
+workspace = true

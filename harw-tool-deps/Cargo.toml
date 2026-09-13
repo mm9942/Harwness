@@ -1,0 +1,26 @@
+[package]
+name = "harw-tool-deps"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-code-graph = { path = "../harw-code-graph" }
+harw-extension-api = { path = "../harw-extension-api" }
+harw-macros = { path = "../harw-macros" }
+harw-sandbox = { path = "../harw-sandbox" }
+harw-tools = { path = "../harw-tools" }
+# `serde`/`serde_json` sind Pflicht-Dependencies für `#[harw_macros::tool]`:
+# der generierte Executor-Prolog ruft `::serde_json::from_value` auf.
+# Versionsangabe bewusst identisch zu harw-tool-fs (Workspace-Konvention);
+# die exakte Auflösung übernimmt das Workspace-Cargo.lock.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+harw-types = { path = "../harw-types" }
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[lints]
+workspace = true

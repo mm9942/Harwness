@@ -1,0 +1,5 @@
+error: Feldname `Clan` enthält ungültiges Zeichen 'C'; erlaubt sind nur [a-z0-9_.]
+ --> tests/compile_fail/14_metrics_undeclared_label.rs:4:54
+  |
+4 |     CHILD_ADMITTED: counter, unit = count, labels = ["Clan"], cardinality = single, name = "harw_child_admitted_total";
+  |                                                      ^^^^^^

@@ -1,0 +1,799 @@
+{
+  "vendor": "openai",
+  "verified_at": "2026-07-16T00:00:00Z",
+  "primary_sources": [
+    {
+      "url": "https://developers.openai.com/api/docs/models",
+      "title": "OpenAI Models — official reference",
+      "fetched_at": "2026-07-16T00:00:00Z"
+    },
+    {
+      "url": "https://developers.openai.com/api/docs/models/compare",
+      "title": "OpenAI Models — compare table",
+      "fetched_at": "2026-07-16T00:00:00Z"
+    }
+  ],
+  "records": [
+    {
+      "vendor": "openai",
+      "canonical_id": "gpt-5.6-sol",
+      "aliases": ["gpt-5.6"],
+      "family": "gpt",
+      "release_version": "5.6",
+      "variant": "sol",
+      "lifecycle": "ga",
+      "context_window": 1050000,
+      "max_output_tokens": 128000,
+      "modalities": ["text", "image"],
+      "capabilities": {
+        "tool_calling": "parallel",
+        "parallel_tools": true,
+        "structured_output": "json_schema",
+        "reasoning": "effort",
+        "reasoning_effort_levels": ["none", "low", "medium", "high", "xhigh", "max"],
+        "reasoning_pro_mode": true,
+        "prompt_caching": "explicit",
+        "streaming": "server_sent",
+        "image_input": true
+      },
+      "native_agent_features": {
+        "computer_use": true,
+        "code_execution": true,
+        "built_in_search": true,
+        "file_search": true,
+        "image_generation": true,
+        "hosted_shell": true,
+        "mcp": true
+      },
+      "knowledge_cutoff": "2026-02-16",
+      "released_at": null,
+      "snapshot_id": null,
+      "sources": [
+        {
+          "url": "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
+          "title": "GPT-5.6 Sol model card — OpenAI API docs",
+          "fetched_at": "2026-07-16T00:00:00Z"
+        }
+      ],
+      "notes": "Frontier model in GPT-5.6 family. Alias gpt-5.6 routes to this model. Supports persisted reasoning, explicit prompt caching controls, programmatic tool calling, and Pro mode (reasoning.mode='pro'). Context surcharge applies above 272K input tokens (2x input, 1.5x output). Cache writes billed at 1.25x uncached rate."
+    },
+    {
+      "vendor": "openai",
+      "canonical_id": "gpt-5.6-terra",
+      "aliases": [],
+      "family": "gpt",
+      "release_version": "5.6",
+      "variant": "terra",
+      "lifecycle": "ga",
+      "context_window": 1050000,
+      "max_output_tokens": 128000,
+      "modalities": ["text", "image"],
+      "capabilities": {
+        "tool_calling": "parallel",
+        "parallel_tools": true,
+        "structured_output": "json_schema",
+        "reasoning": "effort",
+        "reasoning_effort_levels": ["none", "low", "medium", "high", "xhigh", "max"],
+        "reasoning_pro_mode": true,
+        "prompt_caching": "explicit",
+        "streaming": "server_sent",
+        "image_input": true
+      },
+      "native_agent_features": {
+        "computer_use": true,
+        "code_execution": true,
+        "built_in_search": true,
+        "file_search": true,
+        "image_generation": true,
+        "hosted_shell": true,
+        "mcp": true
+      },
+      "knowledge_cutoff": "2026-02-16",
+      "released_at": null,
+      "snapshot_id": null,
+      "sources": [
+        {
+          "url": "https://developers.openai.com/api/docs/models/gpt-5.6-terra",
+          "title": "GPT-5.6 Terra model card — OpenAI API docs",
+          "fetched_at": "2026-07-16T00:00:00Z"
+        }
+      ],
+      "notes": "Mid-tier model in GPT-5.6 family. Balances intelligence and cost. Roughly corresponds to the mini tier from earlier GPT-5 families. Context surcharge above 272K input tokens. Cache writes at 1.25x uncached rate."
+    },
+    {
+      "vendor": "openai",
+      "canonical_id": "gpt-5.6-luna",
+      "aliases": [],
+      "family": "gpt",
+      "release_version": "5.6",
+      "variant": "luna",
+      "lifecycle": "ga",
+      "context_window": 1050000,
+      "max_output_tokens": 128000,
+      "modalities": ["text", "image"],
+      "capabilities": {
+        "tool_calling": "parallel",
+        "parallel_tools": true,
+        "structured_output": "json_schema",
+        "reasoning": "effort",
+        "reasoning_effort_levels": ["none", "low", "medium", "high", "xhigh", "max"],
+        "reasoning_pro_mode": true,
+        "prompt_caching": "explicit",
+        "streaming": "server_sent",
+        "image_input": true
+      },
+      "native_agent_features": {
+        "computer_use": true,
+        "code_execution": true,
+        "built_in_search": true,
+        "file_search": true,
+        "image_generation": true,
+        "hosted_shell": true,
+        "mcp": true
+      },
+      "knowledge_cutoff": "2026-02-16",
+      "released_at": null,
+      "snapshot_id": null,
+      "sources": [
+        {
+          "url": "https://developers.openai.com/api/docs/models/gpt-5.6-luna",
+          "title": "GPT-5.6 Luna model card — OpenAI API docs",
+          "fetched_at": "2026-07-16T00:00:00Z"
+        }
+      ],
+      "notes": "Cost-optimized tier in GPT-5.6 family. Roughly corresponds to nano tier from earlier GPT-5 families. Targeted at cost-sensitive, high-volume workloads. Context surcharge above 272K input tokens."
+    },
+    {
+      "vendor": "openai",
+      "canonical_id": "gpt-5.4-pro",
+      "aliases": ["gpt-5.4-pro-2026-03-05"],
+      "family": "gpt",
+      "release_version": "5.4",
+      "variant": "pro",
+      "lifecycle": "ga",
+      "context_window": 1050000,
+      "max_output_tokens": 128000,
+      "modalities": ["text", "image"],
+      "capabilities": {
+        "tool_calling": "parallel",
+        "parallel_tools": true,
+        "structured_output": null,
+        "reasoning": "effort",
+        "reasoning_effort_levels": ["medium", "high", "xhigh"],
+        "reasoning_pro_mode": false,
+        "prompt_caching": "implicit",
+        "streaming": "server_sent",
+        "image_input": true
+      },
+      "native_agent_features": {
+        "computer_use": true,
+        "code_execution": false,
+        "built_in_search": true,
+        "file_search": true,
+        "image_generation": true,
+        "hosted_shell": false,
+        "mcp": true
+      },
+      "knowledge_cutoff": "2025-08-31",
+      "released_at": "2026-03-05",
+      "snapshot_id": "gpt-5.4-pro-2026-03-05",
+      "sources": [
+        {
+          "url": "https://developers.openai.com/api/docs/models/gpt-5.4-pro",
+          "title": "GPT-5.4 Pro model card — OpenAI API docs",
+          "fetched_at": "2026-07-16T00:00:00Z"
+        }
+      ],
+      "notes": "High-intelligence reasoning model with higher compute per request. Available via Responses API only for multi-turn interactions. Structured outputs NOT supported. Requests may take several minutes; background mode recommended. Context surcharge above 272K tokens. Pricing: $30 input / $180 output per 1M tokens."
+    },
+    {
+      "vendor": "openai",
+      "canonical_id": "gpt-5.4",
+      "aliases": ["gpt-5.4-2026-03-05"],
+      "family": "gpt",
+      "release_version": "5.4",
+      "variant": null,
+      "lifecycle": "ga",
+      "context_window": 1050000,
+      "max_output_tokens": 128000,
+      "modalities": ["text", "image"],
+      "capabilities": {
+        "tool_calling": "parallel",
+        "parallel_tools": true,
+        "structured_output": "json_schema",
+        "reasoning": "effort",
+        "reasoning_effort_levels": ["none", "low", "medium", "high", "xhigh"],
+        "reasoning_pro_mode": false,
+        "prompt_caching": "implicit",
+        "streaming": "server_sent",
+        "image_input": true
+      },
+      "native_agent_features": {
+        "computer_use": true,
+        "code_execution": true,
+        "built_in_search": true,
+        "file_search": true,
+        "image_generation": true,
+        "hosted_shell": true,
+        "mcp": true
+      },
+      "knowledge_cutoff": "2025-08-31",
+      "released_at": "2026-03-05",
+      "snapshot_id": "gpt-5.4-2026-03-05",
+      "sources": [
+        {
+          "url": "https://developers.openai.com/api/docs/models/gpt-5.4",
+          "title": "GPT-5.4 model card — OpenAI API docs",
+          "fetched_at": "2026-07-16T00:00:00Z"
+        }
+      ],
+      "notes": "Frontier model. Unifies Codex and GPT lines. Default reasoning effort level is none. Context surcharge above 272K tokens (2x input, 1.5x output)."
+    },
+    {
+      "vendor": "openai",
+      "canonical_id": "gpt-5.4-mini",
+      "aliases": ["gpt-5.4-mini-2026-03-17"],
+      "family": "gpt",
+      "release_version": "5.4",
+      "variant": "mini",
+      "lifecycle": "ga",
+      "context_window": 400000,
+      "max_output_tokens": 128000,
+      "modalities": ["text", "image"],
+      "capabilities": {
+        "tool_calling": "parallel",
+        "parallel_tools": true,
+        "structured_output": "json_schema",
+        "reasoning": "effort",
+        "reasoning_effort_levels": ["none", "low", "medium", "high", "xhigh"],
+        "reasoning_pro_mode": false,
+        "prompt_caching": "implicit",
+        "streaming": "server_sent",
+        "image_input": true
+      },
+      "native_agent_features": {
+        "computer_use": true,
+        "code_execution": true,
+        "built_in_search": true,
+        "file_search": true,
+        "image_generation": true,
+        "hosted_shell": true,
+        "mcp": true
+      },
+      "knowledge_cutoff": "2025-08-31",
+      "released_at": "2026-03-17",
+      "snapshot_id": "gpt-5.4-mini-2026-03-17",
+      "sources": [
+        {
+          "url": "https://developers.openai.com/api/docs/models/gpt-5.4-mini",
+          "title": "GPT-5.4 mini model card — OpenAI API docs",
+          "fetched_at": "2026-07-16T00:00:00Z"
+        }
+      ],
+      "notes": "Strongest mini model for coding, computer use, and subagents. Default reasoning effort none. Full agent tool suite including computer use and code interpreter."
+    },
+    {
+      "vendor": "openai",
+      "canonical_id": "gpt-5.4-nano",
+      "aliases": ["gpt-5.4-nano-2026-03-17"],
+      "family": "gpt",
+      "release_version": "5.4",
+      "variant": "nano",
+      "lifecycle": "ga",
+      "context_window": 400000,
+      "max_output_tokens": 128000,
+      "modalities": ["text", "image"],
+      "capabilities": {
+        "tool_calling": "parallel",
+        "parallel_tools": true,
+        "structured_output": "json_schema",
+        "reasoning": "effort",
+        "reasoning_effort_levels": ["none", "low", "medium", "high", "xhigh"],
+        "reasoning_pro_mode": false,
+        "prompt_caching": "implicit",
+        "streaming": "server_sent",
+        "image_input": true
+      },
+      "native_agent_features": {
+        "computer_use": false,
+        "code_execution": true,
+        "built_in_search": true,
+        "file_search": true,
+        "image_generation": true,
+        "hosted_shell": true,
+        "mcp": true
+      },
+      "knowledge_cutoff": "2025-08-31",
+      "released_at": "2026-03-17",
+      "snapshot_id": "gpt-5.4-nano-2026-03-17",
+      "sources": [
+        {
+          "url": "https://developers.openai.com/api/docs/models/gpt-5.4-nano",
+          "title": "GPT-5.4 nano model card — OpenAI API docs",
+          "fetched_at": "2026-07-16T00:00:00Z"
+        }
+      ],
+      "notes": "Cheapest GPT-5.4-class model. Targeted at classification, data extraction, ranking, and sub-agents. Computer use NOT supported. Supports broadest endpoint range including legacy completions, speech, moderation."
+    },
+    {
+      "vendor": "openai",
+      "canonical_id": "gpt-5.2",
+      "aliases": ["gpt-5.2-2025-12-11"],
+      "family": "gpt",
+      "release_version": "5.2",
+      "variant": null,
+      "lifecycle": "ga",
+      "context_window": 400000,
+      "max_output_tokens": 128000,
+      "modalities": ["text", "image"],
+      "capabilities": {
+        "tool_calling": "parallel",
+        "parallel_tools": true,
+        "structured_output": "json_schema",
+        "reasoning": "effort",
+        "reasoning_effort_levels": ["none", "low", "medium", "high", "xhigh"],
+        "reasoning_pro_mode": false,
+        "prompt_caching": "implicit",
+        "streaming": "server_sent",
+        "image_input": true
+      },
+      "native_agent_features": {
+        "computer_use": null,
+        "code_execution": null,
+        "built_in_search": null,
+        "file_search": null,
+        "image_generation": null,
+        "hosted_shell": null,
+        "mcp": null
+      },
+      "knowledge_cutoff": "2025-08-31",
+      "released_at": "2025-12-11",
+      "snapshot_id": "gpt-5.2-2025-12-11",
+      "sources": [
+        {
+          "url": "https://developers.openai.com/api/docs/models/gpt-5.2",
+          "title": "GPT-5.2 model card — OpenAI API docs",
+          "fetched_at": "2026-07-16T00:00:00Z"
+        }
+      ],
+      "notes": "Previous frontier model, superseded by GPT-5.6. Native agent tool support not enumerated on model page — see Responses API tools documentation."
+    },
+    {
+      "vendor": "openai",
+      "canonical_id": "gpt-5",
+      "aliases": ["gpt-5-2025-08-07"],
+      "family": "gpt",
+      "release_version": "5",
+      "variant": null,
+      "lifecycle": "ga",
+      "context_window": 400000,
+      "max_output_tokens": 128000,
+      "modalities": ["text", "image"],
+      "capabilities": {
+        "tool_calling": "parallel",
+        "parallel_tools": true,
+        "structured_output": "json_schema",
+        "reasoning": "effort",
+        "reasoning_effort_levels": ["minimal", "low", "medium", "high"],
+        "reasoning_pro_mode": false,
+        "prompt_caching": "implicit",
+        "streaming": "server_sent",
+        "image_input": true
+      },
+      "native_agent_features": {
+        "computer_use": null,
+        "code_execution": null,
+        "built_in_search": null,
+        "file_search": null,
+        "image_generation": null,
+        "hosted_shell": null,
+        "mcp": null
+      },
+      "knowledge_cutoff": "2024-09-30",
+      "released_at": "2025-08-07",
+      "snapshot_id": "gpt-5-2025-08-07",
+      "sources": [
+        {
+          "url": "https://developers.openai.com/api/docs/models/gpt-5",
+          "title": "GPT-5 model card — OpenAI API docs",
+          "fetched_at": "2026-07-16T00:00:00Z"
+        }
+      ],
+      "notes": "Previous-generation flagship. Docs recommend using GPT-5.6 instead. Reasoning effort levels are minimal/low/medium/high (not xhigh). Native agent tool details not enumerated on model page."
+    },
+    {
+      "vendor": "openai",
+      "canonical_id": "gpt-4.1",
+      "aliases": ["gpt-4.1-2025-04-14"],
+      "family": "gpt",
+      "release_version": "4.1",
+      "variant": null,
+      "lifecycle": "ga",
+      "context_window": 1047576,
+      "max_output_tokens": 32768,
+      "modalities": ["text", "image"],
+      "capabilities": {
+        "tool_calling": "parallel",
+        "parallel_tools": true,
+        "structured_output": "json_schema",
+        "reasoning": "none",
+        "reasoning_effort_levels": [],
+        "reasoning_pro_mode": false,
+        "prompt_caching": "implicit",
+        "streaming": "server_sent",
+        "image_input": true
+      },
+      "native_agent_features": {
+        "computer_use": null,
+        "code_execution": null,
+        "built_in_search": null,
+        "file_search": null,
+        "image_generation": null,
+        "hosted_shell": null,
+        "mcp": null
+      },
+      "knowledge_cutoff": "2024-06-01",
+      "released_at": "2025-04-14",
+      "snapshot_id": "gpt-4.1-2025-04-14",
+      "sources": [
+        {
+          "url": "https://developers.openai.com/api/docs/models/gpt-4.1",
+          "title": "GPT-4.1 model card — OpenAI API docs",
+          "fetched_at": "2026-07-16T00:00:00Z"
+        }
+      ],
+      "notes": "Smartest non-reasoning model. No reasoning step. Fine-tuning supported. Docs recommend GPT-5 for complex tasks. Tool calling excels via function calling; native Responses API agent tools not enumerated on model page."
+    },
+    {
+      "vendor": "openai",
+      "canonical_id": "gpt-4.1-mini",
+      "aliases": ["gpt-4.1-mini-2025-04-14"],
+      "family": "gpt",
+      "release_version": "4.1",
+      "variant": "mini",
+      "lifecycle": "ga",
+      "context_window": 1047576,
+      "max_output_tokens": 32768,
+      "modalities": ["text", "image"],
+      "capabilities": {
+        "tool_calling": "parallel",
+        "parallel_tools": true,
+        "structured_output": "json_schema",
+        "reasoning": "none",
+        "reasoning_effort_levels": [],
+        "reasoning_pro_mode": false,
+        "prompt_caching": "implicit",
+        "streaming": "server_sent",
+        "image_input": true
+      },
+      "native_agent_features": {
+        "computer_use": null,
+        "code_execution": null,
+        "built_in_search": null,
+        "file_search": null,
+        "image_generation": null,
+        "hosted_shell": null,
+        "mcp": null
+      },
+      "knowledge_cutoff": "2024-06-01",
+      "released_at": "2025-04-14",
+      "snapshot_id": "gpt-4.1-mini-2025-04-14",
+      "sources": [
+        {
+          "url": "https://developers.openai.com/api/docs/models/gpt-4.1-mini",
+          "title": "GPT-4.1 mini model card — OpenAI API docs",
+          "fetched_at": "2026-07-16T00:00:00Z"
+        }
+      ],
+      "notes": "Fast and affordable non-reasoning model. No reasoning step. Fine-tuning supported. Supports Realtime API."
+    },
+    {
+      "vendor": "openai",
+      "canonical_id": "gpt-4.1-nano",
+      "aliases": ["gpt-4.1-nano-2025-04-14"],
+      "family": "gpt",
+      "release_version": "4.1",
+      "variant": "nano",
+      "lifecycle": "ga",
+      "context_window": 1047576,
+      "max_output_tokens": 32768,
+      "modalities": ["text", "image"],
+      "capabilities": {
+        "tool_calling": "parallel",
+        "parallel_tools": true,
+        "structured_output": "json_schema",
+        "reasoning": "none",
+        "reasoning_effort_levels": [],
+        "reasoning_pro_mode": false,
+        "prompt_caching": "implicit",
+        "streaming": "server_sent",
+        "image_input": true
+      },
+      "native_agent_features": {
+        "computer_use": null,
+        "code_execution": null,
+        "built_in_search": null,
+        "file_search": null,
+        "image_generation": null,
+        "hosted_shell": null,
+        "mcp": null
+      },
+      "knowledge_cutoff": "2024-06-01",
+      "released_at": "2025-04-14",
+      "snapshot_id": "gpt-4.1-nano-2025-04-14",
+      "sources": [
+        {
+          "url": "https://developers.openai.com/api/docs/models/gpt-4.1-nano",
+          "title": "GPT-4.1 nano model card — OpenAI API docs",
+          "fetched_at": "2026-07-16T00:00:00Z"
+        }
+      ],
+      "notes": "Cheapest GPT-4.1 tier. No reasoning step. Fine-tuning supported. Supports Realtime and legacy completions API."
+    },
+    {
+      "vendor": "openai",
+      "canonical_id": "o3-pro",
+      "aliases": ["o3-pro-2025-06-10"],
+      "family": "o",
+      "release_version": "3",
+      "variant": "pro",
+      "lifecycle": "ga",
+      "context_window": 200000,
+      "max_output_tokens": 100000,
+      "modalities": ["text", "image"],
+      "capabilities": {
+        "tool_calling": "parallel",
+        "parallel_tools": true,
+        "structured_output": "json_schema",
+        "reasoning": "effort",
+        "reasoning_effort_levels": null,
+        "reasoning_pro_mode": false,
+        "prompt_caching": null,
+        "streaming": "none",
+        "image_input": true
+      },
+      "native_agent_features": {
+        "computer_use": null,
+        "code_execution": null,
+        "built_in_search": null,
+        "file_search": null,
+        "image_generation": null,
+        "hosted_shell": null,
+        "mcp": null
+      },
+      "knowledge_cutoff": "2024-06-01",
+      "released_at": "2025-06-10",
+      "snapshot_id": "o3-pro-2025-06-10",
+      "sources": [
+        {
+          "url": "https://developers.openai.com/api/docs/models/o3-pro",
+          "title": "o3-pro model card — OpenAI API docs",
+          "fetched_at": "2026-07-16T00:00:00Z"
+        }
+      ],
+      "notes": "Highest-compute o3 variant. Streaming NOT supported. Background mode recommended due to multi-minute response times. Reasoning effort enumerated as 'Highest' on model page but specific configurable levels not documented. Prompt caching status not documented on model page."
+    },
+    {
+      "vendor": "openai",
+      "canonical_id": "o3",
+      "aliases": ["o3-2025-04-16"],
+      "family": "o",
+      "release_version": "3",
+      "variant": null,
+      "lifecycle": "ga",
+      "context_window": 200000,
+      "max_output_tokens": 100000,
+      "modalities": ["text", "image"],
+      "capabilities": {
+        "tool_calling": "parallel",
+        "parallel_tools": true,
+        "structured_output": "json_schema",
+        "reasoning": "effort",
+        "reasoning_effort_levels": null,
+        "reasoning_pro_mode": false,
+        "prompt_caching": "implicit",
+        "streaming": "server_sent",
+        "image_input": true
+      },
+      "native_agent_features": {
+        "computer_use": null,
+        "code_execution": null,
+        "built_in_search": null,
+        "file_search": null,
+        "image_generation": null,
+        "hosted_shell": null,
+        "mcp": null
+      },
+      "knowledge_cutoff": "2024-06-01",
+      "released_at": "2025-04-16",
+      "snapshot_id": "o3-2025-04-16",
+      "sources": [
+        {
+          "url": "https://developers.openai.com/api/docs/models/o3",
+          "title": "o3 model card — OpenAI API docs",
+          "fetched_at": "2026-07-16T00:00:00Z"
+        }
+      ],
+      "notes": "Docs state o3 is succeeded by GPT-5. Strong at math, science, coding, and visual reasoning. Specific reasoning effort levels not enumerated on model page. Prompt caching confirmed (cached at $0.50/1M)."
+    },
+    {
+      "vendor": "openai",
+      "canonical_id": "o4-mini",
+      "aliases": ["o4-mini-2025-04-16"],
+      "family": "o",
+      "release_version": "4",
+      "variant": "mini",
+      "lifecycle": "deprecated",
+      "context_window": 200000,
+      "max_output_tokens": 100000,
+      "modalities": ["text", "image"],
+      "capabilities": {
+        "tool_calling": "parallel",
+        "parallel_tools": true,
+        "structured_output": "json_schema",
+        "reasoning": "effort",
+        "reasoning_effort_levels": null,
+        "reasoning_pro_mode": false,
+        "prompt_caching": "implicit",
+        "streaming": "server_sent",
+        "image_input": true
+      },
+      "native_agent_features": {
+        "computer_use": null,
+        "code_execution": null,
+        "built_in_search": null,
+        "file_search": null,
+        "image_generation": null,
+        "hosted_shell": null,
+        "mcp": null
+      },
+      "knowledge_cutoff": "2024-06-01",
+      "released_at": "2025-04-16",
+      "snapshot_id": "o4-mini-2025-04-16",
+      "sources": [
+        {
+          "url": "https://developers.openai.com/api/docs/models/o4-mini",
+          "title": "o4-mini model card — OpenAI API docs",
+          "fetched_at": "2026-07-16T00:00:00Z"
+        }
+      ],
+      "notes": "Dated snapshot o4-mini-2025-04-16 marked Deprecated on model page. Docs note model is succeeded by GPT-5 mini. API shutdown reported for October 23, 2026. Fine-tuning supported. Specific reasoning effort levels not enumerated on model page."
+    },
+    {
+      "vendor": "openai",
+      "canonical_id": "o3-deep-research",
+      "aliases": ["o3-deep-research-2025-06-26"],
+      "family": "o",
+      "release_version": "3",
+      "variant": "deep-research",
+      "lifecycle": "deprecated",
+      "context_window": 200000,
+      "max_output_tokens": 100000,
+      "modalities": ["text", "image"],
+      "capabilities": {
+        "tool_calling": "none",
+        "parallel_tools": false,
+        "structured_output": null,
+        "reasoning": "effort",
+        "reasoning_effort_levels": null,
+        "reasoning_pro_mode": false,
+        "prompt_caching": "implicit",
+        "streaming": "server_sent",
+        "image_input": true
+      },
+      "native_agent_features": {
+        "computer_use": false,
+        "code_execution": false,
+        "built_in_search": true,
+        "file_search": true,
+        "image_generation": false,
+        "hosted_shell": false,
+        "mcp": true
+      },
+      "knowledge_cutoff": "2024-06-01",
+      "released_at": "2025-06-26",
+      "snapshot_id": "o3-deep-research-2025-06-26",
+      "sources": [
+        {
+          "url": "https://developers.openai.com/api/docs/models/o3-deep-research",
+          "title": "o3-deep-research model card — OpenAI API docs",
+          "fetched_at": "2026-07-16T00:00:00Z"
+        }
+      ],
+      "notes": "Specialized for complex multi-step research tasks. Always uses web_search. Function calling NOT supported. Structured outputs NOT supported. Dated snapshot marked Deprecated. API shutdown reported for July 23, 2026. Supports MCP connectors for user data."
+    },
+    {
+      "vendor": "openai",
+      "canonical_id": "o4-mini-deep-research",
+      "aliases": ["o4-mini-deep-research-2025-06-26"],
+      "family": "o",
+      "release_version": "4",
+      "variant": "mini-deep-research",
+      "lifecycle": "deprecated",
+      "context_window": 200000,
+      "max_output_tokens": 100000,
+      "modalities": ["text", "image"],
+      "capabilities": {
+        "tool_calling": "none",
+        "parallel_tools": false,
+        "structured_output": null,
+        "reasoning": "effort",
+        "reasoning_effort_levels": null,
+        "reasoning_pro_mode": false,
+        "prompt_caching": "implicit",
+        "streaming": "server_sent",
+        "image_input": true
+      },
+      "native_agent_features": {
+        "computer_use": false,
+        "code_execution": false,
+        "built_in_search": true,
+        "file_search": true,
+        "image_generation": false,
+        "hosted_shell": false,
+        "mcp": true
+      },
+      "knowledge_cutoff": "2024-06-01",
+      "released_at": "2025-06-26",
+      "snapshot_id": "o4-mini-deep-research-2025-06-26",
+      "sources": [
+        {
+          "url": "https://developers.openai.com/api/docs/models/o4-mini-deep-research",
+          "title": "o4-mini-deep-research model card — OpenAI API docs",
+          "fetched_at": "2026-07-16T00:00:00Z"
+        }
+      ],
+      "notes": "Faster, more affordable deep research model. Function calling NOT supported. Structured outputs NOT supported. Dated snapshot marked Deprecated. API shutdown reported for July 23, 2026. Supports MCP connectors."
+    }
+  ],
+  "unresolved_questions": [
+    {
+      "id": "uq-1",
+      "question": "Exact dated snapshot IDs for GPT-5.6-sol, GPT-5.6-terra, and GPT-5.6-luna",
+      "context": "Model pages confirmed the base IDs but did not display dated snapshot strings (e.g., gpt-5.6-sol-YYYYMMDD). The compare page also did not surface them.",
+      "blocking": false
+    },
+    {
+      "id": "uq-2",
+      "question": "Native Responses API tool support flags for o3, o3-pro, o4-mini",
+      "context": "Individual model pages for o-series models did not enumerate computer_use, code_execution, built_in_search, or file_search as explicit per-model flags. The tools documentation is referenced separately.",
+      "blocking": false
+    },
+    {
+      "id": "uq-3",
+      "question": "Native Responses API tool support flags for gpt-4.1, gpt-4.1-mini, gpt-4.1-nano, gpt-5, gpt-5.2",
+      "context": "Model pages for these models did not enumerate individual agent tools. Tools are invoked via function calling; built-in tool availability via the Responses API was not confirmed per-model.",
+      "blocking": false
+    },
+    {
+      "id": "uq-4",
+      "question": "Exact reasoning effort levels for o3, o3-pro, o4-mini, o3-deep-research, o4-mini-deep-research",
+      "context": "Model pages show a qualitative 'reasoning level' indicator (Highest, Higher) but do not enumerate the string values accepted by reasoning.effort for these models.",
+      "blocking": false
+    },
+    {
+      "id": "uq-5",
+      "question": "gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna exact release / GA announcement dates",
+      "context": "Knowledge cutoff (Feb 16 2026) is documented but no public announcement or GA date is specified on the model pages.",
+      "blocking": false
+    },
+    {
+      "id": "uq-6",
+      "question": "Prompt caching status for o3-pro",
+      "context": "The o3-pro model page does not include prompt caching in the features table. It is unclear whether it is unsupported or simply undocumented.",
+      "blocking": false
+    },
+    {
+      "id": "uq-7",
+      "question": "GPT-5.6 Sol structured output support — json_mode vs json_schema",
+      "context": "Model page confirms structured outputs are supported but does not specify whether json_schema (stricter) or only json_mode is available for all three GPT-5.6 variants.",
+      "blocking": false
+    },
+    {
+      "id": "uq-8",
+      "question": "Whether gpt-5.4-pro supports prompt caching",
+      "context": "The gpt-5.4-pro model page does not list prompt caching in the feature table. It may be unsupported given the premium positioning of the model.",
+      "blocking": false
+    }
+  ]
+}

@@ -1,0 +1,108 @@
+[package]
+name = "harw-sentinel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Die Sammelstelle selbst: `Sentinel`, `SentinelConfig`. Dieses Binary macht
+# sie zu einem laufenden Prozess (Knoten AW2-19) — siehe `src/main.rs`.
+harw-dod-sentinel = { path = "../harw-dod-sentinel" }
+# Daten-/Erzeugungsvokabular: `trait Sensor`, `SensorReading`, `SecurityEvent`,
+# `EventKind`, `SecurityEvidence`. Nötig, um die Sammelschleife und den
+# IPC-Empfangspfad gegen dieselben Typen zu schreiben, die `harw-dod-sentinel`
+# selbst verwendet.
+harw-dod-signals = { path = "../harw-dod-signals" }
+# Zugriffsvokabular: `Capability`, `CapabilityClass`, `ReadScope`,
+# `SensorHandle`. Trägt die Abnahme dieses Knotens: jeder hier registrierte
+# Sensor muss `Capability::class() == CapabilityClass::Unprivileged` sein.
+harw-dod-cap = { path = "../harw-dod-cap" }
+# `TelemetrySink`-Trait für den Sink-Parameter von `Sentinel::new`.
+harw-observe = { path = "../harw-observe" }
+# `FileSink`, der einzige gelandete `TelemetrySink`-Implementierer — der
+# Standard-Sink dieses Binaries.
+harw-observe-file = { path = "../harw-observe-file" }
+# `paths::telemetry_dir`, `paths::home_dir` — Root-Space-Auflösung ohne
+# eigene Zweitimplementierung.
+harw-home = { path = "../harw-home" }
+# `SensorId` für jeden hier gebauten `SensorHandle`.
+harw-types = { path = "../harw-types" }
+# `#[derive(harw_macros::HarwError)]` für `src/error.rs` und `src/ipc.rs`.
+harw-macros = { path = "../harw-macros" }
+# Schließt Bruch 1 (Sensor -> Regelwerk): `run_rules`, `Rule`, `RuleContext`,
+# `Finding`/`FindingKind`/`RuleChecked`, `EgressFlowRule`,
+# `StructureDriftRule`, `BaselineDeviationRule` — siehe `src/findings.rs`
+# Moduldoku für den Aufrufort im Poll-Zyklus und, nachgezählt statt
+# angenommen, wie viele weitere Einträge diese Kante dem Abhängigkeitsbaum
+# dieses unprivilegierten Binaries hinzufügt (Abschnitt „Das
+# Privilegienbudget dieser Kante").
+harw-dod-rules = { path = "../harw-dod-rules" }
+# `NetworkScope` für den `network_scope`-Eintrag des `RuleContext`, den
+# `src/findings.rs` baut — siehe dortige Moduldoku, Abschnitt „Was dieser
+# Kontext (noch) nicht befüllt", für die Begründung von `NetworkScope::empty`.
+harw-sandbox = { path = "../harw-sandbox" }
+
+# --- Sensor-Crates: nur die tatsächlich gebauten (siehe src/sensors.rs für
+# die vollständige Registrierungs- und Auslassungsbegründung) ---
+# `ListenerSensor` (`Capability::ReadProcNet`, unprivilegiert).
+harw-dod-listener = { path = "../harw-dod-listener" }
+# `WorkspaceDriftSensor`, `Inventory` (`Capability::ReadWorkspaceGraph`,
+# unprivilegiert).
+harw-dod-workspace = { path = "../harw-dod-workspace" }
+# `CpuSensor` (`Capability::ReadProcStat`, unprivilegiert).
+harw-dod-cpu = { path = "../harw-dod-cpu" }
+# `ThermalSensor` (`Capability::ReadSysfsThermal`, unprivilegiert).
+harw-dod-thermal = { path = "../harw-dod-thermal" }
+# `MemorySensor` (`Capability::ReadProcMeminfo`, unprivilegiert).
+harw-dod-memory = { path = "../harw-dod-memory" }
+# `BlockioSensor` (`Capability::ReadSysfsBlock`, unprivilegiert).
+harw-dod-blockio = { path = "../harw-dod-blockio" }
+# `NetCountersSensor` (`Capability::ReadProcNetDev`, unprivilegiert).
+harw-dod-netcounters = { path = "../harw-dod-netcounters" }
+# `GpuSensor` (`Capability::ReadSysfsDrm`, unprivilegiert).
+harw-dod-gpu = { path = "../harw-dod-gpu" }
+# `CgroupSensor` (`Capability::ReadCgroupV2`, unprivilegiert).
+harw-dod-cgroup = { path = "../harw-dod-cgroup" }
+harw-dod-scanreport = { path = "../harw-dod-scanreport" }
+# Bewusst NICHT aufgenommen: `harw-dod-authlog`. Sein einziges produktives
+# Backend (`AuditBackend`) trägt `Capability::ReadAuditNetlink`, Klasse
+# `CapabilityClass::Netlink` — nicht unprivilegiert. Ein Journal-Backend
+# (das unprivilegierte `Capability::ReadJournal` trüge) existiert laut
+# eigener Crate-Dokumentation bewusst nicht. Ebenso bewusst NICHT
+# aufgenommen: `harw-dod-fsmon` (`Capability::WatchFilesystem`, Klasse
+# `FileWatch`) und `harw-dod-procmon` (`Capability::LoadBpfProgram`, Klasse
+# `Bpf`) — beide gelandet, keine ihrer Fähigkeiten unprivilegiert. Siehe
+# `src/sensors.rs`-Moduldoku für die volle Begründung, warum diese Crates
+# hier fehlen, obwohl sie gebaut sind.
+
+jiff = { workspace = true }
+tracing = { workspace = true }
+# Version identisch zu `harw-cli`/`harw-browser-thirtyfour` — ein Sink für
+# `tracing`, keine Zweitwahl je Binary.
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# `--log`-Grammatik; Version identisch zu `harw-cli`.
+clap = { version = "4.6.1", features = ["derive"] }
+# Sicherer `SOCK_SEQPACKET`-Unix-Socket und `SO_PEERCRED` ohne `unsafe`
+# (`net`-Feature; Muster: `harw-dod-netlink/Cargo.toml`, dessen
+# `NetlinkAuditSource` denselben Feature-Zuschnitt für einen anderen
+# Sockettyp verwendet).
+rustix = { workspace = true, features = ["net"] }
+# Sichere Landlock-Bindung. **Nicht** über `[workspace.dependencies]`
+# verfügbar (dort bislang ungenutzt) und diese Crate ist die einzige
+# Konsumentin — direkte Versionsangabe statt Workspace-Umweg, wie es dieser
+# Workspace auch für andere Einzelkonsumenten hält (z. B.
+# `tikv-jemallocator` nur in `harw-cli/Cargo.toml`). Version 0.4.7 über
+# `docs.rs/crate/landlock` nachgeschlagen (Stand dieses Knotens) — `cargo
+# add` konnte hier nicht laufen, siehe `src/sandbox.rs`-Moduldoku.
+landlock = "0.4.7"
+# Wire-Kodierung für `harw_dod_signals::SecurityEvent` über den
+# IPC-Empfangspfad (siehe dortige Moduldoku: „Wire-Stabilität von
+# `EventKind`" — `#[serde(deny_unknown_fields)]`, kebab-case, bereits für
+# genau diesen Zweck vorgesehen).
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

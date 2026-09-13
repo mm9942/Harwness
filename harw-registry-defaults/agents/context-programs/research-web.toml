@@ -1,0 +1,73 @@
+# Kontextprogramm für Web-Dokumentationsrecherche (Rolle: `researcher-web`).
+#
+# WOFÜR: die einzige Rolle mit Netzzugang (siehe `researcher-web.toml`) —
+# holt offizielle Dokumentation/Release-Notes über die Host-Allowlist der
+# Sandbox. Der Kontextbedarf unterscheidet sich fundamental von
+# `research-deps`: nicht lokaler, vertrauter Quellcode, sondern extern
+# geliefertes Material, dessen Herkunft selbst Teil der Nutzenrechnung ist.
+#
+# `extends = base`: `task.objective` unverändert. `history.tail` wird
+# überschrieben (siehe unten) — das ist die gezielte Verschärfung einer
+# geerbten Sektion, wie in `base.toml` beschrieben (namensgleiche
+# Neudeklaration, kein struktureller Entzug).
+#
+# ÜBERSCHRIEBENE BASIS-SEKTION:
+#   - `history.tail`: `detail` von `summary` (Basis) auf `references`
+#     gesenkt. BEGRÜNDUNG UND KOSTEN: eine Web-Recherche-Sitzung besteht
+#     überwiegend aus `web.fetch`-Aufrufen mit langen HTML-/Markdown-
+#     Antworten — genau das Muster, für das `DetailMode::References`
+#     gebaut wurde (`harw-core/src/history_tail.rs`,
+#     `render_history_tail` vergleicht Verweiskosten gegen Volltextkosten
+#     und kürzt nur, wenn der Verweis tatsächlich billiger ist). Der Preis:
+#     der Rechercheur sieht ältere Turns nur noch als
+#     [`harw_context::FragmentReference`] (Label, Vertrauen, Herkunft,
+#     Preisschild, Digest — kein Rumpf) und muss bei Bedarf aktiv über
+#     `context.load` nachladen, mit den dort geltenden Turn-Kappen. Für eine
+#     Rechercheaufgabe, deren wertvolle Erkenntnis meist im *aktuellen*
+#     Fund liegt, nicht im Wortlaut vorheriger Abrufe, ist das der richtige
+#     Tausch: der garantierte Schwanz (`HISTORY_TAIL_GUARANTEED_GROUPS`)
+#     bleibt ohnehin immer voll erhalten.
+#
+# ZUSÄTZLICHE SEKTIONEN:
+#   - `task.read_scope` (full/data, must-include): auch eine Web-Recherche
+#     hat einen lokalen Lesebereich (z. B. um zu sehen, welche Crate-Version
+#     tatsächlich verwendet wird, bevor extern dazu recherchiert wird).
+#   - `web.fetch_allowlist` (full/instruction, must-include): die Menge der
+#     erreichbaren Hosts. `full`, weil eine gekürzte Allowlist ihren Zweck
+#     verfehlt (derselbe Grund wie bei `task.read_scope`). Vertrauen
+#     `instruction`, nicht `data`: die Allowlist ist eine bindende
+#     Sicherheitsvorgabe der Sandbox, keine bloße Randinformation — sie
+#     grenzt ab, was diese Rolle überhaupt tun darf.
+#
+# ZUSÄTZLICHER AUSSCHLUSS: `deps.lockfile_index` — die Web-Rechercheurin
+# arbeitet mit externen Primärquellen, nicht mit dem lokal geparsten
+# Lockfile-Auszug von `research-deps`; eine Vermischung beider Quellen im
+# selben Kontext würde die Trennung "extern, ungeprüft" vs. "lokal, fixiert"
+# verwischen, die diese beiden Programme bewusst auseinanderhalten.
+
+schema = "harwness.context/v1"
+id = "harwness.context.research-web@1"
+version = "1.0.0"
+extends = { id = "harwness.context.base@1" }
+
+# `exclude` steht bewusst vor `[[sections]]` — siehe Kommentar in `base.toml`
+# zum TOML-Fallstrick mit Array-of-Tables.
+exclude = ["deps.lockfile_index"]
+
+[[sections]]
+name = "history.tail"
+strength = "must-include"
+detail = "references"
+trust = "evidence"
+
+[[sections]]
+name = "task.read_scope"
+strength = "must-include"
+detail = "full"
+trust = "data"
+
+[[sections]]
+name = "web.fetch_allowlist"
+strength = "must-include"
+detail = "full"
+trust = "instruction"

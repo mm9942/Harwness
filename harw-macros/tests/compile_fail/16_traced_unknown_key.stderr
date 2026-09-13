@@ -1,0 +1,5 @@
+error: unbekannter Schlüssel `bogus`; erwartet: level, fields
+ --> tests/compile_fail/16_traced_unknown_key.rs:4:23
+  |
+4 | #[harw_macros::traced(bogus = "x")]
+  |                       ^^^^^

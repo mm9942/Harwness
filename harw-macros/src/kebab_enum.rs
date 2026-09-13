@@ -1,0 +1,571 @@
+//! `#[derive(KebabEnum)]`-Expansion.
+//!
+//! Spec: AP W1-26e (KebabEnum-Derive-Makro).
+//!
+//! # Zweck
+//! Fieldless Enums (Betriebsarten, Kategorien, Status-Werte, …) tauchen im
+//! Workspace wiederholt mit einer handgeschriebenen kebab-case-`Display`/
+//! `FromStr`-Paarung auf. Dieses Makro erzeugt beide Impls sowie eine
+//! `ALL`-Konstante aus der reinen Varianten-Deklaration.
+//!
+//! # Anwendbarkeit
+//! `#[derive(KebabEnum)]` ist ausschließlich auf Enums anwendbar, deren
+//! Varianten **ausnahmslos** Unit-Varianten sind (keine Tuple- oder
+//! Named-Varianten) und die mindestens eine Variante besitzen:
+//!
+//! ```ignore
+//! #[derive(KebabEnum)]
+//! pub enum Permission {
+//!     Observer,
+//!     Operator,
+//!     #[kebab_enum(rename = "super-admin")]
+//!     Maintainer,
+//! }
+//! ```
+//!
+//! Jede Nicht-Unit-Variante erzeugt einen Compile-Fehler.
+//!
+//! # Generierte API
+//!
+//! ```ignore
+//! impl Permission {
+//!     pub const ALL: &'static [Permission];
+//!     pub fn as_str(&self) -> &'static str;
+//! }
+//! impl std::fmt::Display for Permission { .. }   // kanonischer kebab-case-Name
+//! impl std::str::FromStr for Permission {         // akzeptiert kebab-case UND
+//!     type Err = <error>;                         // snake_case, case-insensitiv
+//!     ..
+//! }
+//! ```
+//!
+//! `ALL` listet alle Varianten in Deklarationsreihenfolge.
+//!
+//! # kebab-case-Konvertierungsregel
+//!
+//! Der `Ident` jeder Variante wird in Wörter zerlegt und mit `-` verbunden,
+//! anschließend vollständig kleingeschrieben. Wortgrenzen entstehen an:
+//!
+//! 1. jedem expliziten Trennzeichen (`_`, `-`, Leerzeichen) im Bezeichner,
+//! 2. dem Übergang von Klein-/Ziffernzeichen zu einem Großbuchstaben
+//!    (`AddCriterion` → `add`, `criterion` → `add-criterion`),
+//! 3. dem **Ende** eines Akronym-Laufs aus mehreren Großbuchstaben, wenn
+//!    darauf ein Kleinbuchstabe folgt — der letzte Großbuchstabe des Laufs
+//!    beginnt dann ein neues Wort.
+//!
+//! Regel 3 verhindert, dass Akronyme buchstabenweise auseinandergerissen
+//! werden: `HTTPServer` → Lauf `HTTP`, danach beginnt mit `Server` ein neues
+//! Wort (weil auf das `S` das kleine `e` folgt) → `http-server`, **nicht**
+//! `h-t-t-p-server`. Ein Enum-Bezeichner, der komplett aus Großbuchstaben
+//! besteht (z. B. `ID`), bildet dagegen ein einziges Wort (`id`), da kein
+//! Kleinbuchstabe-Übergang eine Aufspaltung auslöst.
+//!
+//! Diese Regel ist implementiert in [`to_kebab_case`] und deckungsgleich mit
+//! dem, was gängige Rename-Konventionen (z. B. `serde(rename_all = "kebab-case")`)
+//! für Akronyme erwarten.
+//!
+//! `#[kebab_enum(rename = "...")]` an einer Variante überschreibt den
+//! automatisch abgeleiteten Namen vollständig (auch für `Display`).
+//!
+//! # FromStr-Toleranz
+//!
+//! `FromStr::from_str` normalisiert die Eingabe (`_` → `-`, dann
+//! `to_ascii_lowercase()`) und vergleicht sie gegen die ebenso normalisierte
+//! kanonische Form jeder Variante. Dadurch werden kebab-case, SNAKE_CASE,
+//! Snake_Case und beliebige Groß-/Kleinschreibung akzeptiert; `Display`
+//! liefert stets ausschließlich die kanonische kebab-case-Form.
+//!
+//! Erzeugen zwei Varianten (nach Normalisierung, inkl. `rename`) denselben
+//! Namen, ist das ein Compile-Fehler (sonst wäre `FromStr` für diesen Namen
+//! nicht mehr eindeutig).
+//!
+//! # Attribute
+//!
+//! - `#[kebab_enum(error = "pfad::zu::Error")]` (Enum-Ebene) — Pfad des
+//!   Fehlertyps für `FromStr::Err`. Default: `crate::error::InvalidId`,
+//!   dieselbe Konvention wie bei `#[derive(HarwId)]` (siehe `id.rs`), damit
+//!   ein Crate für beide Makros denselben Fehlertyp wiederverwenden kann.
+//! - `#[kebab_enum(ctor = "methodenname")]` (Enum-Ebene) — Name der
+//!   assoziierten Fehler-Konstruktorfunktion. Default: `unknown_variant`.
+//! - `#[kebab_enum(rename = "...")]` (Varianten-Ebene) — überschreibt den
+//!   kanonischen Namen dieser Variante.
+//!
+//! # Fehlertyp-Vertrag (wichtig für Konsumenten)
+//!
+//! Wie bei `HarwId` kann der Fehlertyp nicht im Proc-Macro-Crate liegen. Der
+//! Konsument muss unter dem konfigurierten Pfad eine assoziierte Funktion
+//! mit dieser Signatur bereitstellen (Default-Namen):
+//!
+//! ```ignore
+//! impl crate::error::InvalidId {
+//!     pub fn unknown_variant(type_name: &'static str, value: &str) -> Self { /* ... */ }
+//! }
+//! ```
+//!
+//! `type_name` ist der Enum-Name (z. B. `"Permission"`), `value` die
+//! ursprüngliche, nicht normalisierte Eingabe. Ein `type Err = ()` wurde
+//! bewusst verworfen: ohne Kontext (Enum-Name, unbekannter Wert) lässt sich
+//! aus `()` keine brauchbare Fehlermeldung mehr rekonstruieren; ein
+//! sprechender, aber weiterhin pfad-konfigurierbarer Fehlertyp behält beide
+//! Eigenschaften (Aussagekraft und Entkopplung vom Proc-Macro-Crate).
+
+use proc_macro2::TokenStream;
+use quote::quote;
+use syn::{Attribute, Data, DeriveInput, Fields, Ident, LitStr, Path, Variant};
+
+/// Geparste `#[kebab_enum(...)]`-Konfiguration auf Enum-Ebene.
+///
+/// # Design-doc reference
+/// Spec section "KebabEnum — Attribute" (Modul-Doc oben).
+struct KebabEnumArgs {
+    /// Pfad des Fehlertyps für `FromStr::Err`.
+    error_path: Path,
+    /// Name der assoziierten Fehler-Konstruktorfunktion (Typname, Wert → Fehler).
+    ctor_ident: Ident,
+}
+
+impl Default for KebabEnumArgs {
+    fn default() -> Self {
+        Self {
+            error_path: syn::parse_quote!(crate::error::InvalidId),
+            ctor_ident: Ident::new("unknown_variant", proc_macro2::Span::call_site()),
+        }
+    }
+}
+
+/// Liest alle `#[kebab_enum(...)]`-Attribute auf Enum-Ebene ein.
+///
+/// # Errors
+/// Liefert `syn::Error` für unbekannte Schlüssel oder einen ungültigen Pfad
+/// bzw. Bezeichner in `error` / `ctor`.
+///
+/// # Design-doc reference
+/// Spec section "KebabEnum — Attribute" (Modul-Doc oben).
+fn parse_kebab_enum_args(attrs: &[Attribute]) -> syn::Result<KebabEnumArgs> {
+    let mut args = KebabEnumArgs::default();
+
+    for attr in attrs {
+        if !attr.path().is_ident("kebab_enum") {
+            continue;
+        }
+
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("error") {
+                let lit: LitStr = meta.value()?.parse()?;
+                args.error_path = syn::parse_str(&lit.value()).map_err(|e| {
+                    syn::Error::new_spanned(
+                        &lit,
+                        format!("`error` muss ein gültiger Pfad sein: {e}"),
+                    )
+                })?;
+                Ok(())
+            } else if meta.path.is_ident("ctor") {
+                let lit: LitStr = meta.value()?.parse()?;
+                args.ctor_ident = syn::parse_str(&lit.value()).map_err(|e| {
+                    syn::Error::new_spanned(
+                        &lit,
+                        format!("`ctor` muss ein gültiger Bezeichner sein: {e}"),
+                    )
+                })?;
+                Ok(())
+            } else {
+                Err(meta.error(
+                    "unbekanntes kebab_enum-Attribut auf Enum-Ebene; erwartet: \
+                     error = \"...\", ctor = \"...\"",
+                ))
+            }
+        })?;
+    }
+
+    Ok(args)
+}
+
+/// Liest ein optionales `#[kebab_enum(rename = "...")]` auf einer Variante ein.
+///
+/// # Errors
+/// Liefert `syn::Error` bei einem unbekannten Schlüssel auf Varianten-Ebene.
+///
+/// # Design-doc reference
+/// Spec section "KebabEnum — Attribute" (Modul-Doc oben).
+fn parse_variant_rename(variant: &Variant) -> syn::Result<Option<LitStr>> {
+    let mut rename = None;
+
+    for attr in &variant.attrs {
+        if !attr.path().is_ident("kebab_enum") {
+            continue;
+        }
+
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("rename") {
+                let lit: LitStr = meta.value()?.parse()?;
+                rename = Some(lit);
+                Ok(())
+            } else {
+                Err(meta.error(
+                    "unbekanntes kebab_enum-Attribut auf Varianten-Ebene; erwartet: rename = \"...\"",
+                ))
+            }
+        })?;
+    }
+
+    Ok(rename)
+}
+
+/// Wandelt einen Rust-Bezeichner (z. B. einen Enum-Varianten-`Ident`) in
+/// kebab-case um.
+///
+/// Siehe Modul-Doc, Abschnitt "kebab-case-Konvertierungsregel", für die
+/// vollständige Spezifikation der Wortgrenzen-Regeln (insbesondere den
+/// Akronym-Sonderfall `HTTPServer` → `http-server`).
+///
+/// # Design-doc reference
+/// Spec section "KebabEnum — kebab-case-Konvertierungsregel" (Modul-Doc oben).
+fn to_kebab_case(ident: &str) -> String {
+    let chars: Vec<char> = ident.chars().collect();
+    let mut words: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '_' || c == '-' || c == ' ' {
+            if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+
+        if c.is_uppercase() {
+            let prev_is_lower_or_digit = i > 0
+                && chars[i - 1] != '_'
+                && chars[i - 1] != '-'
+                && chars[i - 1] != ' '
+                && (chars[i - 1].is_lowercase() || chars[i - 1].is_ascii_digit());
+            let prev_is_upper = i > 0 && chars[i - 1].is_uppercase();
+            let next_is_lower = i + 1 < chars.len() && chars[i + 1].is_lowercase();
+
+            let starts_new_word = !current.is_empty()
+                && (prev_is_lower_or_digit || (prev_is_upper && next_is_lower));
+            if starts_new_word {
+                words.push(std::mem::take(&mut current));
+            }
+        }
+
+        current.extend(c.to_lowercase());
+    }
+
+    if !current.is_empty() {
+        words.push(current);
+    }
+
+    words.join("-")
+}
+
+/// Ein aufgelöster Varianten-Eintrag: Bezeichner plus kanonischer und
+/// normalisierter (Groß-/Kleinschreibung sowie `_`/`-` vereinheitlicht) Name.
+struct VariantInfo {
+    ident: Ident,
+    /// Von `Display`/`as_str` gelieferter Name (kebab-case oder `rename`-Wert).
+    canonical: String,
+    /// `canonical` mit `_` → `-` und vollständig kleingeschrieben; Basis für
+    /// den `FromStr`-Vergleich und die Kollisionsprüfung.
+    normalized: String,
+}
+
+/// Expander für das `KebabEnum`-Derive-Makro.
+///
+/// Validiert, dass `input` ein Enum aus ausschließlich Unit-Varianten ist,
+/// löst pro Variante den kanonischen Namen auf (automatisch abgeleitet oder
+/// per `rename`), prüft auf Namenskollisionen und erzeugt `ALL`, `as_str`,
+/// `Display` und `FromStr`.
+///
+/// # Errors
+/// - Kein Enum → `syn::Error`.
+/// - Enum ohne Varianten → `syn::Error`.
+/// - Nicht-Unit-Variante → `syn::Error`.
+/// - Zwei Varianten mit identischem normalisiertem Namen → `syn::Error`.
+/// - Ungültige `#[kebab_enum(...)]`-Konfiguration → `syn::Error` (siehe
+///   [`parse_kebab_enum_args`], [`parse_variant_rename`]).
+///
+/// # Design-doc reference
+/// Spec section "KebabEnum — generierte API" (Modul-Doc oben).
+pub(crate) fn expand_kebab_enum(input: &DeriveInput) -> syn::Result<TokenStream> {
+    let enum_name = &input.ident;
+    let args = parse_kebab_enum_args(&input.attrs)?;
+
+    let data = match &input.data {
+        Data::Enum(data) => data,
+        _ => {
+            return Err(syn::Error::new_spanned(
+                input,
+                "KebabEnum kann nur auf enums angewendet werden",
+            ));
+        }
+    };
+
+    if data.variants.is_empty() {
+        return Err(syn::Error::new_spanned(
+            input,
+            "KebabEnum erfordert mindestens eine Variante",
+        ));
+    }
+
+    let mut infos: Vec<VariantInfo> = Vec::with_capacity(data.variants.len());
+    for variant in &data.variants {
+        if !matches!(variant.fields, Fields::Unit) {
+            return Err(syn::Error::new_spanned(
+                &variant.ident,
+                format!(
+                    "KebabEnum erfordert ausschließlich Unit-Varianten; Variante `{}` hat Felder",
+                    variant.ident
+                ),
+            ));
+        }
+
+        let rename = parse_variant_rename(variant)?;
+        let canonical = match rename {
+            Some(lit) => lit.value(),
+            None => to_kebab_case(&variant.ident.to_string()),
+        };
+        let normalized = canonical.replace('_', "-").to_ascii_lowercase();
+
+        infos.push(VariantInfo {
+            ident: variant.ident.clone(),
+            canonical,
+            normalized,
+        });
+    }
+
+    for i in 0..infos.len() {
+        for j in (i + 1)..infos.len() {
+            if infos[i].normalized == infos[j].normalized {
+                return Err(syn::Error::new_spanned(
+                    &infos[j].ident,
+                    format!(
+                        "Varianten `{}` und `{}` erzeugen denselben kebab-Namen `{}`; \
+                         verwende #[kebab_enum(rename = \"...\")] zur Unterscheidung",
+                        infos[i].ident, infos[j].ident, infos[i].normalized,
+                    ),
+                ));
+            }
+        }
+    }
+
+    let error_path = &args.error_path;
+    let ctor_ident = &args.ctor_ident;
+    let enum_name_str = enum_name.to_string();
+
+    let all_variants: Vec<TokenStream> = infos
+        .iter()
+        .map(|v| {
+            let ident = &v.ident;
+            quote! { #enum_name::#ident }
+        })
+        .collect();
+
+    let as_str_arms: Vec<TokenStream> = infos
+        .iter()
+        .map(|v| {
+            let ident = &v.ident;
+            let canonical = &v.canonical;
+            quote! { #enum_name::#ident => #canonical, }
+        })
+        .collect();
+
+    let from_str_arms: Vec<TokenStream> = infos
+        .iter()
+        .map(|v| {
+            let ident = &v.ident;
+            let normalized = &v.normalized;
+            quote! { #normalized => ::core::result::Result::Ok(#enum_name::#ident), }
+        })
+        .collect();
+
+    Ok(quote! {
+        impl #enum_name {
+            /// Alle Varianten in Deklarationsreihenfolge.
+            pub const ALL: &'static [#enum_name] = &[#(#all_variants),*];
+
+            /// Kanonischer kebab-case-Name dieser Variante.
+            #[must_use]
+            pub fn as_str(&self) -> &'static str {
+                match self {
+                    #(#as_str_arms)*
+                }
+            }
+        }
+
+        impl ::std::fmt::Display for #enum_name {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+
+        impl ::std::str::FromStr for #enum_name {
+            type Err = #error_path;
+
+            fn from_str(s: &str) -> ::core::result::Result<Self, Self::Err> {
+                let normalized = s.replace('_', "-").to_ascii_lowercase();
+                match normalized.as_str() {
+                    #(#from_str_arms)*
+                    _ => ::core::result::Result::Err(#error_path::#ctor_ident(#enum_name_str, s)),
+                }
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kebab_case_converts_simple_pascal_case() {
+        assert_eq!(to_kebab_case("AddCriterion"), "add-criterion");
+    }
+
+    #[test]
+    fn kebab_case_groups_leading_acronym_before_a_word() {
+        assert_eq!(to_kebab_case("HTTPServer"), "http-server");
+    }
+
+    #[test]
+    fn kebab_case_treats_all_caps_identifier_as_one_word() {
+        assert_eq!(to_kebab_case("ID"), "id");
+    }
+
+    #[test]
+    fn kebab_case_handles_existing_separators() {
+        assert_eq!(to_kebab_case("Already_Snake"), "already-snake");
+    }
+
+    #[test]
+    fn kebab_case_handles_single_letter() {
+        assert_eq!(to_kebab_case("A"), "a");
+    }
+
+    #[test]
+    fn expand_rejects_non_enum() {
+        let input: DeriveInput = syn::parse_quote! {
+            pub struct Foo(String);
+        };
+        let err = expand_kebab_enum(&input).expect_err("non-enum input must be rejected");
+        assert!(err.to_string().contains("enums"));
+    }
+
+    #[test]
+    fn expand_rejects_enum_without_variants() {
+        let input: DeriveInput = syn::parse_quote! {
+            pub enum Foo {}
+        };
+        let err = expand_kebab_enum(&input).expect_err("empty enums must be rejected");
+        assert!(err.to_string().contains("mindestens eine Variante"));
+    }
+
+    #[test]
+    fn expand_rejects_non_unit_variant() {
+        let input: DeriveInput = syn::parse_quote! {
+            pub enum Foo {
+                A,
+                B(String),
+            }
+        };
+        let err = expand_kebab_enum(&input).expect_err("tuple variants must be rejected");
+        assert!(err.to_string().contains("ausschließlich Unit-Varianten"));
+    }
+
+    #[test]
+    fn expand_rejects_duplicate_normalized_names() {
+        let input: DeriveInput = syn::parse_quote! {
+            pub enum Foo {
+                AddCriterion,
+                #[kebab_enum(rename = "add_criterion")]
+                Other,
+            }
+        };
+        let err = expand_kebab_enum(&input).expect_err("colliding kebab names must be rejected");
+        assert!(err.to_string().contains("denselben kebab-Namen"));
+    }
+
+    #[test]
+    fn expand_rejects_unknown_enum_level_attribute() {
+        let input: DeriveInput = syn::parse_quote! {
+            #[kebab_enum(bogus)]
+            pub enum Foo { A }
+        };
+        let err = expand_kebab_enum(&input).expect_err("unknown enum-level keys must be rejected");
+        assert!(err.to_string().contains("unbekanntes kebab_enum-Attribut"));
+    }
+
+    #[test]
+    fn expand_rejects_unknown_variant_level_attribute() {
+        let input: DeriveInput = syn::parse_quote! {
+            pub enum Foo {
+                #[kebab_enum(bogus)]
+                A,
+            }
+        };
+        let err = expand_kebab_enum(&input).expect_err("unknown variant-level keys must be rejected");
+        assert!(err.to_string().contains("unbekanntes kebab_enum-Attribut"));
+    }
+
+    #[test]
+    fn expand_default_expansion_contains_expected_items() {
+        let input: DeriveInput = syn::parse_quote! {
+            pub enum AddCriterion {
+                AddCriterion,
+                HTTPServer,
+            }
+        };
+        let tokens = expand_kebab_enum(&input)
+            .expect("valid enum must expand")
+            .to_string();
+
+        assert!(tokens.contains("ALL"));
+        assert!(tokens.contains("fn as_str"));
+        assert!(tokens.contains("\"add-criterion\""));
+        assert!(tokens.contains("\"http-server\""));
+        assert!(tokens.contains("impl :: std :: fmt :: Display for AddCriterion"));
+        assert!(tokens.contains("impl :: std :: str :: FromStr for AddCriterion"));
+        // Default error path and ctor.
+        assert!(tokens.contains("crate :: error :: InvalidId"));
+        assert!(tokens.contains(":: unknown_variant"));
+    }
+
+    #[test]
+    fn expand_rename_overrides_canonical_name() {
+        let input: DeriveInput = syn::parse_quote! {
+            pub enum Foo {
+                #[kebab_enum(rename = "super-admin")]
+                Maintainer,
+            }
+        };
+        let tokens = expand_kebab_enum(&input)
+            .expect("renamed variant must expand")
+            .to_string();
+        assert!(tokens.contains("\"super-admin\""));
+        assert!(!tokens.contains("\"maintainer\""));
+    }
+
+    #[test]
+    fn expand_custom_error_and_ctor_attributes_are_used() {
+        let input: DeriveInput = syn::parse_quote! {
+            #[kebab_enum(error = "my_crate::error::MyError", ctor = "custom_unknown")]
+            pub enum Foo { A }
+        };
+        let tokens = expand_kebab_enum(&input)
+            .expect("custom error/ctor must expand")
+            .to_string();
+        assert!(tokens.contains("my_crate :: error :: MyError"));
+        assert!(tokens.contains(":: custom_unknown"));
+        assert!(!tokens.contains("crate :: error :: InvalidId"));
+    }
+
+    #[test]
+    fn expand_rejects_invalid_error_path() {
+        let input: DeriveInput = syn::parse_quote! {
+            #[kebab_enum(error = "not a path!!")]
+            pub enum Foo { A }
+        };
+        let err = expand_kebab_enum(&input).expect_err("invalid error path must be rejected");
+        assert!(err.to_string().contains("gültiger Pfad"));
+    }
+}

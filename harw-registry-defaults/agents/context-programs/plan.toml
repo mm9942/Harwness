@@ -1,0 +1,76 @@
+# Kontextprogramm für Planungsvorschläge (Rolle: `planner`).
+#
+# WOFÜR: erzeugt aus belegtem Kontext einen Planvorschlag, ohne den
+# autoritativen Plan selbst zu mutieren (siehe `planner.toml`,
+# `may_change_plan = false`). Braucht deshalb sowohl die unveränderlichen
+# Leitplanken der Aufgabe als auch den bestehenden Plan, gegen den der
+# Vorschlag nicht widersprechen darf.
+#
+# `extends = base`: `task.objective` unverändert. `history.tail` wird von
+# `summary` auf `full` angehoben (siehe unten) — die Basis-Sektion bleibt
+# bestehen, wird aber namensgleich verschärft, wie in `base.toml`
+# beschrieben.
+#
+# ÜBERSCHRIEBENE BASIS-SEKTION:
+#   - `history.tail`: `detail` auf `full` angehoben. BEGRÜNDUNG: eine
+#     Planänderung baut fast immer unmittelbar auf dem exakten Wortlaut des
+#     letzten Austauschs auf ("wir haben gerade entschieden, X wegzulassen,
+#     weil Y") — eine Zusammenfassung riskiert, genau die Nuance zu
+#     verlieren, die die Planentscheidung trägt. KOSTEN DIESER RICHTUNG
+#     (Gegenstück zu `research-web`s Absenkung): mehr Budget pro Turn für
+#     diese Sektion, kein Nachladen nötig, aber auch kein Sparpotenzial
+#     durch Verweise — bewusst in Kauf genommen, weil ein nachträgliches
+#     `context.load` mitten in einer Planungsentscheidung die Antwortzeit
+#     genau in dem Moment verlängert, in dem Kontinuität am wichtigsten ist.
+#
+# ZUSÄTZLICHE SEKTIONEN:
+#   - `goal.invariants` (full/instruction, must-include): die unveränder-
+#     lichen Randbedingungen des Ziels (was ein Plan niemals verletzen darf).
+#     `full`, weil eine gekürzte Invariante ihren Zweck als harte Schranke
+#     verfehlt. Vertrauen `instruction`: das sind bindende Vorgaben, keine
+#     bloße Evidenz früherer Zustände.
+#   - `plan.current` (full/evidence, must-include): der bestehende,
+#     autoritative Plan. `full`, weil ein Planvorschlag, der den
+#     bestehenden Plan nur zusammengefasst kennt, ihn leicht unbeabsichtigt
+#     widersprüchlich fortschreiben könnte. Vertrauen `evidence`, nicht
+#     `instruction`: der bestehende Plan ist Tatsachenlage (was bereits
+#     beschlossen wurde), keine neue Weisung an diesen Aufruf — die
+#     eigentliche Weisung steht in `task.objective`/`goal.invariants`.
+#
+# KEINE `references`-Sektion in diesem Programm: Planung ist der Ort, an
+# dem Vollständigkeit (Plan + Invarianten + jüngste Historie) den Ausschlag
+# gibt, nicht Sparsamkeit — ein unvollständig gesehener Plan ist teurer als
+# ein paar zusätzliche Tokens.
+#
+# ZUSÄTZLICHER AUSSCHLUSS: `web.*` — ein Planvorschlag entsteht aus bereits
+# vorhandenem, belegtem Kontext (Aufgabe, Ziel, bestehender Plan), nicht aus
+# einer neuen Web-Recherche; das ist Aufgabe von `research-web`, dessen
+# Ergebnis dem Planer über andere Kanäle (Findings) zufließt, nicht über
+# einen eigenen Netzzugriff im selben Turn.
+
+schema = "harwness.context/v1"
+id = "harwness.context.plan@1"
+version = "1.0.0"
+extends = { id = "harwness.context.base@1" }
+
+# `exclude` steht bewusst vor `[[sections]]` — siehe Kommentar in `base.toml`
+# zum TOML-Fallstrick mit Array-of-Tables.
+exclude = ["web.*"]
+
+[[sections]]
+name = "history.tail"
+strength = "must-include"
+detail = "full"
+trust = "evidence"
+
+[[sections]]
+name = "goal.invariants"
+strength = "must-include"
+detail = "full"
+trust = "instruction"
+
+[[sections]]
+name = "plan.current"
+strength = "must-include"
+detail = "full"
+trust = "evidence"

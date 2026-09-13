@@ -1,0 +1,8 @@
+schema = "harwness.agent/v1"
+id = "harwness.agent.slice13-auth-base@1"
+version = "1.0.0"
+role = "worker"
+specialization = "slice13-auth-base"
+
+[authority]
+capabilities = ["filesystem.read"]

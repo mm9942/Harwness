@@ -1,0 +1,132 @@
+# Eingebauter Endpoint-Triage-Spezialist (Knoten AW6-03) — vierte der vier
+# Triage-Spezialisierungen des Security-Clans
+# (`harwness.family.security@1`, siehe `agents/families/security/security.toml`),
+# neben `security-egress-triage`, `security-baseline-triage` und
+# `security-structure-triage`.
+#
+# Namensableitung (AW6-00-Konvention): Dateistamm `security-endpoint-triage`
+# unter `agents/roles/security-endpoint-triage/` ergibt den Rollennamen
+# `"security-endpoint-triage"`. Kollidiert mit nichts Bestehendem.
+#
+# ── Was diese Rolle triagiert, und aus welcher Ereignisquelle ───────────────
+# `harw_dod_signals::EventKind` kennt sechs Ereignisarten: `ProcessExec`,
+# `FileWrite`, `EgressFlow`, `ListenerOpened`, `AuthEvent`, `StructureDrift`.
+# Drei davon haben bereits eine eigene, in `harw-dod-rules` verdrahtete Regel
+# und damit eine eigene Rolle dieses Knotens:
+#   * Netz (`EgressFlow`/`ListenerOpened`)   → `security-egress-triage`
+#   * Struktur (`StructureDrift`)            → `security-structure-triage`
+#   * Baseline-Abweichung (`HostSample`)     → `security-baseline-triage`
+# Für die verbleibenden DREI Ereignisarten — Prozess (`ProcessExec`),
+# Dateisystem (`FileWrite`) und Anmeldung (`AuthEvent`) — existiert in
+# `harw-dod-rules` heute KEINE eigene `Rule`-Implementierung, die sie zu
+# einem `Finding` verdichtet. Das ist der Grund, warum diese drei
+# Ereignisarten NICHT als drei eigene Rollen entstehen: eine Rolle, deren
+# einzige Aufgabe eine Regel wäre, die es nicht gibt, hätte nichts zu
+# triagieren außer unverdichteten Rohereignissen — für genau diesen Fall
+# bündelt diese eine Rolle alle drei. Ihre Ereignisquelle sind die rohen
+# `SecurityEvent`-Varianten `ProcessExec { path, argv_digest }`,
+# `FileWrite { path }` und `AuthEvent { outcome: AuthOutcome }` — jede davon
+# ist laut Arbeitsauftrag ein "angreiferkontrolliertes Sensorfeld"
+# (ausgeführter Pfad, geschriebener Pfad, Anmelde-Ausgang), und genau das
+# macht ihre Sichtung zu Triage-Arbeit statt zu einer automatisierbaren
+# Regelauswertung: ohne eine `Rule`, die eine feste Grenze zieht, braucht es
+# ein Urteilsvermögen, das die drei Felder gemeinsam liest, um ein
+# plausibles Muster (z. B. ein neu geschriebener Pfad, unmittelbar gefolgt
+# von dessen Ausführung und einem fehlgeschlagenen Anmeldeversuch) von
+# unabhängigem Rauschen zu unterscheiden. Die Rolle bekommt die rohen
+# `SecurityEvent`-Batches dieser drei Arten als Parameter übergeben; sie
+# erzeugt selbst keine `Rule`-Auswertung und kein `Finding<RuleChecked>` —
+# ihr Vorschlag ist ein Verdikt über Rohereignisse, kein Regel-Ergebnis.
+#
+# ── Warum genau diese Werkzeuge (keine) ──────────────────────────────────────
+# `[tools].admitted` bleibt leer, exakt wie bei `context-steward` und aus
+# demselben Grund: die heutige Implementierung nimmt bereits abgerufene
+# `SecurityEvent`-Batches als Eingabeparameter entgegen, statt selbst ein
+# Werkzeug aufzurufen. `forbidden` benennt trotzdem jedes Schreib- und
+# Netzwerkzeug ausdrücklich. Da `admitted` leer ist, ist die Auflage "jedes
+# admittierte Werkzeug muss von `AUTO_APPROVED_TOOLS` gedeckt sein"
+# (`harw-registry-defaults/src/lib.rs`) hier trivial erfüllt — nichts
+# einzutragen, nichts zu melden.
+#
+# ── Was sie ausdrücklich NICHT tut ──────────────────────────────────────────
+#   - sie startet keinen Prozess, schreibt keine Datei und meldet sich
+#     nirgends an — sie LIEST nur bereits aufgezeichnete Ereignisse dieser
+#     drei Arten;
+#   - sie ersetzt keine künftige `Rule`-Implementierung für diese drei
+#     Ereignisarten — entsteht eine, triagiert sie danach deren
+#     `Finding<RuleChecked>` genauso wie die drei übrigen Spezialisierungen
+#     es heute für ihre jeweilige Regel tun, statt weiterhin auf Rohdaten zu
+#     arbeiten (das ist eine künftige, unabhängige Änderung dieser Datei);
+#   - sie trifft keine Eskalationsentscheidung — ihr Ergebnis ist ein
+#     Verdikt-VORSCHLAG (`harwness.security-verdict/v1`), niemals ein
+#     committeter `Finding<Triaged>`; das Committen bleibt ausschließlich
+#     `harw-dod-escalate` vorbehalten.
+#
+# ── Rückgabevertrag ──────────────────────────────────────────────────────────
+# Diese Rolle deklariert ihren Vertrag SELBST (`[return]` am Dateiende). Der
+# frühere Kommentar an dieser Stelle behauptete das Gegenteil — „kein eigenes
+# `[return]`, die Familie setzt `[defaults].return_contract` für alle ihre
+# Mitglieder“. Das war falsch, und zwar nicht nur beim Senken über
+# `role_names::ALL`, sondern grundsätzlich: es gibt diese Vererbung nicht.
+#
+#   * `harw_agent_dsl::family::resolve_family` legt `[defaults]` unverändert
+#     als `toml::Table` in `ResolvedFamily.defaults` ab — mehr passiert dort
+#     nicht.
+#   * `harw_agent_dsl::executable::lower` liest den Vertrag ausschließlich aus
+#     der aufgelösten Konfiguration DES AGENTEN:
+#     `config_string(&resolved.config, &["return", "return_pipeline"], "contract")`.
+#   * Zwischen beidem existiert kein Pfad. `resolve_definition` und `lower`
+#     bekommen überhaupt keine Familie zu sehen, und `ResolvedFamily.defaults`
+#     hat außerhalb von `family.rs` selbst keinen Konsumenten. Familien-
+#     `[defaults]` sind heute eine deklarative Notiz, keine Vererbung.
+#
+# Die Deklaration hier ist deshalb keine Redundanz, sondern die einzige
+# Quelle. Genau so hält es die Research-Familie schon lange: `research.toml`
+# führt ebenfalls `[defaults].return_contract`, und trotzdem deklariert JEDE
+# ihrer drei Rollen (`explorer`, `researcher-deps`, `researcher-web`) ihren
+# `[return].contract` zusätzlich selbst — sonst trüge keine von ihnen einen.
+# `intel-scout` und `context-steward` machen es NICHT vor: beide deklarieren
+# keinen `[return]` und tragen folglich tatsächlich keinen Vertrag. Das fällt
+# nur nicht auf, weil sie nicht in `role_names::ALL` stehen und daher nie
+# gesenkt werden.
+#
+# `harwness.security-verdict/v1` ist der vierte Arm des `ChildReturnContract`,
+# eigens für Sicherheitsverdikte gebaut. Eine Triage-Rolle MUSS ihn tragen:
+# ihr Ergebnis ist ein Verdikt-VORSCHLAG, kein Freitext — und kein Commit.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.security-endpoint-triage@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "security-endpoint-triage"
+
+name = "Security Endpoint Triage"
+description = "Sichtet rohe Prozess-, Dateisystem- und Anmelde-Ereignisse, für die harw-dod-rules heute keine eigene Rule fuehrt; schlägt ein Verdikt vor, committet nie."
+
+[work]
+mode = "endpoint-signal-triage"
+may_write_code = false
+may_research_web = false
+
+# Keine Werkzeugoberfläche beansprucht — siehe Begründung oben.
+[tools]
+admitted = []
+forbidden = ["fs.write", "shell.exec", "web.fetch", "web.docs_rs", "web.crates_io"]
+
+# Ein reiner Sichtungs-/Vorschlags-Job braucht keine Kind-Agenten.
+[spawn]
+max_depth = 0
+
+[spawn.budget]
+max_tokens = 40000
+max_tool_calls = 20
+max_wall_secs = 120
+
+# Der Rückgabevertrag — selbst deklariert, nicht geerbt (die vollständige
+# Begründung samt Beweis, dass die Familien-`[defaults]` nirgends greifen,
+# steht im Kopf dieser Datei). `contract` ist für `ReturnPipeline` ein
+# undurchsichtiges Label; die IR prüft weder Existenz noch Form des Schemas
+# (`harw-agent-dsl/src/executable.rs`).
+[return]
+contract = "harwness.security-verdict/v1"

@@ -1,0 +1,51 @@
+# Mitgliedschaftsantrag des Intel-Scout in der Sicherheitsfamilie (Knoten
+# AW7-06). Schema `harwness.family-membership/v1`
+# (`harw_agent_dsl::family::RawFamilyMembership`) — eine eigene Datei je
+# Rolle, damit die Aufnahme NIE `security.toml` selbst aendert (siehe dessen
+# Kommentar "Befund: das Roster nimmt eine neue Rolle NICHT automatisch auf").
+#
+# `harw_agent_dsl::family::admit_family_member` prueft beim Zusammenfuehren
+# ausdruecklich, dass `capabilities` eine Teilmenge des `[universe]` von
+# `harwness.family.security@1` ist — sonst schlaegt
+# `builtin_family_definitions()` mit `AuthorityElevation` fehl und nennt diese
+# Rolle. Das `universe` der Sicherheitsfamilie:
+#   security.advisory.correlate, security.context.curate,
+#   security.context.read, security.scanreport.read, security.sensor.read,
+#   security.verdict.propose.
+#
+# ── Begruendung je beanspruchter Faehigkeit ─────────────────────────────────
+# Diese Rolle beansprucht genau EINE Faehigkeit, keine mehr:
+#
+#   * `security.advisory.correlate` — der ganze Zweck dieser Rolle: eine
+#     hereingereichte Advisory-Meldung gegen `Cargo.lock` korrelieren
+#     (`harw_dod_rules::advisory::correlate_advisories`). Ohne diese
+#     Faehigkeit koennte die Rolle ihre einzige Aufgabe nicht ausueben.
+#
+# Und ausdruecklich NICHT die uebrigen fuenf Faehigkeiten des `universe`,
+# jede einzeln begruendet:
+#
+#   * `security.sensor.read` — der Intel-Scout liest keine rohen, ggf.
+#     angreiferkontrollierten Sensor-/Telemetriefelder; sein Eingang ist ein
+#     bereits geparstes `Cargo.lock` (`LockedPackage`) plus hereingereichte
+#     Advisories, kein `HostSample`/`SecurityEvent`.
+#   * `security.scanreport.read` — er liest keinen aufbereiteten
+#     DoD-Scanbericht; der Join laeuft direkt gegen das Lockfile, nicht gegen
+#     einen Bericht ueber laufende Prozesse.
+#   * `security.verdict.propose` — er faellt keine Triage-Entscheidung
+#     (Confirmed/FalsePositive/NeedsReview); sein Ergebnis ist ein
+#     `Finding<RuleChecked>`, kein `Verdict`. Das Triagieren bleibt
+#     `harw-dod-escalate` vorbehalten ("Ein Befund, keine Aktion").
+#   * `security.context.read` / `security.context.curate` — beide gehoeren
+#     zum kuratierten Sicherheits-Kontextfenster des Context Stewards
+#     (AW6-08); der Intel-Scout pflegt kein Kontextfenster und liest keins,
+#     um seinen Join durchzufuehren.
+#
+# Eine Rolle, die mehr beansprucht als sie benutzt, ist die Vorstufe zu einer
+# Rechteausweitung, die niemand bemerkt — deshalb genau diese eine Zeile.
+schema = "harwness.family-membership/v1"
+family = "harwness.family.security@1"
+role   = "harwness.agent.intel-scout@1"
+as_orchestrator = false
+
+[capabilities]
+capabilities = ["security.advisory.correlate"]

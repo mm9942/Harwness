@@ -1,0 +1,5 @@
+error: Feld 'value' hat kein #[raw(...)]-Attribut; erwartet eines von first, join, join_from = N, nth = N, required
+  --> tests/compile_fail/03_missing_raw_attr.rs:10:5
+   |
+10 |     value: Option<String>,
+   |     ^^^^^

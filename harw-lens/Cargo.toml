@@ -1,0 +1,25 @@
+[package]
+name = "harw-lens"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Die vier Innencrates, deren Vokabular/Einstiegspunkte tatsächlich Teil der
+# Fassadenfläche werden (siehe `//!`-Block in src/lib.rs für die Begründung
+# je Typ/Funktion). `harw-lens-rank`, `harw-lens-chunk`, `harw-lens-store`
+# und `harw-lens-index` werden bewusst NICHT aufgenommen: kein re-exportierter
+# Name dieser Crate verweist auf ihre Typen, und keine eigene Logik dieser
+# Crate ruft sie direkt auf (Chunking/Storage/Ranking/Suche laufen
+# ausschließlich innerhalb von harw-lens-source/harw-lens-query ab).
+harw-lens-types = { path = "../harw-lens-types" }
+harw-lens-embed = { path = "../harw-lens-embed" }
+harw-lens-source = { path = "../harw-lens-source" }
+harw-lens-query = { path = "../harw-lens-query" }
+harw-macros = { path = "../harw-macros" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

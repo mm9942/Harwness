@@ -1,0 +1,95 @@
+[package]
+name = "harw-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "harw"
+path = "src/main.rs"
+
+[dependencies]
+harw-config = { path = "../harw-config" }
+harw-agent-dsl = { path = "../harw-agent-dsl" }
+harw-channel = { path = "../harw-channel" }
+harw-channel-telegram = { path = "../harw-channel-telegram" }
+harw-channel-telegram-transport = { path = "../harw-channel-telegram-transport" }
+harw-core = { path = "../harw-core" }
+harw-context = { path = "../harw-context" }
+harw-lens-types = { path = "../harw-lens-types" }
+harw-operations = { path = "../harw-operations" }
+harw-ops = { path = "../harw-ops" }
+harw-sandbox = { path = "../harw-sandbox" }
+harw-tui = { path = "../harw-tui" }
+harw-memory = { path = "../harw-memory" }
+harw-types = { path = "../harw-types" }
+harw-extension-api = { path = "../harw-extension-api" }
+harw-registry-defaults = { path = "../harw-registry-defaults" }
+harw-mcp-server = { path = "../harw-mcp-server" }
+harw-session-store = { path = "../harw-session-store" }
+harw-secrets = { path = "../harw-secrets", features = ["keyring"] }
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+# `Lease` appears in the `WorkerCancellationSink` trait signature the CLI
+# implements (`src/worker_cancellation.rs`), so `harw-job-runtime` is a
+# production dependency, not test-only. It is already pulled in transitively via
+# harw-core / harw-mcp-server / harw-session-store.
+harw-job-runtime = { path = "../harw-job-runtime" }
+# Planungsfläche — von drei Stellen im Binary benutzt:
+#  * `src/job_worker.rs` (W4-08): parst den Mutationsvertrag eines Plan-Knotens
+#    und meldet den Job-Ausgang über `PlanJobBridge` zurück in den Plan.
+#  * `src/main.rs` (W5-08): Composition-Root — Plan-/Goal-Store, `PlanToolConfig`,
+#    `register_plan_services`, `FindingStore`, `GoalContextProvider`.
+#  * `src/chat.rs` (W5-06): reicht dieselben Stores in den One-shot-Kontext.
+# Produktions-, nicht Test-Abhängigkeiten.
+harw-plan = { path = "../harw-plan" }
+harw-plan-bridge = { path = "../harw-plan-bridge" }
+tokio = { version = "1", features = ["rt", "net", "macros", "time", "signal"] }
+jiff = { workspace = true }
+clap = { version = "4.6.1", features = ["derive"] }
+harw-home = { path = "../harw-home" }
+toml = "1.1.3"
+harw-provider-http = { path = "../harw-provider-http" }
+harw-oauth = { path = "../harw-oauth" }
+harw-knowledge = { path = "../harw-knowledge" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+secrecy = "0.10.3"
+secrecy_08 = { package = "secrecy", version = "0.8" }
+serde_json = "1"
+harw-install = { path = "../harw-install" }
+harw-model-catalog = { path = "../harw-model-catalog" }
+clap_complete = "4.6.7"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing = "0.1.44"
+tikv-jemallocator = "0.7.0"
+# AP W5-06 — `ChildRegistryFactory::build_registry` nimmt
+# `harw_catalog::AgentSuggestions`; der One-shot-Pfad implementiert den Trait.
+harw-catalog = { path = "../harw-catalog" }
+# AW1-01c — die Wurzel-Erzeuger in chat.rs/lifecycle.rs/main.rs bauen den
+# ersten `harw_observe::TraceContext` einer Arbeit; Version identisch zu
+# harw-types/harw-core, damit im Workspace nur eine `uuid`-Auflösung existiert.
+harw-observe = { path = "../harw-observe" }
+uuid = { version = "1", features = ["v4"] }
+# Bottom-up-Befund: `harw-web` hatte null Produktionskonsumenten. `src/web.rs`
+# ist die Komposition, die den Unix-Socket-Server aus derselben
+# `harw-operations`-Registry baut, die auch `harw-cli` sonst zusammenstellt.
+harw-web = { path = "../harw-web" }
+# Ermittelt die eigene UID für `harw_web::authz::StaticUidTierMap` — dieselbe
+# Crate wie `harw-web`s eigenes `SO_PEERCRED`, hier nur das `process`-Feature
+# für `rustix::process::getuid` statt `net`.
+rustix = { workspace = true, features = ["process"] }
+# Bottom-up-Befund: `harw-observe-prom`/`harw-observe-otlp` hatten null
+# Produktionskonsumenten. `src/observe.rs` ist die eine Kompositionsstelle,
+# die einen `RoutingSink` (Vorgabe: nur der immer aktive File-Sink) um sie
+# ergänzt, wenn `harw gateway --metrics-prometheus-port`/`--metrics-otlp-endpoint`
+# das ausdrücklich verlangen.
+harw-observe-file = { path = "../harw-observe-file" }
+harw-observe-prom = { path = "../harw-observe-prom" }
+harw-observe-otlp = { path = "../harw-observe-otlp" }
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+
+[lints]
+workspace = true

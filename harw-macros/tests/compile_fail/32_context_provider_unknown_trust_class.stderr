@@ -1,0 +1,5 @@
+error: unknown trust class `Bogus`; expected one of: Instruction, Evidence, Data
+ --> tests/compile_fail/32_context_provider_unknown_trust_class.rs:5:28
+  |
+5 | #[context_provider(trust = Bogus)]
+  |                            ^^^^^

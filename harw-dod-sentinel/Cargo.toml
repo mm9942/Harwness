@@ -1,0 +1,38 @@
+[package]
+name = "harw-dod-sentinel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Kennungen (`SensorId`) für Gesundheitszustand, Metrik-Labels und Belege.
+harw-types = { path = "../harw-types" }
+# `SensorHandle<Bound>`, `SensorError`, `Permanence` — das Zugriffsvokabular,
+# über das diese Crate entscheidet, ob ein Fehler wiederholbar ist. Bewusst
+# **keine** Abhängigkeit auf eine der elf Sensor-Crates (siehe `//!`-Doku von
+# `lib.rs`, Abschnitt "Keine Parselogik").
+harw-dod-cap = { path = "../harw-dod-cap" }
+# `trait Sensor`, `SensorReading`, `HostSample`, `SecurityEvent`, `EventKind`,
+# `SecurityEvidence` — das Datenvokabular, das diese Crate abruft, puffert und
+# einfriert, ohne es selbst zu deuten.
+harw-dod-signals = { path = "../harw-dod-signals" }
+# `TelemetrySink`, `MetricKey`, `FieldName`/`FieldValue` für die in
+# `src/metrics.rs` deklarierten Kennzahlen.
+harw-observe = { path = "../harw-observe" }
+# `#[derive(harw_macros::HarwError)]` (`error.rs`) und `harw_macros::metrics!`
+# / `harw_macros::field!` (`metrics.rs`).
+harw-macros = { path = "../harw-macros" }
+# Injizierte Zeit (`jiff::Timestamp`) für den Automaten und den Ringpuffer;
+# diese Crate liest nie die Systemuhr selbst (siehe `//!`-Doku von `lib.rs`).
+jiff = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# Nur für `error.rs`-Tests: konstruiert einen echten `serde_json::Error`, um
+# den `#[from]`-Pfad von `SentinelError::Evidence` zu prüfen, ohne den
+# (laut `harw_dod_signals::error`-Moduldoku praktisch unerreichbaren)
+# Fehlerpfad von `SecurityEvidence::capture` selbst auslösen zu müssen.
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

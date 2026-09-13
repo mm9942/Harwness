@@ -1,0 +1,17 @@
+# Build-Artefakte
+/target/
+**/target/
+# Lokale/temporäre Dateien
+/.tmp/
+/.remember/
+/.claude/settings.local.json
+/.cargo_check.log
+/.diskcheck.tmp
+# Editor
+*.swp
+.DS_Store
+
+# Web-UI
+/webui/node_modules/
+/webui/.next/
+/webui/out/

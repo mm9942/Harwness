@@ -1,0 +1,27 @@
+[package]
+name = "harw-channel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-types = { path = "../harw-types" }
+harw-macros = { path = "../harw-macros" }
+harw-secrets = { path = "../harw-secrets" }
+harw-session-store = { path = "../harw-session-store" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+jiff = { workspace = true }
+fs4 = "1.1.0"
+tempfile = "3.27.0"
+
+# External deps — parent resolves exact versions via `cargo add` (no invented pins).
+# TODO(parent cargo add): jiff --features serde   # jiff::Timestamp / SignedDuration (serde feature required — InboundEvent & PairingCode derive Serialize/Deserialize)
+# TODO(parent cargo add): governor                # shared token-bucket rate-limit utility (§3.5 mechanism is core, numbers are adapter-specific) — reserved
+# TODO(parent cargo add): backon                  # retry/backoff governance for transport loops (§6.2) — reserved
+# TODO(parent cargo add): infer                    # content-sniffed MIME validation for attachment intake (§2.4) — reserved
+# TODO(parent cargo add): sha2                     # content-hash of admitted events & attachments for audit (§5, §2.4) — reserved
+# TODO(parent cargo add): url                      # link parsing/validation in outbound render + webhook public_url (§3.6) — reserved
+
+[lints]
+workspace = true

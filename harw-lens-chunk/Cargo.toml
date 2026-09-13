@@ -1,0 +1,13 @@
+[package]
+name = "harw-lens-chunk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-lens-types = { path = "../harw-lens-types" }
+harw-types = { path = "../harw-types" }
+harw-macros = { path = "../harw-macros" }
+
+[lints]
+workspace = true

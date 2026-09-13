@@ -1,0 +1,47 @@
+# Eingebauter Dependency-Rechercheur (AP W3-04) — Registry-Profil `ReadOnlyExplore`.
+#
+# Beantwortet "wie funktioniert diese Abhaengigkeit wirklich" aus dem lokal
+# bereits entpackten Registry-Quellcode und aus `Cargo.lock` — nicht aus dem
+# Gedaechtnis des Modells und nicht aus dem Netz.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.researcher-deps@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "researcher-deps"
+
+name = "Dependency Researcher"
+description = "Belegt Dependency-Verhalten aus Cargo.lock und dem lokalen Registry-Quellcache."
+
+[research]
+sources = ["source-tree", "lockfiles", "local-docs"]
+primary_sources_required = true
+output = "structured-evidence"
+may_write_code = false
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+]
+forbidden = ["fs.write", "shell.exec", "web.fetch", "web.docs_rs", "web.crates_io"]
+
+[spawn]
+max_depth = 1
+
+[spawn.budget]
+max_tokens = 60000
+max_tool_calls = 40
+max_wall_secs = 180
+
+[return]
+contract = "harwness.return.research-finding@1"

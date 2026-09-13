@@ -1,0 +1,31 @@
+[package]
+name = "harw-lens-embed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-lens-types = { path = "../harw-lens-types" }
+harw-types = { path = "../harw-types" }
+harw-macros = { path = "../harw-macros" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+blake3 = { workspace = true }
+# Transport für `http_backend::HttpEmbedBackend` (Knoten AW7-06). Version und
+# Feature-Zuschnitt ("blocking", "json", "rustls-tls") folgen bewusst
+# `harw-provider-http`s bereits vorhandener, bereits geprüfter Wahl -- keine
+# zweite, abweichende reqwest-Konfiguration im Baum. "blocking" kommt hinzu,
+# weil `Embedder::embed` synchron ist (siehe `http_backend`s Moduldoku für die
+# daraus folgende Aufrufer-Pflicht in async-Kontexten).
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls",
+] }
+# Hält den API-Key außerhalb von Debug-Ausgaben -- dieselbe Crate, die
+# `harw-provider-http` bereits für denselben Zweck einsetzt.
+secrecy = "0.10.3"
+
+[lints]
+workspace = true

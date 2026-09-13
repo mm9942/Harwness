@@ -1,0 +1,14 @@
+{
+  "now": "1970-01-01T00:00:00Z",
+  "reading": {
+    "samples": [
+      {
+        "sensor": "harw-dod-fixtures-suite",
+        "observed_at": "1970-01-01T00:00:00Z",
+        "metric": "fixture_selftest_value",
+        "value": 45000.0
+      }
+    ],
+    "events": []
+  }
+}

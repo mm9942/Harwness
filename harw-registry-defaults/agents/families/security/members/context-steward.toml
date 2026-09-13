@@ -1,0 +1,65 @@
+# Mitgliedschaftsantrag des Context Stewards in der Sicherheitsfamilie
+# (Knoten AW6-08). Schema `harwness.family-membership/v1`
+# (`harw_agent_dsl::family::RawFamilyMembership`) — eine eigene Datei je
+# Rolle, damit die Aufnahme NIE `security.toml` selbst aendert (siehe dessen
+# Kommentar "Befund: das Roster nimmt eine neue Rolle NICHT automatisch auf"),
+# exakt nach demselben Muster wie `members/intel-scout.toml` (AW7-06).
+#
+# `harw_agent_dsl::family::admit_family_member` prueft beim Zusammenfuehren
+# ausdruecklich, dass `capabilities` eine Teilmenge des `[universe]` von
+# `harwness.family.security@1` ist — sonst schlaegt
+# `builtin_family_definitions()` mit `AuthorityElevation` fehl und nennt diese
+# Rolle. Das `universe` der Sicherheitsfamilie:
+#   security.advisory.correlate, security.context.curate,
+#   security.context.read, security.scanreport.read, security.sensor.read,
+#   security.verdict.propose.
+#
+# ── Begruendung je beanspruchter Faehigkeit ─────────────────────────────────
+# Diese Rolle beansprucht genau ZWEI Faehigkeiten:
+#
+#   * `security.context.curate` — der Kernzweck dieser Rolle: das kuratierte
+#     Sicherheits-Kontextfenster pflegen — ordnen und zusammenfassen, was
+#     `ContextProposal`/`ModelBehaviorProposal` vorschlagen
+#     (`harw_knowledge::context_steward::{curate_context_proposals,
+#     curate_model_behavior_proposals, build_steward_digest}`). Ohne diese
+#     Faehigkeit koennte die Rolle ihre einzige Aufgabe nicht ausueben.
+#   * `security.context.read` — um etwas zu pflegen, muss der Steward den
+#     aktuellen Stand des kuratierten Kontextfensters kennen (welche
+#     Sektionen, welche Staerken, welche Vorschlaege bereits entschieden
+#     wurden) — Kuratieren ohne Lesen waere blind. Security.toml benennt
+#     diese Faehigkeit ausdruecklich fuer "Triage + Context Steward" gemeinsam.
+#
+# Und ausdruecklich NICHT die uebrigen vier Faehigkeiten des `universe`, jede
+# einzeln begruendet:
+#
+#   * `security.sensor.read` — der Context Steward liest keine rohen, ggf.
+#     angreiferkontrollierten Sensor-/Telemetriefelder; seine Eingabe sind
+#     bereits als `ContextProposal`/`ModelBehaviorProposal` typisierte,
+#     sichtbarkeitsgeprueft abgerufene Vorschlaege, kein `HostSample`/
+#     `SecurityEvent`.
+#   * `security.scanreport.read` — er liest keinen aufbereiteten
+#     DoD-Scanbericht; sein Eingang ist die Vorschlags-/Artefaktmechanik aus
+#     `harw-knowledge`, nicht ein Bericht ueber laufende Prozesse.
+#   * `security.advisory.correlate` — er korreliert keine Advisories gegen
+#     `Cargo.lock`; das bleibt dem Intel-Scout (AW7-06) vorbehalten, dessen
+#     Aufgabe eine vollstaendig andere Domaene ist (Abhaengigkeiten statt
+#     Kontextprogramme).
+#   * `security.verdict.propose` — obwohl `security.toml`s Kommentar diese
+#     Faehigkeit fuer "Triage + Context Steward" vorsieht, erzeugt die
+#     heutige Implementierung dieses Knotens **keinen**
+#     `harwness.security-verdict/v1`-Befund (AW6-02, ausserhalb dieses
+#     Schreibbereichs) — sie erzeugt ueberhaupt kein neues Artefakt, sondern
+#     ordnet und fasst nur bereits bestehende `ContextProposal`/
+#     `ModelBehaviorProposal`-Vorschlaege zusammen, deren eigene
+#     Vorschlagsmechanik (AW5-09/AW6-06) unabhaengig vom Verdict-Vertrag ist.
+#     Eine Rolle, die eine Faehigkeit beansprucht, die ihr heutiger Code nicht
+#     benutzt, ist die Vorstufe zu einer Rechteausweitung, die niemand
+#     bemerkt — deshalb bleibt sie hier aussen vor, bis ein Knoten sie
+#     tatsaechlich braucht.
+schema = "harwness.family-membership/v1"
+family = "harwness.family.security@1"
+role   = "harwness.agent.context-steward@1"
+as_orchestrator = false
+
+[capabilities]
+capabilities = ["security.context.curate", "security.context.read"]

@@ -1,0 +1,63 @@
+# Eingebauter Planungs-Worker (AP W3-04) — Registry-Profil `Planning`.
+#
+# Erzeugt einen Planvorschlag; er veraendert den autoritativen Plan nicht selbst.
+# `plan` und `goal` sind Operationen der Composition-Root, nicht dieses Crates —
+# `harw-registry-defaults` registriert fuer dieses Profil nur die read-only
+# Tool-Provider.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.planner@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "planner"
+
+name = "Planner"
+description = "Erzeugt aus belegtem Kontext einen Planvorschlag, ohne den autoritativen Plan zu mutieren."
+
+[work]
+mode = "plan-proposal"
+may_change_plan = false
+may_write_code = false
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+  # `lens.ask` ist read-only Retrieval (semantische Abfrage ueber
+  # `docs.design`/`knowledge.palace`) und kein Mutations-Werkzeug — ein
+  # Planner darf lesen, siehe die uebrigen `fs.*`/`deps.*`-Eintraege oben.
+  # Ohne diesen Eintrag sieht der Planner `lens.ask` im beworbenen
+  # Werkzeuginventar (`RegistryProfile::Planning::tool_names`) und darf es
+  # trotzdem nicht aufrufen, weil `harw-core/src/session.rs` die
+  # `SessionActivation` deny-by-default aus genau dieser `admitted`-Liste
+  # baut. `RegistryProfile::Planning` registriert `lens.ask` ausdrueck-
+  # lich nur fuer die Rolle `planner` (siehe `LENS_TOOLS`-Begruendung in
+  # `harw-registry-defaults/src/profile.rs`) — ein Planvorschlag entsteht
+  # aus Design-Dokumenten und abgelegtem Kontextwissen, die genau dieser
+  # Index abfragt; ohne ihn muesste der Planner dieselbe Frage nur noch per
+  # `fs.grep`/`fs.search` erraten.
+  "lens.ask",
+  "plan",
+  "goal",
+]
+forbidden = ["fs.write", "shell.exec", "web.fetch", "web.docs_rs", "web.crates_io"]
+
+[spawn]
+max_depth = 1
+
+[spawn.budget]
+max_tokens = 60000
+max_tool_calls = 40
+max_wall_secs = 180
+
+[return]
+contract = "harwness.return.plan-proposal@1"

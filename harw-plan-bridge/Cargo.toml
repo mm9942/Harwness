@@ -1,0 +1,57 @@
+[package]
+name = "harw-plan-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-plan = { path = "../harw-plan" }
+harw-research = { path = "../harw-research" }
+harw-operations = { path = "../harw-operations" }
+harw-extension-api = { path = "../harw-extension-api" }
+harw-job-runtime = { path = "../harw-job-runtime" }
+harw-session-store = { path = "../harw-session-store" }
+harw-knowledge = { path = "../harw-knowledge" }
+harw-home = { path = "../harw-home" }
+harw-types = { path = "../harw-types" }
+harw-macros = { path = "../harw-macros" }
+harw-observe = { path = "../harw-observe" }
+harw-agent-dsl = { path = "../harw-agent-dsl" }
+harw-core = { path = "../harw-core" }
+# AW3-03: Quellenbindung `PlanContextProvider` (harw_context::Fragment) und
+# die Registry-Prüfung für v2-Fragment-Provider (fragment_registry). Kein
+# Zyklus: `harw-context` hängt nur von harw-types/harw-lens-types/harw-macros
+# ab, keines davon kennt harw-plan-bridge.
+harw-context = { path = "../harw-context" }
+harw-lens-types = { path = "../harw-lens-types" }
+# AW6-04: Plan-Andockung für Sicherheitsbefunde. `harw-dod-escalate`
+# re-exportiert `Finding<Triaged>`/`Triaged`/`Ladder` — dieses Crate zieht
+# die Kante zu `harw-dod-escalate`, nie umgekehrt (dessen Moduldoku,
+# Abschnitt „Andockung für harw-plan-bridge"). `harw-dod-signals` liefert
+# `SecurityEvidence`, deren `digest`-Feld strukturell nie fehlt (siehe
+# `security_bridge`-Moduldoku).
+harw-dod-escalate = { path = "../harw-dod-escalate" }
+harw-dod-signals = { path = "../harw-dod-signals" }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+# Zwei Zeitbibliotheken sind hier unvermeidbar, nicht versehentlich:
+# `harw-plan` (Plan/Goal/Evidence) rechnet in `time::OffsetDateTime`,
+# `harw-research` / `harw-job-runtime` (Findings, Jobs) in `jiff::Timestamp`.
+# Dieses Crate ist genau die Naht zwischen beiden und konvertiert an einer
+# einzigen Stelle (`finding_store::offset_from_timestamp`).
+time = { version = "0.3.53", features = ["serde", "serde-well-known", "formatting", "parsing"] }
+jiff = { workspace = true }
+tracing = "0.1.44"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+# Nur für Tests: baut über `EgressFlowRule` ein echtes `Finding<Triaged>`,
+# genau wie `harw-dod-escalate` selbst es in seinen eigenen Tests tut — statt
+# einen privaten Konstruktor zu umgehen. `harw-dod-rules` ist deshalb keine
+# normale Abhängigkeit dieses Crates: der produktive Code nennt nur
+# `Finding<Triaged>`, re-exportiert von `harw-dod-escalate`.
+harw-dod-rules = { path = "../harw-dod-rules" }
+harw-sandbox = { path = "../harw-sandbox" }
+
+[lints]
+workspace = true

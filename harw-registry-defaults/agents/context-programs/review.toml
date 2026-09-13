@@ -1,0 +1,69 @@
+# Kontextprogramm für Code-/Sicherheitsprüfung (Prüfen-Rolle).
+#
+# WOFÜR: bewertet einen bereits entstandenen Diff/Stand gegen Ziel und
+# Invarianten — liest, urteilt, schreibt nicht. Der Kontextbedarf ist fast
+# das Gegenteil von `implement`: nicht der volle Lesebereich des Workspace,
+# sondern gezielt der Änderungsdiff plus die Maßstäbe, gegen die er geprüft
+# wird.
+#
+# `extends = base`: `task.objective` unverändert. `history.tail` wird auf
+# `references` gesenkt (siehe unten, namensgleiche Verschärfung der
+# geerbten Sektion).
+#
+# ÜBERSCHRIEBENE BASIS-SEKTION:
+#   - `history.tail`: `detail` von `summary` auf `references` gesenkt.
+#     BEGRÜNDUNG UND KOSTEN: eine Prüfung urteilt in erster Linie über den
+#     Diff und die Invarianten, nicht über den Verlauf, der zu diesem Diff
+#     geführt hat — der Verlauf ist bestenfalls Hintergrund. Ein Verweis
+#     kostet hier fast nichts an Aussagekraft, aber spart das Budget, das
+#     stattdessen dem vollständigen `diff.changeset` zugutekommt (siehe
+#     unten). Preis: muss der Prüfer doch einmal auf ein älteres Detail
+#     zurückgreifen ("warum wurde X so entschieden"), zahlt er den
+#     Nachlade-Preis über `context.load` — ein selten gebrauchter,
+#     akzeptierter Tausch, weil der Regelfall (Diff + Invarianten reichen)
+#     deutlich überwiegt.
+#
+# ZUSÄTZLICHE SEKTIONEN:
+#   - `diff.changeset` (full/evidence, must-include): der eigentliche
+#     Prüfgegenstand. `full`, ausdrücklich nicht `summary`: eine
+#     zusammengefasste Diff-Ansicht ist für eine Sicherheits-/Korrektheits-
+#     prüfung wertlos — genau die Zeile, die übersehen werden darf, ist die
+#     Zeile, die eine Zusammenfassung typischerweise wegkürzt.
+#   - `goal.invariants` (summary/instruction, must-include): der Maßstab,
+#     gegen den geprüft wird. `summary` genügt — anders als `plan`, das
+#     Invarianten als bindende Schranke für eine NEUE Entscheidung braucht
+#     (dort `full`), muss der Prüfer sie nur wiedererkennen, um eine
+#     Verletzung zu erkennen.
+#
+# ZUSÄTZLICHER AUSSCHLUSS: `plan.current` — die Prüfung bewertet das
+# Ergebnis gegen Ziel und Invarianten, nicht gegen den Prozessplan, der
+# dorthin geführt hat; das hält die Prüfung ergebnisorientiert und verhindert
+# eine Rechtfertigung über "aber so stand es im Plan", wenn das Ergebnis
+# selbst ein Invariante verletzt.
+
+schema = "harwness.context/v1"
+id = "harwness.context.review@1"
+version = "1.0.0"
+extends = { id = "harwness.context.base@1" }
+
+# `exclude` steht bewusst vor `[[sections]]` — siehe Kommentar in `base.toml`
+# zum TOML-Fallstrick mit Array-of-Tables.
+exclude = ["plan.current"]
+
+[[sections]]
+name = "history.tail"
+strength = "must-include"
+detail = "references"
+trust = "evidence"
+
+[[sections]]
+name = "diff.changeset"
+strength = "must-include"
+detail = "full"
+trust = "evidence"
+
+[[sections]]
+name = "goal.invariants"
+strength = "must-include"
+detail = "summary"
+trust = "instruction"

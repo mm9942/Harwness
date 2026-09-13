@@ -1,0 +1,1202 @@
+//! Durable, fenced job persistence for worker and MCP orchestration.
+//!
+//! The store owns filesystem locking and atomic record replacement; the pure
+//! lifecycle rules remain in `harw-job-runtime`. Every mutation verifies the
+//! current lease token, so an expired or restarted worker cannot overwrite a
+//! job reclaimed by another worker.
+//!
+//! Jede Mutation (Claim, Renew, Complete, Cancel, Reconcile) synct nach dem
+//! atomaren `persist()` zusätzlich das Elternverzeichnis des Job-Datensatzes;
+//! ein hier verlorener Fortschritt hieße stillen Stillstand statt eines
+//! bloß veralteten Zustands.
+
+use std::fs::{File, OpenOptions};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "haiku",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "solaris",
+))]
+use std::os::unix::fs::OpenOptionsExt;
+
+use fs4::FileExt;
+use harw_job_runtime::{
+    JobCancellation, JobClaim, JobCompletion, JobOutcome, JobRuntimeError, JobState, Lease,
+    LeaseToken, StoredJob,
+};
+use harw_types::{ApprovalActor, WorkId};
+use jiff::{SignedDuration, Timestamp};
+use serde::{Deserialize, Serialize};
+use tempfile::NamedTempFile;
+
+use crate::error::{SessionStoreError, SessionStoreResult};
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+const O_NOFOLLOW: i32 = 0o400000;
+
+#[cfg(any(
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "haiku",
+    target_os = "illumos",
+    target_os = "ios",
+    target_os = "macos",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "solaris",
+))]
+const O_NOFOLLOW: i32 = 0x100;
+
+/// Query for an eventually-consistent job list snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobListQuery {
+    pub states: Option<Vec<JobState>>,
+    pub holder: Option<String>,
+    pub limit: usize,
+    pub cursor: Option<WorkId>,
+}
+
+impl Default for JobListQuery {
+    fn default() -> Self {
+        Self {
+            states: None,
+            holder: None,
+            limit: 50,
+            cursor: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JobPage {
+    pub jobs: Vec<StoredJob>,
+    pub next_cursor: Option<WorkId>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClaimRequest {
+    pub worker_id: String,
+    pub lease_ttl: SignedDuration,
+    pub now: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RenewalRequest {
+    pub token: LeaseToken,
+    pub now: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompleteRequest {
+    pub token: LeaseToken,
+    pub completed_at: Timestamp,
+    pub outcome: JobOutcome,
+}
+
+/// A cancellation command accepted only from a trusted authority boundary.
+///
+/// The request must be constructed from an authenticated operator or paired
+/// channel peer; raw model tool arguments are not a valid source for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelRequest {
+    pub cancelled_at: Timestamp,
+    pub cancelled_by: ApprovalActor,
+    pub reason: String,
+}
+
+/// Atomic cancellation result, including the old worker lease that an outer
+/// supervisor should signal after the durable fence has been persisted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancellationTransition {
+    pub work_id: WorkId,
+    pub previous_state: JobState,
+    pub prior_lease: Option<Lease>,
+    pub completion: JobCompletion,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExpiredJob {
+    pub work_id: WorkId,
+    pub expired_lease: Lease,
+    pub reclaimed_at: Timestamp,
+    pub retry_scheduled_for: Option<Timestamp>,
+}
+
+/// Redacted lifecycle notification emitted after a durable job mutation.
+///
+/// This deliberately contains no input, outcome payload, lease, worker
+/// identity, or authority data. Consumers may use it to advance an event
+/// cursor or wake a bounded transport without becoming a second source of
+/// truth for job state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobLifecycleEvent {
+    pub work_id: WorkId,
+    pub state: JobState,
+    pub revision: u64,
+}
+
+/// Composition-boundary publication hook for durable lifecycle events.
+pub trait JobEventSink: Send + Sync {
+    fn publish(&self, event: JobLifecycleEvent);
+}
+
+#[derive(Debug, Default)]
+pub struct NoopJobEventSink;
+
+impl JobEventSink for NoopJobEventSink {
+    fn publish(&self, _event: JobLifecycleEvent) {}
+}
+
+/// File-backed job records. Lock granularity is one job, allowing unrelated
+/// workers to claim or finish different jobs concurrently.
+pub struct JobStore {
+    root: PathBuf,
+    event_sink: Arc<dyn JobEventSink>,
+}
+
+impl JobStore {
+    #[must_use]
+    pub fn new(root: &Path) -> Self {
+        Self {
+            root: root.join("jobs"),
+            event_sink: Arc::new(NoopJobEventSink),
+        }
+    }
+
+    /// Constructs a store with a composition-provided lifecycle publisher.
+    /// Publication happens only after the record has been durably replaced;
+    /// sink behavior can never change the mutation result.
+    #[must_use]
+    pub fn new_with_event_sink(root: &Path, event_sink: Arc<dyn JobEventSink>) -> Self {
+        Self {
+            root: root.join("jobs"),
+            event_sink,
+        }
+    }
+
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Persists a server-resolved job request. Existing work IDs are never
+    /// overwritten, even if an earlier record has reached a terminal state.
+    pub fn admit(&self, record: &StoredJob) -> SessionStoreResult<()> {
+        self.ensure_root()?;
+        let path = self.record_path(&record.job.id)?;
+        let lock = self.lock(&record.job.id)?;
+        let result = if path_exists_without_following_symlinks(&path, "job record")? {
+            Err(SessionStoreError::JobAlreadyExists {
+                work_id: record.job.id.clone(),
+            })
+        } else {
+            persist_json(&path, record)
+        };
+        unlock(lock, result)
+    }
+
+    pub fn get(&self, work_id: &WorkId) -> SessionStoreResult<StoredJob> {
+        let path = self.record_path(work_id)?;
+        self.read_record(&path, work_id)
+    }
+
+    /// Lists an eventually-consistent snapshot. Point mutations take a
+    /// per-record lock; list readers deliberately do not serialize every job.
+    pub fn list(&self, query: &JobListQuery) -> SessionStoreResult<JobPage> {
+        let records = self.records_dir();
+        if !records.exists() {
+            return Ok(JobPage {
+                jobs: Vec::new(),
+                next_cursor: None,
+            });
+        }
+        let mut jobs = Vec::new();
+        for entry in std::fs::read_dir(records)? {
+            let entry = entry?;
+            if entry.file_type()?.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = std::fs::read(&path)?;
+            let record: StoredJob =
+                serde_json::from_slice(&bytes).map_err(|error| SessionStoreError::CorruptJob {
+                    work_id: WorkId::from_str(
+                        path.file_stem()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("unknown"),
+                    ),
+                    detail: error.to_string(),
+                })?;
+            if query
+                .states
+                .as_ref()
+                .is_some_and(|states| !states.contains(&record.job.state))
+                || query.holder.as_ref().is_some_and(|holder| {
+                    record.lease.as_ref().map(|lease| &lease.holder) != Some(holder)
+                })
+                || query
+                    .cursor
+                    .as_ref()
+                    .is_some_and(|cursor| record.job.id.as_str() <= cursor.as_str())
+            {
+                continue;
+            }
+            jobs.push(record);
+        }
+        jobs.sort_by(|left, right| left.job.id.as_str().cmp(right.job.id.as_str()));
+        let limit = query.limit.clamp(1, 100);
+        let next_cursor = (jobs.len() > limit).then(|| jobs[limit - 1].job.id.clone());
+        jobs.truncate(limit);
+        Ok(JobPage { jobs, next_cursor })
+    }
+
+    /// Atomically acquires a new fenced lease for a Ready, eligible job.
+    pub fn claim(&self, work_id: &WorkId, request: &ClaimRequest) -> SessionStoreResult<JobClaim> {
+        if request.lease_ttl <= SignedDuration::ZERO {
+            return Err(SessionStoreError::InvalidJobLeaseTtl);
+        }
+        let (claim, revision) = self.with_locked(work_id, |record| {
+            if record.job.state != JobState::Ready {
+                return Err(SessionStoreError::JobNotClaimable {
+                    work_id: work_id.clone(),
+                    state: record.job.state,
+                });
+            }
+            if request.now < record.not_before {
+                return Err(SessionStoreError::JobNotEligible {
+                    work_id: work_id.clone(),
+                    not_before: record.not_before,
+                });
+            }
+            let epoch = record.lease_epoch.checked_add(1).ok_or_else(|| {
+                SessionStoreError::JobLeaseEpochExhausted {
+                    work_id: work_id.clone(),
+                }
+            })?;
+            let nonce = WorkId::new().as_str().to_owned();
+            let lease = Lease::acquire_fenced(
+                work_id.clone(),
+                request.worker_id.clone(),
+                request.now,
+                request.lease_ttl,
+                epoch,
+                nonce,
+            )
+            .map_err(|error| map_job_error(work_id, error))?;
+            record.job.state = JobState::Running;
+            record.job.updated_at = request.now;
+            record.lease_epoch = epoch;
+            record.lease = Some(lease.clone());
+            record.revision = record.revision.saturating_add(1);
+            Ok((
+                JobClaim {
+                    job: record.job.clone(),
+                    scope: record.scope.clone(),
+                    token: lease.token(),
+                    lease,
+                },
+                record.revision,
+            ))
+        })?;
+        self.publish(JobLifecycleEvent {
+            work_id: claim.job.id.clone(),
+            state: claim.job.state,
+            revision,
+        });
+        Ok(claim)
+    }
+
+    pub fn renew(&self, request: &RenewalRequest) -> SessionStoreResult<Lease> {
+        let work_id = request.token.work_id.clone();
+        self.with_locked(&work_id, |record| {
+            let renewed = {
+                let lease = current_lease(record, &request.token, request.now)?;
+                lease
+                    .renew(request.now)
+                    .map_err(|error| map_job_error(&work_id, error))?;
+                lease.clone()
+            };
+            record.revision = record.revision.saturating_add(1);
+            Ok(renewed)
+        })
+    }
+
+    /// Completes a Running job exactly once with the current non-expired lease.
+    pub fn complete(
+        &self,
+        work_id: &WorkId,
+        request: &CompleteRequest,
+    ) -> SessionStoreResult<JobCompletion> {
+        if request.token.work_id != *work_id {
+            return Err(SessionStoreError::LeaseTokenMismatch {
+                work_id: work_id.clone(),
+            });
+        }
+        let (completion, revision) = self.with_locked(work_id, |record| {
+            if is_terminal(record.job.state) {
+                return Err(SessionStoreError::JobAlreadyTerminal {
+                    work_id: work_id.clone(),
+                    state: record.job.state,
+                });
+            }
+            current_lease(record, &request.token, request.completed_at)?;
+            let completion = JobCompletion {
+                completed_at: request.completed_at,
+                outcome: request.outcome.clone(),
+            };
+            record.job.state = outcome_state(&completion.outcome);
+            record.job.updated_at = request.completed_at;
+            record.lease = None;
+            record.completion = Some(completion.clone());
+            record.revision = record.revision.saturating_add(1);
+            Ok((completion, record.revision))
+        })?;
+        self.publish(JobLifecycleEvent {
+            work_id: work_id.clone(),
+            state: outcome_state(&request.outcome),
+            revision,
+        });
+        Ok(completion)
+    }
+
+    /// Atomically cancels an unclaimed or running job.
+    ///
+    /// A running job's lease epoch is advanced before the old lease is
+    /// returned, so a zombie worker cannot renew or complete after external
+    /// cancellation signalling begins.
+    pub fn cancel(
+        &self,
+        work_id: &WorkId,
+        request: &CancelRequest,
+    ) -> SessionStoreResult<CancellationTransition> {
+        if request.reason.trim().is_empty() {
+            return Err(SessionStoreError::InvalidJobCancellationReason);
+        }
+        let transition = self.with_locked(work_id, |record| {
+            let previous_state = record.job.state;
+            if !matches!(
+                previous_state,
+                JobState::Pending | JobState::Ready | JobState::Running
+            ) {
+                return Err(SessionStoreError::JobNotCancellable {
+                    work_id: work_id.clone(),
+                    state: previous_state,
+                });
+            }
+
+            let prior_lease = record.lease.take();
+            if previous_state == JobState::Running {
+                record.lease_epoch = record.lease_epoch.checked_add(1).ok_or_else(|| {
+                    SessionStoreError::JobLeaseEpochExhausted {
+                        work_id: work_id.clone(),
+                    }
+                })?;
+            }
+            let completion = JobCompletion {
+                completed_at: request.cancelled_at,
+                outcome: JobOutcome::Cancelled {
+                    reason: request.reason.clone(),
+                },
+            };
+            record.job.state = JobState::Cancelled;
+            record.job.updated_at = request.cancelled_at;
+            record.completion = Some(completion.clone());
+            record.cancellation = Some(JobCancellation {
+                cancelled_at: request.cancelled_at,
+                cancelled_by: request.cancelled_by.clone(),
+                reason: request.reason.clone(),
+            });
+            record.revision = record.revision.saturating_add(1);
+            Ok(CancellationTransition {
+                work_id: work_id.clone(),
+                previous_state,
+                prior_lease,
+                completion,
+                revision: record.revision,
+            })
+        })?;
+        self.publish(JobLifecycleEvent {
+            work_id: transition.work_id.clone(),
+            state: JobState::Cancelled,
+            revision: transition.revision,
+        });
+        Ok(transition)
+    }
+
+    /// Revokes expired leases once, schedules retry eligibility, and returns
+    /// the exact zombie lease the supervisor must cancel/observe.
+    pub fn reconcile_expired(&self, now: Timestamp) -> SessionStoreResult<Vec<ExpiredJob>> {
+        let candidates = self.list(&JobListQuery {
+            states: Some(vec![JobState::Running]),
+            limit: 100,
+            ..JobListQuery::default()
+        })?;
+        let mut expired = Vec::new();
+        for record in candidates.jobs {
+            let work_id = record.job.id.clone();
+            let transition = self.with_locked(&work_id, |record| {
+                let Some(lease) = record.lease.clone() else {
+                    return Ok(None);
+                };
+                if record.job.state != JobState::Running || !lease.is_expired(now) {
+                    return Ok(None);
+                }
+                record.lease = None;
+                record.lease_epoch = record.lease_epoch.saturating_add(1);
+                let retry_scheduled_for = match record.job.record_failure(now) {
+                    Ok(delay) => Some(now.checked_add(delay).map_err(|error| {
+                        SessionStoreError::JobRuntime {
+                            work_id: work_id.clone(),
+                            detail: error.to_string(),
+                        }
+                    })?),
+                    Err(JobRuntimeError::RetryExhausted { .. }) => {
+                        record.completion = Some(JobCompletion {
+                            completed_at: now,
+                            outcome: JobOutcome::Failed {
+                                reason: "worker lease expired and retry budget is exhausted"
+                                    .to_owned(),
+                            },
+                        });
+                        None
+                    }
+                    Err(error) => {
+                        return Err(SessionStoreError::JobRuntime {
+                            work_id: work_id.clone(),
+                            detail: error.to_string(),
+                        });
+                    }
+                };
+                if let Some(not_before) = retry_scheduled_for {
+                    record.not_before = not_before;
+                }
+                record.revision = record.revision.saturating_add(1);
+                Ok(Some((
+                    ExpiredJob {
+                        work_id: work_id.clone(),
+                        expired_lease: lease,
+                        reclaimed_at: now,
+                        retry_scheduled_for,
+                    },
+                    record.job.state,
+                    record.revision,
+                )))
+            })?;
+            if let Some((transition, state, revision)) = transition {
+                self.publish(JobLifecycleEvent {
+                    work_id: transition.work_id.clone(),
+                    state,
+                    revision,
+                });
+                expired.push(transition);
+            }
+        }
+        Ok(expired)
+    }
+
+    fn with_locked<T>(
+        &self,
+        work_id: &WorkId,
+        operation: impl FnOnce(&mut StoredJob) -> SessionStoreResult<T>,
+    ) -> SessionStoreResult<T> {
+        self.ensure_root()?;
+        let path = self.record_path(work_id)?;
+        let lock = self.lock(work_id)?;
+        let result = (|| {
+            let mut record = self.read_record(&path, work_id)?;
+            let output = operation(&mut record)?;
+            persist_json(&path, &record)?;
+            Ok(output)
+        })();
+        unlock(lock, result)
+    }
+
+    fn publish(&self, event: JobLifecycleEvent) {
+        self.event_sink.publish(event);
+    }
+
+    fn ensure_root(&self) -> SessionStoreResult<()> {
+        std::fs::create_dir_all(self.records_dir())?;
+        std::fs::create_dir_all(self.locks_dir())?;
+        Ok(())
+    }
+
+    fn records_dir(&self) -> PathBuf {
+        self.root.join("records")
+    }
+
+    fn locks_dir(&self) -> PathBuf {
+        self.root.join("locks")
+    }
+
+    fn record_path(&self, work_id: &WorkId) -> SessionStoreResult<PathBuf> {
+        Ok(self
+            .records_dir()
+            .join(safe_component(work_id)?)
+            .with_extension("json"))
+    }
+
+    fn lock(&self, work_id: &WorkId) -> SessionStoreResult<File> {
+        let path = self
+            .locks_dir()
+            .join(safe_component(work_id)?)
+            .with_extension("lock");
+        reject_symlink(&path, "job lock")?;
+        let mut options = OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        let file = open_without_following_symlinks(&mut options, &path)?;
+        FileExt::try_lock(&file).map_err(|error| match error {
+            fs4::TryLockError::WouldBlock => SessionStoreError::JobLockContended {
+                work_id: work_id.clone(),
+            },
+            fs4::TryLockError::Error(error) => SessionStoreError::Io(error),
+        })?;
+        Ok(file)
+    }
+
+    fn read_record(&self, path: &Path, work_id: &WorkId) -> SessionStoreResult<StoredJob> {
+        reject_symlink(path, "job record")?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        let mut file = open_without_following_symlinks(&mut options, path).map_err(|error| {
+            if matches!(&error, SessionStoreError::Io(io) if io.kind() == std::io::ErrorKind::NotFound)
+            {
+                SessionStoreError::JobNotFound {
+                    work_id: work_id.clone(),
+                }
+            } else {
+                error
+            }
+        })?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(SessionStoreError::JobNotFound {
+                work_id: work_id.clone(),
+            });
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        let record: StoredJob =
+            serde_json::from_slice(&bytes).map_err(|error| SessionStoreError::CorruptJob {
+                work_id: work_id.clone(),
+                detail: error.to_string(),
+            })?;
+        if record.job.id != *work_id {
+            return Err(SessionStoreError::CorruptJob {
+                work_id: work_id.clone(),
+                detail: "record id does not match its canonical path".to_owned(),
+            });
+        }
+        Ok(record)
+    }
+}
+
+fn current_lease<'a>(
+    record: &'a mut StoredJob,
+    token: &LeaseToken,
+    now: Timestamp,
+) -> SessionStoreResult<&'a mut Lease> {
+    let work_id = record.job.id.clone();
+    let lease = record
+        .lease
+        .as_mut()
+        .ok_or_else(|| SessionStoreError::LeaseTokenMismatch {
+            work_id: work_id.clone(),
+        })?;
+    if !lease.matches_token(token) {
+        return Err(SessionStoreError::LeaseTokenMismatch { work_id });
+    }
+    if lease.is_expired(now) {
+        return Err(SessionStoreError::JobLeaseExpired {
+            work_id,
+            expired_at: lease.expires_at,
+        });
+    }
+    Ok(lease)
+}
+
+fn outcome_state(outcome: &JobOutcome) -> JobState {
+    match outcome {
+        JobOutcome::Succeeded { .. } => JobState::Completed,
+        JobOutcome::Failed { .. } => JobState::Failed,
+        JobOutcome::Cancelled { .. } => JobState::Cancelled,
+        JobOutcome::Blocked { .. } => JobState::Blocked,
+    }
+}
+
+fn map_job_error(work_id: &WorkId, error: JobRuntimeError) -> SessionStoreError {
+    match error {
+        JobRuntimeError::LeaseExpired { expired_at, .. } => SessionStoreError::JobLeaseExpired {
+            work_id: work_id.clone(),
+            expired_at,
+        },
+        error => SessionStoreError::JobRuntime {
+            work_id: work_id.clone(),
+            detail: error.to_string(),
+        },
+    }
+}
+
+fn is_terminal(state: JobState) -> bool {
+    matches!(
+        state,
+        JobState::Completed | JobState::Failed | JobState::Cancelled
+    )
+}
+
+fn safe_component(work_id: &WorkId) -> SessionStoreResult<&str> {
+    let value = work_id.as_str();
+    if value.is_empty()
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(SessionStoreError::UnsafeJobPath(value.to_owned()));
+    }
+    Ok(value)
+}
+
+fn persist_json<T: Serialize>(path: &Path, value: &T) -> SessionStoreResult<()> {
+    let parent = path.parent().ok_or_else(|| {
+        SessionStoreError::Io(std::io::Error::other("job record path has no parent"))
+    })?;
+    let mut temp = NamedTempFile::new_in(parent)?;
+    serde_json::to_writer(temp.as_file_mut(), value)?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)
+        .map_err(|error| SessionStoreError::Io(error.error))?;
+    // Das Elternverzeichnis wird gesynct, weil jede Job-Mutation (Claim,
+    // Renew, Complete, Cancel, Reconcile) über diese Funktion läuft: der
+    // atomare `persist()` ersetzt den Verzeichniseintrag, nicht nur den
+    // Dateiinhalt. Fällt dieser Eintrag nach einem Absturz auf die alte
+    // Version zurück, sieht ein Worker eine überholte Lease oder einen
+    // bereits abgeschlossenen Job wieder als offen an — aus verlorenem
+    // Fortschritt würde stiller Stillstand oder doppelte Bearbeitung.
+    sync_parent_directory(parent)?;
+    Ok(())
+}
+
+/// Synct das Elternverzeichnis eines soeben angelegten oder ersetzten
+/// Job-Datensatzes. Ein `sync_all()` auf der Datei sichert nur ihren Inhalt;
+/// der Verzeichniseintrag, der sie überhaupt auffindbar macht, liegt im
+/// Verzeichnis-Inode und muss separat gesynct werden — sonst kann eine
+/// vollständig geschriebene Datei nach einem Stromausfall trotzdem nicht
+/// existieren. Ein Verzeichnis wird zum Lesen geöffnet (`File::open`), nicht
+/// zum Schreiben; `sync_all()` erfasst dabei genau den Verzeichniseintrag.
+/// Ein Sync-Fehler wird propagiert statt verschluckt, exakt wie in
+/// `store.rs::sync_parent_directory`.
+// Die eine Fassung liegt in `crate::durability`; sie stand vorher in fünf
+// Dateien byte-gleich. Warum ein Eltern-fsync nötig ist, steht dort.
+use crate::durability::sync_parent_directory;
+
+fn path_exists_without_following_symlinks(
+    path: &Path,
+    description: &str,
+) -> SessionStoreResult<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(symlink_error(path, description)),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(SessionStoreError::Io(error)),
+    }
+}
+
+fn reject_symlink(path: &Path, description: &str) -> SessionStoreResult<()> {
+    path_exists_without_following_symlinks(path, description).map(|_| ())
+}
+
+fn open_without_following_symlinks(
+    options: &mut OpenOptions,
+    path: &Path,
+) -> SessionStoreResult<File> {
+    #[cfg(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "haiku",
+        target_os = "illumos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "solaris",
+    ))]
+    options.custom_flags(O_NOFOLLOW);
+
+    options.open(path).map_err(SessionStoreError::Io)
+}
+
+fn symlink_error(path: &Path, description: &str) -> SessionStoreError {
+    SessionStoreError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "{description} must not be a symbolic link: {}",
+            path.display()
+        ),
+    ))
+}
+
+fn unlock<T>(lock: File, result: SessionStoreResult<T>) -> SessionStoreResult<T> {
+    let unlock = FileExt::unlock(&lock).map_err(SessionStoreError::Io);
+    match (result, unlock) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harw_job_runtime::{Budget, Job, JobKind, RetryPolicy};
+    use harw_observe::TraceContext;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<JobLifecycleEvent>>);
+
+    impl JobEventSink for RecordingSink {
+        fn publish(&self, event: JobLifecycleEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    fn record(id: &str) -> StoredJob {
+        let now = Timestamp::now();
+        let mut job = Job::new(
+            WorkId::from_str(id),
+            JobKind::Worker,
+            Budget::unbounded(),
+            RetryPolicy {
+                max_attempts: 2,
+                base_delay: SignedDuration::from_secs(1),
+                factor: 2.0,
+                max_delay: SignedDuration::from_secs(10),
+            },
+            now,
+        );
+        job.mark_ready(now).unwrap();
+        StoredJob {
+            job,
+            scope: harw_job_runtime::JobScope::new(
+                harw_types::TenantId::from_str("test-tenant"),
+                harw_types::WorkspaceId::from_str("test-workspace"),
+                ApprovalActor::Operator {
+                    id: "test-operator".to_owned(),
+                },
+            ),
+            input: serde_json::json!({"task": "review"}),
+            submitted_at: now,
+            not_before: now,
+            lease: None,
+            lease_epoch: 0,
+            completion: None,
+            cancellation: None,
+            revision: 0,
+            trace: None,
+        }
+    }
+
+    fn sample_trace() -> TraceContext {
+        TraceContext {
+            trace_id: "a".repeat(32),
+            span_id: "b".repeat(16),
+            parent_span_id: None,
+        }
+    }
+
+    #[test]
+    fn admitted_job_with_trace_context_roundtrips_through_the_real_store_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = JobStore::new(temp.path());
+        let admitted = StoredJob {
+            trace: Some(sample_trace()),
+            ..record("work-traced")
+        };
+
+        store.admit(&admitted).unwrap();
+
+        let persisted = store.get(&WorkId::from_str("work-traced")).unwrap();
+        assert_eq!(persisted, admitted);
+        assert_eq!(persisted.trace, Some(sample_trace()));
+    }
+
+    #[test]
+    fn admitted_job_without_trace_context_roundtrips_through_the_real_store_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = JobStore::new(temp.path());
+        let admitted = record("work-untraced");
+        assert_eq!(admitted.trace, None);
+
+        store.admit(&admitted).unwrap();
+
+        let persisted = store.get(&WorkId::from_str("work-untraced")).unwrap();
+        assert_eq!(persisted, admitted);
+        assert_eq!(persisted.trace, None);
+    }
+
+    #[test]
+    fn a_stale_worker_cannot_complete_after_reconciliation_and_reclaim() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = JobStore::new(temp.path());
+        store.admit(&record("work-1")).unwrap();
+        let now = Timestamp::now();
+        let first = store
+            .claim(
+                &WorkId::from_str("work-1"),
+                &ClaimRequest {
+                    worker_id: "worker-a".to_owned(),
+                    lease_ttl: SignedDuration::from_secs(1),
+                    now,
+                },
+            )
+            .unwrap();
+        let after_expiry = now.checked_add(SignedDuration::from_secs(2)).unwrap();
+        assert_eq!(store.reconcile_expired(after_expiry).unwrap().len(), 1);
+        let second = store
+            .claim(
+                &WorkId::from_str("work-1"),
+                &ClaimRequest {
+                    worker_id: "worker-b".to_owned(),
+                    lease_ttl: SignedDuration::from_secs(60),
+                    now: after_expiry
+                        .checked_add(SignedDuration::from_secs(2))
+                        .unwrap(),
+                },
+            )
+            .unwrap();
+        assert!(second.token.epoch > first.token.epoch);
+        assert!(matches!(
+            store.complete(
+                &WorkId::from_str("work-1"),
+                &CompleteRequest {
+                    token: first.token,
+                    completed_at: after_expiry,
+                    outcome: JobOutcome::Succeeded {
+                        result: serde_json::json!({})
+                    },
+                },
+            ),
+            Err(SessionStoreError::LeaseTokenMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn cancellation_fences_a_running_lease_and_keeps_scope_immutable() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = JobStore::new(temp.path());
+        let admitted = record("work-cancel");
+        let scope = admitted.scope.clone();
+        store.admit(&admitted).unwrap();
+        let now = Timestamp::now();
+        let claim = store
+            .claim(
+                &WorkId::from_str("work-cancel"),
+                &ClaimRequest {
+                    worker_id: "worker-a".to_owned(),
+                    lease_ttl: SignedDuration::from_secs(60),
+                    now,
+                },
+            )
+            .unwrap();
+        let cancelled_at = now.checked_add(SignedDuration::from_secs(1)).unwrap();
+        let transition = store
+            .cancel(
+                &WorkId::from_str("work-cancel"),
+                &CancelRequest {
+                    cancelled_at,
+                    cancelled_by: ApprovalActor::Operator {
+                        id: "operator-a".to_owned(),
+                    },
+                    reason: "operator stopped the task".to_owned(),
+                },
+            )
+            .unwrap();
+        assert_eq!(transition.previous_state, JobState::Running);
+        assert_eq!(transition.prior_lease, Some(claim.lease.clone()));
+        assert_eq!(claim.scope, scope);
+        assert!(matches!(
+            transition.completion.outcome,
+            JobOutcome::Cancelled { .. }
+        ));
+
+        let persisted = store.get(&WorkId::from_str("work-cancel")).unwrap();
+        assert_eq!(persisted.scope, scope);
+        assert_eq!(persisted.job.state, JobState::Cancelled);
+        assert!(persisted.lease.is_none());
+        assert!(persisted.lease_epoch > claim.token.epoch);
+        assert_eq!(persisted.revision, transition.revision);
+        assert!(matches!(
+            persisted.cancellation,
+            Some(JobCancellation {
+                cancelled_by: ApprovalActor::Operator { ref id },
+                ..
+            }) if id == "operator-a"
+        ));
+        assert!(matches!(
+            store.renew(&RenewalRequest {
+                token: claim.token,
+                now: cancelled_at,
+            }),
+            Err(SessionStoreError::LeaseTokenMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn cancellation_accepts_pending_and_ready_jobs_without_a_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = JobStore::new(temp.path());
+        let now = Timestamp::now();
+        let mut pending = record("work-pending");
+        pending.job.state = JobState::Pending;
+        store.admit(&pending).unwrap();
+        store.admit(&record("work-ready")).unwrap();
+
+        for work_id in ["work-pending", "work-ready"] {
+            let transition = store
+                .cancel(
+                    &WorkId::from_str(work_id),
+                    &CancelRequest {
+                        cancelled_at: now,
+                        cancelled_by: ApprovalActor::Operator {
+                            id: "operator-a".to_owned(),
+                        },
+                        reason: "superseded".to_owned(),
+                    },
+                )
+                .unwrap();
+            assert!(matches!(
+                transition.previous_state,
+                JobState::Pending | JobState::Ready
+            ));
+            assert!(transition.prior_lease.is_none());
+            let persisted = store.get(&WorkId::from_str(work_id)).unwrap();
+            assert_eq!(persisted.job.state, JobState::Cancelled);
+            assert_eq!(persisted.lease_epoch, 0);
+        }
+    }
+
+    #[test]
+    fn durable_transitions_publish_only_redacted_state_and_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let sink = Arc::new(RecordingSink::default());
+        let store = JobStore::new_with_event_sink(temp.path(), sink.clone());
+        let work_id = WorkId::from_str("work-events");
+        store.admit(&record(work_id.as_str())).unwrap();
+        let now = Timestamp::now();
+
+        let claim = store
+            .claim(
+                &work_id,
+                &ClaimRequest {
+                    worker_id: "worker-a".to_owned(),
+                    lease_ttl: SignedDuration::from_secs(60),
+                    now,
+                },
+            )
+            .unwrap();
+        let completed_at = now.checked_add(SignedDuration::from_secs(1)).unwrap();
+        store
+            .complete(
+                &work_id,
+                &CompleteRequest {
+                    token: claim.token,
+                    completed_at,
+                    outcome: JobOutcome::Succeeded {
+                        result: serde_json::json!({"secret": "must-not-publish"}),
+                    },
+                },
+            )
+            .unwrap();
+
+        let events = sink.0.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![
+                JobLifecycleEvent {
+                    work_id: work_id.clone(),
+                    state: JobState::Running,
+                    revision: 1,
+                },
+                JobLifecycleEvent {
+                    work_id,
+                    state: JobState::Completed,
+                    revision: 2,
+                },
+            ]
+        );
+        let encoded = serde_json::to_string(&events).unwrap();
+        assert!(!encoded.contains("secret"));
+        assert!(!encoded.contains("worker-a"));
+    }
+
+    #[test]
+    fn cancellation_and_reconciliation_publish_terminal_and_retry_states() {
+        let temp = tempfile::tempdir().unwrap();
+        let sink = Arc::new(RecordingSink::default());
+        let store = JobStore::new_with_event_sink(temp.path(), sink.clone());
+        let cancelled_id = WorkId::from_str("work-cancel-event");
+        store.admit(&record(cancelled_id.as_str())).unwrap();
+        store
+            .cancel(
+                &cancelled_id,
+                &CancelRequest {
+                    cancelled_at: Timestamp::now(),
+                    cancelled_by: ApprovalActor::Operator {
+                        id: "operator-a".to_owned(),
+                    },
+                    reason: "stop".to_owned(),
+                },
+            )
+            .unwrap();
+
+        let expired_id = WorkId::from_str("work-reconcile-event");
+        store.admit(&record(expired_id.as_str())).unwrap();
+        let started = Timestamp::now();
+        store
+            .claim(
+                &expired_id,
+                &ClaimRequest {
+                    worker_id: "worker-b".to_owned(),
+                    lease_ttl: SignedDuration::from_secs(1),
+                    now: started,
+                },
+            )
+            .unwrap();
+        let after_expiry = started.checked_add(SignedDuration::from_secs(2)).unwrap();
+        let expired = store.reconcile_expired(after_expiry).unwrap();
+        assert_eq!(expired.len(), 1);
+
+        let events = sink.0.lock().unwrap().clone();
+        assert_eq!(events[0].state, JobState::Cancelled);
+        assert_eq!(events[0].revision, 1);
+        assert_eq!(events[1].state, JobState::Running);
+        assert_eq!(events[1].revision, 1);
+        assert_eq!(events[2].state, JobState::Ready);
+        assert_eq!(events[2].revision, 2);
+        assert!(events.windows(2).skip(1).all(|pair| pair[1].revision > 0));
+    }
+
+    #[test]
+    fn sync_parent_directory_reports_a_missing_directory_without_panicking() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("does-not-exist");
+
+        assert!(matches!(
+            sync_parent_directory(&missing),
+            Err(SessionStoreError::Io(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_skips_symlinked_json_records() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = JobStore::new(temp.path());
+        store.admit(&record("work-regular")).unwrap();
+
+        let external = temp.path().join("external.json");
+        std::fs::write(&external, b"not a durable job").unwrap();
+        symlink(&external, store.records_dir().join("work-linked.json")).unwrap();
+
+        let page = store.list(&JobListQuery::default()).unwrap();
+
+        assert_eq!(page.jobs.len(), 1);
+        assert_eq!(page.jobs[0].job.id, WorkId::from_str("work-regular"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn get_rejects_a_symlinked_job_record_without_reading_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-linked-read");
+        store.admit(&record(work_id.as_str())).unwrap();
+
+        let path = store.record_path(&work_id).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let external = temp.path().join("external-record.json");
+        let external_record = record("work-linked-read");
+        let external_bytes = serde_json::to_vec(&external_record).unwrap();
+        std::fs::write(&external, &external_bytes).unwrap();
+        symlink(&external, &path).unwrap();
+
+        assert!(matches!(store.get(&work_id), Err(SessionStoreError::Io(_))));
+        assert_eq!(std::fs::read(&external).unwrap(), external_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_rejects_a_symlinked_job_record_without_overwriting_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-linked-mutate");
+        store.admit(&record(work_id.as_str())).unwrap();
+
+        let path = store.record_path(&work_id).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let external = temp.path().join("external-record.json");
+        let external_bytes = b"untrusted record target".to_vec();
+        std::fs::write(&external, &external_bytes).unwrap();
+        symlink(&external, &path).unwrap();
+
+        assert!(matches!(
+            store.cancel(
+                &work_id,
+                &CancelRequest {
+                    cancelled_at: Timestamp::now(),
+                    cancelled_by: ApprovalActor::Operator {
+                        id: "operator-a".to_owned(),
+                    },
+                    reason: "stop".to_owned(),
+                },
+            ),
+            Err(SessionStoreError::Io(_))
+        ));
+        assert_eq!(std::fs::read(&external).unwrap(), external_bytes);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admit_rejects_a_symlinked_lock_sidecar_without_following_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = JobStore::new(temp.path());
+        store.ensure_root().unwrap();
+        let work_id = WorkId::from_str("work-linked-lock");
+        let lock_path = store.locks_dir().join("work-linked-lock.lock");
+        let external = temp.path().join("external.lock");
+        let external_bytes = b"untrusted lock target".to_vec();
+        std::fs::write(&external, &external_bytes).unwrap();
+        symlink(&external, &lock_path).unwrap();
+
+        assert!(matches!(
+            store.admit(&record(work_id.as_str())),
+            Err(SessionStoreError::Io(_))
+        ));
+        assert_eq!(std::fs::read(&external).unwrap(), external_bytes);
+        assert!(!store.record_path(&work_id).unwrap().exists());
+    }
+}

@@ -1,0 +1,84 @@
+[package]
+name = "harw-knowledge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-types = { path = "../harw-types" }
+harw-macros = { path = "../harw-macros" }
+harw-job-runtime = { path = "../harw-job-runtime" }
+harw-session-store = { path = "../harw-session-store" }
+# `SecurityEvidence`, `Hardness`, `Severity` behind `SecurityFinding` /
+# `Baseline` (AW4-05). No cycle: `harw-dod-signals` does not depend on
+# `harw-knowledge` (checked at AW4-05 time).
+harw-dod-signals = { path = "../harw-dod-signals" }
+# `Baseline::to_rule_baseline` converts into
+# `harw_dod_rules::baseline::{Baseline, PalaceStatus}` — the edge-cut that
+# stops this crate's whole graph (notably `harw-model-catalog` ->
+# `reqwest`/`tokio`) from reaching `harw-sentinel` through a reexport (see
+# `src/security.rs` module doc). No cycle: `harw-dod-rules` depends back on
+# this crate only as a `[dev-dependencies]` entry (checked in
+# `harw-dod-rules/Cargo.toml`) for its own test/doctest convenience; Cargo
+# explicitly supports dev-dependency cycles since they never enter the
+# production dependency graph.
+harw-dod-rules = { path = "../harw-dod-rules" }
+# AW3-03: Quellenbindung `KnowledgeContextProvider` liefert `harw_context::Fragment`.
+# Kein Zyklus: `harw-context` hängt nur von harw-types/harw-lens-types/harw-macros
+# ab, keines davon kennt harw-knowledge.
+harw-context = { path = "../harw-context" }
+harw-lens-types = { path = "../harw-lens-types" }
+# AW5-09: `ContextProposal::target_program` referenziert die `DefinitionId`
+# eines Kontextprogramms (`harwness.context.<name>@<major>`, siehe
+# `context_program.rs` §Grammatik) und `ProposedChange` bettet
+# `RawContextSectionSpec`/`SectionStrength` ein, statt sie zu duplizieren.
+# Kein Zyklus: `harw-agent-dsl` hängt nur von `harw-context` (das
+# `harw-knowledge` bereits kennt), `semver`, `serde`, `time`, `toml`, `blake3`
+# ab — keines davon kennt `harw-knowledge` (geprüft zum Zeitpunkt AW5-09).
+harw-agent-dsl = { path = "../harw-agent-dsl" }
+# AW5-09: `ContextProposal::evidence: Vec<EvidenceRef>` — dieselbe Belegkette,
+# die `harw-plan`-Knoten trägt (inkl. `digest: Option<ContentDigest>`, AW4-04).
+# Kein Zyklus: `harw-plan` hängt nur von `harw-macros`/`harw-types`/`serde`/
+# `serde_json`/`time`/`tracing` ab, keines davon kennt `harw-knowledge`. Auf
+# `harw-plan-bridge` (das umgekehrt bereits von `harw-knowledge` abhängt, siehe
+# `fragment_registry.rs`) wird bewusst NICHT zugegriffen — das wäre der Zyklus.
+# AW6-06: `ModelBehaviorProposal` embeds `harw_model_catalog::descriptor`'s
+# `ToolCallingSupport`/`TokenCount` and `harw_model_catalog::observed::Score`
+# read-only, instead of duplicating that vocabulary. Kein Zyklus: geprüft zum
+# Zeitpunkt AW6-06 hängt `harw-model-catalog` nur von `harw-config`,
+# `harw-context`, `harw-lens-types`, `harw-types` (path) und externen Crates
+# (reqwest/secrecy/serde/serde_json/tokio/time/toml) ab — keine dieser
+# Path-Abhängigkeiten kennt `harw-knowledge` (dieselbe Prüfung, die AW5-09
+# bereits für `harw-agent-dsl`/`harw-context` durchgeführt hat).
+harw-model-catalog = { path = "../harw-model-catalog" }
+harw-plan = { path = "../harw-plan" }
+# AW6-08: the Context Steward's three null counters (`context_steward.rs`)
+# need `harw_observe::{NullCounter, NullCounterRegistry, NullSink,
+# TelemetrySink, Cardinality, MetricKey, MetricKind, Unit}` to make the
+# invariants it hangs a counter on observable, per the mechanic `harw-observe`
+# built in AW1-07 (deliberately without any concrete counters of its own).
+# Kein Zyklus: `harw-observe` hängt nur von `harw-macros` und `serde` ab
+# (siehe `harw-observe/Cargo.toml`), keines davon kennt `harw-knowledge` —
+# geprüft zum Zeitpunkt AW6-08.
+harw-observe = { path = "../harw-observe" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1" }
+jiff = { workspace = true }
+serde_norway = "0.9.42"
+# External crates are LISTED here for the parent build to `cargo add` (this
+# worker never runs cargo); no version is invented for them.
+# TODO(parent cargo add): jiff --features serde   # Timestamp for frontmatter / diary / dream (NOT chrono)
+# TODO(parent cargo add): serde_norway            # YAML frontmatter (de)serialization (NOT serde_yaml/serde_yml)
+# TODO(parent cargo add): pulldown-cmark          # markdown body parsing for recall/render (future; body scan is hand-rolled in v1)
+# TODO(parent cargo add): aho-corasick            # multi-pattern keyword/tag scanning (future; tokenizer is hand-rolled in v1)
+# TODO(parent cargo add): notify 9.0.0-rc.4       # workbench push-surface file watching (PIN EXACTLY — pre-1.0 rc)
+# TODO(parent cargo add): croner                  # dream-job cron schedule parsing (§4.3)
+# TODO(parent cargo add): blake3                  # content-hash for artifact versioning / index-cache keys (future)
+# TODO(parent cargo add): etcetera                # XDG/workspace-root resolution for the on-disk layout (§1.2)
+# TODO(parent cargo add): toml                    # kanban board.toml metadata (§1.2)
+# Optional — NOT required by knowledge-surfaces.md v1; add only if a later phase needs them:
+# TODO(parent cargo add): ulid                    # OPTIONAL time-ordered ids (doc uses slug-derived ids)
+# TODO(parent cargo add): redb                    # OPTIONAL embedded index cache (doc uses a rebuildable file cache)
+
+[lints]
+workspace = true

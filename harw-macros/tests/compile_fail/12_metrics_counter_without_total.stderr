@@ -1,0 +1,5 @@
+error: counter-Metrik `harw_child_admitted` muss auf `_total` enden
+ --> tests/compile_fail/12_metrics_counter_without_total.rs:4:86
+  |
+4 |     CHILD_ADMITTED: counter, unit = count, labels = [], cardinality = single, name = "harw_child_admitted";
+  |                                                                                      ^^^^^^^^^^^^^^^^^^^^^

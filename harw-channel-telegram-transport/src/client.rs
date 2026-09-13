@@ -1,0 +1,607 @@
+//! Token-owning client for the Telegram Bot API.
+//!
+//! The token lives only in [`TelegramClient`] as a `SecretBox`.  Callers use
+//! typed request arguments and never need to construct a token-bearing URL.
+
+use std::{fmt, time::Duration};
+
+use secrecy::{ExposeSecret, SecretBox, SecretString};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
+
+use crate::error::{TelegramTransportError, TransportResult};
+
+const API_BASE: &str = "https://api.telegram.org";
+const MAX_SERVER_ATTEMPTS: u32 = 5;
+const INITIAL_SERVER_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_SERVER_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Telegram Bot API client which owns its bot token.
+pub struct TelegramClient {
+    http: reqwest::Client,
+    token: SecretBox<str>,
+}
+
+impl TelegramClient {
+    /// Build a client using reqwest's default configuration.
+    pub fn new(token: impl Into<SecretString>) -> Self {
+        Self::with_http_client(reqwest::Client::new(), token)
+    }
+
+    /// Build a client with a caller-configured HTTP client.
+    ///
+    /// This is useful when the application needs explicit proxy, timeout, or
+    /// TLS policy while preserving token ownership in this boundary.
+    pub fn with_http_client(http: reqwest::Client, token: impl Into<SecretString>) -> Self {
+        Self {
+            http,
+            token: token.into(),
+        }
+    }
+
+    /// Fetch this bot's Telegram identity and capabilities.
+    pub async fn get_me(&self) -> TransportResult<BotInfo> {
+        self.call("getMe", EmptyRequest {}).await
+    }
+
+    /// Fetch pending updates using Telegram long polling.
+    pub async fn get_updates(
+        &self,
+        offset: Option<i64>,
+        timeout_secs: u64,
+        allowed_updates: &[&str],
+    ) -> TransportResult<Vec<Value>> {
+        self.call(
+            "getUpdates",
+            GetUpdatesRequest {
+                offset,
+                timeout: timeout_secs,
+                allowed_updates,
+            },
+        )
+        .await
+    }
+
+    /// Send a text message, optionally into a forum topic with an inline keyboard.
+    pub async fn send_message(
+        &self,
+        chat_id: i64,
+        text: &str,
+        message_thread_id: Option<i64>,
+        inline_keyboard: Option<&[Vec<InlineKeyboardButton>]>,
+    ) -> TransportResult<SentMessage> {
+        self.call(
+            "sendMessage",
+            SendMessageRequest {
+                chat_id,
+                text,
+                message_thread_id,
+                reply_markup: inline_keyboard.map(InlineKeyboardMarkup::new),
+            },
+        )
+        .await
+    }
+
+    /// Replace the text of an existing message.
+    pub async fn edit_message_text(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        inline_keyboard: Option<&[Vec<InlineKeyboardButton>]>,
+    ) -> TransportResult<SentMessage> {
+        self.call(
+            "editMessageText",
+            EditMessageTextRequest {
+                chat_id,
+                message_id,
+                text,
+                reply_markup: inline_keyboard.map(InlineKeyboardMarkup::new),
+            },
+        )
+        .await
+    }
+
+    /// Resolve Telegram metadata for a downloadable file.
+    pub async fn get_file(&self, file_id: &str) -> TransportResult<TelegramFile> {
+        self.call("getFile", GetFileRequest { file_id }).await
+    }
+
+    /// Download a Telegram file, rejecting bodies larger than `max_bytes`.
+    ///
+    /// The declared content length is checked before reading.  Chunked bodies
+    /// are checked incrementally, so an untrusted response cannot grow the
+    /// in-memory buffer past the configured ceiling.
+    pub async fn download_file(
+        &self,
+        file: &TelegramFile,
+        max_bytes: usize,
+    ) -> TransportResult<Vec<u8>> {
+        let file_path = file.file_path.as_deref().ok_or_else(|| {
+            TelegramTransportError::AttachmentRejected {
+                reason: "Telegram getFile response did not include file_path".to_owned(),
+            }
+        })?;
+        let mut server_attempt = 0;
+        let mut response = loop {
+            let response = self
+                .http
+                .get(self.file_url(file_path))
+                .send()
+                .await
+                .map_err(TelegramTransportError::from)?;
+            if should_retry_server_error(response.status().as_u16().into(), server_attempt) {
+                tokio::time::sleep(server_backoff(server_attempt)).await;
+                server_attempt += 1;
+                continue;
+            }
+            break response;
+        };
+
+        if !response.status().is_success() {
+            return Err(api_rejected(
+                "downloadFile",
+                response.status().as_u16().into(),
+                None,
+            ));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_bytes as u64)
+        {
+            return Err(TelegramTransportError::AttachmentRejected {
+                reason: format!("Telegram file exceeds {max_bytes}-byte limit"),
+            });
+        }
+
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(TelegramTransportError::from)?
+        {
+            let remaining = max_bytes.saturating_sub(body.len());
+            if chunk.len() > remaining {
+                return Err(TelegramTransportError::AttachmentRejected {
+                    reason: format!("Telegram file exceeds {max_bytes}-byte limit"),
+                });
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+
+    /// Acknowledge a callback query, optionally with an operator-visible notice.
+    pub async fn answer_callback_query(
+        &self,
+        callback_query_id: &str,
+        text: Option<&str>,
+        show_alert: bool,
+    ) -> TransportResult<()> {
+        self.call_ok(
+            "answerCallbackQuery",
+            AnswerCallbackQueryRequest {
+                callback_query_id,
+                text,
+                show_alert,
+            },
+        )
+        .await
+    }
+
+    /// Register the commands Telegram presents to the user.
+    pub async fn set_my_commands(&self, commands: &[BotCommand]) -> TransportResult<()> {
+        self.call_ok("setMyCommands", SetMyCommandsRequest { commands })
+            .await
+    }
+
+    /// Configure Telegram to deliver updates to an HTTPS webhook.
+    pub async fn set_webhook(
+        &self,
+        url: &str,
+        secret_token: Option<&str>,
+        allowed_updates: &[&str],
+        drop_pending_updates: bool,
+    ) -> TransportResult<()> {
+        if let Some(secret_token) = secret_token {
+            if !is_valid_webhook_secret(secret_token) {
+                return Err(TelegramTransportError::ApiRejected {
+                    method: "setWebhook",
+                    code: 0,
+                    description:
+                        "webhook secret token must be 1-256 ASCII characters from [A-Za-z0-9_-]"
+                            .to_owned(),
+                });
+            }
+        }
+        self.call_ok(
+            "setWebhook",
+            SetWebhookRequest {
+                url,
+                secret_token,
+                allowed_updates,
+                drop_pending_updates,
+            },
+        )
+        .await
+    }
+
+    /// Disable Telegram webhook delivery.
+    pub async fn delete_webhook(&self, drop_pending_updates: bool) -> TransportResult<()> {
+        self.call_ok(
+            "deleteWebhook",
+            DeleteWebhookRequest {
+                drop_pending_updates,
+            },
+        )
+        .await
+    }
+
+    async fn call<T: DeserializeOwned, B: Serialize>(
+        &self,
+        method: &'static str,
+        body: B,
+    ) -> TransportResult<T> {
+        let mut server_attempt = 0;
+        loop {
+            let response = self
+                .http
+                .post(self.api_url(method))
+                .json(&body)
+                .send()
+                .await
+                .map_err(TelegramTransportError::from)?;
+            let status = response.status();
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(TelegramTransportError::from)?;
+            let envelope: TelegramResponse<T> = match serde_json::from_slice(&bytes) {
+                Ok(envelope) => envelope,
+                Err(_) if should_retry_server_error(status.as_u16().into(), server_attempt) => {
+                    tokio::time::sleep(server_backoff(server_attempt)).await;
+                    server_attempt += 1;
+                    continue;
+                }
+                Err(_) => {
+                    return Err(api_rejected(
+                        method,
+                        status.as_u16().into(),
+                        Some("invalid Telegram API JSON response".to_owned()),
+                    ));
+                }
+            };
+
+            if envelope.ok {
+                return envelope
+                    .result
+                    .ok_or_else(|| TelegramTransportError::ApiRejected {
+                        method,
+                        code: status.as_u16().into(),
+                        description: "successful Telegram response did not include result"
+                            .to_owned(),
+                    });
+            }
+
+            let code = envelope
+                .error_code
+                .unwrap_or_else(|| status.as_u16().into());
+            let retry_after = envelope.parameters.and_then(|value| value.retry_after);
+            match retry_decision(code, retry_after, server_attempt) {
+                RetryDecision::RetryAfter(delay) => {
+                    tokio::time::sleep(delay).await;
+                    if (500..600).contains(&code) {
+                        server_attempt += 1;
+                    }
+                    continue;
+                }
+                RetryDecision::Reject => {
+                    return Err(api_rejected(method, code, envelope.description));
+                }
+            }
+        }
+    }
+
+    async fn call_ok<B: Serialize>(&self, method: &'static str, body: B) -> TransportResult<()> {
+        self.call::<bool, B>(method, body).await.map(|_| ())
+    }
+
+    fn api_url(&self, method: &str) -> String {
+        format!("{API_BASE}/bot{}/{method}", self.token.expose_secret())
+    }
+
+    fn file_url(&self, file_path: &str) -> String {
+        format!(
+            "{API_BASE}/file/bot{}/{file_path}",
+            self.token.expose_secret()
+        )
+    }
+}
+
+#[derive(Serialize)]
+struct EmptyRequest {}
+
+#[derive(Serialize)]
+struct GetUpdatesRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    offset: Option<i64>,
+    timeout: u64,
+    allowed_updates: &'a [&'a str],
+}
+
+#[derive(Serialize)]
+struct InlineKeyboardMarkup<'a> {
+    inline_keyboard: &'a [Vec<InlineKeyboardButton>],
+}
+
+impl<'a> InlineKeyboardMarkup<'a> {
+    fn new(inline_keyboard: &'a [Vec<InlineKeyboardButton>]) -> Self {
+        Self { inline_keyboard }
+    }
+}
+
+#[derive(Serialize)]
+struct SendMessageRequest<'a> {
+    chat_id: i64,
+    text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_thread_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_markup: Option<InlineKeyboardMarkup<'a>>,
+}
+
+#[derive(Serialize)]
+struct EditMessageTextRequest<'a> {
+    chat_id: i64,
+    message_id: i64,
+    text: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_markup: Option<InlineKeyboardMarkup<'a>>,
+}
+
+#[derive(Serialize)]
+struct GetFileRequest<'a> {
+    file_id: &'a str,
+}
+
+#[derive(Serialize)]
+struct AnswerCallbackQueryRequest<'a> {
+    callback_query_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<&'a str>,
+    show_alert: bool,
+}
+
+#[derive(Serialize)]
+struct SetMyCommandsRequest<'a> {
+    commands: &'a [BotCommand],
+}
+
+#[derive(Serialize)]
+struct SetWebhookRequest<'a> {
+    url: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secret_token: Option<&'a str>,
+    allowed_updates: &'a [&'a str],
+    drop_pending_updates: bool,
+}
+
+#[derive(Serialize)]
+struct DeleteWebhookRequest {
+    drop_pending_updates: bool,
+}
+
+impl fmt::Debug for TelegramClient {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TelegramClient")
+            .field("http", &"reqwest::Client")
+            .field("token", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Bot identity returned by `getMe`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct BotInfo {
+    pub id: i64,
+    pub is_bot: bool,
+    pub first_name: String,
+    pub username: Option<String>,
+    pub can_join_groups: Option<bool>,
+    pub can_read_all_group_messages: Option<bool>,
+    pub supports_inline_queries: Option<bool>,
+}
+
+/// Message metadata returned by Telegram send and edit calls.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct SentMessage {
+    pub message_id: i64,
+    pub date: i64,
+    #[serde(deserialize_with = "deserialize_chat_id")]
+    pub chat_id: i64,
+    pub message_thread_id: Option<i64>,
+}
+
+fn deserialize_chat_id<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct ChatId {
+        id: i64,
+    }
+
+    ChatId::deserialize(deserializer).map(|chat| chat.id)
+}
+
+/// File metadata returned by `getFile`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct TelegramFile {
+    pub file_id: String,
+    pub file_unique_id: String,
+    pub file_size: Option<u64>,
+    pub file_path: Option<String>,
+}
+
+/// A command exposed in Telegram's command menu.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BotCommand {
+    pub command: String,
+    pub description: String,
+}
+
+/// A supported inline keyboard button.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InlineKeyboardButton {
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callback_data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TelegramResponse<T> {
+    ok: bool,
+    result: Option<T>,
+    description: Option<String>,
+    error_code: Option<i64>,
+    parameters: Option<TelegramResponseParameters>,
+}
+
+#[derive(Deserialize)]
+struct TelegramResponseParameters {
+    retry_after: Option<u64>,
+}
+
+fn api_rejected(
+    method: &'static str,
+    code: i64,
+    description: Option<String>,
+) -> TelegramTransportError {
+    TelegramTransportError::ApiRejected {
+        method,
+        code,
+        description: description
+            .unwrap_or_else(|| "Telegram API did not provide a description".to_owned()),
+    }
+}
+
+fn should_retry_server_error(code: i64, prior_retries: u32) -> bool {
+    (500..600).contains(&code) && prior_retries < MAX_SERVER_ATTEMPTS - 1
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryDecision {
+    RetryAfter(Duration),
+    Reject,
+}
+
+fn retry_decision(
+    code: i64,
+    retry_after_secs: Option<u64>,
+    prior_server_retries: u32,
+) -> RetryDecision {
+    if code == 429 {
+        return retry_after_secs
+            .map(|seconds| RetryDecision::RetryAfter(Duration::from_secs(seconds)))
+            .unwrap_or(RetryDecision::Reject);
+    }
+    if should_retry_server_error(code, prior_server_retries) {
+        return RetryDecision::RetryAfter(server_backoff(prior_server_retries));
+    }
+    RetryDecision::Reject
+}
+
+fn server_backoff(prior_retries: u32) -> Duration {
+    INITIAL_SERVER_BACKOFF
+        .checked_mul(2_u32.saturating_pow(prior_retries))
+        .unwrap_or(MAX_SERVER_BACKOFF)
+        .min(MAX_SERVER_BACKOFF)
+}
+
+fn is_valid_webhook_secret(secret_token: &str) -> bool {
+    (1..=256).contains(&secret_token.len())
+        && secret_token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_urls_follow_telegram_bot_api_shape() {
+        let client = TelegramClient::new("123456:secret-token");
+        assert_eq!(
+            client.api_url("getMe"),
+            "https://api.telegram.org/bot123456:secret-token/getMe"
+        );
+        assert_eq!(
+            client.file_url("documents/file_1.pdf"),
+            "https://api.telegram.org/file/bot123456:secret-token/documents/file_1.pdf"
+        );
+    }
+
+    #[test]
+    fn retry_decision_uses_telegram_rate_limit_and_bounded_server_backoff() {
+        assert_eq!(
+            retry_decision(429, Some(17), 0),
+            RetryDecision::RetryAfter(Duration::from_secs(17))
+        );
+        assert_eq!(retry_decision(429, None, 0), RetryDecision::Reject);
+        assert_eq!(
+            retry_decision(500, None, 0),
+            RetryDecision::RetryAfter(Duration::from_secs(1))
+        );
+        assert_eq!(
+            retry_decision(599, None, MAX_SERVER_ATTEMPTS - 2),
+            RetryDecision::RetryAfter(Duration::from_secs(8))
+        );
+        assert_eq!(
+            retry_decision(500, None, MAX_SERVER_ATTEMPTS - 1),
+            RetryDecision::Reject
+        );
+        assert_eq!(server_backoff(10), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn response_envelope_parses_telegram_error_parameters_and_acknowledgements() {
+        let rate_limited: TelegramResponse<bool> = serde_json::from_str(
+            r#"{"ok":false,"description":"Too Many Requests","error_code":429,"parameters":{"retry_after":17}}"#,
+        )
+        .map_err(|error| error.to_string())
+        .unwrap_or_else(|error| panic!("test JSON must deserialize: {error}"));
+        assert!(!rate_limited.ok);
+        assert_eq!(rate_limited.error_code, Some(429));
+        assert_eq!(
+            rate_limited.parameters.and_then(|parameters| parameters.retry_after),
+            Some(17)
+        );
+
+        let acknowledgement: TelegramResponse<bool> =
+            serde_json::from_str(r#"{"ok":true,"result":true}"#)
+                .map_err(|error| error.to_string())
+                .unwrap_or_else(|error| panic!("test JSON must deserialize: {error}"));
+        assert_eq!(acknowledgement.result, Some(true));
+    }
+
+    #[test]
+    fn debug_never_emits_token() {
+        let token = "123456:secret-token";
+        let rendered = format!("{:?}", TelegramClient::new(token));
+        assert!(!rendered.contains(token));
+        assert!(rendered.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn webhook_secret_uses_telegram_character_and_length_limits() {
+        assert!(is_valid_webhook_secret("secret_123-ABC"));
+        assert!(is_valid_webhook_secret(&"a".repeat(256)));
+        assert!(!is_valid_webhook_secret(""));
+        assert!(!is_valid_webhook_secret(&"a".repeat(257)));
+        assert!(!is_valid_webhook_secret("space forbidden"));
+    }
+}

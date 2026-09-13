@@ -1,0 +1,713 @@
+{
+  "vendor": "zai",
+  "family": "glm",
+  "retrieved_at": "2026-07-16",
+  "source_urls": [
+    "https://docs.z.ai/",
+    "https://docs.z.ai/release-notes/new-released",
+    "https://docs.z.ai/guides/llm/glm-5.2",
+    "https://docs.z.ai/llms.txt",
+    "https://open.bigmodel.cn/dev/api",
+    "https://openrouter.ai/z-ai",
+    "https://llmgateway.io/providers/zai",
+    "https://docs.litellm.ai/docs/providers/zai",
+    "https://www.marktechpost.com/2026/06/14/z-ai-launches-glm-5-2-with-a-usable-1m-token-context-two-thinking-effort-levels-and-no-benchmarks-at-launch/",
+    "https://gate.ai/blog/glm-5-2-z-ai-specs-pricing-api-use-cases"
+  ],
+  "api_base_urls": {
+    "international": "https://api.z.ai/api/paas/v4/",
+    "mainland_china": "https://open.bigmodel.cn/api/paas/v4/"
+  },
+  "records": [
+    {
+      "api_id": "glm-5.2",
+      "display_name": "GLM-5.2",
+      "family": "glm",
+      "vendor": "zai",
+      "tier": "flagship",
+      "generation": "5",
+      "minor_version": "2",
+      "status": "ga",
+      "ga_date": "2026-06-13",
+      "weights_release_date": "2026-06-16",
+      "deprecation_date": null,
+      "retirement_date": null,
+      "context_window_tokens": 1048576,
+      "max_output_tokens": 131072,
+      "architecture": {
+        "type": "MoE",
+        "total_parameters": "744B",
+        "active_parameters": "~40B",
+        "attention": "IndexShare sparse attention (reuses indexer across every 4 sparse layers)",
+        "flop_reduction_at_1m_context": "2.9x vs dense"
+      },
+      "pricing": {
+        "input_per_mtok_usd": 1.40,
+        "output_per_mtok_usd": 4.40,
+        "cache_read_per_mtok_usd": 0.26,
+        "web_search_addon_per_search_usd": 0.010,
+        "source": "llmgateway.io 2026-07-16"
+      },
+      "modalities": {
+        "input": ["text"],
+        "output": ["text"]
+      },
+      "capabilities": {
+        "tool_use": true,
+        "mcp_integration": true,
+        "structured_output": true,
+        "streaming": true,
+        "reasoning_thinking": true,
+        "thinking_param": "{ \"thinking\": { \"type\": \"enabled\" | \"disabled\" } }",
+        "reasoning_effort_param": true,
+        "reasoning_effort_values": ["high", "max"],
+        "prompt_caching": true,
+        "web_search_addon": true,
+        "vision": false
+      },
+      "platform_ids": {
+        "z_ai_api": "glm-5.2",
+        "bigmodel_cn": "glm-5.2",
+        "openrouter": "z-ai/glm-5.2",
+        "nvidia_nim": "z-ai/glm-5.2"
+      },
+      "benchmarks": {
+        "swe_bench_pro": "62.1%",
+        "frontier_swe": "74.4%",
+        "artificial_analysis_intelligence_index_v4_1": 51
+      },
+      "notes": [
+        "Flagship as of 2026-07-16; replaces GLM-5.1 as top-tier text model.",
+        "Supports 1M lossless context via IndexShare sparse attention architecture.",
+        "Open-weight model released under MIT license with public weights.",
+        "Two thinking-effort levels: high and max. Z.AI recommends max for complex coding.",
+        "Compatible with Claude Code, Cline, OpenCode, OpenClaw via Anthropic-compatible endpoint.",
+        "GLM Coding Plan tiers: Lite, Pro, Max, Team — all included from release day.",
+        "744B total parameters MoE, ~40B active per forward pass.",
+        "Ranked 4th overall on Artificial Analysis Intelligence Index v4.1 (highest open-weight).",
+        "SWE-bench Pro 62.1% beats GPT-5.5 (58.6%) and GLM-5.1 (58.4%).",
+        "FrontierSWE 74.4% — nearly tied with Claude Opus 4.8 (75.1%)."
+      ]
+    },
+    {
+      "api_id": "glm-5.1",
+      "display_name": "GLM-5.1",
+      "family": "glm",
+      "vendor": "zai",
+      "tier": "flagship-prev",
+      "generation": "5",
+      "minor_version": "1",
+      "status": "ga",
+      "ga_date": "2026-04-07",
+      "deprecation_date": null,
+      "retirement_date": null,
+      "context_window_tokens": 200000,
+      "max_output_tokens": null,
+      "pricing": {
+        "input_per_mtok_usd": 1.40,
+        "output_per_mtok_usd": 4.40,
+        "cache_read_per_mtok_usd": 0.26,
+        "web_search_addon_per_search_usd": 0.010
+      },
+      "modalities": {
+        "input": ["text"],
+        "output": ["text"]
+      },
+      "capabilities": {
+        "tool_use": true,
+        "structured_output": true,
+        "streaming": true,
+        "reasoning_thinking": true,
+        "prompt_caching": true,
+        "web_search_addon": true,
+        "vision": false,
+        "autonomous_long_horizon": true
+      },
+      "platform_ids": {
+        "z_ai_api": "glm-5.1",
+        "bigmodel_cn": "glm-5.1",
+        "openrouter": "z-ai/glm-5.1"
+      },
+      "notes": [
+        "Long-horizon agentic model capable of autonomous operation for up to 8 hours in a single run.",
+        "Planning/execution/refinement loop; bug fixing and strategy iteration.",
+        "Benchmarked against Claude Opus 4.6 at release."
+      ]
+    },
+    {
+      "api_id": "glm-5",
+      "display_name": "GLM-5",
+      "family": "glm",
+      "vendor": "zai",
+      "tier": "flagship-prev",
+      "generation": "5",
+      "status": "ga",
+      "ga_date": "2026-02-12",
+      "deprecation_date": null,
+      "retirement_date": null,
+      "context_window_tokens": 202752,
+      "max_output_tokens": null,
+      "pricing": {
+        "input_per_mtok_usd": 1.00,
+        "output_per_mtok_usd": 3.20,
+        "cache_read_per_mtok_usd": 0.20,
+        "web_search_addon_per_search_usd": 0.010
+      },
+      "modalities": {
+        "input": ["text"],
+        "output": ["text"]
+      },
+      "capabilities": {
+        "tool_use": true,
+        "structured_output": true,
+        "streaming": true,
+        "reasoning_thinking": true,
+        "prompt_caching": true,
+        "web_search_addon": true,
+        "vision": false
+      },
+      "platform_ids": {
+        "z_ai_api": "glm-5",
+        "bigmodel_cn": "glm-5",
+        "openrouter": "z-ai/glm-5"
+      },
+      "notes": [
+        "Integrates DeepSeek Sparse Attention for higher token efficiency.",
+        "Deep reasoning and complex systems engineering focus.",
+        "Benchmarked against Claude Opus 4.5 at release."
+      ]
+    },
+    {
+      "api_id": "glm-5-turbo",
+      "display_name": "GLM-5-Turbo",
+      "family": "glm",
+      "vendor": "zai",
+      "tier": "turbo",
+      "generation": "5",
+      "status": "ga",
+      "ga_date": "2026-03-15",
+      "deprecation_date": null,
+      "retirement_date": null,
+      "context_window_tokens": 203000,
+      "max_output_tokens": null,
+      "pricing": {
+        "input_per_mtok_usd": 1.20,
+        "output_per_mtok_usd": 4.00
+      },
+      "modalities": {
+        "input": ["text"],
+        "output": ["text"]
+      },
+      "capabilities": {
+        "tool_use": true,
+        "structured_output": true,
+        "streaming": true,
+        "reasoning_thinking": false,
+        "prompt_caching": false,
+        "vision": false,
+        "multi_agent_coordination": true
+      },
+      "platform_ids": {
+        "z_ai_api": "glm-5-turbo",
+        "openrouter": "z-ai/glm-5-turbo"
+      },
+      "notes": [
+        "Fast inference variant; optimized for long agent execution chains.",
+        "Strengthened tool and Skills integration; multi-agent coordination."
+      ]
+    },
+    {
+      "api_id": "glm-5v-turbo",
+      "display_name": "GLM-5V-Turbo",
+      "family": "glm",
+      "vendor": "zai",
+      "tier": "multimodal",
+      "generation": "5",
+      "status": "ga",
+      "ga_date": "2026-04-01",
+      "deprecation_date": null,
+      "retirement_date": null,
+      "context_window_tokens": 203000,
+      "max_output_tokens": null,
+      "pricing": {
+        "input_per_mtok_usd": 1.20,
+        "output_per_mtok_usd": 4.00
+      },
+      "modalities": {
+        "input": ["text", "image", "video"],
+        "output": ["text"]
+      },
+      "capabilities": {
+        "tool_use": true,
+        "structured_output": true,
+        "streaming": true,
+        "reasoning_thinking": true,
+        "prompt_caching": false,
+        "vision": true,
+        "gui_agent": true,
+        "multimodal_tool_use": true
+      },
+      "platform_ids": {
+        "z_ai_api": "glm-5v-turbo",
+        "openrouter": "z-ai/glm-5v-turbo"
+      },
+      "notes": [
+        "First native multimodal agent foundation model from Z.AI.",
+        "Handles image, video, and text natively.",
+        "GUI task execution and long-horizon planning."
+      ]
+    },
+    {
+      "api_id": "glm-4.7",
+      "display_name": "GLM-4.7",
+      "family": "glm",
+      "vendor": "zai",
+      "tier": "standard",
+      "generation": "4",
+      "minor_version": "7",
+      "status": "ga",
+      "ga_date": "2025-12-22",
+      "deprecation_date": null,
+      "retirement_date": null,
+      "context_window_tokens": 200000,
+      "max_output_tokens": null,
+      "pricing": {
+        "input_per_mtok_usd": 0.60,
+        "output_per_mtok_usd": 2.20,
+        "cache_read_per_mtok_usd": 0.11,
+        "web_search_addon_per_search_usd": 0.010
+      },
+      "modalities": {
+        "input": ["text"],
+        "output": ["text"]
+      },
+      "capabilities": {
+        "tool_use": true,
+        "structured_output": true,
+        "streaming": true,
+        "reasoning_thinking": true,
+        "prompt_caching": true,
+        "web_search_addon": true,
+        "vision": false,
+        "agentic_coding": true
+      },
+      "platform_ids": {
+        "z_ai_api": "glm-4.7",
+        "bigmodel_cn": "glm-4.7",
+        "openrouter": "z-ai/glm-4.7"
+      },
+      "notes": [
+        "Enhanced coding, reasoning, agentic coding for goal-driven multi-step tasks.",
+        "Open-source SOTA performance on major coding and reasoning benchmarks at release."
+      ]
+    },
+    {
+      "api_id": "glm-4.7-flash",
+      "display_name": "GLM-4.7-Flash",
+      "family": "glm",
+      "vendor": "zai",
+      "tier": "free",
+      "generation": "4",
+      "minor_version": "7",
+      "status": "ga",
+      "ga_date": "2026-01-19",
+      "deprecation_date": null,
+      "retirement_date": null,
+      "context_window_tokens": 203000,
+      "max_output_tokens": null,
+      "pricing": {
+        "input_per_mtok_usd": 0.06,
+        "output_per_mtok_usd": 0.40
+      },
+      "modalities": {
+        "input": ["text"],
+        "output": ["text"]
+      },
+      "capabilities": {
+        "tool_use": true,
+        "structured_output": true,
+        "streaming": true,
+        "reasoning_thinking": false,
+        "prompt_caching": false,
+        "vision": false
+      },
+      "platform_ids": {
+        "z_ai_api": "glm-4.7-flash",
+        "bigmodel_cn": "glm-4.7-flash",
+        "openrouter": "z-ai/glm-4.7-flash"
+      },
+      "notes": [
+        "30B-class model; free for all registered Z.AI accounts.",
+        "203K context — largest free context window from any major API provider at release.",
+        "Optimized for agentic coding use cases."
+      ]
+    },
+    {
+      "api_id": "glm-4.7-flashx",
+      "display_name": "GLM-4.7-FlashX",
+      "family": "glm",
+      "vendor": "zai",
+      "tier": "flash-premium",
+      "generation": "4",
+      "minor_version": "7",
+      "status": "ga",
+      "ga_date": null,
+      "deprecation_date": null,
+      "retirement_date": null,
+      "context_window_tokens": 200000,
+      "max_output_tokens": null,
+      "pricing": {
+        "input_per_mtok_usd": 0.07,
+        "output_per_mtok_usd": 0.40,
+        "cache_read_per_mtok_usd": 0.01
+      },
+      "modalities": {
+        "input": ["text"],
+        "output": ["text"]
+      },
+      "capabilities": {
+        "tool_use": true,
+        "structured_output": true,
+        "streaming": true,
+        "reasoning_thinking": true,
+        "prompt_caching": true,
+        "vision": false
+      },
+      "platform_ids": {
+        "z_ai_api": "glm-4.7-flashx"
+      },
+      "notes": [
+        "Fast-accelerated variant of GLM-4.7-Flash with reasoning support.",
+        "Very low-cost entry point with caching."
+      ]
+    },
+    {
+      "api_id": "glm-4.6",
+      "display_name": "GLM-4.6",
+      "family": "glm",
+      "vendor": "zai",
+      "tier": "standard",
+      "generation": "4",
+      "minor_version": "6",
+      "status": "ga",
+      "ga_date": "2025-09-30",
+      "deprecation_date": null,
+      "retirement_date": null,
+      "context_window_tokens": 200000,
+      "max_output_tokens": 131072,
+      "architecture": {
+        "type": "MoE",
+        "total_parameters": "355B"
+      },
+      "pricing": {
+        "input_per_mtok_usd": 0.60,
+        "output_per_mtok_usd": 2.20,
+        "cache_read_per_mtok_usd": 0.11,
+        "web_search_addon_per_search_usd": 0.010
+      },
+      "modalities": {
+        "input": ["text"],
+        "output": ["text"]
+      },
+      "capabilities": {
+        "tool_use": true,
+        "structured_output": true,
+        "streaming": true,
+        "reasoning_thinking": true,
+        "prompt_caching": true,
+        "web_search_addon": true,
+        "vision": false,
+        "tool_use_during_inference": true
+      },
+      "platform_ids": {
+        "z_ai_api": "glm-4.6",
+        "bigmodel_cn": "glm-4.6",
+        "openrouter": "z-ai/glm-4.6"
+      },
+      "notes": [
+        "Flagship coding model at China's domestic release (Sept 2025).",
+        "Context expanded from 128K (GLM-4.5) to 200K.",
+        "First integration of quantization on Cambricon chips (domestic CN chip manufacturer).",
+        "Compatible with Claude Code, Cline, Roo Code, Kilo Code.",
+        "Advanced reasoning with tool-use support during inference."
+      ]
+    },
+    {
+      "api_id": "glm-4.6v",
+      "display_name": "GLM-4.6V",
+      "family": "glm",
+      "vendor": "zai",
+      "tier": "multimodal",
+      "generation": "4",
+      "minor_version": "6",
+      "status": "ga",
+      "ga_date": "2025-12-08",
+      "deprecation_date": null,
+      "retirement_date": null,
+      "context_window_tokens": 128000,
+      "max_output_tokens": null,
+      "pricing": {
+        "input_per_mtok_usd": 0.30,
+        "output_per_mtok_usd": 0.90,
+        "cache_read_per_mtok_usd": 0.05
+      },
+      "modalities": {
+        "input": ["text", "image"],
+        "output": ["text"]
+      },
+      "capabilities": {
+        "tool_use": true,
+        "native_function_calling": true,
+        "structured_output": true,
+        "streaming": true,
+        "reasoning_thinking": true,
+        "prompt_caching": true,
+        "vision": true
+      },
+      "platform_ids": {
+        "z_ai_api": "glm-4.6v",
+        "bigmodel_cn": "glm-4.6v",
+        "openrouter": "z-ai/glm-4.6v"
+      },
+      "notes": [
+        "SOTA visual understanding with native Function Calling.",
+        "Links visual perception with executable actions for multimodal agents.",
+        "GLM-4.6V-Flash (9B local variant) also exists; API ID: glm-4.6v-flash — deactivated Jun 28 2026 on some platforms.",
+        "GLM-4.6V-FlashX (accelerated): glm-4.6v-flashx, $0.04/$0.40 per MTok."
+      ]
+    },
+    {
+      "api_id": "glm-4.5",
+      "display_name": "GLM-4.5",
+      "family": "glm",
+      "vendor": "zai",
+      "tier": "standard",
+      "generation": "4",
+      "minor_version": "5",
+      "status": "ga",
+      "ga_date": "2025-07-28",
+      "deprecation_date": null,
+      "retirement_date": null,
+      "context_window_tokens": 128000,
+      "max_output_tokens": null,
+      "architecture": {
+        "type": "MoE",
+        "total_parameters": "355B",
+        "active_parameters": "32B"
+      },
+      "pricing": {
+        "input_per_mtok_usd": 0.60,
+        "output_per_mtok_usd": 2.20,
+        "cache_read_per_mtok_usd": 0.11,
+        "web_search_addon_per_search_usd": 0.010
+      },
+      "modalities": {
+        "input": ["text"],
+        "output": ["text"]
+      },
+      "capabilities": {
+        "tool_use": true,
+        "structured_output": true,
+        "streaming": true,
+        "reasoning_thinking": true,
+        "thinking_mode": "hybrid (thinking + non-thinking)",
+        "thinking_toggle": "reasoning.enabled parameter",
+        "prompt_caching": true,
+        "web_search_addon": true,
+        "vision": false,
+        "claude_code_compatible": true
+      },
+      "platform_ids": {
+        "z_ai_api": "glm-4.5",
+        "bigmodel_cn": "glm-4.5",
+        "openrouter": "z-ai/glm-4.5"
+      },
+      "notes": [
+        "Native agentic LLM; purpose-built for agent-based applications.",
+        "Hybrid inference: thinking mode for complex reasoning, non-thinking for instant responses.",
+        "One-click compatibility with Claude Code framework.",
+        "355B total MoE, 32B active parameters.",
+        "glm-4.5-x premium variant: $2.20/$8.90 per MTok input/output."
+      ]
+    },
+    {
+      "api_id": "glm-4.5-air",
+      "display_name": "GLM-4.5-Air",
+      "family": "glm",
+      "vendor": "zai",
+      "tier": "lightweight",
+      "generation": "4",
+      "minor_version": "5",
+      "status": "ga",
+      "ga_date": "2025-07-28",
+      "deprecation_date": null,
+      "retirement_date": null,
+      "context_window_tokens": 128000,
+      "max_output_tokens": null,
+      "architecture": {
+        "type": "MoE",
+        "total_parameters": "106B",
+        "active_parameters": "12B"
+      },
+      "pricing": {
+        "input_per_mtok_usd": 0.20,
+        "output_per_mtok_usd": 1.10,
+        "cache_read_per_mtok_usd": 0.03
+      },
+      "modalities": {
+        "input": ["text"],
+        "output": ["text"]
+      },
+      "capabilities": {
+        "tool_use": true,
+        "structured_output": true,
+        "streaming": true,
+        "reasoning_thinking": false,
+        "prompt_caching": true,
+        "vision": false,
+        "claude_code_compatible": true
+      },
+      "platform_ids": {
+        "z_ai_api": "glm-4.5-air",
+        "bigmodel_cn": "glm-4.5-air",
+        "openrouter": "z-ai/glm-4.5-air"
+      },
+      "notes": [
+        "Compact MoE variant of GLM-4.5; 106B total / 12B active parameters.",
+        "Also purpose-built for agent-centric applications.",
+        "Supports thinking and non-thinking modes (per some sources — not universally confirmed).",
+        "glm-4.5-airx accelerated variant: $1.10/$4.50 per MTok.",
+        "glm-4.5-flash (free) deactivated Jun 28 2026."
+      ]
+    },
+    {
+      "api_id": "glm-4.5v",
+      "display_name": "GLM-4.5V",
+      "family": "glm",
+      "vendor": "zai",
+      "tier": "multimodal",
+      "generation": "4",
+      "minor_version": "5",
+      "status": "ga",
+      "ga_date": "2025-08-11",
+      "deprecation_date": null,
+      "retirement_date": null,
+      "context_window_tokens": 128000,
+      "max_output_tokens": null,
+      "pricing": {
+        "input_per_mtok_usd": 0.60,
+        "output_per_mtok_usd": 1.80,
+        "cache_read_per_mtok_usd": 0.11
+      },
+      "modalities": {
+        "input": ["text", "image", "video"],
+        "output": ["text"]
+      },
+      "capabilities": {
+        "tool_use": true,
+        "structured_output": true,
+        "streaming": true,
+        "reasoning_thinking": true,
+        "prompt_caching": true,
+        "vision": true,
+        "video_understanding": true,
+        "gui_agent": true
+      },
+      "platform_ids": {
+        "z_ai_api": "glm-4.5v",
+        "openrouter": "z-ai/glm-4.5v"
+      },
+      "notes": [
+        "100B-scale open-source vision reasoning model.",
+        "Video understanding and GUI agent capabilities.",
+        "Thinking mode supported."
+      ]
+    },
+    {
+      "api_id": "glm-4-32b-0414-128k",
+      "display_name": "GLM-4-32B",
+      "family": "glm",
+      "vendor": "zai",
+      "tier": "cost-effective",
+      "generation": "4",
+      "status": "ga",
+      "ga_date": null,
+      "deprecation_date": null,
+      "retirement_date": null,
+      "context_window_tokens": 128000,
+      "max_output_tokens": null,
+      "pricing": {
+        "input_per_mtok_usd": 0.10,
+        "output_per_mtok_usd": 0.10,
+        "cache_read_per_mtok_usd": 0.00
+      },
+      "modalities": {
+        "input": ["text"],
+        "output": ["text"]
+      },
+      "capabilities": {
+        "tool_use": true,
+        "structured_output": true,
+        "streaming": true,
+        "reasoning_thinking": false,
+        "prompt_caching": true,
+        "vision": false
+      },
+      "platform_ids": {
+        "z_ai_api": "glm-4-32b-0414-128k",
+        "bigmodel_cn": "glm-4-32b-0414-128k"
+      },
+      "notes": [
+        "32B dense model; cost-effective; tool use, search, code tasks.",
+        "Only GLM-4 (non-GLM-4.x) generation model still actively listed.",
+        "Flat input/output pricing at $0.10/MTok."
+      ]
+    }
+  ],
+  "deactivated_models": [
+    {
+      "api_id": "glm-4.7-flash-free",
+      "display_name": "GLM-4.7-Flash (Free tier)",
+      "status": "deactivated",
+      "deactivation_date": "2026-06-28",
+      "notes": ["Deactivated on third-party platforms; check z.ai directly for current free tier availability."]
+    },
+    {
+      "api_id": "glm-4.6v-flash",
+      "display_name": "GLM-4.6V-Flash",
+      "status": "deactivated",
+      "deactivation_date": "2026-06-28",
+      "notes": ["9B local-deployment variant. Deactivated on some platforms as of Jun 28 2026."]
+    },
+    {
+      "api_id": "glm-4.5-flash",
+      "display_name": "GLM-4.5-Flash",
+      "status": "deactivated",
+      "deactivation_date": "2026-06-28",
+      "notes": ["Free-tier model. Deactivated on some platforms as of Jun 28 2026."]
+    }
+  ],
+  "global_notes": {
+    "api_compatibility": "Both api.z.ai and open.bigmodel.cn expose OpenAI-compatible endpoints. Model IDs are identical across both regional endpoints.",
+    "sdk_options": "Official: zai-sdk (Python 0.2.3, Java 0.3.5). Also compatible with openai Python SDK >= 1.0 via base_url override.",
+    "thinking_mode_glm_4_5": "GLM-4.5 and 4.5-Air use `reasoning.enabled` toggle for hybrid thinking/non-thinking modes.",
+    "thinking_mode_glm_5_2": "GLM-5.2 uses `thinking: {type: enabled|disabled}` + `reasoning_effort: high|max` parameters.",
+    "prompt_caching": "Available on GLM-5.2, 5.1, 5, 4.7, 4.7-flashx, 4.6, 4.6v, 4.5, 4.5-air, 4.5v, 4-32b. Cache pricing listed per model.",
+    "tool_calling": "All listed models support function calling via tools array. GLM-4.6V additionally supports native multimodal function calling linking vision to actions.",
+    "web_search_addon": "Available as add-on (+$0.010/search) for GLM-5.2, 5.1, 5, 4.7, 4.6, 4.5.",
+    "open_weights": "GLM-4.5, 4.6, 4.7, 5, and 5.2 are MIT-licensed open-weight models with public weights.",
+    "bigmodel_cn_vs_zai": "open.bigmodel.cn is the Mainland China endpoint; api.z.ai is the international endpoint. Plans: GLM Coding Plan (subscription) or Standard API (pay-as-you-go). Both regions share identical model IDs.",
+    "glm_4_5_series_note": "GLM-4.5 series was released on bigmodel.cn first (July 2025) before Z.AI international platform."
+  },
+  "unresolved_questions": [
+    "GLM-5.2 exact context window: docs.z.ai states '1M lossless'; OpenRouter lists 1.048M tokens; llmgateway.io lists 1M. The precise token count (1,000,000 vs 1,048,576) is unconfirmed from official API reference.",
+    "GLM-5.2 reasoning_effort values: OpenRouter lists 'high' and 'xhigh' (xhigh = max); docs.z.ai examples show 'max'. Whether 'high'/'max' and 'high'/'xhigh' are synonymous or separate values is unconfirmed.",
+    "GLM-4.5-Air thinking mode: LiteLLM and llmgateway.io do not list Reasoning as a capability for glm-4.5-air, while OpenRouter states hybrid inference is supported. Status ambiguous.",
+    "GLM-4.7 exact architecture: parameter count not confirmed from primary sources; likely MoE but size unverified.",
+    "open.bigmodel.cn API catalog completeness: GLM-5.x series may not be available on bigmodel.cn (primarily China-domestic); only GLM-4.x confirmed on that endpoint across multiple sources.",
+    "Prompt caching TTL and minimum token threshold: not documented in any retrieved Z.AI source.",
+    "GLM-5.2 as 'long-horizon' model with stable 1M context: VERIFIED — docs.z.ai explicitly describes it as supporting '1M lossless context' for 'long-horizon tasks'; MarkTechPost confirms 'usable 1M-token context'; IndexShare architecture reduces per-token FLOPs 2.9x at 1M. The 1M context claim is well-sourced and credible.",
+    "GLM-4.5-x and glm-4.5-airx variants: existence confirmed via llmgateway.io and LiteLLM but no official docs.z.ai page found for these; pricing may differ from listed values.",
+    "glm-4.7-flash current free-tier status on z.ai itself: deactivation was reported for third-party aggregators; z.ai direct may still offer free access — unconfirmed as of 2026-07-16."
+  ]
+}

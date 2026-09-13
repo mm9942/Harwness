@@ -1,0 +1,28 @@
+[package]
+name = "harw-lens-query"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-lens-types = { path = "../harw-lens-types" }
+harw-lens-index = { path = "../harw-lens-index" }
+harw-lens-store = { path = "../harw-lens-store" }
+harw-lens-embed = { path = "../harw-lens-embed" }
+harw-lens-rank = { path = "../harw-lens-rank" }
+harw-home = { path = "../harw-home" }
+harw-macros = { path = "../harw-macros" }
+
+[dev-dependencies]
+# Round-trip ("build, then query") and visibility-separation fixtures reuse
+# the source-binding crate instead of re-implementing chunking/build logic in
+# test code. One-directional: `harw-lens-source` has no dependency (dev or
+# otherwise) back on `harw-lens-query`, so this is not a cycle.
+harw-lens-source = { path = "../harw-lens-source" }
+harw-knowledge = { path = "../harw-knowledge" }
+harw-types = { path = "../harw-types" }
+tempfile = { workspace = true }
+jiff = { workspace = true }
+
+[lints]
+workspace = true

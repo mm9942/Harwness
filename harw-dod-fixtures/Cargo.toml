@@ -1,0 +1,29 @@
+[package]
+name = "harw-dod-fixtures"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Zugriffsvokabular: Capability, ReadScope, SensorError, SensorHandle.
+harw-dod-cap = { path = "../harw-dod-cap" }
+# Datenvokabular und der eine `trait Sensor`, den jede Prüfung aufruft.
+harw-dod-signals = { path = "../harw-dod-signals" }
+# Die eine Dateisystem-Naht: `capture()` liest den Quellbaum eines Sensors
+# ausschließlich darüber, nie über direktes `std::fs` (siehe capture.rs).
+harw-dod-readfs = { path = "../harw-dod-readfs" }
+# `SensorId` für den festen Testgriff (siehe `FIXTURE_SENSOR_ID`).
+harw-types = { path = "../harw-types" }
+# `#[derive(harw_macros::HarwError)]` für `error.rs`.
+harw-macros = { path = "../harw-macros" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+jiff = { workspace = true }
+# Nicht nur für Tests: `harness::assert_content_freedom` und
+# `harness::assert_scope_tightness` bauen bei jedem Aufruf ein frisches
+# temporäres Verzeichnis, in gewöhnlichem (nicht `#[cfg(test)]`-gebundenem)
+# Bibliothekscode — deshalb reguläre Abhängigkeit, keine Dev-Dependency.
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

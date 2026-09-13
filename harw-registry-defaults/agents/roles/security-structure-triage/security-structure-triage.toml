@@ -1,0 +1,114 @@
+# Eingebauter Struktur-Triage-Spezialist (Knoten AW6-03) — dritte der vier
+# Triage-Spezialisierungen des Security-Clans
+# (`harwness.family.security@1`, siehe `agents/families/security/security.toml`),
+# neben `security-egress-triage`, `security-baseline-triage` und
+# `security-endpoint-triage`.
+#
+# Namensableitung (AW6-00-Konvention): Dateistamm `security-structure-triage`
+# unter `agents/roles/security-structure-triage/` ergibt den Rollennamen
+# `"security-structure-triage"`. Kollidiert mit nichts Bestehendem.
+#
+# ── Was diese Rolle triagiert, und aus welcher Ereignisquelle ───────────────
+# Sie triagiert Struktur-Abweichungen: `EventKind::StructureDrift` aus
+# `harw_dod_signals::SecurityEvent` (die Ereignisquelle "Struktur" aus dem
+# Sensor-Katalog, geliefert von `harw-dod-workspace`) sowie die daraus von
+# `harw_dod_rules::rules::StructureDriftRule` abgeleiteten
+# `Finding<RuleChecked>`. Die strukturierte Einstufung
+# (`harw_dod_signals::DriftSeverity`) ist bereits am Sensor entstanden —
+# genau das war die an anderer Stelle behobene Kopplung, die diese Regel aus
+# Textmustern zurückgewinnen musste (siehe die Regel-Moduldoku:
+# "Das war eine Sicherheitsregel, die ihre Einstufung aus Textmustern
+# rekonstruierte"). Diese Rolle liest deshalb ausschließlich das
+# strukturierte `DriftSeverity`-Feld für ihre Sichtung, niemals den
+# begleitenden `detail`-Freitext als Datenquelle — der Freitext ist
+# Beschreibung für Menschen, keine Eingabe für eine Einstufung. Die Rolle
+# bekommt bereits ausgewertete `Finding<RuleChecked>`-Batches als Parameter
+# übergeben; sie ruft `StructureDriftRule::evaluate` nicht selbst auf.
+#
+# ── Warum genau diese Werkzeuge (keine) ──────────────────────────────────────
+# `[tools].admitted` bleibt leer, exakt wie bei `context-steward` und aus
+# demselben Grund: die heutige Implementierung nimmt bereits abgerufene
+# `Finding`-/`SecurityEvent`-Batches als Eingabeparameter entgegen, statt
+# selbst ein Werkzeug aufzurufen. `forbidden` benennt trotzdem jedes
+# Schreib- und Netzwerkzeug ausdrücklich. Da `admitted` leer ist, ist die
+# Auflage "jedes admittierte Werkzeug muss von `AUTO_APPROVED_TOOLS`
+# gedeckt sein" (`harw-registry-defaults/src/lib.rs`) hier trivial erfüllt —
+# nichts einzutragen, nichts zu melden.
+#
+# ── Was sie ausdrücklich NICHT tut ──────────────────────────────────────────
+#   - sie leitet keine Schwere aus `detail`-Freitext ab — nur aus
+#     `DriftSeverity`, das der Sensor bereits liefert;
+#   - sie trifft keine Eskalationsentscheidung — ihr Ergebnis ist ein
+#     Verdikt-VORSCHLAG (`harwness.security-verdict/v1`), niemals ein
+#     committeter `Finding<Triaged>`; das Committen bleibt ausschließlich
+#     `harw-dod-escalate` vorbehalten;
+#   - sie schreibt nichts und startet keinen Subprozess.
+#
+# ── Rückgabevertrag ──────────────────────────────────────────────────────────
+# Diese Rolle deklariert ihren Vertrag SELBST (`[return]` am Dateiende). Der
+# frühere Kommentar an dieser Stelle behauptete das Gegenteil — „kein eigenes
+# `[return]`, die Familie setzt `[defaults].return_contract` für alle ihre
+# Mitglieder“. Das war falsch, und zwar nicht nur beim Senken über
+# `role_names::ALL`, sondern grundsätzlich: es gibt diese Vererbung nicht.
+#
+#   * `harw_agent_dsl::family::resolve_family` legt `[defaults]` unverändert
+#     als `toml::Table` in `ResolvedFamily.defaults` ab — mehr passiert dort
+#     nicht.
+#   * `harw_agent_dsl::executable::lower` liest den Vertrag ausschließlich aus
+#     der aufgelösten Konfiguration DES AGENTEN:
+#     `config_string(&resolved.config, &["return", "return_pipeline"], "contract")`.
+#   * Zwischen beidem existiert kein Pfad. `resolve_definition` und `lower`
+#     bekommen überhaupt keine Familie zu sehen, und `ResolvedFamily.defaults`
+#     hat außerhalb von `family.rs` selbst keinen Konsumenten. Familien-
+#     `[defaults]` sind heute eine deklarative Notiz, keine Vererbung.
+#
+# Die Deklaration hier ist deshalb keine Redundanz, sondern die einzige
+# Quelle. Genau so hält es die Research-Familie schon lange: `research.toml`
+# führt ebenfalls `[defaults].return_contract`, und trotzdem deklariert JEDE
+# ihrer drei Rollen (`explorer`, `researcher-deps`, `researcher-web`) ihren
+# `[return].contract` zusätzlich selbst — sonst trüge keine von ihnen einen.
+# `intel-scout` und `context-steward` machen es NICHT vor: beide deklarieren
+# keinen `[return]` und tragen folglich tatsächlich keinen Vertrag. Das fällt
+# nur nicht auf, weil sie nicht in `role_names::ALL` stehen und daher nie
+# gesenkt werden.
+#
+# `harwness.security-verdict/v1` ist der vierte Arm des `ChildReturnContract`,
+# eigens für Sicherheitsverdikte gebaut. Eine Triage-Rolle MUSS ihn tragen:
+# ihr Ergebnis ist ein Verdikt-VORSCHLAG, kein Freitext — und kein Commit.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.security-structure-triage@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "security-structure-triage"
+
+name = "Security Structure Triage"
+description = "Sichtet Struktur-Abweichungen (StructureDrift/DriftSeverity) gegen bereits ausgewertete StructureDriftRule-Funde; schlägt ein Verdikt vor, committet nie."
+
+[work]
+mode = "structure-drift-triage"
+may_write_code = false
+may_research_web = false
+
+# Keine Werkzeugoberfläche beansprucht — siehe Begründung oben.
+[tools]
+admitted = []
+forbidden = ["fs.write", "shell.exec", "web.fetch", "web.docs_rs", "web.crates_io"]
+
+# Ein reiner Sichtungs-/Vorschlags-Job braucht keine Kind-Agenten.
+[spawn]
+max_depth = 0
+
+[spawn.budget]
+max_tokens = 40000
+max_tool_calls = 20
+max_wall_secs = 120
+
+# Der Rückgabevertrag — selbst deklariert, nicht geerbt (die vollständige
+# Begründung samt Beweis, dass die Familien-`[defaults]` nirgends greifen,
+# steht im Kopf dieser Datei). `contract` ist für `ReturnPipeline` ein
+# undurchsichtiges Label; die IR prüft weder Existenz noch Form des Schemas
+# (`harw-agent-dsl/src/executable.rs`).
+[return]
+contract = "harwness.security-verdict/v1"

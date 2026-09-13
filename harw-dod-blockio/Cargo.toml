@@ -1,0 +1,32 @@
+[package]
+name = "harw-dod-blockio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Zugriffsvokabular: Capability, ReadScope, SensorHandle, SensorError.
+harw-dod-cap = { path = "../harw-dod-cap" }
+# Datenvokabular und der eine `trait Sensor`, den dieser Sensor implementiert.
+harw-dod-signals = { path = "../harw-dod-signals" }
+# Die eine Dateisystem-Naht: `glob::glob` und `read_line_fields` lesen jedes
+# `<gerät>/stat`, nie direktes `std::fs` (siehe src/lib.rs-Moduldoku).
+harw-dod-readfs = { path = "../harw-dod-readfs" }
+# `SensorId` für `SensorHandle`.
+harw-types = { path = "../harw-types" }
+# Verbindliche Abhängigkeit jeder Sensor-Crate laut Arbeitsauftrag AW2-10.
+# `#[derive(harw_macros::SensorSource)]` selbst trägt genau ein Feld über
+# genau eine glob-adressierte Quelle mit genau einem Skalarwert je Treffer —
+# `<gerät>/stat` ist eine Datei mit vielen Werten in Spalten, dafür passt das
+# Makro nicht (siehe src/lib.rs-Moduldoku, Abschnitt „Warum kein
+# `#[derive(SensorSource)]`"). Aktuell ungenutzt, analog zur unbenutzten
+# `harw-macros`-Abhängigkeit in `harw-dod-cpu/Cargo.toml`.
+harw-macros = { path = "../harw-macros" }
+jiff = { workspace = true }
+
+[dev-dependencies]
+harw-dod-fixtures = { path = "../harw-dod-fixtures" }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

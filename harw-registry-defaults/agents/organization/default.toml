@@ -1,0 +1,195 @@
+# Die eingebaute Default-Organisation (§15, §22 DSL-Spec).
+#
+# Format nach `harw_agent_dsl::organization::RawOrganizationDefinition`:
+# `schema`, `id`, `version`, `name` und `[root]` sind Pflicht; `clans`, `cells`,
+# `extends` und `patch` sind optional. `[root]`, `[[clans]]` und `[[cells]]`
+# tragen `deny_unknown_fields` — ein Tippfehler im Feldnamen ist ein
+# Deserialisierungsfehler, keine stillschweigend ignorierte Zeile.
+#
+# ── Warum es diese Datei gibt ────────────────────────────────────────────────
+# `harw_plan_bridge::CellPlan::from_cell` nimmt einen `RawCellSpec` aus einer
+# aufgelösten Organisation. Ohne Organisationsdefinition gibt es keine Zelle und
+# damit auch keinen Konsumenten für die Zell-Auflösung. Diese Datei ist die
+# Definition, gegen die `/analyze` seine Wellen fährt.
+#
+# ── Warum die Knotennamen zu den Clans passen ────────────────────────────────
+# `CellPlan::from_cell` wählt Mitglieder über einen Glob, der gegen die `TaskId`
+# **und** gegen jeden `write_scope`-Eintrag gehalten wird. Analyse-Knoten haben
+# keinen `write_scope`, also entscheidet allein die `TaskId`. Deshalb tragen die
+# Plan-Knoten den Clan im Namen (`research-<crate>`, `coding-<slice>`,
+# `<lauf>-synthesis`) und die Muster hier heißen genau so. Der Glob-Dialekt von
+# `harw_plan::ScopeMatcher` kennt `*`, `**` und `?` — **keine** Brace-Expansion;
+# ein Muster kann also nicht zwei Präfixe gleichzeitig abdecken.
+#
+# ── Referenzierte Agenten ────────────────────────────────────────────────────
+# `root.agent` und jede `clan.leader`-Referenz zeigt auf eine Rolle, die als
+# eingebettete Agentendefinition existiert und in `role_names::ALL` steht:
+#   * `analyst` — die einzige eingebaute Rolle mit `max_depth = 2`; nur sie darf
+#     read-only Kinder starten und deren Rückgaben verdichten. Sie führt
+#     deshalb `research`, `synthesis` UND `security`: die vier
+#     Triage-Rollen tragen `max_depth = 0` und könnten ihre eigene
+#     Fan-out-Zelle gar nicht starten (siehe die Begründung beim
+#     `security`-Clan unten).
+#   * `planner` — die einzige eingebaute Rolle mit `plan`/`goal` auf ihrer
+#     Werkzeugoberfläche.
+# Ein Root-Orchestrator-Agent im engeren Sinne existiert (noch) nicht; bis dahin
+# ist der Analyst der einzige ehrliche Kandidat. Der Test
+# `test_organization_references_only_embedded_roles` hält das fest.
+
+schema = "harwness.organization/v1"
+id = "harwness.organization.default@1"
+version = "1.0.0"
+name = "Harwness Default Organization"
+
+# §22 Invariante 12: die Organisation erzeugt keinen zweiten Root. `root.agent`
+# ist der einzige Einstiegspunkt.
+[root]
+agent = { id = "harwness.agent.analyst@1" }
+family = { id = "harwness.family.research@1" }
+
+# ── Clans (§22 Invariante 10: run-lokale Subtrees) ───────────────────────────
+
+# Recherche und Analyse. `plan_scope` deckt die Knoten ab, die `/analyze` je
+# Crate anlegt (`research-<crate>`).
+[[clans]]
+id = "research"
+name = "Research Clan"
+leader = { id = "harwness.agent.analyst@1" }
+family = { id = "harwness.family.research@1" }
+plan_scope = "research-*"
+
+# Implementierung. Heute ohne schreibende Rolle im Roster — siehe den Kopf von
+# `agents/family/coding.toml`.
+[[clans]]
+id = "coding"
+name = "Coding Clan"
+leader = { id = "harwness.agent.planner@1" }
+family = { id = "harwness.family.coding@1" }
+plan_scope = "coding-*"
+
+# Verdichtung. Ein Synthesis-Knoten hängt von allen Knoten seines Laufs ab; der
+# Clan bleibt trotzdem run-lokal, weil er nur die Verdichtung besitzt, nicht die
+# Arbeit davor.
+[[clans]]
+id = "synthesis"
+name = "Synthesis Clan"
+leader = { id = "harwness.agent.analyst@1" }
+family = { id = "harwness.family.research@1" }
+plan_scope = "*-synthesis"
+
+# Sicherheits-Triage (Knoten AW6-03).
+#
+# ── Warum der Leader hier `analyst` ist und nicht mehr `context-steward` ────
+# Der frühere Eintrag nannte `harwness.agent.context-steward@1`. Das war eine
+# tote Referenz: `context-steward` steht nicht in
+# `harw_registry_defaults::profile::role_names::ALL` und ist dort eine
+# dokumentierte, bewusst offene Ausnahme — die Rollendatei wird zwar
+# eingesammelt, aber `builtin_agent_definitions` filtert `targets` über `ALL`
+# und senkt sie deshalb NIE zu einer startbaren Rolle. Ein Clan, dessen
+# Leader im gesenkten Inventar gar nicht vorkommt, kann seine Zelle nie
+# starten; `test_organization_references_only_embedded_roles` hat damit
+# schlicht recht gehabt.
+#
+# Warum ausgerechnet `analyst` führen darf — drei Gründe, keiner davon eine
+# Ausweichbewegung:
+#
+#   1. Er ist der Einzige, der es KANN. Ein Clan-Leader startet die Mitglieder
+#      seiner Zelle (`security-triage-wave`, `kind = "fanout"`,
+#      `barrier = "all-terminal"`). Alle vier Triage-Rollen tragen
+#      ausdrücklich `max_depth = 0` — unter ihnen entsteht keine weitere
+#      Ebene, weil sie angreiferkontrollierte Sensorfelder lesen. Eine von
+#      ihnen zum Leader zu machen hieße, einen Fan-out von einem Knoten zu
+#      verlangen, der per Definition kein Kind erzeugen darf: die Zelle wäre
+#      auf dem Papier verdrahtet und in der Ausführung tot. `analyst` ist die
+#      einzige eingebaute Rolle mit `max_depth = 2` und damit die einzige, die
+#      read-only Kinder starten und deren Rückgaben verdichten darf.
+#   2. Es ist derselbe Präzedenzfall, nicht ein neuer. `analyst` führt bereits
+#      `research` und `synthesis`, und zwar mit `role = "worker"` statt
+#      `role = "child-orchestrator"` — genau die Begründung, mit der der
+#      frühere Eintrag `context-steward` gewählt hatte. Nur trägt sie hier den
+#      Analysten, weil er zusätzlich in `ALL` steht.
+#   3. Er hebt die Autoritätsdecke des Clans nicht an: `analyst` ist read-only
+#      (kein `fs.write`, kein `shell.exec`) und die einzige Nicht-Web-Rolle
+#      unter den Verdichtern — `test_analyst_is_the_only_role_allowed_to_spawn_two_levels`
+#      hält beides fest.
+#
+# Offener Befund (außerhalb des Schreibbereichs dieser Änderung): der
+# eigentlich passende Leader wäre `context-steward` — dafür müsste er in
+# `role_names::ALL` (`harw-registry-defaults/src/profile.rs`) aufgenommen
+# werden UND einen `[return].contract` deklarieren, den er heute nicht trägt.
+# Zusätzlich ist `[orchestrators].allowed` der Sicherheitsfamilie
+# (`agents/families/security/security.toml`) leer: kein Mitglied dieser
+# Familie ist heute als Orchestrator zugelassen, der Leader kommt also
+# zwangsläufig von außerhalb ihres Rosters. Beides ist gemeldet, nicht hier
+# umgangen.
+#
+# `plan_scope = "security-*"` spiegelt `research-*`/`coding-*`: Plan-Knoten
+# einer Security-Welle heißen `security-<befund>`.
+[[clans]]
+id = "security"
+name = "Security Clan"
+leader = { id = "harwness.agent.analyst@1" }
+family = { id = "harwness.family.security@1" }
+plan_scope = "security-*"
+
+# ── Zellen (§22 Invariante 11: temporäre Fan-out-Batches) ────────────────────
+
+# Die Research-Welle: alle Mitglieder starten gemeinsam (`fanout`), der
+# Orchestrator wartet auf jedes einzelne (`all-terminal`), und
+# `write_partition = "required"` zerlegt die Welle über
+# `harw_plan::graph::partition_write_sets` in Batches mit paarweise disjunkten
+# Schreibbereichen. Für read-only Analyse-Knoten (leerer `write_scope`)
+# kollidiert nichts, es bleibt bei genau einem Batch — die Politik kostet dort
+# also nichts und greift, sobald schreibende Knoten dazukommen.
+[[cells]]
+id = "research-wave"
+clan = "research"
+kind = "fanout"
+barrier = "all-terminal"
+write_partition = "required"
+members_from_plan = "research-*"
+
+# Die Coding-Welle: `kind = "sequential"` heißt, der Orchestrator arbeitet die
+# Batches nacheinander ab (`CellPlan` wertet `kind` bewusst nicht selbst aus —
+# eine sequenzielle Zelle ist eine mit Batches der Größe eins, und diese
+# Entscheidung gehört dem Aufrufer). `all-terminal` ist hier die einzige
+# sinnvolle Barriere: eine Coding-Welle ist erst fertig, wenn jedes Kind
+# terminiert hat.
+[[cells]]
+id = "coding-wave"
+clan = "coding"
+kind = "sequential"
+barrier = "all-terminal"
+write_partition = "required"
+members_from_plan = "coding-*"
+
+# Die Verdichtung: `explicit-join` bildet auf `JoinSemantics::Collect` ab — die
+# Runtime bricht nichts ab und sammelt auch fehlgeschlagene Ergebnisse ein, der
+# Orchestrator entscheidet selbst, was daraus folgt. `write_partition =
+# "advisory"` statt `"required"`, weil eine Verdichtung typischerweise ein
+# einziger Knoten ist: eine erzwungene Trennung hätte dort nichts zu trennen.
+[[cells]]
+id = "synthesis-join"
+clan = "synthesis"
+kind = "barrier"
+barrier = "explicit-join"
+write_partition = "advisory"
+members_from_plan = "*-synthesis"
+
+# Die Security-Triage-Welle (Knoten AW6-03): die vier Triage-Spezialisierungen
+# (`security-egress-triage`, `security-baseline-triage`,
+# `security-structure-triage`, `security-endpoint-triage`) starten gemeinsam
+# (`fanout`) und werden alle abgewartet (`all-terminal`) — exakt wie die
+# Research-Welle. `write_partition = "none"`, weil ein Triage-Kind
+# keinen `write_scope` hat (`may_write_code = false`, kein `fs.write` in
+# `admitted`): es gibt nichts zu trennen, und `partition_write_sets` hätte an
+# vier leeren Schreibbereichen ohnehin nichts zu tun. Das ist genau die
+# Zellenpolitik, die der Arbeitsplan für AW6-03 benennt ("Fan-out über Zellen
+# mit `write_partition` None").
+[[cells]]
+id = "security-triage-wave"
+clan = "security"
+kind = "fanout"
+barrier = "all-terminal"
+write_partition = "none"
+members_from_plan = "security-*"

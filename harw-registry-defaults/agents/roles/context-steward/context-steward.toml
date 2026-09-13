@@ -1,0 +1,79 @@
+# Eingebauter Context Steward (Knoten AW6-08) — pflegt Kontextprogramme, indem
+# er bereits abgerufene `ContextProposal`- (AW5-09) und
+# `ModelBehaviorProposal`-Bestände (AW6-06) aufbereitet, ordnet und
+# zusammenfasst. Zweite Rolle der Sicherheitsfamilie
+# (`harwness.family.security@1`, siehe
+# `agents/families/security/security.toml`), nach `intel-scout` (AW7-06).
+#
+# Namensableitung (AW6-00-Konvention): Dateistamm `context-steward` unter
+# `agents/roles/context-steward/` ergibt den Rollennamen `"context-steward"`.
+# Eine Namenskollision wäre ein harter Fehler
+# (`harw_registry_defaults::embedded_agents::reject_duplicate_names`); dieser
+# Name kollidiert mit nichts Bestehendem (geprüft gegen `intel-scout` und die
+# fünf Basisrollen unter `agents/`).
+#
+# Was diese Rolle tut: sie liest bereits sichtbarkeitsgeprüfte
+# `ContextProposal`/`ModelBehaviorProposal`-Batches (über
+# `harw_knowledge::memory::recall::search_with` mit
+# `VisibilityScope::OperatorOnly`, außerhalb dieser Definition) und übergibt
+# sie an `harw_knowledge::context_steward::{curate_context_proposals,
+# curate_model_behavior_proposals, build_steward_digest}` — reine, deterministische
+# Funktionen, die ordnen und zusammenfassen, niemals anwenden. Siehe deren
+# Moduldoku für den vollständigen strukturellen Beweis, dass kein Aufruf
+# hier ein Kontextprogramm oder einen Modellkatalog-Eintrag ändert.
+#
+# Was sie ausdrücklich NICHT tut:
+#   - sie wendet keinen Vorschlag an — es gibt in `harw-knowledge` keine
+#     `apply`-Funktion für `ContextProposal`/`ModelBehaviorProposal`, und
+#     diese Rolle bekäme sie auch nicht zur Verfügung gestellt, gäbe es sie;
+#   - sie trifft keine Sicherheits-Triage-Entscheidung (kein `Finding`, kein
+#     `Verdict`) — das bleibt den vier Triage-Spezialisierungen (AW6-03) und
+#     `harw-dod-escalate` vorbehalten;
+#   - sie leitet den Sicherheits-Clan nicht (`role = "worker"`,
+#     `as_orchestrator = false` in der Mitgliedschaftsdatei) — siehe die
+#     Begründung dort und im Abschlussbericht dieses Knotens: ihre einzige
+#     heute implementierte Arbeit ist reine, kinderlose Aggregation ohne
+#     Koordinationslogik über andere Agenten.
+#
+# `[work].may_write_code = false`: die Rolle schreibt keinen Code und keine
+# Definitionsdatei. `[tools].admitted` bleibt leer — die heutige
+# Implementierung nimmt bereits abgerufene Vorschlags-Batches als Eingabe
+# entgegen, statt selbst ein Werkzeug aufzurufen; ein künftiger Knoten, der
+# diese Rolle an einen echten `/context-steward`-artigen Aufrufer bindet
+# (heute außerhalb des Schreibbereichs von AW6-08: `harw-ops/**`), ergänzt
+# dort das passende Tool-Label, ohne diese Datei ändern zu müssen, solange
+# sich die Aufnahmefähigkeit nicht ändert.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.context-steward@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "context-steward"
+
+name = "Context Steward"
+description = "Ordnet und fasst bereits abgerufene ContextProposal-/ModelBehaviorProposal-Bestände zusammen; wendet nie an und entscheidet nie."
+
+[work]
+mode = "context-curation"
+may_write_code = false
+may_research_web = false
+
+# Keine Werkzeugoberflaeche beansprucht: die heutige Implementierung erhaelt
+# ihre Eingabe (bereits sichtbarkeitsgeprueft) als Parameter, statt selbst ein
+# Werkzeug aufzurufen. `forbidden` benennt trotzdem ausdruecklich jedes
+# Schreib- und Netzwerkzeug, damit eine Ablehnung nachvollziehbar ist statt
+# nur "nicht in admitted" (dieselbe Disziplin wie bei `intel-scout`).
+[tools]
+admitted = []
+forbidden = ["fs.write", "shell.exec", "web.fetch", "web.docs_rs", "web.crates_io"]
+
+# Reine Aggregation ohne Kind-Agenten — dieselbe Begruendung wie bei
+# `intel-scout`: ein Korrelations-/Kurations-Join braucht keine Delegation.
+[spawn]
+max_depth = 0
+
+[spawn.budget]
+max_tokens = 40000
+max_tool_calls = 20
+max_wall_secs = 120

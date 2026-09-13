@@ -1,0 +1,35 @@
+[package]
+name = "harw-channel-telegram-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-channel = { path = "../harw-channel" }
+harw-channel-telegram = { path = "../harw-channel-telegram" }
+harw-secrets = { path = "../harw-secrets" }
+harw-types = { path = "../harw-types" }
+jiff = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1.53.0", features = ["rt", "macros", "time", "net"] }
+secrecy = "0.10"
+secrecy_08 = { version = "0.8", package = "secrecy" }
+backon = "1.6.0"
+axum = "0.8.9"
+# Ohne Versionspin, wie alle anderen Workspace-internen Pfad-Deps: eine Version
+# neben `path` ist für den lokalen Build redundant und wird bei einem
+# Versionsbump zur zweiten Stelle, die man vergessen kann.
+# `harw/tests/version_coherence.rs` prüft genau das.
+harw-config = { path = "../harw-config" }
+infer = "0.22.0"
+fs4 = "1.1.0"
+tempfile = "3.27.0"
+tracing = "0.1.44"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints]
+workspace = true

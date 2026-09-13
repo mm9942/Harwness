@@ -1,0 +1,479 @@
+{
+  "vendor": "anthropic",
+  "family": "claude",
+  "retrieved_at": "2026-07-16",
+  "source_urls": [
+    "https://platform.claude.com/docs/en/about-claude/models/overview",
+    "https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions",
+    "https://platform.claude.com/docs/en/about-claude/models/introducing-claude-fable-5-and-claude-mythos-5"
+  ],
+  "records": [
+    {
+      "api_id": "claude-fable-5",
+      "alias": "claude-fable-5",
+      "display_name": "Claude Fable 5",
+      "family": "claude",
+      "vendor": "anthropic",
+      "tier": "fable",
+      "generation": "5",
+      "status": "ga",
+      "ga_date": "2026-06-09",
+      "deprecation_date": null,
+      "retirement_date": null,
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 131072,
+      "max_output_tokens_batch": 307200,
+      "knowledge_cutoff": "2026-01",
+      "training_data_cutoff": "2026-01",
+      "pricing": {
+        "input_per_mtok_usd": 10.0,
+        "output_per_mtok_usd": 50.0,
+        "cache_read_per_mtok_usd": 1.0,
+        "cache_write_5min_per_mtok_usd": 12.5,
+        "cache_write_1hr_per_mtok_usd": 20.0
+      },
+      "modalities": {
+        "input": ["text", "image"],
+        "output": ["text"]
+      },
+      "capabilities": {
+        "tool_use": true,
+        "tool_use_parallel": true,
+        "tool_use_native": true,
+        "extended_thinking": false,
+        "adaptive_thinking": true,
+        "adaptive_thinking_always_on": true,
+        "raw_thinking_returned": false,
+        "prompt_caching": true,
+        "prompt_caching_min_tokens": 1024,
+        "streaming": true,
+        "vision": true,
+        "computer_use": true,
+        "code_execution": true,
+        "memory_tool": true,
+        "batch_api": true,
+        "effort_parameter": true,
+        "task_budgets": true,
+        "context_editing": true,
+        "compaction": true,
+        "refusals": true,
+        "server_side_fallback": true,
+        "multilingual": true
+      },
+      "platform_ids": {
+        "claude_api": "claude-fable-5",
+        "aws_bedrock": "anthropic.claude-fable-5",
+        "google_cloud_vertex": "claude-fable-5",
+        "microsoft_foundry": "claude-fable-5",
+        "claude_platform_aws": "claude-fable-5"
+      },
+      "notes": [
+        "Most capable widely released Anthropic model as of 2026-07.",
+        "Safety classifiers can decline requests with stop_reason=refusal (HTTP 200).",
+        "Adaptive thinking is always on; raw chain-of-thought is never returned.",
+        "Uses tokenizer introduced with Opus 4.7: ~30% more tokens than pre-4.7 models for same text.",
+        "30-day data retention; not available under zero data retention (Covered Model).",
+        "Batch API supports up to 300k output tokens with output-300k-2026-03-24 beta header.",
+        "SWE-Bench Pro score: 80.3%.",
+        "Falls back to Opus 4.8 for flagged cybersecurity/biology requests via safety classifiers."
+      ]
+    },
+    {
+      "api_id": "claude-mythos-5",
+      "alias": "claude-mythos-5",
+      "display_name": "Claude Mythos 5",
+      "family": "claude",
+      "vendor": "anthropic",
+      "tier": "mythos",
+      "generation": "5",
+      "status": "limited_availability",
+      "ga_date": "2026-06-09",
+      "deprecation_date": null,
+      "retirement_date": null,
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 131072,
+      "max_output_tokens_batch": 307200,
+      "knowledge_cutoff": "2026-01",
+      "training_data_cutoff": "2026-01",
+      "pricing": {
+        "input_per_mtok_usd": 10.0,
+        "output_per_mtok_usd": 50.0,
+        "cache_read_per_mtok_usd": 1.0,
+        "cache_write_5min_per_mtok_usd": 12.5,
+        "cache_write_1hr_per_mtok_usd": 20.0
+      },
+      "modalities": {
+        "input": ["text", "image"],
+        "output": ["text"]
+      },
+      "capabilities": {
+        "tool_use": true,
+        "tool_use_parallel": true,
+        "tool_use_native": true,
+        "extended_thinking": false,
+        "adaptive_thinking": true,
+        "adaptive_thinking_always_on": true,
+        "raw_thinking_returned": false,
+        "prompt_caching": true,
+        "prompt_caching_min_tokens": 1024,
+        "streaming": true,
+        "vision": true,
+        "computer_use": true,
+        "code_execution": true,
+        "memory_tool": true,
+        "batch_api": true,
+        "effort_parameter": true,
+        "task_budgets": true,
+        "context_editing": true,
+        "compaction": true,
+        "refusals": false,
+        "server_side_fallback": false,
+        "multilingual": true
+      },
+      "platform_ids": {
+        "claude_api": "claude-mythos-5",
+        "aws_bedrock": null,
+        "google_cloud_vertex": null,
+        "microsoft_foundry": null,
+        "claude_platform_aws": null
+      },
+      "notes": [
+        "Shares Fable 5 capabilities and pricing exactly.",
+        "No safety classifiers — designed for defensive cybersecurity workflows (Project Glasswing).",
+        "Invitation-only; contact Anthropic, AWS, or Google Cloud account team for access.",
+        "Successor to Claude Mythos Preview.",
+        "30-day data retention; not available under zero data retention (Covered Model).",
+        "General platform availability not confirmed — limited to approved customers only."
+      ]
+    },
+    {
+      "api_id": "claude-opus-4-8",
+      "alias": "claude-opus-4-8",
+      "display_name": "Claude Opus 4.8",
+      "family": "claude",
+      "vendor": "anthropic",
+      "tier": "opus",
+      "generation": "4",
+      "minor_version": "8",
+      "status": "ga",
+      "ga_date": "2026-05-28",
+      "deprecation_date": null,
+      "retirement_date": null,
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 131072,
+      "max_output_tokens_batch": 307200,
+      "knowledge_cutoff": "2026-01",
+      "training_data_cutoff": "2026-01",
+      "pricing": {
+        "input_per_mtok_usd": 5.0,
+        "output_per_mtok_usd": 25.0
+      },
+      "modalities": {
+        "input": ["text", "image"],
+        "output": ["text"]
+      },
+      "capabilities": {
+        "tool_use": true,
+        "tool_use_parallel": true,
+        "tool_use_native": true,
+        "extended_thinking": false,
+        "adaptive_thinking": true,
+        "adaptive_thinking_always_on": false,
+        "prompt_caching": true,
+        "prompt_caching_min_tokens": 1024,
+        "streaming": true,
+        "vision": true,
+        "computer_use": true,
+        "code_execution": true,
+        "memory_tool": true,
+        "batch_api": true,
+        "effort_parameter": true,
+        "effort_default": "high",
+        "multilingual": true
+      },
+      "platform_ids": {
+        "claude_api": "claude-opus-4-8",
+        "aws_bedrock": "anthropic.claude-opus-4-8",
+        "google_cloud_vertex": "claude-opus-4-8",
+        "microsoft_foundry": "claude-opus-4-8",
+        "claude_platform_aws": "claude-opus-4-8"
+      },
+      "notes": [
+        "Recommended starting model for complex agentic coding and enterprise work.",
+        "Effort parameter defaults to 'high' on all surfaces.",
+        "~4x less likely than Opus 4.7 to let code flaws pass unremarked.",
+        "Recommended by Anthropic for cybersecurity work requiring reduced guardrails.",
+        "SWE-Bench Pro score: 69.2%.",
+        "Batch API supports up to 300k output tokens with output-300k-2026-03-24 beta header.",
+        "Dateless ID format introduced with 4.6 generation — pinned snapshot, not evergreen pointer."
+      ]
+    },
+    {
+      "api_id": "claude-sonnet-5",
+      "alias": "claude-sonnet-5",
+      "display_name": "Claude Sonnet 5",
+      "family": "claude",
+      "vendor": "anthropic",
+      "tier": "sonnet",
+      "generation": "5",
+      "status": "ga",
+      "ga_date": "2026-06-30",
+      "deprecation_date": null,
+      "retirement_date": null,
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 131072,
+      "max_output_tokens_batch": 307200,
+      "knowledge_cutoff": "2026-01",
+      "training_data_cutoff": "2026-01",
+      "pricing": {
+        "input_per_mtok_usd": 3.0,
+        "output_per_mtok_usd": 15.0,
+        "introductory_input_per_mtok_usd": 2.0,
+        "introductory_output_per_mtok_usd": 10.0,
+        "introductory_pricing_ends": "2026-08-31"
+      },
+      "modalities": {
+        "input": ["text", "image"],
+        "output": ["text"]
+      },
+      "capabilities": {
+        "tool_use": true,
+        "tool_use_parallel": true,
+        "tool_use_native": true,
+        "extended_thinking": false,
+        "adaptive_thinking": true,
+        "adaptive_thinking_always_on": false,
+        "prompt_caching": true,
+        "prompt_caching_min_tokens": 1024,
+        "streaming": true,
+        "vision": true,
+        "computer_use": true,
+        "code_execution": true,
+        "batch_api": true,
+        "effort_parameter": true,
+        "effort_default": "high",
+        "multilingual": true
+      },
+      "platform_ids": {
+        "claude_api": "claude-sonnet-5",
+        "aws_bedrock": "anthropic.claude-sonnet-5",
+        "google_cloud_vertex": "claude-sonnet-5",
+        "microsoft_foundry": "claude-sonnet-5",
+        "claude_platform_aws": "claude-sonnet-5"
+      },
+      "notes": [
+        "Default model for Free and Pro tiers on claude.ai as of 2026-06-30.",
+        "Best combination of speed and intelligence at its price point.",
+        "Introductory pricing of $2/$10 per MTok applies through 2026-08-31.",
+        "No long-context pricing premium for the 1M token context window.",
+        "SWE-Bench Pro score: 63.2%.",
+        "Batch API supports up to 300k output tokens with output-300k-2026-03-24 beta header.",
+        "Lower rate of undesirable behaviors than Sonnet 4.6; safer for agentic contexts."
+      ]
+    },
+    {
+      "api_id": "claude-haiku-4-5-20251001",
+      "alias": "claude-haiku-4-5",
+      "display_name": "Claude Haiku 4.5",
+      "family": "claude",
+      "vendor": "anthropic",
+      "tier": "haiku",
+      "generation": "4",
+      "minor_version": "5",
+      "snapshot_date": "20251001",
+      "status": "ga",
+      "ga_date": "2025-10-15",
+      "deprecation_date": null,
+      "retirement_date": null,
+      "context_window_tokens": 200000,
+      "max_output_tokens": 65536,
+      "knowledge_cutoff": "2025-02",
+      "training_data_cutoff": "2025-07",
+      "pricing": {
+        "input_per_mtok_usd": 1.0,
+        "output_per_mtok_usd": 5.0
+      },
+      "modalities": {
+        "input": ["text", "image"],
+        "output": ["text"]
+      },
+      "capabilities": {
+        "tool_use": true,
+        "tool_use_parallel": true,
+        "tool_use_native": true,
+        "extended_thinking": true,
+        "extended_thinking_uses_budget_tokens": true,
+        "extended_thinking_output_billed_as_output": true,
+        "adaptive_thinking": false,
+        "prompt_caching": true,
+        "prompt_caching_min_tokens": 1024,
+        "streaming": true,
+        "vision": true,
+        "computer_use": true,
+        "code_execution": true,
+        "multilingual": true,
+        "context_awareness": true,
+        "multi_agent": true,
+        "thinking_block_clearing": true
+      },
+      "platform_ids": {
+        "claude_api": "claude-haiku-4-5-20251001",
+        "claude_api_alias": "claude-haiku-4-5",
+        "aws_bedrock": "anthropic.claude-haiku-4-5-20251001-v1:0",
+        "google_cloud_vertex": "claude-haiku-4-5@20251001",
+        "microsoft_foundry": "claude-haiku-4-5",
+        "claude_platform_aws": "claude-haiku-4-5"
+      },
+      "notes": [
+        "Fastest model with near-frontier intelligence in current lineup.",
+        "First Haiku model with extended thinking and computer use.",
+        "Extended thinking uses token budget parameter (not modern effort parameter).",
+        "Only last turn's thinking blocks kept in context for Haiku models.",
+        "Forced tool use (tool_choice: required) not supported with extended thinking.",
+        "Surpasses Claude Sonnet 4 on computer use evaluations.",
+        "SWE-Bench Verified score: 73.3% (Sonnet 4.5: 77.2%).",
+        "90% cost savings with prompt caching; 50% with batch processing.",
+        "Uses dated ID format (pre-4.6 generation); alias claude-haiku-4-5 resolves to this snapshot.",
+        "Context awareness: model understands its context window consumption."
+      ]
+    }
+  ],
+  "legacy_models": [
+    {
+      "api_id": "claude-opus-4-7",
+      "alias": "claude-opus-4-7",
+      "display_name": "Claude Opus 4.7",
+      "status": "legacy",
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 131072,
+      "capabilities": {
+        "extended_thinking": false,
+        "adaptive_thinking": true,
+        "tool_use": true,
+        "vision": true,
+        "computer_use": true,
+        "prompt_caching": true
+      },
+      "pricing": {
+        "input_per_mtok_usd": 5.0,
+        "output_per_mtok_usd": 25.0
+      },
+      "notes": ["Introduced new tokenizer (~30% more tokens vs pre-4.7 models). Now legacy."]
+    },
+    {
+      "api_id": "claude-opus-4-6",
+      "alias": "claude-opus-4-6",
+      "display_name": "Claude Opus 4.6",
+      "status": "legacy",
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 131072,
+      "capabilities": {
+        "extended_thinking": true,
+        "adaptive_thinking": true,
+        "tool_use": true,
+        "vision": true,
+        "computer_use": true,
+        "prompt_caching": true
+      },
+      "pricing": {
+        "input_per_mtok_usd": 5.0,
+        "output_per_mtok_usd": 25.0
+      }
+    },
+    {
+      "api_id": "claude-sonnet-4-6",
+      "alias": "claude-sonnet-4-6",
+      "display_name": "Claude Sonnet 4.6",
+      "status": "legacy",
+      "context_window_tokens": 1000000,
+      "max_output_tokens": 131072,
+      "capabilities": {
+        "extended_thinking": true,
+        "adaptive_thinking": true,
+        "tool_use": true,
+        "vision": true,
+        "prompt_caching": true,
+        "batch_api_300k_output": true
+      },
+      "pricing": {
+        "input_per_mtok_usd": 3.0,
+        "output_per_mtok_usd": 15.0
+      }
+    },
+    {
+      "api_id": "claude-sonnet-4-5-20250929",
+      "alias": "claude-sonnet-4-5",
+      "display_name": "Claude Sonnet 4.5",
+      "status": "legacy",
+      "context_window_tokens": 200000,
+      "max_output_tokens": 65536,
+      "capabilities": {
+        "extended_thinking": true,
+        "adaptive_thinking": false,
+        "tool_use": true,
+        "vision": true,
+        "prompt_caching": true
+      },
+      "pricing": {
+        "input_per_mtok_usd": 3.0,
+        "output_per_mtok_usd": 15.0
+      }
+    },
+    {
+      "api_id": "claude-opus-4-5-20251101",
+      "alias": "claude-opus-4-5",
+      "display_name": "Claude Opus 4.5",
+      "status": "legacy",
+      "context_window_tokens": 200000,
+      "max_output_tokens": 65536,
+      "capabilities": {
+        "extended_thinking": true,
+        "adaptive_thinking": false,
+        "tool_use": true,
+        "vision": true,
+        "prompt_caching": true
+      },
+      "pricing": {
+        "input_per_mtok_usd": 5.0,
+        "output_per_mtok_usd": 25.0
+      }
+    },
+    {
+      "api_id": "claude-opus-4-1-20250805",
+      "alias": "claude-opus-4-1",
+      "display_name": "Claude Opus 4.1",
+      "status": "deprecated",
+      "retirement_date": "2026-08-05",
+      "context_window_tokens": 200000,
+      "max_output_tokens": 32768,
+      "capabilities": {
+        "extended_thinking": true,
+        "adaptive_thinking": false,
+        "tool_use": true,
+        "vision": true,
+        "prompt_caching": true
+      },
+      "pricing": {
+        "input_per_mtok_usd": 15.0,
+        "output_per_mtok_usd": 75.0
+      },
+      "notes": ["Deprecated. Retire before 2026-08-05."]
+    }
+  ],
+  "global_notes": {
+    "versioning_convention": "Models 4.6+ use dateless pinned IDs (e.g. claude-opus-4-8). Pre-4.6 models include YYYYMMDD snapshot date in the ID. Dateless IDs in 4.6+ are NOT evergreen pointers — they are fixed snapshots.",
+    "aliases_pre_4_6": "For pre-4.6 models, short aliases (e.g. claude-haiku-4-5) are convenience pointers resolving to the latest dated snapshot for that minor version.",
+    "prompt_caching_ttl": "Default cache TTL is 5 minutes (changed from 60 minutes in early 2026). 1-hour TTL is available at additional cost.",
+    "prompt_caching_isolation": "As of 2026-02-05, caches are isolated per workspace (Claude API, Claude Platform on AWS, Microsoft Foundry). Bedrock and Google Cloud maintain organization-level isolation.",
+    "batch_api_extended_output": "Opus 4.8, 4.7, 4.6, Sonnet 5, Sonnet 4.6 support 300k output tokens on Message Batches API via output-300k-2026-03-24 beta header.",
+    "bedrock_suffix_change": "Opus 4.6 is the last Bedrock ID with -v1 suffix. Dropped starting with Sonnet 4.6.",
+    "claude_platform_aws_ids": "Uses same model IDs as Claude API (not Bedrock-style IDs). Lifecycle follows Anthropic model deprecations, not Bedrock's."
+  },
+  "unresolved_questions": [
+    "Exact computer_use API schema version compatibility for Fable 5 vs Opus 4.8 not confirmed (assumed same schema per search results).",
+    "Claude Mythos 5 platform ID for AWS Bedrock and Google Cloud not publicly documented (limited-availability model).",
+    "Streaming-specific token limits or restrictions for Fable 5/Mythos 5 not explicitly documented.",
+    "Whether Claude Sonnet 5 supports the memory_tool specifically (documented for Fable 5; assumed yes but not verified).",
+    "Exact pricing for prompt caching reads/writes on Opus 4.8 and Sonnet 5 (documented only for Fable 5 in search results)."
+  ]
+}

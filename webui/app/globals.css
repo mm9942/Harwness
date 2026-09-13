@@ -1,0 +1,67 @@
+/* Globale Basiswerte der Control-Plane-Schale (Knoten UI-01).
+ *
+ * Bewusst schlicht: Layout- und Komponentendetails gehören den Knoten, die
+ * tatsächlich Inhalte rendern (UI-02..07). Diese Datei liefert nur die
+ * Grundtypografie, das Farbschema (hell/dunkel über prefers-color-scheme)
+ * und die Token, die `components/ui/**` referenziert — insbesondere die
+ * Vertrauensklassen-Token für den Datenblock-Renderer (siehe
+ * `components/ui/DataBlock.tsx`).
+ */
+
+:root {
+  color-scheme: light dark;
+
+  --harw-bg: #f7f7f8;
+  --harw-fg: #1a1a1f;
+  --harw-border: #d8d8de;
+  --harw-muted: #6b6b76;
+
+  /* Vertrauensklassen (AW4-01, Zwei-Block-Rendering): `harw-web` liefert
+   * diese Klasse aktuell NICHT mit (siehe `components/ui/DataBlock.tsx`-
+   * Kommentar) — die Token existieren bereits hier, damit UI-02..07 sie
+   * konsistent verwenden können, sobald die Klasse tatsächlich am Server
+   * ankommt. Bis dahin rendert `DataBlock` ausschließlich `data`. */
+  --harw-trust-data-bg: #eef0f3;
+  --harw-trust-data-border: #c7cbd1;
+  --harw-trust-evidence-bg: #fff6e0;
+  --harw-trust-evidence-border: #e0c34c;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --harw-bg: #16161a;
+    --harw-fg: #eaeaf0;
+    --harw-border: #33333c;
+    --harw-muted: #9a9aa6;
+
+    --harw-trust-data-bg: #202127;
+    --harw-trust-data-border: #3a3c46;
+    --harw-trust-evidence-bg: #2b2408;
+    --harw-trust-evidence-border: #6b571a;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--harw-bg);
+  color: var(--harw-fg);
+  font-family:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+code,
+pre {
+  font-family:
+    ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, monospace;
+}

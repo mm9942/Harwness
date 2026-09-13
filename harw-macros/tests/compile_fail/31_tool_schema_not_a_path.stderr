@@ -1,0 +1,5 @@
+error: expected identifier
+  --> tests/compile_fail/31_tool_schema_not_a_path.rs:13:19
+   |
+13 |     tool_schema = "not-a-type";
+   |                   ^^^^^^^^^^^^

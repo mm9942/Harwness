@@ -1,0 +1,20 @@
+[package]
+name = "harw-extension-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-types = { path = "../harw-types" }
+harw-tools = { path = "../harw-tools" }
+harw-macros = { path = "../harw-macros" }
+harw-sandbox = { path = "../harw-sandbox" }
+harw-catalog = { path = "../harw-catalog" }
+harw-context = { path = "../harw-context" }
+harw-lens-types = { path = "../harw-lens-types" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+jiff = { workspace = true }
+
+[lints]
+workspace = true

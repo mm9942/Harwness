@@ -1,0 +1,1537 @@
+//! `AgentSession` — der Session-State als FSM.
+//!
+//! Gültige Übergänge werden über `match` erzwungen. Ausgabe geht
+//! ausschließlich über `SessionEvent`s, nie direkt an ein Terminal.
+//!
+//! Session-level tool/instructions/context filtering is controlled via
+//! [`crate::activation::SessionActivation`]. See that module for details.
+//!
+//! Der Interaktionsmodus ([`crate::mode::InteractionMode`]) sitzt eine Ebene
+//! darüber: er setzt Tool-Aktivierung *und* Sandbox-Obergrenze gemeinsam und
+//! ausschließlich reduzierend — siehe [`AgentSession::set_mode`].
+//!
+//! # Folgeknoten zu AW2-01/AW2-02: `ContextProgram` je Sitzung — erbt oder bringt mit?
+//!
+//! [`SpawnContext::ceiling`] wird beim Handoff an ein Kind **geschnitten**
+//! (`ManagedAgentSpawner::admit` → `cut_ceiling`, `harw-core/src/child_controller.rs`):
+//! eine Decke ist eine Sicherheitsobergrenze, ein Kind darf nie mehr sehen als
+//! sein Elternteil zuließ. Ein [`harw_agent_dsl::executable::ContextProgram`]
+//! ist etwas anderes: es sagt, *welche* Sektionen ein Agent tatsächlich
+//! anfordert (Auswahl), nicht *wie viel* er höchstens anfordern dürfte
+//! (Obergrenze). Für diese Auswahl gilt kein Halbverband-Schnitt-Argument —
+//! genau wie `detail`/`strength` innerhalb eines Kontextprogramms selbst
+//! additiv bleiben (§ `harw_agent_dsl::context_program`, "Welche Achsen
+//! `extends` schneidet"), gibt es keinen Sicherheitsgrund, das Programm *als
+//! Ganzes* vom Elternteil zu vererben: `harw-registry-defaults` ordnet jeder
+//! der neun Rollen (Orchestrator, Worker, Explorer, Researcher, …) ihr eigenes
+//! Kontextprogramm zu, passend zu dem, was diese Rolle für ihre Aufgabe lesen
+//! muss — ein Planungs-Kind braucht `plan.current` mit vollem Detail, ein
+//! Recherche-Kind braucht `web.fetch_allowlist`, keines braucht zwingend das
+//! Programm seines Elternteils.
+//!
+//! **Entscheidung dieses Knotens: ein Kind bringt sein Programm aus seiner
+//! eigenen Rollendefinition mit — es erbt das des Elternteils nicht.** Die
+//! Decke (`ceiling`) bleibt in jedem Fall die harte, geschnittene
+//! Obergrenze: ein mitgebrachtes Programm, das mehr verlangt, als die
+//! (geschnittene) Decke zulässt, wird weiterhin von
+//! [`harw_agent_dsl::context_program::ContextCeilingAdmission::admits_program`]
+//! abgewiesen, bevor es eine Sitzung je erreicht — die Rollenwahl kann die
+//! Decke also nicht umgehen, nur innerhalb ihrer wählen.
+//!
+//! ## Wo dieser Knoten die Grenze zieht
+//! [`AgentSession::context_program`] trägt dieses Programm — bewusst als
+//! **eigenes Feld auf `AgentSession`, nicht auf [`SpawnContext`]**. Der Grund
+//! ist rein mechanisch, nicht konzeptionell: `SpawnContext`s Felder sind alle
+//! `pub`, und die Struktur wird an über einem Dutzend Stellen außerhalb dieses
+//! Knotens per Literal aufgebaut (`harw-core/src/child_controller.rs`,
+//! `harw-core/tests/child_controller.rs`, `harw-core/tests/turn_loop.rs`,
+//! `harw-tui/src/app.rs`, `harw-tui/src/approval.rs`,
+//! `harw-cli/src/main.rs`, `harw-cli/src/chat.rs`,
+//! `harw-cli/src/lifecycle.rs`, `harw-cli/src/job_worker.rs`) — jede davon
+//! liegt außerhalb des exklusiven Schreibbereichs dieses Knotens
+//! (`harw-agent-dsl/src/executable.rs`, `harw-core/src/session.rs`,
+//! `harw-core/src/turn_loop.rs`). Ein neues Pflichtfeld auf `SpawnContext`
+//! bricht jede dieser Literal-Konstruktionen, genau wie es beim seinerzeitigen
+//! Hinzufügen von `ceiling` selbst der Fall war (siehe dessen Doku oben, „hält
+//! die nötige Anpassung … auf ein mechanisches `ceiling: None,` reduziert" —
+//! diese Anpassung *fand* an all diesen Stellen statt, in einem Knoten, dessen
+//! Schreibbereich sie einschloss). `AgentSession`s Felder sind dagegen privat;
+//! jede externe Konstruktion läuft ausschließlich über
+//! [`AgentSession::new`]/[`AgentSession::new_with_id`], die beide in dieser
+//! Datei liegen. Ein neues privates Feld mit `None`-Default dort bricht daher
+//! keine einzige externe Stelle.
+//!
+//! **Offener Befund:** [`SpawnContext::ceiling`] und
+//! [`AgentSession::context_program`] leben deshalb (Stand dieses Knotens) auf
+//! zwei verschiedenen Typen, nicht „daneben" auf demselben. Ein
+//! `ContextProgram`-Feld direkt auf `SpawnContext` bleibt ein Folge-Knoten,
+//! sollte je ein zweiter Konsument neben `ManagedAgentSpawner::admit`
+//! entstehen, der das Programm ebenfalls braucht, bevor eine Sitzung existiert.
+//!
+//! ## Folgeknoten: `admit` verdrahtet das mitgebrachte Programm
+//! [`crate::child_controller::ManagedAgentSpawner::admit`] ist die einzige
+//! Stelle, die eine Kind-Sitzung tatsächlich erzeugt — also auch die einzige
+//! Stelle, die [`AgentSession::with_context_program`] produktiv aufrufen kann.
+//! Sie tut das direkt neben der bestehenden IR-Aktivierung
+//! (`with_executable_agent_ir`), aus derselben [`ExecutableAgentIr`], die
+//! bereits Tool-Surface, Budget und Pause-Sperre liefert: `ir.context_program()`
+//! ist das Programm, das die Rolle aus ihrer eigenen Definition mitbringt —
+//! erbt nicht vom Elternteil, siehe oben. Trägt die IR nichts Eigenes
+//! (`ContextProgram::default()`, der Fall, wenn die Rollen-Definition keine
+//! `[context]`/`[context_program]`-Tabelle deklariert), bleibt
+//! [`AgentSession::context_program`] `None` — die tragende Auflage dieses
+//! Feldes gilt also auch am produktiven Aufrufer, nicht nur in Tests.
+//!
+//! Die Kontext-Decke ([`SpawnContext::ceiling`]) wird davon unberührt weiter
+//! **geschnitten**, nicht mitgebracht: `admit` ruft `cut_ceiling` unverändert
+//! an derselben Stelle wie zuvor. Ein mitgebrachtes Programm erweitert diese
+//! Decke aber nie — `admit` prüft es unmittelbar neben dem Deckenschnitt gegen
+//! die bereits geschnittene Kind-Decke
+//! (`ManagedAgentSpawner::describe_context_program_ceiling_violation`) und
+//! weist die Admission ab, statt eine zu weitreichende Sektion
+//! stillschweigend zu ignorieren — derselbe Fehlschluss wäre eine stille
+//! Lücke, kein Absturz, genau wie bei einem übersprungenen `cut_ceiling`.
+
+use crate::activation::{SessionActivation, ToolProfile};
+use crate::context_budget::ContextBudget;
+use crate::error::{CoreError, CoreResult};
+use crate::history::ConversationHistory;
+use crate::mode::InteractionMode;
+use harw_agent_dsl::ExecutableAgentIr;
+use harw_agent_dsl::executable::{ContextProgram, SnapshotId};
+use harw_agent_dsl::roles::AgentRoleId;
+use harw_catalog::{AgentSuggestions, SpawnCapabilitySnapshot};
+use harw_context::ContextCeiling;
+use harw_extension_api::ExtensionRegistry;
+use harw_observe::TraceContext;
+use harw_protocol::events::SessionEvent;
+use harw_protocol::events::TurnEvent;
+use harw_sandbox::SandboxSpec;
+use harw_tools::{ToolCall, ToolName};
+use harw_types::{
+    AgentRole, ApprovalActor, ItemId, ModelId, ProviderId, ReasoningEffort, SessionId, TokenUsage,
+    TurnId,
+};
+use tokio::sync::mpsc;
+
+/// Session-State FSM — ungültige Übergänge sind über `match` abgesichert.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SessionState {
+    Idle,
+    Running,
+    WaitingForApproval,
+    /// NEU ggü. codex — für Orchestrator→Worker Handoffs.
+    WaitingForChild,
+    Failed(String),
+}
+
+impl std::fmt::Display for SessionState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Idle => write!(f, "Idle"),
+            Self::Running => write!(f, "Running"),
+            Self::WaitingForApproval => write!(f, "WaitingForApproval"),
+            Self::WaitingForChild => write!(f, "WaitingForChild"),
+            Self::Failed(msg) => write!(f, "Failed({msg})"),
+        }
+    }
+}
+
+pub struct AgentSession {
+    id: SessionId,
+    role: AgentRole,
+    parent_session_id: Option<SessionId>,
+    state: SessionState,
+    registry: ExtensionRegistry,
+    history: ConversationHistory,
+    /// Der aktuell laufende / pausierte Turn (gesetzt ab `try_start_turn`,
+    /// erhalten über einen Handoff hinweg, gelöscht bei `complete_turn`).
+    current_turn: Option<TurnId>,
+    pending_approval: Option<PendingApproval>,
+    pending_handoff: Option<PendingHandoff>,
+    spawn_context: Option<SpawnContext>,
+    context_budget: ContextBudget,
+    /// Reasoning-Effort-Level, das jeder Turn dieser Session an den Provider
+    /// durchreicht. `None` lässt den Provider seinen Default wählen.
+    reasoning_effort: Option<ReasoningEffort>,
+    /// Aktives Modell, das für Turns dieser Session bevorzugt wird.
+    /// `None` lässt den Provider seinen Catalog-Default wählen.
+    active_model: Option<ModelId>,
+    /// Aktiver Provider, der für Turns dieser Session verwendet wird.
+    /// `None` lässt den Session-Manager seinen konfigurierten Default wählen.
+    active_provider: Option<ProviderId>,
+    event_tx: mpsc::UnboundedSender<SessionEvent>,
+    /// Optionaler Sink für Live-Turn-Events (Tool-Calls, Reasoning,
+    /// Item-Updates). Andere Granularität als `event_tx` — daher ein
+    /// eigener, separater Kanal statt Wiederverwendung.
+    turn_event_tx: Option<mpsc::UnboundedSender<TurnEvent>>,
+    /// Session-level filter controlling which tools, instructions providers,
+    /// and context providers are exposed to the model. Defaults to
+    /// [`SessionActivation::default()`] (Full profile, no overrides), which
+    /// exposes every registered tool.
+    activation: SessionActivation,
+    /// Aufsummierte Token-Nutzung **aller** Turns dieser Session.
+    ///
+    /// Ohne diesen Akkumulator wäre eine Token-Obergrenze für Kind-Agenten
+    /// nicht durchsetzbar: `TurnCompleted` trägt die Nutzung zwar als Event,
+    /// aber ein Budget-Wächter besitzt den Event-Kanal nicht. Wird von
+    /// [`AgentSession::complete_turn`] fortgeschrieben.
+    total_usage: TokenUsage,
+    /// Interaktionsmodus dieser Session. Er ist keine Anzeige, sondern die
+    /// Quelle der Tool-Aktivierung und der Sandbox-Obergrenze; gewechselt wird
+    /// er ausschließlich über [`AgentSession::set_mode`].
+    mode: InteractionMode,
+    /// Content-addressable identifier of the frozen executable policy that
+    /// configured this session, when one was supplied at construction.
+    executable_snapshot_id: Option<SnapshotId>,
+    /// Welche Kontext-Sektionen dieser Agent tatsächlich anfordert (Auswahl),
+    /// getrennt von [`SpawnContext::ceiling`] (Obergrenze). `None`: die
+    /// Runtime verwendet ihre Standard-Kontextmontage unverändert — diese
+    /// tragende Auflage gilt unabhängig davon, ob dieses Feld je gesetzt wird
+    /// (kein bestehender Aufrufer sieht ohne expliziten
+    /// [`Self::with_context_program`]-Aufruf einen anderen Kontext). Siehe die
+    /// Moduldoku oben ("Folgeknoten zu AW2-01/AW2-02") für die Begründung,
+    /// warum dieses Feld hier und nicht auf [`SpawnContext`] liegt, und warum
+    /// ein Kind sein Programm mitbringt statt es zu erben.
+    context_program: Option<ContextProgram>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpawnContext {
+    pub sandbox: SandboxSpec,
+    pub suggestions: Option<AgentSuggestions>,
+    /// Target-role capability contract resolved by trusted runtime/catalog
+    /// state at admission. This is distinct from advisory suggestions: only
+    /// this snapshot may be considered for activation by a registry factory.
+    pub capability_snapshot: Option<SpawnCapabilitySnapshot>,
+    /// Identity that may answer approvals initiated by this session. It is
+    /// attached by trusted ingress/session construction, never by turn JSON.
+    pub approval_actor: Option<ApprovalActor>,
+    /// The organizational role (§3 DSL spawn matrix) this session was
+    /// admitted under. Used by `ManagedAgentSpawner::admit` to enforce the
+    /// closed spawn matrix (`harw_agent_dsl::roles::can_spawn`) before a
+    /// child is created — a session's own organizational role determines
+    /// which target roles it may ever spawn, independent of sandbox/depth
+    /// limits.
+    pub organizational_role: AgentRoleId,
+    /// Der Trace-Kontext, unter dem dieser Agent läuft.
+    ///
+    /// Wird beim Handoff an ein Kind **vererbt**, nicht neu erzeugt: ein Kind
+    /// gehört zur selben Arbeit wie sein Elternteil, und genau das soll die
+    /// gemeinsame `trace_id` später sichtbar machen. `ManagedAgentSpawner::admit`
+    /// baut daraus den Trace des Kindes: dieselbe `trace_id`, eine frische
+    /// `span_id` für das Kind, die `span_id` des Elternteils als
+    /// `parent_span_id`. Ein Elternteil ohne Trace (`None`) vererbt ebenfalls
+    /// `None` — dieses Feld erfindet nie einen Wurzel-Trace für eine Stelle,
+    /// die keine Wurzel ist.
+    pub trace: Option<TraceContext>,
+    /// Die Kontext-Decke, unter der dieser Agent — und jedes seiner Kinder —
+    /// laufen darf.
+    ///
+    /// # Warum hier, warum im selben Schritt wie die Berechtigungen
+    /// Wird beim Handoff an ein Kind **im selben Schritt** geschnitten wie
+    /// die Berechtigungen (siehe
+    /// [`crate::child_controller::ManagedAgentSpawner::admit`], unmittelbar
+    /// neben der Sandbox-Eskalationsprüfung und der Trace-Vererbung, nicht
+    /// davor, nicht danach, nicht in einer eigenen Funktion). Läge der
+    /// Deckenschnitt in einem zweiten, separaten Schritt, gäbe es einen
+    /// Zustand dazwischen, in dem ein Kind bereits ein `ContextProgram`
+    /// trägt, dessen Decke noch niemand geschnitten hat — ein Fehler in der
+    /// Reihenfolge wäre dann eine stille Lücke, kein Absturz, und genau
+    /// solche Lücken bleiben lange unentdeckt. Deshalb liegt dieses Feld
+    /// direkt neben `trace`, nicht in einem eigenen Modul.
+    ///
+    /// # `None` ist fail-closed, nicht "unbegrenzt"
+    /// Ein Elternteil ohne eigene Decke — nur an einer extern registrierten
+    /// Wurzel möglich, siehe
+    /// [`crate::child_controller::ManagedAgentSpawner::with_external_root_parent`] —
+    /// vererbt seinem Kind die maximal restriktive Decke (keine Sektion,
+    /// [`harw_context::TrustClass::Data`], kein Budget), niemals gar keine
+    /// Grenze. Ein fehlendes Feld darf nie zu mehr Autorität führen als ein
+    /// explizit gesetztes.
+    ///
+    /// `Option` statt eines Pflichtfelds folgt demselben Muster wie `trace`
+    /// oben: es hält die nötige Anpassung an jeder bereits bestehenden
+    /// externen Konstruktionsstelle (`harw-cli`, `harw-tui`) auf ein
+    /// mechanisches `ceiling: None,` reduziert, ohne dass diese Stellen eine
+    /// echte Decke erfinden müssten — sicher genau deshalb, weil `None` dort
+    /// als geschlossen, nicht als offen, gelesen wird.
+    pub ceiling: Option<ContextCeiling>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingApproval {
+    pub call: ToolCall,
+    pub request: ItemId,
+    pub actor: ApprovalActor,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingHandoff {
+    pub child: SessionId,
+    pub call_id: harw_types::ToolCallId,
+    pub role: String,
+}
+
+/// Handle das ein laufender Turn hält.
+pub struct TurnHandle {
+    pub turn_id: TurnId,
+    pub session_id: SessionId,
+}
+
+/// Rejection wenn `try_start_turn` fehlschlägt.
+#[derive(Debug)]
+pub enum TurnRejection {
+    NotIdle(SessionState),
+}
+
+impl std::fmt::Display for TurnRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotIdle(state) => write!(f, "session not idle: {state}"),
+        }
+    }
+}
+impl std::error::Error for TurnRejection {}
+
+impl AgentSession {
+    pub fn new(
+        role: AgentRole,
+        parent_session_id: Option<SessionId>,
+        registry: ExtensionRegistry,
+        event_tx: mpsc::UnboundedSender<SessionEvent>,
+    ) -> Self {
+        Self::new_with_id(
+            SessionId::new(),
+            role,
+            parent_session_id,
+            registry,
+            event_tx,
+        )
+    }
+
+    /// Creates a session with a caller-supplied identifier.
+    pub fn new_with_id(
+        session_id: SessionId,
+        role: AgentRole,
+        parent_session_id: Option<SessionId>,
+        registry: ExtensionRegistry,
+        event_tx: mpsc::UnboundedSender<SessionEvent>,
+    ) -> Self {
+        Self {
+            id: session_id,
+            role,
+            parent_session_id,
+            state: SessionState::Idle,
+            registry,
+            history: ConversationHistory::new(),
+            current_turn: None,
+            pending_approval: None,
+            pending_handoff: None,
+            spawn_context: None,
+            context_budget: ContextBudget::default(),
+            reasoning_effort: None,
+            active_model: None,
+            active_provider: None,
+            event_tx,
+            turn_event_tx: None,
+            activation: SessionActivation::default(),
+            total_usage: TokenUsage::default(),
+            mode: InteractionMode::default(),
+            executable_snapshot_id: None,
+            context_program: None,
+        }
+    }
+
+    /// Applies the runtime policy carried by a frozen executable agent IR.
+    ///
+    /// The resulting tool surface is deny-by-default: it starts from the
+    /// minimal profile, admits only the IR's admitted names, then applies its
+    /// forbidden names as final denials. The IR snapshot ID is retained for
+    /// audit and correlation.
+    #[must_use]
+    pub fn with_executable_agent_ir(mut self, executable: &ExecutableAgentIr) -> Self {
+        let mut activation = SessionActivation::new(ToolProfile::Minimal);
+
+        for name in executable.tool_surface().admitted() {
+            activation.enable_tool(ToolName::new(name.clone()));
+        }
+        for name in executable.tool_surface().forbidden() {
+            activation.disable_tool(ToolName::new(name.clone()));
+        }
+
+        self.activation = activation;
+        self.executable_snapshot_id = Some(executable.snapshot_id());
+        self
+    }
+
+    /// Returns the frozen executable policy snapshot ID, if this session was
+    /// constructed through [`Self::with_executable_agent_ir`].
+    #[must_use]
+    pub fn executable_snapshot_id(&self) -> Option<&SnapshotId> {
+        self.executable_snapshot_id.as_ref()
+    }
+
+    /// Attaches the immutable, trusted context established before the session
+    /// started. It is intentionally unavailable to model/tool JSON.
+    ///
+    /// Die Sandbox wird beim Anhängen sofort mit der Obergrenze des aktuellen
+    /// [`InteractionMode`] geschnitten. Damit hängt die Autorität nicht von der
+    /// Reihenfolge der Builder-Aufrufe ab: `with_mode(...).with_spawn_context(...)`
+    /// und `with_spawn_context(...).with_mode(...)` ergeben dieselbe Sandbox.
+    /// Für den Default-Modus [`InteractionMode::Chat`] ist der Schnitt die
+    /// Identität, bestehende Aufrufer sehen also keine Änderung.
+    #[must_use]
+    pub fn with_spawn_context(mut self, mut spawn_context: SpawnContext) -> Self {
+        spawn_context.sandbox = spawn_context
+            .sandbox
+            .restrict(&self.mode.permission_ceiling());
+        self.spawn_context = Some(spawn_context);
+        self
+    }
+
+    /// Liefert den aktuellen Interaktionsmodus der Session.
+    ///
+    /// # Returns
+    /// Den [`InteractionMode`] (`Copy`), der zuletzt über
+    /// [`Self::with_mode`] oder [`Self::set_mode`] gesetzt wurde;
+    /// [`InteractionMode::Chat`], wenn nie einer gesetzt wurde.
+    #[must_use]
+    pub fn mode(&self) -> InteractionMode {
+        self.mode
+    }
+
+    /// Builder-Variante von [`Self::set_mode`] für den Aufbau einer Session.
+    ///
+    /// # Beschreibung
+    /// Wendet den Modus genauso an wie [`Self::set_mode`] — Tool-Aktivierung
+    /// und Sandbox-Schnitt —, sendet aber **kein**
+    /// [`TurnEvent::ModeChanged`]: beim Aufbau hat noch kein Wechsel
+    /// stattgefunden, und ein Sink ist zu diesem Zeitpunkt in der Regel noch
+    /// gar nicht angehängt.
+    ///
+    /// # Arguments
+    /// - `mode` (`InteractionMode`): der zu setzende Modus (`Copy`).
+    ///
+    /// # Returns
+    /// `Self` mit gesetztem und bereits angewandtem Modus.
+    ///
+    /// # Beispiele
+    /// ```rust,no_run
+    /// use harw_core::mode::InteractionMode;
+    /// // session.with_mode(InteractionMode::Explore);
+    /// ```
+    #[must_use]
+    pub fn with_mode(mut self, mode: InteractionMode) -> Self {
+        self.mode = mode;
+        self.apply_mode();
+        self
+    }
+
+    /// Wechselt den Modus und wendet ihn sofort an: Tool-Aktivierung aus
+    /// `allowed_tools`, Sandbox aus `permission_ceiling` (nur Reduktion).
+    /// Der Spawn-Kontext behält seinen Workspace; nur die Permissions schrumpfen.
+    ///
+    /// # Beschreibung
+    /// Der Modus ist eine durchgesetzte Grenze, kein Hinweis an das Modell.
+    /// Konkret geschieht dreierlei:
+    /// 1. Eine frische [`SessionActivation`] aus
+    ///    [`InteractionMode::tool_profile`] ersetzt die bisherige. Frühere
+    ///    Einzel-Overrides (`enable_tool`/`disable_tool`) fallen dabei weg —
+    ///    andernfalls könnte ein alter `enable_tool`-Override ein Werkzeug in
+    ///    einen engeren Modus hineinretten.
+    /// 2. Jeder Name aus [`InteractionMode::allowed_tools`] wird freigeschaltet.
+    ///    `None` bedeutet „keine namensbasierte Einschränkung".
+    /// 3. Die Sandbox des Spawn-Kontexts wird mit
+    ///    [`InteractionMode::permission_ceiling`] **geschnitten**
+    ///    ([`harw_sandbox::SandboxSpec::restrict`]). Der Schnitt ist monoton:
+    ///    ein Wechsel nach [`InteractionMode::Work`] gibt nichts zurück, was die
+    ///    Sandbox vorher nicht hatte. Der [`harw_sandbox::NetworkScope`] bleibt
+    ///    unangetastet — eine Permission-Obergrenze sagt nichts über einzelne
+    ///    Ziele aus, weder über Hostnamen
+    ///    ([`harw_sandbox::EgressTarget::Host`],
+    ///    [`harw_sandbox::EgressTarget::DnsSuffix`]) noch über Adressbereiche
+    ///    ([`harw_sandbox::EgressTarget::Cidr`]).
+    ///
+    /// Ohne Spawn-Kontext entfällt Schritt 3 ersatzlos: es gibt dann keine
+    /// Autorität, die zu schneiden wäre, und die Tool-Ausführung lehnt eine
+    /// solche Session ohnehin ab.
+    ///
+    /// Nur die Sandbox ist monoton, die Tool-Aktivierung ist es nicht: ein
+    /// Wechsel zurück nach [`InteractionMode::Work`] macht Werkzeuge wieder
+    /// sichtbar. Das ist ungefährlich, weil die endgültige Autorität die
+    /// Sandbox trägt — ein wieder sichtbares `fs.write` scheitert weiterhin an
+    /// fehlendem [`harw_sandbox::Permission::WriteWorkspace`].
+    ///
+    /// # Arguments
+    /// - `mode` (`InteractionMode`): der neue Modus (`Copy`, kein Ownership-Transfer).
+    ///
+    /// # Panics
+    /// Keine.
+    ///
+    /// # Nebenläufigkeit
+    /// Verlangt exklusiven Zugriff (`&mut self`) und hält keine Sperre. Das
+    /// [`TurnEvent::ModeChanged`] geht best-effort über den optionalen
+    /// Turn-Event-Sink; ein abgehängter Empfänger wird ignoriert.
+    pub fn set_mode(&mut self, mode: InteractionMode) {
+        self.mode = mode;
+        self.apply_mode();
+        if let Some(tx) = &self.turn_event_tx {
+            let _ = tx.send(TurnEvent::ModeChanged {
+                mode: mode.as_str().to_owned(),
+            });
+        }
+    }
+
+    // Setzt den bereits in `self.mode` hinterlegten Modus durch: Activation neu
+    // aufbauen und die Sandbox schneiden. Bewusst ohne Event — der Aufrufer
+    // entscheidet, ob ein Wechsel stattgefunden hat.
+    fn apply_mode(&mut self) {
+        let mut activation = SessionActivation::new(self.mode.tool_profile());
+        if let Some(names) = self.mode.allowed_tools() {
+            for name in names {
+                activation.enable_tool(ToolName::new(*name));
+            }
+        }
+        self.activation = activation;
+
+        if let Some(context) = self.spawn_context.as_mut() {
+            context.sandbox = context.sandbox.restrict(&self.mode.permission_ceiling());
+        }
+    }
+
+    #[must_use]
+    pub fn spawn_context(&self) -> Option<&SpawnContext> {
+        self.spawn_context.as_ref()
+    }
+
+    /// Overrides the model-visible context budget for this session. Durable
+    /// history is unchanged; only request assembly is bounded.
+    #[must_use]
+    pub fn with_context_budget(mut self, context_budget: ContextBudget) -> Self {
+        self.context_budget = context_budget;
+        self
+    }
+
+    #[must_use]
+    pub fn context_budget(&self) -> ContextBudget {
+        self.context_budget
+    }
+
+    /// Setzt das [`ContextProgram`], das diese Sitzung mitbringt.
+    ///
+    /// # Beschreibung
+    /// Diese Sitzung bringt ihr Programm aus ihrer eigenen Rollendefinition
+    /// mit — sie erbt es nicht automatisch von einem Elternteil (§ Moduldoku
+    /// "Folgeknoten zu AW2-01/AW2-02"). Aufrufer, die eine Kette von
+    /// Kind-Sitzungen mit demselben Programm laufen lassen wollen, müssen
+    /// dieses Programm daher an jeder Konstruktionsstelle erneut übergeben;
+    /// diese Methode selbst liest kein Elternteil.
+    ///
+    /// Setzt keine Decke ([`SpawnContext::ceiling`]) durch — eine Sitzung ohne
+    /// zusätzliche Prüfung kann hierüber ein Programm setzen, das ihre eigene
+    /// Decke überschreitet. Die Deckenprüfung
+    /// ([`harw_agent_dsl::context_program::ContextCeilingAdmission::admits_program`])
+    /// muss der Aufrufer selbst vor diesem Aufruf durchführen, z. B. über
+    /// [`harw_agent_dsl::executable::ContextProgram::from_resolved_program`].
+    ///
+    /// # Arguments
+    /// - `context_program` (`ContextProgram`): das mitgebrachte Programm.
+    #[must_use]
+    pub fn with_context_program(mut self, context_program: ContextProgram) -> Self {
+        self.context_program = Some(context_program);
+        self
+    }
+
+    /// Liefert das [`ContextProgram`], das diese Sitzung mitbringt.
+    ///
+    /// # Returns
+    /// `None`, solange [`Self::with_context_program`] nie aufgerufen wurde —
+    /// dann verwendet die Runtime ihre Standard-Kontextmontage unverändert
+    /// (die tragende Auflage dieses Feldes, § Moduldoku).
+    #[must_use]
+    pub fn context_program(&self) -> Option<&ContextProgram> {
+        self.context_program.as_ref()
+    }
+
+    /// Setzt das Reasoning-Effort-Level, das jeder Turn dieser Session an den
+    /// Provider durchreicht. `None` lässt den Provider seinen Default wählen.
+    #[must_use]
+    pub fn with_reasoning_effort(mut self, reasoning_effort: Option<ReasoningEffort>) -> Self {
+        self.reasoning_effort = reasoning_effort;
+        self
+    }
+
+    #[must_use]
+    pub fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+        self.reasoning_effort
+    }
+
+    /// Setzt das Reasoning-Effort-Level in-place.
+    ///
+    /// Nicht-konsumierendes Gegenstück zu [`Self::with_reasoning_effort`] für
+    /// bereits im `SessionManager` registrierte Sessions (Wave 8: monotone
+    /// Vererbung an Child-Spawns, die erst nach der Session-Erzeugung geklammert
+    /// werden). `None` fällt auf den Provider-Default zurück.
+    pub fn set_reasoning_effort(&mut self, reasoning_effort: Option<ReasoningEffort>) {
+        self.reasoning_effort = reasoning_effort;
+    }
+
+    /// Builder-style setter: overrides the model selected for every turn of
+    /// this session. `None` lets the provider pick its catalog default.
+    #[must_use]
+    pub fn with_active_model(mut self, model: Option<ModelId>) -> Self {
+        self.active_model = model;
+        self
+    }
+
+    /// Returns the active model override for this session, if any.
+    #[must_use]
+    pub fn active_model(&self) -> Option<&ModelId> {
+        self.active_model.as_ref()
+    }
+
+    /// Sets the active model override in-place.
+    ///
+    /// Non-consuming counterpart to [`Self::with_active_model`] for sessions
+    /// already registered in the session manager. `None` falls back to the
+    /// provider's catalog default.
+    pub fn set_active_model(&mut self, model: Option<ModelId>) {
+        self.active_model = model;
+    }
+
+    /// Builder-style setter: overrides the provider used for every turn of
+    /// this session. `None` lets the session manager use its configured default.
+    #[must_use]
+    pub fn with_active_provider(mut self, provider: Option<ProviderId>) -> Self {
+        self.active_provider = provider;
+        self
+    }
+
+    /// Returns the active provider override for this session, if any.
+    #[must_use]
+    pub fn active_provider(&self) -> Option<&ProviderId> {
+        self.active_provider.as_ref()
+    }
+
+    /// Sets the active provider override in-place.
+    ///
+    /// Non-consuming counterpart to [`Self::with_active_provider`] for sessions
+    /// already registered in the session manager. `None` falls back to the
+    /// session manager's configured default provider.
+    pub fn set_active_provider(&mut self, provider: Option<ProviderId>) {
+        self.active_provider = provider;
+    }
+
+    /// Attaches a sink for live per-turn events (tool calls, reasoning, item
+    /// updates). Optional — sessions without a sink simply drop these events.
+    #[must_use]
+    pub fn with_turn_event_sink(mut self, turn_event_tx: mpsc::UnboundedSender<TurnEvent>) -> Self {
+        self.turn_event_tx = Some(turn_event_tx);
+        self
+    }
+
+    /// Returns the attached live per-turn event sink, if any was configured
+    /// via [`AgentSession::with_turn_event_sink`].
+    #[must_use]
+    pub fn turn_event_tx(&self) -> Option<&mpsc::UnboundedSender<TurnEvent>> {
+        self.turn_event_tx.as_ref()
+    }
+
+    /// Returns a shared reference to the session's activation filter.
+    ///
+    /// # Description
+    /// The activation filter controls which tools, instructions providers, and
+    /// context providers are model-visible for this session. Read it in the
+    /// turn-loop to apply filtering before building the model request.
+    ///
+    /// # Returns
+    /// Immutable reference to [`SessionActivation`].
+    ///
+    /// # Concurrency
+    /// Read-only; safe from any thread while the session is borrowed.
+    #[must_use]
+    pub fn activation(&self) -> &SessionActivation {
+        &self.activation
+    }
+
+    /// Returns a mutable reference to the session's activation filter.
+    ///
+    /// # Description
+    /// Use this to toggle individual tools, instructions, or context providers
+    /// at runtime without rebuilding the session.
+    ///
+    /// # Returns
+    /// Exclusive mutable reference to [`SessionActivation`].
+    pub fn activation_mut(&mut self) -> &mut SessionActivation {
+        &mut self.activation
+    }
+
+    /// Builder-style setter for the activation filter (consumes and returns
+    /// `self` for chaining with other `with_*` methods).
+    ///
+    /// # Arguments
+    /// - `activation` (`SessionActivation`): the new filter to install.
+    ///
+    /// # Returns
+    /// `Self` with the activation replaced.
+    ///
+    /// # Examples
+    /// ```rust,no_run
+    /// use harw_core::activation::{SessionActivation, ToolProfile};
+    /// // session.with_activation(SessionActivation::new(ToolProfile::Minimal));
+    /// ```
+    #[must_use]
+    pub fn with_activation(mut self, activation: SessionActivation) -> Self {
+        self.activation = activation;
+        self
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &SessionId {
+        &self.id
+    }
+    #[must_use]
+    pub fn role(&self) -> &AgentRole {
+        &self.role
+    }
+    #[must_use]
+    pub fn parent_session_id(&self) -> Option<&SessionId> {
+        self.parent_session_id.as_ref()
+    }
+    #[must_use]
+    pub fn state(&self) -> &SessionState {
+        &self.state
+    }
+    #[must_use]
+    pub fn history(&self) -> &ConversationHistory {
+        &self.history
+    }
+    pub fn history_mut(&mut self) -> &mut ConversationHistory {
+        &mut self.history
+    }
+    #[must_use]
+    pub fn registry(&self) -> &ExtensionRegistry {
+        &self.registry
+    }
+    /// Die ID des aktuell laufenden bzw. pausierten Turns.
+    #[must_use]
+    pub fn current_turn(&self) -> Option<&TurnId> {
+        self.current_turn.as_ref()
+    }
+
+    /// Versucht einen Turn zu starten. Nur aus `Idle` möglich.
+    pub fn try_start_turn(&mut self) -> Result<TurnHandle, TurnRejection> {
+        match &self.state {
+            SessionState::Idle => {
+                let turn_id = TurnId::new();
+                self.state = SessionState::Running;
+                self.current_turn = Some(turn_id.clone());
+                let _ = self.event_tx.send(SessionEvent::TurnStarted {
+                    session_id: self.id.clone(),
+                    turn_id: turn_id.clone(),
+                });
+                Ok(TurnHandle {
+                    turn_id,
+                    session_id: self.id.clone(),
+                })
+            }
+            other => Err(TurnRejection::NotIdle(other.clone())),
+        }
+    }
+
+    /// Turn erfolgreich abschließen.
+    /// Aufsummierte Token-Nutzung aller bisherigen Turns dieser Session.
+    ///
+    /// # Beschreibung
+    /// Quelle für die Durchsetzung einer Token-Obergrenze (`AgentBudget::max_tokens`)
+    /// bei Kind-Agenten. Der Wert wächst monoton und wird nie zurückgesetzt —
+    /// eine Session ist die Abrechnungseinheit, nicht der einzelne Turn.
+    ///
+    /// # Concurrency
+    /// Lesend, lock-frei; erfordert eine geteilte Referenz auf die Session.
+    #[must_use]
+    pub fn total_usage(&self) -> &TokenUsage {
+        &self.total_usage
+    }
+
+    pub fn complete_turn(&mut self, handle: TurnHandle, usage: TokenUsage) {
+        self.total_usage.add(&usage);
+        self.state = SessionState::Idle;
+        self.current_turn = None;
+        self.pending_approval = None;
+        self.pending_handoff = None;
+        let _ = self.event_tx.send(SessionEvent::TurnCompleted {
+            session_id: handle.session_id,
+            turn_id: handle.turn_id,
+            usage,
+        });
+    }
+
+    /// In `WaitingForChild` wechseln (Handoff).
+    pub fn begin_handoff(
+        &mut self,
+        child: SessionId,
+        call_id: harw_types::ToolCallId,
+        role: String,
+    ) -> CoreResult<()> {
+        if self.state != SessionState::Running {
+            return Err(CoreError::NotIdle {
+                session_id: self.id.to_string(),
+                state: self.state.to_string(),
+            });
+        }
+        self.pending_handoff = Some(PendingHandoff {
+            child,
+            call_id,
+            role,
+        });
+        self.state = SessionState::WaitingForChild;
+        Ok(())
+    }
+
+    pub fn begin_approval(
+        &mut self,
+        call: ToolCall,
+        request: ItemId,
+        actor: ApprovalActor,
+    ) -> CoreResult<()> {
+        if self.state != SessionState::Running {
+            return Err(CoreError::NotIdle {
+                session_id: self.id.to_string(),
+                state: self.state.to_string(),
+            });
+        }
+        self.pending_approval = Some(PendingApproval {
+            call,
+            request,
+            actor,
+        });
+        self.state = SessionState::WaitingForApproval;
+        Ok(())
+    }
+
+    pub fn resolve_approval(&mut self, actor: &ApprovalActor) -> CoreResult<PendingApproval> {
+        match self.state {
+            SessionState::WaitingForApproval => {
+                let pending = self.pending_approval.take().ok_or_else(|| {
+                    CoreError::TurnRejected("approval state has no pending call".to_owned())
+                })?;
+                if &pending.actor != actor {
+                    self.pending_approval = Some(pending);
+                    return Err(CoreError::ApprovalActorMismatch {
+                        session_id: self.id.to_string(),
+                    });
+                }
+                self.state = SessionState::Running;
+                Ok(pending)
+            }
+            _ => Err(CoreError::NotIdle {
+                session_id: self.id.to_string(),
+                state: self.state.to_string(),
+            }),
+        }
+    }
+
+    /// Borrows the immutable approval correlation while the session remains
+    /// paused. A durable store consumes a callback before the core transitions
+    /// the session back to `Running`.
+    #[must_use]
+    pub fn pending_approval(&self) -> Option<&PendingApproval> {
+        self.pending_approval.as_ref()
+    }
+
+    /// Child hat geliefert — zurück zu `Running`.
+    pub fn child_completed(
+        &mut self,
+        child: &SessionId,
+        call_id: &harw_types::ToolCallId,
+    ) -> CoreResult<()> {
+        match &self.state {
+            SessionState::WaitingForChild => {
+                let pending = self.pending_handoff.as_ref().ok_or_else(|| {
+                    CoreError::TurnRejected("handoff state has no pending child".to_owned())
+                })?;
+                if &pending.child != child || &pending.call_id != call_id {
+                    return Err(CoreError::TurnRejected(
+                        "child result does not match the pending handoff".to_owned(),
+                    ));
+                }
+                self.state = SessionState::Running;
+                self.pending_handoff = None;
+                Ok(())
+            }
+            other => Err(CoreError::NotIdle {
+                session_id: self.id.to_string(),
+                state: other.to_string(),
+            }),
+        }
+    }
+
+    /// Terminaler Fehler.
+    pub fn fail(&mut self, reason: String) {
+        self.state = SessionState::Failed(reason.clone());
+        self.pending_approval = None;
+        self.pending_handoff = None;
+        let _ = self.event_tx.send(SessionEvent::SessionFailed {
+            session_id: self.id.clone(),
+            reason,
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harw_agent_dsl::authority::AuthorityCeiling;
+    use harw_agent_dsl::lower;
+    use harw_agent_dsl::parse::parse_toml;
+    use harw_agent_dsl::resolved::{ResolutionTrace, ResolvedAgentDefinition};
+    use harw_context::{ContextBudgetSpec, SectionName, TrustClass};
+    use harw_extension_api::ExtensionRegistryBuilder;
+    use harw_sandbox::{Permission, PermissionSet, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_types::{TenantId, WorkspaceId};
+    use std::path::PathBuf;
+
+    fn test_session() -> AgentSession {
+        let (event_tx, _receiver) = mpsc::unbounded_channel();
+        AgentSession::new(
+            AgentRole::Assistant,
+            None,
+            ExtensionRegistryBuilder::default().build(),
+            event_tx,
+        )
+    }
+
+    #[test]
+    fn context_program_defaults_to_none() {
+        let session = test_session();
+        assert!(
+            session.context_program().is_none(),
+            "a session without with_context_program must render exactly as before this node"
+        );
+    }
+
+    #[test]
+    fn with_context_program_sets_and_returns_it() {
+        // `ContextProgram` has no public constructor besides `Default` and
+        // `from_resolved_program` (which needs a full `ResolvedContextProgramDefinition`
+        // plus a `ContextCeiling` — exercised in `harw-agent-dsl`'s own tests).
+        // This session-level test only proves the round-trip through
+        // `with_context_program`/`context_program`, so `Default` suffices; a
+        // non-default program would exercise the same builder plumbing.
+        let program = ContextProgram::default();
+        let session = test_session().with_context_program(program.clone());
+
+        assert_eq!(
+            session.context_program(),
+            Some(&program),
+            "the session must return exactly the program it was given"
+        );
+    }
+
+    #[test]
+    fn context_program_does_not_affect_context_budget_or_activation() {
+        // A declared context_program must not leak into unrelated session
+        // state — the field is additive, not a hidden side channel.
+        let baseline = test_session();
+        let with_program = test_session().with_context_program(ContextProgram::default());
+
+        assert_eq!(with_program.context_budget(), baseline.context_budget());
+        assert_eq!(with_program.mode(), baseline.mode());
+    }
+
+    fn executable_agent_ir(admitted: &[&str], forbidden: &[&str]) -> ExecutableAgentIr {
+        let admitted = admitted
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let forbidden = forbidden
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let raw = parse_toml(&format!(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.session-policy-test@1"
+version = "1.0.0"
+role = "worker"
+specialization = "session-policy-test"
+
+[tools]
+admitted = [{admitted}]
+forbidden = [{forbidden}]
+"#
+        ))
+        .expect("test agent definition must parse");
+        let resolved = ResolvedAgentDefinition {
+            id: raw.id,
+            version: raw.version,
+            role: raw.role,
+            specialization: raw.specialization,
+            name: raw.name,
+            description: raw.description,
+            authority: AuthorityCeiling::default(),
+            trace: ResolutionTrace { steps: Vec::new() },
+            config: raw.tables,
+        };
+
+        lower(&resolved).expect("test agent definition must lower")
+    }
+
+    #[test]
+    fn test_new_with_id_preserves_supplied_session_id() {
+        let (event_tx, _receiver) = mpsc::unbounded_channel();
+        let session_id = SessionId::new();
+        let session = AgentSession::new_with_id(
+            session_id.clone(),
+            AgentRole::Assistant,
+            None,
+            ExtensionRegistryBuilder::default().build(),
+            event_tx,
+        );
+
+        assert_eq!(session.id(), &session_id);
+    }
+
+    #[test]
+    fn executable_policy_with_empty_admitted_list_allows_no_tools() {
+        let executable = executable_agent_ir(&[], &[]);
+        let session = test_session().with_executable_agent_ir(&executable);
+
+        assert_eq!(session.activation().profile(), ToolProfile::Minimal);
+        assert!(
+            !session
+                .activation()
+                .is_tool_enabled(&ToolName::new("fs.read"))
+        );
+        assert!(
+            !session
+                .activation()
+                .is_tool_enabled(&ToolName::new("custom.tool"))
+        );
+    }
+
+    #[test]
+    fn executable_policy_makes_admitted_tools_visible() {
+        let executable = executable_agent_ir(&["fs.read", "custom.tool"], &[]);
+        let session = test_session().with_executable_agent_ir(&executable);
+
+        assert!(
+            session
+                .activation()
+                .is_tool_enabled(&ToolName::new("fs.read"))
+        );
+        assert!(
+            session
+                .activation()
+                .is_tool_enabled(&ToolName::new("custom.tool"))
+        );
+        assert!(
+            !session
+                .activation()
+                .is_tool_enabled(&ToolName::new("shell.exec"))
+        );
+    }
+
+    #[test]
+    fn executable_policy_forbidden_tool_wins_over_admission() {
+        let executable = executable_agent_ir(&["shell.exec"], &["shell.exec"]);
+        let session = test_session().with_executable_agent_ir(&executable);
+
+        assert!(
+            !session
+                .activation()
+                .is_tool_enabled(&ToolName::new("shell.exec"))
+        );
+    }
+
+    #[test]
+    fn executable_policy_retains_snapshot_id() {
+        let executable = executable_agent_ir(&[], &[]);
+        let snapshot_id = executable.snapshot_id();
+        let session = test_session().with_executable_agent_ir(&executable);
+
+        assert_eq!(session.executable_snapshot_id(), Some(&snapshot_id));
+    }
+
+    #[test]
+    fn normal_session_defaults_to_full_tool_profile() {
+        assert_eq!(test_session().activation().profile(), ToolProfile::Full);
+    }
+
+    #[test]
+    fn test_set_reasoning_effort_round_trips_some_value() {
+        let mut session = test_session();
+        assert_eq!(session.reasoning_effort(), None);
+
+        session.set_reasoning_effort(Some(ReasoningEffort::High));
+
+        assert_eq!(session.reasoning_effort(), Some(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn test_set_reasoning_effort_none_resets_to_provider_default() {
+        let mut session = test_session().with_reasoning_effort(Some(ReasoningEffort::Medium));
+        assert_eq!(session.reasoning_effort(), Some(ReasoningEffort::Medium));
+
+        session.set_reasoning_effort(None);
+
+        assert_eq!(session.reasoning_effort(), None);
+    }
+
+    #[test]
+    fn test_set_reasoning_effort_overwrites_previous_value() {
+        let mut session = test_session().with_reasoning_effort(Some(ReasoningEffort::Low));
+
+        session.set_reasoning_effort(Some(ReasoningEffort::Minimal));
+
+        assert_eq!(session.reasoning_effort(), Some(ReasoningEffort::Minimal));
+    }
+
+    #[test]
+    fn test_agent_session_active_model_default_is_none() {
+        let session = test_session();
+        assert_eq!(session.active_model(), None);
+    }
+
+    #[test]
+    fn test_agent_session_set_active_model_persists() {
+        let mut session = test_session();
+        let model = ModelId::from("claude-opus-4");
+
+        session.set_active_model(Some(model.clone()));
+
+        assert_eq!(session.active_model(), Some(&model));
+
+        // Clearing resets to None.
+        session.set_active_model(None);
+        assert_eq!(session.active_model(), None);
+    }
+
+    #[test]
+    fn test_agent_session_set_active_provider_persists() {
+        let mut session = test_session();
+        let provider = ProviderId::from("anthropic");
+
+        session.set_active_provider(Some(provider.clone()));
+
+        assert_eq!(session.active_provider(), Some(&provider));
+
+        // Builder-style with_active_provider also works.
+        let session2 = test_session().with_active_provider(Some(provider.clone()));
+        assert_eq!(session2.active_provider(), Some(&provider));
+
+        // Clearing resets to None.
+        let mut session3 = test_session().with_active_provider(Some(provider));
+        session3.set_active_provider(None);
+        assert_eq!(session3.active_provider(), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Interaktionsmodus (W2-15)
+    // -----------------------------------------------------------------------
+
+    /// Baut eine Sandbox auf dem echten Harness-Verzeichnis mit genau den
+    /// übergebenen Permissions. Kein Netzwerk, kein Schreibzugriff — nur die
+    /// Auflösung eines bereits vorhandenen Pfades.
+    fn test_sandbox(permissions: &[Permission]) -> SandboxSpec {
+        let harness_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("harw-core hat ein Workspace-Elternverzeichnis")
+            .to_path_buf();
+        let registry = WorkspaceRegistry::build(
+            &harness_root,
+            [WorkspaceRegistration {
+                tenant: TenantId::from_str("test-tenant"),
+                workspace: WorkspaceId::from_str("core-mode-tests"),
+                root: PathBuf::from("harw-core"),
+            }],
+        )
+        .expect("Test-Workspace ist registrierbar");
+        SandboxSpec::from_resolved(
+            registry
+                .resolve(
+                    &TenantId::from_str("test-tenant"),
+                    &WorkspaceId::from_str("core-mode-tests"),
+                )
+                .expect("Test-Workspace löst auf"),
+            PermissionSet::from_policy(permissions.iter().copied()),
+        )
+    }
+
+    fn test_spawn_context(permissions: &[Permission]) -> SpawnContext {
+        SpawnContext {
+            sandbox: test_sandbox(permissions),
+            suggestions: None,
+            capability_snapshot: None,
+            approval_actor: None,
+            organizational_role: AgentRoleId::RootOrchestrator,
+            trace: None,
+            ceiling: None,
+        }
+    }
+
+    fn session_with_permissions(permissions: &[Permission]) -> AgentSession {
+        test_session().with_spawn_context(test_spawn_context(permissions))
+    }
+
+    fn permissions_of(session: &AgentSession) -> PermissionSet {
+        session
+            .spawn_context()
+            .expect("Test-Session hat einen Spawn-Kontext")
+            .sandbox
+            .permissions()
+            .clone()
+    }
+
+    #[test]
+    fn test_default_mode_is_chat() {
+        assert_eq!(test_session().mode(), InteractionMode::Chat);
+    }
+
+    #[test]
+    fn test_with_mode_sets_and_applies_without_emitting_an_event() {
+        let (turn_tx, mut turn_rx) = mpsc::unbounded_channel();
+        let session = test_session()
+            .with_turn_event_sink(turn_tx)
+            .with_mode(InteractionMode::Explore);
+
+        assert_eq!(session.mode(), InteractionMode::Explore);
+        assert_eq!(session.activation().profile(), ToolProfile::Minimal);
+        assert!(
+            turn_rx.try_recv().is_err(),
+            "der Aufbau einer Session ist kein Moduswechsel"
+        );
+    }
+
+    #[test]
+    fn test_set_mode_emits_mode_changed_with_canonical_name() {
+        let (turn_tx, mut turn_rx) = mpsc::unbounded_channel();
+        let mut session =
+            session_with_permissions(&[Permission::ReadWorkspace]).with_turn_event_sink(turn_tx);
+
+        session.set_mode(InteractionMode::Explore);
+
+        let event = turn_rx.try_recv().expect("ModeChanged wird gesendet");
+        assert!(
+            matches!(event, TurnEvent::ModeChanged { mode } if mode == "explore"),
+            "das Event muss den kanonischen Modusnamen tragen"
+        );
+    }
+
+    #[test]
+    fn test_set_mode_without_event_sink_is_a_no_op_for_events() {
+        // Ohne Sink darf set_mode nicht scheitern und muss trotzdem wirken.
+        let mut session = session_with_permissions(&[Permission::WriteWorkspace]);
+        session.set_mode(InteractionMode::Explore);
+        assert_eq!(session.mode(), InteractionMode::Explore);
+        assert!(!permissions_of(&session).contains(Permission::WriteWorkspace));
+    }
+
+    #[test]
+    fn test_set_mode_explore_disables_write_and_shell_tools() {
+        let mut session = session_with_permissions(&[
+            Permission::ReadWorkspace,
+            Permission::WriteWorkspace,
+            Permission::ExecuteProcess,
+        ]);
+        assert!(
+            session
+                .activation()
+                .is_tool_enabled(&ToolName::new("fs.write")),
+            "der Default-Modus Chat filtert nicht"
+        );
+
+        session.set_mode(InteractionMode::Explore);
+
+        assert!(
+            !session
+                .activation()
+                .is_tool_enabled(&ToolName::new("fs.write"))
+        );
+        assert!(
+            !session
+                .activation()
+                .is_tool_enabled(&ToolName::new("shell.exec"))
+        );
+        assert!(
+            session
+                .activation()
+                .is_tool_enabled(&ToolName::new("fs.read"))
+        );
+        assert!(
+            session
+                .activation()
+                .is_tool_enabled(&ToolName::new("deps.source_read"))
+        );
+        assert_eq!(session.activation().profile(), ToolProfile::Minimal);
+    }
+
+    #[test]
+    fn test_set_mode_explore_removes_write_and_execute_permissions() {
+        let mut session = session_with_permissions(&[
+            Permission::ReadWorkspace,
+            Permission::WriteWorkspace,
+            Permission::ExecuteProcess,
+            Permission::NetworkAccess,
+            Permission::ReadCargoRegistry,
+        ]);
+
+        session.set_mode(InteractionMode::Explore);
+
+        let permissions = permissions_of(&session);
+        assert!(permissions.contains(Permission::ReadWorkspace));
+        assert!(permissions.contains(Permission::ReadCargoRegistry));
+        for removed in [
+            Permission::WriteWorkspace,
+            Permission::ExecuteProcess,
+            Permission::NetworkAccess,
+        ] {
+            assert!(
+                !permissions.contains(removed),
+                "Explore muss {removed:?} entziehen"
+            );
+        }
+    }
+
+    #[test]
+    fn test_set_mode_plan_keeps_network_but_not_mutation() {
+        let mut session = session_with_permissions(&[
+            Permission::ReadWorkspace,
+            Permission::WriteWorkspace,
+            Permission::ExecuteProcess,
+            Permission::NetworkAccess,
+        ]);
+
+        session.set_mode(InteractionMode::Plan);
+
+        let permissions = permissions_of(&session);
+        assert!(permissions.contains(Permission::NetworkAccess));
+        assert!(permissions.contains(Permission::ReadWorkspace));
+        assert!(!permissions.contains(Permission::WriteWorkspace));
+        assert!(!permissions.contains(Permission::ExecuteProcess));
+        assert!(
+            session
+                .activation()
+                .is_tool_enabled(&ToolName::new("web.docs_rs"))
+        );
+        assert!(
+            !session
+                .activation()
+                .is_tool_enabled(&ToolName::new("fs.write"))
+        );
+    }
+
+    #[test]
+    fn test_set_mode_work_restores_no_permission_the_sandbox_lacked() {
+        // Monotonie: der Schnitt ist die einzige Operation auf der Sandbox.
+        let mut session =
+            session_with_permissions(&[Permission::ReadWorkspace, Permission::WriteWorkspace]);
+
+        session.set_mode(InteractionMode::Explore);
+        assert!(!permissions_of(&session).contains(Permission::WriteWorkspace));
+
+        session.set_mode(InteractionMode::Work);
+
+        let permissions = permissions_of(&session);
+        assert!(
+            !permissions.contains(Permission::WriteWorkspace),
+            "Work darf eine entzogene Permission nicht zurückgeben"
+        );
+        assert!(
+            !permissions.contains(Permission::ExecuteProcess),
+            "Work darf keine Permission erfinden, die die Session nie hatte"
+        );
+        assert!(permissions.contains(Permission::ReadWorkspace));
+    }
+
+    #[test]
+    fn test_set_mode_work_reopens_tool_activation_only() {
+        let mut session = session_with_permissions(&[Permission::ReadWorkspace]);
+
+        session.set_mode(InteractionMode::Explore);
+        assert!(
+            !session
+                .activation()
+                .is_tool_enabled(&ToolName::new("fs.write"))
+        );
+
+        session.set_mode(InteractionMode::Work);
+
+        assert_eq!(session.activation().profile(), ToolProfile::Full);
+        assert!(
+            session
+                .activation()
+                .is_tool_enabled(&ToolName::new("fs.write")),
+            "die Tool-Aktivierung ist nicht monoton — die Sandbox trägt die Grenze"
+        );
+        assert!(
+            !permissions_of(&session).contains(Permission::WriteWorkspace),
+            "ein wieder sichtbares Werkzeug bekommt keine Autorität zurück"
+        );
+    }
+
+    #[test]
+    fn test_set_mode_drops_earlier_tool_overrides() {
+        let mut session = session_with_permissions(&[Permission::ReadWorkspace]);
+        session
+            .activation_mut()
+            .enable_tool(ToolName::new("shell.exec"));
+
+        session.set_mode(InteractionMode::Explore);
+
+        assert!(
+            !session
+                .activation()
+                .is_tool_enabled(&ToolName::new("shell.exec")),
+            "ein alter enable_tool-Override darf kein Werkzeug in Explore retten"
+        );
+    }
+
+    #[test]
+    fn test_set_mode_preserves_the_workspace_binding() {
+        let before = test_sandbox(&[Permission::ReadWorkspace, Permission::WriteWorkspace]);
+        let mut session = test_session().with_spawn_context(SpawnContext {
+            sandbox: before.clone(),
+            suggestions: None,
+            capability_snapshot: None,
+            approval_actor: None,
+            organizational_role: AgentRoleId::RootOrchestrator,
+            trace: None,
+            ceiling: None,
+        });
+
+        session.set_mode(InteractionMode::Explore);
+
+        let after = session
+            .spawn_context()
+            .expect("Spawn-Kontext bleibt erhalten")
+            .sandbox
+            .clone();
+        assert_eq!(before.workspace(), after.workspace());
+        assert!(after.ensure_child_of(&before).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Trace-Kontext (AW1-01b)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_with_spawn_context_preserves_the_trace_context() {
+        let trace = TraceContext::new("a".repeat(32), "b".repeat(16)).expect("valid trace context");
+        let mut context = test_spawn_context(&[Permission::ReadWorkspace]);
+        context.trace = Some(trace.clone());
+
+        let session = test_session().with_spawn_context(context);
+
+        assert_eq!(
+            session
+                .spawn_context()
+                .expect("session has a spawn context")
+                .trace,
+            Some(trace)
+        );
+    }
+
+    #[test]
+    fn test_spawn_context_without_a_trace_stays_none_through_construction() {
+        let session = session_with_permissions(&[Permission::ReadWorkspace]);
+
+        assert!(
+            session
+                .spawn_context()
+                .expect("session has a spawn context")
+                .trace
+                .is_none(),
+            "a context built without a trace must not gain one along the way"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Kontext-Decke (AW2-02)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_with_spawn_context_preserves_the_context_ceiling() {
+        // `with_spawn_context` deliberately restricts only `sandbox` via the
+        // mode's permission ceiling (see its doc comment above); the context
+        // ceiling is a separate authority cut entirely by
+        // `ManagedAgentSpawner::admit` at handoff time, and must survive
+        // session construction untouched — the same guarantee already
+        // covered for `trace` above.
+        let ceiling = ContextCeiling {
+            sections: [SectionName::try_new("history.tail").expect("valid section name")]
+                .into_iter()
+                .collect(),
+            max_trust: TrustClass::Evidence,
+            budget: ContextBudgetSpec {
+                total: harw_lens_types::BudgetSpec { total: 500 },
+                per_section: std::collections::BTreeMap::new(),
+            },
+        };
+        let mut context = test_spawn_context(&[Permission::ReadWorkspace]);
+        context.ceiling = Some(ceiling.clone());
+
+        let session = test_session().with_spawn_context(context);
+
+        assert_eq!(
+            session
+                .spawn_context()
+                .expect("session has a spawn context")
+                .ceiling,
+            Some(ceiling),
+            "with_spawn_context must not silently widen, narrow, or drop the context ceiling"
+        );
+    }
+
+    #[test]
+    fn test_spawn_context_without_a_ceiling_stays_none_through_construction() {
+        let session = session_with_permissions(&[Permission::ReadWorkspace]);
+
+        assert!(
+            session
+                .spawn_context()
+                .expect("session has a spawn context")
+                .ceiling
+                .is_none(),
+            "a context built without a ceiling must not gain one along the way; \
+             `admit` — not construction — is where `None` is later read as fail-closed"
+        );
+    }
+
+    #[test]
+    fn test_mode_ceiling_is_independent_of_builder_order() {
+        let permissions = [
+            Permission::ReadWorkspace,
+            Permission::WriteWorkspace,
+            Permission::ExecuteProcess,
+        ];
+        let mode_first = test_session()
+            .with_mode(InteractionMode::Explore)
+            .with_spawn_context(test_spawn_context(&permissions));
+        let mut context_first = test_session().with_spawn_context(test_spawn_context(&permissions));
+        context_first.set_mode(InteractionMode::Explore);
+
+        assert_eq!(permissions_of(&mode_first), permissions_of(&context_first));
+        assert!(!permissions_of(&mode_first).contains(Permission::WriteWorkspace));
+    }
+
+    #[test]
+    fn test_set_mode_without_spawn_context_still_filters_tools() {
+        let mut session = test_session();
+        assert!(session.spawn_context().is_none());
+
+        session.set_mode(InteractionMode::Explore);
+
+        assert_eq!(session.mode(), InteractionMode::Explore);
+        assert!(session.spawn_context().is_none());
+        assert!(
+            !session
+                .activation()
+                .is_tool_enabled(&ToolName::new("fs.write"))
+        );
+    }
+}

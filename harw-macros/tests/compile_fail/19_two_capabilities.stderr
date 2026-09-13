@@ -1,0 +1,5 @@
+error: `capability` doppelt angegeben
+  --> tests/compile_fail/19_two_capabilities.rs:11:5
+   |
+11 |     capability = ReadProcStat,
+   |     ^^^^^^^^^^

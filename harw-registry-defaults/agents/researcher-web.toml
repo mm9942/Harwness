@@ -1,0 +1,50 @@
+# Eingebauter Web-Rechercheur (AP W3-04) — Registry-Profil `Research`.
+#
+# Die einzige eingebaute Rolle mit Netzzugang. Der Zugang bleibt doppelt
+# begrenzt: `web.*` ist nur die Tool-Oberflaeche, die tatsaechlich erreichbaren
+# Hosts bestimmt die Allowlist der Sandbox.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.researcher-web@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "researcher-web"
+
+name = "Web Documentation Researcher"
+description = "Holt offizielle Dokumentation und Crate-Metadaten ueber die Host-Allowlist der Sandbox."
+
+[research]
+sources = ["official-docs", "official-repositories", "release-notes"]
+freshness = "required"
+primary_sources_required = true
+output = "verified-research-records"
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+  "web.fetch",
+  "web.docs_rs",
+  "web.crates_io",
+]
+forbidden = ["fs.write", "shell.exec"]
+
+[spawn]
+max_depth = 1
+
+[spawn.budget]
+max_tokens = 60000
+max_tool_calls = 40
+max_wall_secs = 180
+
+[return]
+contract = "harwness.return.research-finding@1"

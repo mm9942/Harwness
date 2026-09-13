@@ -1,0 +1,5 @@
+error: FromRawArgs verlangt ein Struct mit benannten Feldern
+ --> tests/compile_fail/04_tuple_struct.rs:6:1
+  |
+6 | struct TupleArgs(Option<String>);
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -1,0 +1,47 @@
+GOLDEN RENDER — harwness.context.explore@1
+============================================
+STATUS: ursprünglich von Hand aus der Renderlogik abgeleitet, inzwischen
+gegen `harw_agent_dsl::context_program::render_context_program` abgeglichen
+(siehe `harw-registry-defaults/tests/context_program_golden.rs`). Die
+ursprüngliche Ableitung enthielt rollen-spezifische Erfindungen (z. B. je
+Programm anderer Text für `task.objective` trotz identischer `(name, detail,
+trust)`) und in zwei Fällen (`review.golden.txt`, `research-web.golden.txt`)
+frei erfundene `[ref]`-Beispieldaten (Turnnummern, Zeitstempel, Digests), die
+ein reiner Renderer — der nur `ResolvedContextProgramDefinition` erhält, keine
+echten Verlaufsdaten — grundsätzlich nicht erzeugen kann; diese Stellen wurden
+auf einen für alle Programme einheitlichen, rollen-neutralen Platzhalter
+korrigiert (§ Doku von `render_context_program`).
+Quelle der Ableitung:
+  - Sektionsliste/Reihenfolge: `resolve_context_program` (Basis zuerst, dann
+    eigene Sektionen in Deklarationsreihenfolge) angewandt auf
+    `base.toml` + `explore.toml`.
+  - Rendertext je Sektion: fester, rollen-neutraler Platzhalter `<...>`, da
+    die tatsächliche Fragment-Montage in `harw-core` liegt (außerhalb dieses
+    Knotens) — `render_context_program` kennt nur `name`/`detail`, keine
+    Rollenbeschreibung.
+  - `[ref]`-Zeilenformat (falls References-Sektion vorhanden) folgt wörtlich
+    den Feldnamen aus `harw-context/src/reference.rs`,
+    `impl Display for FragmentReference`, mit spitzen Platzhaltern statt
+    erfundener Beispielwerte.
+
+Aufgelöste Sektionsreihenfolge (base zuerst, dann explore):
+  1. task.objective       strength=must-include  detail=full       trust=instruction   [von base]
+  2. history.tail         strength=must-include  detail=summary    trust=evidence      [von base]
+  3. task.read_scope      strength=must-include  detail=full       trust=data          [von explore]
+  4. repo.tree            strength=normal        detail=summary    trust=evidence      [von explore]
+
+Ausschluss (Union, base zuerst): plan.*
+
+--- Gerenderter Turn-Kontext (Platzhalter-Inhalt) ---
+
+## task.objective [instruction]
+<vollständiger Auftragstext des aktuellen Turns>
+
+## history.tail [evidence]
+<zusammengefasster jüngster Verlauf der letzten Turns, gemäß HISTORY_TAIL_GUARANTEED_GROUPS vollständig, älteres ggf. bereits als [ref] verkürzt>
+
+## task.read_scope [data]
+<vollständige Glob-/Verzeichnisliste des erlaubten Lesebereichs>
+
+## repo.tree [evidence]
+<zusammengefasster Verzeichnis-/Modulbaum als Navigationsstartpunkt>

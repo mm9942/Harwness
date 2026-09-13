@@ -1,0 +1,247 @@
+# Eingebaute Security-Familie (§14 DSL-Spec, Knoten AW6-01) — der Rollenvorrat
+# des künftigen Security-Clans.
+#
+# ══════════════════════════════════════════════════════════════════════════════
+# Namensableitung (AW6-00-Konvention): dieser Pfad IST der Name.
+# ══════════════════════════════════════════════════════════════════════════════
+# `agents/families/security/security.toml` ergibt gemäß der in AW6-00
+# eingeführten Verzeichniskonvention (`harw_registry_defaults::embedded_agents`,
+# Abschnitt "Verzeichniskonvention") den Family-Namen
+# `"families/security/security"`. Seit AW6-00 ist eine Namenskollision zweier
+# Dateien ein harter, benannter Fehler (`reject_duplicate_names`) — kein
+# stiller Vorrang mehr. Der Name wurde gegen die bestehenden Familien
+# (`family/research`, `family/coding`) und gegen keine andere bekannte Datei
+# unter `agents/` geprüft; er kollidiert mit nichts Bestehendem.
+#
+# WICHTIG — TOML-Reihenfolge (wie in `research.toml`/`coding.toml`): alle
+# Wurzelfelder (`schema`, `id`, `version`, `name`, `invariants`) stehen VOR der
+# ersten Tabellenüberschrift. Nach `[universe]` geschrieben würden sie zu
+# `universe.schema` usw. und `RawFamilyDefinition`/`AuthorityCeiling` lehnten
+# das beim Deserialisieren ab (`AuthorityCeiling` hat nur `capabilities`).
+
+schema = "harwness.family/v1"
+id = "harwness.family.security@1"
+version = "1.0.0"
+name = "Harwness Security Family"
+
+# Familienweite Invarianten. Jede ist an etwas Nachprüfbarem festgemacht — kein
+# reines Versprechen:
+#   * `universe_disjoint_from_other_families` — durch den Disjunktheitstest in
+#     `harw-agent-dsl/src/family.rs`/`authority.rs` bewiesen, nicht nur behauptet.
+#   * `triage_never_calls_productive_tools` — eine Folge der Disjunktheit,
+#     sobald ein künftiger Konsument Tool-Zulassung gegen `universe` prüft
+#     (heute deklarativ, siehe Kommentar bei `[universe]` unten).
+#   * `verdicts_are_proposals_never_commits` — Spiegelbild der Philosophie aus
+#     AW6-04/AW6-06 ("schlägt vor, committet nie"), hier vorweggenommen für den
+#     Verdict-Vertrag aus AW6-02.
+invariants = [
+  "universe_disjoint_from_other_families",
+  "triage_never_calls_productive_tools",
+  "verdicts_are_proposals_never_commits",
+]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Die tragende Zusicherung — `universe` und Disjunktheit.
+# ══════════════════════════════════════════════════════════════════════════════
+# `universe` ist eine additive Erweiterung von `RawFamilyDefinition`
+# (`harw-agent-dsl/src/family.rs`, Knoten AW6-01) und wiederverwendet den
+# bereits vorhandenen, sortiert-deduplizierten Mengentyp `AuthorityCeiling`
+# (`harw-agent-dsl/src/authority.rs`) — nicht, weil `universe` dasselbe
+# Konzept wie die Authority-Decke eines einzelnen Agenten wäre (§7 reduziert
+# Authority entlang einer *Vererbungskette*), sondern weil beide Konzepte
+# dieselbe Mengenalgebra brauchen: eine sortierte, deduplizierte
+# Capability-Menge mit `intersect`. `universe` ist die obere Schranke dessen,
+# was IRGENDEIN Mitglied dieser Familie jemals an Capabilities tragen darf —
+# quer über alle künftigen Rollen hinweg, nicht pro Agent.
+#
+# Warum das die eigentliche Arbeit ist: ein Triage-Agent liest
+# angreiferkontrollierte Sensorfelder (rohe Scan-Ergebnisse, Prozess- und
+# Netzwerktelemetrie). Überschneidet sich sein `universe` mit dem einer
+# Familie, die produktive Werkzeuge trägt (z. B. `family/coding`, sobald sie
+# eine schreibende Rolle bekommt), dann ist der Weg von "ein Angreifer
+# schreibt einen Dateinamen in ein Sensorfeld" zu "ein Agent ruft ein Werkzeug
+# damit auf" offen — ohne dass irgendwo eine einzelne Regel verletzt wurde.
+# Die Disjunktheit ist deshalb keine Fleißaufgabe, sondern die Eigenschaft,
+# die diesen Angriffspfad an der Wurzel abschneidet.
+#
+# Die Capability-Namen unten sind bewusst unter dem Präfix `security.`
+# gruppiert — disjunkt zu den bereits verwendeten Präfixen `filesystem.`,
+# `process.` und `agent.` aus `harw-agent-dsl/src/authority.rs` und zu den
+# `[tools]`-Labels der bestehenden Rollen (`fs.*`, `shell.*`, `web.*`,
+# `deps.*`, `plan`, `goal`). Jeder Eintrag ist auf eine der drei künftigen
+# Rollengruppen zurückführbar, ohne sie beim Namen zu nennen (§ Auftrag:
+# "Deklariere die Aufnahmefähigkeit, nicht die Bewohner"):
+#   * `security.sensor.read`        — Triage: rohe, ggf. angreiferkontrollierte
+#                                      Sensor-/Telemetriefelder lesen.
+#   * `security.scanreport.read`    — Triage: aufbereitete DoD-Scanberichte lesen.
+#   * `security.verdict.propose`    — Triage + Context Steward: einen Befund
+#                                      vorschlagen (§ AW6-02
+#                                      `harwness.security-verdict/v1`) — niemals
+#                                      committen; das Committen bleibt einer
+#                                      autoritativen Instanz vorbehalten, analog
+#                                      zu AW6-04/AW6-06 ("schlägt vor, committet
+#                                      nie").
+#   * `security.context.read`       — Triage + Context Steward: das kuratierte
+#                                      Sicherheits-Kontextfenster lesen.
+#   * `security.context.curate`     — Context Steward: das Kontextfenster
+#                                      pflegen (u. a. seine "drei Nullzähler",
+#                                      § AW6-08).
+#   * `security.advisory.correlate` — Intel-Scout: `Cargo.lock`-Einträge gegen
+#                                      Advisories korrelieren (§ AW7-06
+#                                      `find_locked`).
+#
+# Diese Liste ist heute NICHT gegen einen Runtime-Konsumenten verdrahtet, der
+# Tool-Zulassung (`[tools].admitted`) gegen `universe` prüft — dieser
+# Wellenknoten liefert die deklarative Zusicherung und ihren Beweis
+# (Disjunktheitstest in `harw-agent-dsl/src/authority.rs` und
+# `harw-agent-dsl/src/family.rs`), nicht die Laufzeitdurchsetzung. Ein
+# künftiger Konsument kann `AuthorityCeiling::is_disjoint_from` exakt so
+# wiederverwenden, wie der Test es hier tut.
+[universe]
+capabilities = [
+  "security.advisory.correlate",
+  "security.context.curate",
+  "security.context.read",
+  "security.scanreport.read",
+  "security.sensor.read",
+  "security.verdict.propose",
+]
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WICHTIG — diese Familie hat heute noch keine Bewohner.
+# ══════════════════════════════════════════════════════════════════════════════
+# `harw_registry_defaults::profile::role_names::ALL` kennt fünf Rollen
+# (explorer, researcher-deps, researcher-web, planner, analyst) — keine davon
+# ist eine Sicherheitsrolle. Die tatsächlichen Bewohner kommen aus späteren,
+# unabhängigen Knoten:
+#   * AW6-03 — vier Triage-Spezialisierungen (`agents/roles/security-*/**`),
+#     Fan-out über Zellen mit `write_partition = "none"`.
+#   * AW6-08 — Context Steward (`agents/roles/context-steward/**`).
+#   * AW7-06 — Intel-Scout (`agents/roles/intel-scout/**`).
+# Genau wie `coding.toml` es für den Coding-Clan vormacht: frei erfundene IDs
+# stehen hier bewusst *nicht* in `[orchestrators]`/`[workers]` — eine Family,
+# die eine nicht existierende Rolle erlaubt, verspricht eine Fähigkeit, die die
+# Runtime beim Spawn nicht einlösen kann. Deshalb bleiben beide Roster unten
+# leer (Standardwert von `FamilyRoster`), bis AW6-03/AW6-08/AW7-06 ihre
+# Rollendateien anlegen.
+#
+# ── Befund: das Roster nimmt eine neue Rolle NICHT automatisch auf ──────────
+# Die AW6-00-Konvention macht "eine neue Rolle anlegen" zu "eine Datei
+# hinzufügen", ohne eine geteilte Datei zu ändern (§ Modul-Dokumentation
+# `embedded_agents.rs`). Das gilt für die *Entdeckung* der Rollendatei selbst.
+# Es gilt NICHT für ihre *Familienmitgliedschaft*: `FamilyRoster.allowed` ist
+# eine explizite `Vec<DefinitionRef>` (siehe `harw-agent-dsl/src/family.rs`),
+# kein Glob und kein Namensraum-Präfix-Muster. Legt AW6-03 morgen
+# `agents/roles/security-triage-1/security-triage-1.toml` an, wird die Rolle
+# zwar eingesammelt und ist startbar — sie ist aber erst dann Mitglied DIESER
+# Familie (`resolved.workers` enthält ihre ID), wenn jemand ihre
+# `harwness.agent.security-triage-1@1`-Referenz händisch in
+# `[workers] allowed = [...]` dieser Datei einträgt. Diese Datei MUSS sich
+# also ändern, sobald die ersten Bewohner einziehen — das widerspricht dem
+# Ziel von AW6-00 ("eine Definition hinzufügen wird nie zu einer geteilten
+# Datei ändern"), gilt aber nur für die Roster-Mitgliedschaft, nicht für die
+# Rollen-Entdeckung selbst. Das ist ein Befund für AW6-03/AW6-08/AW7-06, kein
+# Bug dieser Datei: sie ist additiv vorbereitet (leeres Roster statt erfundener
+# IDs), aber sie kann die künftige Änderung nicht vermeiden. Eine
+# glob-basierte Roster-Erweiterung wäre eine Grammatik-Erweiterung mit
+# eigenem Entwurfsbedarf (u. a.: darf ein Glob auch Rollen aus fremden
+# Families einfangen? wie wirkt sich das auf bestehende Konsumenten von
+# `ResolvedFamily.workers` aus, die heute eine konkrete ID-Liste erwarten?)
+# und wird hier bewusst NICHT eingeführt — außerhalb des Auftrags von AW6-01.
+# ══════════════════════════════════════════════════════════════════════════════
+# AW6-03 — die vier Triage-Spezialisierungen sind jetzt Bewohner.
+# ══════════════════════════════════════════════════════════════════════════════
+# Jede Rolle unten hat einen eigenen Kopfkommentar in ihrer Rollendatei, der
+# begründet, WAS sie triagiert und AUS WELCHER Ereignisquelle
+# (`harw_dod_signals::EventKind`) sie das tut:
+#   * `security-egress-triage`    — Netz (`EgressFlow`/`ListenerOpened`),
+#     gegen bereits ausgewertete `EgressFlowRule`-Funde.
+#   * `security-baseline-triage`  — Baseline-Abweichung (`HostSample` gegen
+#     `Baseline`), gegen bereits ausgewertete `BaselineDeviationRule`-Funde.
+#   * `security-structure-triage` — Struktur (`StructureDrift`), gegen
+#     bereits ausgewertete `StructureDriftRule`-Funde.
+#   * `security-endpoint-triage`  — die drei Ereignisarten, für die
+#     `harw-dod-rules` heute KEINE eigene `Rule` führt (`ProcessExec`,
+#     `FileWrite`, `AuthEvent`) — Prozess, Dateisystem und Anmeldung gebündelt
+#     in einer Rolle, weil keine der drei allein einen verdichteten Befund
+#     hätte, den sie triagieren könnte.
+#
+# Warum genau vier und keine fünfte: der Sensor-Katalog liefert fünf
+# Ereigniskategorien (Prozess, Netz, Dateisystem, Anmeldung, Struktur), aber
+# nur drei davon (Netz, Struktur, Baseline) haben eine eigene, in
+# `harw-dod-rules` verdrahtete Regel, die sie zu einem `Finding` verdichtet.
+# Eine eigene Rolle je der übrigen drei Rohereignisarten (Prozess,
+# Dateisystem, Anmeldung) hätte je für sich nichts zu triagieren außer
+# unverdichteten Einzelfeldern — "eine leere Datei mit einem Namen", genau
+# die Fehlerklasse, die der Arbeitsplan ausdrücklich benennt. Deshalb bündelt
+# `security-endpoint-triage` alle drei: gemeinsam ergeben sie ein Muster
+# (ein neu geschriebener Pfad, seine Ausführung, ein Anmeldeversuch), das
+# einzeln nicht sichtbar wäre. Keine fünfte Rolle entsteht aus einer
+# Ereignisquelle, für die es keinen Sensor gibt — es gibt keine.
+#
+# Keine dieser vier Rollen bekommt `fs.write` oder `shell.exec`
+# (`[tools].forbidden` in jeder Rollendatei, geprüft durch
+# `test_every_builtin_role_forbids_write_and_shell_tools`); jede hat
+# `[tools].admitted = []` (kein neues Werkzeug-Label nötig, also nichts
+# gegen `AUTO_APPROVED_TOOLS` zu melden) und keine deklariert `[return]`
+# selbst — sie erben `harwness.security-verdict/v1` aus `[defaults]`
+# unten, exakt wie `intel-scout`/`context-steward` es bereits vormachen.
+#
+# `intel-scout` und `context-steward` bleiben hier bewusst AUSSEN VOR: ihre
+# Mitgliedschaft ist ein eigener, an anderer Stelle offen gebliebener Befund
+# (ihre `members/*.toml`-Anträge existieren bereits, sind aber nirgends
+# zusammengeführt) — außerhalb des Auftrags dieses Knotens (AW6-03), der
+# ausschließlich die vier Triage-Spezialisierungen einträgt.
+[orchestrators]
+allowed = []
+
+[workers]
+allowed = [
+  "harwness.agent.security-egress-triage@1",
+  "harwness.agent.security-baseline-triage@1",
+  "harwness.agent.security-structure-triage@1",
+  "harwness.agent.security-endpoint-triage@1",
+]
+
+# `return_contract` ist ein undurchsichtiges Label (siehe
+# `harw-agent-dsl/src/executable.rs::ReturnPipeline`, "diese IR prüft weder
+# Existenz noch Form des Schemas") — dieselbe Konvention, die `coding.toml`
+# und `research.toml` bereits nutzen. Der Wert ist keine Erfindung dieser
+# Datei: `docs/aw-plan.md` benennt `harwness.security-verdict/v1` bereits als
+# Ziel-ID von AW6-02 ("Verdict-Vertrag"). AW6-02 hängt an AW6-01 (dieser
+# Knoten) — diese Familie legt die ID als forward-declared Label fest, AW6-02
+# implementiert den Vertrag dahinter.
+[defaults]
+return_contract = "harwness.security-verdict/v1"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Der Clan — jetzt verdrahtet in `agents/organization/default.toml` (Knoten AW6-03).
+# ══════════════════════════════════════════════════════════════════════════════
+# Ein Clan ist in dieser DSL kein eigener Verzeichniskonventions-Typ — er
+# existiert ausschließlich als `[[clans]]`-Eintrag INNERHALB einer
+# Organisationsdefinition (`harw-agent-dsl/src/organization.rs::RawClanSpec`).
+# Der frühere Entwurf hier (AW6-01) war bewusst auskommentiert, weil
+# `agents/organization/**` außerhalb des damaligen Schreibbereichs lag. Dieser
+# Knoten (AW6-03) hat `agents/organization/default.toml` ausdrücklich
+# zugewiesen bekommen und trägt dort jetzt den `[[clans]]`- und den
+# passenden `[[cells]]`-Eintrag ein — siehe die Kommentare dort für die volle
+# Begründung.
+#
+# Zuschnitt, wie in dieser Datei bereits vorgezeichnet:
+#   * `plan_scope = "security-*"` spiegelt `research-*`/`coding-*`.
+#   * `leader` zeigt auf `harwness.agent.context-steward@1` — der frühere
+#     Platzhalter-Kommentar nannte ihn bereits als plausibelsten Kandidaten
+#     ("er verdichtet wie `analyst` es für `research` tut"). Wie `analyst`
+#     (Leader von `research`/`synthesis`) trägt auch `context-steward`
+#     `role = "worker"`, nicht `role = "child-orchestrator"` — die
+#     Organisationsdatei folgt damit demselben bereits gelebten Präzedenzfall,
+#     nicht einer neuen Ausnahme.
+#   * Die Fan-out-Zelle fährt `write_partition = "none"`, exakt wie der
+#     Arbeitsplan es für AW6-03 benennt ("Fan-out über Zellen mit
+#     `write_partition` None") — Triage-Kinder haben keinen `write_scope`,
+#     also gibt es nichts zu trennen.
+#
+# `intel-scout` und `context-steward` bleiben als Werkzeug-Mitglieder dieses
+# Clans außen vor (siehe die `[workers]`-Begründung oben) — `context-steward`
+# führt hier ausschließlich die Leader-Rolle, unabhängig von seiner (noch
+# offenen) Roster-Mitgliedschaft.

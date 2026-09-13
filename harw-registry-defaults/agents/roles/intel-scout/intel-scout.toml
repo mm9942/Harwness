@@ -1,0 +1,55 @@
+# Eingebauter Intel-Scout (Knoten AW7-06) — erste Rolle der Sicherheitsfamilie
+# (`harwness.family.security@1`, siehe
+# `agents/families/security/security.toml`).
+#
+# Namensableitung (AW6-00-Konvention): Dateistamm `intel-scout` unter
+# `agents/roles/intel-scout/` ergibt den Rollennamen `"intel-scout"`. Die
+# Verzeichnistiefe ist beliebig — `harw_registry_defaults::embedded_agents`
+# sammelt diese Datei über dieselbe rekursive Sammelregel wie jede andere
+# Agentenrolle ein, ohne dass eine geteilte Datei geändert werden musste.
+#
+# Was diese Rolle tut: sie korreliert hereingereichte Sicherheitsmeldungen
+# (Advisories) gegen die tatsächlich gebauten Abhängigkeiten
+# (`Cargo.lock`, über `harw_dod_rules::advisory::correlate_advisories`).
+# Was sie ausdrücklich NICHT tut:
+#   - sie holt keine Advisories selbst — kein Netzzugriff, kein
+#     `web.*`-Werkzeug (siehe `[tools].forbidden` unten und
+#     `harw-dod-rules/src/advisory.rs`-Moduldoku);
+#   - sie trifft keine Eskalationsentscheidung — ihr Ergebnis ist ein
+#     `Finding<RuleChecked>`, den ausschließlich `harw-dod-escalate` triagiert;
+#   - sie schreibt nichts und startet keinen Subprozess (`may_write_code =
+#     false`, kein `shell.exec` in `[tools].admitted`).
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.intel-scout@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "intel-scout"
+
+name = "Intel Scout"
+description = "Korreliert hereingereichte Sicherheits-Advisories gegen das tatsächlich gebaute Cargo.lock; holt selbst keine Advisories und trifft keine Eskalationsentscheidung."
+
+[work]
+mode = "advisory-correlation"
+may_write_code = false
+may_research_web = false
+
+# Die zugelassene Werkzeugoberflaeche. `deps.locked` genuegt fuer den Join
+# gegen `Cargo.lock` (`harw_code_graph::lockfile::parse_lockfile`); `forbidden`
+# benennt insbesondere jedes Netz- und Schreibwerkzeug ausdruecklich, damit
+# eine Ablehnung nachvollziehbar ist statt nur "nicht in admitted".
+[tools]
+admitted = [
+  "deps.locked",
+]
+forbidden = ["fs.write", "shell.exec", "web.fetch", "web.docs_rs", "web.crates_io"]
+
+# Ein reiner Korrelations-Join braucht keine Kind-Agenten.
+[spawn]
+max_depth = 0
+
+[spawn.budget]
+max_tokens = 40000
+max_tool_calls = 20
+max_wall_secs = 120

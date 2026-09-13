@@ -1,0 +1,19 @@
+[package]
+name = "harw-lens-index"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-lens-types = { path = "../harw-lens-types" }
+harw-lens-store = { path = "../harw-lens-store" }
+harw-types = { path = "../harw-types" }
+harw-macros = { path = "../harw-macros" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

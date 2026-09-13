@@ -1,0 +1,26 @@
+[package]
+name = "harw-tool-fs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-extension-api = { path = "../harw-extension-api" }
+harw-macros = { path = "../harw-macros" }
+harw-tools = { path = "../harw-tools" }
+harw-types = { path = "../harw-types" }
+harw-sandbox = { path = "../harw-sandbox" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+# Versionen belegt aus dem Workspace-`Cargo.lock` (siehe AP W2-01..03).
+regex = "1.13.0"
+globset = "0.4.19"
+ignore = "0.4.32"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+tempfile = "3"
+
+[lints]
+workspace = true

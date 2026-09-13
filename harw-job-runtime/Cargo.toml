@@ -1,0 +1,20 @@
+[package]
+name = "harw-job-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-types = { path = "../harw-types" }
+harw-macros = { path = "../harw-macros" }
+# AW1-01: TraceContext lives here (frozen wire form, docs/aw-contract-master.md §A.4).
+# Path dependency only — AW0-01 builds harw-observe in parallel; no version pin.
+harw-observe = { path = "../harw-observe" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+jiff = { workspace = true }
+# TODO(parent cargo add): jiff --features serde   # Timestamp + SignedDuration for leases/budgets/backoff
+# TODO(parent cargo add): backon                  # async retry-backoff EXECUTION (RetryPolicy computes delays, backon drives them)
+
+[lints]
+workspace = true

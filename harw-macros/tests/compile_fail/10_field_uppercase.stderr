@@ -1,0 +1,5 @@
+error: Feldname `Child.Admitted` enthält ungültiges Zeichen 'C'; erlaubt sind nur [a-z0-9_.]
+ --> tests/compile_fail/10_field_uppercase.rs:4:33
+  |
+4 |     let _ = harw_macros::field!("Child.Admitted");
+  |                                 ^^^^^^^^^^^^^^^^

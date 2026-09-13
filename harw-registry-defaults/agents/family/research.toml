@@ -1,0 +1,59 @@
+# Eingebaute Research-Family (§14 DSL-Spec) — der Rollenvorrat des Clans
+# `research` der eingebauten Default-Organisation.
+#
+# Format nach `harw_agent_dsl::family::RawFamilyDefinition`: `schema`, `id`,
+# `version` und `name` sind Pflichtfelder; `orchestrators`, `workers`,
+# `defaults`, `invariants`, `extends` und `patch` sind optional.
+#
+# WICHTIG — TOML-Reihenfolge: `invariants` ist ein Feld der Wurzel-Tabelle und
+# muss deshalb *vor* der ersten Tabellenüberschrift stehen. Nach `[workers]`
+# geschrieben würde es zu `workers.invariants` und beim Deserialisieren
+# abgelehnt (`FamilyRoster` trägt `deny_unknown_fields`).
+#
+# Die Roster nennen ausschließlich Rollen, die als eingebettete Agentendefinition
+# in `harw-registry-defaults/agents/` existieren und in
+# `harw_registry_defaults::profile::role_names::ALL` stehen. Der Test
+# `test_research_family_lists_exactly_the_read_only_research_roles` hält die
+# Liste an diese Konstanten gebunden — ein Tippfehler wird zum Testfehler, nicht
+# zu einer stillschweigend unbekannten Rolle.
+
+schema = "harwness.family/v1"
+id = "harwness.family.research@1"
+version = "1.0.0"
+name = "Harwness Research Family"
+
+# Familienweite Invarianten. Jede ist an den eingebetteten Rollen nachprüfbar:
+#   * `workers_are_read_only` — alle drei Worker führen `fs.write` und
+#     `shell.exec` ausdrücklich in `forbidden`.
+#   * `children_never_pause` — `worker-base.toml` setzt `allow_pause = false`;
+#     ein read-only Kind hat keinen Kanal für eine Freigabe.
+#   * `findings_carry_sources` — alle drei Worker geben
+#     `harwness.return.research-finding@1` zurück, also belegte Funde.
+invariants = [
+  "workers_are_read_only",
+  "children_never_pause",
+  "findings_carry_sources",
+]
+
+# Der Analyst ist die einzige eingebaute Rolle mit `max_depth = 2`: nur er darf
+# read-only Kinder starten und deren Rückgaben verdichten. Damit ist er der
+# einzige Kandidat für die Leader-Position eines Research-Clans.
+[orchestrators]
+allowed = ["harwness.agent.analyst@1"]
+
+# Die drei read-only Rechercheure. `explorer` liest Workspace und
+# Dependency-Quellen, `researcher-deps` belegt Dependency-Verhalten aus
+# `Cargo.lock` und dem lokalen Quellcache, `researcher-web` ist die einzige
+# Rolle mit Netzzugang (doppelt begrenzt durch die Host-Allowlist der Sandbox).
+[workers]
+allowed = [
+  "harwness.agent.explorer@1",
+  "harwness.agent.researcher-deps@1",
+  "harwness.agent.researcher-web@1",
+]
+
+# Familienweite Vorgaben. `return_contract` ist hier keine Wiederholung, sondern
+# die gemeinsame Zusage: alle drei Worker liefern denselben Vertrag, ein
+# Konsument muss die Rückgabe also nicht je Rolle unterscheiden.
+[defaults]
+return_contract = "harwness.return.research-finding@1"

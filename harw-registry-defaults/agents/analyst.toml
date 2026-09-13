@@ -1,0 +1,49 @@
+# Eingebauter Analyse-Worker (AP W3-04) — Registry-Profil `ReadOnlyExplore`.
+#
+# Orchestrator-naher Worker: er darf eine Ebene tiefer delegieren als die
+# uebrigen eingebauten Rollen (`max_depth = 2`), bleibt aber selbst read-only
+# und ohne Netzzugang.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.analyst@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "analyst"
+
+name = "Analyst"
+description = "Verdichtet die Funde read-only arbeitender Kinder zu einer belegten Gesamtaussage."
+
+[work]
+mode = "analysis"
+may_write_code = false
+may_research_web = false
+aggregates_child_returns = true
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+]
+forbidden = ["fs.write", "shell.exec", "web.fetch", "web.docs_rs", "web.crates_io"]
+
+# Einzige eingebaute Rolle mit `max_depth = 2`: der Analyst darf read-only
+# Kinder starten und deren Rueckgaben zusammenfuehren.
+[spawn]
+max_depth = 2
+
+[spawn.budget]
+max_tokens = 120000
+max_tool_calls = 64
+max_wall_secs = 600
+
+[return]
+contract = "harwness.return.research-finding@1"

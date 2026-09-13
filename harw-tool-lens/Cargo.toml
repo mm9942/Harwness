@@ -1,0 +1,37 @@
+[package]
+name = "harw-tool-lens"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-extension-api = { path = "../harw-extension-api" }
+harw-home = { path = "../harw-home" }
+harw-lens = { path = "../harw-lens" }
+harw-lens-federation = { path = "../harw-lens-federation" }
+harw-macros = { path = "../harw-macros" }
+harw-tools = { path = "../harw-tools" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# `ask_embedder()` (siehe `src/provenance.rs`) baut bei konfiguriertem
+# Endpunkt ein `harw_lens::HttpEmbedBackend`, das einen `secrecy::SecretString`
+# als API-Key entgegennimmt -- dieselbe Version, die `harw-lens-embed` bereits
+# gegen `Cargo.lock` aufgelöst hat (0.10.3), keine zweite Auflösung.
+secrecy = "0.10.3"
+# `lens_ask` (siehe `src/ask_tool.rs`) ruft `ask_with_home` -- eine
+# synchrone Funktion, die bei konfiguriertem entfernten Einbetter
+# `reqwest::blocking` durchläuft -- über `tokio::task::spawn_blocking` auf,
+# damit ein Aufruf aus dieser async fn heraus nicht mit "Cannot start a
+# runtime from within a runtime" abbricht (siehe
+# `harw_lens_embed::http_backend`s Moduldoku und `provenance.rs`s
+# `//!`-Block). Bisher nur `dev-dependencies`; jetzt Laufzeitabhängigkeit,
+# weil der Aufruf im produktiven Pfad liegt, nicht nur in Tests.
+tokio = { version = "1", features = ["rt"] }
+
+[dev-dependencies]
+harw-lens-query = { path = "../harw-lens-query" }
+harw-sandbox = { path = "../harw-sandbox" }
+harw-types = { path = "../harw-types" }
+
+[lints]
+workspace = true

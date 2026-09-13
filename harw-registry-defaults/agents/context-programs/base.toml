@@ -1,0 +1,106 @@
+# Basis aller neun Kontextprogramme der Programmbibliothek (AW6-05).
+#
+# WARUM ES GENAU EINE BASIS GIBT (nicht neun unabhängige Definitionen):
+# Jedes Kontextprogramm trifft implizit eine Sicherheitsentscheidung — welche
+# Sektion in den Kontext darf, mit welchem Vertrauen, und was garantiert
+# draußen bleibt. Neun unabhängige Definitionen wären neun Orte, an denen
+# diese Entscheidung getroffen und gepflegt werden müsste; ändert sich eine
+# Vertrauensregel (z. B. "history.tail ist künftig nur noch `evidence`, nicht
+# mehr `instruction`-fähig"), müsste sie an neun Stellen nachgezogen werden,
+# mit dem Risiko, eine zu vergessen. Diese Basis macht daraus eine Stelle.
+#
+# WICHTIGER BEFUND ZUR GRAMMATIK (siehe `harw-agent-dsl/src/context_program.rs`,
+# `resolve_inner`, Zeilen ~652-693): `extends` ist strukturell additiv, nicht
+# beschränkend.
+#   - Ein Kind übernimmt die vollständigen `sections`/`exclude`-Listen der
+#     Basis (per `merge_section`/`append_unique`) und hängt seine eigenen
+#     `[[sections]]`/`exclude`-Einträge *zusätzlich* an. Es gibt in der
+#     eigenen `extends`-Deklaration KEINEN Mechanismus, eine geerbte Sektion
+#     wieder zu entfernen — `patch.sections.remove` wird nur für
+#     *Overlay-Layer mit identischer `id`* ausgewertet (derselbe Layer-Loop,
+#     Zeilen ~700-721), nicht für die erstmalige `extends`-Definition eines
+#     Kindes. Ein Kind kann eine geerbte Sektion also nur GEZIELT ÜBERSCHREIBEN
+#     (gleicher `name`, andere `strength`/`detail`/`trust` — siehe
+#     `merge_section`), niemals strukturell STREICHEN.
+#   - Für `exclude` gilt dasselbe in die andere Richtung: `append_unique` kann
+#     nur hinzufügen, nie einen von der Basis ererbten Ausschluss aufheben.
+#     Das ist die einzige Richtung, in der "nie über die Basis hinauswachsen"
+#     tatsächlich gilt: der Ausschluss-Fußboden der Basis ist unentfernbar.
+#   - Für `sections`/`must_include` gilt die Analogie zu AW6-01 (Schnitt bei
+#     Familien-`universe`) AUSDRÜCKLICH NICHT: dort ist Schnitt eingebaut
+#     (`MergeOp::Intersect`), hier ist der einzige `Intersect`-Op überhaupt nur
+#     für `patch.exclude.*` erreichbar (`apply_exclude_patch`), NICHT für
+#     `patch.sections.*` (das kennt nur `append`/`remove`/`replace`, siehe
+#     `apply_sections_patch`) und schon gar nicht für die additive
+#     `extends`-Vererbung selbst.
+# Konsequenz für dieses Verzeichnis: die Basis ist der GARANTIERTE BODEN jedes
+# der neun Programme (jede Basis-Sektion ist in jedem abgeleiteten Programm
+# mindestens so eingeschlossen, wie hier deklariert, es sei denn ein Kind
+# überschreibt sie namensgleich mit engerem `detail`/`trust`), nicht dessen
+# Decke. Ein Kind kann wachsen; es kann eine geerbte Sektion verschärfen
+# (z. B. `full` → `references`), aber es kann sie nicht spurlos entfernen.
+# Das ist ein Befund für den zentralen Bericht, keine stille Annahme.
+#
+# SEKTIONSWAHL DER BASIS — und warum genau diese zwei:
+#   - `task.objective`: ohne den eigentlichen Auftrag ist jede weitere
+#     Sektion bedeutungslos; jedes der neun Programme braucht ihn vollständig
+#     (`full`) und mit Instruktions-Vertrauen (`instruction`) — der Auftrag
+#     IST eine Instruktion, keine bloße Evidenz.
+#   - `history.tail`: der bislang einzige produktionsreife Verweisziel-Typ
+#     (`harw_context::DetailMode::References`, Knoten AW5-07,
+#     `harw-core/src/history_tail.rs`). Jedes der neun Programme braucht
+#     zumindest ein knappes Bild des unmittelbar Vorangegangenen, um nicht
+#     bei jedem Turn faktisch bei null anzufangen. Basis-Default ist
+#     `summary` (nicht `full`, nicht `references`) — der Mittelweg, den
+#     einzelne Programme in beide Richtungen verschärfen (siehe deren
+#     Begründung): `plan` und `triage` heben auf `full` an (sie brauchen den
+#     exakten Wortlaut des letzten Austauschs), `research-web` und `review`
+#     senken auf `references` ab (ihr History-Bedarf ist gering, ihr
+#     Volumen an Werkzeug-Transkripten dagegen hoch — siehe dort für die
+#     Kostenrechnung). Vertrauen `evidence`, nicht `instruction`: Historie ist
+#     belegter Verlauf, keine neue Weisung.
+#
+# AUSSCHLUSS DER BASIS — der unentfernbare Fußboden:
+#   - `credential.*`, `secret.*`: keines der neun Programme braucht
+#     Zugangsdaten im Fließtext-Kontext; ein Leck hier ist durch keinen
+#     Nutzen aufzuwiegen. Fail-closed für alle neun, dauerhaft.
+#   - `sibling_transcripts`: aus `worker-base.toml` (AP W3-04) übernommen —
+#     ein Kind sieht nie das Transkript eines Geschwisters. Gilt auch für
+#     `orchestrate`, das zwar *aggregierte* `child.returns` sieht (siehe
+#     dort), aber nie rohe Geschwister-Transkripte.
+#   - `full_parent_transcript`: ebenfalls aus `worker-base.toml` — ein Kind
+#     sieht seinen Auftrag (`task.objective`), nicht das vollständige
+#     Elterngespräch, aus dem dieser Auftrag entstand.
+
+schema = "harwness.context/v1"
+id = "harwness.context.base@1"
+version = "1.0.0"
+
+# WICHTIG (TOML-Fallstrick, siehe Bericht): `exclude` muss hier VOR jedem
+# `[[sections]]`-Eintrag stehen. Ein Array-of-Tables (`[[sections]]`) bleibt
+# in TOML "offen", bis der nächste Tabellen-Header erscheint — ein
+# nachfolgendes bare `exclude = [...]` würde sonst stillschweigend zu einem
+# Feld des zuletzt geöffneten `[[sections]]`-Eintrags statt zu einem
+# Top-Level-Feld von `RawContextProgramDefinition`, und würde dort wegen
+# `#[serde(deny_unknown_fields)]` auf `RawContextSectionSpec` mit einem
+# Parse-Fehler abgewiesen. Genau dieser Fehler steckt (unkompiliert, da
+# ```toml, kein ```rust-Doctest) im "Vollständiges Beispiel" der Moduldoku
+# von `harw-agent-dsl/src/context_program.rs` (Zeilen ~84-110) — siehe Bericht.
+exclude = [
+  "credential.*",
+  "secret.*",
+  "sibling_transcripts",
+  "full_parent_transcript",
+]
+
+[[sections]]
+name = "task.objective"
+strength = "must-include"
+detail = "full"
+trust = "instruction"
+
+[[sections]]
+name = "history.tail"
+strength = "must-include"
+detail = "summary"
+trust = "evidence"

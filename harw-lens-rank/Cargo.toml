@@ -1,0 +1,21 @@
+[package]
+name = "harw-lens-rank"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-lens-types = { path = "../harw-lens-types" }
+
+# Nur für Tests und Dokumentationsbeispiele: baut ChunkDigest-Fixtures über
+# ContentDigest::of. Fließt nie in ein ausgeliefertes Binary — cargo schließt
+# dev-dependencies aus `cargo build --release` aus. Die harte Vorgabe
+# "keine Abhängigkeit, die I/O, Systemzeit oder Zufall kann" gilt der
+# produktiven Abhängigkeitsfläche dieser Crate; blake3 (über ContentDigest)
+# ist ohnehin rein und deterministisch, taucht hier aber ausschließlich in
+# #[cfg(test)]-Code und Doctests auf.
+[dev-dependencies]
+harw-types = { path = "../harw-types" }
+
+[lints]
+workspace = true
