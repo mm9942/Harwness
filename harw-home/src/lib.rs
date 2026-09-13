@@ -49,7 +49,7 @@ pub mod trust;
 pub use error::{HomeError, HomeResult};
 pub use paths::{
     LayerReport, active_profile_name, active_profile_path, auth_path, config_layers,
-    config_layers_report, home_dir, profile_dir,
+    config_layers_report, config_layers_report_at, home_dir, profile_dir,
 };
 pub use scaffold::{Scaffolded, ensure_home};
 pub use trust::{

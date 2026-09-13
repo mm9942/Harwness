@@ -403,9 +403,36 @@ pub fn config_layers(home: &Path) -> HomeResult<Vec<PathBuf>> {
 /// - [`HomeError::Io`] / [`HomeError::TrustStore`]: Trust-Store unlesbar oder
 ///   fehlerhaft, Arbeitsverzeichnis nicht kanonisierbar.
 pub fn config_layers_report(home: &Path) -> HomeResult<LayerReport> {
+    match std::env::current_dir() {
+        Ok(cwd) => config_layers_report_at(home, &cwd),
+        Err(_) => {
+            let profile = active_profile_name(home);
+            config_layers_report_in(home, &profile, None)
+        }
+    }
+}
+
+/// Cwd-explizite Variante von [`config_layers_report`].
+///
+/// # Description
+/// Für Aufrufer, die das Arbeitsverzeichnis bereits kennen (z. B.
+/// `RuntimeSpec::cwd`) und deshalb nicht auf `std::env::current_dir()`
+/// angewiesen sein wollen — insbesondere für Tests, die den
+/// Prozess-Arbeitsordner nicht wechseln dürfen. Das aktive Profil wird genau
+/// wie in [`config_layers_report`] über [`active_profile_name`] ermittelt
+/// (Präzedenz `HARW_PROFILE` → `active_profile`-Datei → [`DEFAULT_PROFILE`]);
+/// nur das Arbeitsverzeichnis kommt von `cwd` statt vom Prozess.
+///
+/// # Arguments
+/// - `home` (`&Path`): Root-Space.
+/// - `cwd` (`&Path`): Arbeitsverzeichnis, dessen `<cwd>/.harw` als Repo-Layer
+///   geprüft wird.
+///
+/// # Errors
+/// Wie [`config_layers_report`].
+pub fn config_layers_report_at(home: &Path, cwd: &Path) -> HomeResult<LayerReport> {
     let profile = active_profile_name(home);
-    let cwd = std::env::current_dir().ok();
-    config_layers_report_in(home, &profile, cwd.as_deref())
+    config_layers_report_in(home, &profile, Some(cwd))
 }
 
 /// Testbarer Kern von [`config_layers_report`] ohne Env-/CWD-Zugriff.
@@ -696,6 +723,35 @@ mod tests {
             assert_eq!(report.untrusted_repo, None);
             assert_eq!(report.status, None);
         }
+    }
+
+    #[test]
+    fn config_layers_report_at_uses_explicit_cwd_without_process_cwd() {
+        // Deckt `config_layers_report_at` gegen zwei Tempdirs ab — eine
+        // freigegebene, eine nicht freigegebene Repo-`.harw` — ohne
+        // `std::env::set_current_dir` zu benutzen (das ist prozessglobal und
+        // würde parallele Tests gegenseitig stören).
+        let home = TempDir::new("at-home");
+        let trusted_repo = repo_with_harw("at-trusted-repo");
+        crate::trust::trust_project(&home.0, &trusted_repo.0).unwrap();
+        let untrusted_repo = repo_with_harw("at-untrusted-repo");
+
+        let trusted_report = config_layers_report_at(&home.0, trusted_repo.0.as_path()).unwrap();
+        assert_eq!(
+            trusted_report.layers.last(),
+            Some(&trusted_repo.0.join(".harw"))
+        );
+        assert_eq!(trusted_report.untrusted_repo, None);
+        assert_eq!(trusted_report.status, Some(TrustStatus::Trusted));
+
+        let untrusted_report =
+            config_layers_report_at(&home.0, untrusted_repo.0.as_path()).unwrap();
+        assert_eq!(untrusted_report.layers.len(), 2);
+        assert_eq!(
+            untrusted_report.untrusted_repo,
+            Some(untrusted_repo.0.join(".harw"))
+        );
+        assert_eq!(untrusted_report.status, Some(TrustStatus::Untrusted));
     }
 
     #[test]

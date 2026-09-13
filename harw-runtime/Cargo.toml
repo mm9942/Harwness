@@ -14,6 +14,7 @@ harw-core = { path = "../harw-core" }
 harw-extension-api = { path = "../harw-extension-api" }
 harw-home = { path = "../harw-home" }
 harw-job-runtime = { path = "../harw-job-runtime" }
+harw-lens-types = { path = "../harw-lens-types" }
 harw-macros = { path = "../harw-macros" }
 harw-memory = { path = "../harw-memory" }
 harw-model-catalog = { path = "../harw-model-catalog" }
@@ -26,12 +27,18 @@ harw-project-discovery = { path = "../harw-project-discovery" }
 harw-provider-http = { path = "../harw-provider-http" }
 harw-registry-defaults = { path = "../harw-registry-defaults" }
 harw-sandbox = { path = "../harw-sandbox" }
+harw-secrets = { path = "../harw-secrets" }
 harw-session-store = { path = "../harw-session-store" }
 harw-types = { path = "../harw-types" }
 # Kein `[workspace.dependencies]`-Eintrag für tokio; Version = Cargo.lock.
-tokio = { version = "1.53.0", features = ["rt"] }
+tokio = { version = "1.53.0", features = ["rt", "sync"] }
 tracing = { workspace = true }
+# secrecy 0.10 wie harw-provider-http/harw-model-catalog (Version = Cargo.lock)
+secrecy = "0.10.3"
 serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

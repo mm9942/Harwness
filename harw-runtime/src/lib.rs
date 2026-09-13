@@ -4,8 +4,16 @@
 //! die Montage die Wellen W2b/W2c gemäß `docs/remediation/CONTRACTS.md` §runtime.
 #![forbid(unsafe_code)]
 
+pub mod approval;
+pub mod budget;
+pub mod ceiling;
+pub mod config;
 pub mod error;
+pub mod model;
+pub mod sandbox;
+pub mod services;
 pub mod spec;
+pub mod trace;
 
 pub use error::{RuntimeError, RuntimeResult};
 pub use spec::{
