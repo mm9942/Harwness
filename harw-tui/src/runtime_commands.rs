@@ -8,9 +8,9 @@
 //!   vertrauenswürdigen [`Principal`], nicht aus einer Konstante.
 //! - [`slash_service_map`] — die Dienste für Slash-Kommandos kommen aus
 //!   [`RuntimeServices::service_map`] mit [`ServiceSurface::Slash`].
-//! - [`validate_tool_toggle`] — `/tools on|off <name>` darf die
-//!   Basis-Aktivierung der Session nie erweitern und meldet Tippfehler als
-//!   Fehler statt als Erfolg.
+//! - [`validate_tool_toggle`] — `/tools on|off <name>` darf die Decke der
+//!   Session (Basis ∩ Modus, `AgentSession::mode_ceiling`) nie erweitern und
+//!   meldet Tippfehler als Fehler statt als Erfolg.
 //!
 //! # Typen
 //! - [`ToolToggleError`] — abgelehnter Tool-Umschaltwunsch.
@@ -25,8 +25,8 @@
 //!
 //! # Beispiel
 //! ```rust,ignore
-//! let base = session.base_activation();
-//! validate_tool_toggle(base, &tool_snapshot, "shell.exec", true)?;
+//! let ceiling = session.mode_ceiling();
+//! validate_tool_toggle(&ceiling, &tool_snapshot, "shell.exec", true)?;
 //! ```
 
 use harw_core::activation::SessionActivation;
@@ -46,6 +46,8 @@ use harw_types::{PermissionTier, Principal};
 ///
 /// # Returns
 /// Die zugeteilte [`PermissionTier`].
+///
+/// Vertrag: Aufrufer folgt in W2d-2/D5 (app.rs).
 #[must_use]
 pub(crate) fn caller_tier(principal: &Principal) -> PermissionTier {
     principal.tier()
@@ -63,6 +65,8 @@ pub(crate) fn caller_tier(principal: &Principal) -> PermissionTier {
 ///
 /// # Returns
 /// Eine frische [`ServiceMap`] für die Slash-Fläche.
+///
+/// Vertrag: Aufrufer folgt in W2d-2/D5 (app.rs).
 #[must_use]
 pub(crate) fn slash_service_map(services: &RuntimeServices) -> ServiceMap {
     services.service_map(ServiceSurface::Slash)
@@ -80,8 +84,8 @@ pub(crate) enum ToolToggleError {
         /// Angefragter Tool-Name.
         name: String,
     },
-    /// Das Einschalten würde die Basis-Aktivierung der Session erweitern.
-    BeyondBase {
+    /// Das Einschalten würde die Decke der Session (Basis ∩ Modus) erweitern.
+    BeyondCeiling {
         /// Angefragter Tool-Name.
         name: String,
     },
@@ -93,9 +97,9 @@ impl std::fmt::Display for ToolToggleError {
             Self::UnknownTool { name } => {
                 write!(f, "unbekanntes Werkzeug '{name}': in dieser Session nicht registriert")
             }
-            Self::BeyondBase { name } => write!(
+            Self::BeyondCeiling { name } => write!(
                 f,
-                "Werkzeug '{name}' kann nicht eingeschaltet werden: die Basis-Freigabe dieser Session erlaubt es nicht"
+                "Werkzeug '{name}' kann nicht eingeschaltet werden: die Decke dieser Session (Basis ∩ Modus) erlaubt es nicht"
             ),
         }
     }
@@ -109,14 +113,14 @@ impl std::error::Error for ToolToggleError {}
 /// # Description
 /// - Ist `tool` nicht in `known_tools` enthalten, ist das ein Fehler — auch
 ///   beim Ausschalten, damit Tippfehler nicht still als Erfolg gelten.
-/// - Beim Einschalten muss die Basis-Aktivierung das Tool erlauben
-///   ([`SessionActivation::is_tool_enabled`]); `/tools` darf Verbote der
-///   Agent-Definition nicht aufheben.
+/// - Beim Einschalten muss die Decke das Tool erlauben
+///   ([`SessionActivation::is_tool_enabled`]); `/tools` darf weder Verbote der
+///   Agent-Definition (Basis) noch des aktiven Modus aufheben.
 /// - Das Ausschalten eines bekannten Tools verengt nur und ist immer zulässig.
 ///
 /// # Arguments
-/// - `base` (`&SessionActivation`): Basis-Aktivierung der Session
-///   (`AgentSession::base_activation`).
+/// - `ceiling` (`&SessionActivation`): Decke der Session = Basis-Aktivierung ∩
+///   Modus-Aktivierung (`AgentSession::mode_ceiling`).
 /// - `known_tools` (`&[(String, bool)]`): `(name, aktuell_aktiv)`-Paare aller
 ///   registrierten Tools; nur die Namen werden ausgewertet.
 /// - `tool` (`&str`): angefragter Tool-Name.
@@ -127,13 +131,13 @@ impl std::error::Error for ToolToggleError {}
 ///
 /// # Errors
 /// - [`ToolToggleError::UnknownTool`], wenn `tool` nicht registriert ist.
-/// - [`ToolToggleError::BeyondBase`], wenn `enable` gesetzt ist und die Basis
-///   das Tool nicht erlaubt.
+/// - [`ToolToggleError::BeyondCeiling`], wenn `enable` gesetzt ist und die
+///   Decke das Tool nicht erlaubt.
 ///
 /// # Concurrency
 /// Rein lesend; sicher aus jedem Thread.
 pub(crate) fn validate_tool_toggle(
-    base: &SessionActivation,
+    ceiling: &SessionActivation,
     known_tools: &[(String, bool)],
     tool: &str,
     enable: bool,
@@ -143,8 +147,8 @@ pub(crate) fn validate_tool_toggle(
             name: tool.to_owned(),
         });
     }
-    if enable && !base.is_tool_enabled(&ToolName::new(tool)) {
-        return Err(ToolToggleError::BeyondBase {
+    if enable && !ceiling.is_tool_enabled(&ToolName::new(tool)) {
+        return Err(ToolToggleError::BeyondCeiling {
             name: tool.to_owned(),
         });
     }
@@ -161,8 +165,8 @@ mod tests {
         vec![("fs.read".to_owned(), true), ("shell.exec".to_owned(), false)]
     }
 
-    /// Basis: nichts erlaubt außer `fs.read`.
-    fn base() -> SessionActivation {
+    /// Decke: nichts erlaubt außer `fs.read`.
+    fn ceiling() -> SessionActivation {
         let mut act = SessionActivation::new(ToolProfile::Minimal);
         act.enable_tool(ToolName::new("fs.read"));
         act
@@ -185,29 +189,29 @@ mod tests {
         let expected = Err(ToolToggleError::UnknownTool {
             name: "fs.raed".to_owned(),
         });
-        assert_eq!(validate_tool_toggle(&base(), &known(), "fs.raed", true), expected);
-        assert_eq!(validate_tool_toggle(&base(), &known(), "fs.raed", false), expected);
+        assert_eq!(validate_tool_toggle(&ceiling(), &known(), "fs.raed", true), expected);
+        assert_eq!(validate_tool_toggle(&ceiling(), &known(), "fs.raed", false), expected);
     }
 
     #[test]
     fn test_validate_tool_toggle_disable_known_tool_is_ok() {
-        assert_eq!(validate_tool_toggle(&base(), &known(), "fs.read", false), Ok(()));
-        assert_eq!(validate_tool_toggle(&base(), &known(), "shell.exec", false), Ok(()));
+        assert_eq!(validate_tool_toggle(&ceiling(), &known(), "fs.read", false), Ok(()));
+        assert_eq!(validate_tool_toggle(&ceiling(), &known(), "shell.exec", false), Ok(()));
     }
 
     #[test]
-    fn test_validate_tool_toggle_enable_forbidden_by_base_is_err() {
+    fn test_validate_tool_toggle_enable_forbidden_by_ceiling_is_err() {
         assert_eq!(
-            validate_tool_toggle(&base(), &known(), "shell.exec", true),
-            Err(ToolToggleError::BeyondBase {
+            validate_tool_toggle(&ceiling(), &known(), "shell.exec", true),
+            Err(ToolToggleError::BeyondCeiling {
                 name: "shell.exec".to_owned()
             })
         );
     }
 
     #[test]
-    fn test_validate_tool_toggle_enable_allowed_by_base_is_ok() {
-        assert_eq!(validate_tool_toggle(&base(), &known(), "fs.read", true), Ok(()));
+    fn test_validate_tool_toggle_enable_allowed_by_ceiling_is_ok() {
+        assert_eq!(validate_tool_toggle(&ceiling(), &known(), "fs.read", true), Ok(()));
     }
 
     #[test]
@@ -215,7 +219,7 @@ mod tests {
         let unknown = ToolToggleError::UnknownTool {
             name: "fs.raed".to_owned(),
         };
-        let beyond = ToolToggleError::BeyondBase {
+        let beyond = ToolToggleError::BeyondCeiling {
             name: "shell.exec".to_owned(),
         };
         assert!(unknown.to_string().contains("fs.raed"));

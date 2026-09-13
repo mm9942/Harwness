@@ -320,6 +320,22 @@ impl std::fmt::Display for TurnRejection {
 }
 impl std::error::Error for TurnRejection {}
 
+// Baut die Modus-Decke (Tool-Profil + Positivliste) für `mode`, unabhängig
+// von jeder konkreten Session — eine reine Funktion von `InteractionMode`
+// nach `SessionActivation`. Gemeinsam genutzt von `AgentSession::apply_mode`
+// (Schnitt mit der Basis wird zur aktuellen Aktivierung) und
+// `AgentSession::mode_ceiling` (derselbe Schnitt, ohne ihn zu speichern),
+// damit beide exakt dieselbe Modus-Seite sehen.
+fn mode_activation(mode: InteractionMode) -> SessionActivation {
+    let mut activation = SessionActivation::new(mode.tool_profile());
+    if let Some(names) = mode.allowed_tools() {
+        for name in names {
+            activation.enable_tool(ToolName::new(*name));
+        }
+    }
+    activation
+}
+
 impl AgentSession {
     pub fn new(
         role: AgentRole,
@@ -545,13 +561,7 @@ impl AgentSession {
     // Werte. Deshalb darf jeder Builder-Schritt, der eine Basis setzt, sie
     // anschließend aufrufen.
     fn apply_mode(&mut self) {
-        let mut mode_activation = SessionActivation::new(self.mode.tool_profile());
-        if let Some(names) = self.mode.allowed_tools() {
-            for name in names {
-                mode_activation.enable_tool(ToolName::new(*name));
-            }
-        }
-        self.activation = self.base_activation.intersect(&mode_activation);
+        self.activation = self.base_activation.intersect(&mode_activation(self.mode));
 
         let ceiling = self.mode.permission_ceiling();
         if let (Some(context), Some(base)) =
@@ -699,18 +709,25 @@ impl AgentSession {
         self.turn_event_tx.as_ref()
     }
 
-    /// Returns a shared reference to the session's activation filter.
+    /// Liefert die aktuelle Aktivierung dieser Session.
     ///
-    /// # Description
-    /// The activation filter controls which tools, instructions providers, and
-    /// context providers are model-visible for this session. Read it in the
-    /// turn-loop to apply filtering before building the model request.
+    /// # Beschreibung
+    /// Steuert, welche Werkzeuge, Instructions-Provider und Context-Provider
+    /// für das Modell sichtbar sind. Der Wert ist stets der Schnitt aus
+    /// [`Self::base_activation`] und der Modus-Decke des aktuellen
+    /// [`InteractionMode`] — also genau [`Self::mode_ceiling`]:
+    /// `apply_mode` schreibt hierher nichts anderes. Unmittelbar nach jedem
+    /// [`Self::set_mode`]-Aufruf gilt daher, dass diese Aktivierung und
+    /// [`Self::mode_ceiling`] für jedes Werkzeug dasselbe Ergebnis liefern.
+    /// Ein Laufzeit-Toggle über [`Self::activation_mut`] (`/tools on|profile`)
+    /// darf diesen Wert danach nur noch gegen die Decke aus
+    /// [`Self::mode_ceiling`] validieren, nie über sie hinaus erweitern.
     ///
     /// # Returns
-    /// Immutable reference to [`SessionActivation`].
+    /// Unveränderliche Referenz auf die aktuelle [`SessionActivation`].
     ///
-    /// # Concurrency
-    /// Read-only; safe from any thread while the session is borrowed.
+    /// # Nebenläufigkeit
+    /// Nur lesend; sicher aus jedem Thread, solange die Session geliehen ist.
     #[must_use]
     pub fn activation(&self) -> &SessionActivation {
         &self.activation
@@ -737,6 +754,35 @@ impl AgentSession {
     #[must_use]
     pub fn base_activation(&self) -> &SessionActivation {
         &self.base_activation
+    }
+
+    /// Liefert die Modus-Decke: die Obergrenze, gegen die Laufzeit-Toggles wie
+    /// `/tools on|profile|reset` validieren müssen.
+    ///
+    /// # Beschreibung
+    /// Der Schnitt aus [`Self::base_activation`] und der Modus-Decke des
+    /// aktuellen [`InteractionMode`] (Profil + Positivliste, siehe
+    /// [`InteractionMode::tool_profile`] und [`InteractionMode::allowed_tools`])
+    /// — dieselbe Modus-Seite, die `apply_mode` auch in [`Self::activation`]
+    /// einsetzt (beide nutzen dieselbe private `mode_activation`-Hilfsfunktion).
+    /// Unmittelbar nach [`Self::set_mode`] liefern [`Self::activation`] und
+    /// dieser Wert deshalb für jedes Werkzeug dasselbe Ergebnis. Ein
+    /// Laufzeit-Toggle wie `/tools on <name>` oder `/tools profile <p>` darf
+    /// die Aktivierung danach nur noch innerhalb dieser Decke bewegen, nie
+    /// über sie hinaus — dieser Wert ist der Referenzpunkt, gegen den ein
+    /// solcher Toggle schneiden muss, nicht die (potenziell weitere) Basis
+    /// allein.
+    ///
+    /// # Returns
+    /// Eine frisch berechnete [`SessionActivation`] — die Modus-Obergrenze,
+    /// kein gespeicherter Zustand.
+    ///
+    /// # Nebenläufigkeit
+    /// Nur lesend, alloziert bei jedem Aufruf eine neue [`SessionActivation`];
+    /// sicher aus jedem Thread, solange die Session geliehen ist.
+    #[must_use]
+    pub fn mode_ceiling(&self) -> SessionActivation {
+        self.base_activation.intersect(&mode_activation(self.mode))
     }
 
     /// Verengt die Basis dauerhaft auf den Schnitt mit `ceiling`.
@@ -1658,5 +1704,87 @@ forbidden = [{forbidden}]
                 .activation()
                 .is_tool_enabled(&ToolName::new("fs.write"))
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // mode_ceiling (W2d1/F-C, T3)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_mode_ceiling_full_mode_keeps_base_disabled_tool_out() {
+        // Basis: Full-Profil mit einem explizit verbotenen Werkzeug. Modus mit
+        // Full-Profil (Work) filtert namensbasiert nicht — die Decke muss das
+        // Verbot der Basis trotzdem durchreichen, kein Modus darf mehr
+        // erlauben als die Basis je trug.
+        let mut base = SessionActivation::new(ToolProfile::Full);
+        base.disable_tool(ToolName::new("x"));
+        let session = test_session()
+            .with_activation(base)
+            .with_mode(InteractionMode::Work);
+
+        let ceiling = session.mode_ceiling();
+
+        assert_eq!(ceiling.profile(), ToolProfile::Full);
+        assert!(!ceiling.is_tool_enabled(&ToolName::new("x")));
+        assert!(ceiling.is_tool_enabled(&ToolName::new("fs.read")));
+    }
+
+    #[test]
+    fn test_mode_ceiling_explore_mode_intersects_allowlist_with_base() {
+        // Basis: Minimal-Profil mit zwei explizit freigeschalteten Namen
+        // ("fs.read" liegt auch in der Explore-Positivliste, "custom.tool"
+        // nicht). Modus: Explore (Minimal + Positivliste). Die Decke darf nur
+        // enthalten, was in beiden Seiten sichtbar ist.
+        let mut base = SessionActivation::new(ToolProfile::Minimal);
+        base.enable_tool(ToolName::new("fs.read"));
+        base.enable_tool(ToolName::new("custom.tool"));
+        let session = test_session()
+            .with_activation(base)
+            .with_mode(InteractionMode::Explore);
+
+        let ceiling = session.mode_ceiling();
+
+        assert_eq!(ceiling.profile(), ToolProfile::Minimal);
+        // In beiden Seiten sichtbar: bleibt sichtbar.
+        assert!(ceiling.is_tool_enabled(&ToolName::new("fs.read")));
+        // Nur in der Basis freigeschaltet, nicht in der Explore-Positivliste:
+        // fällt aus dem Schnitt heraus.
+        assert!(!ceiling.is_tool_enabled(&ToolName::new("custom.tool")));
+        // Nur in der Explore-Positivliste, nicht in der Basis freigeschaltet:
+        // fällt ebenfalls heraus.
+        assert!(!ceiling.is_tool_enabled(&ToolName::new("fs.list")));
+        assert!(!ceiling.is_tool_enabled(&ToolName::new("shell.exec")));
+    }
+
+    #[test]
+    fn test_mode_ceiling_matches_activation_after_set_mode() {
+        // `SessionActivation` hat kein `PartialEq` (siehe activation.rs) —
+        // der Vergleich läuft daher über `is_tool_enabled` an Sondennamen
+        // sowie `profile()`, wie schon `intersect`s eigene Tests in
+        // activation.rs es tun.
+        let mut session = session_with_permissions(&[
+            Permission::ReadWorkspace,
+            Permission::WriteWorkspace,
+            Permission::ExecuteProcess,
+        ]);
+
+        session.set_mode(InteractionMode::Explore);
+
+        let ceiling = session.mode_ceiling();
+        assert_eq!(session.activation().profile(), ceiling.profile());
+        for name in [
+            "fs.read",
+            "fs.write",
+            "shell.exec",
+            "deps.source_read",
+            "custom.tool",
+        ] {
+            let tool = ToolName::new(name);
+            assert_eq!(
+                session.activation().is_tool_enabled(&tool),
+                ceiling.is_tool_enabled(&tool),
+                "activation() muss nach set_mode exakt mode_ceiling() entsprechen für {name}"
+            );
+        }
     }
 }

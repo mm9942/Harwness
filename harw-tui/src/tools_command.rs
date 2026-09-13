@@ -181,9 +181,9 @@ pub fn handle_tools_command(
 /// `profile`), the snapshot is ignored. For the list sub-command (`args == ""`),
 /// the snapshot is used to build the listing output.
 ///
-/// Veraltet ab W2d-2: diese Funktion prüft keine Basis-Grenze — `on <tool>`
-/// kann die Basis-Aktivierung der Session überschreiten und `profile <name>`
-/// wird nicht auf die Basis geschnitten. Aufrufer wechseln zu
+/// Veraltet ab W2d-2: diese Funktion prüft keine Decke (Basis ∩ Modus) —
+/// `on <tool>`, `reset` und `profile <name>` können die Decke der Session
+/// überschreiten. Aufrufer wechseln zu
 /// [`dispatch_tools_command_bounded`]. Kein `#[deprecated]`, da das in
 /// `app.rs` clippy `-D warnings` brechen würde, solange die Migration (Welle
 /// D5) dort nicht nachgezogen ist.
@@ -225,35 +225,39 @@ pub fn dispatch_tools_command(
 }
 
 /// Dispatches a `/tools` command the same way as [`dispatch_tools_command`],
-/// but never lets the session's activation exceed `base` (Welle W2d-1/B,
-/// Befund `w4-tui-control.md` §5).
+/// but never lets the session's activation exceed `ceiling` (Welle W2d-1/B,
+/// Befund `w4-tui-control.md` §5; Fix W2d-1/F-T, Befunde T2/T3/T7).
 ///
 /// # Description
-/// Parses `args` identically to [`dispatch_tools_command`]. Before applying
-/// `on <tool>` or `off <tool>`, the toggle is checked with
-/// [`crate::runtime_commands::validate_tool_toggle`] against `base` and
-/// `tool_snapshot`: an unknown tool name, or an attempt to enable a tool the
-/// base activation forbids, is rejected with
-/// [`ToolsCommandOutcome::Error`] and `activation` is left untouched. After
-/// `profile <name>` applies the new profile, the resulting activation is cut
-/// down to `base` via [`SessionActivation::intersect`] so a profile switch
-/// can never grant more than the session's base activation allows.
+/// `ceiling` is the session's tool ceiling: base activation ∩ mode activation
+/// (`AgentSession::mode_ceiling`). Every sub-command is bounded by it:
 ///
-/// `reset` and `reset <name>` behave exactly as in [`dispatch_tools_command`]
-/// — they only revert per-tool overrides made through this same command and
-/// can never move `activation` beyond `base`, because every prior mutation
-/// through this function was already bounded by `base`.
+/// - `on <tool>` / `off <tool>`: checked first with
+///   `crate::runtime_commands::validate_tool_toggle` against `ceiling` and
+///   `tool_snapshot`. An unknown tool name, or an attempt to enable a tool the
+///   ceiling forbids, is rejected with [`ToolsCommandOutcome::Error`] and
+///   `activation` is left untouched. `off` only narrows and always applies to
+///   a known tool.
+/// - `reset`: replaces `activation` with a copy of `ceiling` — the widest
+///   state this command may ever restore.
+/// - `reset <name>`: sets the named tool to exactly the state `ceiling` gives
+///   it (enabled iff `ceiling.is_tool_enabled(name)`); other tools are
+///   unchanged.
+/// - `profile <p>`: applies the profile, then cuts the result down to
+///   `ceiling` via [`SessionActivation::intersect`]. The confirmation names the
+///   effective state: registered tools the profile would have enabled but the
+///   ceiling withholds are listed together with the effective profile.
 ///
 /// # Arguments
 /// - `args` (`&str`): everything after `/tools` in the user's input.
 /// - `tool_snapshot` (`&[(String, bool)]`): `(tool_name, is_enabled)` pairs
 ///   collected from the registry while holding a shared session borrow; also
-///   used as the known-tool set for toggle validation.
+///   used as the known-tool set for toggle validation and for reporting
+///   withheld tools after `profile`.
 /// - `activation` (`&mut SessionActivation`): current session activation;
-///   mutated only when the requested change is within `base`.
-/// - `base` (`&SessionActivation`): the session's base activation
-///   (`AgentSession::base_activation`), the ceiling `activation` may never
-///   exceed.
+///   mutated only within `ceiling`.
+/// - `ceiling` (`&SessionActivation`): the session ceiling (base ∩ mode),
+///   which `activation` may never exceed.
 ///
 /// # Returns
 /// A [`ToolsCommandOutcome`] ready for rendering.
@@ -261,14 +265,18 @@ pub fn dispatch_tools_command(
 /// # Errors
 /// Returns [`ToolsCommandOutcome::Error`] (rendered via `into_lines`) when
 /// `on`/`off` names an unregistered tool, when `on` would enable a tool
-/// beyond `base`, when `profile` names an unknown profile, or when the
+/// beyond `ceiling`, when `profile` names an unknown profile, or when the
 /// sub-command is unrecognized. No mutation occurs in the error case.
+///
+/// # Concurrency
+/// Pure synchronous function; no locking. The caller owns `activation`
+/// exclusively while this runs.
 #[must_use]
 pub fn dispatch_tools_command_bounded(
     args: &str,
     tool_snapshot: &[(String, bool)],
     activation: &mut SessionActivation,
-    base: &SessionActivation,
+    ceiling: &SessionActivation,
 ) -> ToolsCommandOutcome {
     let trimmed = args.trim();
     let parts: Vec<&str> = if trimmed.is_empty() {
@@ -279,11 +287,11 @@ pub fn dispatch_tools_command_bounded(
 
     match parts.as_slice() {
         [] => list_from_snapshot(tool_snapshot, activation),
-        ["on", name] => bounded_set_tool(activation, base, tool_snapshot, name, true),
-        ["off", name] => bounded_set_tool(activation, base, tool_snapshot, name, false),
-        ["reset"] => reset_all(activation),
-        ["reset", name] => reset_one(activation, name),
-        ["profile", p] => bounded_set_profile(activation, base, p),
+        ["on", name] => bounded_set_tool(activation, ceiling, tool_snapshot, name, true),
+        ["off", name] => bounded_set_tool(activation, ceiling, tool_snapshot, name, false),
+        ["reset"] => bounded_reset_all(activation, ceiling),
+        ["reset", name] => bounded_reset_one(activation, ceiling, name),
+        ["profile", p] => bounded_set_profile(activation, ceiling, tool_snapshot, p),
         _ => ToolsCommandOutcome::Error(
             "usage: /tools | /tools on <name> | /tools off <name> \
              | /tools reset [<name>] | /tools profile <minimal|coding|full>"
@@ -391,49 +399,106 @@ fn set_tool(activation: &mut SessionActivation, name: &str, on: bool) -> ToolsCo
     }
 }
 
-/// Validates and applies a single `on <tool>` / `off <tool>` toggle against a
-/// base activation ceiling.
+/// Validates and applies a single `on <tool>` / `off <tool>` toggle against
+/// the session ceiling (base ∩ mode).
 ///
 /// # Description
-/// Delegates the check to
-/// [`crate::runtime_commands::validate_tool_toggle`]. On `Err`, `activation`
-/// is left untouched and the error's `Display` message is returned as
-/// [`ToolsCommandOutcome::Error`]. On `Ok`, delegates to [`set_tool`] to apply
-/// the change and build the confirmation message.
+/// Delegates the check to `crate::runtime_commands::validate_tool_toggle`.
+/// On `Err`, `activation` is left untouched and the error's `Display` message
+/// is returned as [`ToolsCommandOutcome::Error`]. On `Ok`, delegates to
+/// [`set_tool`] to apply the change and build the confirmation message.
 ///
 /// # Arguments
 /// - `activation` — session activation to mutate on success.
-/// - `base` — ceiling the toggle may never exceed.
+/// - `ceiling` — session ceiling (base ∩ mode) the toggle may never exceed.
 /// - `known_tools` — `(name, enabled)` pairs used to validate `name`.
 /// - `name` — raw tool-name string from the command line.
 /// - `enable` — `true` for `on`, `false` for `off`.
 fn bounded_set_tool(
     activation: &mut SessionActivation,
-    base: &SessionActivation,
+    ceiling: &SessionActivation,
     known_tools: &[(String, bool)],
     name: &str,
     enable: bool,
 ) -> ToolsCommandOutcome {
-    if let Err(err) = crate::runtime_commands::validate_tool_toggle(base, known_tools, name, enable) {
+    if let Err(err) =
+        crate::runtime_commands::validate_tool_toggle(ceiling, known_tools, name, enable)
+    {
         return ToolsCommandOutcome::Error(err.to_string());
     }
     set_tool(activation, name, enable)
 }
 
-/// Applies a `profile <name>` switch, then cuts the resulting activation down
-/// to `base` so the new profile can never grant more than the session's base
-/// activation allows.
+/// Resets the whole activation to the session ceiling (Befund T2).
 ///
 /// # Description
-/// Parses `p` exactly like [`set_profile`]. On success, applies the profile
-/// to `activation` and replaces `activation` with
-/// `activation.intersect(base)` ([`SessionActivation::intersect`]) before
-/// returning the confirmation — an unknown profile name leaves `activation`
-/// untouched.
+/// Replaces `activation` with a copy of `ceiling` (base ∩ mode). Unlike
+/// [`reset_all`], this never widens beyond the ceiling: a fresh activation of
+/// the current profile could re-enable tools the base or mode forbids.
+///
+/// # Arguments
+/// - `activation` — session activation to replace in-place.
+/// - `ceiling` — session ceiling to restore.
+fn bounded_reset_all(
+    activation: &mut SessionActivation,
+    ceiling: &SessionActivation,
+) -> ToolsCommandOutcome {
+    *activation = ceiling.clone();
+    ToolsCommandOutcome::Confirmation(
+        "reset all tool overrides to the session ceiling".to_string(),
+    )
+}
+
+/// Resets one named tool to the state the session ceiling gives it
+/// (Befund T2).
+///
+/// # Description
+/// Clears the tool's overrides with [`SessionActivation::reset_tool`]; if the
+/// resulting profile-only state differs from `ceiling.is_tool_enabled(name)`,
+/// an explicit override is set so the tool ends up enabled exactly when the
+/// ceiling enables it. Other tools are unchanged.
 ///
 /// # Arguments
 /// - `activation` — session activation to mutate.
-/// - `base` — ceiling the resulting activation is intersected with.
+/// - `ceiling` — session ceiling whose state for `name` is adopted.
+/// - `name` — raw tool-name string from the command line.
+fn bounded_reset_one(
+    activation: &mut SessionActivation,
+    ceiling: &SessionActivation,
+    name: &str,
+) -> ToolsCommandOutcome {
+    let tool_name = ToolName::new(name.to_string());
+    let allowed = ceiling.is_tool_enabled(&tool_name);
+    activation.reset_tool(&tool_name);
+    if activation.is_tool_enabled(&tool_name) != allowed {
+        if allowed {
+            activation.enable_tool(tool_name);
+        } else {
+            activation.disable_tool(tool_name);
+        }
+    }
+    let state = if allowed { "on" } else { "off" };
+    ToolsCommandOutcome::Confirmation(format!("reset {name} to session ceiling ({state})"))
+}
+
+/// Applies a `profile <name>` switch, then cuts the resulting activation down
+/// to the session ceiling (Befunde T3/T7).
+///
+/// # Description
+/// Parses `p` exactly like [`set_profile`]. On success, applies the profile
+/// to a copy of `activation`, stores `requested.intersect(ceiling)`
+/// ([`SessionActivation::intersect`]) back into `activation`, and reports the
+/// effective result: when no registered tool (from `known_tools`) and no name
+/// on the requested profile's allow-list was withheld by the ceiling, the
+/// message is `profile set to <p>`; otherwise it names the effective profile
+/// and the withheld tools in sorted order. An unknown profile name leaves
+/// `activation` untouched.
+///
+/// # Arguments
+/// - `activation` — session activation to mutate.
+/// - `ceiling` — session ceiling (base ∩ mode) the result is intersected with.
+/// - `known_tools` — `(name, enabled)` pairs of registered tools, used to
+///   report withheld tools.
 /// - `p` — profile name: `"minimal"`, `"coding"`, or `"full"`.
 ///
 /// # Errors
@@ -441,7 +506,8 @@ fn bounded_set_tool(
 /// profile name; `activation` is not mutated in that case.
 fn bounded_set_profile(
     activation: &mut SessionActivation,
-    base: &SessionActivation,
+    ceiling: &SessionActivation,
+    known_tools: &[(String, bool)],
     p: &str,
 ) -> ToolsCommandOutcome {
     let profile = match p.to_ascii_lowercase().as_str() {
@@ -454,9 +520,35 @@ fn bounded_set_profile(
             ));
         }
     };
-    activation.set_profile(profile);
-    *activation = activation.intersect(base);
-    ToolsCommandOutcome::Confirmation(format!("profile set to {p}"))
+    let mut requested = activation.clone();
+    requested.set_profile(profile);
+    let effective = requested.intersect(ceiling);
+
+    let mut candidates: std::collections::BTreeSet<String> = known_tools
+        .iter()
+        .map(|(name, _)| name.to_owned())
+        .collect();
+    if let Some(allowlist) = profile.allowlist() {
+        candidates.extend(allowlist.into_iter().map(|name| name.0));
+    }
+    let withheld: Vec<String> = candidates
+        .into_iter()
+        .filter(|name| {
+            let tool_name = ToolName::new(name.as_str());
+            requested.is_tool_enabled(&tool_name) && !effective.is_tool_enabled(&tool_name)
+        })
+        .collect();
+
+    *activation = effective;
+    if withheld.is_empty() {
+        ToolsCommandOutcome::Confirmation(format!("profile set to {p}"))
+    } else {
+        ToolsCommandOutcome::Confirmation(format!(
+            "profile {p} limited by session ceiling: effective profile {:?}, withheld: {}",
+            activation.profile(),
+            withheld.join(", ")
+        ))
+    }
 }
 
 /// Resets all per-tool overrides by replacing the activation with a fresh
@@ -580,12 +672,28 @@ mod tests {
         SessionActivation::new(ToolProfile::Full)
     }
 
-    /// Base activation for the `_bounded` tests: `Minimal` profile with only
-    /// `test.alpha` explicitly enabled — `test.beta` stays forbidden.
-    fn bounded_base() -> SessionActivation {
-        let mut base = SessionActivation::new(ToolProfile::Minimal);
-        base.enable_tool(ToolName::new("test.alpha"));
-        base
+    /// Ceiling for the `_bounded` tests: `Minimal` profile with only
+    /// `test.alpha` explicitly enabled (an allowlist) — `test.beta` stays
+    /// forbidden.
+    fn bounded_ceiling() -> SessionActivation {
+        let mut ceiling = SessionActivation::new(ToolProfile::Minimal);
+        ceiling.enable_tool(ToolName::new("test.alpha"));
+        ceiling
+    }
+
+    /// Ceiling for the reset tests: `Full` base with `test.beta` disabled.
+    fn full_ceiling_without_beta() -> SessionActivation {
+        let mut ceiling = SessionActivation::new(ToolProfile::Full);
+        ceiling.disable_tool(ToolName::new("test.beta"));
+        ceiling
+    }
+
+    /// `(name, enabled)` snapshot with both fake tools registered.
+    fn both_known() -> Vec<(String, bool)> {
+        vec![
+            ("test.alpha".to_string(), true),
+            ("test.beta".to_string(), false),
+        ]
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
@@ -789,12 +897,12 @@ mod tests {
     fn test_dispatch_tools_command_bounded_unknown_tool_changes_nothing() {
         let known = vec![("test.alpha".to_string(), true)];
         let mut activation = full_activation();
-        let base = bounded_base();
+        let ceiling = bounded_ceiling();
         let ghost = ToolName::new("test.ghost");
         assert!(activation.is_tool_enabled(&ghost), "Full profile defaults to visible");
 
         let outcome =
-            dispatch_tools_command_bounded("off test.ghost", &known, &mut activation, &base);
+            dispatch_tools_command_bounded("off test.ghost", &known, &mut activation, &ceiling);
 
         assert!(
             matches!(outcome, ToolsCommandOutcome::Error(ref msg) if msg.contains("test.ghost")),
@@ -806,25 +914,25 @@ mod tests {
         );
     }
 
-    /// `on <tool>` beyond what `base` allows is rejected, even though the
+    /// `on <tool>` beyond what `ceiling` allows is rejected, even though the
     /// tool is registered.
     #[test]
-    fn test_dispatch_tools_command_bounded_enable_beyond_base_is_rejected() {
+    fn test_dispatch_tools_command_bounded_enable_beyond_ceiling_is_rejected() {
         let known = vec![
             ("test.alpha".to_string(), false),
             ("test.beta".to_string(), false),
         ];
         let mut activation = SessionActivation::new(ToolProfile::Minimal);
-        let base = bounded_base();
+        let ceiling = bounded_ceiling();
         let beta = ToolName::new("test.beta");
         assert!(!activation.is_tool_enabled(&beta));
 
         let outcome =
-            dispatch_tools_command_bounded("on test.beta", &known, &mut activation, &base);
+            dispatch_tools_command_bounded("on test.beta", &known, &mut activation, &ceiling);
 
         assert!(
             matches!(outcome, ToolsCommandOutcome::Error(ref msg) if msg.contains("test.beta")),
-            "toggle beyond base must be rejected by name"
+            "toggle beyond ceiling must be rejected by name"
         );
         assert!(
             !activation.is_tool_enabled(&beta),
@@ -832,18 +940,18 @@ mod tests {
         );
     }
 
-    /// Disabling a known tool always applies, regardless of `base` — turning
+    /// Disabling a known tool always applies, regardless of `ceiling` — turning
     /// a tool off only narrows, never exceeds, any ceiling.
     #[test]
     fn test_dispatch_tools_command_bounded_disable_known_tool_applies() {
         let known = vec![("test.alpha".to_string(), true)];
         let mut activation = full_activation();
-        let base = bounded_base();
+        let ceiling = bounded_ceiling();
         let alpha = ToolName::new("test.alpha");
         assert!(activation.is_tool_enabled(&alpha));
 
         let outcome =
-            dispatch_tools_command_bounded("off test.alpha", &known, &mut activation, &base);
+            dispatch_tools_command_bounded("off test.alpha", &known, &mut activation, &ceiling);
 
         assert_eq!(
             outcome,
@@ -853,16 +961,17 @@ mod tests {
     }
 
     /// `profile full` would normally allow every tool, but the resulting
-    /// activation must be cut down to `base` — only `test.alpha` (allowed by
-    /// `base`) stays visible, `test.beta` does not.
+    /// activation must be cut down to `ceiling` — only `test.alpha` (allowed by
+    /// `ceiling`) stays visible, `test.beta` does not. With no registered tools
+    /// and no allow-list names withheld, the plain confirmation is honest.
     #[test]
-    fn test_dispatch_tools_command_bounded_profile_is_cut_to_base() {
+    fn test_dispatch_tools_command_bounded_profile_is_cut_to_ceiling() {
         let known: Vec<(String, bool)> = Vec::new();
         let mut activation = SessionActivation::new(ToolProfile::Minimal);
-        let base = bounded_base();
+        let ceiling = bounded_ceiling();
 
         let outcome =
-            dispatch_tools_command_bounded("profile full", &known, &mut activation, &base);
+            dispatch_tools_command_bounded("profile full", &known, &mut activation, &ceiling);
 
         assert_eq!(
             outcome,
@@ -870,11 +979,141 @@ mod tests {
         );
         assert!(
             activation.is_tool_enabled(&ToolName::new("test.alpha")),
-            "base allows test.alpha, so the cut activation must still allow it"
+            "ceiling allows test.alpha, so the cut activation must still allow it"
         );
         assert!(
             !activation.is_tool_enabled(&ToolName::new("test.beta")),
-            "base forbids test.beta, so `profile full` must not resurrect it"
+            "ceiling forbids test.beta, so `profile full` must not resurrect it"
         );
+    }
+
+    /// T2: `reset` restores the ceiling, not a fresh `Full` profile — session
+    /// overrides are dropped, and `test.beta`, disabled by the ceiling, stays
+    /// off.
+    #[test]
+    fn test_dispatch_tools_command_bounded_reset_restores_ceiling() {
+        let known = both_known();
+        let ceiling = full_ceiling_without_beta();
+        let alpha = ToolName::new("test.alpha");
+        let beta = ToolName::new("test.beta");
+        let mut activation = ceiling.clone();
+        activation.disable_tool(ToolName::new("test.alpha"));
+
+        let outcome = dispatch_tools_command_bounded("reset", &known, &mut activation, &ceiling);
+
+        assert_eq!(
+            outcome,
+            ToolsCommandOutcome::Confirmation(
+                "reset all tool overrides to the session ceiling".to_string()
+            )
+        );
+        assert!(activation.is_tool_enabled(&alpha), "ceiling allows test.alpha");
+        assert!(
+            !activation.is_tool_enabled(&beta),
+            "reset must not re-enable test.beta beyond the ceiling"
+        );
+    }
+
+    /// T2: `reset test.beta` adopts the ceiling's state for that tool — the
+    /// override that disables it (from the ceiling itself) must not be cleared
+    /// into the `Full` profile default.
+    #[test]
+    fn test_dispatch_tools_command_bounded_reset_one_keeps_ceiling_disabled_tool_off() {
+        let known = both_known();
+        let ceiling = full_ceiling_without_beta();
+        let beta = ToolName::new("test.beta");
+        let mut activation = ceiling.clone();
+
+        let outcome =
+            dispatch_tools_command_bounded("reset test.beta", &known, &mut activation, &ceiling);
+
+        assert_eq!(
+            outcome,
+            ToolsCommandOutcome::Confirmation("reset test.beta to session ceiling (off)".to_string())
+        );
+        assert!(
+            !activation.is_tool_enabled(&beta),
+            "reset <name> must not re-enable test.beta beyond the ceiling"
+        );
+        assert!(activation.is_tool_enabled(&ToolName::new("test.alpha")));
+    }
+
+    /// T2: after a full `reset` followed by `reset test.beta`, `test.beta`
+    /// is still off, and `reset test.alpha` restores a disabled but allowed
+    /// tool to on.
+    #[test]
+    fn test_dispatch_tools_command_bounded_reset_then_reset_one_stays_within_ceiling() {
+        let known = both_known();
+        let ceiling = full_ceiling_without_beta();
+        let alpha = ToolName::new("test.alpha");
+        let beta = ToolName::new("test.beta");
+        let mut activation = SessionActivation::new(ToolProfile::Full);
+        activation.disable_tool(ToolName::new("test.alpha"));
+
+        let first = dispatch_tools_command_bounded("reset", &known, &mut activation, &ceiling);
+        let second =
+            dispatch_tools_command_bounded("reset test.beta", &known, &mut activation, &ceiling);
+        activation.disable_tool(ToolName::new("test.alpha"));
+        let third =
+            dispatch_tools_command_bounded("reset test.alpha", &known, &mut activation, &ceiling);
+
+        assert!(matches!(first, ToolsCommandOutcome::Confirmation(_)));
+        assert!(matches!(second, ToolsCommandOutcome::Confirmation(_)));
+        assert_eq!(
+            third,
+            ToolsCommandOutcome::Confirmation("reset test.alpha to session ceiling (on)".to_string())
+        );
+        assert!(!activation.is_tool_enabled(&beta), "test.beta stays off");
+        assert!(activation.is_tool_enabled(&alpha), "test.alpha restored to on");
+    }
+
+    /// T3/T9(b): with a `Minimal` + allowlist ceiling, `on <tool outside>` is
+    /// rejected with the `BeyondCeiling` message.
+    #[test]
+    fn test_dispatch_tools_command_bounded_on_outside_ceiling_is_beyond_ceiling() {
+        let known = both_known();
+        let ceiling = bounded_ceiling();
+        let mut activation = ceiling.clone();
+        let expected = crate::runtime_commands::ToolToggleError::BeyondCeiling {
+            name: "test.beta".to_string(),
+        }
+        .to_string();
+
+        let outcome =
+            dispatch_tools_command_bounded("on test.beta", &known, &mut activation, &ceiling);
+
+        assert_eq!(outcome, ToolsCommandOutcome::Error(expected));
+        assert!(!activation.is_tool_enabled(&ToolName::new("test.beta")));
+    }
+
+    /// T7/T9(b): `profile full` under a `Minimal` + allowlist ceiling stays a
+    /// subset of the ceiling for every registered tool, and the confirmation
+    /// names the effective profile and the withheld tool instead of claiming
+    /// "profile set to full".
+    #[test]
+    fn test_dispatch_tools_command_bounded_profile_full_reports_withheld_tools() {
+        let known = both_known();
+        let ceiling = bounded_ceiling();
+        let mut activation = SessionActivation::new(ToolProfile::Minimal);
+
+        let outcome =
+            dispatch_tools_command_bounded("profile full", &known, &mut activation, &ceiling);
+
+        assert_eq!(
+            outcome,
+            ToolsCommandOutcome::Confirmation(
+                "profile full limited by session ceiling: effective profile Minimal, \
+                 withheld: test.beta"
+                    .to_string()
+            )
+        );
+        for (name, _) in &known {
+            let tool = ToolName::new(name.as_str());
+            assert!(
+                !activation.is_tool_enabled(&tool) || ceiling.is_tool_enabled(&tool),
+                "{name} must not be enabled beyond the ceiling"
+            );
+        }
+        assert!(activation.is_tool_enabled(&ToolName::new("test.alpha")));
     }
 }

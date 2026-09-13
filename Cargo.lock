@@ -1983,6 +1983,7 @@ dependencies = [
  "harw-ops",
  "harw-plan",
  "harw-plan-bridge",
+ "harw-protocol",
  "harw-provider-http",
  "harw-registry-defaults",
  "harw-runtime",

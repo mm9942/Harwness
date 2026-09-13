@@ -64,12 +64,26 @@
 //!   [`harw_types::Principal`] ([`crate::runtime_web::web_principal`]) hinein.
 //!   `ServiceMap::insert` überschreibt gleichen Typs — der Owner-Principal
 //!   der Montage wird so durch den des Peers ersetzt, nie erweitert.
-//! - Die Sandbox ist die beim Start **einmal** gebaute Web-Wurzel-Sandbox
-//!   ([`harw_runtime::root_sandbox`]), je Anfrage über
-//!   [`crate::runtime_web::narrow_web_sandbox`] auf das Tier verengt. Ein
-//!   `Observer`-Peer bekommt damit nur `ReadWorkspace`. Weil die Fabrik keinen
+//! - Die Sandbox ist [`RuntimeAssembly::sandbox`] — dieselbe Web-Wurzel-Sandbox,
+//!   die die Montage beim Bau **einmal** über [`harw_runtime::root_sandbox`]
+//!   erzeugt (`harw-runtime/src/assembly.rs::RuntimeAssemblyBuilder::build`).
+//!   Dieses Modul baut seit F-W/W4 **keine** zweite, eigene Bindung mehr — vor
+//!   W4 rief [`serve_web`] `harw_runtime::root_sandbox(EntryKind::Web, &cwd)`
+//!   selbst noch einmal auf und band dabei versehentlich an `cwd` statt an den
+//!   von der Montage ermittelten Projekt-Wurzelpfad. Je Anfrage verengt
+//!   [`crate::runtime_web::narrow_web_sandbox`] `assembly.sandbox()` auf das
+//!   Tier des Peers. Ein `Observer`-Peer bekommt damit nur `ReadWorkspace` —
+//!   und, weil die Web-Decke laut Reduktionstabelle ([`EntryKind::Web`],
+//!   `docs/remediation/CONTRACTS.md:106`) für **alle** Tiers `{ReadWorkspace}`
+//!   ist, bekommt selbst ein `Owner`-Peer nie mehr als das: das Tier verengt
+//!   nur innerhalb dieser Decke, es hebt sie nie an. Eine Anhebung der Decke
+//!   (z. B. Schreibrechte für `Owner` im Web) ist keine Entscheidung dieses
+//!   Moduls, sondern bleibt W5/WB-COMP vorbehalten. Weil die Fabrik keinen
 //!   Fehler melden kann, scheitert ein nicht bindbares Arbeitsverzeichnis
-//!   bereits beim Start und nicht erst je Anfrage.
+//!   weiterhin bereits beim Start und nicht erst je Anfrage — seit W4 nicht
+//!   mehr über die separate `root_sandbox`-Zeile, sondern schon beim
+//!   Montagebau ([`crate::runtime_web::web_assembly`]), der `sandbox()`
+//!   liefert, bevor die Kontext-Fabrik überhaupt entsteht.
 //!
 //! # Woher der `ApprovalActor` kommt — und woher nicht
 //! `approval.pending`/`approval.resolve` (`harw-ops::approval`) leiten den
@@ -231,10 +245,17 @@ pub(crate) fn serve_web(
     let approver: Arc<dyn ApprovalActorResolver> =
         Arc::new(StaticUidApprovalActorMap::new(vec![(uid, "owner".to_owned())]));
 
-    // Einmal beim Start: ein nicht bindbares Arbeitsverzeichnis bricht hier
-    // ab, weil die Kontext-Fabrik je Anfrage keinen Fehler melden kann.
-    let root_sandbox =
-        harw_runtime::root_sandbox(EntryKind::Web, &cwd).map_err(|error| error.to_string())?;
+    // F-W/W4: aus der Montage übernommen statt ein zweites Mal gebaut.
+    // `assembly.sandbox()` ist dieselbe Web-Wurzel-Sandbox, die
+    // `RuntimeAssembly::builder(..).build()` oben bereits über
+    // `harw_runtime::root_sandbox(EntryKind::Web, &project.project_root)`
+    // erzeugt hat (`harw-runtime/src/assembly.rs:495`) — die vorherige, hier
+    // erneut an `cwd` statt an den Projekt-Wurzelpfad gebundene Zeile entfällt.
+    // Ein nicht bindbares Arbeitsverzeichnis bricht deshalb weiterhin beim
+    // Start ab, jetzt aber schon durch den Montagebau (`web_assembly(..)?`
+    // oben), nicht mehr durch eine eigene Zeile hier — die Kontext-Fabrik
+    // unten kann je Anfrage ohnehin keinen Fehler melden.
+    let root_sandbox = assembly.sandbox().clone();
 
     let factory_assembly = Arc::clone(&assembly);
     let context_factory: Arc<harw_web::server::WebContextFactory> =
@@ -695,5 +716,33 @@ mod tests {
             config: harw_plan::PlanToolConfig::default(),
         };
         assert!(runtime_plan_services(complete).is_some());
+    }
+
+    /// F-W/W6: `WebRouteTable::from_registry(assembly.operations())` gegen
+    /// eine echte `EntryKind::Web`-Montage (`OperationSurface::CommandsOnly`,
+    /// `harw-runtime/src/assembly.rs:774-786`) enthält beide
+    /// Genehmigungsrouten. `approval.pending`/`approval.resolve`
+    /// (`harw-ops/src/approval.rs:320-326,444-449`) deklarieren nur
+    /// `Surface::Web`, kein `Surface::ModelTool` — der CommandsOnly-Filter
+    /// lässt jede Operation mit mindestens einer Nicht-ModelTool-Fläche
+    /// durch, sie fehlen also nicht in der Web-Registrierung.
+    #[test]
+    fn test_web_route_table_from_registry_includes_approval_routes() {
+        let (_home, _cwd, assembly) = test_assembly(true);
+
+        let routes = WebRouteTable::from_registry(assembly.operations())
+            .expect("no two operations claim the same web path");
+
+        let pending = routes
+            .find("/api/approval-pending")
+            .expect("approval.pending is registered as a web route from the assembly");
+        assert_eq!(pending.operation_name(), "approval.pending");
+        assert!(pending.readonly(), "approval.pending is declared readonly");
+
+        let resolve = routes
+            .find("/api/approval-resolve")
+            .expect("approval.resolve is registered as a web route from the assembly");
+        assert_eq!(resolve.operation_name(), "approval.resolve");
+        assert!(!resolve.readonly(), "approval.resolve is declared mutating");
     }
 }

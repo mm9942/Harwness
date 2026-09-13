@@ -1582,8 +1582,14 @@ mod tests {
     /// setzt genau das Feld, das `build()` (siehe die Bau-Stelle oben) per
     /// `secret_resolver.as_deref().map(|r| r as &dyn SecretResolver)` an
     /// [`build_root_model_with_resolver`] weiterreicht.
+    ///
+    /// Befund W7 (Z2d-1-Review): der ursprüngliche Testname versprach, dass der
+    /// Resolver tatsächlich für ein konfiguriertes Modell *verwendet* wird —
+    /// geprüft wird aber nur, dass der Builder das Feld setzt. Umbenannt, um
+    /// Testname und Assertion in Deckung zu bringen; die Assertion selbst ist
+    /// unverändert.
     #[test]
-    fn test_builder_secret_resolver_is_used_for_configured_model() {
+    fn test_builder_secret_resolver_sets_field() {
         struct FakeResolver;
         impl SecretResolver for FakeResolver {
             fn resolve(&self, _reference: &str) -> Result<secrecy::SecretString, String> {
@@ -1613,5 +1619,17 @@ mod tests {
             "secret_resolver() muss das Feld setzen, das build() beim Bau des \
              Wurzel-Modells an build_root_model_with_resolver reicht"
         );
+    }
+
+    /// Befund W8 (Z2d-1-Review): `web.rs` ist die erste Aufrufstelle, die
+    /// `RuntimeAssembly` über einen `Send + Sync`-Grenze (Achsum-Handler)
+    /// trägt; bis dahin gab es keinen Compile-Zeit-Beleg, dass der Typ diese
+    /// Auto-Traits tatsächlich hält. Reiner Compile-Zeit-Test: schlägt beim
+    /// Kompilieren fehl, falls `RuntimeAssembly` künftig ein `!Send`- oder
+    /// `!Sync`-Feld bekommt.
+    #[test]
+    fn test_runtime_assembly_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<RuntimeAssembly>();
     }
 }

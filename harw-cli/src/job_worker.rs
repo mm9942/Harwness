@@ -1306,6 +1306,15 @@ fn derive_plan_node_sandbox(
         }
     }
 
+    // Befund W11 (Z2d-1-Review): diese Prüfung — Vertragsforderung ⊆ geerbte
+    // Sandbox — läuft bewusst *vor* dem Knotenart-Schnitt weiter unten
+    // (`job_sandbox`/`PlanNodeKind`-Tabelle) und ist fail-closed: sie sieht nur
+    // die geerbte Sandbox, nicht das Zielprofil der Knotenart. Ein
+    // Research-Knoten mit `allowed_paths` unter einer nur lesenden geerbten
+    // Sandbox scheitert deshalb hier bereits mit einem Fehler, statt später
+    // still auf `{Read}` zurückgeschnitten zu werden — Autorität wird nie
+    // stillschweigend erweitert, ein zu weiter Vertrag wird abgelehnt statt
+    // klammheimlich verengt.
     let ceiling = contract_permission_ceiling(contract);
     for permission in ceiling.iter() {
         if !inherited.permissions().contains(permission) {

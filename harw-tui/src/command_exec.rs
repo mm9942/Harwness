@@ -96,8 +96,9 @@ pub(crate) struct CommandServices<'a> {
 ///   geklont, Services siehe unten) und [`CommandAdapter::dispatch`] awaiten.
 ///   `Ok(output)` liefert `output.text`; `Err(error)` wird als
 ///   `"Fehler: {error}"` gerendert. Nicht gefunden: `"Unbekannter Command: {path}"`.
-/// - [`Invocation::Shell`] / [`Invocation::ShellRepeat`]: ehrlicher
-///   „noch nicht verfügbar"-Hinweis (keine Shell-Ausführung in diesem Build).
+/// - [`Invocation::Shell`] / [`Invocation::ShellRepeat`]: Ablehnung über die
+///   Capability `commands.shell` („Shell-Ausführung abgelehnt: Capability
+///   'commands.shell' ist nicht aktiviert"); der TUI-Kontext aktiviert sie nicht.
 /// - [`Invocation::Note`]: `"Notiz: {text}"`.
 /// - [`Invocation::Mention`]: `"@{target}: {body}"`.
 /// - [`Invocation::Chat`]: unverändert durchgereicht.
