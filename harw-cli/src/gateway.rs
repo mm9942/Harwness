@@ -3,8 +3,10 @@
 //! Dieser Daemon ersetzt `harw serve` als systemd-`ExecStart`. Er hält die
 //! langlebige Runtime am Leben und supervidiert vier Subsysteme:
 //!
-//! - **Agenten/Gateway** — der Provider-Weg (nativer Anthropic/Foundry via
-//!   [`harw_provider_http::build_provider_with_home`]), an den Nachrichten als Turns gehen.
+//! - **Agenten/Gateway** — der Provider-Weg über die Gateway-`RuntimeAssembly`
+//!   (mit Secret-Resolver für versiegelte `secrets:`-Credentials, siehe
+//!   [`crate::runtime_gateway::gateway_assembly`]), an den Nachrichten als
+//!   Turns gehen.
 //! - **Channels/Telegram** — bewusst fail-closed, bis der sichere Adapter
 //!   einen transport-gebundenen Ingress bereitstellt.
 //! - **Knowledge/Workbench** — [`harw_knowledge::KnowledgeStore`] wird am
@@ -66,9 +68,34 @@
 //! die einzig sinnvolle Wahl ist.
 //!
 //! # Fehler
-//! Startfehler (Home/Config) werden als `String` gemeldet. Laufzeitfehler der
-//! Subsysteme werden geloggt und führen **nicht** zum Prozess-Exit — der Daemon
-//! bleibt am Leben (kein Crash-Loop).
+//! Startfehler werden von [`run`] als `String` gemeldet und beenden den
+//! Prozess, **bevor** irgendein Subsystem startet:
+//!
+//! - Home-Auflösung/Scaffolding und ein nicht lesbares Arbeitsverzeichnis.
+//!   **cwd-Abhängigkeit:** der Gateway montiert gegen
+//!   `std::env::current_dir()` — Repo-Layer-Erkennung (`<cwd>/.harw`),
+//!   Vertrauensprüfung und Projekterkennung folgen damit dem
+//!   Arbeitsverzeichnis des Prozesses (unter systemd `WorkingDirectory=`).
+//! - **Provider fehlt/nicht baubar** (kein `default_provider`/`default_model`,
+//!   unauflösbares Credential, ungültiger Endpoint): `Err("gateway: …")`,
+//!   kein Echo-Fallback (G-048).
+//! - **KEK fehlt:** ein aktivierter Provider mit `secrets:`-Referenz ohne
+//!   `[kek]` in `auth.toml` endet mit
+//!   `Err("gateway: enabled sealed-secret provider requires a configured KEK")`;
+//!   ebenso ein nicht ladbares KEK-Material oder ein nicht zu öffnender
+//!   versiegelter Speicher (Meldungen ohne Geheimnisinhalt).
+//! - Konfigurations- und Vertrauensfehler (ungültige Config, defekter
+//!   Trust-Store, nicht vertrauensfähiges Projekt).
+//! - Telemetrie-Aufbau (belegter Prometheus-Port, `https://`-OTLP-Endpunkt)
+//!   und Runtime-Start.
+//!
+//! Ein vorhandenes, aber **nicht freigegebenes** repo-lokales `.harw` ist
+//! dagegen **kein** Fehler: es wird nur verengend übernommen und per
+//! `tracing::warn!` gemeldet. Scheitert die Montage, startet auch die
+//! periodische Audit-Kettenprüfung nicht — sie ist Teil von [`supervise`].
+//!
+//! Laufzeitfehler der Subsysteme werden geloggt und führen **nicht** zum
+//! Prozess-Exit — der Daemon bleibt am Leben (kein Crash-Loop).
 
 use std::collections::HashSet;
 use std::fs;
@@ -84,7 +111,7 @@ use harw_channel_telegram_transport::{
     AdmittedEventConsumer, LongPollConfig, LongPollShutdown, TelegramClient, TelegramOffsetStore,
     TelegramOutbound, TelegramRenderer, spawn_long_poll_thread,
 };
-use harw_config::{ChannelToml, ResolvedConfig, SecretRef, discover_config, resolve_env_ref};
+use harw_config::{ChannelToml, ResolvedConfig, SecretRef, resolve_env_ref};
 use harw_core::{
     AgentSession, ModelProvider, TranscriptStateStore, TurnInput, TurnOutcome, run_turn,
 };
@@ -96,10 +123,11 @@ use harw_secrets::audit::chain::PersistedChainStatus;
 use harw_secrets::audit::telemetry::AUDIT_CHAIN_BREAK;
 use harw_secrets::{AuditError, AuditResult};
 use harw_session_store::{RecordKind, TranscriptStore};
-use harw_types::{AgentRole, ChannelId, SessionId, ThreadRef};
+use harw_types::{AgentRole, ChannelId, Principal, SessionId, ThreadRef};
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::home::resolve_home;
+use crate::runtime_gateway::{GatewayEntry, channel_principal, gateway_assembly};
 
 /// Zählt jeden Gateway-Start. Geroutet unter dem Präfix `"app."`
 /// (`crate::observe`) — erreicht damit optional Prometheus/OTLP, nie ohne
@@ -312,20 +340,48 @@ type ActivityClock = Arc<Mutex<Instant>>;
 ///   File-Sink an (siehe `crate::observe`-Moduldoku).
 ///
 /// # Errors
-/// Ein `String` bei Home-Auflösung, Scaffolding, Config-Ladefehler oder wenn
-/// der Telemetrie-Aufbau fehlschlägt (z. B. ein belegter Prometheus-Port
-/// oder ein `https://`-OTLP-Endpunkt).
+/// Ein `String` — jeweils bevor ein Subsystem (auch die Audit-Kettenprüfung)
+/// startet — bei:
+/// - Home-Auflösung, Scaffolding oder nicht lesbarem Arbeitsverzeichnis
+///   (`std::env::current_dir()`; Repo-Layer, Vertrauen und Projekterkennung
+///   der Montage folgen diesem cwd).
+/// - fehlgeschlagener Gateway-Montage ([`mount_gateway_assembly`], Präfix
+///   `"gateway: "`): Konfiguration, Vertrauen (defekter Trust-Store, nicht
+///   vertrauensfähiges Projekt), **Provider fehlt/nicht baubar** — kein
+///   Echo-Fallback, G-048 — und **KEK fehlt** für einen aktivierten
+///   `secrets:`-Provider (`"gateway: enabled sealed-secret provider requires
+///   a configured KEK"`) bzw. nicht ladbares KEK-Material/nicht zu öffnender
+///   versiegelter Speicher.
+/// - fehlgeschlagenem Telemetrie-Aufbau (z. B. ein belegter Prometheus-Port
+///   oder ein `https://`-OTLP-Endpunkt) oder Runtime-Start.
+///
+/// Ein nicht freigegebenes repo-lokales `.harw` ist **kein** Fehler, sondern
+/// nur eine `tracing::warn!`-Meldung (verengende Übernahme).
 pub fn run(home_override: Option<PathBuf>, telemetry: crate::cli::TelemetryArgs) -> Result<(), String> {
     let home = resolve_home(home_override)?;
     harw_home::ensure_home(&home).map_err(|error| error.to_string())?;
+    let cwd = std::env::current_dir()
+        .map_err(|error| format!("gateway: Arbeitsverzeichnis nicht lesbar: {error}"))?;
 
-    let layers = harw_home::config_layers(&home).map_err(|error| error.to_string())?;
-    let config = discover_config(&layers).map_err(|error| error.to_string())?;
-    config.validate().map_err(|error| error.to_string())?;
+    // Profil vor der Montage auflösen: der Telegram-Verlaufsspeicher der
+    // Assembly liegt unter `<profil>/sessions`, derselben Wurzel wie Dream.
+    let profile_name = harw_home::active_profile_name(&home);
+    let profile = harw_home::profile_dir(&home, &profile_name).map_err(|e| e.to_string())?;
+
+    // Die Gateway-Montagen ersetzen `config_layers` + `discover_config` +
+    // `validate` und den früher separat gebauten Provider. Scheitert der
+    // Provider-Aufbau, endet `run` mit `Err` — kein Echo-Fallback (G-048).
+    // Telegram und Dream bekommen je eine eigene Montage (G1/G3), damit
+    // Audit und Trace den auslösenden Kanal unterscheiden.
+    let assemblies = mount_gateway_assembly(&home, &cwd, &profile.join("sessions"))?;
     // Shared with `audit_chain_scheduler`, which clones this `Arc` into a
     // fresh `spawn_blocking` closure on every tick (see its doc for why it
     // re-opens the configured secret store each tick instead of holding one).
-    let config = Arc::new(config);
+    let config = Arc::clone(assemblies.telegram.config());
+    let providers = GatewayProviders {
+        telegram: Arc::clone(assemblies.telegram.model()),
+        dream: Arc::clone(assemblies.dream.model()),
+    };
 
     let telemetry_sinks = crate::observe::build(&home, &telemetry)?;
     telemetry_sinks.sink.record(
@@ -343,8 +399,6 @@ pub fn run(home_override: Option<PathBuf>, telemetry: crate::cli::TelemetryArgs)
 
     // Knowledge-Store am Profil-Wissensordner mounten (memory/diary/dream/
     // workbench/kanban teilen sich diesen Store).
-    let profile_name = harw_home::active_profile_name(&home);
-    let profile = harw_home::profile_dir(&home, &profile_name).map_err(|e| e.to_string())?;
     let knowledge_root = profile.join("knowledge");
     std::fs::create_dir_all(&knowledge_root)
         .map_err(|error| format!("knowledge-Ordner anlegen: {error}"))?;
@@ -362,6 +416,7 @@ pub fn run(home_override: Option<PathBuf>, telemetry: crate::cli::TelemetryArgs)
     let result = runtime.block_on(supervise(
         &home,
         Arc::clone(&config),
+        providers,
         &knowledge,
         &dream_transcript_root,
         Arc::clone(&telemetry_sinks.sink),
@@ -375,6 +430,178 @@ pub fn run(home_override: Option<PathBuf>, telemetry: crate::cli::TelemetryArgs)
     result
 }
 
+/// Geteilter Auflöser für versiegelte `secrets:`-Provider-Credentials, den
+/// beide Gateway-Montagen über `Arc::clone` gemeinsam nutzen.
+type GatewaySecretResolver = Arc<dyn harw_provider_http::SecretResolver + Send + Sync>;
+
+/// Die Runtime-Montagen eines Gateway-Starts (Befunde G1/G3).
+///
+/// Telegram und Dream laufen über **getrennte**
+/// [`harw_runtime::RuntimeAssembly`]-Instanzen mit eigener
+/// [`harw_runtime::EntryKind`] (`GatewayTelegram`/`GatewayDream`), eigenem
+/// Principal und eigenem Transkript-Mapper, damit Audit und Trace den
+/// auslösenden Kanal unterscheiden können. Beide teilen denselben
+/// Secret-Resolver. Es gibt keinen Config-Schalter, der Dream deaktiviert —
+/// der Dream-Scheduler läuft immer, deshalb wird die Dream-Montage stets
+/// gebaut.
+struct GatewayAssemblies {
+    /// Montage für Telegram-Turns; ihre Konfiguration speist außerdem
+    /// Statusausgabe, Telegram-Ingress und Audit-Kettenprüfung.
+    telegram: harw_runtime::RuntimeAssembly,
+    /// Montage für Dream-Läufe; ihr Modell geht an [`dream_scheduler`].
+    dream: harw_runtime::RuntimeAssembly,
+}
+
+/// Die Wurzel-Modelle der beiden Gateway-Montagen, gebündelt für
+/// [`supervise`] (hält dessen Parameterliste unter der
+/// `clippy::too_many_arguments`-Schwelle, ohne `#[allow]`).
+struct GatewayProviders {
+    /// Modell der Telegram-Montage (`GatewayAssemblies::telegram`); geht an
+    /// die Telegram-Long-Poll-Supervision.
+    telegram: Arc<dyn ModelProvider>,
+    /// Modell der **eigenen** Dream-Montage (`GatewayAssemblies::dream`,
+    /// Befunde G1/G3); geht an [`dream_scheduler`].
+    dream: Arc<dyn ModelProvider>,
+}
+
+/// Öffnet den Secret-Resolver für die Gateway-Montagen genau einmal.
+///
+/// # Description
+/// `gateway_assembly` lädt die maßgebliche Konfiguration erst innerhalb von
+/// `RuntimeAssemblyBuilder::build`, aber
+/// [`crate::secret_store::open_configured_secret_resolver`] braucht die
+/// *aufgelöste* Konfiguration vorher, um zu entscheiden, ob ein aktivierter
+/// Provider überhaupt eine `secrets:`-Referenz nutzt. Diese Funktion lädt
+/// deshalb vorab dieselbe vertrauensbewusste Konfiguration über
+/// [`harw_runtime::load_config`] — mit der [`harw_runtime::RuntimeSpec`] des
+/// übergebenen `entry` (`entry.entry_kind()`, Befund G4 statt eines hart
+/// codierten `EntryKind::GatewayTelegram`) — und öffnet damit den Resolver.
+/// `load_config` hängt nur von `home`/`cwd` der Spec ab; ein einziger
+/// vorläufiger Ladevorgang gilt deshalb für beide Gateway-Einstiege, und der
+/// Resolver wird per `Arc::clone` geteilt.
+///
+/// # Arguments
+/// - `entry` ([`GatewayEntry`]): Einstieg der ersten Montage, deren Spec
+///   nachgebildet wird.
+/// - `home` (`&Path`): aufgelöster Root-Space.
+/// - `cwd` (`&Path`): Arbeitsverzeichnis des Gateway-Prozesses.
+/// - `principal` (`&Principal`): Principal derselben Montage (geklont in die
+///   vorläufige Spec).
+///
+/// # Returns
+/// `Some(resolver)`, wenn ein aktivierter Provider `secrets:` nutzt und der
+/// versiegelte Speicher geöffnet werden konnte; `None`, wenn kein aktivierter
+/// Provider `secrets:` nutzt.
+///
+/// # Errors
+/// `String` mit Präfix `"gateway: "`: Konfigurations-/Vertrauensfehler aus
+/// `load_config`, fehlendes KEK (`"gateway: enabled sealed-secret provider
+/// requires a configured KEK"`), nicht ladbares KEK-Material oder nicht zu
+/// öffnender Speicher — jeweils ohne Geheimnisinhalt.
+fn open_gateway_secret_resolver(
+    entry: GatewayEntry,
+    home: &Path,
+    cwd: &Path,
+    principal: &Principal,
+) -> Result<Option<GatewaySecretResolver>, String> {
+    let spec =
+        crate::runtime_entry::runtime_spec(entry.entry_kind(), home, cwd, principal.clone());
+    let (preliminary_config, _trust_report) =
+        harw_runtime::load_config(&spec).map_err(|error| format!("gateway: {error}"))?;
+    let resolver = crate::secret_store::open_configured_secret_resolver(home, &preliminary_config)
+        .map_err(|error| format!("gateway: {error}"))?;
+    Ok(resolver.map(|resolver| Arc::new(resolver) as GatewaySecretResolver))
+}
+
+/// Montiert die Gateway-Runtimes (Konfiguration, Vertrauen, Modell) einmalig.
+///
+/// # Description
+/// Öffnet zuerst über [`open_gateway_secret_resolver`] genau einmal den
+/// Secret-Resolver (Regression B3) und baut dann über [`gateway_assembly`]
+/// zwei [`harw_runtime::RuntimeAssembly`]-Instanzen, die sich diesen
+/// Resolver per `Arc::clone` teilen:
+///
+/// - **Telegram:** [`GatewayEntry::Telegram`], Principal
+///   `channel_principal(GatewayEntry::Telegram, "gateway")`,
+///   Transkript-Verlaufsspeicher unter `sessions_root` mit
+///   [`telegram_thread_for_session`].
+/// - **Dream:** [`GatewayEntry::Dream`], Principal
+///   `channel_principal(GatewayEntry::Dream, "")` (Dream hat keinen externen
+///   Peer), Transkript-Verlaufsspeicher unter `sessions_root` mit
+///   [`dream_thread_for_session`] — derselbe Mapper, den
+///   [`build_dream_state_store`] für die Dream-Läufe nutzt.
+///
+/// Meldet ein nicht freigegebenes repo-lokales `.harw` einmal per
+/// `tracing::warn!` (Feld `path`); es wurde von der Montage höchstens
+/// verengend übernommen und ist **kein** Fehler. Beide Montagen lesen
+/// denselben `home`/`cwd`, der Vertrauensbefund ist daher identisch.
+///
+/// # Arguments
+/// - `home` (`&Path`): aufgelöster Root-Space.
+/// - `cwd` (`&Path`): Arbeitsverzeichnis des Gateway-Prozesses.
+/// - `sessions_root` (`&Path`): `<profil>/sessions` des aktiven Profils.
+///
+/// # Errors
+/// Jeder Montagefehler (Konfiguration, Vertrauen, Projekt, Registry,
+/// **Provider**, Speicher) als `String` mit Präfix `"gateway: "`, ebenso jeder
+/// Fehler aus [`open_gateway_secret_resolver`] (u. a. fehlendes KEK). Es gibt
+/// keinen Echo-Ersatz für einen nicht baubaren Provider (G-048).
+fn mount_gateway_assembly(
+    home: &Path,
+    cwd: &Path,
+    sessions_root: &Path,
+) -> Result<GatewayAssemblies, String> {
+    // Daemon-Platzhalter (G6): bis P1.6 gibt es keinen transport-gebundenen
+    // Peer für die Telegram-Montage des Daemons. `"gateway"` ist deshalb eine
+    // feste Platzhalter-Kennung (`telegram:gateway`), kein authentifizierter
+    // Telegram-Peer; die Rechte bleiben unabhängig davon `Observer`/`{}`.
+    let telegram_principal = channel_principal(GatewayEntry::Telegram, "gateway");
+    let secret_resolver =
+        open_gateway_secret_resolver(GatewayEntry::Telegram, home, cwd, &telegram_principal)?;
+
+    let telegram = gateway_assembly(
+        GatewayEntry::Telegram,
+        home,
+        cwd,
+        telegram_principal,
+        crate::runtime_entry::transcript_state_store(sessions_root, telegram_thread_for_session),
+        secret_resolver.as_ref().map(Arc::clone),
+    )?;
+    let dream = gateway_assembly(
+        GatewayEntry::Dream,
+        home,
+        cwd,
+        channel_principal(GatewayEntry::Dream, ""),
+        crate::runtime_entry::transcript_state_store(sessions_root, dream_thread_for_session),
+        secret_resolver,
+    )?;
+
+    let trust_report = telegram.trust_report();
+    if trust_report.has_untrusted_repo() {
+        let path = trust_report
+            .untrusted_repo
+            .as_deref()
+            .unwrap_or_else(|| Path::new(""));
+        tracing::warn!(
+            path = %path.display(),
+            "repo-lokales .harw ist nicht freigegeben; nur verengend übernommen"
+        );
+    }
+    Ok(GatewayAssemblies { telegram, dream })
+}
+
+/// Statuszeile des Agenten-Subsystems für die Startausgabe.
+///
+/// Nur aufrufbar mit einem bereits gebauten Provider — deshalb gibt es keinen
+/// „degradiert"-Zweig mehr (G-048).
+fn gateway_provider_status(config: &ResolvedConfig) -> String {
+    format!(
+        "bereit (provider={}, model={})",
+        config.harness.default_provider.as_deref().unwrap_or("—"),
+        config.harness.default_model.as_deref().unwrap_or("—"),
+    )
+}
+
 /// Supervidiert die Subsysteme und wartet auf ein Shutdown-Signal.
 ///
 /// # Arguments
@@ -384,6 +611,10 @@ pub fn run(home_override: Option<PathBuf>, telemetry: crate::cli::TelemetryArgs)
 ///   Geheimnisspeicher neu öffnet (siehe dortige Doku), was einen
 ///   `'static`-fähigen Griff auf die Konfiguration statt eines an diesen
 ///   Stack-Frame gebundenen Borrows braucht.
+/// - `providers` ([`GatewayProviders`]): die Wurzel-Modelle der Telegram-
+///   und der **eigenen** Dream-Montage (`RuntimeAssembly::model`, Befunde
+///   G1/G3); `telegram` geht an die Telegram-Long-Poll-Supervision, `dream`
+///   an [`dream_scheduler`].
 /// - `telemetry_sink` (`Arc<dyn TelemetrySink>`): derselbe zusammengesetzte
 ///   Sink, den [`run`] baut; [`audit_chain_scheduler`] meldet
 ///   `audit_chain_break` darüber (siehe dessen Doku für die Routing-
@@ -394,49 +625,16 @@ pub fn run(home_override: Option<PathBuf>, telemetry: crate::cli::TelemetryArgs)
 async fn supervise(
     home: &Path,
     config: Arc<ResolvedConfig>,
+    providers: GatewayProviders,
     knowledge: &KnowledgeStore,
     dream_transcript_root: &Path,
     telemetry_sink: Arc<dyn TelemetrySink>,
     audit_chain_check_interval_secs: u64,
 ) -> Result<(), String> {
-    // Provider einmal für den Dream-Scheduler bauen. `select!` treibt die
-    // Gateway-Futures auf derselben Task, daher ist ein geteilter `&`-Borrow
-    // ohne `Send`/`Arc` korrekt.
-    let provider_result: Result<Box<dyn ModelProvider>, ()> =
-        match crate::secret_store::open_configured_secret_resolver(home, &config) {
-            Ok(Some(resolver)) => harw_provider_http::build_provider_with_home(
-                &config,
-                home,
-                Some(&resolver as &dyn harw_provider_http::SecretResolver),
-            )
-            .map_err(|_| ()),
-            Ok(None) => {
-                harw_provider_http::build_provider_with_home(&config, home, None).map_err(|_| ())
-            }
-            Err(_) => Err(()),
-        };
-
-    let (provider, provider_status): (Box<dyn ModelProvider>, String) = match provider_result {
-        Ok(provider) => (
-            provider,
-            format!(
-                "bereit (provider={}, model={})",
-                config.harness.default_provider.as_deref().unwrap_or("—"),
-                config.harness.default_model.as_deref().unwrap_or("—"),
-            ),
-        ),
-        Err(()) => {
-            eprintln!(
-                "gateway: Provider degradiert (Provider- oder Secret-Resolver-Aufbau fehlgeschlagen); nutze Echo."
-            );
-            (
-                Box::new(harw_core::EchoModelProvider::new(
-                    "(offline Echo — kein Provider angebunden)",
-                )),
-                "degradiert (Provider- oder Secret-Resolver-Aufbau fehlgeschlagen)".to_owned(),
-            )
-        }
-    };
+    // Beide Provider stammen aus den Gateway-Montagen in [`run`] und sind dort
+    // bereits erfolgreich gebaut worden; einen degradierten Echo-Zustand gibt
+    // es nicht mehr (G-048).
+    let provider_status = gateway_provider_status(&config);
 
     let telegram_mode = telegram_ingress_mode(&config);
     let telegram_status = telegram_ingress_status(&telegram_mode);
@@ -470,8 +668,10 @@ async fn supervise(
     // have all succeeded; no legacy polling path is present here.
     let activity: ActivityClock = Arc::new(Mutex::new(Instant::now()));
 
-    let provider = Arc::<dyn ModelProvider>::from(provider);
-    let telegram_provider = Arc::clone(&provider);
+    let GatewayProviders {
+        telegram: telegram_provider,
+        dream: dream_provider,
+    } = providers;
     let telegram_profile = dream_transcript_root
         .parent()
         .map(Path::to_path_buf)
@@ -495,7 +695,7 @@ async fn supervise(
 
     // Traum-Scheduler: läuft immer (auch ohne Telegram) und träumt bei Idle.
     let dream = dream_scheduler(
-        provider.as_ref(),
+        dream_provider.as_ref(),
         knowledge,
         dream_transcript_root,
         &activity,
@@ -1540,6 +1740,42 @@ mod tests {
         TranscriptStore::new(root).append(&record).unwrap();
     }
 
+    /// Bildet den Fehlerpfad von [`run`] ohne Prozess-Globalzustand ab: `run`
+    /// ruft genau [`mount_gateway_assembly`] vor jedem Subsystemstart auf.
+    /// Ein Home ohne Provider-Konfiguration muss dort mit `Err` enden, statt
+    /// wie früher still einen Echo-Provider zu montieren (G-048).
+    #[test]
+    fn test_gateway_run_without_provider_fails_instead_of_echo() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let sessions_root = home.path().join("sessions");
+
+        let result = mount_gateway_assembly(home.path(), cwd.path(), &sessions_root);
+
+        let Err(error) = result else {
+            panic!("a home without provider config must not mount a gateway runtime");
+        };
+        assert!(
+            error.starts_with("gateway: "),
+            "mount error must come from the gateway assembly, got: {error}"
+        );
+        assert!(
+            !error.contains("Echo"),
+            "mount error must not describe an echo fallback, got: {error}"
+        );
+    }
+
+    #[test]
+    fn gateway_provider_status_reports_configured_provider_and_model() {
+        let mut config = ResolvedConfig::default();
+        config.harness.default_provider = Some("anthropic".to_owned());
+        config.harness.default_model = Some("claude".to_owned());
+
+        let status = gateway_provider_status(&config);
+
+        assert_eq!(status, "bereit (provider=anthropic, model=claude)");
+    }
+
     #[test]
     fn scan_workbench_counts_only_scope_dirs() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2158,5 +2394,138 @@ pinned_identities = [123456789]
             &harw_observe::NullSink,
         );
         assert_eq!(AUDIT_CHAIN_BREAK.count(), before + 1);
+    }
+
+    /// Legt in `home` eine vertraute Gateway-Konfiguration mit genau einem
+    /// aktivierten Provider `sealed` an, dessen Credential eine
+    /// `secrets:`-Referenz ist (`config.toml`, `providers/sealed.toml`,
+    /// `models/model.toml`). Mit `Some(key_path)` kommt eine `auth.toml` mit
+    /// `[kek]`-Key-File-Provenance hinzu; mit `None` fehlt das KEK.
+    fn write_gateway_sealed_provider_home(home: &Path, key_path: Option<&Path>) {
+        std::fs::write(
+            home.join("config.toml"),
+            "default_provider = \"sealed\"\ndefault_model = \"model\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.join("providers")).unwrap();
+        std::fs::write(
+            home.join("providers").join("sealed.toml"),
+            "name = \"sealed\"\napi = \"openai-chat\"\nbase_url = \"https://example.test/v1\"\nauth = \"secrets:provider-token\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.join("models")).unwrap();
+        std::fs::write(
+            home.join("models").join("model.toml"),
+            "id = \"model\"\nprovider = \"sealed\"\n",
+        )
+        .unwrap();
+        if let Some(key_path) = key_path {
+            let key_file = key_path.to_string_lossy().into_owned();
+            std::fs::write(
+                home.join("auth.toml"),
+                format!("[kek]\nprovenance = \"key_file\"\nkey_file_path = {key_file:?}\n"),
+            )
+            .unwrap();
+        }
+    }
+
+    /// Versiegelt `provider-token` im Store `<home>/sealed-secrets` unter dem
+    /// Test-KEK — derselbe Pfad und dieselbe Provenienz, die
+    /// `crate::secret_store::open_configured_secret_resolver` öffnet.
+    fn seal_gateway_test_provider_token(home: &Path, key_path: &Path) {
+        let policy = harw_secrets::CryptoPolicy::strongest();
+        let provenance = harw_secrets::KekProvenance::KeyFile {
+            path: key_path.to_path_buf(),
+        };
+        let key_material = harw_secrets::load_kek_material(&policy, &provenance).unwrap();
+        let mut store = harw_secrets::SecretStore::with_key_material(
+            home.join("sealed-secrets"),
+            policy,
+            provenance,
+            harw_secrets::KeyVersion::initial(),
+            key_material,
+        );
+        store
+            .create(
+                "provider-token",
+                "provider authentication",
+                &secrecy_08::SecretBox::new(b"gateway-mount-token".to_vec().into_boxed_slice()),
+            )
+            .expect("seal test token");
+    }
+
+    /// Regression B3/G2: ein aktivierter Provider mit `secrets:`-Credential,
+    /// konfiguriertem KEK und versiegeltem Token muss über den Resolver
+    /// montieren — nicht mit „sealed secret … could not be resolved" bzw.
+    /// „secret resolver failed" scheitern. Zugleich Beleg für G1: Telegram
+    /// und Dream bekommen je eine eigene Montage mit eigener `EntryKind` und
+    /// eigenem Principal. Kein Netz: der Provider wird nur gebaut, nie
+    /// angefragt.
+    #[test]
+    fn test_mount_gateway_assembly_sealed_secret_provider_resolves_with_kek() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let key_path = write_gateway_test_kek(home.path());
+        seal_gateway_test_provider_token(home.path(), &key_path);
+        write_gateway_sealed_provider_home(home.path(), Some(&key_path));
+        let sessions_root = home.path().join("sessions");
+
+        let assemblies = match mount_gateway_assembly(home.path(), cwd.path(), &sessions_root) {
+            Ok(assemblies) => assemblies,
+            Err(error) => {
+                assert!(
+                    !error.contains("sealed secret") && !error.contains("secret resolver failed"),
+                    "a configured KEK must let the sealed provider credential resolve, got: {error}"
+                );
+                panic!("sealed-secret provider with a configured KEK must mount, got: {error}");
+            }
+        };
+
+        assert_eq!(
+            assemblies.telegram.config().harness.default_provider.as_deref(),
+            Some("sealed")
+        );
+        let telegram_rights = assemblies.telegram.rights_snapshot();
+        assert_eq!(telegram_rights.entry, harw_runtime::EntryKind::GatewayTelegram);
+        assert_eq!(telegram_rights.principal.id(), "telegram:gateway");
+        let dream_rights = assemblies.dream.rights_snapshot();
+        assert_eq!(dream_rights.entry, harw_runtime::EntryKind::GatewayDream);
+        assert_eq!(dream_rights.principal.id(), "gateway-dream");
+    }
+
+    /// G2 Negativfall: derselbe `secrets:`-Provider ohne `[kek]` muss die
+    /// Montage mit dem exakten, geheimnisfreien Text aus
+    /// `crate::secret_store::open_configured_secret_resolver` abbrechen.
+    #[test]
+    fn test_mount_gateway_assembly_sealed_secret_provider_without_kek_returns_err() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        write_gateway_sealed_provider_home(home.path(), None);
+        let sessions_root = home.path().join("sessions");
+
+        let Err(error) = mount_gateway_assembly(home.path(), cwd.path(), &sessions_root) else {
+            panic!("a sealed-secret provider without a KEK must not mount");
+        };
+
+        assert!(
+            error.starts_with("gateway: enabled sealed-secret provider requires a configured KEK"),
+            "unexpected mount error: {error}"
+        );
+        assert!(!error.contains("provider-token"));
+    }
+
+    /// Ohne aktivierten `secrets:`-Provider öffnet der Gateway keinen
+    /// versiegelten Speicher und verlangt kein KEK (G4-Hilfsfunktion).
+    #[test]
+    fn test_open_gateway_secret_resolver_without_sealed_provider_returns_none() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let principal = channel_principal(GatewayEntry::Dream, "");
+
+        let resolver =
+            open_gateway_secret_resolver(GatewayEntry::Dream, home.path(), cwd.path(), &principal)
+                .expect("an empty home has no sealed provider and needs no KEK");
+
+        assert!(resolver.is_none());
     }
 }

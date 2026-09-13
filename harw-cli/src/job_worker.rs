@@ -27,6 +27,7 @@
 //! inherited sandbox, and the plan actor are injected through
 //! [`PlanNodeServices`].
 
+use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -169,6 +170,9 @@ impl PlanNodeServices {
 /// - `transcript_root` (`&Path`): root of the durable job transcripts.
 /// - `plan_services` (`Option<Arc<PlanNodeServices>>`): plan store, inherited
 ///   sandbox and plan actor; `None` disables plan-node execution.
+/// - `configured_submitters` (`Arc<BTreeSet<String>>`): ids of the currently
+///   configured MCP principals; a prompt job whose operator submitter is not
+///   in this set fails with a `scope:` reason before any model call.
 ///
 /// # Returns
 /// The number of jobs that reached a terminal state in this poll.
@@ -182,6 +186,7 @@ pub async fn run_job_worker_once(
     provider: Arc<dyn ModelProvider>,
     transcript_root: &Path,
     plan_services: Option<Arc<PlanNodeServices>>,
+    configured_submitters: Arc<BTreeSet<String>>,
 ) -> usize {
     let page = match store.list(&JobListQuery {
         states: Some(vec![JobState::Ready]),
@@ -206,6 +211,7 @@ pub async fn run_job_worker_once(
         let provider = Arc::clone(&provider);
         let transcript_root = transcript_root.to_path_buf();
         let services = plan_services.as_ref().map(Arc::clone);
+        let submitters = Arc::clone(&configured_submitters);
         let result = runner
             .run(
                 &work_id,
@@ -226,6 +232,7 @@ pub async fn run_job_worker_once(
                             transcript_root,
                             services,
                             operation_control,
+                            submitters,
                         ),
                     )
                 },
@@ -256,6 +263,9 @@ pub async fn run_job_worker_once(
 /// - `plan_services` (`Option<Arc<PlanNodeServices>>`): plan store, inherited
 ///   sandbox and plan actor; `None` disables plan-node execution.
 /// - `shutdown` (`watch::Receiver<bool>`): set to `true` to end the loop.
+/// - `configured_submitters` (`Arc<BTreeSet<String>>`): ids of the currently
+///   configured MCP principals, handed to every poll; see
+///   [`run_job_worker_once`].
 ///
 /// # Returns
 /// Nothing; returns once `shutdown` is observed as `true` or its sender is
@@ -270,6 +280,7 @@ pub async fn run_job_worker(
     transcript_root: &Path,
     plan_services: Option<Arc<PlanNodeServices>>,
     mut shutdown: watch::Receiver<bool>,
+    configured_submitters: Arc<BTreeSet<String>>,
 ) {
     loop {
         if *shutdown.borrow() {
@@ -281,6 +292,7 @@ pub async fn run_job_worker(
             Arc::clone(&provider),
             transcript_root,
             plan_services.as_ref().map(Arc::clone),
+            Arc::clone(&configured_submitters),
         )
         .await;
         tokio::select! {
@@ -320,6 +332,7 @@ async fn execute_claim(
     transcript_root: PathBuf,
     plan_services: Option<Arc<PlanNodeServices>>,
     control: Arc<WorkerExecutionControl>,
+    configured_submitters: Arc<BTreeSet<String>>,
 ) -> JobOutcome {
     let outcome = if is_plan_node_kind(&claim.job.kind) {
         execute_plan_node_claim(
@@ -338,6 +351,7 @@ async fn execute_claim(
             provider,
             transcript_root,
             Arc::clone(&control),
+            &configured_submitters,
         )
         .await
     };
@@ -364,10 +378,11 @@ async fn execute_prompt_claim(
     provider: Arc<dyn ModelProvider>,
     transcript_root: PathBuf,
     control: Arc<WorkerExecutionControl>,
+    configured_submitters: &BTreeSet<String>,
 ) -> JobOutcome {
     let work_id = claim.job.id.as_str().to_owned();
 
-    if let Err(reason) = check_prompt_claim_scope(&claim, &input) {
+    if let Err(reason) = check_prompt_claim_scope(&claim, &input, configured_submitters) {
         tracing::warn!(work_id = %work_id, reason = %reason, "prompt job rejected before any model call");
         return JobOutcome::Failed { reason };
     }
@@ -450,7 +465,16 @@ const PROMPT_LEASE_COMMIT_MARGIN_SECONDS: i64 = 5;
 // `ApprovalActor::Operator` setzt. Alles andere passt nicht zu diesem Pfad.
 // Eine Eingabe, die selbst einen Tenant/Workspace adressiert, muss exakt dem
 // serverseitig aufgelösten Scope entsprechen.
-fn check_prompt_claim_scope(claim: &JobClaim, input: &serde_json::Value) -> Result<(), String> {
+//
+// Konfigurations-Kontext (W2d-1/C1, Restlücke aus W1-13): Der Einreicher muss
+// zusätzlich ein *aktuell* konfigurierter MCP-Principal sein
+// (`runtime_jobs::configured_principal_ids`, exakter Vergleich). Ein Job, dessen
+// Principal seit der Einreichung aus der Config entfernt wurde, läuft nicht mehr.
+fn check_prompt_claim_scope(
+    claim: &JobClaim,
+    input: &serde_json::Value,
+    configured_submitters: &BTreeSet<String>,
+) -> Result<(), String> {
     if claim.lease.holder != WORKER_ID {
         return Err("scope: the job lease is held by another worker".to_owned());
     }
@@ -464,7 +488,11 @@ fn check_prompt_claim_scope(claim: &JobClaim, input: &serde_json::Value) -> Resu
         return Err("scope: the job workspace is not a valid identifier".to_owned());
     }
     match claim.scope.submitter() {
-        harw_types::ApprovalActor::Operator { id } if is_scope_identifier(id) => {}
+        harw_types::ApprovalActor::Operator { id } if is_scope_identifier(id) => {
+            if !configured_submitters.contains(id) {
+                return Err("scope: Einreicher ist kein konfigurierter MCP-Principal".to_owned());
+            }
+        }
         harw_types::ApprovalActor::Operator { .. } => {
             return Err("scope: the job submitter has no valid operator id".to_owned());
         }
@@ -804,7 +832,16 @@ async fn execute_plan_node_claim(
     };
 
     // From here the node exists, so every failure is reportable.
-    let sandbox = match derive_plan_node_sandbox(services.sandbox(), &payload.contract) {
+    // The write *request* is the contract's: only a contract that names allowed
+    // paths asks for `WriteWorkspace`. Whether it is granted is decided by the
+    // derivation (plan-node table ∩ contract ∩ inherited) and read back below.
+    let requests_write = !payload.contract.allowed_paths.is_empty();
+    let sandbox = match derive_plan_node_sandbox(
+        services.sandbox(),
+        &payload.contract,
+        kind,
+        requests_write,
+    ) {
         Ok(sandbox) => sandbox,
         Err(reason) => {
             tracing::error!(
@@ -1216,16 +1253,30 @@ fn leaves_workspace(pattern: &str) -> bool {
 /// Derives the sandbox a plan node runs under by reducing the inherited one.
 ///
 /// # Description
-/// The operation is monotone in both directions it can go: the returned
-/// sandbox is `inherited ∩ contract_ceiling`, and every demand the contract
-/// makes that `inherited` does not already hold is an error rather than a
-/// grant.  It also rejects a write scope that lexically leaves the workspace,
-/// because such a path could never be a *reduction* of a workspace-bound
-/// sandbox.
+/// The permissions are not chosen freely from `inherited`.  They come from the
+/// shared plan-node table (`crate::runtime_jobs::job_sandbox` with
+/// [`crate::runtime_jobs::JobEntry::PlanNode`], i.e.
+/// `harw_runtime::plan_node_sandbox`), are cut by the contract ceiling
+/// ([`contract_permission_ceiling`]) and are never more than
+/// `inherited.permissions()`:
+///
+/// `result ⊆ inherited ∩ plan-node table(kind, may_write) ∩ contract`.
+///
+/// The workspace binding stays the inherited one (the table sandbox is bound
+/// to the same canonical root, but under its own tenant alias), and the
+/// network scope is cut to the table's (empty) scope.  Every demand the
+/// contract makes that `inherited` does not already hold is an error rather
+/// than a grant, and a write scope that lexically leaves the workspace is
+/// rejected, because such a path could never be a *reduction* of a
+/// workspace-bound sandbox.
 ///
 /// # Arguments
 /// - `inherited` (`&SandboxSpec`): the authority the job itself holds.
 /// - `contract` (`&MutationContract`): the node's mutation contract.
+/// - `kind` (`PlanNodeKind`): the node's kind; non-writing kinds never keep
+///   [`Permission::WriteWorkspace`].
+/// - `may_write` (`bool`): whether the caller requests write access for this
+///   node (the worker passes "the contract names allowed paths").
 ///
 /// # Returns
 /// The narrowed [`SandboxSpec`]; it always passes
@@ -1233,14 +1284,18 @@ fn leaves_workspace(pattern: &str) -> bool {
 ///
 /// # Errors
 /// Returns a human-readable reason when the contract names a path outside the
-/// workspace, when it needs a permission the job does not hold, or when the
-/// derived sandbox would not be a child of `inherited`.
+/// workspace, when it needs a permission the job does not hold, when the
+/// plan-node table sandbox cannot be bound to the inherited workspace root, or
+/// when the derived sandbox would not be a child of `inherited`.
 ///
 /// # Concurrency
-/// Pure; safe from any thread.
+/// Synchronous; canonicalizes the inherited workspace root once (filesystem
+/// read), otherwise pure.
 fn derive_plan_node_sandbox(
     inherited: &SandboxSpec,
     contract: &MutationContract,
+    kind: PlanNodeKind,
+    may_write: bool,
 ) -> Result<SandboxSpec, String> {
     for rule in &contract.allowed_paths {
         let pattern = rule_pattern(rule);
@@ -1260,7 +1315,27 @@ fn derive_plan_node_sandbox(
         }
     }
 
-    let derived = inherited.restrict(&ceiling);
+    let root = inherited.workspace().canonical_root();
+    let node = crate::runtime_jobs::job_sandbox(
+        crate::runtime_jobs::JobEntry::PlanNode { kind, may_write },
+        root,
+    )
+    .map_err(|error| {
+        format!(
+            "could not build the plan-node sandbox: {}",
+            sanitize_failure(&error)
+        )
+    })?;
+
+    // Table ∩ contract ∩ inherited on the permission axis; the inherited
+    // binding is kept so the result is a child of `inherited`, and the network
+    // scope is cut to the table's.
+    let node_permissions = node
+        .restrict(&ceiling)
+        .restrict(inherited.permissions())
+        .permissions()
+        .clone();
+    let derived = inherited.restrict_with(&node_permissions, node.network_scope());
     derived.ensure_child_of(inherited).map_err(|error| {
         format!(
             "derived plan-node sandbox is not a reduction of the job sandbox: {}",
@@ -1743,6 +1818,11 @@ mod tests {
         serde_json::Value::Object(object)
     }
 
+    // Die Einreicher-Menge passend zu `ready_record` (Operator `operator`).
+    fn operator_submitters() -> Arc<BTreeSet<String>> {
+        Arc::new(BTreeSet::from(["operator".to_owned()]))
+    }
+
     fn plan_services(root: &Path, permissions: &[Permission]) -> Arc<PlanNodeServices> {
         let plan: Arc<dyn PlanStore> = Arc::new(InMemoryPlanStore::new());
         Arc::new(PlanNodeServices::new(
@@ -1839,7 +1919,12 @@ mod tests {
         );
         let contract = contract_for("t-1", &[PathRule::DirectoryPrefix("src".to_owned())]);
 
-        let derived = match derive_plan_node_sandbox(&inherited, &contract) {
+        let derived = match derive_plan_node_sandbox(
+            &inherited,
+            &contract,
+            PlanNodeKind::Coding,
+            true,
+        ) {
             Ok(derived) => derived,
             Err(error) => panic!("derivation must succeed: {error}"),
         };
@@ -1860,7 +1945,12 @@ mod tests {
         );
         let contract = contract_for("t-1", &[]);
 
-        let derived = match derive_plan_node_sandbox(&inherited, &contract) {
+        let derived = match derive_plan_node_sandbox(
+            &inherited,
+            &contract,
+            PlanNodeKind::Coding,
+            false,
+        ) {
             Ok(derived) => derived,
             Err(error) => panic!("derivation must succeed: {error}"),
         };
@@ -1875,7 +1965,12 @@ mod tests {
         let inherited = sandbox_with(dir.path(), &[Permission::ReadWorkspace]);
         let contract = contract_for("t-1", &[PathRule::Exact("src/lib.rs".to_owned())]);
 
-        let error = match derive_plan_node_sandbox(&inherited, &contract) {
+        let error = match derive_plan_node_sandbox(
+            &inherited,
+            &contract,
+            PlanNodeKind::Coding,
+            true,
+        ) {
             Ok(_) => panic!("a contract may never widen the inherited sandbox"),
             Err(error) => error,
         };
@@ -1897,12 +1992,106 @@ mod tests {
         ] {
             let pattern = rule_pattern(&escaping).to_owned();
             let contract = contract_for("t-1", &[escaping]);
-            match derive_plan_node_sandbox(&inherited, &contract) {
+            match derive_plan_node_sandbox(
+                &inherited,
+                &contract,
+                PlanNodeKind::Coding,
+                true,
+            ) {
                 Ok(_) => panic!("write scope '{pattern}' must be rejected"),
                 Err(error) => assert!(
                     error.contains("leaves the workspace"),
                     "unclear message for '{pattern}': {error}"
                 ),
+            }
+        }
+    }
+
+    #[test]
+    fn test_derive_plan_node_sandbox_research_node_drops_write() {
+        let dir = temp_dir();
+        let inherited = sandbox_with(
+            dir.path(),
+            &[Permission::ReadWorkspace, Permission::WriteWorkspace],
+        );
+        // The contract asks for writing, but a research node never writes.
+        let contract = contract_for("t-1", &[PathRule::DirectoryPrefix("src".to_owned())]);
+
+        let derived =
+            match derive_plan_node_sandbox(
+                &inherited,
+                &contract,
+                PlanNodeKind::Research,
+                true,
+            ) {
+                Ok(derived) => derived,
+                Err(error) => panic!("derivation must succeed: {error}"),
+            };
+        assert!(derived.permissions().contains(Permission::ReadWorkspace));
+        assert!(!derived.permissions().contains(Permission::WriteWorkspace));
+        assert!(derived.ensure_child_of(&inherited).is_ok());
+    }
+
+    #[test]
+    fn test_derive_plan_node_sandbox_never_exceeds_inherited() {
+        let dir = temp_dir();
+        let inherited = sandbox_with(
+            dir.path(),
+            &[
+                Permission::ReadWorkspace,
+                Permission::WriteWorkspace,
+                Permission::ExecuteProcess,
+                Permission::NetworkAccess,
+                Permission::ReadSecrets,
+            ],
+        );
+        let kinds = [
+            PlanNodeKind::Research,
+            PlanNodeKind::Explore,
+            PlanNodeKind::Analysis,
+            PlanNodeKind::Synthesis,
+            PlanNodeKind::Contract,
+            PlanNodeKind::Coding,
+            PlanNodeKind::Integration,
+            PlanNodeKind::Verification,
+            PlanNodeKind::Docs,
+            PlanNodeKind::Composite,
+        ];
+        let write_contract = contract_for("t-1", &[PathRule::Exact("src/lib.rs".to_owned())]);
+        let read_contract = contract_for("t-1", &[]);
+        for kind in kinds {
+            for may_write in [false, true] {
+                for contract in [&write_contract, &read_contract] {
+                    let derived =
+                        match derive_plan_node_sandbox(&inherited, contract, kind, may_write) {
+                            Ok(derived) => derived,
+                            Err(error) => panic!("derivation for {kind:?} must succeed: {error}"),
+                        };
+                    assert!(
+                        derived
+                            .permissions()
+                            .is_subset_of(inherited.permissions()),
+                        "{kind:?}/{may_write}: result exceeds the inherited sandbox"
+                    );
+                    assert!(derived.ensure_child_of(&inherited).is_ok());
+                    assert_eq!(derived.workspace(), inherited.workspace());
+                    assert!(derived.network_scope().is_empty());
+                    for forbidden in [
+                        Permission::ExecuteProcess,
+                        Permission::NetworkAccess,
+                        Permission::ReadSecrets,
+                    ] {
+                        assert!(
+                            !derived.permissions().contains(forbidden),
+                            "{kind:?}/{may_write}: {forbidden:?} must never survive"
+                        );
+                    }
+                    let writes = derived.permissions().contains(Permission::WriteWorkspace);
+                    let expected = may_write
+                        && !contract.allowed_paths.is_empty()
+                        && profile_for_node_kind(kind, true) == RegistryProfile::Full;
+                    assert_eq!(writes, expected, "{kind:?}/{may_write}: write mismatch");
+                }
             }
         }
     }
@@ -2047,6 +2236,7 @@ mod tests {
             Arc::new(EchoModelProvider::new("done")),
             temp.path(),
             None,
+            operator_submitters(),
         )
         .await;
         assert_eq!(completed, 1);
@@ -2071,6 +2261,7 @@ mod tests {
             Arc::clone(&provider) as Arc<dyn ModelProvider>,
             temp.path(),
             None,
+            operator_submitters(),
         )
         .await;
         assert!(provider.recorded().is_empty());
@@ -2105,6 +2296,7 @@ mod tests {
             Arc::clone(&provider) as Arc<dyn ModelProvider>,
             temp.path(),
             Some(services),
+            operator_submitters(),
         )
         .await;
 
@@ -2140,6 +2332,7 @@ mod tests {
             Arc::clone(&provider) as Arc<dyn ModelProvider>,
             temp.path(),
             None,
+            operator_submitters(),
         )
         .await;
 
@@ -2172,6 +2365,7 @@ mod tests {
             Arc::clone(&provider) as Arc<dyn ModelProvider>,
             temp.path(),
             Some(services),
+            operator_submitters(),
         )
         .await;
 
@@ -2333,8 +2527,29 @@ mod prompt_claim_guard_tests {
             provider,
             root,
             None,
+            operator_submitters(),
         )
         .await;
+    }
+
+    // Die Einreicher-Menge passend zu `operator_scope` (Operator `operator`).
+    fn operator_submitters() -> Arc<BTreeSet<String>> {
+        Arc::new(BTreeSet::from(["operator".to_owned()]))
+    }
+
+    // Claimt einen zugelassenen Job als dieser Worker (`WORKER_ID`).
+    fn claim_as_worker(store: &JobStore, id: &str) -> JobClaim {
+        match store.claim(
+            &WorkId::from_str(id),
+            &ClaimRequest {
+                worker_id: WORKER_ID.to_owned(),
+                lease_ttl: SignedDuration::from_secs(LEASE_TTL_SECONDS),
+                now: Timestamp::now(),
+            },
+        ) {
+            Ok(claim) => claim,
+            Err(error) => panic!("claim '{id}': {error}"),
+        }
     }
 
     fn empty_request() -> harw_core::ModelRequest {
@@ -2534,6 +2749,7 @@ mod prompt_claim_guard_tests {
             Arc::clone(&provider) as Arc<dyn ModelProvider>,
             temp.path().to_path_buf(),
             WorkerExecutionControl::new(),
+            &operator_submitters(),
         )
         .await;
 
@@ -2542,6 +2758,83 @@ mod prompt_claim_guard_tests {
             JobOutcome::Failed { reason } => assert!(reason.starts_with("scope:"), "{reason}"),
             other => panic!("a foreign claim must fail, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_check_prompt_claim_scope_rejects_unconfigured_submitter() {
+        let temp = temp_dir();
+        let store = JobStore::new(temp.path());
+        let input = serde_json::json!({"task": "summarize"});
+        admit(
+            &store,
+            &record("unconfigured", input.clone(), Budget::unbounded(), operator_scope()),
+        );
+        let claim = claim_as_worker(&store, "unconfigured");
+
+        for submitters in [
+            BTreeSet::new(),
+            BTreeSet::from(["other-operator".to_owned()]),
+            // Exakter Vergleich: keine Normalisierung von Groß/Klein oder Rand.
+            BTreeSet::from(["Operator".to_owned(), " operator".to_owned()]),
+        ] {
+            assert_eq!(
+                check_prompt_claim_scope(&claim, &input, &submitters),
+                Err("scope: Einreicher ist kein konfigurierter MCP-Principal".to_owned()),
+                "submitters: {submitters:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_check_prompt_claim_scope_accepts_configured_submitter() {
+        let temp = temp_dir();
+        let store = JobStore::new(temp.path());
+        let input = serde_json::json!({"task": "summarize"});
+        admit(
+            &store,
+            &record("configured", input.clone(), Budget::unbounded(), operator_scope()),
+        );
+        let claim = claim_as_worker(&store, "configured");
+        let submitters = BTreeSet::from(["alpha".to_owned(), "operator".to_owned()]);
+
+        assert_eq!(check_prompt_claim_scope(&claim, &input, &submitters), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn test_run_job_worker_once_unconfigured_submitter_fails_without_model_call() {
+        let temp = temp_dir();
+        let store = Arc::new(JobStore::new(temp.path()));
+        admit(
+            &store,
+            &record(
+                "removed-principal",
+                serde_json::json!({"prompt": "hello"}),
+                Budget::unbounded(),
+                operator_scope(),
+            ),
+        );
+        let provider = Arc::new(RecordingModelProvider::new());
+
+        let completed = run_job_worker_once(
+            Arc::clone(&store),
+            Arc::new(JobExecutionRegistry::new()),
+            Arc::clone(&provider) as Arc<dyn ModelProvider>,
+            temp.path(),
+            None,
+            Arc::new(BTreeSet::from(["someone-else".to_owned()])),
+        )
+        .await;
+
+        assert_eq!(completed, 1, "the rejected job must reach a terminal state");
+        assert_eq!(
+            provider.recorded().len(),
+            0,
+            "an unconfigured submitter must never reach the model"
+        );
+        assert_eq!(
+            failure_reason(&store, "removed-principal"),
+            "scope: Einreicher ist kein konfigurierter MCP-Principal"
+        );
     }
 
     // ── Budget ────────────────────────────────────────────────────────────

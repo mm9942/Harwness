@@ -6,9 +6,8 @@
 //! eine abgeschickte `/command`-Zeile klassifiziert ([`crate::classify_input`])
 //! und, im Fall einer `Invocation::Command`, den passenden
 //! [`harw_operations::adapter::CommandAdapter`] aus der übergebenen Adapter-Liste
-//! sucht und dispatcht. Das lokale, statische `/command`-Popup
-//! ([`crate::registry::CommandRegistry`]) bleibt davon unberührt — es dient
-//! ausschließlich der Autocomplete-Anzeige in `app.rs`.
+//! sucht und dispatcht. Die Zulassung erfolgt über
+//! [`crate::CommandRegistry::dispatch`] (siehe „Berechtigungen“).
 //!
 //! # Verantwortungsgrenze
 //! Das Modul führt selbst **keine** Operationslogik aus — jede `/command`-Zeile
@@ -21,11 +20,13 @@
 //! Services.
 //!
 //! # Berechtigungen
-//! Jeder Dispatch führt eine explizite Caller-Stufe mit. Ein Adapter wird nur
-//! ausgeführt, wenn seine deklarierte [`harw_operations::PermissionTier`] die
-//! Caller-Stufe nicht überschreitet. Die lokale TUI nennt ihre privilegierte
-//! Konsole an der Composition Root ausdrücklich `Owner`; andere Surfaces müssen
-//! ihre eigene, niedrigere Stufe übergeben.
+//! Jeder Dispatch führt eine explizite Caller-Stufe mit, die die Composition
+//! Root wählt. Die Admission (unbekannter Command mit Tippfehler-Vorschlag,
+//! Stufe gegen die deklarierte [`harw_operations::PermissionTier`] des Adapters,
+//! Scope, Shell-Capability) läuft ausschließlich über
+//! [`crate::CommandRegistry::dispatch`]; der Katalog wird pro Aufruf per
+//! `CommandRegistry::from_command_adapters` aus der Adapter-Liste gebaut.
+//! Services und `OpContext` entstehen erst nach erfolgreicher Admission.
 //!
 //! # Nebenläufigkeit
 //! `execute_command_as` ist `async` und ruft `CommandAdapter::dispatch` (ebenfalls
@@ -46,8 +47,11 @@ use harw_operations::{OpContext, PermissionTier, ServiceMap, SharedSessionContro
 use harw_sandbox::SandboxSpec;
 use harw_types::{SessionId, TurnId};
 
-use crate::Invocation;
 use crate::session_controller::TuiSessionController;
+use crate::{
+    CapabilitySet, CommandAction, CommandError, CommandRegistry, DispatchContext, Invocation,
+    InvocationSurface,
+};
 
 /// Bündelt die optionalen/langlebigen Services, die eine `/command`-Ausführung
 /// benötigt.
@@ -139,6 +143,12 @@ async fn execute_command(
 /// test-only compatibility wrapper [`execute_command`] represents the local
 /// owner console in source-local tests.
 ///
+/// # Beschreibung
+/// Die gesamte Admission (unbekannter Command mit Vorschlag, Stufe, Scope,
+/// Shell-Capability) läuft ausschließlich über
+/// [`crate::CommandRegistry::dispatch`] mit dem TUI-Kontext aus
+/// [`tui_dispatch_context`]. Es gibt keine zweite Tier-Prüfung in diesem Modul.
+///
 /// # Argumente
 /// - `services` (`&CommandServices<'_>`): siehe [`CommandServices`].
 pub(crate) async fn execute_command_as(
@@ -149,72 +159,127 @@ pub(crate) async fn execute_command_as(
     raw_line: &str,
     services: &CommandServices<'_>,
 ) -> String {
+    execute_with_context(
+        adapters,
+        sandbox,
+        session_id,
+        tui_dispatch_context(caller_permission),
+        raw_line,
+        services,
+    )
+    .await
+}
+
+/// Baut den [`DispatchContext`] der lokalen TUI.
+///
+/// # Beschreibung
+/// Surface ist [`InvocationSurface::Tui`]. Capabilities sind
+/// [`CapabilitySet::default()`]: Kein Produktionspfad erteilt heute
+/// `commands.shell` (es gibt weder einen Config-Schlüssel noch einen Erzeuger
+/// von `CapabilitySet` außerhalb von Tests), und dieser Build führt keine
+/// Shell-Befehle aus.
+fn tui_dispatch_context(caller_permission: PermissionTier) -> DispatchContext {
+    DispatchContext {
+        caller_tier: caller_permission,
+        surface: InvocationSurface::Tui,
+        capabilities: CapabilitySet::default(),
+    }
+}
+
+/// Klassifiziert, admittiert (über [`CommandRegistry::dispatch`]) und führt aus.
+///
+/// # Beschreibung
+/// Aus `adapters` wird per [`CommandRegistry::from_command_adapters`] der
+/// Dispatch-Katalog gebaut. Nur `Ok(CommandAction::Command(..))` führt zur
+/// Ausführung: der Adapter mit Pfad `/{spec.name}` wird gesucht, erst danach
+/// werden Services gebaut und `CommandAdapter::dispatch` awaitet. Jeder
+/// Admission-Fehler wird über [`render_admission_error`] als Text
+/// zurückgegeben, ohne Services zu bauen oder die Operation anzufassen.
+async fn execute_with_context(
+    adapters: &[CommandAdapter],
+    sandbox: &SandboxSpec,
+    session_id: &SessionId,
+    context: DispatchContext,
+    raw_line: &str,
+    services: &CommandServices<'_>,
+) -> String {
     let invocation = match crate::classify_input(raw_line) {
         Ok(invocation) => invocation,
         Err(error) => return format!("Eingabe abgelehnt: {error}"),
     };
+    // Die vom Nutzer getippte Form (inkl. Alias) für Fehlermeldungen festhalten,
+    // bevor `dispatch` die Invocation konsumiert.
+    let typed = match &invocation {
+        Invocation::Command { name, .. } => format!("/{name}"),
+        Invocation::Shell(_) | Invocation::ShellRepeat => "!".to_owned(),
+        Invocation::Note(_) | Invocation::Mention { .. } | Invocation::Chat(_) => String::new(),
+    };
 
-    match invocation {
-        Invocation::Command { name, raw_args } => {
-            let path = format!("/{name}");
-            // Canonical paths take precedence over aliases. Keep the fallback
-            // separate rather than combining predicates in one `find`: a malformed
-            // adapter list must not let an earlier alias shadow a later canonical
-            // command and thereby change its permission boundary.
-            let adapter = adapters
-                .iter()
-                .find(|adapter| adapter.path() == path)
-                .or_else(|| {
-                    adapters.iter().find(|adapter| {
-                        adapter
-                            .operation()
-                            .meta()
-                            .aliases
-                            .iter()
-                            .any(|alias| *alias == name)
-                    })
-                });
+    let registry = CommandRegistry::from_command_adapters(adapters);
+    let action = match registry.dispatch(context, invocation) {
+        Ok(action) => action,
+        Err(error) => return render_admission_error(&typed, &error),
+    };
 
-            match adapter {
-                Some(adapter) => {
-                    // Authorize before building services or creating an execution
-                    // context. Use the permission copied into the adapter when it
-                    // was registered so authorization remains tied to the command
-                    // dispatch surface selected above.
-                    let required = adapter.permission();
-                    if required > caller_permission {
-                        return format!(
-                            "Berechtigung verweigert: {path} erfordert {required:?}; aktuelle Stufe ist {caller_permission:?}"
-                        );
-                    }
-                    let service_map = build_services(
-                        adapters,
-                        services.runtime_config,
-                        services.memory,
-                        services.controller,
-                        services.job_store,
-                    );
-                    let ctx = OpContext::new(
-                        session_id.clone(),
-                        TurnId::new(),
-                        sandbox.clone(),
-                        service_map,
-                    );
-                    match adapter.dispatch(&ctx, raw_args).await {
-                        Ok(output) => output.text,
-                        Err(error) => format!("Fehler: {error}"),
-                    }
-                }
-                None => format!("Unbekannter Command: {path}"),
+    match action {
+        CommandAction::Command(spec, raw_args) => {
+            let path = format!("/{}", spec.name.as_str());
+            // `from_command_adapters` übernimmt pro Pfad den ersten Adapter; dieselbe
+            // Suche hier trifft also genau den Adapter, dessen Stufe admittiert wurde.
+            let Some(adapter) = adapters.iter().find(|adapter| adapter.path() == path) else {
+                return format!("Unbekannter Command: {typed}");
+            };
+            let service_map = build_services(
+                adapters,
+                services.runtime_config,
+                services.memory,
+                services.controller,
+                services.job_store,
+            );
+            let ctx = OpContext::new(
+                session_id.clone(),
+                TurnId::new(),
+                sandbox.clone(),
+                service_map,
+            );
+            match adapter.dispatch(&ctx, raw_args).await {
+                Ok(output) => output.text,
+                Err(error) => format!("Fehler: {error}"),
             }
         }
-        Invocation::Shell(command) => {
+        CommandAction::Shell(command) => {
             format!("Shell-Ausführung ist noch nicht verfügbar: {command}")
         }
-        Invocation::ShellRepeat => "Shell-Wiederholung ist noch nicht verfügbar.".to_owned(),
-        Invocation::Note(note) => format!("Notiz: {note}"),
-        Invocation::Mention { target, body } => format!("@{target}: {body}"),
-        Invocation::Chat(text) => text,
+        CommandAction::ShellRepeat => "Shell-Wiederholung ist noch nicht verfügbar.".to_owned(),
+        CommandAction::Note(note) => format!("Notiz: {note}"),
+        CommandAction::Mention { target, body } => format!("@{target}: {body}"),
+        CommandAction::Chat(text) => text,
+    }
+}
+
+/// Setzt einen Admission-Fehler aus [`CommandRegistry::dispatch`] in Anzeigetext um.
+///
+/// # Argumente
+/// - `typed` (`&str`): vom Nutzer getippte Form (`/name`, Alias oder `!`).
+/// - `error` (`&CommandError`): der Admission-Fehler.
+fn render_admission_error(typed: &str, error: &CommandError) -> String {
+    match error {
+        CommandError::UnknownCommand {
+            suggestion: Some(suggestion),
+            ..
+        } => format!("Unbekannter Command: {typed} (meinten Sie /{suggestion}?)"),
+        CommandError::UnknownCommand {
+            suggestion: None, ..
+        } => format!("Unbekannter Command: {typed}"),
+        CommandError::PermissionDenied {
+            required, actual, ..
+        } => format!(
+            "Berechtigung verweigert: {typed} erfordert {required:?}; aktuelle Stufe ist {actual:?}"
+        ),
+        CommandError::CapabilityDenied { capability } => {
+            format!("Shell-Ausführung abgelehnt: Capability '{capability}' ist nicht aktiviert")
+        }
+        other => format!("Eingabe abgelehnt: {other}"),
     }
 }
 
@@ -522,8 +587,10 @@ mod tests {
         .await;
         std::fs::remove_dir_all(tmp).ok();
 
+        // Die TUI erteilt `commands.shell` nicht (`tui_dispatch_context`); die
+        // Admission über `CommandRegistry::dispatch` lehnt deshalb ab.
         assert_eq!(
-            output, "Shell-Ausführung ist noch nicht verfügbar: ls -la",
+            output, "Shell-Ausführung abgelehnt: Capability 'commands.shell' ist nicht aktiviert",
             "unexpected shell output; got: {output}"
         );
     }
@@ -550,9 +617,51 @@ mod tests {
         std::fs::remove_dir_all(tmp).ok();
 
         assert_eq!(
-            output, "Shell-Wiederholung ist noch nicht verfügbar.",
+            output, "Shell-Ausführung abgelehnt: Capability 'commands.shell' ist nicht aktiviert",
             "unexpected shell-repeat output; got: {output}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_context_admitted_shell_is_not_available() {
+        let adapters = adapters();
+        let (sandbox, tmp) = test_sandbox();
+        let session_id = SessionId::new();
+        let controller = test_controller();
+        let context = crate::DispatchContext {
+            caller_tier: PermissionTier::Operator,
+            surface: crate::InvocationSurface::Tui,
+            capabilities: crate::CapabilitySet::with(crate::ShellCapability::CommandsShell),
+        };
+        let services = CommandServices {
+            runtime_config: None,
+            memory: None,
+            controller: &controller,
+            job_store: None,
+        };
+
+        let shell = super::execute_with_context(
+            &adapters,
+            &sandbox,
+            &session_id,
+            context,
+            "!ls -la",
+            &services,
+        )
+        .await;
+        let repeat = super::execute_with_context(
+            &adapters,
+            &sandbox,
+            &session_id,
+            context,
+            "!!",
+            &services,
+        )
+        .await;
+        std::fs::remove_dir_all(tmp).ok();
+
+        assert_eq!(shell, "Shell-Ausführung ist noch nicht verfügbar: ls -la");
+        assert_eq!(repeat, "Shell-Wiederholung ist noch nicht verfügbar.");
     }
 
     // -----------------------------------------------------------------------
@@ -732,6 +841,81 @@ mod tests {
             0,
             "a denied alias must not dispatch its operation"
         );
+    }
+
+    #[tokio::test]
+    async fn test_execute_command_as_observer_cannot_run_operator_command() {
+        let operation = Arc::new(CountingOperation::protected_alias());
+        let adapters = CommandAdapter::from_operation(operation.clone());
+        let (sandbox, tmp) = test_sandbox();
+        let session_id = SessionId::new();
+        let controller = test_controller();
+        let services = CommandServices {
+            runtime_config: None,
+            memory: None,
+            controller: &controller,
+            job_store: None,
+        };
+
+        let denied = super::execute_command_as(
+            &adapters,
+            &sandbox,
+            &session_id,
+            PermissionTier::Observer,
+            "/protected",
+            &services,
+        )
+        .await;
+        assert_eq!(
+            denied,
+            "Berechtigung verweigert: /protected erfordert Operator; aktuelle Stufe ist Observer"
+        );
+        assert_eq!(
+            operation.dispatches.load(Ordering::Relaxed),
+            0,
+            "a denied canonical command must not dispatch its operation"
+        );
+
+        let admitted = super::execute_command_as(
+            &adapters,
+            &sandbox,
+            &session_id,
+            PermissionTier::Operator,
+            "/protected",
+            &services,
+        )
+        .await;
+        std::fs::remove_dir_all(tmp).ok();
+
+        assert_eq!(admitted, "dispatched");
+        assert_eq!(operation.dispatches.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_execute_command_as_unknown_command_suggests_nearest() {
+        let adapters = adapters();
+        let (sandbox, tmp) = test_sandbox();
+        let session_id = SessionId::new();
+
+        let output = super::execute_command_as(
+            &adapters,
+            &sandbox,
+            &session_id,
+            PermissionTier::Operator,
+            "/stauts",
+            &CommandServices {
+                runtime_config: None,
+                memory: None,
+                controller: &test_controller(),
+                job_store: None,
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(tmp).ok();
+
+        // `stauts` (Länge 6) → gleiche Anfangsbuchstaben-Kandidaten mit minimaler
+        // Längendifferenz; `status` ist in `register_all` vor `skills` registriert.
+        assert_eq!(output, "Unbekannter Command: /stauts (meinten Sie /status?)");
     }
 
     // -----------------------------------------------------------------------

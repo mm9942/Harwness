@@ -7,12 +7,18 @@
 //! `WebServerConfig`. [`serve_web`] ist der Konsument — aufgerufen aus
 //! `cli::Command::Web` (`main.rs::dispatch`).
 //!
-//! # Dieselbe Registry wie der Rest der CLI
-//! [`crate::build_operation_registry`] ist dieselbe Funktion, die auch
-//! `harw analyze` und der Chat-Einstieg verwenden (siehe deren Aufrufer in
-//! `main.rs`). [`harw_web::router::WebRouteTable::from_registry`] baut die
-//! Routentabelle **ausschließlich** aus dieser einen Registry — es gibt in
-//! diesem Modul keine zweite Stelle, die Operationen zusammenstellt.
+//! # Eine Montage: `RuntimeAssembly`
+//! Seit W2d-1/B1 montiert [`serve_web`] den Lauf ausschließlich über
+//! [`crate::runtime_web::web_assembly`] (`harw-runtime`,
+//! [`harw_runtime::EntryKind::Web`]). Konfiguration, Trust-Bericht,
+//! Operations-Registry und Service-Map kommen aus dieser einen Montage;
+//! [`harw_web::router::WebRouteTable::from_registry`] baut die Routentabelle
+//! **ausschließlich** aus [`harw_runtime::RuntimeAssembly::operations`] — es
+//! gibt in diesem Modul keine zweite Stelle, die Operationen zusammenstellt.
+//! Die Konfiguration wird vertrauensbewusst über
+//! [`harw_runtime::load_config`] für dieselbe Spec geladen
+//! ([`crate::runtime_web::web_spec`]); die frühere Layer-Liste aus
+//! `crate::resolve_serve_paths` wird dafür nicht mehr gelesen.
 //!
 //! # Warum er nicht ungefragt läuft
 //! `harw web` bindet nur, weil der Subcommand explizit aufgerufen wurde —
@@ -22,16 +28,19 @@
 //! zweiten, stillen Startpfad hinzu: [`serve_web`] wird ausschließlich aus
 //! dem `Web`-Subcommand aufgerufen, nirgends sonst.
 //!
+//! # HARW-Home ist Pflicht
+//! Ohne HARW-Home (externes `--config-dir` ohne `--home`) gibt es weder
+//! einen Trust-Bericht noch einen Freigabespeicher; [`serve_web`] bricht dann
+//! sofort mit einer Fehlermeldung ab, statt eine halbe Fläche ohne
+//! `approval.*` zu starten.
+//!
 //! # Der Socket-Pfad
-//! `harw-home` kennt — anders als vom Auftrag vermutet — **keinen**
-//! zentralen Pfadnamen für einen Kontrollflächen-Socket; auch
-//! `harw-sentinel`s `sentinel.sock` ist eine lokale Konstante in
-//! `harw-sentinel::cli`, kein Eintrag in `harw_home::paths`. Dieses Modul
-//! folgt demselben Muster: [`DEFAULT_SOCKET_FILE_NAME`] ist eine lokale
-//! Vorgabe (`<home>/web.sock`), überschreibbar über `--socket`. Ohne
-//! `--socket` und ohne auflösbares HARW-Home (externes `--config-dir` ohne
-//! `--home`) bricht [`serve_web`] mit einer Fehlermeldung ab, statt einen
-//! Pfad zu erraten.
+//! `harw-home` kennt **keinen** zentralen Pfadnamen für einen
+//! Kontrollflächen-Socket; auch `harw-sentinel`s `sentinel.sock` ist eine
+//! lokale Konstante in `harw-sentinel::cli`, kein Eintrag in
+//! `harw_home::paths`. Dieses Modul folgt demselben Muster:
+//! [`DEFAULT_SOCKET_FILE_NAME`] ist eine lokale Vorgabe (`<home>/web.sock`),
+//! überschreibbar über `--socket`.
 //!
 //! # `SO_PEERCRED`-Autorisierung
 //! Der aktuelle Prozess-Eigentümer (die eigene UID, über
@@ -41,94 +50,77 @@
 //! liegt unter dem privaten HARW-Home; ein Peer mit fremder UID, der ihn
 //! trotzdem erreicht, bekommt `403 unknown_peer`.
 //!
-//! # `OpContext` je Aufruf
+//! # `OpContext` je Aufruf — das Tier wirkt (F-045)
 //! [`harw_web::server::WebContextFactory`] wird einmal pro angenommener
-//! Verbindung aufgerufen und muss synchron einen frischen `OpContext`
-//! liefern. `OperationRegistry` und `ServiceMap` sind nicht `Clone` (siehe
-//! `harw_operations::registry`/`context`-Moduldoku); dieses Modul baut daher
-//! bei jedem Aufruf eine neue `OperationRegistry` aus `Arc`-Klonen der immer
-//! gleichen Operationsliste sowie eine neue `ServiceMap`, in die dieselben
-//! Plan-/Goal-/Finding-Store-`Arc`s eingefügt werden, die beim Start der
-//! Planungsfläche geöffnet wurden (`crate::build_plan_services`) — kein
-//! zweiter Store wird pro Aufruf geöffnet, nur die `ServiceMap`-Hülle ist
-//! neu. Ist die Planungsfläche abgeschaltet oder kein HARW-Home auflösbar,
-//! bleiben `/plan`, `/goal`, `/explore`, `/research-*` und `/analyze`
-//! registriert, aber ohne Store — sie antworten `OpError::NotAvailable`,
-//! genau wie im One-Shot-Chat-Pfad ohne Planungsfläche.
+//! Verbindung aufgerufen, bekommt Peer **und** Tier und muss synchron (ohne
+//! `Result`) einen frischen `OpContext` liefern. [`web_context_for`] baut ihn:
 //!
-//! Die Sandbox kommt aus [`crate::build_local_spawn_context`] — derselben
-//! Funktion, die auch `harw analyze` für seine `OpContext`-Sandbox
-//! verwendet.
+//! - Die Service-Map ist [`harw_runtime::RuntimeServices::service_map`] für
+//!   [`ServiceSurface::Web`] — dieselbe Map, die
+//!   [`harw_runtime::RuntimeAssembly::op_context`] verwendet. Die Montage
+//!   selbst kennt die verbindungsgebundenen Dienste nicht; darum legt diese
+//!   Datei danach [`PeerCredentials`], den `ApprovalActorResolver`, den
+//!   Freigabespeicher der Montage und einen tier-genauen
+//!   [`harw_types::Principal`] ([`crate::runtime_web::web_principal`]) hinein.
+//!   `ServiceMap::insert` überschreibt gleichen Typs — der Owner-Principal
+//!   der Montage wird so durch den des Peers ersetzt, nie erweitert.
+//! - Die Sandbox ist die beim Start **einmal** gebaute Web-Wurzel-Sandbox
+//!   ([`harw_runtime::root_sandbox`]), je Anfrage über
+//!   [`crate::runtime_web::narrow_web_sandbox`] auf das Tier verengt. Ein
+//!   `Observer`-Peer bekommt damit nur `ReadWorkspace`. Weil die Fabrik keinen
+//!   Fehler melden kann, scheitert ein nicht bindbares Arbeitsverzeichnis
+//!   bereits beim Start und nicht erst je Anfrage.
 //!
 //! # Woher der `ApprovalActor` kommt — und woher nicht
 //! `approval.pending`/`approval.resolve` (`harw-ops::approval`) leiten den
 //! [`harw_types::ApprovalActor`] ausschließlich aus zwei Services her, die
-//! diese Datei in die [`ServiceMap`] jeder Verbindung legt: den
+//! diese Datei in die `ServiceMap` jeder Verbindung legt: den
 //! [`PeerCredentials`], die [`harw_web::server::WebContextFactory`] pro
 //! angenommener Verbindung aus `SO_PEERCRED` liest (Kernel-verbürgt, siehe
 //! `harw_web::peer`-Moduldoku), und einen `Arc<dyn ApprovalActorResolver>`,
-//! der diese `uid` serverseitig auf einen `ApprovalActor` abbildet. Der
-//! `peer`-Parameter der [`harw_web::server::WebContextFactory`]-Closure war
-//! zuvor als `_peer` verworfen — ohne ihn im [`OpContext`] zu registrieren,
-//! konnte `approval.resolve` den Aufrufer nie identifizieren und musste
-//! fail-closed mit `OpError::NotAvailable` antworten. Es gibt **keinen**
-//! zweiten Weg, aus dem ein `ApprovalActor` entstehen könnte: weder
-//! `ApprovalResolveArgs` noch diese Datei lesen ihn aus dem Anfragerumpf.
+//! der diese `uid` serverseitig auf einen `ApprovalActor` abbildet. Es gibt
+//! **keinen** zweiten Weg, aus dem ein `ApprovalActor` entstehen könnte:
+//! weder `ApprovalResolveArgs` noch diese Datei lesen ihn aus dem
+//! Anfragerumpf.
 //!
 //! # Die Genehmiger-Tabelle — ohne Vorgabewert, wie [`StaticUidTierMap`]
 //! [`StaticUidApprovalActorMap`] wird hier — genau wie [`StaticUidTierMap`]
-//! wenige Zeilen darüber — **an der Kompositionswurzel** aus der eigenen
-//! Prozess-`uid` gebaut, nie aus dem Anfragerumpf: `rustix::process::getuid`
-//! liefert dieselbe `uid`, die auch [`PermissionTier::Owner`] bekommt, und
-//! diese Datei bildet sie auf `ApprovalActor::Operator { id: "owner" }` ab.
-//! Genau wie [`StaticUidTierMap::new`] hier ohne Rückfallwert aufgerufen
-//! wird, hat auch [`StaticUidApprovalActorMap::new`] hier **keinen**
-//! Eintrag für irgendeine andere `uid` — eine unbekannte `uid` bleibt
-//! `None`, nie ein generischer Actor (siehe `StaticUidApprovalActorMap`s
-//! eigene Moduldoku: „ein unbekannter Genehmiger ist niemals ein
-//! akzeptabler Standardwert"). Diese Datei erweitert die Tabelle bewusst
-//! nicht auf mehrere Benutzer — das wäre eine neue, hier nicht getroffene
-//! Betriebsentscheidung (wer außer dem Prozess-Eigentümer genehmigen darf),
-//! keine, die diese Komposition selbst fällen sollte.
+//! — **an der Kompositionswurzel** aus der eigenen Prozess-`uid` gebaut, nie
+//! aus dem Anfragerumpf, und bildet sie auf `ApprovalActor::Operator { id:
+//! "owner" }` ab. Eine unbekannte `uid` bleibt `None`, nie ein generischer
+//! Actor. Diese Datei erweitert die Tabelle bewusst nicht auf mehrere
+//! Benutzer — das wäre eine Betriebsentscheidung, keine
+//! Kompositionsentscheidung.
 //!
 //! # Der Genehmigungsspeicher
-//! [`ApprovalStore::new`] ist infallibel und öffnet keine Datei sofort —
-//! diese Datei baut ihn deshalb, sobald ein HARW-Home auflösbar ist, direkt
-//! aus `home` (dieselbe Bedingung wie bei den Plan-Diensten): der Typ hängt
-//! sein eigenes `approvals`-Unterverzeichnis intern an, diese Datei fügt
-//! keinen zweiten Verzeichnisnamen hinzu. Der fertige Speicher landet als
-//! `Arc<ApprovalStore>` in der `ServiceMap` jeder Verbindung. Ohne
-//! HARW-Home (externes `--config-dir` ohne `--home`) bleibt er `None`;
-//! `approval.pending`/`approval.resolve` antworten dann
-//! `OpError::NotAvailable`, genau wie `/plan`/`/goal` ohne Home.
+//! [`ApprovalStore::new`] ist infallibel und öffnet keine Datei sofort. Diese
+//! Datei baut ihn aus dem (Pflicht-)Home und übergibt ihn der Montage
+//! ([`harw_runtime::RuntimeStores::approval_store`]); je Verbindung landet
+//! derselbe `Arc<ApprovalStore>` in der `ServiceMap`.
 //!
 //! # `harw-dod`: kein Konsument hier
 //! `harw-cli` braucht `harw-dod` nicht. Die Fassade bündelt Host-Sicherheits-
-//! sensorik (CPU/Speicher/Netz/Auth-Log/Prozessüberwachung, Regelbewertung,
-//! Eskalation) für einen Beobachtungsprozess — das ist `harw-sentinel`s
-//! Aufgabe, nicht die eines CLI-Kontrollflächen-Servers, der Operationen an
-//! einen bereits identifizierten, lokal-vertrauten Peer weiterreicht. Diese
-//! Datei zieht deshalb keine `harw-dod`-Abhängigkeit; die Fassade wartet
-//! weiter auf ihren richtigen Konsumenten.
+//! sensorik für einen Beobachtungsprozess — das ist `harw-sentinel`s
+//! Aufgabe, nicht die eines CLI-Kontrollflächen-Servers.
 //!
 //! # Nebenläufigkeit
 //! [`serve_web`] baut eine einthreadige `tokio`-Runtime (wie
-//! `main::serve_mcp`) und läuft darin bis `BoundWebServer::serve` endet
-//! (Annahmefehler oder Prozessende). Jede Verbindung bedient `harw-web`
-//! bereits in einer eigenen Task (siehe dortige Moduldoku).
+//! `main::serve_mcp`) und läuft darin bis `BoundWebServer::serve` endet.
+//! Die `RuntimeAssembly` liegt in einem `Arc` und wird per `Arc::clone` in
+//! die Kontext-Fabrik gereicht; jede Verbindung bedient `harw-web` in einer
+//! eigenen Task.
 //!
 //! # Fehler
-//! Ein `String` bei Home-/Config-Auflösung, Registrierungsfehlern
-//! ([`harw_web::error::WebError`]) oder wenn kein Socket-Pfad auflösbar ist.
+//! Ein `String` bei fehlendem Home, Config-/Trust-Fehlern
+//! ([`harw_runtime::RuntimeError`]), Montage- oder Sandbox-Fehlern,
+//! Routenfehlern ([`harw_web::error::WebError`]) oder Bindefehlern.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use harw_operations::context::{OpContext, ServiceMap};
 use harw_operations::operation::PermissionTier;
-use harw_operations::registry::OperationRegistry;
-use harw_plan::{GoalStore, PlanStore, PlanToolConfig};
-use harw_plan_bridge::{FindingStore, register_plan_services};
+use harw_runtime::{EntryKind, RuntimeAssembly, ServiceSurface};
 use harw_sandbox::SandboxSpec;
 use harw_session_store::approval::ApprovalStore;
 use harw_types::{SessionId, TurnId};
@@ -155,54 +147,81 @@ const EVENT_BUS_CAPACITY: usize = 64;
 /// Prozess endet.
 ///
 /// # Arguments
-/// - `layers` (`Vec<PathBuf>`): Config-Layer, wie von
-///   [`crate::resolve_serve_paths`] geliefert.
-/// - `home` (`Option<PathBuf>`): das aufgelöste HARW-Home, falls kein
-///   externes `--config-dir` verwendet wurde — bestimmt sowohl den
-///   Vorgabe-Socket-Pfad als auch, ob die Planungsfläche Stores öffnen kann.
-/// - `socket_override` (`Option<PathBuf>`): `--socket`; hat Vorrang vor der
-///   Vorgabe unter `home`.
+/// - `_layers` (`Vec<PathBuf>`): wird nicht mehr gelesen; die Konfiguration
+///   kommt aus der `RuntimeAssembly` (Trust-Bericht). Bleibt für die
+///   Signaturstabilität des Aufrufers in `main.rs`.
+/// - `home` (`Option<PathBuf>`): das aufgelöste HARW-Home. **Pflicht** —
+///   `None` ist ein Fehler (siehe Moduldoc, Abschnitt „HARW-Home ist Pflicht").
+/// - `socket_override` (`Option<PathBuf>`): `--socket`; hat Vorrang vor
+///   `<home>/web.sock`.
 ///
 /// # Returns
 /// `Ok(())`, wenn die Annahmeschleife regulär endet (siehe
 /// [`harw_web::server::BoundWebServer::serve`]).
 ///
 /// # Errors
-/// Ein `String`, wenn keine Konfiguration geladen werden kann, kein
-/// Socket-Pfad auflösbar ist (`socket_override` und `home` beide `None`),
-/// die Sandbox nicht gebaut werden kann, die Routentabelle einen Fehler
-/// meldet ([`harw_web::error::WebError::MissingSurfaceMetadata`] o. ä.), oder
-/// der Server nicht binden kann.
+/// Ein `String`, wenn `home` fehlt, das Arbeitsverzeichnis nicht lesbar ist,
+/// die Konfiguration nicht vertrauensbewusst geladen werden kann, die
+/// Planungsfläche nicht öffnet, die Montage oder die Web-Wurzel-Sandbox
+/// scheitert, die Routentabelle einen Fehler meldet oder der Server nicht
+/// binden kann.
 ///
 /// # Concurrency
 /// Baut eine eigene einthreadige `tokio`-Runtime, siehe Moduldoc.
 pub(crate) fn serve_web(
-    layers: Vec<PathBuf>,
+    // Konfiguration kommt aus der RuntimeAssembly (Trust-Bericht); Layer-Liste
+    // bleibt für Signaturstabilität.
+    _layers: Vec<PathBuf>,
     home: Option<PathBuf>,
     socket_override: Option<PathBuf>,
 ) -> Result<(), String> {
-    let config = harw_config::discover_config(&layers).map_err(|error| error.to_string())?;
-    config.validate().map_err(|error| error.to_string())?;
+    let home = home.ok_or_else(|| {
+        "harw web benötigt ein HARW-Home (--home); ohne Home gibt es weder Trust-Bericht noch Freigabespeicher"
+            .to_owned()
+    })?;
+    let socket_path = socket_override.unwrap_or_else(|| home.join(DEFAULT_SOCKET_FILE_NAME));
+    let cwd = std::env::current_dir().map_err(|error| format!("cwd: {error}"))?;
+    let uid = rustix::process::getuid().as_raw();
 
-    let socket_path = socket_override
-        .or_else(|| home.as_deref().map(|home| home.join(DEFAULT_SOCKET_FILE_NAME)))
-        .ok_or_else(|| {
-            "harw web: kein Socket-Pfad auflösbar — gib --socket an oder verwende ein HARW-Home \
-             (kein externes --config-dir ohne --home)"
-                .to_owned()
-        })?;
+    // Dieselbe Spec, aus der `web_assembly` montiert: die Plan-Dienste sind
+    // eine Builder-Eingabe und brauchen deshalb die Konfiguration vorab.
+    let (config, trust) =
+        harw_runtime::load_config(&crate::runtime_web::web_spec(&home, &cwd, uid))
+            .map_err(|error| error.to_string())?;
+    tracing::info!(
+        layers = trust.layers.len(),
+        untrusted_repo = trust.has_untrusted_repo(),
+        "web.config.loaded"
+    );
 
     let plan_config = crate::plan_tool_config_from_section(&config.harness.tools.plan)?;
-    let (operations, plan_tools) = crate::build_operation_registry(&plan_config);
+    let plan = runtime_plan_services(crate::build_plan_services(
+        &home,
+        &plan_config,
+        crate::DEFAULT_PLAN_SPACE,
+        crate::DEFAULT_GOAL_SPACE,
+    )?);
+
+    // `ApprovalStore::new` hängt sein eigenes `approvals`-Unterverzeichnis an
+    // (siehe Moduldoc, Abschnitt „Der Genehmigungsspeicher").
+    let approval_store = Some(Arc::new(ApprovalStore::new(&home)));
+
+    let assembly = Arc::new(crate::runtime_web::web_assembly(
+        &home,
+        &cwd,
+        uid,
+        approval_store,
+        plan,
+    )?);
+    // `operations()` liefert `&Arc<OperationRegistry>`; Deref-Koerzion auf
+    // `&OperationRegistry` für `from_registry`.
+    let routes = WebRouteTable::from_registry(assembly.operations())
+        .map_err(|error| error.to_string())?;
     tracing::info!(
-        total = operations.len(),
-        plan_tools,
+        total = assembly.operations().len(),
         "web.registry.assembled"
     );
 
-    let routes = WebRouteTable::from_registry(&operations).map_err(|error| error.to_string())?;
-
-    let uid = rustix::process::getuid().as_raw();
     let authorizer: Arc<dyn harw_web::PeerAuthorizer> =
         Arc::new(StaticUidTierMap::new(vec![(uid, PermissionTier::Owner)]));
 
@@ -212,50 +231,15 @@ pub(crate) fn serve_web(
     let approver: Arc<dyn ApprovalActorResolver> =
         Arc::new(StaticUidApprovalActorMap::new(vec![(uid, "owner".to_owned())]));
 
-    let project_root = std::env::current_dir().map_err(|error| format!("cwd: {error}"))?;
-    let sandbox = crate::build_local_spawn_context(&project_root)?.sandbox;
+    // Einmal beim Start: ein nicht bindbares Arbeitsverzeichnis bricht hier
+    // ab, weil die Kontext-Fabrik je Anfrage keinen Fehler melden kann.
+    let root_sandbox =
+        harw_runtime::root_sandbox(EntryKind::Web, &cwd).map_err(|error| error.to_string())?;
 
-    // Ohne HARW-Home bleibt der Genehmigungsspeicher `None` — dieselbe
-    // Bedingung wie bei den Plan-Diensten unten (siehe Moduldoc, Abschnitt
-    // „Der Genehmigungsspeicher"). `ApprovalStore::new` hängt sein eigenes
-    // `approvals`-Unterverzeichnis an `root` an (siehe dortige
-    // Implementierung) — diese Datei erfindet dafür keinen eigenen,
-    // doppelten Verzeichnisnamen.
-    let approval_store: Option<Arc<ApprovalStore>> =
-        home.as_deref().map(|home_path| Arc::new(ApprovalStore::new(home_path)));
-
-    let plan_services = match home.as_deref() {
-        Some(home_path) => Some(crate::build_plan_services(
-            home_path,
-            &plan_config,
-            crate::DEFAULT_PLAN_SPACE,
-            crate::DEFAULT_GOAL_SPACE,
-        )?),
-        None => None,
-    };
-    let plan_store = plan_services.as_ref().and_then(|services| services.plan.clone());
-    let goal_store = plan_services.as_ref().and_then(|services| services.goal.clone());
-    let finding_store = plan_services
-        .as_ref()
-        .and_then(|services| services.findings.clone());
-
-    // Alles, was der Server einmal aufbaut, in einem Bündel; die
-    // `PeerCredentials` kommen weiterhin je Verbindung vom Kernel und werden
-    // hier bewusst nicht eingelagert.
-    let web_services = WebServerServices {
-        operations,
-        sandbox,
-        plan: plan_store,
-        goal: goal_store,
-        findings: finding_store,
-        plan_config,
-        approver,
-        approval_store,
-    };
-
+    let factory_assembly = Arc::clone(&assembly);
     let context_factory: Arc<harw_web::server::WebContextFactory> =
-        Arc::new(move |peer: &PeerCredentials, _tier: PermissionTier| {
-            build_web_op_context(&web_services, *peer)
+        Arc::new(move |peer: &PeerCredentials, tier: PermissionTier| {
+            web_context_for(&factory_assembly, &root_sandbox, &approver, *peer, tier)
         });
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -280,164 +264,251 @@ pub(crate) fn serve_web(
     })
 }
 
-/// Die Dienste, die [`serve_web`] **einmal beim Start** aufbaut und die jede
-/// angenommene Verbindung unverändert weiterverwendet.
+/// Übersetzt die crate-eigene Planungsfläche in [`harw_runtime::PlanServices`].
 ///
 /// # Description
-/// Bündelt die acht langlebigen Bestandteile, aus denen
-/// [`build_web_op_context`] pro Anfrage einen frischen [`OpContext`] formt.
-/// Der Schnitt trennt zwei Lebensdauern: alles hier entsteht **einmal** an
-/// der Kompositionswurzel in [`serve_web`] und wird nur noch geliehen bzw.
-/// über `Arc`-Zeiger geklont; das einzige **je Verbindung** entstehende
-/// Datum — die [`PeerCredentials`] — bleibt bewusst ein eigener Parameter
-/// von [`build_web_op_context`] und ist **kein Feld dieses Structs**.
-///
-/// # Woher die Peer-Credentials kommen
-/// Die [`PeerCredentials`] stammen **vom Kernel** (`SO_PEERCRED`, gelesen in
-/// `harw-web` und der [`harw_web::server::WebContextFactory`] übergeben) und
-/// **nie aus dem Anfragerumpf**. Sie sind `Copy` und werden je Verbindung
-/// neu gereicht; würde man sie hier einlagern, entstünde ein geteiltes,
-/// langlebiges Identitätsfeld — genau der zweite Autoritätspfad, den dieses
-/// Modul nicht haben darf.
-///
-/// # Felder
-/// - `operations`: die einmal gebaute [`OperationRegistry`]
-///   ([`crate::build_operation_registry`]); je Anfrage wird daraus eine neue
-///   Registry aus `Arc`-Klonen der Operationen gebaut, weil
-///   `OperationRegistry` nicht `Clone` ist (siehe Moduldoc).
-/// - `sandbox`: die Sandbox aus [`crate::build_local_spawn_context`]; wird
-///   je Anfrage geklont, da `OpContext::new` Eigentum verlangt.
-/// - `plan`: der beim Start geöffnete Plan-Store (`crate::build_plan_services`),
-///   `None` bei abgeschalteter Planungsfläche oder ohne HARW-Home.
-/// - `goal`: der zugehörige Goal-Store, mit derselben `None`-Bedingung.
-/// - `findings`: der zugehörige Finding-Store, mit derselben `None`-Bedingung.
-/// - `plan_config`: dieselbe [`PlanToolConfig`], die auch die Operationen
-///   registriert hat.
-/// - `approver`: die serverseitig gebaute, uid-basierte Genehmiger-Tabelle
-///   (siehe Moduldoc, Abschnitt „Die Genehmiger-Tabelle"). Sie hat **keinen
-///   Vorgabewert**: eine unbekannte uid wird abgewiesen, nicht auf einen
-///   Standard-Actor abgebildet.
-/// - `approval_store`: der Genehmigungsspeicher aus [`serve_web`], `None`
-///   ohne HARW-Home (siehe Moduldoc, Abschnitt „Der Genehmigungsspeicher").
-///
-/// # Concurrency
-/// Wird hinter der `WebContextFactory` in einem `Arc` geteilt und nur
-/// gelesen; kein veränderlicher Zustand.
-struct WebServerServices {
-    // Einmal gebaute Operationsliste; Vorlage für die Registry je Anfrage.
-    operations: OperationRegistry,
-    // Sandbox der Kompositionswurzel; je Anfrage geklont.
-    sandbox: SandboxSpec,
-    // Beim Start geöffnete Planungsfläche — alle drei oder keiner.
-    plan: Option<Arc<dyn PlanStore>>,
-    goal: Option<Arc<dyn GoalStore>>,
-    findings: Option<Arc<FindingStore>>,
-    // Konfiguration, mit der die Plan-Operationen registriert wurden.
-    plan_config: PlanToolConfig,
-    // uid-basierte Genehmiger-Tabelle ohne Rückfallwert.
-    approver: Arc<dyn ApprovalActorResolver>,
-    // Genehmigungsspeicher; `None` ohne HARW-Home.
-    approval_store: Option<Arc<ApprovalStore>>,
-}
-
-/// Baut den [`OpContext`] einer einzelnen freigegebenen Web-Anfrage.
-///
-/// # Description
-/// Aufgerufen aus [`harw_web::server::WebContextFactory`] — synchron, einmal
-/// pro angenommener Verbindung (siehe dortige Vertragsdoku). Baut eine
-/// frische [`OperationRegistry`] aus `Arc`-Klonen von `services.operations`
-/// (die Registry selbst ist nicht `Clone`, siehe Moduldoc) und registriert
-/// die Plan-Dienste erneut, falls Plan-, Goal- **und** Finding-Store
-/// vorhanden sind — dieselbe Bedingung wie im One-Shot-Chat-Pfad
-/// (`chat::one_shot_model_tool_context`).
+/// `crate::build_plan_services` trägt Plan-, Goal- und Finding-Store als
+/// einzelne `Option`s (abgeschaltete Planungsfläche ⇒ alle `None`). Die
+/// Montage nimmt nur eine vollständige Fläche an: alle drei oder keiner.
 ///
 /// # Arguments
-/// - `services` (`&WebServerServices`): die einmal beim Start gebauten
-///   Dienste; geliehen, nie verschoben.
-/// - `peer` (`PeerCredentials`): die über `SO_PEERCRED` gelesene Identität
-///   **dieser einen** Verbindung, unverändert aus dem
-///   [`harw_web::server::WebContextFactory`]-Parameter übernommen — vom
-///   Kernel, nie aus dem Anfragerumpf. Als `PeerCredentials`-Service
-///   registriert, damit `approval.resolve` (`harw-ops::approval`) den
-///   Aufrufer identifizieren kann (siehe Moduldoc, Abschnitt „Woher der
-///   `ApprovalActor` kommt").
+/// - `services` (`crate::PlanServices`): Ergebnis von
+///   `crate::build_plan_services`; wird verbraucht.
+///
+/// # Returns
+/// `Some`, wenn Plan, Goal **und** Findings vorhanden sind, sonst `None`.
+fn runtime_plan_services(services: crate::PlanServices) -> Option<harw_runtime::PlanServices> {
+    let crate::PlanServices {
+        plan,
+        goal,
+        findings,
+        config,
+        ..
+    } = services;
+    match (plan, goal, findings) {
+        (Some(plan), Some(goal), Some(findings)) => Some(harw_runtime::PlanServices {
+            plan,
+            goal,
+            findings,
+            plan_config: config,
+        }),
+        _ => None,
+    }
+}
+
+/// Baut den [`OpContext`] einer freigegebenen Web-Anfrage aus der Montage.
+///
+/// # Description
+/// Aufgerufen aus der [`harw_web::server::WebContextFactory`] — synchron,
+/// einmal pro angenommener Verbindung. Holt die
+/// [`ServiceSurface::Web`]-Service-Map der Montage (dieselbe wie in
+/// [`RuntimeAssembly::op_context`]) und ergänzt sie über [`web_op_context`]
+/// um die verbindungsgebundenen Dienste und die tier-verengte Sandbox.
+///
+/// # Arguments
+/// - `assembly` (`&RuntimeAssembly`): die einmal beim Start gebaute Montage.
+/// - `root_sandbox` (`&SandboxSpec`): Web-Wurzel-Sandbox aus
+///   [`harw_runtime::root_sandbox`].
+/// - `approver` (`&Arc<dyn ApprovalActorResolver>`): uid-basierte
+///   Genehmiger-Tabelle ohne Rückfallwert.
+/// - `peer` (`PeerCredentials`): Kernel-verbürgte Identität dieser Verbindung.
+/// - `tier` ([`PermissionTier`]): vom `PeerAuthorizer` zugeteilte Stufe.
 ///
 /// # Returns
 /// Einen frischen [`OpContext`] mit neuer [`SessionId`]/[`TurnId`].
 ///
 /// # Concurrency
-/// Rein synchron; jeder Aufruf klont nur `Arc`-Zeiger und baut eine neue,
-/// kleine `ServiceMap`-Hülle — kein gemeinsamer veränderlicher Zustand.
-fn build_web_op_context(services: &WebServerServices, peer: PeerCredentials) -> OpContext {
-    let mut registry = OperationRegistry::new();
-    for operation in services.operations.iter() {
-        registry.register(Arc::clone(operation));
-    }
+/// Rein synchron; klont nur `Arc`-Zeiger und baut eine neue `ServiceMap`.
+fn web_context_for(
+    assembly: &RuntimeAssembly,
+    root_sandbox: &SandboxSpec,
+    approver: &Arc<dyn ApprovalActorResolver>,
+    peer: PeerCredentials,
+    tier: PermissionTier,
+) -> OpContext {
+    web_op_context(
+        assembly.services().service_map(ServiceSurface::Web),
+        assembly.approval_store(),
+        root_sandbox,
+        approver,
+        peer,
+        tier,
+    )
+}
 
-    let mut service_map = ServiceMap::new();
-    if let (Some(plan), Some(goal), Some(findings)) =
-        (services.plan.clone(), services.goal.clone(), services.findings.clone())
-    {
-        let plan_config = services.plan_config.clone();
-        register_plan_services(&mut service_map, plan, goal, findings, plan_config);
+/// Ergänzt eine Service-Map um die verbindungsgebundenen Web-Dienste und baut
+/// daraus den [`OpContext`].
+///
+/// # Description
+/// Legt einen tier-genauen [`harw_types::Principal`]
+/// ([`crate::runtime_web::web_principal`], überschreibt den Owner-Principal
+/// der Montage), die [`PeerCredentials`], den `ApprovalActorResolver` und —
+/// falls vorhanden — den Freigabespeicher in `services`; die Sandbox ist
+/// `root_sandbox` verengt auf `tier` ([`crate::runtime_web::narrow_web_sandbox`]).
+///
+/// # Arguments
+/// - `services` (`ServiceMap`): Basis-Map; wird verbraucht.
+/// - `approval_store` (`Option<&Arc<ApprovalStore>>`): Freigabespeicher.
+/// - `root_sandbox` (`&SandboxSpec`): Web-Wurzel-Sandbox.
+/// - `approver` (`&Arc<dyn ApprovalActorResolver>`): Genehmiger-Tabelle.
+/// - `peer` (`PeerCredentials`): Identität dieser Verbindung — vom Kernel,
+///   nie aus dem Anfragerumpf.
+/// - `tier` ([`PermissionTier`]): Stufe des Peers.
+///
+/// # Returns
+/// Einen frischen [`OpContext`] mit neuer [`SessionId`]/[`TurnId`].
+fn web_op_context(
+    mut services: ServiceMap,
+    approval_store: Option<&Arc<ApprovalStore>>,
+    root_sandbox: &SandboxSpec,
+    approver: &Arc<dyn ApprovalActorResolver>,
+    peer: PeerCredentials,
+    tier: PermissionTier,
+) -> OpContext {
+    services.insert(crate::runtime_web::web_principal(peer.uid, tier));
+    services.insert(peer);
+    services.insert(Arc::clone(approver));
+    if let Some(approval_store) = approval_store {
+        services.insert(Arc::clone(approval_store));
     }
-    service_map.insert(peer);
-    service_map.insert(Arc::clone(&services.approver));
-    if let Some(approval_store) = services.approval_store.clone() {
-        service_map.insert(approval_store);
-    }
-    service_map.insert(registry);
-
     OpContext::new(
         SessionId::new(),
         TurnId::new(),
-        services.sandbox.clone(),
-        service_map,
+        crate::runtime_web::narrow_web_sandbox(root_sandbox, tier),
+        services,
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harw_operations::registry::OperationRegistry;
+    use harw_sandbox::Permission;
+    use harw_types::Principal;
 
-    // `build_web_op_context` öffnet keinen Socket und keine Datei — die
-    // Sandbox und die Operationsliste sind reine In-Memory-Werte. Dieser
-    // Test belegt, dass ohne Plan-Store trotzdem ein gültiger `OpContext`
-    // entsteht (die abgeschaltete Planungsfläche darf den Aufbau nicht zum
-    // Absturz bringen). Kein Test in dieser Datei öffnet einen echten
-    // Socket — `build_web_op_context` ist rein synchron und
-    // dateisystemfrei, solange kein `Arc<ApprovalStore>` übergeben wird.
-    #[test]
-    fn test_build_web_op_context_without_plan_services_still_builds_a_context() {
-        let operations = OperationRegistry::new();
-        let sandbox = test_sandbox();
-        let peer = PeerCredentials::new(1, 1, 1);
-        let approver: Arc<dyn ApprovalActorResolver> =
-            Arc::new(StaticUidApprovalActorMap::new(vec![]));
-
-        let services = WebServerServices {
-            operations,
-            sandbox,
-            plan: None,
-            goal: None,
-            findings: None,
-            plan_config: PlanToolConfig::default(),
-            approver,
-            approval_store: None,
+    // Montage aus leerem Temp-Home ohne Netz/Provider (`ModelSource::Echo`).
+    // Die `TempDir`s müssen so lange leben wie die Montage.
+    fn test_assembly(
+        with_approval_store: bool,
+    ) -> (tempfile::TempDir, tempfile::TempDir, RuntimeAssembly) {
+        let home = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(error) => panic!("tempdir: {error}"),
         };
-        let ctx = build_web_op_context(&services, peer);
-
-        assert!(ctx.service::<OperationRegistry>().is_some());
-        assert!(ctx.service::<PeerCredentials>().is_some());
-        assert!(ctx.service::<Arc<dyn ApprovalActorResolver>>().is_some());
-        assert!(ctx.service::<Arc<ApprovalStore>>().is_none());
+        let cwd = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(error) => panic!("tempdir: {error}"),
+        };
+        let store = with_approval_store.then(|| Arc::new(ApprovalStore::new(home.path())));
+        let assembly =
+            match crate::runtime_web::web_assembly(home.path(), cwd.path(), 1000, store, None) {
+                Ok(assembly) => assembly,
+                Err(error) => panic!("web assembly: {error}"),
+            };
+        (home, cwd, assembly)
     }
 
-    /// Der wichtigste Test dieses Knotens: mit `PeerCredentials`,
-    /// `ApprovalActorResolver` und `ApprovalStore` tatsächlich in der
-    /// `ServiceMap` registriert, antwortet `approval.pending` nicht mehr
-    /// mit `OpError::NotAvailable` (Befund 1 des Auftrags). Öffnet nur ein
-    /// temporäres Verzeichnis für den `ApprovalStore` — keinen Socket.
+    // Web-Wurzel-Sandbox über einem eigenen Temp-Verzeichnis.
+    fn test_root_sandbox() -> (tempfile::TempDir, SandboxSpec) {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(error) => panic!("tempdir: {error}"),
+        };
+        let sandbox = match harw_runtime::root_sandbox(EntryKind::Web, dir.path()) {
+            Ok(sandbox) => sandbox,
+            Err(error) => panic!("root sandbox: {error}"),
+        };
+        (dir, sandbox)
+    }
+
+    // Basis-Map wie früher `build_web_op_context`: nur die Registry.
+    fn registry_map(registry: &OperationRegistry) -> ServiceMap {
+        let mut fresh = OperationRegistry::new();
+        for operation in registry.iter() {
+            fresh.register(Arc::clone(operation));
+        }
+        let mut map = ServiceMap::new();
+        map.insert(fresh);
+        map
+    }
+
+    /// Ohne Freigabespeicher entsteht trotzdem ein gültiger Kontext mit
+    /// Registry, Peer, Genehmiger und tier-genauem Principal aus der Montage.
+    #[test]
+    fn test_web_context_for_without_approval_store_still_builds_a_context() {
+        let (_home, _cwd, assembly) = test_assembly(false);
+        let (_root_dir, root) = test_root_sandbox();
+        let approver: Arc<dyn ApprovalActorResolver> =
+            Arc::new(StaticUidApprovalActorMap::new(vec![]));
+        let peer = PeerCredentials::new(1, 1, 1);
+
+        let ctx = web_context_for(&assembly, &root, &approver, peer, PermissionTier::Owner);
+
+        assert!(ctx.service::<OperationRegistry>().is_some());
+        assert_eq!(ctx.service::<PeerCredentials>(), Some(&peer));
+        assert!(ctx.service::<Arc<dyn ApprovalActorResolver>>().is_some());
+        assert!(ctx.service::<Arc<ApprovalStore>>().is_none());
+        let principal = ctx.service::<Principal>().expect("principal is registered");
+        assert_eq!(principal.id(), "uid:1");
+        assert_eq!(principal.tier(), PermissionTier::Owner);
+    }
+
+    /// F-045: ein `Observer`-Peer bekommt nur `ReadWorkspace` — und einen
+    /// Observer-Principal, nicht den Owner-Principal der Montage.
+    #[test]
+    fn test_web_context_for_observer_sandbox_has_only_read_workspace() {
+        let (_home, _cwd, assembly) = test_assembly(true);
+        let (_root_dir, root) = test_root_sandbox();
+        let approver: Arc<dyn ApprovalActorResolver> =
+            Arc::new(StaticUidApprovalActorMap::new(vec![(1000, "owner".to_owned())]));
+        let peer = PeerCredentials::new(1, 1000, 1000);
+
+        let ctx = web_context_for(&assembly, &root, &approver, peer, PermissionTier::Observer);
+
+        let permissions = ctx.sandbox().permissions();
+        assert!(permissions.contains(Permission::ReadWorkspace));
+        assert!(!permissions.contains(Permission::WriteWorkspace));
+        assert!(!permissions.contains(Permission::ExecuteProcess));
+        assert!(permissions.is_subset_of(root.permissions()));
+        assert!(ctx.service::<Arc<ApprovalStore>>().is_some());
+        let principal = ctx.service::<Principal>().expect("principal is registered");
+        assert_eq!(principal.tier(), PermissionTier::Observer);
+    }
+
+    /// Kein Tier erhält mehr als die Web-Wurzel-Sandbox.
+    #[test]
+    fn test_web_op_context_never_exceeds_root_sandbox_for_any_tier() {
+        let (_root_dir, root) = test_root_sandbox();
+        let approver: Arc<dyn ApprovalActorResolver> =
+            Arc::new(StaticUidApprovalActorMap::new(vec![]));
+        for tier in [
+            PermissionTier::Observer,
+            PermissionTier::Operator,
+            PermissionTier::Maintainer,
+            PermissionTier::Owner,
+        ] {
+            let ctx = web_op_context(
+                ServiceMap::new(),
+                None,
+                &root,
+                &approver,
+                PeerCredentials::new(1, 1000, 1000),
+                tier,
+            );
+            assert!(
+                ctx.sandbox().permissions().is_subset_of(root.permissions()),
+                "{tier:?} exceeds the web root sandbox"
+            );
+            assert_eq!(
+                ctx.sandbox().permissions(),
+                crate::runtime_web::narrow_web_sandbox(&root, tier).permissions()
+            );
+        }
+    }
+
+    /// Mit `PeerCredentials`, `ApprovalActorResolver` und `ApprovalStore` in
+    /// der `ServiceMap` antwortet `approval.pending` nicht mit
+    /// `OpError::NotAvailable`. Öffnet nur ein temporäres Verzeichnis.
     #[tokio::test]
     async fn test_approval_pending_is_reachable_once_peer_and_resolver_are_wired() {
         use harw_operations::OpError;
@@ -445,7 +516,7 @@ mod tests {
 
         let mut registry = OperationRegistry::new();
         harw_ops::register_all(&mut registry);
-        let sandbox = test_sandbox();
+        let (_root_dir, root) = test_root_sandbox();
 
         let store_root = match tempfile::tempdir() {
             Ok(dir) => dir,
@@ -456,24 +527,19 @@ mod tests {
         let approver: Arc<dyn ApprovalActorResolver> =
             Arc::new(StaticUidApprovalActorMap::new(vec![(1000, "owner".to_owned())]));
 
-        // Die Op wird vor dem Bündeln als `Arc` gegriffen, weil
-        // `WebServerServices` die Registry besitzt.
         let op = Arc::clone(
             registry
                 .find_by_name("approval.pending")
                 .expect("approval.pending ist registriert"),
         );
-        let services = WebServerServices {
-            operations: registry,
-            sandbox,
-            plan: None,
-            goal: None,
-            findings: None,
-            plan_config: PlanToolConfig::default(),
-            approver,
-            approval_store: Some(approval_store),
-        };
-        let ctx = build_web_op_context(&services, peer);
+        let ctx = web_op_context(
+            registry_map(&registry),
+            Some(&approval_store),
+            &root,
+            &approver,
+            peer,
+            PermissionTier::Owner,
+        );
 
         let result = op.run(&ctx, OpInput::model_tool(serde_json::json!({}))).await;
 
@@ -484,8 +550,7 @@ mod tests {
     }
 
     /// Eine `uid` ohne Eintrag in der Genehmiger-Tabelle wird abgewiesen —
-    /// nie auf einen Vorgabe-Actor abgebildet (siehe Moduldoc, Abschnitt
-    /// „Die Genehmiger-Tabelle").
+    /// nie auf einen Vorgabe-Actor abgebildet.
     #[tokio::test]
     async fn test_approval_resolve_rejects_a_peer_unknown_to_the_approver_table() {
         use harw_operations::OpError;
@@ -493,7 +558,7 @@ mod tests {
 
         let mut registry = OperationRegistry::new();
         harw_ops::register_all(&mut registry);
-        let sandbox = test_sandbox();
+        let (_root_dir, root) = test_root_sandbox();
 
         let store_root = match tempfile::tempdir() {
             Ok(dir) => dir,
@@ -506,24 +571,19 @@ mod tests {
             Arc::new(StaticUidApprovalActorMap::new(vec![(1000, "owner".to_owned())]));
         let unknown_peer = PeerCredentials::new(2, 9999, 9999);
 
-        // Die Op wird vor dem Bündeln als `Arc` gegriffen, weil
-        // `WebServerServices` die Registry besitzt.
         let op = Arc::clone(
             registry
                 .find_by_name("approval.resolve")
                 .expect("approval.resolve ist registriert"),
         );
-        let services = WebServerServices {
-            operations: registry,
-            sandbox,
-            plan: None,
-            goal: None,
-            findings: None,
-            plan_config: PlanToolConfig::default(),
-            approver,
-            approval_store: Some(approval_store),
-        };
-        let ctx = build_web_op_context(&services, unknown_peer);
+        let ctx = web_op_context(
+            registry_map(&registry),
+            Some(&approval_store),
+            &root,
+            &approver,
+            unknown_peer,
+            PermissionTier::Owner,
+        );
 
         let args = serde_json::json!({
             "session": "session-1",
@@ -542,19 +602,17 @@ mod tests {
     }
 
     /// Der `ApprovalActor` stammt ausschließlich aus den Peer-Credentials,
-    /// nie aus dem Anfragerumpf: `args` unten trägt kein Actor-Feld — der
-    /// Actor entsteht trotzdem, weil `peer.uid` in der Genehmiger-Tabelle
-    /// steht, und die Auflösung ist an genau diesen Actor gebunden.
+    /// nie aus dem Anfragerumpf.
     #[tokio::test]
     async fn test_approval_resolve_derives_the_actor_from_peer_credentials_not_the_body() {
         use harw_operations::operation::OpInput;
         use harw_session_store::approval::ApprovalRecord;
-        use harw_types::{ApprovalActor, ItemId, SessionId, ToolCallId};
+        use harw_types::{ApprovalActor, ItemId, ToolCallId};
         use jiff::Timestamp;
 
         let mut registry = OperationRegistry::new();
         harw_ops::register_all(&mut registry);
-        let sandbox = test_sandbox();
+        let (_root_dir, root) = test_root_sandbox();
 
         let store_root = match tempfile::tempdir() {
             Ok(dir) => dir,
@@ -577,24 +635,19 @@ mod tests {
         let approver: Arc<dyn ApprovalActorResolver> =
             Arc::new(StaticUidApprovalActorMap::new(vec![(1000, "owner".to_owned())]));
 
-        // Die Op wird vor dem Bündeln als `Arc` gegriffen, weil
-        // `WebServerServices` die Registry besitzt.
         let op = Arc::clone(
             registry
                 .find_by_name("approval.resolve")
                 .expect("approval.resolve ist registriert"),
         );
-        let services = WebServerServices {
-            operations: registry,
-            sandbox,
-            plan: None,
-            goal: None,
-            findings: None,
-            plan_config: PlanToolConfig::default(),
-            approver,
-            approval_store: Some(approval_store),
-        };
-        let ctx = build_web_op_context(&services, peer);
+        let ctx = web_op_context(
+            registry_map(&registry),
+            Some(&approval_store),
+            &root,
+            &approver,
+            peer,
+            PermissionTier::Owner,
+        );
 
         // Bewusst ohne jedes Actor-Feld — `ApprovalResolveArgs` hat keins.
         let args = serde_json::json!({
@@ -611,33 +664,36 @@ mod tests {
         assert!(output.text.contains("owner"));
     }
 
-    fn test_sandbox() -> SandboxSpec {
-        use harw_sandbox::{
-            Permission, PermissionSet, WorkspaceRegistration, WorkspaceRegistry,
+    /// Eine halb geöffnete Planungsfläche wird nie an die Montage gereicht.
+    #[test]
+    fn test_runtime_plan_services_requires_all_three_stores() {
+        let disabled = crate::PlanServices {
+            services: ServiceMap::new(),
+            plan: None,
+            goal: None,
+            findings: None,
+            config: harw_plan::PlanToolConfig::default(),
         };
-        use harw_types::{TenantId, WorkspaceId};
+        assert!(runtime_plan_services(disabled).is_none());
 
-        let dir = match tempfile::tempdir() {
-            Ok(dir) => dir,
-            Err(error) => panic!("tempdir: {error}"),
+        let partial = crate::PlanServices {
+            services: ServiceMap::new(),
+            plan: Some(Arc::new(harw_plan::InMemoryPlanStore::new())),
+            goal: Some(Arc::new(harw_plan::InMemoryGoalStore::new())),
+            findings: None,
+            config: harw_plan::PlanToolConfig::default(),
         };
-        let tenant = TenantId::from_str("test");
-        let workspace = WorkspaceId::from_str("project");
-        let registry = match WorkspaceRegistry::build(
-            dir.path(),
-            [WorkspaceRegistration {
-                tenant: tenant.clone(),
-                workspace: workspace.clone(),
-                root: PathBuf::from("."),
-            }],
-        ) {
-            Ok(registry) => registry,
-            Err(error) => panic!("workspace registry: {error}"),
+        assert!(runtime_plan_services(partial).is_none());
+
+        let complete = crate::PlanServices {
+            services: ServiceMap::new(),
+            plan: Some(Arc::new(harw_plan::InMemoryPlanStore::new())),
+            goal: Some(Arc::new(harw_plan::InMemoryGoalStore::new())),
+            findings: Some(Arc::new(harw_plan_bridge::FindingStore::new(
+                "/nonexistent/w2d1-b1/plans",
+            ))),
+            config: harw_plan::PlanToolConfig::default(),
         };
-        let binding = match registry.resolve(&tenant, &workspace) {
-            Ok(binding) => binding,
-            Err(error) => panic!("resolve: {error}"),
-        };
-        SandboxSpec::from_resolved(binding, PermissionSet::from_policy([Permission::ReadWorkspace]))
+        assert!(runtime_plan_services(complete).is_some());
     }
 }

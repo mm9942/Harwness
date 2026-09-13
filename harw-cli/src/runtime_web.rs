@@ -3,8 +3,7 @@
 //! # Zweck
 //! Schließt Befund F-045 (`docs/remediation/CONTRACTS.md` §runtime-spec,
 //! `harw-runtime/src/sandbox.rs::permissions_for_tier`-Moduldoc): der
-//! bisherige `harw-cli/src/web.rs`-Pfad (Zeilen 179-262, nur gelesen, nicht
-//! verändert) reichte jedes [`PermissionTier`] eines Peers unverändert an
+//! frühere `harw-cli/src/web.rs`-Pfad (vor W2d-1/B1) reichte jedes [`PermissionTier`] eines Peers unverändert an
 //! [`harw_web::server::WebContextFactory`] weiter, ohne die Sandbox danach zu
 //! verengen — ein `Observer`-Peer erhielt dieselbe Autorität wie ein `Owner`.
 //! Dieses Modul liefert die eine Stelle, die
@@ -12,9 +11,10 @@
 //! - den vertrauenswürdigen [`Principal`] eines Web-Peers baut
 //!   ([`web_principal`]),
 //! - die Web-Runtime-Montage über den gemeinsamen Vertrag
-//!   `crate::runtime_entry` zusammensetzt ([`web_assembly`]), und
+//!   `crate::runtime_entry` und den Builder zusammensetzt ([`web_spec`],
+//!   [`web_assembly`], optional mit Plan-Diensten), und
 //! - die Anfrage-Sandbox eines Peers strikt auf sein Tier verengt
-//!   ([`web_request_sandbox`]).
+//!   ([`narrow_web_sandbox`]).
 //!
 //! # Verantwortung
 //! Der Web-Einstieg führt laut Reduktionstabelle
@@ -22,7 +22,7 @@
 //! Modell-Turns aus; [`web_assembly`] baut deshalb ausschließlich ein
 //! [`harw_runtime::ModelSource::Echo`]-Root-Modell, das nie aufgerufen wird.
 //! Die Wurzel-Sandbox eines Web-Laufs trägt bereits nur `{ReadWorkspace}`
-//! (Profil-Obergrenze); [`web_request_sandbox`] schneidet sie zusätzlich mit
+//! (Profil-Obergrenze); [`narrow_web_sandbox`] schneidet sie zusätzlich mit
 //! [`harw_runtime::permissions_for_tier`] auf das Tier des anfragenden Peers —
 //! die Autorität kann dadurch nur sinken, nie steigen
 //! ([`harw_sandbox::SandboxSpec::restrict`]).
@@ -40,7 +40,7 @@
 //! über eine `.await`-Grenze, da keine Funktion `async` ist.
 //!
 //! # Fehler
-//! [`web_assembly`] und [`web_request_sandbox`] melden Fehler als `String`
+//! [`web_assembly`] meldet Fehler als `String`
 //! (Vertrag von `crate::runtime_entry` bzw. Display von
 //! [`harw_runtime::RuntimeError`]) — dieselbe Fehlerform, die
 //! `harw-cli/src/web.rs` bereits für seine Kompositionsfehler verwendet.
@@ -51,10 +51,12 @@
 //! use harw_operations::operation::PermissionTier;
 //!
 //! # fn demo() -> Result<(), String> {
-//! let sandbox = crate::runtime_web::web_request_sandbox(
+//! let root = harw_runtime::root_sandbox(
+//!     harw_runtime::EntryKind::Web,
 //!     Path::new("/home/mia/projects/harwness"),
-//!     PermissionTier::Observer,
-//! )?;
+//! )
+//! .map_err(|error| error.to_string())?;
+//! let sandbox = crate::runtime_web::narrow_web_sandbox(&root, PermissionTier::Observer);
 //! assert!(sandbox.permissions().contains(harw_sandbox::Permission::ReadWorkspace));
 //! # Ok(())
 //! # }
@@ -63,7 +65,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use harw_runtime::{EntryKind, ModelSource, RuntimeAssembly, RuntimeStores};
+use harw_runtime::{EntryKind, ModelSource, PlanServices, RuntimeAssembly, RuntimeSpec, RuntimeStores};
 use harw_sandbox::SandboxSpec;
 use harw_session_store::ApprovalStore;
 use harw_types::{IngressSurface, PermissionTier, Principal, PrincipalKind, SessionId, ThreadRef};
@@ -108,28 +110,57 @@ fn web_thread_for_session(session_id: &SessionId) -> ThreadRef {
     ThreadRef::from_str(format!("web:{}", session_id.as_str()))
 }
 
-/// Baut die Runtime-Montage des Web-Einstiegs.
+/// Baut die Eingangsbeschreibung eines Web-Laufs.
 ///
 /// # Description
-/// Verkettet den gemeinsamen Vertrag `crate::runtime_entry` in der
-/// vorgeschriebenen Reihenfolge: [`crate::runtime_entry::runtime_spec`] mit
-/// [`EntryKind::Web`] und einem [`PermissionTier::Owner`]-Principal (die
+/// [`crate::runtime_entry::runtime_spec`] mit [`EntryKind::Web`] und einem
+/// [`PermissionTier::Owner`]-Principal für den Prozess-Eigentümer (die
 /// Montage selbst trägt keine Tier-Verengung — die leistet erst
-/// [`web_request_sandbox`] je Anfrage), dann
-/// [`crate::runtime_entry::profile_sessions_root`] und
-/// [`crate::runtime_entry::transcript_state_store`] für den Verlaufsspeicher,
-/// und zuletzt [`crate::runtime_entry::build_assembly`]. Der Web-Einstieg
-/// führt laut Reduktionstabelle (`OperationSurface::CommandsOnly`) keine
-/// Modell-Turns aus; das Root-Modell ist deshalb ein
-/// [`ModelSource::Echo`], der nie aufgerufen wird.
+/// [`narrow_web_sandbox`] je Anfrage). Eine eigene Funktion, damit
+/// `crate::web::serve_web` die Konfiguration über
+/// [`harw_runtime::load_config`] für **dieselbe** Spec lädt, aus der
+/// [`web_assembly`] später montiert.
 ///
 /// # Arguments
 /// - `home` (`&Path`): aufgelöster Root-Space (`~/.harw`).
 /// - `cwd` (`&Path`): Arbeitsverzeichnis des Laufs.
-/// - `uid` (`u32`): vom Kernel bezeugte Peer-UID, siehe [`web_principal`].
+/// - `uid` (`u32`): Prozess-UID des Server-Eigentümers.
+///
+/// # Returns
+/// Eine [`RuntimeSpec`] ohne Overrides.
+#[must_use]
+pub(crate) fn web_spec(home: &Path, cwd: &Path, uid: u32) -> RuntimeSpec {
+    crate::runtime_entry::runtime_spec(
+        EntryKind::Web,
+        home,
+        cwd,
+        web_principal(uid, PermissionTier::Owner),
+    )
+}
+
+/// Baut die Runtime-Montage des Web-Einstiegs.
+///
+/// # Description
+/// Nutzt den Builder direkt ([`RuntimeAssembly::builder`]) statt
+/// [`crate::runtime_entry::build_assembly`], weil dieser Pfad optional
+/// [`harw_runtime::RuntimeAssemblyBuilder::plan_services`] setzen muss und
+/// `build_assembly` dafür keinen Parameter hat. Reihenfolge: [`web_spec`],
+/// [`crate::runtime_entry::profile_sessions_root`],
+/// [`crate::runtime_entry::transcript_state_store`], Modell, Speicher,
+/// optional Plan-Dienste, Bau. Der Web-Einstieg führt laut
+/// Reduktionstabelle (`OperationSurface::CommandsOnly`) keine Modell-Turns
+/// aus; das Root-Modell ist deshalb ein [`ModelSource::Echo`], der nie
+/// aufgerufen wird. Ohne Plan-Dienste registriert die Montage keine
+/// Plan-Operationen.
+///
+/// # Arguments
+/// - `home` (`&Path`): aufgelöster Root-Space (`~/.harw`).
+/// - `cwd` (`&Path`): Arbeitsverzeichnis des Laufs.
+/// - `uid` (`u32`): Prozess-UID des Server-Eigentümers, siehe [`web_spec`].
 /// - `approval_store` (`Option<Arc<ApprovalStore>>`): durabler
-///   Genehmigungsspeicher, `None` ohne auflösbares HARW-Home (siehe
-///   `harw-cli/src/web.rs`-Moduldoc, Abschnitt „Der Genehmigungsspeicher").
+///   Genehmigungsspeicher.
+/// - `plan` (`Option<PlanServices>`): vollständig geöffnete Planungsfläche
+///   oder `None`.
 ///
 /// # Returns
 /// Die fertig montierte [`RuntimeAssembly`] des Laufs.
@@ -137,19 +168,15 @@ fn web_thread_for_session(session_id: &SessionId) -> ThreadRef {
 /// # Errors
 /// `String`, wenn der Sitzungs-Wurzelpfad nicht auflösbar ist
 /// ([`crate::runtime_entry::profile_sessions_root`]) oder die Montage
-/// scheitert ([`crate::runtime_entry::build_assembly`]).
+/// scheitert (Display von [`harw_runtime::RuntimeError`]).
 pub(crate) fn web_assembly(
     home: &Path,
     cwd: &Path,
     uid: u32,
     approval_store: Option<Arc<ApprovalStore>>,
+    plan: Option<PlanServices>,
 ) -> Result<RuntimeAssembly, String> {
-    let spec = crate::runtime_entry::runtime_spec(
-        EntryKind::Web,
-        home,
-        cwd,
-        web_principal(uid, PermissionTier::Owner),
-    );
+    let spec = web_spec(home, cwd, uid);
     let sessions_root = crate::runtime_entry::profile_sessions_root(home)?;
     let state_store =
         crate::runtime_entry::transcript_state_store(&sessions_root, web_thread_for_session);
@@ -161,7 +188,11 @@ pub(crate) fn web_assembly(
     // Web-Einstieg ist CommandsOnly (CONTRACTS.md §runtime-spec-Tabelle):
     // der Root-Turn ruft nie ein Modell auf.
     let model = ModelSource::Echo("harw web führt keine Modell-Turns aus".to_owned());
-    crate::runtime_entry::build_assembly(spec, model, stores, None)
+    let mut builder = RuntimeAssembly::builder(spec).model(model).stores(stores);
+    if let Some(plan) = plan {
+        builder = builder.plan_services(plan);
+    }
+    builder.build().map_err(|error| error.to_string())
 }
 
 /// Verengt die Wurzel-Sandbox des Web-Einstiegs auf das Tier eines Peers.
@@ -171,31 +202,22 @@ pub(crate) fn web_assembly(
 /// Profil-Obergrenze `{ReadWorkspace}` für [`EntryKind::Web`];
 /// [`harw_runtime::permissions_for_tier`] liefert die tier-abhängige weitere
 /// Obergrenze, und [`SandboxSpec::restrict`] schneidet — Autorität wird nie
-/// neu vergeben, nur weiter beschnitten. Ein `Observer`-Peer erhält damit nie
-/// mehr als Lesezugriff, unabhängig davon, was die Profil-Obergrenze sonst
-/// erlauben würde.
+/// neu vergeben, nur weiter beschnitten. Infallibel: `crate::web` baut die
+/// Wurzel-Sandbox einmal beim Start (Fehler dort brechen den Start ab) und
+/// verengt sie je Anfrage hiermit, weil die `WebContextFactory` keinen
+/// Fehler melden kann.
 ///
 /// # Arguments
-/// - `project_root` (`&Path`): Wurzel des Projekts, an die die Sandbox
-///   gebunden wird.
+/// - `root` (`&SandboxSpec`): Wurzel-Sandbox aus
+///   [`harw_runtime::root_sandbox`]`(EntryKind::Web, …)`.
 /// - `tier` ([`PermissionTier`]): die dem anfragenden Peer zugeteilte Stufe.
 ///
 /// # Returns
-/// Eine [`SandboxSpec`], deren Rechte Teilmenge sowohl der
-/// [`EntryKind::Web`]-Profil-Obergrenze als auch von
+/// Eine [`SandboxSpec`], deren Rechte Teilmenge von `root` und von
 /// [`harw_runtime::permissions_for_tier`]`(tier)` sind.
-///
-/// # Errors
-/// `String` (Display von [`harw_runtime::RuntimeError`]), wenn
-/// `project_root` nicht kanonisierbar ist, kein Verzeichnis ist oder die
-/// Workspace-Registrierung scheitert.
-pub(crate) fn web_request_sandbox(
-    project_root: &Path,
-    tier: PermissionTier,
-) -> Result<SandboxSpec, String> {
-    let root = harw_runtime::root_sandbox(EntryKind::Web, project_root)
-        .map_err(|error| error.to_string())?;
-    Ok(root.restrict(&harw_runtime::permissions_for_tier(tier)))
+#[must_use]
+pub(crate) fn narrow_web_sandbox(root: &SandboxSpec, tier: PermissionTier) -> SandboxSpec {
+    root.restrict(&harw_runtime::permissions_for_tier(tier))
 }
 
 #[cfg(test)]
@@ -221,29 +243,62 @@ mod tests {
         }
     }
 
+    fn web_root(dir: &Path) -> SandboxSpec {
+        harw_runtime::root_sandbox(EntryKind::Web, dir).expect("temp dir binds as workspace root")
+    }
+
     #[test]
-    fn test_web_request_sandbox_observer_has_only_read_workspace() {
+    fn test_narrow_web_sandbox_observer_has_only_read_workspace() {
         let dir = tempfile::TempDir::new().expect("temp dir");
-        let sandbox = web_request_sandbox(dir.path(), PermissionTier::Observer)
-            .expect("observer sandbox narrows without error");
+        let sandbox = narrow_web_sandbox(&web_root(dir.path()), PermissionTier::Observer);
         assert!(sandbox.permissions().contains(Permission::ReadWorkspace));
         assert!(!sandbox.permissions().contains(Permission::WriteWorkspace));
         assert!(!sandbox.permissions().contains(Permission::ExecuteProcess));
     }
 
     #[test]
-    fn test_web_request_sandbox_never_exceeds_root_permissions() {
+    fn test_narrow_web_sandbox_never_exceeds_root_permissions() {
         let dir = tempfile::TempDir::new().expect("temp dir");
-        let root = harw_runtime::root_sandbox(EntryKind::Web, dir.path())
-            .expect("temp dir binds as workspace root");
+        let root = web_root(dir.path());
         for tier in ALL_TIERS {
-            let narrowed = web_request_sandbox(dir.path(), tier)
-                .expect("narrowing for any tier must not fail");
+            let narrowed = narrow_web_sandbox(&root, tier);
             assert!(
                 narrowed.permissions().is_subset_of(root.permissions()),
                 "{tier:?} exceeds the EntryKind::Web profile ceiling"
             );
+            assert!(
+                narrowed
+                    .permissions()
+                    .is_subset_of(&harw_runtime::permissions_for_tier(tier)),
+                "{tier:?} exceeds its tier ceiling"
+            );
         }
+    }
+
+    #[test]
+    fn test_web_spec_is_web_entry_with_owner_principal() {
+        let home = tempfile::TempDir::new().expect("temp home");
+        let cwd = tempfile::TempDir::new().expect("temp cwd");
+        let spec = web_spec(home.path(), cwd.path(), 1000);
+        assert_eq!(spec.entry, EntryKind::Web);
+        assert_eq!(spec.home, home.path());
+        assert_eq!(spec.cwd, cwd.path());
+        assert_eq!(spec.principal.tier(), PermissionTier::Owner);
+        assert_eq!(spec.principal.id(), "uid:1000");
+    }
+
+    // Kein Netz, kein Provider: `ModelSource::Echo` und ein leeres
+    // Temp-Home ohne `config.toml` (gleiche Annahme wie
+    // `runtime_entry::tests::test_build_assembly_local_echo_succeeds`).
+    #[test]
+    fn test_web_assembly_without_home_config_builds_with_approval_store() {
+        let home = tempfile::TempDir::new().expect("temp home");
+        let cwd = tempfile::TempDir::new().expect("temp cwd");
+        let store = Arc::new(ApprovalStore::new(home.path()));
+        let assembly = web_assembly(home.path(), cwd.path(), 1000, Some(Arc::clone(&store)), None)
+            .expect("web assembly builds from an empty home");
+        let held = assembly.approval_store().expect("approval store is kept");
+        assert!(Arc::ptr_eq(held, &store));
     }
 
     #[test]

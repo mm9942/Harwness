@@ -431,6 +431,9 @@ fn serve_mcp(
             .map(|resolver| resolver as &dyn SecretResolver),
     )?;
     let principals = build_principal_registry(&config);
+    // Prompt-Jobs laufen nur für aktuell konfigurierte MCP-Principals
+    // (`job_worker::check_prompt_claim_scope`).
+    let configured_submitters = Arc::new(crate::runtime_jobs::configured_principal_ids(&config));
     let address = config
         .harness
         .mcp_listener
@@ -505,6 +508,7 @@ fn serve_mcp(
         let worker_provider = Arc::clone(&provider);
         let worker_transcript_root = transcript_root.clone();
         let worker_plan_services = plan_node_services.clone();
+        let worker_submitters = Arc::clone(&configured_submitters);
         let worker = tokio::spawn(async move {
             job_worker::run_job_worker(
                 worker_store,
@@ -513,6 +517,7 @@ fn serve_mcp(
                 &worker_transcript_root,
                 worker_plan_services,
                 shutdown_rx,
+                worker_submitters,
             )
             .await;
         });

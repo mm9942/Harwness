@@ -65,6 +65,7 @@ use harw_operations::registry::OperationRegistry;
 use harw_operations::{OpContext, SharedSessionController};
 use harw_project_discovery::{DiscoveryConfig, ProjectContext, discover_project};
 use harw_protocol::events::{SessionEvent, TurnEvent};
+use harw_provider_http::SecretResolver;
 use harw_registry_defaults::embedded_agents::builtin_agent_definitions;
 use harw_registry_defaults::profile::{
     IdentityOverrides, assemble_registry_for_project, role_names,
@@ -81,7 +82,7 @@ use crate::children::RuntimeChildRegistryFactory;
 use crate::config::{ConfigTrustReport, load_config};
 use crate::contributors::{AssemblyContributor, AssemblyInputs, AssemblyParts};
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::model::{ModelSource, build_root_model};
+use crate::model::{ModelSource, build_root_model_with_resolver};
 use crate::sandbox::root_sandbox;
 use crate::services::{PlanServices, RuntimeServices, RuntimeServicesParts, ServiceSurface};
 use crate::spec::{
@@ -322,6 +323,9 @@ pub struct RuntimeAssemblyBuilder {
     session_events: Option<UnboundedSender<SessionEvent>>,
     contributors: Vec<Arc<dyn AssemblyContributor>>,
     root_session_id: Option<SessionId>,
+    /// Löst `secrets:`-Referenzen beim Bau von [`ModelSource::Configured`]
+    /// auf; ohne ihn schlägt jedes `auth = "secrets:…"` fehl (Befund C2a).
+    secret_resolver: Option<Arc<dyn SecretResolver + Send + Sync>>,
 }
 
 impl std::fmt::Debug for RuntimeAssemblyBuilder {
@@ -335,6 +339,7 @@ impl std::fmt::Debug for RuntimeAssemblyBuilder {
             .field("session_controller", &self.session_controller.is_some())
             .field("session_events", &self.session_events.is_some())
             .field("contributors", &self.contributors.len())
+            .field("secret_resolver", &self.secret_resolver.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -392,6 +397,23 @@ impl RuntimeAssemblyBuilder {
         self
     }
 
+    /// Übergibt den `secrets:`-Resolver für [`ModelSource::Configured`].
+    ///
+    /// # Beschreibung
+    /// Ohne diesen Aufruf baut [`Self::build`] das Wurzel-Modell mit
+    /// `resolver: None` — jede `auth = "secrets:…"`-Referenz eines
+    /// aktivierten Providers schlägt dann fehl
+    /// ([`harw_provider_http::build_provider_with_home`]). Der Aufrufer öffnet
+    /// den versiegelten Speicher genau wie bisher
+    /// (`harw-cli/src/secret_store.rs` `open_configured_secret_resolver`) und
+    /// reicht das Ergebnis hier herein; diese Crate öffnet ihn nicht selbst
+    /// (siehe `crate::model`, Abschnitt „Geheimnisse").
+    #[must_use]
+    pub fn secret_resolver(mut self, resolver: Arc<dyn SecretResolver + Send + Sync>) -> Self {
+        self.secret_resolver = Some(resolver);
+        self
+    }
+
     /// Hängt einen [`AssemblyContributor`] an. Die Reihenfolge der Aufrufe ist
     /// die Ausführungsreihenfolge.
     #[must_use]
@@ -446,6 +468,7 @@ impl RuntimeAssemblyBuilder {
             session_events,
             contributors,
             root_session_id,
+            secret_resolver,
         } = self;
 
         let model_source = model.ok_or_else(|| RuntimeError::Provider {
@@ -535,7 +558,17 @@ impl RuntimeAssemblyBuilder {
         let turn_limits = TurnLimits::from_root_budget(&budget);
 
         // 9. Modell, dann Spawner (die Kind-Fabrik braucht den Anbieter).
-        let model = build_root_model(&spec, &config, model_source)?;
+        //    `secret_resolver` löst `secrets:`-Referenzen für
+        //    `ModelSource::Configured` auf (Befund C2a); der Upcast wirft nur
+        //    die Auto-Traits ab, dieselbe `SecretResolver`-Vtable bleibt
+        //    gültig, deshalb reicht eine gewöhnliche Unsize-Coercion ohne
+        //    Trait-Upcasting-Feature.
+        let model = build_root_model_with_resolver(
+            &spec,
+            &config,
+            model_source,
+            secret_resolver.as_deref().map(|r| r as &dyn SecretResolver),
+        )?;
         let root_session_id = root_session_id.unwrap_or_else(SessionId::new);
         let (spawner, spawner_roles) = build_spawner(
             profile.spawner,
@@ -1006,6 +1039,7 @@ impl RuntimeAssembly {
             session_events: None,
             contributors: Vec::new(),
             root_session_id: None,
+            secret_resolver: None,
         }
     }
 
@@ -1534,5 +1568,50 @@ mod tests {
                 assert!(!ceiling.sections.is_empty(), "{entry:?}");
             }
         }
+    }
+
+    /// Befund C2a: `build()` reichte `secrets:`-Referenzen bis heute nicht an
+    /// [`build_root_model_with_resolver`] durch, weil der Builder keinen
+    /// Resolver kannte. Ein Test, der [`RuntimeAssemblyBuilder::build`]
+    /// tatsächlich durchläuft, bräuchte zusätzlich [`RuntimeStores`] (ein
+    /// durabler `StateStore`) und — je nach [`SpawnerPolicy`] des Einstiegs —
+    /// einen `session_events`-Sender samt `SessionManager`; beide Bauteile
+    /// liegen außerhalb der Read-list dieses Agenten (`harw-session-store`,
+    /// `harw-core::SessionManager`) und außerhalb der owned files. Geprüft
+    /// wird deshalb der unstrittige Teil: [`RuntimeAssemblyBuilder::secret_resolver`]
+    /// setzt genau das Feld, das `build()` (siehe die Bau-Stelle oben) per
+    /// `secret_resolver.as_deref().map(|r| r as &dyn SecretResolver)` an
+    /// [`build_root_model_with_resolver`] weiterreicht.
+    #[test]
+    fn test_builder_secret_resolver_is_used_for_configured_model() {
+        struct FakeResolver;
+        impl SecretResolver for FakeResolver {
+            fn resolve(&self, _reference: &str) -> Result<secrecy::SecretString, String> {
+                Ok(secrecy::SecretString::from("fake-secret".to_owned()))
+            }
+        }
+
+        let spec = RuntimeSpec {
+            entry: EntryKind::OneShot,
+            home: std::path::PathBuf::from("/nonexistent-home"),
+            cwd: std::path::PathBuf::from("/nonexistent-cwd"),
+            principal: harw_types::Principal::trusted_ingress(
+                harw_types::PrincipalKind::Human,
+                "test",
+                harw_types::IngressSurface::Tui,
+                harw_types::PermissionTier::Owner,
+            ),
+            mode_override: None,
+            active_agent: None,
+            reasoning_effort: None,
+        };
+
+        let builder = RuntimeAssembly::builder(spec).secret_resolver(Arc::new(FakeResolver));
+
+        assert!(
+            builder.secret_resolver.is_some(),
+            "secret_resolver() muss das Feld setzen, das build() beim Bau des \
+             Wurzel-Modells an build_root_model_with_resolver reicht"
+        );
     }
 }

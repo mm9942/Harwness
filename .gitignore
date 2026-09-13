@@ -15,3 +15,15 @@
 /webui/node_modules/
 /webui/.next/
 /webui/out/
+
+# Agenten-/Assistenz-Dateien und Sitzungsprotokolle (nicht Teil des Projekts)
+AGENTS.md
+AGENT.md
+CLAUDE.md
+.claude/
+.codex/
+docs/remediation/AGENT-BRIEF.md
+*.transcript.txt
+*.jsonl
+.env
+.env.*

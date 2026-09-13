@@ -401,11 +401,104 @@ impl CommandRegistry {
             .expect("built-in op-set must have no name or alias collisions")
     }
 
+    /// Builds the dispatch catalog directly from the TUI's command adapters.
+    ///
+    /// # Description
+    /// Used by `command_exec::execute_command_as` so that admission (tier, scope,
+    /// shell capability, unknown command with suggestion) runs exclusively through
+    /// [`Self::dispatch`] (Befund w4-tui-control C1). One [`CommandSpec`] is derived
+    /// per adapter:
+    ///
+    /// - `name`: the adapter `path` without its single leading `/`. Paths without a
+    ///   leading `/` or with an invalid [`crate::CommandName`] are skipped, because
+    ///   the former path lookup (`adapter.path() == "/{name}"`) could never reach them.
+    /// - `permission`: [`harw_operations::adapter::CommandAdapter::permission`], i.e. the
+    ///   tier copied from the operation when the adapter was registered.
+    /// - `scope`: mapped from [`harw_operations::adapter::CommandAdapter::visibility`].
+    /// - `aliases` / `domain`: read from the operation metadata exactly once per adapter;
+    ///   aliases that are not valid command names are dropped (they were unreachable).
+    ///
+    /// Unlike [`Self::from_operation_registry`], this constructor does not reject
+    /// collisions: the first adapter claiming a canonical name wins, mirroring the
+    /// former first-match adapter lookup. [`Self::find`] resolves canonical names
+    /// before aliases, so an alias can never shadow a canonical command.
+    ///
+    /// # Arguments
+    /// - `adapters` (`&[CommandAdapter]`): the `/`-command adapters of the TUI.
+    ///
+    /// # Returns
+    /// A [`CommandRegistry`] with at most one spec per adapter, in adapter order.
+    ///
+    /// # Concurrency
+    /// Requires only shared borrows; safe to call from any thread.
+    #[must_use]
+    pub(crate) fn from_command_adapters(
+        adapters: &[harw_operations::adapter::CommandAdapter],
+    ) -> Self {
+        let mut specs: Vec<CommandSpec> = Vec::with_capacity(adapters.len());
+        for adapter in adapters {
+            let Some(stripped) = adapter.path().strip_prefix('/') else {
+                tracing::debug!(
+                    path = adapter.path(),
+                    operation = adapter.operation_name(),
+                    "command adapter path has no leading '/'; skipped"
+                );
+                continue;
+            };
+            let name = match crate::CommandName::parse(stripped) {
+                Ok(name) => name,
+                Err(error) => {
+                    tracing::debug!(
+                        path = adapter.path(),
+                        operation = adapter.operation_name(),
+                        %error,
+                        "command adapter path is not a valid command name; skipped"
+                    );
+                    continue;
+                }
+            };
+            if specs.iter().any(|spec| spec.name == name) {
+                tracing::debug!(
+                    path = adapter.path(),
+                    operation = adapter.operation_name(),
+                    "duplicate command adapter path; first adapter wins"
+                );
+                continue;
+            }
+            let meta = adapter.operation().meta();
+            let aliases: Vec<String> = meta
+                .aliases
+                .iter()
+                .filter(|alias| crate::CommandName::parse(**alias).is_ok())
+                .map(|alias| (*alias).to_owned())
+                .collect();
+            specs.push(CommandSpec {
+                name,
+                aliases,
+                scope: map_visibility(adapter.visibility()),
+                permission: adapter.permission(),
+                output: OutputSurface::Inline,
+                domain: map_domain(meta.domain),
+            });
+        }
+        Self::new(specs)
+    }
+
+    /// Looks up a command by canonical name, falling back to aliases.
+    ///
+    /// Canonical names take precedence over aliases across the whole catalog, so a
+    /// malformed catalog cannot let an earlier alias shadow a later canonical command
+    /// and thereby change its permission boundary.
     #[must_use]
     pub fn find(&self, name: &str) -> Option<&CommandSpec> {
-        self.specs.iter().find(|spec| {
-            spec.name.as_str() == name || spec.aliases.iter().any(|alias| alias == name)
-        })
+        self.specs
+            .iter()
+            .find(|spec| spec.name.as_str() == name)
+            .or_else(|| {
+                self.specs
+                    .iter()
+                    .find(|spec| spec.aliases.iter().any(|alias| alias == name))
+            })
     }
 
     /// Returns all registered command specifications, in registration order.
@@ -414,7 +507,19 @@ impl CommandRegistry {
         &self.specs
     }
 
-    /// Performs all shell admission checks before handing the action to a runtime.
+    /// Performs all admission checks before handing the action to a runtime.
+    ///
+    /// # Description
+    /// Single admission point for TUI and channel invocations:
+    /// - unknown command → [`CommandError::UnknownCommand`] with a typo suggestion;
+    /// - caller tier below the command's [`CommandSpec::permission`] (the operation's
+    ///   declared tier) → [`CommandError::PermissionDenied`];
+    /// - `TuiOnly` command from a channel → [`CommandError::TuiOnlyCommand`];
+    /// - shell shortcuts below `Operator` or without the surface-appropriate
+    ///   capability → [`CommandError::PermissionDenied`] / [`CommandError::CapabilityDenied`].
+    ///
+    /// # Errors
+    /// See the variants listed above.
     pub fn dispatch(
         &self,
         context: DispatchContext,
@@ -553,6 +658,7 @@ fn map_domain(d: harw_operations::operation::OperationDomain) -> CommandDomain {
 mod tests {
     use super::*;
     use crate::classify_input;
+    use harw_operations::adapter::CommandAdapter;
 
     fn context(
         caller_tier: PermissionTier,
@@ -606,6 +712,99 @@ mod tests {
             CommandError::PermissionDenied { command, required: PermissionTier::Operator, .. }
                 if command == "new"
         ));
+    }
+
+    fn protected_spec(name: &str, alias: &str, permission: PermissionTier) -> CommandSpec {
+        CommandSpec::new(
+            name,
+            [alias],
+            CommandScope::TuiOnly,
+            permission,
+            OutputSurface::Inline,
+            CommandDomain::Misc,
+        )
+        .expect("test spec must be valid")
+    }
+
+    #[test]
+    fn test_dispatch_rejects_tier_below_operation_requirement() {
+        let registry = CommandRegistry::new(vec![protected_spec(
+            "maint",
+            "mt",
+            PermissionTier::Maintainer,
+        )]);
+        let invocation = Invocation::Command {
+            name: "maint".to_owned(),
+            raw_args: vec![],
+        };
+
+        let denied = registry
+            .dispatch(
+                context(
+                    PermissionTier::Operator,
+                    InvocationSurface::Tui,
+                    CapabilitySet::default(),
+                ),
+                invocation.clone(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            denied,
+            CommandError::PermissionDenied {
+                command: "maint".to_owned(),
+                required: PermissionTier::Maintainer,
+                actual: PermissionTier::Operator,
+            }
+        );
+
+        let admitted = registry
+            .dispatch(
+                context(
+                    PermissionTier::Maintainer,
+                    InvocationSurface::Tui,
+                    CapabilitySet::default(),
+                ),
+                invocation,
+            )
+            .expect("caller at exactly the required tier must be admitted");
+        let CommandAction::Command(spec, args) = &admitted else {
+            panic!("expected an admitted command action, got {admitted:?}");
+        };
+        assert_eq!(spec.name.as_str(), "maint");
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn test_find_prefers_canonical_name_over_earlier_alias() {
+        let registry = CommandRegistry::new(vec![
+            protected_spec("first", "second", PermissionTier::Observer),
+            protected_spec("second", "sec", PermissionTier::Owner),
+        ]);
+        assert_eq!(
+            registry.find("second").map(|spec| spec.permission),
+            Some(PermissionTier::Owner),
+            "an earlier alias must not shadow a later canonical command"
+        );
+        assert_eq!(
+            registry.find("sec").map(|spec| spec.name.as_str()),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn test_from_command_adapters_carries_adapter_permission_and_aliases() {
+        let ops = ops_registry();
+        let adapters: Vec<CommandAdapter> = ops
+            .iter()
+            .flat_map(|op| CommandAdapter::from_operation(std::sync::Arc::clone(op)))
+            .collect();
+        let registry = CommandRegistry::from_command_adapters(&adapters);
+
+        let model = registry.find("m").expect("alias 'm' must resolve");
+        assert_eq!(model.name.as_str(), "model");
+        assert_eq!(model.permission, PermissionTier::Operator);
+        assert_eq!(model.scope, CommandScope::TuiOnly);
+        assert!(CommandRegistry::from_command_adapters(&[]).specs().is_empty());
     }
 
     #[test]

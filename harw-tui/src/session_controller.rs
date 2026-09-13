@@ -172,22 +172,31 @@ impl TuiSessionController {
     ///
     /// Der Modus wird nur gesetzt, wenn überhaupt einer angefordert wurde — sonst
     /// würde jeder `/model`-Wechsel die Session ungefragt auf den Default-Modus
-    /// zurückstellen. [`AgentSession::set_mode`] schneidet dabei Tool-Aktivierung
-    /// und Sandbox-Obergrenze; der Aufruf gehört deshalb zwingend an die
-    /// Turn-Grenze und nicht in einen laufenden Turn.
+    /// zurückstellen. Zusätzlich wird [`AgentSession::set_mode`] nur aufgerufen,
+    /// wenn der angeforderte Modus vom aktuellen (`session.mode()`) abweicht:
+    /// [`AgentSession::set_mode`] schneidet Tool-Aktivierung und Sandbox-Obergrenze
+    /// neu aus der Basis (W2A-01), und dieser Schnitt darf nicht bei jedem
+    /// `/effort`- oder `/model`-Wechsel wiederholt werden, wenn sich der Modus
+    /// dabei gar nicht ändert — sonst würden zur Laufzeit über `activation_mut()`
+    /// vorgenommene Overrides bei jedem Controller-Apply verworfen, obwohl kein
+    /// Moduswechsel angefordert wurde. Der Aufruf gehört weiterhin zwingend an
+    /// die Turn-Grenze und nicht in einen laufenden Turn.
     ///
     /// # Argumente
     /// - `session` (`&mut AgentSession`): die lebende Session, auf die mutiert wird.
     ///
     /// # Rückgabe
-    /// `true` wenn die Session modifiziert wurde, `false` wenn keine Mutation anstand.
+    /// `true` wenn die Session modifiziert wurde (Effort, Modell, Provider wurden
+    /// stets geschrieben, sobald eine Mutation anstand; der Modus zusätzlich nur
+    /// bei tatsächlichem Wechsel), `false` wenn keine Mutation anstand.
     ///
     /// # Nebenläufigkeit
     /// Darf nur zwischen Turns aufgerufen werden (vom Renderer-Thread), nicht
     /// während ein Turn läuft.
     ///
     /// # Spec
-    /// harw-tui Design §session_controller — apply_to_session.
+    /// harw-tui Design §session_controller — apply_to_session; W2A-01
+    /// (`AgentSession::set_mode` schneidet ab jetzt immer von der Basis).
     pub fn apply_to_session(&self, session: &mut AgentSession) -> bool {
         let Ok(mut inner) = self.inner.lock() else {
             return false;
@@ -199,7 +208,9 @@ impl TuiSessionController {
         session.set_active_model(inner.active_model.as_deref().map(ModelId::from));
         session.set_active_provider(inner.active_provider.as_deref().map(ProviderId::from));
         if let Some(mode) = inner.interaction_mode {
-            session.set_mode(mode);
+            if session.mode() != mode {
+                session.set_mode(mode);
+            }
         }
         inner.applied_generation = inner.generation;
         true
@@ -664,6 +675,79 @@ mod tests {
         assert!(
             session.active_model().is_none(),
             "session.active_model must be None after applying a None snapshot"
+        );
+    }
+
+    // ── 14. apply_to_session mit unverändertem Modus lässt die Aktivierung
+    //        unangetastet (W2A-01: set_mode schneidet immer von der Basis) ────
+
+    #[test]
+    fn test_apply_to_session_same_mode_does_not_reset_activation() {
+        use harw_tools::ToolName;
+
+        let mut session = test_session();
+        assert_eq!(
+            session.mode(),
+            InteractionMode::Chat,
+            "precondition: fresh session starts in Chat mode"
+        );
+
+        // Aktivierung manuell einschränken — simuliert einen zur Laufzeit über
+        // `activation_mut()` gesetzten Override, der bei einem unnötigen
+        // `set_mode`-Aufruf verloren ginge.
+        session
+            .activation_mut()
+            .disable_tool(ToolName::new("shell.exec"));
+        assert!(
+            !session.activation().is_tool_enabled(&ToolName::new("shell.exec")),
+            "precondition: tool override must be in effect before apply"
+        );
+
+        let ctrl = TuiSessionController::new();
+        ctrl.request_mode("chat")
+            .expect("chat must be a known mode");
+
+        let modified = ctrl.apply_to_session(&mut session);
+        assert!(
+            modified,
+            "apply_to_session must still report true: a mutation was pending"
+        );
+        assert_eq!(
+            session.mode(),
+            InteractionMode::Chat,
+            "mode must remain Chat (no change requested)"
+        );
+        assert!(
+            !session.activation().is_tool_enabled(&ToolName::new("shell.exec")),
+            "requesting the session's current mode must not re-cut activation \
+             from the base and must not undo the manual restriction"
+        );
+    }
+
+    // ── 15. apply_to_session mit geändertem Modus wendet den Modus an ────────
+
+    #[test]
+    fn test_apply_to_session_changed_mode_applies_mode() {
+        let mut session = test_session();
+        assert_eq!(
+            session.mode(),
+            InteractionMode::Chat,
+            "precondition: fresh session starts in Chat mode"
+        );
+
+        let ctrl = TuiSessionController::new();
+        ctrl.request_mode("explore")
+            .expect("explore must be a known mode");
+
+        let modified = ctrl.apply_to_session(&mut session);
+        assert!(
+            modified,
+            "apply_to_session must return true when a mode change is pending"
+        );
+        assert_eq!(
+            session.mode(),
+            InteractionMode::Explore,
+            "an actual mode change must still be applied via set_mode"
         );
     }
 }
