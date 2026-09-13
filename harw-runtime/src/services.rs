@@ -220,6 +220,21 @@ pub struct RuntimeServicesParts {
     /// [`OperationRegistry`] aus `Arc`-Klonen gebaut, weil die Registry selbst
     /// nicht `Clone` ist und Operationen sie per
     /// `ctx.service::<OperationRegistry>()` als konkreten Typ nachschlagen.
+    ///
+    /// # Verhältnis zu [`crate::spec::OperationSurface`]
+    /// Diese Vorlage ist **bereits** die Fläche des Einstiegs: die Montage
+    /// füllt sie über `assembly::build_operations` nach
+    /// [`crate::spec::EntryProfile::operations`], und
+    /// [`crate::spec::OperationSurface::None`] liefert eine leere Registry.
+    /// Diese Fabrik verengt daher nichts mehr und darf es auch nicht — sie
+    /// legt jeder [`ServiceSurface`] dieselbe Vorlage hin.
+    ///
+    /// Die beiden Achsen sind verschieden und dürfen nicht verwechselt werden:
+    /// [`crate::spec::OperationSurface`] sagt, **welche Operationen es in
+    /// diesem Lauf überhaupt gibt** (und ob sie dem Modell als Werkzeuge
+    /// angeboten werden — das entscheidet allein die Montage über den
+    /// `ModelToolProvider`, nicht diese Fabrik); [`ServiceSurface`] sagt,
+    /// **welche Dienste** eine bereits vorhandene Operation vorfindet.
     pub operations: Arc<OperationRegistry>,
     /// Transkript-/Zustandsspeicher der Sitzung.
     pub state_store: Arc<dyn StateStore>,
@@ -334,6 +349,15 @@ impl RuntimeServices {
     /// | Plan-Dienste (falls vorhanden) | ✓ | ✓ | ✓ | ✓ |
     /// | `Arc<ManagedAgentSpawner>` (falls vorhanden) | ✓ | ✓ | — | — |
     /// | [`SharedSessionController`] (falls vorhanden) | ✓ | ✓ | — | — |
+    ///
+    /// Die Zeile [`OperationRegistry`] trägt in jeder Fläche dieselbe Menge —
+    /// nämlich die, die [`crate::spec::EntryProfile::operations`] dem Einstieg
+    /// zuspricht (siehe [`RuntimeServicesParts::operations`]). Ein Einstieg
+    /// mit [`crate::spec::OperationSurface::None`] bekommt hier überall eine
+    /// leere Registry, einer mit
+    /// [`crate::spec::OperationSurface::CommandsOnly`] überall dieselbe
+    /// Command-Menge; die Modell-Tool-Fläche entsteht **nicht** hier, sondern
+    /// als `ToolProvider` in der Extension-Registry der Montage.
     ///
     /// Drei Zeilen dieser Tabelle sind gegenüber dem Alt-Stand Korrekturen:
     /// der Spawner im Slash-Pfad (G-061, `/agent` war dort `NotAvailable`), die

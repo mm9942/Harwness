@@ -1,0 +1,6 @@
+[W2C-01]
+files = ["harw-runtime/src/assembly.rs", "harw-runtime/src/children.rs", "harw-runtime/src/contributors.rs", "harw-runtime/src/lib.rs", "harw-runtime/tests/rights_matrix.rs", "harw-runtime/Cargo.toml"]
+
+# Fix-Schritt Z2c
+[Z2c-F2]
+files = ["harw-runtime/src/assembly.rs","harw-runtime/src/children.rs","harw-runtime/src/services.rs","harw-runtime/src/approval.rs","harw-runtime/tests/rights_matrix.rs"]

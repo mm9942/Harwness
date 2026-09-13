@@ -8,6 +8,10 @@ rust-version.workspace = true
 # Gemeinsame Runtime-Montage (L12): darf nur von `harw-tui` und `harw-cli`
 # genutzt werden, sonst entsteht ein Zyklus.
 harw-agent-dsl = { path = "../harw-agent-dsl" }
+# `AgentSuggestions` steht in der Signatur von `ChildRegistryFactory::build_registry`
+# (harw-core/src/child_controller.rs:393-398); harw-extension-api re-exportiert den
+# Typ nicht (harw-extension-api/src/capabilities.rs:3).
+harw-catalog = { path = "../harw-catalog" }
 harw-config = { path = "../harw-config" }
 harw-context = { path = "../harw-context" }
 harw-core = { path = "../harw-core" }
@@ -24,6 +28,9 @@ harw-ops = { path = "../harw-ops" }
 harw-plan = { path = "../harw-plan" }
 harw-plan-bridge = { path = "../harw-plan-bridge" }
 harw-project-discovery = { path = "../harw-project-discovery" }
+# `SessionEvent`/`TurnEvent` fuer `new_root_session`; harw-core re-exportiert beide
+# nicht (harw-core/src/session.rs:108-109 importiert sie selbst so).
+harw-protocol = { path = "../harw-protocol" }
 harw-provider-http = { path = "../harw-provider-http" }
 harw-registry-defaults = { path = "../harw-registry-defaults" }
 harw-sandbox = { path = "../harw-sandbox" }
@@ -39,6 +46,9 @@ serde = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `SpawnInput.context` ist ein `serde_json::Value`
+# (harw-extension-api/src/capabilities.rs:63); nur der Kind-Fabrik-Test baut einen.
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

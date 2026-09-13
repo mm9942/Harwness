@@ -3069,6 +3069,7 @@ name = "harw-runtime"
 version = "0.2.0"
 dependencies = [
  "harw-agent-dsl",
+ "harw-catalog",
  "harw-config",
  "harw-context",
  "harw-core",
@@ -3085,6 +3086,7 @@ dependencies = [
  "harw-plan",
  "harw-plan-bridge",
  "harw-project-discovery",
+ "harw-protocol",
  "harw-provider-http",
  "harw-registry-defaults",
  "harw-sandbox",
@@ -3093,6 +3095,7 @@ dependencies = [
  "harw-types",
  "secrecy 0.10.3",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
