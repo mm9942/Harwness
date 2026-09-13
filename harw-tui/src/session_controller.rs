@@ -182,6 +182,16 @@ impl TuiSessionController {
     /// Moduswechsel angefordert wurde. Der Aufruf gehört weiterhin zwingend an
     /// die Turn-Grenze und nicht in einen laufenden Turn.
     ///
+    /// `/mode <gleicher Modus>` (Befund `w2d1/Z2d1-tui.md` T5): Fordert der
+    /// Nutzer denselben Modus an, in dem die Session bereits ist, setzt
+    /// [`SessionController::request_mode`] zwar `inner.interaction_mode`, aber
+    /// der Vergleich `session.mode() != mode` oben bleibt `false` — `set_mode`
+    /// wird nicht aufgerufen. Das ist absichtlich ein No-op sowohl für die
+    /// Tool-Aktivierung (kein erneuter Schnitt aus der Basis, W2A-01) als auch
+    /// für zur Laufzeit gesetzte Overrides (`activation_mut()`-Änderungen
+    /// seit dem letzten Moduswechsel bleiben erhalten). Effort/Modell/Provider
+    /// werden davon unabhängig trotzdem übernommen, falls mitgesendet.
+    ///
     /// # Argumente
     /// - `session` (`&mut AgentSession`): die lebende Session, auf die mutiert wird.
     ///

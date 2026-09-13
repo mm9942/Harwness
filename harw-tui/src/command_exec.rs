@@ -28,6 +28,18 @@
 //! `CommandRegistry::from_command_adapters` aus der Adapter-Liste gebaut.
 //! Services und `OpContext` entstehen erst nach erfolgreicher Admission.
 //!
+//! # Services-Closure (W2d-2/CE)
+//! [`execute_command_as`] nimmt die Services nicht mehr als fertigen
+//! [`ServiceMap`]-Wert oder als `CommandServices`-Bündel entgegen, sondern als
+//! generische Closure `F: FnOnce() -> ServiceMap`. Composition Roots
+//! (`app.rs`) übergeben `|| runtime_commands::slash_service_map(rt.services())`.
+//! Die Closure wird **erst** aufgerufen, nachdem [`crate::CommandRegistry::dispatch`]
+//! die Invocation admittiert und in `CommandAction::Command` aufgelöst hat —
+//! ein abgelehnter Command (unbekannt, Berechtigung, Capability) baut nie eine
+//! `ServiceMap`. `CommandServices` und [`build_services`] existieren nur noch
+//! `#[cfg(test)]`, um die vorherigen Test-Erwartungen (feste Service-Bündel)
+//! als Closures nachzubilden.
+//!
 //! # Nebenläufigkeit
 //! `execute_command_as` ist `async` und ruft `CommandAdapter::dispatch` (ebenfalls
 //! `async`) auf. Der Aufrufer (`run_loop` in `app.rs`) awaitet die Funktion im
@@ -38,15 +50,26 @@
 //! ([`crate::CommandError`]) und Dispatch-Fehler ([`harw_operations::OpError`])
 //! werden in menschenlesbaren Text umgesetzt.
 
+// `HashSet`, `Arc`, `OperationRegistry`, `SharedSessionController` und
+// `TuiSessionController` werden ab W2d-2/CE nur noch von den `#[cfg(test)]`-
+// gebundenen Items `CommandServices` und `build_services` gebraucht — siehe
+// Moduldoc „Services-Closure (W2d-2/CE)". Ohne `#[cfg(test)]` hier wären sie
+// in einem Produktions-Build ungenutzte Importe (Verstoß gegen `-D warnings`).
+#[cfg(test)]
 use std::collections::HashSet;
+#[cfg(test)]
 use std::sync::Arc;
 
 use harw_operations::adapter::CommandAdapter;
+#[cfg(test)]
 use harw_operations::registry::OperationRegistry;
-use harw_operations::{OpContext, PermissionTier, ServiceMap, SharedSessionController};
+use harw_operations::{OpContext, PermissionTier, ServiceMap};
+#[cfg(test)]
+use harw_operations::SharedSessionController;
 use harw_sandbox::SandboxSpec;
 use harw_types::{SessionId, TurnId};
 
+#[cfg(test)]
 use crate::session_controller::TuiSessionController;
 use crate::{
     CapabilitySet, CommandAction, CommandError, CommandRegistry, DispatchContext, Invocation,
@@ -54,14 +77,16 @@ use crate::{
 };
 
 /// Bündelt die optionalen/langlebigen Services, die eine `/command`-Ausführung
-/// benötigt.
+/// in Tests benötigt.
 ///
 /// # Beschreibung
-/// `runtime_config`, `memory`, `controller` und `job_store` gehören fachlich
-/// zusammen: sie werden von der Composition Root stets gemeinsam durchgereicht
-/// und wandern 1:1 in [`build_services`]. Das Bündeln in dieser Struct hält
-/// [`execute_command`] und [`execute_command_as`] unter der clippy-Grenze von
-/// sieben Parametern, ohne die einzelnen Felder künstlich zu verstecken.
+/// Nur noch `#[cfg(test)]` (W2d-2/CE): Produktionsaufrufer bauen die
+/// [`ServiceMap`] direkt über `runtime_commands::slash_service_map` und reichen
+/// sie als `F: FnOnce() -> ServiceMap`-Closure an [`execute_command_as`].
+/// `CommandServices` bildet dasselbe Feldbündel für Tests nach, die weiterhin
+/// gezielt einzelne Services (Config, Memory, Controller, Job-Store) setzen
+/// wollen; sie wandern 1:1 in [`build_services`], das ebenfalls nur unter Test
+/// existiert.
 ///
 /// # Felder
 /// - `runtime_config` (`Option<&Arc<harw_config::ResolvedConfig>>`): Optionaler,
@@ -75,6 +100,7 @@ use crate::{
 ///   Turn sichtbar.
 /// - `job_store` (`Option<&Arc<harw_session_store::JobStore>>`): Optionaler
 ///   dauerhafter Job-Store.
+#[cfg(test)]
 pub(crate) struct CommandServices<'a> {
     pub(crate) runtime_config: Option<&'a Arc<harw_config::ResolvedConfig>>,
     pub(crate) memory: Option<&'a Arc<dyn harw_memory::Memory>>,
@@ -111,7 +137,9 @@ pub(crate) struct CommandServices<'a> {
 /// - `session_id` (`&SessionId`): Stabile Session-ID; wird pro Dispatch geklont.
 /// - `raw_line` (`&str`): die abgeschickte Rohzeile (inkl. führendem `/`, `!`,
 ///   `#` bzw. `@`).
-/// - `services` (`&CommandServices<'_>`): siehe [`CommandServices`].
+/// - `services` (`&CommandServices<'_>`): siehe [`CommandServices`]; wird pro
+///   Aufruf in eine `|| build_services(..)`-Closure für [`execute_command_as`]
+///   übersetzt.
 ///
 /// # Rückgabe
 /// Ein (ggf. mehrzeiliger, durch `\n` getrennter) Ausgabetext für die Historie.
@@ -133,7 +161,15 @@ async fn execute_command(
         session_id,
         PermissionTier::Owner,
         raw_line,
-        services,
+        || {
+            build_services(
+                adapters,
+                services.runtime_config,
+                services.memory,
+                services.controller,
+                services.job_store,
+            )
+        },
     )
     .await
 }
@@ -150,16 +186,31 @@ async fn execute_command(
 /// [`crate::CommandRegistry::dispatch`] mit dem TUI-Kontext aus
 /// [`tui_dispatch_context`]. Es gibt keine zweite Tier-Prüfung in diesem Modul.
 ///
+/// `services` ist ab W2d-2/CE keine fertige [`ServiceMap`] und kein
+/// [`CommandServices`]-Bündel mehr, sondern eine `F: FnOnce() -> ServiceMap`-
+/// Closure. Sie wird **nur** aufgerufen, wenn [`crate::CommandRegistry::dispatch`]
+/// die Invocation zu `CommandAction::Command` auflöst — jeder Admission-Fehler
+/// (unbekannt, Berechtigung, Capability) gibt seinen Text zurück, ohne die
+/// Closure je aufzurufen.
+///
 /// # Argumente
-/// - `services` (`&CommandServices<'_>`): siehe [`CommandServices`].
-pub(crate) async fn execute_command_as(
+/// - `services` (`F`): liefert die [`ServiceMap`] für genau diesen Dispatch,
+///   erst nach erfolgreicher Admission ausgewertet.
+///
+/// # Nebenläufigkeit
+/// `async`; ruft `services()` synchron innerhalb des `async fn`-Bodys auf,
+/// bevor `CommandAdapter::dispatch` awaitet wird.
+pub(crate) async fn execute_command_as<F>(
     adapters: &[CommandAdapter],
     sandbox: &SandboxSpec,
     session_id: &SessionId,
     caller_permission: PermissionTier,
     raw_line: &str,
-    services: &CommandServices<'_>,
-) -> String {
+    services: F,
+) -> String
+where
+    F: FnOnce() -> ServiceMap,
+{
     execute_with_context(
         adapters,
         sandbox,
@@ -193,17 +244,21 @@ fn tui_dispatch_context(caller_permission: PermissionTier) -> DispatchContext {
 /// Aus `adapters` wird per [`CommandRegistry::from_command_adapters`] der
 /// Dispatch-Katalog gebaut. Nur `Ok(CommandAction::Command(..))` führt zur
 /// Ausführung: der Adapter mit Pfad `/{spec.name}` wird gesucht, erst danach
-/// werden Services gebaut und `CommandAdapter::dispatch` awaitet. Jeder
-/// Admission-Fehler wird über [`render_admission_error`] als Text
-/// zurückgegeben, ohne Services zu bauen oder die Operation anzufassen.
-async fn execute_with_context(
+/// wird `services()` aufgerufen (baut die [`ServiceMap`]) und
+/// `CommandAdapter::dispatch` awaitet. Jeder Admission-Fehler wird über
+/// [`render_admission_error`] als Text zurückgegeben, ohne `services()`
+/// aufzurufen oder die Operation anzufassen.
+async fn execute_with_context<F>(
     adapters: &[CommandAdapter],
     sandbox: &SandboxSpec,
     session_id: &SessionId,
     context: DispatchContext,
     raw_line: &str,
-    services: &CommandServices<'_>,
-) -> String {
+    services: F,
+) -> String
+where
+    F: FnOnce() -> ServiceMap,
+{
     let invocation = match crate::classify_input(raw_line) {
         Ok(invocation) => invocation,
         Err(error) => return format!("Eingabe abgelehnt: {error}"),
@@ -230,13 +285,8 @@ async fn execute_with_context(
             let Some(adapter) = adapters.iter().find(|adapter| adapter.path() == path) else {
                 return format!("Unbekannter Command: {typed}");
             };
-            let service_map = build_services(
-                adapters,
-                services.runtime_config,
-                services.memory,
-                services.controller,
-                services.job_store,
-            );
+            // Closure erst hier aufrufen — nach erfolgreicher Admission (§1.2).
+            let service_map = services();
             let ctx = OpContext::new(
                 session_id.clone(),
                 TurnId::new(),
@@ -322,6 +372,10 @@ fn render_admission_error(typed: &str, error: &CommandError) -> String {
 ///
 /// # Spec
 /// harw-tui Design §session_controller — build_services long-lived controller.
+///
+/// Nur noch `#[cfg(test)]` (W2d-2/CE): Produktionsaufrufer bauen die
+/// `ServiceMap` direkt über `runtime_commands::slash_service_map`.
+#[cfg(test)]
 pub(crate) fn build_services(
     adapters: &[CommandAdapter],
     runtime_config: Option<&Arc<harw_config::ResolvedConfig>>,
@@ -378,7 +432,7 @@ mod tests {
 
     use crate::session_controller::TuiSessionController;
 
-    use super::CommandServices;
+    use super::{CommandServices, build_services};
 
     /// Baut alle 16 `harw-ops`-Adapter über die echte Registrierungsfunktion.
     fn adapters() -> Vec<CommandAdapter> {
@@ -641,23 +695,25 @@ mod tests {
             job_store: None,
         };
 
-        let shell = super::execute_with_context(
-            &adapters,
-            &sandbox,
-            &session_id,
-            context,
-            "!ls -la",
-            &services,
-        )
+        let shell = super::execute_with_context(&adapters, &sandbox, &session_id, context, "!ls -la", || {
+            build_services(
+                &adapters,
+                services.runtime_config,
+                services.memory,
+                services.controller,
+                services.job_store,
+            )
+        })
         .await;
-        let repeat = super::execute_with_context(
-            &adapters,
-            &sandbox,
-            &session_id,
-            context,
-            "!!",
-            &services,
-        )
+        let repeat = super::execute_with_context(&adapters, &sandbox, &session_id, context, "!!", || {
+            build_services(
+                &adapters,
+                services.runtime_config,
+                services.memory,
+                services.controller,
+                services.job_store,
+            )
+        })
         .await;
         std::fs::remove_dir_all(tmp).ok();
 
@@ -783,18 +839,14 @@ mod tests {
         let (sandbox, tmp) = test_sandbox();
         let session_id = SessionId::new();
 
+        let controller = test_controller();
         let output = super::execute_command_as(
             &adapters,
             &sandbox,
             &session_id,
             harw_operations::PermissionTier::Observer,
             "/model list",
-            &CommandServices {
-                runtime_config: None,
-                memory: None,
-                controller: &test_controller(),
-                job_store: None,
-            },
+            || build_services(&adapters, None, None, &controller, None),
         )
         .await;
         std::fs::remove_dir_all(tmp).ok();
@@ -812,18 +864,14 @@ mod tests {
         operation.meta_reads.store(0, Ordering::Relaxed);
 
         let (sandbox, tmp) = test_sandbox();
+        let controller = test_controller();
         let output = super::execute_command_as(
             &adapters,
             &sandbox,
             &SessionId::new(),
             PermissionTier::Observer,
             "/guard",
-            &CommandServices {
-                runtime_config: None,
-                memory: None,
-                controller: &test_controller(),
-                job_store: None,
-            },
+            || build_services(&adapters, None, None, &controller, None),
         )
         .await;
         std::fs::remove_dir_all(tmp).ok();
@@ -851,12 +899,6 @@ mod tests {
         let (sandbox, tmp) = test_sandbox();
         let session_id = SessionId::new();
         let controller = test_controller();
-        let services = CommandServices {
-            runtime_config: None,
-            memory: None,
-            controller: &controller,
-            job_store: None,
-        };
 
         let denied = super::execute_command_as(
             &adapters,
@@ -864,7 +906,7 @@ mod tests {
             &session_id,
             PermissionTier::Observer,
             "/protected",
-            &services,
+            || build_services(&adapters, None, None, &controller, None),
         )
         .await;
         assert_eq!(
@@ -883,7 +925,7 @@ mod tests {
             &session_id,
             PermissionTier::Operator,
             "/protected",
-            &services,
+            || build_services(&adapters, None, None, &controller, None),
         )
         .await;
         std::fs::remove_dir_all(tmp).ok();
@@ -898,18 +940,14 @@ mod tests {
         let (sandbox, tmp) = test_sandbox();
         let session_id = SessionId::new();
 
+        let controller = test_controller();
         let output = super::execute_command_as(
             &adapters,
             &sandbox,
             &session_id,
             PermissionTier::Operator,
             "/stauts",
-            &CommandServices {
-                runtime_config: None,
-                memory: None,
-                controller: &test_controller(),
-                job_store: None,
-            },
+            || build_services(&adapters, None, None, &controller, None),
         )
         .await;
         std::fs::remove_dir_all(tmp).ok();
@@ -917,6 +955,73 @@ mod tests {
         // `stauts` (Länge 6) → gleiche Anfangsbuchstaben-Kandidaten mit minimaler
         // Längendifferenz; `status` ist in `register_all` vor `skills` registriert.
         assert_eq!(output, "Unbekannter Command: /stauts (meinten Sie /status?)");
+    }
+
+    // -----------------------------------------------------------------------
+    // Closure discipline: services() must not be evaluated on denied admission
+    // -----------------------------------------------------------------------
+
+    /// `test_execute_command_as_does_not_build_services_on_denied_admission`:
+    /// Denied admission (`Observer` calling an `Operator`-tier command) must
+    /// never evaluate the `services` closure. A counter incremented inside the
+    /// closure stays at `0` after a denied call and only becomes `1` once the
+    /// same call is admitted (Operator tier) — proving the closure runs
+    /// exactly at, and only at, the point `execute_with_context` reaches
+    /// `CommandAction::Command`.
+    #[tokio::test]
+    async fn test_execute_command_as_does_not_build_services_on_denied_admission() {
+        let adapters = adapters();
+        let (sandbox, tmp) = test_sandbox();
+        let session_id = SessionId::new();
+        let controller = test_controller();
+        let calls = AtomicUsize::new(0);
+
+        let denied = super::execute_command_as(
+            &adapters,
+            &sandbox,
+            &session_id,
+            PermissionTier::Observer,
+            "/model list",
+            || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                build_services(&adapters, None, None, &controller, None)
+            },
+        )
+        .await;
+
+        assert_eq!(
+            denied,
+            "Berechtigung verweigert: /model erfordert Operator; aktuelle Stufe ist Observer"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "services() must not be evaluated when admission is denied"
+        );
+
+        let admitted = super::execute_command_as(
+            &adapters,
+            &sandbox,
+            &session_id,
+            PermissionTier::Operator,
+            "/model list",
+            || {
+                calls.fetch_add(1, Ordering::Relaxed);
+                build_services(&adapters, None, None, &controller, None)
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(tmp).ok();
+
+        assert!(
+            !admitted.starts_with("Unbekannter Command") && !admitted.starts_with("Berechtigung"),
+            "admitted call must actually dispatch; got: {admitted}"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "services() must be evaluated exactly once, after successful admission"
+        );
     }
 
     // -----------------------------------------------------------------------

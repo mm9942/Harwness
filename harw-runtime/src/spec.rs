@@ -234,9 +234,14 @@ pub struct RuntimeSpec {
     pub cwd: PathBuf,
     /// Vertrauenswürdig ermittelter Aufrufer.
     pub principal: Principal,
-    /// Explizit gewählter Interaktionsmodus (sonst Vorgabe aus Konfiguration).
+    /// Interaktionsmodus der Wurzelsitzung. Die Montage liest **keine**
+    /// Konfigurationsvorgabe: der Aufrufer löst Flag und Konfiguration selbst
+    /// auf und setzt das Ergebnis hier (CONTRACTS-W2d2 E6); `None` lässt den
+    /// Vorgabemodus der Sitzung unverändert.
     pub mode_override: Option<InteractionMode>,
-    /// Explizit gewählter Agent (sonst Vorgabe aus Konfiguration).
+    /// Wurzel-Agent. Wie beim Modus löst der Aufrufer `--agent` und eine
+    /// etwaige Konfigurationsvorgabe selbst auf (E6); `None` heißt „kein
+    /// benannter Agent", die Montage ergänzt keinen.
     pub active_agent: Option<String>,
     /// Explizit gewählter Reasoning-Effort.
     pub reasoning_effort: Option<ReasoningEffort>,

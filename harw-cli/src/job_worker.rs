@@ -5,48 +5,61 @@
 //! authority the turn is allowed to carry.
 //!
 //! * [`JobKind::Worker`] / [`JobKind::Dream`] — a trusted `prompt`/`task`
-//!   string is turned into one durable assistant turn with *no* extensions,
-//!   tools, or ambient authority at all.
+//!   string is turned into one durable assistant turn under the runtime entry
+//!   `EntryKind::JobPrompt`: no tools, no permissions, no ambient authority.
 //! * [`JobKind::Custom`] named [`PLAN_NODE_JOB_KIND`] — a plan node admitted by
-//!   `harw_plan_bridge::PlanJobBridge::admit_ready_nodes`.  The turn gets a
-//!   tool registry chosen by the node's kind and a sandbox derived by
-//!   *reduction* from the mutation contract of that node.  Success and failure
-//!   both flow back into the plan, so a node can never be left `InProgress`
-//!   forever.
+//!   `harw_plan_bridge::PlanJobBridge::admit_ready_nodes`.  The turn runs under
+//!   `EntryKind::JobPlanNode`, narrowed (`harw_runtime::RuntimeNarrowing`) to
+//!   the registry profile chosen by the node's kind and to the permissions of
+//!   a sandbox derived by *reduction* from the node's mutation contract.
+//!   Success and failure both flow back into the plan, so a node can never be
+//!   left `InProgress` forever.
+//!
+//! # Runtime assembly (W2d-2 J1, CONTRACTS-W2d2.md §1.3)
+//! Every executed job is assembled through
+//! `crate::runtime_jobs::job_assembly` and gets its root session from
+//! `harw_runtime::RuntimeAssembly::new_root_session`, under the session id
+//! `durable-job-<work id>`.  Principal, sandbox, context ceiling, trace and
+//! approval chain therefore come from the runtime profile table, not from this
+//! module.  A worker without a HARW home ([`JobWorkerContext::runtime_root`]
+//! `None`) cannot assemble a runtime and blocks every job before any model
+//! call.
 //!
 //! # Approvals
 //! A durable job runs unattended.  There is no user who could answer an
 //! `AskUser` guardrail, so a paused turn is never awaited: for a plan-node job
-//! it terminates the job as failed (see [`PauseDisposition`]), and the
-//! session's [`SpawnContext::approval_actor`] is deliberately `None` so no
-//! identity is even eligible to answer.
+//! it terminates the job as failed (see [`PauseDisposition`]).  The job
+//! principal (`IngressSurface::JobWorker`) yields no approval actor, so the
+//! session's `SpawnContext::approval_actor` is `None` and no identity is even
+//! eligible to answer; no responder is mounted.
 //!
 //! # Concurrency
 //! Every entry point is `async` and `Send`.  All shared state travels as
 //! `Arc<…>`; the worker itself holds no global state — the plan store, the
 //! inherited sandbox, and the plan actor are injected through
-//! [`PlanNodeServices`].
+//! [`PlanNodeServices`], home and transcript root through
+//! [`JobWorkerContext`].
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use harw_agent_dsl::roles::AgentRoleId;
 use harw_core::{
     AgentSession, DurableJobRunner, ExecutionControl, JobExecutionRegistry, ModelMessage,
-    ModelProvider, SpawnContext, StateStore, TranscriptStateStore, TurnInput, TurnOutcome,
-    run_turn,
+    ModelProvider, StateStore, TranscriptStateStore, TurnInput, TurnOutcome, run_turn,
 };
-use harw_extension_api::{ExtensionRegistry, empty_extension_registry};
 use harw_job_runtime::{JobClaim, JobKind, JobOutcome, JobState};
-use harw_observe::TraceContext;
 use harw_plan::admission::{MutationContract, PathRule};
 use harw_plan::{Criterion, PlanNodeKind, PlanStore, TaskId, VerificationStep};
 use harw_plan_bridge::{PlanJobBridge, offset_from_timestamp};
-use harw_registry_defaults::profile::{IdentityOverrides, RegistryProfile, assemble_registry};
+use harw_protocol::{SessionEvent, TurnEvent};
+use harw_registry_defaults::profile::{IdentityOverrides, RegistryProfile};
+use harw_runtime::{RuntimeAssembly, RuntimeNarrowing};
 use harw_sandbox::{Permission, PermissionSet, SandboxSpec};
 use harw_session_store::{ClaimRequest, JobListQuery, JobStore, TranscriptStore};
-use harw_types::{AgentRole, SessionId, ThreadRef};
+use harw_types::{SessionId, ThreadRef};
+
+use crate::runtime_jobs::{JobAssemblyInputs, JobEntry, job_assembly, job_principal};
 use jiff::{SignedDuration, Timestamp};
 use tokio::sync::watch;
 
@@ -70,6 +83,49 @@ pub const PLAN_NODE_JOB_KIND: &str = "plan-node";
 /// Reason recorded when a plan-node job arrives without a configured plan store.
 const MISSING_PLAN_SERVICES: &str =
     "plan-node job cannot run: this worker was started without a plan store";
+
+/// Reason recorded when a job is claimed by a worker without a HARW home
+/// (CONTRACTS-W2d2.md E3): without a home there is no runtime assembly.
+const MISSING_RUNTIME_ROOT: &str = "job runtime requires a HARW home";
+
+/// Home and working directory every job runtime is assembled from.
+///
+/// # Description
+/// `home` is the resolved HARW home (`--home` / `HARW_HOME`); `cwd` is the
+/// working directory a prompt job's runtime discovers its project from.  A
+/// plan-node job does not use `cwd`: its runtime is assembled below the
+/// canonical workspace root of the derived node sandbox.
+///
+/// # Concurrency
+/// Plain owned data; `Send + Sync`.
+#[derive(Clone, Debug)]
+pub struct JobRuntimeRoot {
+    /// Resolved HARW home.
+    pub home: PathBuf,
+    /// Working directory of prompt-job runtimes.
+    pub cwd: PathBuf,
+}
+
+/// Everything a worker poll needs besides store, registry, model and plan.
+///
+/// # Description
+/// Built once by `harw serve` and shared as `Arc<JobWorkerContext>` with every
+/// poll (CONTRACTS-W2d2.md §1.3).
+///
+/// # Concurrency
+/// Immutable after construction; `Send + Sync`.
+#[derive(Debug)]
+pub struct JobWorkerContext {
+    /// Root of the durable job transcripts.
+    pub transcript_root: PathBuf,
+    /// Ids of the currently configured MCP principals; a prompt job whose
+    /// operator submitter is not in this set fails with a `scope:` reason
+    /// before any model call.
+    pub configured_submitters: Arc<BTreeSet<String>>,
+    /// Home and cwd of the job runtimes; `None` blocks every executed job with
+    /// `"job runtime requires a HARW home"` before any model call.
+    pub runtime_root: Option<JobRuntimeRoot>,
+}
 
 /// The services a `plan-node` job needs on top of the plain job pipeline.
 ///
@@ -167,12 +223,10 @@ impl PlanNodeServices {
 /// - `executions` (`Arc<JobExecutionRegistry>`): registry the fenced
 ///   cancellation control is registered in.
 /// - `provider` (`Arc<dyn ModelProvider>`): the model behind every turn.
-/// - `transcript_root` (`&Path`): root of the durable job transcripts.
 /// - `plan_services` (`Option<Arc<PlanNodeServices>>`): plan store, inherited
 ///   sandbox and plan actor; `None` disables plan-node execution.
-/// - `configured_submitters` (`Arc<BTreeSet<String>>`): ids of the currently
-///   configured MCP principals; a prompt job whose operator submitter is not
-///   in this set fails with a `scope:` reason before any model call.
+/// - `context` (`Arc<JobWorkerContext>`): transcript root, configured
+///   submitters and runtime root; only the pointer is cloned per job.
 ///
 /// # Returns
 /// The number of jobs that reached a terminal state in this poll.
@@ -184,9 +238,8 @@ pub async fn run_job_worker_once(
     store: Arc<JobStore>,
     executions: Arc<JobExecutionRegistry>,
     provider: Arc<dyn ModelProvider>,
-    transcript_root: &Path,
     plan_services: Option<Arc<PlanNodeServices>>,
-    configured_submitters: Arc<BTreeSet<String>>,
+    context: Arc<JobWorkerContext>,
 ) -> usize {
     let page = match store.list(&JobListQuery {
         states: Some(vec![JobState::Ready]),
@@ -209,9 +262,9 @@ pub async fn run_job_worker_once(
         let work_id = record.job.id.clone();
         let input = record.input.clone();
         let provider = Arc::clone(&provider);
-        let transcript_root = transcript_root.to_path_buf();
+        let job_store = Arc::clone(&store);
         let services = plan_services.as_ref().map(Arc::clone);
-        let submitters = Arc::clone(&configured_submitters);
+        let context = Arc::clone(&context);
         let result = runner
             .run(
                 &work_id,
@@ -229,10 +282,10 @@ pub async fn run_job_worker_once(
                             claim,
                             input,
                             provider,
-                            transcript_root,
+                            job_store,
                             services,
                             operation_control,
-                            submitters,
+                            context,
                         ),
                     )
                 },
@@ -259,12 +312,11 @@ pub async fn run_job_worker_once(
 /// - `store` (`Arc<JobStore>`): the durable job store.
 /// - `executions` (`Arc<JobExecutionRegistry>`): fenced cancellation registry.
 /// - `provider` (`Arc<dyn ModelProvider>`): the model behind every turn.
-/// - `transcript_root` (`&Path`): root of the durable job transcripts.
 /// - `plan_services` (`Option<Arc<PlanNodeServices>>`): plan store, inherited
 ///   sandbox and plan actor; `None` disables plan-node execution.
 /// - `shutdown` (`watch::Receiver<bool>`): set to `true` to end the loop.
-/// - `configured_submitters` (`Arc<BTreeSet<String>>`): ids of the currently
-///   configured MCP principals, handed to every poll; see
+/// - `context` (`Arc<JobWorkerContext>`): transcript root, configured
+///   submitters and runtime root, handed to every poll; see
 ///   [`run_job_worker_once`].
 ///
 /// # Returns
@@ -277,10 +329,9 @@ pub async fn run_job_worker(
     store: Arc<JobStore>,
     executions: Arc<JobExecutionRegistry>,
     provider: Arc<dyn ModelProvider>,
-    transcript_root: &Path,
     plan_services: Option<Arc<PlanNodeServices>>,
     mut shutdown: watch::Receiver<bool>,
-    configured_submitters: Arc<BTreeSet<String>>,
+    context: Arc<JobWorkerContext>,
 ) {
     loop {
         if *shutdown.borrow() {
@@ -290,9 +341,8 @@ pub async fn run_job_worker(
             Arc::clone(&store),
             Arc::clone(&executions),
             Arc::clone(&provider),
-            transcript_root,
             plan_services.as_ref().map(Arc::clone),
-            Arc::clone(&configured_submitters),
+            Arc::clone(&context),
         )
         .await;
         tokio::select! {
@@ -329,19 +379,20 @@ async fn execute_claim(
     claim: JobClaim,
     input: serde_json::Value,
     provider: Arc<dyn ModelProvider>,
-    transcript_root: PathBuf,
+    job_store: Arc<JobStore>,
     plan_services: Option<Arc<PlanNodeServices>>,
     control: Arc<WorkerExecutionControl>,
-    configured_submitters: Arc<BTreeSet<String>>,
+    context: Arc<JobWorkerContext>,
 ) -> JobOutcome {
     let outcome = if is_plan_node_kind(&claim.job.kind) {
         execute_plan_node_claim(
             claim,
             input,
             provider,
-            transcript_root,
+            job_store,
             plan_services,
             Arc::clone(&control),
+            &context,
         )
         .await
     } else {
@@ -349,9 +400,9 @@ async fn execute_claim(
             claim,
             input,
             provider,
-            transcript_root,
+            job_store,
             Arc::clone(&control),
-            &configured_submitters,
+            &context,
         )
         .await
     };
@@ -359,7 +410,8 @@ async fn execute_claim(
     outcome
 }
 
-// The historical path: a trusted prompt string, no tools, no sandbox.
+// The historical path: a trusted prompt string, no tools, no permissions —
+// now assembled as `EntryKind::JobPrompt` (W2d-2 J1).
 //
 // P0.12 (Register F-123): Ohne diese Prüfungen hätte jeder `SubmitOwn`-Principal
 // unbegrenzten Modellzugang auf Serverkosten. Deshalb gilt, in dieser
@@ -367,25 +419,39 @@ async fn execute_claim(
 // 1. Scope: Claim, Lease und `JobScope` müssen zum Worker- und
 //    Principal-Kontext passen (`check_prompt_claim_scope`), sonst
 //    `Failed{scope: …}` **ohne** Modellaufruf.
-// 2. Budget: das Job-Budget wird auf die harten MCP-Obergrenzen gedeckelt
+// 2. Prompt: eine fehlende oder leere Eingabe blockiert (`prompt_from_input`).
+// 3. Budget: das Job-Budget wird auf die harten MCP-Obergrenzen gedeckelt
 //    (`effective_prompt_budget`). Tokens werden nach jeder Modell-Runde aus der
 //    gemeldeten Usage verbucht (`BudgetedModelProvider`); die Wanduhr läuft als
 //    `tokio::time::timeout` um den ganzen Turn. Überschreitung ⇒
 //    `Failed{budget: …}`, danach kein weiterer Modellaufruf.
+// 4. Runtime (W2d-2 J1, E3): ohne HARW-Home `Blocked{MISSING_RUNTIME_ROOT}`;
+//    ein Montagefehler endet als `Failed` — beides ohne Modellaufruf.
 async fn execute_prompt_claim(
     claim: JobClaim,
     input: serde_json::Value,
     provider: Arc<dyn ModelProvider>,
-    transcript_root: PathBuf,
+    job_store: Arc<JobStore>,
     control: Arc<WorkerExecutionControl>,
-    configured_submitters: &BTreeSet<String>,
+    context: &JobWorkerContext,
 ) -> JobOutcome {
     let work_id = claim.job.id.as_str().to_owned();
 
-    if let Err(reason) = check_prompt_claim_scope(&claim, &input, configured_submitters) {
+    if let Err(reason) = check_prompt_claim_scope(&claim, &input, &context.configured_submitters)
+    {
         tracing::warn!(work_id = %work_id, reason = %reason, "prompt job rejected before any model call");
         return JobOutcome::Failed { reason };
     }
+    // `check_prompt_claim_scope` hat den Einreicher bereits als gültigen
+    // Operator geprüft; der zweite Blick ist nur die fail-closed Entpackung.
+    let submitter_id = match claim.scope.submitter() {
+        harw_types::ApprovalActor::Operator { id } => id.to_owned(),
+        harw_types::ApprovalActor::ChannelPeer { .. } => {
+            return JobOutcome::Failed {
+                reason: "scope: the job submitter has no valid operator id".to_owned(),
+            };
+        }
+    };
 
     let prompt = match prompt_from_input(&input) {
         Ok(prompt) => prompt,
@@ -401,24 +467,44 @@ async fn execute_prompt_claim(
             return JobOutcome::Failed { reason };
         }
     };
+
+    let Some(runtime_root) = context.runtime_root.as_ref() else {
+        tracing::warn!(work_id = %work_id, "prompt job claimed by a worker without a HARW home");
+        return JobOutcome::Blocked {
+            reason: MISSING_RUNTIME_ROOT.to_owned(),
+        };
+    };
+
     let ledger = PromptTokenLedger::new(budget, claim.job.usage.clone());
     let budgeted: Arc<dyn ModelProvider> = Arc::new(BudgetedModelProvider {
         inner: provider,
         ledger: Arc::clone(&ledger),
     });
 
-    let turn = execute_turn(
-        claim,
-        prompt,
-        budgeted,
-        transcript_root,
-        Arc::clone(&control),
-        TurnSetup {
-            registry: empty_extension_registry(),
-            spawn_context: None,
-            pause: PauseDisposition::Blocked,
+    let assembled = assemble_job_turn(
+        JobAssemblyInputs {
+            entry: JobEntry::Prompt,
+            home: &runtime_root.home,
+            cwd: &runtime_root.cwd,
+            principal: job_principal(&submitter_id),
+            session_id: durable_session_id(&claim),
+            state_store: job_state_store(&context.transcript_root),
+            job_store,
+            model: budgeted,
+            narrowing: None,
         },
+        PauseDisposition::Blocked,
+        None,
     );
+    let (setup, model) = match assembled {
+        Ok(assembled) => assembled,
+        Err(reason) => {
+            tracing::error!(work_id = %work_id, reason = %reason, "prompt job runtime assembly failed");
+            return JobOutcome::Failed { reason };
+        }
+    };
+
+    let turn = execute_turn(claim, prompt, model, Arc::clone(&control), setup);
     match tokio::time::timeout(wall.duration, turn).await {
         // Ein Abbruch durch den Supervisor bleibt ein Abbruch; jeder andere
         // Ausgang eines Turns, der das Token-Budget gerissen hat, ist ein
@@ -762,40 +848,17 @@ impl ModelProvider for BudgetedModelProvider {
     }
 }
 
-/// Derives the trace a claimed plan-node job's [`SpawnContext`] should carry.
-///
-/// # Description
-/// AW1-01c. This is deliberately not a fresh root: a plan-node job continues
-/// work that was already admitted with a trace (`StoredJob.trace`, AW1-01),
-/// so inventing a new root here would look like continuity without being
-/// one — worse than carrying no trace at all. The correct behaviour would be
-/// to *inherit* that trace (same `trace_id`, a fresh span, the job's span as
-/// `parent_span_id`), but [`JobClaim`] (`harw-job-runtime/src/stored.rs`)
-/// does not carry the trace forward from the `StoredJob` it was claimed
-/// from — `harw_session_store::JobStore::claim` builds `JobClaim` without
-/// copying `record.trace`. There is nothing on `claim` to inherit yet, so
-/// this returns `None` until `JobClaim` gains a `trace` field.
-///
-/// # Arguments
-/// - `claim` (`&JobClaim`): the claimed job. Unused today — kept as a
-///   parameter so a future `JobClaim` trace field can be threaded through
-///   here without changing the call site.
-///
-/// # Returns
-/// Always `None`, for the reason above.
-fn plan_node_spawn_trace(_claim: &JobClaim) -> Option<TraceContext> {
-    None
-}
-
-// The plan-node path: typed payload, contract-derived sandbox, role-derived
-// tool registry, and a mandatory report back into the plan.
+// The plan-node path: typed payload, contract-derived permissions, role-derived
+// registry profile (both applied as a `RuntimeNarrowing` of
+// `EntryKind::JobPlanNode`), and a mandatory report back into the plan.
 async fn execute_plan_node_claim(
     claim: JobClaim,
     input: serde_json::Value,
     provider: Arc<dyn ModelProvider>,
-    transcript_root: PathBuf,
+    job_store: Arc<JobStore>,
     plan_services: Option<Arc<PlanNodeServices>>,
     control: Arc<WorkerExecutionControl>,
+    context: &JobWorkerContext,
 ) -> JobOutcome {
     let work_id = claim.job.id.as_str().to_owned();
 
@@ -835,6 +898,8 @@ async fn execute_plan_node_claim(
     // The write *request* is the contract's: only a contract that names allowed
     // paths asks for `WriteWorkspace`. Whether it is granted is decided by the
     // derivation (plan-node table ∩ contract ∩ inherited) and read back below.
+    // The derived sandbox is a *check* and the source of the narrowed
+    // permissions; the session's sandbox itself is built by the assembly.
     let requests_write = !payload.contract.allowed_paths.is_empty();
     let sandbox = match derive_plan_node_sandbox(
         services.sandbox(),
@@ -853,26 +918,52 @@ async fn execute_plan_node_claim(
             return fail_plan_node(&services, &payload.task_id, &work_id, reason);
         }
     };
-    let may_write = sandbox.permissions().contains(Permission::WriteWorkspace);
-    let profile = profile_for_node_kind(kind, may_write);
 
-    let workspace_root = sandbox.workspace().canonical_root().to_path_buf();
-    let assembled = match assemble_registry(
-        profile,
-        workspace_root,
-        plan_node_identity(&payload, profile),
-    ) {
+    let Some(runtime_root) = context.runtime_root.as_ref() else {
+        tracing::error!(
+            task = %payload.task_id,
+            work_id = %work_id,
+            "plan-node job claimed by a worker without a HARW home"
+        );
+        return report_plan_node_outcome(
+            &services,
+            &payload.task_id,
+            &work_id,
+            JobOutcome::Blocked {
+                reason: MISSING_RUNTIME_ROOT.to_owned(),
+            },
+        );
+    };
+
+    let (entry, narrowing) = plan_node_narrowing(&payload, kind, &sandbox);
+    let profile = narrowing.registry_profile;
+    let may_write = sandbox.permissions().contains(Permission::WriteWorkspace);
+    let assembled = assemble_job_turn(
+        JobAssemblyInputs {
+            entry,
+            home: &runtime_root.home,
+            cwd: sandbox.workspace().canonical_root(),
+            principal: job_principal(services.actor()),
+            session_id: durable_session_id(&claim),
+            state_store: job_state_store(&context.transcript_root),
+            job_store,
+            model: provider,
+            narrowing: Some(narrowing),
+        },
+        PauseDisposition::Failed,
+        // J1-F, kept as defense in depth: the narrowing binds the assembly's
+        // sandbox to the derived workspace root (R0-F); this check only fires
+        // on a genuine deviation.
+        Some(&sandbox),
+    );
+    let (setup, model) = match assembled {
         Ok(assembled) => assembled,
-        Err(error) => {
-            let reason = format!(
-                "could not assemble the plan-node tool registry: {}",
-                sanitize_failure(&error.to_string())
-            );
+        Err(reason) => {
             tracing::error!(
                 task = %payload.task_id,
                 work_id = %work_id,
-                error = %error,
-                "plan-node registry assembly failed"
+                reason = %reason,
+                "plan-node runtime assembly failed"
             );
             return fail_plan_node(&services, &payload.task_id, &work_id, reason);
         }
@@ -887,39 +978,56 @@ async fn execute_plan_node_claim(
         "plan-node job starting"
     );
 
-    // Computed before `claim` moves into `execute_turn` below.
-    let trace = plan_node_spawn_trace(&claim);
-    let outcome = execute_turn(
-        claim,
-        plan_node_prompt(&payload),
-        provider,
-        transcript_root,
-        control,
-        TurnSetup {
-            registry: assembled.registry,
-            spawn_context: Some(SpawnContext {
-                sandbox,
-                suggestions: None,
-                capability_snapshot: None,
-                // No identity may answer an approval: a durable job has no user.
-                approval_actor: None,
-                organizational_role: AgentRoleId::Worker,
-                trace,
-                // Root: a plan-node job has no parent session whose
-                // already-cut ceiling it could inherit (see
-                // `plan_node_spawn_trace` above for the analogous trace
-                // reasoning) — the ceiling is created here, once. `Worker`
-                // is a leaf in the §3 spawn matrix and never admits further
-                // children, so this ceiling only ever governs this job's
-                // own context assembly, never a cut for a grandchild.
-                ceiling: Some(crate::root_context::local_root_context_ceiling()),
-            }),
-            pause: PauseDisposition::Failed,
-        },
-    )
-    .await;
+    let outcome = execute_turn(claim, plan_node_prompt(&payload), model, control, setup).await;
 
     report_plan_node_outcome(&services, &payload.task_id, &work_id, outcome)
+}
+
+// Fail-closed check of a plan node's assembled sandbox (J1-F). Since R0-F the
+// narrowing carries `workspace_root`, so the assembly binds exactly the derived
+// workspace root even when `discover_project` finds a marked project above it.
+// The check stays as defense in depth: any deviation (a future assembly change,
+// a path swapped between canonicalizations) fails closed. The workspace ids differ
+// by construction (tenant alias), hence the canonical roots are compared, not
+// `SandboxSpec::ensure_child_of`. Both roots are canonical already.
+fn ensure_same_workspace_root(
+    assembled: &SandboxSpec,
+    derived: &SandboxSpec,
+) -> Result<(), String> {
+    let bound = assembled.workspace().canonical_root();
+    let required = derived.workspace().canonical_root();
+    if bound == required {
+        Ok(())
+    } else {
+        Err(format!(
+            "plan node workspace root mismatch: assembly bound {}, contract requires {}",
+            bound.display(),
+            required.display()
+        ))
+    }
+}
+
+// Job-Art und Verengung eines Plan-Knotens (CONTRACTS-W2d2.md §2 J1, E10):
+// Profil nach Knotenart und tatsächlich gewährtem Schreibrecht, Identität des
+// Plan-Knoten-Agenten, Rechte und Workspace-Root der abgeleiteten Sandbox (R0-F).
+fn plan_node_narrowing(
+    payload: &PlanNodePayload,
+    kind: PlanNodeKind,
+    sandbox: &SandboxSpec,
+) -> (JobEntry, RuntimeNarrowing) {
+    let may_write = sandbox.permissions().contains(Permission::WriteWorkspace);
+    let profile = profile_for_node_kind(kind, may_write);
+    (
+        JobEntry::PlanNode { kind, may_write },
+        RuntimeNarrowing {
+            registry_profile: profile,
+            identity: plan_node_identity(payload, profile),
+            permissions: sandbox.permissions().clone(),
+            // R0-F: bind the root sandbox to exactly the derived workspace root,
+            // not to the project root discovered above it.
+            workspace_root: Some(sandbox.workspace().canonical_root().to_path_buf()),
+        },
+    )
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -943,44 +1051,99 @@ enum PauseDisposition {
 
 /// Everything the turn needs beyond prompt and provider.
 struct TurnSetup {
-    /// The tool surface this turn may see.
-    registry: ExtensionRegistry,
-    /// The trusted context (sandbox, approval identity, organizational role).
-    spawn_context: Option<SpawnContext>,
+    /// The root session built by `RuntimeAssembly::new_root_session`.
+    session: AgentSession,
+    /// The durable history store the assembly was built with.
+    state_store: Arc<dyn StateStore>,
     /// How a paused turn is scored.
     pause: PauseDisposition,
+}
+
+// The durable session id of a job: `durable-job-<work id>`. The same id is the
+// assembly's registered root and the key of the job transcript.
+fn durable_session_id(claim: &JobClaim) -> SessionId {
+    SessionId::from_str(format!("durable-job-{}", claim.job.id.as_str()))
+}
+
+// The durable transcript store of all job sessions below `transcript_root`.
+fn job_state_store(transcript_root: &Path) -> Arc<dyn StateStore> {
+    Arc::new(TranscriptStateStore::new(
+        TranscriptStore::new(transcript_root),
+        job_thread,
+    ))
+}
+
+// Assembles the job runtime and builds its root session (W2d-2 J1). The
+// assembly is a local of this synchronous function and is dropped before any
+// `await`: the root session owns its registry, and the model is handed out as
+// a pointer. No responder is mounted — neither job entry has
+// `AskResolution::Interactive`. The event receivers are dropped on purpose: a
+// durable job has no live observer; its record is the transcript.
+//
+// `required_sandbox` (plan nodes only, J1-F): the assembled sandbox must be
+// bound to exactly its workspace root, checked before any session exists.
+//
+// Returns the turn setup and the assembly's model, or the sanitized `Failed`
+// reason of a failed assembly, workspace-root check or root session.
+fn assemble_job_turn(
+    inputs: JobAssemblyInputs<'_>,
+    pause: PauseDisposition,
+    required_sandbox: Option<&SandboxSpec>,
+) -> Result<(TurnSetup, Arc<dyn ModelProvider>), String> {
+    let session_id = inputs.session_id.clone();
+    let state_store = Arc::clone(&inputs.state_store);
+    let assembly: RuntimeAssembly = job_assembly(inputs).map_err(|error| {
+        format!(
+            "could not assemble the job runtime: {}",
+            sanitize_failure(&error)
+        )
+    })?;
+    if let Some(required) = required_sandbox {
+        ensure_same_workspace_root(assembly.sandbox(), required)
+            .map_err(|reason| sanitize_failure(&reason))?;
+    }
+    let model = Arc::clone(assembly.model());
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+    let (turn_tx, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
+    let root = assembly
+        .new_root_session(session_id, event_tx, turn_tx, None)
+        .map_err(|error| {
+            format!(
+                "could not create the job root session: {}",
+                sanitize_failure(&error.to_string())
+            )
+        })?;
+    Ok((
+        TurnSetup {
+            session: root.session,
+            state_store,
+            pause,
+        },
+        model,
+    ))
 }
 
 async fn execute_turn(
     claim: JobClaim,
     prompt: String,
     provider: Arc<dyn ModelProvider>,
-    transcript_root: PathBuf,
     control: Arc<WorkerExecutionControl>,
     setup: TurnSetup,
 ) -> JobOutcome {
     let TurnSetup {
-        registry,
-        spawn_context,
+        mut session,
+        state_store,
         pause,
     } = setup;
 
-    let session_id = SessionId::from_str(format!("durable-job-{}", claim.job.id.as_str()));
-    let durable_session_id = session_id.clone();
-    let transcripts = TranscriptStateStore::new(TranscriptStore::new(&transcript_root), job_thread);
-    let durable_transcript_root = transcript_root.clone();
-    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut session =
-        AgentSession::new_with_id(session_id, AgentRole::Assistant, None, registry, event_tx);
-    if let Some(context) = spawn_context {
-        session = session.with_spawn_context(context);
-    }
+    let session_id = durable_session_id(&claim);
+    let durable_store = Arc::clone(&state_store);
 
     let mut turn = tokio::spawn(async move {
         run_turn(
             &mut session,
             provider.as_ref(),
-            &transcripts,
+            state_store.as_ref(),
             TurnInput::user(prompt),
         )
         .await
@@ -1003,11 +1166,7 @@ async fn execute_turn(
     control.clear_abort_handle();
     match result {
         Ok(Ok((TurnOutcome::Completed, _session))) => {
-            let durable_transcripts = TranscriptStateStore::new(
-                TranscriptStore::new(&durable_transcript_root),
-                job_thread,
-            );
-            match durable_transcripts.load_history(&durable_session_id).await {
+            match durable_store.load_history(&session_id).await {
                 Ok(history) => JobOutcome::Succeeded {
                     result: serde_json::json!({ "assistant": last_assistant_text(&history) }),
                 },
@@ -1693,7 +1852,7 @@ mod tests {
     use super::*;
     use harw_core::{EchoModelProvider, JobExecutionRegistry, RecordingModelProvider};
     use harw_job_runtime::{Budget, Job, JobScope, RetryPolicy, StoredJob};
-    use harw_plan::InMemoryPlanStore;
+    use harw_plan::{InMemoryPlanStore, PlanAction, PlanId, PlanNodeStatus};
     use harw_plan::admission::RepoRevision;
     use harw_plan::ids::RevisionId;
     use harw_sandbox::{WorkspaceRegistration, WorkspaceRegistry};
@@ -1830,6 +1989,29 @@ mod tests {
     // Die Einreicher-Menge passend zu `ready_record` (Operator `operator`).
     fn operator_submitters() -> Arc<BTreeSet<String>> {
         Arc::new(BTreeSet::from(["operator".to_owned()]))
+    }
+
+    // Worker-Kontext mit Temp-Home (`harw_home::ensure_home`) und Temp-cwd
+    // unter `root`; Transkripte liegen direkt unter `root`.
+    fn job_context(root: &Path) -> Arc<JobWorkerContext> {
+        Arc::new(JobWorkerContext {
+            transcript_root: root.to_path_buf(),
+            configured_submitters: operator_submitters(),
+            runtime_root: Some(runtime_root_under(root)),
+        })
+    }
+
+    // Legt Home und cwd der Job-Runtime unter `root` an.
+    fn runtime_root_under(root: &Path) -> JobRuntimeRoot {
+        let home = root.join("runtime-home");
+        let cwd = root.join("runtime-cwd");
+        if let Err(error) = harw_home::ensure_home(&home) {
+            panic!("scaffold home: {error}");
+        }
+        if let Err(error) = std::fs::create_dir_all(&cwd) {
+            panic!("create cwd: {error}");
+        }
+        JobRuntimeRoot { home, cwd }
     }
 
     fn plan_services(root: &Path, permissions: &[Permission]) -> Arc<PlanNodeServices> {
@@ -2149,45 +2331,6 @@ mod tests {
         );
     }
 
-    // ── Trace (AW1-01c) ──────────────────────────────────────────────────
-
-    /// Documents the AW1-01c decision: even when the claimed job's on-disk
-    /// `StoredJob` carried a trace, the resulting `JobClaim` does not — so
-    /// `plan_node_spawn_trace` cannot inherit one and must return `None`
-    /// rather than inventing a fresh root. This pins the exact gap
-    /// (`JobClaim` in `harw-job-runtime/src/stored.rs`) so a follow-up node
-    /// can prove it closed by turning this same assertion into `is_some()`.
-    #[test]
-    fn plan_node_spawn_trace_is_none_even_when_the_stored_job_carries_a_trace() {
-        let temp = temp_dir();
-        let store = JobStore::new(temp.path());
-        let mut record = ready_record_of_kind(
-            "plan-node-traced",
-            JobKind::Custom(PLAN_NODE_JOB_KIND.to_owned()),
-            serde_json::json!({"task_id": "t-1"}),
-        );
-        record.trace = Some(
-            TraceContext::new("a".repeat(32), "b".repeat(16)).expect("sample trace is valid hex"),
-        );
-        admit(&store, &record);
-
-        let claim = store
-            .claim(
-                &WorkId::from_str("plan-node-traced"),
-                &ClaimRequest {
-                    worker_id: WORKER_ID.to_owned(),
-                    lease_ttl: SignedDuration::from_secs(LEASE_TTL_SECONDS),
-                    now: Timestamp::now(),
-                },
-            )
-            .expect("claim a ready job");
-
-        assert!(
-            plan_node_spawn_trace(&claim).is_none(),
-            "JobClaim does not carry StoredJob.trace forward yet — see AW1-01c report"
-        );
-    }
-
     // ── Approval handling ─────────────────────────────────────────────────
 
     #[test]
@@ -2243,9 +2386,8 @@ mod tests {
             Arc::clone(&store),
             Arc::new(JobExecutionRegistry::new()),
             Arc::new(EchoModelProvider::new("done")),
-            temp.path(),
             None,
-            operator_submitters(),
+            job_context(temp.path()),
         )
         .await;
         assert_eq!(completed, 1);
@@ -2268,9 +2410,8 @@ mod tests {
             Arc::clone(&store),
             Arc::new(JobExecutionRegistry::new()),
             Arc::clone(&provider) as Arc<dyn ModelProvider>,
-            temp.path(),
             None,
-            operator_submitters(),
+            job_context(temp.path()),
         )
         .await;
         assert!(provider.recorded().is_empty());
@@ -2303,9 +2444,8 @@ mod tests {
             Arc::clone(&store),
             Arc::new(JobExecutionRegistry::new()),
             Arc::clone(&provider) as Arc<dyn ModelProvider>,
-            temp.path(),
             Some(services),
-            operator_submitters(),
+            job_context(temp.path()),
         )
         .await;
 
@@ -2339,9 +2479,8 @@ mod tests {
             Arc::clone(&store),
             Arc::new(JobExecutionRegistry::new()),
             Arc::clone(&provider) as Arc<dyn ModelProvider>,
-            temp.path(),
             None,
-            operator_submitters(),
+            job_context(temp.path()),
         )
         .await;
 
@@ -2372,9 +2511,8 @@ mod tests {
             Arc::clone(&store),
             Arc::new(JobExecutionRegistry::new()),
             Arc::clone(&provider) as Arc<dyn ModelProvider>,
-            temp.path(),
             Some(services),
-            operator_submitters(),
+            job_context(temp.path()),
         )
         .await;
 
@@ -2447,6 +2585,337 @@ mod tests {
         assert!(
             prompt.contains("do not ask for approval"),
             "prompt: {prompt}"
+        );
+    }
+
+    // ── Runtime assembly (W2d-2 J1) ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_prompt_job_without_runtime_root_is_blocked_before_model_call() {
+        let temp = temp_dir();
+        let store = Arc::new(JobStore::new(temp.path()));
+        admit(
+            &store,
+            &ready_record("homeless-job", serde_json::json!({"prompt": "hello"})),
+        );
+        let provider = Arc::new(RecordingModelProvider::new());
+        let context = Arc::new(JobWorkerContext {
+            transcript_root: temp.path().to_path_buf(),
+            configured_submitters: operator_submitters(),
+            runtime_root: None,
+        });
+
+        let completed = run_job_worker_once(
+            Arc::clone(&store),
+            Arc::new(JobExecutionRegistry::new()),
+            Arc::clone(&provider) as Arc<dyn ModelProvider>,
+            None,
+            context,
+        )
+        .await;
+
+        assert_eq!(completed, 1, "the job must reach a terminal state");
+        assert!(
+            provider.recorded().is_empty(),
+            "a worker without a HARW home must never reach the model"
+        );
+        let JobOutcome::Blocked { reason } = completion_of(&store, "homeless-job") else {
+            panic!("a prompt job without a runtime root must block");
+        };
+        assert_eq!(reason, "job runtime requires a HARW home");
+    }
+
+    #[tokio::test]
+    async fn test_prompt_job_session_id_is_durable_job_id() {
+        let temp = temp_dir();
+        let store = Arc::new(JobStore::new(temp.path()));
+        admit(
+            &store,
+            &ready_record("session-job", serde_json::json!({"prompt": "hello"})),
+        );
+
+        let completed = run_job_worker_once(
+            Arc::clone(&store),
+            Arc::new(JobExecutionRegistry::new()),
+            Arc::new(EchoModelProvider::new("durable answer")),
+            None,
+            job_context(temp.path()),
+        )
+        .await;
+
+        assert_eq!(completed, 1);
+        assert!(matches!(
+            completion_of(&store, "session-job"),
+            JobOutcome::Succeeded { .. }
+        ));
+        // Der Verlauf liegt unter genau der Wurzel-Session-id `durable-job-<id>`,
+        // die die Montage registriert und `new_root_session` akzeptiert hat.
+        let history = match job_state_store(temp.path())
+            .load_history(&SessionId::from_str("durable-job-session-job"))
+            .await
+        {
+            Ok(history) => history,
+            Err(error) => panic!("load durable job history: {error}"),
+        };
+        assert_eq!(last_assistant_text(&history), "durable answer");
+    }
+
+    #[test]
+    fn test_plan_node_job_registry_is_narrowed_to_readonly_for_research() {
+        let temp = temp_dir();
+        let inherited = sandbox_with(
+            temp.path(),
+            &[Permission::ReadWorkspace, Permission::WriteWorkspace],
+        );
+        // The contract asks for writing, but a research node never writes.
+        let contract = contract_for("t-1", &[PathRule::DirectoryPrefix("src".to_owned())]);
+        let payload = match PlanNodePayload::parse(&plan_node_input(Some("t-1"), &contract)) {
+            Ok(payload) => payload,
+            Err(error) => panic!("bridge payload must parse: {error}"),
+        };
+        let derived = match derive_plan_node_sandbox(
+            &inherited,
+            &contract,
+            PlanNodeKind::Research,
+            true,
+        ) {
+            Ok(derived) => derived,
+            Err(error) => panic!("derivation must succeed: {error}"),
+        };
+
+        let (entry, narrowing) = plan_node_narrowing(&payload, PlanNodeKind::Research, &derived);
+        assert_eq!(
+            entry,
+            JobEntry::PlanNode {
+                kind: PlanNodeKind::Research,
+                may_write: false,
+            }
+        );
+        assert_eq!(narrowing.registry_profile, RegistryProfile::ReadOnlyExplore);
+        assert!(!narrowing.permissions.contains(Permission::WriteWorkspace));
+
+        let runtime = runtime_root_under(temp.path());
+        let assembly = match job_assembly(JobAssemblyInputs {
+            entry,
+            home: &runtime.home,
+            cwd: derived.workspace().canonical_root(),
+            principal: job_principal("test-runtime"),
+            session_id: SessionId::from_str("durable-job-research"),
+            state_store: job_state_store(temp.path()),
+            job_store: Arc::new(JobStore::new(temp.path())),
+            model: Arc::new(EchoModelProvider::new("x")),
+            narrowing: Some(narrowing),
+        }) {
+            Ok(assembly) => assembly,
+            Err(error) => panic!("narrowed plan-node assembly must build: {error}"),
+        };
+
+        let tools = assembly.rights_snapshot().tools;
+        assert!(tools.iter().any(|tool| tool == "fs.read"), "tools: {tools:?}");
+        for forbidden in ["fs.write", "shell.exec"] {
+            assert!(
+                !tools.iter().any(|tool| tool == forbidden),
+                "a research node must not see '{forbidden}': {tools:?}"
+            );
+        }
+        let permissions = assembly.sandbox().permissions();
+        assert!(permissions.contains(Permission::ReadWorkspace));
+        assert!(!permissions.contains(Permission::WriteWorkspace));
+        assert!(!permissions.contains(Permission::ExecuteProcess));
+    }
+
+    // ── Workspace-root check (W2d-2 J1-F) ─────────────────────────────────
+
+    // Binds a sandbox to `harness_root/relative` (`"."` binds the harness root
+    // itself), like `harw_runtime::sandbox::root_sandbox` does for a project.
+    fn sandbox_bound_to(
+        harness_root: &Path,
+        relative: &str,
+        tenant: &str,
+        permissions: &[Permission],
+    ) -> SandboxSpec {
+        if let Err(error) = std::fs::create_dir_all(harness_root.join(relative)) {
+            panic!("create workspace '{relative}': {error}");
+        }
+        let tenant = TenantId::from_str(tenant);
+        let workspace = WorkspaceId::from_str("workspace");
+        let registry = match WorkspaceRegistry::build(
+            harness_root,
+            [WorkspaceRegistration {
+                tenant: tenant.clone(),
+                workspace: workspace.clone(),
+                root: PathBuf::from(relative),
+            }],
+        ) {
+            Ok(registry) => registry,
+            Err(error) => panic!("workspace registry: {error}"),
+        };
+        let binding = match registry.resolve(&tenant, &workspace) {
+            Ok(binding) => binding,
+            Err(error) => panic!("resolve workspace: {error}"),
+        };
+        SandboxSpec::from_resolved(
+            binding,
+            PermissionSet::from_policy(permissions.iter().copied()),
+        )
+    }
+
+    #[test]
+    fn test_ensure_same_workspace_root_rejects_parent_root() {
+        let temp = temp_dir();
+        // The derived (contract) sandbox is bound to the child directory; the
+        // assembly bound its parent — a wider directory, even with fewer rights.
+        let read_write = [Permission::ReadWorkspace, Permission::WriteWorkspace];
+        let derived = sandbox_bound_to(temp.path(), "workspace", "tenant", &read_write);
+        let read_only = [Permission::ReadWorkspace];
+        let assembled = sandbox_bound_to(temp.path(), ".", "job-plan-node", &read_only);
+        assert_ne!(
+            assembled.workspace().canonical_root(),
+            derived.workspace().canonical_root()
+        );
+
+        let reason = match ensure_same_workspace_root(&assembled, &derived) {
+            Ok(()) => panic!("a parent root must never pass as the derived workspace"),
+            Err(reason) => reason,
+        };
+        assert!(
+            reason.starts_with("plan node workspace root mismatch: assembly bound "),
+            "unclear message: {reason}"
+        );
+        assert!(
+            reason.contains(&derived.workspace().canonical_root().display().to_string()),
+            "the required root must be named: {reason}"
+        );
+    }
+
+    #[test]
+    fn test_ensure_same_workspace_root_accepts_identical_root() {
+        let temp = temp_dir();
+        // Different tenant alias and permissions, same canonical root: the
+        // check is about the bound directory only.
+        let read_only = [Permission::ReadWorkspace];
+        let derived = sandbox_bound_to(temp.path(), "workspace", "tenant", &read_only);
+        let assembled = sandbox_bound_to(temp.path(), "workspace", "job-plan-node", &read_only);
+
+        assert_eq!(ensure_same_workspace_root(&assembled, &derived), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn test_plan_node_under_a_marked_parent_directory_binds_the_workspace_root() {
+        let temp = temp_dir();
+        // A project marker *above* the inherited workspace (`<temp>/workspace`):
+        // `discover_project` resolves `<temp>` as the project root. Since R0-F
+        // the narrowing binds the sandbox to `<temp>/workspace` regardless.
+        if let Err(error) = std::fs::write(temp.path().join("Cargo.toml"), "[workspace]\n") {
+            panic!("write project marker: {error}");
+        }
+        let store = Arc::new(JobStore::new(temp.path()));
+        let contract = contract_for("t-1", &[]);
+        admit(
+            &store,
+            &ready_record_of_kind(
+                "marked-parent-job",
+                JobKind::Custom(PLAN_NODE_JOB_KIND.to_owned()),
+                plan_node_input(Some("t-1"), &contract),
+            ),
+        );
+        let plan = InMemoryPlanStore::new();
+        if let Err(error) = plan.apply(
+            PlanAction::Create {
+                plan_id: PlanId::new("p-test"),
+                goal: "test goal".to_owned(),
+            },
+            "test",
+        ) {
+            panic!("create plan: {error}");
+        }
+        let mut node = harw_plan::testing::base_node("t-1");
+        node.kind = PlanNodeKind::Research;
+        node.status = PlanNodeStatus::Ready;
+        if let Err(error) = plan.apply(PlanAction::AddNode { node }, "test") {
+            panic!("add node: {error}");
+        }
+        let plan: Arc<dyn PlanStore> = Arc::new(plan);
+        let inherited = sandbox_with(temp.path(), &[Permission::ReadWorkspace]);
+        let services = Arc::new(PlanNodeServices::new(
+            plan,
+            inherited.clone(),
+            "test-runtime".to_owned(),
+        ));
+        let provider = Arc::new(RecordingModelProvider::new());
+
+        let completed = run_job_worker_once(
+            Arc::clone(&store),
+            Arc::new(JobExecutionRegistry::new()),
+            Arc::clone(&provider) as Arc<dyn ModelProvider>,
+            Some(services),
+            job_context(temp.path()),
+        )
+        .await;
+
+        assert_eq!(completed, 1, "the plan job must reach a terminal state");
+        assert!(
+            !provider.recorded().is_empty(),
+            "a plan node below a marked parent directory must now reach the model"
+        );
+        match completion_of(&store, "marked-parent-job") {
+            JobOutcome::Failed { reason } | JobOutcome::Blocked { reason } => assert!(
+                !reason.starts_with("plan node workspace root mismatch")
+                    && !reason.starts_with("could not assemble the job runtime"),
+                "the assembly must bind the workspace root: {reason}"
+            ),
+            JobOutcome::Succeeded { .. } | JobOutcome::Cancelled { .. } => {}
+        }
+
+        // The bound root itself: the same narrowing the worker uses binds the
+        // assembly's sandbox (and spawn context) to exactly the derived root,
+        // while project discovery still stops at the marked parent.
+        let payload = match PlanNodePayload::parse(&plan_node_input(Some("t-1"), &contract)) {
+            Ok(payload) => payload,
+            Err(error) => panic!("bridge payload must parse: {error}"),
+        };
+        let derived =
+            match derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Research, false) {
+                Ok(derived) => derived,
+                Err(error) => panic!("derivation must succeed: {error}"),
+            };
+        let (entry, narrowing) = plan_node_narrowing(&payload, PlanNodeKind::Research, &derived);
+        assert_eq!(
+            narrowing.workspace_root.as_deref(),
+            Some(derived.workspace().canonical_root())
+        );
+        let runtime = runtime_root_under(temp.path());
+        let assembly = match job_assembly(JobAssemblyInputs {
+            entry,
+            home: &runtime.home,
+            cwd: derived.workspace().canonical_root(),
+            principal: job_principal("test-runtime"),
+            session_id: SessionId::from_str("durable-job-marked-parent"),
+            state_store: job_state_store(temp.path()),
+            job_store: Arc::new(JobStore::new(temp.path())),
+            model: Arc::new(EchoModelProvider::new("x")),
+            narrowing: Some(narrowing),
+        }) {
+            Ok(assembly) => assembly,
+            Err(error) => panic!("plan-node assembly below a marked parent must build: {error}"),
+        };
+        let canonical_temp = match temp.path().canonicalize() {
+            Ok(path) => path,
+            Err(error) => panic!("canonicalize temp: {error}"),
+        };
+        assert_eq!(assembly.project().project_root, canonical_temp);
+        assert_eq!(
+            assembly.sandbox().workspace().canonical_root(),
+            derived.workspace().canonical_root(),
+            "the assembly binds the workspace root, not the marked parent"
+        );
+        assert_eq!(
+            assembly.spawn_context().sandbox.workspace().canonical_root(),
+            derived.workspace().canonical_root()
+        );
+        assert_eq!(
+            ensure_same_workspace_root(assembly.sandbox(), &derived),
+            Ok(())
         );
     }
 }
@@ -2534,9 +3003,8 @@ mod prompt_claim_guard_tests {
             Arc::clone(store),
             Arc::new(JobExecutionRegistry::new()),
             provider,
-            root,
             None,
-            operator_submitters(),
+            job_context_with_submitters(root, operator_submitters()),
         )
         .await;
     }
@@ -2544,6 +3012,27 @@ mod prompt_claim_guard_tests {
     // Die Einreicher-Menge passend zu `operator_scope` (Operator `operator`).
     fn operator_submitters() -> Arc<BTreeSet<String>> {
         Arc::new(BTreeSet::from(["operator".to_owned()]))
+    }
+
+    // Worker-Kontext mit Temp-Home (`harw_home::ensure_home`) und Temp-cwd
+    // unter `root`; Transkripte liegen direkt unter `root`.
+    fn job_context_with_submitters(
+        root: &Path,
+        configured_submitters: Arc<BTreeSet<String>>,
+    ) -> Arc<JobWorkerContext> {
+        let home = root.join("runtime-home");
+        let cwd = root.join("runtime-cwd");
+        if let Err(error) = harw_home::ensure_home(&home) {
+            panic!("scaffold home: {error}");
+        }
+        if let Err(error) = std::fs::create_dir_all(&cwd) {
+            panic!("create cwd: {error}");
+        }
+        Arc::new(JobWorkerContext {
+            transcript_root: root.to_path_buf(),
+            configured_submitters,
+            runtime_root: Some(JobRuntimeRoot { home, cwd }),
+        })
     }
 
     // Claimt einen zugelassenen Job als dieser Worker (`WORKER_ID`).
@@ -2756,9 +3245,9 @@ mod prompt_claim_guard_tests {
             claim,
             serde_json::json!({"task": "summarize"}),
             Arc::clone(&provider) as Arc<dyn ModelProvider>,
-            temp.path().to_path_buf(),
+            Arc::new(JobStore::new(temp.path())),
             WorkerExecutionControl::new(),
-            &operator_submitters(),
+            &job_context_with_submitters(temp.path(), operator_submitters()),
         )
         .await;
 
@@ -2828,9 +3317,11 @@ mod prompt_claim_guard_tests {
             Arc::clone(&store),
             Arc::new(JobExecutionRegistry::new()),
             Arc::clone(&provider) as Arc<dyn ModelProvider>,
-            temp.path(),
             None,
-            Arc::new(BTreeSet::from(["someone-else".to_owned()])),
+            job_context_with_submitters(
+                temp.path(),
+                Arc::new(BTreeSet::from(["someone-else".to_owned()])),
+            ),
         )
         .await;
 

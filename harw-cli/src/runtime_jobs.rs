@@ -1,11 +1,12 @@
-//! Runtime-Ableitung für den durablen Job-Worker (W2d-1 Welle A, Agent A3).
+//! Runtime-Ableitung für den durablen Job-Worker (W2d-1 Welle A, Agent A3;
+//! W2d-2 J1, Plan D3b).
 //!
 //! # Zweck
 //! Eine Stelle, an der der Job-Worker Identität, Sandbox und Runtime-Montage
 //! eines Jobs aus der gemeinsamen Runtime (`harw-runtime`) ableitet, statt sie
 //! in `job_worker.rs` selbst zusammenzusetzen. Vertrag:
 //! `docs/remediation/CONTRACTS.md` §principal und §runtime-spec (Zeilen
-//! `JobPrompt` / `JobPlanNode`).
+//! `JobPrompt` / `JobPlanNode`), `docs/remediation/CONTRACTS-W2d2.md` §1.3.
 //!
 //! # Verantwortung
 //! - [`JobEntry`]: welche Art Job läuft (Prompt oder Plan-Knoten) und die
@@ -14,21 +15,22 @@
 //!   vertrauenswürdigen Eingangsgrenze `JobWorker`.
 //! - [`job_sandbox`]: die Wurzel-Sandbox eines Jobs — nur über
 //!   [`root_sandbox`] bzw. [`plan_node_sandbox`], also nie weiter als die
-//!   Profiltabelle.
-//! - [`job_assembly`]: die Runtime-Montage eines Jobs über
-//!   `crate::runtime_entry::build_assembly`.
-//! - [`configured_principal_ids`] / [`submitter_is_configured`]: schließen die
-//!   Restlücke aus `docs/remediation/ledger/W1/W1-13.md` §1 — der Worker kann
-//!   prüfen, ob der Einreicher eines Jobs noch ein *aktuell konfigurierter*
-//!   MCP-Principal ist.
+//!   Profiltabelle. Der Worker nutzt sie als *Prüfung* der Plan-Knoten-Ableitung.
+//! - [`JobAssemblyInputs`] / [`job_assembly`]: die Runtime-Montage eines Jobs
+//!   direkt über [`RuntimeAssembly::builder`] — mit fester Wurzel-Session-id
+//!   und optionaler [`RuntimeNarrowing`] (Plan-Knoten).
+//! - [`configured_principal_ids`]: schließt die Restlücke aus
+//!   `docs/remediation/ledger/W1/W1-13.md` §1 — der Worker prüft, ob der
+//!   Einreicher eines Jobs noch ein *aktuell konfigurierter* MCP-Principal ist.
 //!
 //! # Nebenläufigkeit
 //! Alle Funktionen sind synchron und zustandslos; geteilte Speicher werden als
-//! `Arc` hereingereicht und nur weitergegeben.
+//! `Arc` hereingereicht und nur weitergegeben. [`job_assembly`] liest
+//! Konfiguration und Projekt vom Dateisystem.
 //!
 //! # Fehler
-//! Fehler erscheinen als `String` (Vertrag von `runtime_entry`); die
-//! Sandbox-Fehler sind die `Display`-Form von `harw_runtime::RuntimeError`.
+//! Fehler erscheinen als `String`; Sandbox- und Montagefehler sind die
+//! `Display`-Form von `harw_runtime::RuntimeError`.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -38,11 +40,12 @@ use harw_config::ResolvedConfig;
 use harw_core::{ModelProvider, StateStore};
 use harw_plan::PlanNodeKind;
 use harw_runtime::{
-    EntryKind, ModelSource, RuntimeAssembly, RuntimeStores, plan_node_sandbox, root_sandbox,
+    EntryKind, ModelSource, RuntimeAssembly, RuntimeNarrowing, RuntimeStores, plan_node_sandbox,
+    root_sandbox,
 };
 use harw_sandbox::SandboxSpec;
 use harw_session_store::JobStore;
-use harw_types::{IngressSurface, PermissionTier, Principal, PrincipalKind};
+use harw_types::{IngressSurface, PermissionTier, Principal, PrincipalKind, SessionId};
 
 /// Art eines durablen Jobs aus Sicht der Runtime.
 ///
@@ -121,40 +124,84 @@ pub(crate) fn job_sandbox(entry: JobEntry, project_root: &Path) -> Result<Sandbo
     .map_err(|error| error.to_string())
 }
 
-/// Montiert die Runtime eines Jobs über `crate::runtime_entry::build_assembly`.
+/// Eingaben der Runtime-Montage eines Jobs (CONTRACTS-W2d2.md §1.3).
 ///
 /// # Description
+/// Bündelt alles, was [`job_assembly`] braucht, damit die Montage genau eine
+/// Aufrufstelle mit benannten Feldern hat (statt einer langen Parameterliste).
+pub(crate) struct JobAssemblyInputs<'a> {
+    /// Job-Art; bestimmt den Einstieg ([`JobEntry::entry_kind`]).
+    pub(crate) entry: JobEntry,
+    /// Harness-Home (`--home` bzw. `HARW_HOME`).
+    pub(crate) home: &'a Path,
+    /// Arbeitsverzeichnis des Jobs (Projekterkennung der Montage).
+    pub(crate) cwd: &'a Path,
+    /// Principal aus [`job_principal`].
+    pub(crate) principal: Principal,
+    /// Wurzel-Session-id; der Worker übergibt `durable-job-<work id>`.
+    pub(crate) session_id: SessionId,
+    /// Durabler Verlaufsspeicher des Jobs.
+    pub(crate) state_store: Arc<dyn StateStore>,
+    /// Job-Speicher des Workers.
+    pub(crate) job_store: Arc<JobStore>,
+    /// Provider des Jobs (ggf. budgetiert); wird unverändert übernommen.
+    pub(crate) model: Arc<dyn ModelProvider>,
+    /// Verengung von Profil, Identität, Rechten und Workspace-Root (R0-F); `Some` nur für
+    /// Plan-Knoten.
+    pub(crate) narrowing: Option<RuntimeNarrowing>,
+}
+
+/// Montiert die Runtime eines Jobs direkt über [`RuntimeAssembly::builder`].
+///
+/// # Description
+/// Spec: [`crate::runtime_entry::runtime_spec`] mit dem Einstieg der Job-Art.
 /// Speicher: `state_store`, `job_store: Some(..)`, keine durablen Freigaben.
 /// Modell: der vom Worker bereits gebaute Provider ([`ModelSource::Override`]).
+/// Wurzel-Session-id: fest `inputs.session_id` — der Worker muss dieselbe id an
+/// `RuntimeAssembly::new_root_session` geben. Verengung: nur wenn
+/// `inputs.narrowing` gesetzt ist (Bau-Semantik fail-closed in `harw-runtime`).
 /// Keine `session_events`: beide Job-Profile haben `SpawnerPolicy::None`
-/// (`harw-runtime/src/spec.rs`), die Montage verlangt Events nur für
+/// (`harw-runtime/src/spec.rs`), der Bau verlangt Events nur für
 /// `SpawnerPolicy::BuiltinRoles`.
 ///
 /// # Arguments
-/// - `entry`: Job-Art (bestimmt den Einstieg).
-/// - `home`, `cwd`: Harness-Home und Arbeitsverzeichnis des Jobs.
-/// - `principal`: Principal aus [`job_principal`].
-/// - `state_store`, `job_store`: durable Speicher des Workers.
-/// - `model`: Provider des Jobs (ggf. budgetiert).
+/// - `inputs` ([`JobAssemblyInputs`]): alle Montage-Eingaben; wird verbraucht.
+///
+/// # Returns
+/// Die montierte [`RuntimeAssembly`].
 ///
 /// # Errors
-/// Jeder Montagefehler von `build_assembly` als `String`.
-pub(crate) fn job_assembly(
-    entry: JobEntry,
-    home: &Path,
-    cwd: &Path,
-    principal: Principal,
-    state_store: Arc<dyn StateStore>,
-    job_store: Arc<JobStore>,
-    model: Arc<dyn ModelProvider>,
-) -> Result<RuntimeAssembly, String> {
+/// Die `Display`-Form jedes `RuntimeError` des Baus (Konfiguration, Vertrauen,
+/// Projekterkennung, Sandbox, Registry/Verengung, Provider, Spawner).
+///
+/// # Concurrency
+/// Synchron; liest Konfiguration und Projekt vom Dateisystem.
+pub(crate) fn job_assembly(inputs: JobAssemblyInputs<'_>) -> Result<RuntimeAssembly, String> {
+    let JobAssemblyInputs {
+        entry,
+        home,
+        cwd,
+        principal,
+        session_id,
+        state_store,
+        job_store,
+        model,
+        narrowing,
+    } = inputs;
     let spec = crate::runtime_entry::runtime_spec(entry.entry_kind(), home, cwd, principal);
     let stores = RuntimeStores {
         state_store,
         job_store: Some(job_store),
         approval_store: None,
     };
-    crate::runtime_entry::build_assembly(spec, ModelSource::Override(model), stores, None)
+    let mut builder = RuntimeAssembly::builder(spec)
+        .model(ModelSource::Override(model))
+        .stores(stores)
+        .root_session_id(session_id);
+    if let Some(narrowing) = narrowing {
+        builder = builder.narrowing(narrowing);
+    }
+    builder.build().map_err(|error| error.to_string())
 }
 
 /// Sammelt die ids aller konfigurierten MCP-Principals.
@@ -176,23 +223,6 @@ pub(crate) fn configured_principal_ids(config: &ResolvedConfig) -> BTreeSet<Stri
         .iter()
         .map(|principal| principal.id.clone())
         .collect()
-}
-
-/// Prüft, ob `submitter_id` ein aktuell konfigurierter MCP-Principal ist.
-///
-/// # Description
-/// Exakter Vergleich ohne Normalisierung (kein Trimmen, keine
-/// Groß-/Kleinschreibungs-Faltung). Eine leere id ist nie konfiguriert.
-/// Schließt die Restlücke aus `ledger/W1/W1-13.md` §1.
-#[must_use]
-pub(crate) fn submitter_is_configured(config: &ResolvedConfig, submitter_id: &str) -> bool {
-    !submitter_id.is_empty()
-        && config
-            .harness
-            .mcp_listener
-            .principals
-            .iter()
-            .any(|principal| principal.id == submitter_id)
 }
 
 #[cfg(test)]
@@ -284,13 +314,31 @@ mod tests {
     }
 
     #[test]
-    fn test_submitter_is_configured_rejects_unknown() {
-        let config = config_with_principals(&["client-7"]);
-        assert!(submitter_is_configured(&config, "client-7"));
-        assert!(!submitter_is_configured(&config, "client-8"));
-        assert!(!submitter_is_configured(&config, "client-7 "));
-        assert!(!submitter_is_configured(&config, "CLIENT-7"));
-        assert!(!submitter_is_configured(&config, ""));
-        assert!(!submitter_is_configured(&ResolvedConfig::default(), "client-7"));
+    fn test_job_assembly_prompt_uses_given_session_id_and_no_tools() {
+        let home = tempfile::tempdir().expect("test: home tempdir");
+        let cwd = tempfile::tempdir().expect("test: cwd tempdir");
+        let jobs = tempfile::tempdir().expect("test: job store tempdir");
+        harw_home::ensure_home(home.path()).expect("test: scaffold home");
+        let session_id = SessionId::from_str("durable-job-assembly-test");
+
+        let assembly = job_assembly(JobAssemblyInputs {
+            entry: JobEntry::Prompt,
+            home: home.path(),
+            cwd: cwd.path(),
+            principal: job_principal("client-7"),
+            session_id: session_id.clone(),
+            state_store: Arc::new(harw_core::InMemoryStateStore::new()),
+            job_store: Arc::new(JobStore::new(jobs.path())),
+            model: Arc::new(harw_core::EchoModelProvider::new("x")),
+            narrowing: None,
+        })
+        .expect("test: prompt job assembly builds");
+
+        assert_eq!(assembly.root_session_id(), &session_id);
+        assert_eq!(assembly.spec().entry, EntryKind::JobPrompt);
+        assert!(assembly.rights_snapshot().tools.is_empty());
+        assert_eq!(assembly.sandbox().permissions().iter().count(), 0);
+        assert!(assembly.job_store().is_some());
+        assert_eq!(assembly.spawn_context().approval_actor, None);
     }
 }

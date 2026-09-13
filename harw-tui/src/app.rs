@@ -4,19 +4,23 @@
 //!
 //! ## Verantwortung
 //!
-//! Dieses Modul besitzt den interaktiven Chat-Loop. Es baut eine
-//! [`harw_core::AgentSession`] mit dem Bootstrap-Turn-Loop
-//! ([`harw_core::run_turn`]) und betreibt einen **asynchronen**
+//! Dieses Modul besitzt den interaktiven Chat-Loop (`run_loop`) und den
+//! Renderer-Zustand ([`ChatApp`]). Es **montiert keine Laufzeit**: Session,
+//! Registry, Sandbox, Spawn-Kontext, Freigabekette und Dienste baut die
+//! gemeinsame Runtime-Montage ([`harw_runtime::RuntimeAssembly`]); die
+//! TUI-Composition-Root (`crate::runtime_root`, `run_tui`) verdrahtet sie mit
+//! diesem Modul (W2d-2, CONTRACTS-W2d2 §1.2). Der Loop treibt Turns über
+//! [`harw_core::run_turn`] und betreibt einen **asynchronen**
 //! `tokio::select!`-Event-Loop über drei Quellen (Spec-Abschnitt 2.1):
 //! - Terminal-Eingaben (`TuiEvent`) von einem blockierenden
-//!   Reader-Thread (`spawn_input_reader`),
+//!   Reader-Thread (`crate::input_reader::spawn_input_reader`),
 //! - Anwendungsereignisse (`HarwEvent`) vom internen Bus,
-//! - Frame-Anforderungen (`frame_requester`), koalesziert von einem
-//!   Scheduler-Task, der `TuiEvent::Draw` einspeist.
+//! - Frame-Anforderungen (`frame_requester`), koalesziert von
+//!   `frame_scheduler`, der `TuiEvent::Draw` einspeist.
 //!
 //! - Terminal-Setup (Raw-Mode + Bracketed-Paste, **Alternate-Screen**) hinter
-//!   einem RAII-Guard, der den Terminalzustand bei *jedem* Exit-Pfad (Fehler,
-//!   Panic, sauberer Abbruch) zurückstellt.
+//!   einem RAII-Guard (`TerminalGuard`), der den Terminalzustand bei *jedem*
+//!   Exit-Pfad (Fehler, Panic, sauberer Abbruch) zurückstellt.
 //! - Verlauf wird intern in `ChatApp::cells` gespeichert und über einen
 //!   scrollbaren `Paragraph`-Widget im Fullscreen-Layout gerendert. Kein
 //!   `insert_before` / Terminal-Scrollback.
@@ -26,8 +30,20 @@
 //!   Tastensteuerung liegt in `handle_key`, das ausschließlich Zustand mutiert
 //!   und `HarwEvent`s emittiert (testbar ohne Terminal).
 //! - Da [`harw_core::ModelProvider`] kein Token-Streaming anbietet, wird die
-//!   Antwort nach dem Turn **simuliert gestreamt**: der Volltext läuft durch
-//!   einen `StreamCollector` und wird zeilenweise, frame-getaktet, enthüllt.
+//!   Antwort nach dem Turn **simuliert gestreamt**.
+//!
+//! ## Slash-Kommandos und `/tools`
+//! - `/command`-Zeilen laufen über
+//!   [`crate::command_exec::execute_command_as`]. Die Berechtigungsstufe kommt
+//!   aus dem Principal der Montage ([`crate::runtime_commands::caller_tier`]),
+//!   die Dienste aus ihrer Slash-Fläche
+//!   ([`crate::runtime_commands::slash_service_map`]) — erst nach
+//!   erfolgreicher Admission gebaut. Ohne Montage ([`ChatApp::with_runtime`]
+//!   nicht aufgerufen) antwortet der Loop mit "Fehler: keine Runtime-Montage".
+//! - `/tools` läuft lokal über
+//!   [`crate::tools_command::dispatch_tools_command_bounded`] und kann die
+//!   Decke der Session (`AgentSession::mode_ceiling`, Basis ∩ Modus) nie
+//!   erweitern.
 //!
 //! ## Pausierte Turns (AP W5-03)
 //! Ein Turn, den der Kern an einer Freigabe ([`TurnOutcome::AwaitingApproval`])
@@ -35,38 +51,49 @@
 //! **zu Ende geführt**, nicht abgebrochen: `drive_pauses_to_completion`
 //! übergibt das Ergebnis an [`crate::approval::ApprovalDriver::drive_to_completion`]
 //! und pollt dabei den Fragekanal, die Tastatur und die Turn-Ereignisse weiter,
-//! während der Spinner läuft. Der `Arc<TuiApprovalHandler>` liegt dabei
-//! gleichzeitig in der [`ExtensionRegistry`] der Session und im Treiber; der
-//! Spawn-Kontext trägt zwingend einen `ApprovalActor`.
+//! während der Spinner läuft. Derselbe `Arc<TuiApprovalHandler>` liegt in der
+//! Freigabekette der Wurzel-Session und im Treiber; beides richtet die
+//! Composition-Root ein.
 //!
 //! ## Schlüsseltypen
 //! - [`ChatApp`] — Zustand des Renderers (Eingabepuffer, Verlauf-Log, Popup, Scroll).
 //! - [`Role`] — Rolle einer Chat-Nachricht (User, Assistant, System).
 //! - [`LineAction`] — TTY-freies Ergebnis der Zeilen-Klassifizierung.
-//! - [`TuiPlanServices`] — optionale Plan-/Ziel-Stores der Composition-Root.
+//! - [`TuiPlanServices`] — lesende Sicht auf Plan-/Ziel-Stores der Montage.
+//! - [`TuiRunOutcome`] / [`ResumeSessionSelector`] — Ausgang des Loops und
+//!   `/resume`-Auswahl.
 //! - [`TuiError`] — Fehlertyp dieses Moduls.
-//! - `TerminalGuard` — RAII-Guard für Raw-Mode und Alternate-Screen (privat).
+//! - `TerminalGuard` — RAII-Guard für Raw-Mode und Alternate-Screen (crate-intern).
 //! - `SharedHistoryCell` — Verlaufszelle, die nach dem Anhängen noch
 //!   fortgeschrieben werden kann (privat).
+//!
+//! ## Crate-interne Schnittstelle zu `runtime_root`
+//! `WELCOME`, `TerminalGuard::enter`, `frame_scheduler`, `run_loop`,
+//! `install_loaded_history`, `tui_error_from_approval_driver`,
+//! `ChatApp::push_lines`, `ChatApp::with_runtime` / `ChatApp::runtime` sind
+//! `pub(crate)`.
 //!
 //! ## Nebenläufigkeit
 //! Der asynchrone Loop läuft auf einem `current_thread`-Tokio-Runtime.
 //! Ein OS-Thread liest Tastatur-Ereignisse blockierend; ein Tokio-Task
 //! koalesziert Frame-Anforderungen. Alle drei kommunizieren über
-//! unbounded MPSC-Kanäle.
+//! unbounded MPSC-Kanäle. Die Montage wird als `Arc` geteilt und nur lesend
+//! benutzt.
 //!
 //! ## Fehler
 //! Alle Fehler dieses Moduls werden als [`TuiError`] ausgedrückt.
 //!
 //! ## Beispiele
 //! ```ignore
-//! use harw_tui::app::run_chat_tui;
-//! // Provider wird aus dem Crate-Setup bezogen.
-//! // run_chat_tui(provider)?;
+//! use harw_tui::app::{ChatApp, Role};
+//! // adapters/sandbox/session_id und die Montage liefert `crate::runtime_root`.
+//! let mut app = ChatApp::new(adapters, sandbox, session_id).with_runtime(assembly);
+//! app.push_line(Role::System, "Hinweis");
+//! assert_eq!(app.cells_len(), 1);
 //! ```
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -82,40 +109,29 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use harw_agent_dsl::{ExecutableAgentIr, roles::AgentRoleId};
 use harw_core::{
-    AgentSession, ChildLimits, ChildRegistryFactory, ConversationHistory, CoreError,
-    InteractionMode, ManagedAgentSpawner, ModelError, ModelMessage, ModelProvider, SessionManager,
-    SpawnContext, StateStore, TurnInput, TurnOutcome, run_turn,
+    AgentSession, ConversationHistory, CoreError, InteractionMode, ManagedAgentSpawner,
+    ModelError, ModelMessage, TurnInput, TurnOutcome, run_turn,
 };
 use harw_extension_api::registry::ContextProviderRegistrationError;
-use harw_extension_api::{AgentSpawnError, ApprovalHandler, ExtensionRegistry, SpawnInput};
-use harw_observe::TraceContext;
-use harw_operations::adapter::{CommandAdapter, ModelToolProvider};
-use harw_operations::registry::OperationRegistry;
-use harw_operations::{OpContext, PermissionTier, ServiceMap, SharedSessionController};
+use harw_operations::adapter::CommandAdapter;
 use harw_plan::PlanStore;
 use harw_plan::goal::{GoalStore, evaluate_goal};
 use harw_protocol::events::{SessionEvent, TurnEvent};
 use harw_protocol::items::{ContentPart, TurnItem};
-use harw_registry_defaults::assemble_default_registry;
-use harw_registry_defaults::profile::{IdentityOverrides, profile_for_role, role_names};
-use harw_sandbox::{SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+use harw_sandbox::SandboxSpec;
+use harw_types::SessionId;
 use harw_types::TokenUsage;
-use harw_types::{AgentRole, ApprovalActor, SessionId, TenantId, WorkspaceId};
-use uuid::Uuid;
 
 use crate::CommandRegistry;
 use crate::approval::{
     ApprovalDriver, ApprovalDriverError, ApprovalPrompt, ApprovalPromptReceiver, ChildTurnDriver,
-    TuiApprovalHandler,
 };
 use crate::chat_scroll::{ChatScroll, ScrollAction};
-use crate::command_exec::{CommandServices, execute_command_as};
+use crate::command_exec::execute_command_as;
 use crate::command_popup::{CommandPopup, PopupAction};
-use crate::events::{HarwEvent, HarwEventSender, harw_event_channel};
-use crate::frame_requester::{FrameRequester, MIN_FRAME_INTERVAL, frame_channel};
-use crate::gateway::ChatGateway;
+use crate::events::{HarwEvent, HarwEventSender};
+use crate::frame_requester::{FrameRequester, MIN_FRAME_INTERVAL};
 use crate::history_cell::{
     ApprovalPromptCell, AssistantHistoryCell, GoalCell, HistoryCell, PlainHistoryCell,
     PlanGraphCell, ReasoningHistoryCell, SubAgentCell, SubAgentStatus, ToolCallHistoryCell,
@@ -123,7 +139,11 @@ use crate::history_cell::{
 };
 use crate::input_editor::{InputAction, InputEditor};
 use crate::input_history::InputHistoryStore;
-use crate::input_reader::spawn_input_reader;
+use crate::runtime_commands;
+// Nur Tests (über `use super::*`) rufen die in `runtime_root` gewanderte
+// Coercion-Hilfe noch unqualifiziert auf; Prod in app.rs nutzt sie nicht.
+#[cfg(test)]
+use crate::runtime_root::as_dyn_approval_handler;
 use crate::session_controller::TuiSessionController;
 use crate::spinner::Spinner;
 use crate::style;
@@ -133,14 +153,9 @@ use crate::tui_event::TuiEvent;
 const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 
 /// Willkommens-Systemzeile beim Start des Chats.
-const WELCOME: &str = "Willkommen. Tippe eine Nachricht — Enter zum Senden.";
+pub(crate) const WELCOME: &str = "Willkommen. Tippe eine Nachricht — Enter zum Senden.";
 
 const NON_TEXT_CONTENT_PLACEHOLDER: &str = "[non-text content]";
-
-/// Permission tier carried by the trusted local TUI actor for slash-command
-/// dispatch. This stays aligned with [`trusted_tui_spawn_context`], which
-/// identifies that actor as an `ApprovalActor::Operator`.
-const LOCAL_TUI_OPERATION_PERMISSION: PermissionTier = PermissionTier::Operator;
 
 /// Obergrenze der in einer [`ToolCallHistoryCell`] gezeigten Argument-Vorschau.
 const TOOL_ARGUMENTS_PREVIEW_CHARS: usize = 80;
@@ -271,10 +286,15 @@ impl TurnEventState {
 ///
 /// # Beschreibung
 /// Die TUI öffnet **niemals** selbst einen Plan-/Goal-Store: zwei nebenläufige
-/// Store-Instanzen auf demselben Verzeichnis wären ein Datenverlust-Risiko
-/// (dieselbe Begründung wie in `harw-cli/src/chat.rs::OneShotPlanServices`).
-/// Die Composition-Root baut die Dienste genau einmal und reicht sie über
-/// [`run_chat_tui_resumable_with_plan`] durch.
+/// Store-Instanzen auf demselben Verzeichnis wären ein Datenverlust-Risiko.
+/// Die Runtime-Montage ([`harw_runtime::RuntimeAssembly`]) hält die Dienste
+/// genau einmal ([`harw_runtime::PlanServices`]); dieser Typ ist nur die
+/// schmale, lesende Sicht des Renderers darauf und entsteht über
+/// `impl From<&harw_runtime::PlanServices>`.
+///
+/// Ziel-Kontext, zusätzliche Freigabe-Politiken und der Startmodus gehören
+/// nicht mehr hierher: sie werden in der Runtime-Montage verdrahtet
+/// (W2d-2, CONTRACTS-W2d2 §1.2).
 ///
 /// `None` an dieser Schnittstelle bedeutet: der Renderer zeigt Plan-Updates als
 /// einzeilige Systemmeldung statt als Graph und kann nach `/goal check` keinen
@@ -288,27 +308,24 @@ pub struct TuiPlanServices {
     pub plan_store: Arc<dyn PlanStore>,
     /// Der Goal-Store der aktiven Profilsitzung.
     pub goal_store: Arc<dyn GoalStore>,
-    /// Zusätzliche Kontext-Beitragende, die in **jeden** Turn dieser Session
-    /// einfließen sollen — insbesondere der Ziel-Kontext.
-    ///
-    /// Bewusst als `Arc<dyn ContextProvider>` und nicht als konkreter Typ:
-    /// `harw-tui` hängt nicht an `harw-plan-bridge` und soll es auch nicht.
-    /// Die Composition-Root kennt beide Seiten und baut den Provider; die
-    /// Oberfläche hängt ihn nur noch in ihre Registry.
-    ///
-    /// Ohne diesen Weg überlebt ein per `--goal` gesetztes Ziel zwar im Store,
-    /// erreicht aber keinen einzigen Modell-Turn.
-    pub context_providers: Vec<Arc<dyn harw_extension_api::ContextProvider>>,
-    /// Zusätzliche Freigabe-Politiken, die **hinter** die bestehenden gehängt
-    /// werden (etwa die aus `[policy] require_approval_for` kompilierte).
-    ///
-    /// Anhängen kann nie lockern: `harw_core::turn_loop::check_approval` nimmt
-    /// die erste Nicht-`Allow`-Entscheidung, eine zusätzliche Politik kann also
-    /// nur weitere Werkzeuge unter Vorbehalt stellen.
-    pub approval_handlers: Vec<Arc<dyn harw_extension_api::ApprovalHandler>>,
-    /// Interaktionsmodus, mit dem die Session startet (aus `--mode` bzw.
-    /// `[mode] default`); `None` behält den Session-Default.
-    pub initial_mode: Option<harw_core::InteractionMode>,
+}
+
+/// Übernimmt Plan- und Ziel-Store aus den Plan-Diensten der Runtime-Montage.
+///
+/// # Beschreibung
+/// Klont nur die beiden `Arc`-Zeiger (`plan` → `plan_store`,
+/// `goal` → `goal_store`); es entsteht kein zweiter Store. Befund-Speicher und
+/// Plan-Konfiguration braucht der Renderer nicht.
+///
+/// # Nebenläufigkeit
+/// Rein lesend; zwei atomare Referenzzähler-Erhöhungen.
+impl From<&harw_runtime::PlanServices> for TuiPlanServices {
+    fn from(services: &harw_runtime::PlanServices) -> Self {
+        Self {
+            plan_store: Arc::clone(&services.plan),
+            goal_store: Arc::clone(&services.goal),
+        }
+    }
 }
 
 /// Handgeschriebene `Debug`-Implementierung — die Store-Traits leiten kein
@@ -347,52 +364,6 @@ pub trait ResumeSessionSelector {
     fn resolve_session(&self, selector: &str) -> Result<SessionId, String>;
 }
 
-/// Local gateway with a replaceable session for the interactive `/resume`
-/// path. `crate::gateway::LocalGateway` intentionally keeps its fields private
-/// and exposes no session replacement operation, so this small adapter owns
-/// that one additional lifecycle operation without widening the shared trait.
-struct ResumableGateway {
-    session: AgentSession,
-    store: Arc<dyn StateStore>,
-    model: Arc<dyn ModelProvider>,
-}
-
-impl ResumableGateway {
-    fn new(
-        session: AgentSession,
-        store: Arc<dyn StateStore>,
-        model: Arc<dyn ModelProvider>,
-    ) -> Self {
-        Self {
-            session,
-            store,
-            model,
-        }
-    }
-
-    fn replace_session(&mut self, session: AgentSession) {
-        self.session = session;
-    }
-}
-
-impl crate::gateway::ChatGateway for ResumableGateway {
-    fn session_mut(&mut self) -> &mut AgentSession {
-        &mut self.session
-    }
-
-    fn store(&self) -> &dyn StateStore {
-        self.store.as_ref()
-    }
-
-    fn model(&self) -> &dyn ModelProvider {
-        self.model.as_ref()
-    }
-
-    fn borrow_turn_ctx(&mut self) -> (&mut AgentSession, &dyn StateStore, &dyn ModelProvider) {
-        (&mut self.session, self.store.as_ref(), self.model.as_ref())
-    }
-}
-
 /// Rolle, unter der eine Chat-Zelle angehängt wird.
 ///
 /// # Beschreibung
@@ -402,7 +373,7 @@ impl crate::gateway::ChatGateway for ResumableGateway {
 /// # Beispiele
 /// ```ignore
 /// use harw_tui::app::{ChatApp, Role};
-/// // adapters/sandbox/session_id werden real in `run_chat_tui` gebaut.
+/// // adapters/sandbox/session_id baut real `crate::runtime_root`.
 /// let mut app = ChatApp::new(Vec::new(), sandbox, session_id);
 /// app.push_line(Role::User, "Hallo");
 /// app.push_line(Role::Assistant, "Antwort");
@@ -444,7 +415,7 @@ pub enum LineAction {
     Chat(String),
     /// Eine `/command`-Zeile (oder `!`-Shell/Note/Mention) asynchron über die
     /// Operation-Adapter-Pipeline ausführen ([`HarwEvent::Command`] →
-    /// [`crate::command_exec::execute_command`]); enthält die unveränderte
+    /// [`crate::command_exec::execute_command_as`]); enthält die unveränderte
     /// Rohzeile. Die lokale [`CommandRegistry`] wird davon unabhängig
     /// weiterhin für die Popup-Autocomplete-Anzeige verwendet.
     Command(String),
@@ -506,7 +477,7 @@ pub fn classify_line(line: &str) -> LineAction {
 /// Zusätzlich hält `ChatApp` die Operation-Adapter-Pipeline
 /// ([`CommandAdapter`], [`SandboxSpec`], [`SessionId`]), über die abgeschickte
 /// `/command`-Zeilen asynchron dispatcht werden ([`HarwEvent::Command`] →
-/// [`crate::command_exec::execute_command`]). Die separate `command_registry`
+/// [`crate::command_exec::execute_command_as`]). Die separate `command_registry`
 /// bleibt unabhängig davon ausschließlich für die Popup-Autocomplete-Anzeige
 /// zuständig.
 ///
@@ -517,7 +488,7 @@ pub fn classify_line(line: &str) -> LineAction {
 /// # Beispiele
 /// ```ignore
 /// use harw_tui::app::{ChatApp, Role};
-/// // adapters/sandbox/session_id werden real in `run_chat_tui` gebaut.
+/// // adapters/sandbox/session_id baut real `crate::runtime_root`.
 /// let mut app = ChatApp::new(Vec::new(), sandbox, session_id);
 /// app.push_line(Role::User, "Frage");
 /// assert_eq!(app.cells_len(), 1);
@@ -551,26 +522,26 @@ pub struct ChatApp {
     /// Stabile Session-ID, die in jeden [`harw_operations::OpContext`] dieser
     /// Session einfließt.
     session_id: SessionId,
-    /// Optionales Memory-Backend, wird bei jedem `/command`-Dispatch als
-    /// `Arc<dyn harw_memory::Memory>`-Service in die `ServiceMap` gelegt.
-    /// `None` bedeutet: `/memory`-Ops liefern `NotAvailable`.
+    /// Optionales Memory-Backend für die Korrektur-Erkennung
+    /// (`harw_memory::detect_correction`) im Chat-Pfad. Die Slash-Dienste
+    /// (inklusive Memory) stammen dagegen aus der Runtime-Montage.
     memory: Option<std::sync::Arc<dyn harw_memory::Memory>>,
-    /// Exact resolved configuration snapshot used to build this runtime.
-    runtime_config: Option<Arc<harw_config::ResolvedConfig>>,
-    /// Durable job store shared by job-related slash commands.
-    job_store: Option<Arc<harw_session_store::JobStore>>,
+    /// Die Runtime-Montage dieses Laufs. Liefert Principal (Berechtigungsstufe
+    /// für Slash-Kommandos) und die Slash-[`harw_operations::ServiceMap`]. `None` bedeutet:
+    /// `/command`-Zeilen werden mit "Fehler: keine Runtime-Montage" beantwortet.
+    runtime: Option<Arc<harw_runtime::RuntimeAssembly>>,
     /// Erkannter Projekt-Root, der im Chat-Header angezeigt werden soll.
     /// Leer-String wenn kein Root ermittelt werden konnte (Fallback-Pfad).
     project_root: String,
     /// Langlebiger Session-Controller — hält `reasoning_effort`, `active_model`
-    /// und `active_provider` über mehrere Turns hinweg. Wird in jeden
-    /// `execute_command`-Aufruf als `SharedSessionController` eingetragen und
-    /// zwischen Turns via `apply_pending_controller_state` auf die
+    /// und `active_provider` über mehrere Turns hinweg und wird zwischen Turns
+    /// via `apply_pending_controller_state` auf die
     /// [`harw_core::AgentSession`] angewendet.
     ///
-    /// Ein `Arc::clone` dieses Handles wird in jedem [`build_services`][crate::command_exec]-Aufruf
-    /// in die `ServiceMap` gelegt, sodass `/effort`- und `/model`-Ops denselben
-    /// Zustand sehen wie der Renderer.
+    /// Die Composition-Root setzt über `with_session_controller` denselben
+    /// Controller, den die Runtime-Montage in ihre Slash-/Modell-Dienste legt,
+    /// sodass `/effort`-, `/model`- und `/mode`-Ops denselben Zustand sehen wie
+    /// der Renderer.
     session_controller: Arc<TuiSessionController>,
     /// Letzte in `draw_viewport` berechnete Gesamtzeilenzahl der History
     /// (nach Wrapping bei aktueller Terminalbreite). Wird von `handle_key`
@@ -618,6 +589,7 @@ impl std::fmt::Debug for ChatApp {
             .field("active_mode", &self.active_mode)
             .field("has_managed_spawner", &self.managed_spawner.is_some())
             .field("has_plan_services", &self.plan_services.is_some())
+            .field("has_runtime", &self.runtime.is_some())
             .finish()
     }
 }
@@ -632,8 +604,8 @@ impl ChatApp {
     /// (ausschließlich für die Popup-Autocomplete-Anzeige, SLICE 5). Das Popup
     /// ist initial geschlossen. Das Theme wird via `style::detect_theme` aus
     /// der Prozessumgebung bestimmt (SLICE 8). `adapters`, `sandbox` und
-    /// `session_id` werden vom Aufrufer (`run_chat_tui`) übernommen und bei
-    /// jedem `/command`-Dispatch verwendet.
+    /// `session_id` werden von der Composition-Root (`crate::runtime_root`)
+    /// übernommen und bei jedem `/command`-Dispatch verwendet.
     ///
     /// # Argumente
     /// - `adapters` (`Vec<CommandAdapter>`): Alle `/`-Command-Adapter, gebaut
@@ -649,7 +621,7 @@ impl ChatApp {
     /// # Beispiele
     /// ```ignore
     /// use harw_tui::app::ChatApp;
-    /// // adapters/sandbox/session_id werden real in `run_chat_tui` gebaut.
+    /// // adapters/sandbox/session_id baut real `crate::runtime_root`.
     /// let app = ChatApp::new(Vec::new(), sandbox, session_id);
     /// assert!(app.input().is_empty());
     /// ```
@@ -661,9 +633,9 @@ impl ChatApp {
     /// Wie [`Self::new`], zusätzlich mit Memory-Backend.
     ///
     /// # Beschreibung
-    /// Registriert `memory` als `Arc<dyn harw_memory::Memory>`-Service in jedem
-    /// via [`crate::command_exec::execute_command`] aufgebauten `OpContext`.
-    /// So dispatcht `/memory list`/`stats`/`recall`/`record`/`maintain` real.
+    /// Hinterlegt `memory` für die Korrektur-Erkennung im Chat-Pfad. Die
+    /// Dienste der `/memory`-Kommandos kommen aus der Runtime-Montage
+    /// ([`Self::with_runtime`]).
     #[must_use]
     pub fn with_memory(
         adapters: Vec<CommandAdapter>,
@@ -693,8 +665,7 @@ impl ChatApp {
             sandbox,
             session_id,
             memory,
-            runtime_config: None,
-            job_store: None,
+            runtime: None,
             project_root: String::new(),
             session_controller: Arc::new(TuiSessionController::new()),
             last_history_total_lines: Cell::new(0),
@@ -713,26 +684,36 @@ impl ChatApp {
         self
     }
 
+    /// Hinterlegt die Runtime-Montage dieses Laufs.
+    ///
+    /// # Beschreibung
+    /// Aus der Montage bezieht `run_loop` für jede `/command`-Zeile die
+    /// Berechtigungsstufe des Aufrufers
+    /// ([`crate::runtime_commands::caller_tier`] über
+    /// [`harw_runtime::RuntimeAssembly::principal`]) und die Slash-Dienste
+    /// ([`crate::runtime_commands::slash_service_map`] über
+    /// [`harw_runtime::RuntimeAssembly::services`]).
+    ///
+    /// # Argumente
+    /// - `assembly` (`Arc<harw_runtime::RuntimeAssembly>`): geteilte Montage;
+    ///   Besitz des `Arc` geht über.
+    ///
+    /// # Rückgabe
+    /// `Self` für Builder-Verkettung.
     #[must_use]
-    pub fn with_runtime_config(mut self, config: Arc<harw_config::ResolvedConfig>) -> Self {
-        self.runtime_config = Some(config);
+    pub(crate) fn with_runtime(mut self, assembly: Arc<harw_runtime::RuntimeAssembly>) -> Self {
+        self.runtime = Some(assembly);
         self
     }
 
+    /// Gibt die hinterlegte Runtime-Montage zurück.
+    ///
+    /// # Rückgabe
+    /// `Option<&Arc<harw_runtime::RuntimeAssembly>>` — `None`, solange
+    /// [`Self::with_runtime`] nicht aufgerufen wurde.
     #[must_use]
-    pub(crate) fn runtime_config(&self) -> Option<&Arc<harw_config::ResolvedConfig>> {
-        self.runtime_config.as_ref()
-    }
-
-    #[must_use]
-    pub fn with_job_store(mut self, store: Arc<harw_session_store::JobStore>) -> Self {
-        self.job_store = Some(store);
-        self
-    }
-
-    #[must_use]
-    pub(crate) fn job_store(&self) -> Option<&Arc<harw_session_store::JobStore>> {
-        self.job_store.as_ref()
+    pub(crate) fn runtime(&self) -> Option<&Arc<harw_runtime::RuntimeAssembly>> {
+        self.runtime.as_ref()
     }
 
     /// Hinterlegt die Kind-Spawn-Autorität dieser Session.
@@ -832,7 +813,8 @@ impl ChatApp {
     /// Stores the detected project root path for display in the chat header.
     ///
     /// # Description
-    /// Called from `run_chat_tui` after `assemble_default_registry` succeeds.
+    /// Called from the composition root (`crate::runtime_root`) with the
+    /// project root of the runtime assembly.
     /// The string is built from `project.project_root.display()` — a
     /// platform-appropriate path string. An empty string means no root was
     /// detected (graceful degradation).
@@ -863,19 +845,6 @@ impl ChatApp {
     #[must_use]
     pub(crate) fn memory(&self) -> Option<&std::sync::Arc<dyn harw_memory::Memory>> {
         self.memory.as_ref()
-    }
-
-    /// Gibt eine Arc-Referenz auf den langlebigen Session-Controller zurück.
-    ///
-    /// # Beschreibung
-    /// Wird von `execute_command` und `build_services` in `command_exec.rs`
-    /// verwendet, um den langen Controller in die `ServiceMap` zu legen.
-    ///
-    /// # Rückgabe
-    /// `&Arc<TuiSessionController>` — gemeinsamer Zustand über alle Turns.
-    #[must_use]
-    pub(crate) fn session_controller(&self) -> &Arc<TuiSessionController> {
-        &self.session_controller
     }
 
     /// Gibt die zuletzt in `draw_viewport` berechnete Gesamtzeilenzahl der
@@ -1017,7 +986,7 @@ impl ChatApp {
     ///
     /// # Argumente
     /// - `lines` (`Vec<Line<'static>>`): Vorgerenderte Zeilen der Zelle.
-    fn push_lines(&mut self, lines: Vec<Line<'static>>) {
+    pub(crate) fn push_lines(&mut self, lines: Vec<Line<'static>>) {
         self.cells.push(Box::new(PlainHistoryCell { lines }));
         self.scroll.on_new_content();
     }
@@ -1110,7 +1079,7 @@ impl ChatApp {
 ///
 /// # Nebenläufigkeit
 /// Nicht thread-sicher; ausschließlich vom Renderer-Thread verwendet.
-struct TerminalGuard {
+pub(crate) struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
 
@@ -1127,7 +1096,7 @@ impl TerminalGuard {
     ///
     /// # Fehler
     /// [`TuiError::Io`], wenn Terminal-Setup fehlschlägt.
-    fn enter() -> Result<Self, TuiError> {
+    pub(crate) fn enter() -> Result<Self, TuiError> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         if let Err(error) = crossterm::execute!(
@@ -1187,62 +1156,6 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn session_id_for_canonical_project_root(project_root: &std::path::Path) -> SessionId {
-    // Stable FNV-1a projection keeps filesystem paths out of session IDs while
-    // preserving deterministic restart identity for the same canonical root.
-    let mut hash = 0xcbf29ce484222325_u64;
-    for byte in project_root.as_os_str().as_encoded_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    SessionId::from_str(format!("local-tui-{hash:016x}"))
-}
-
-/// Erzeugt eine frische, projektbezogene Session-ID.
-///
-/// # Beschreibung
-/// Der Projekt-Hash aus [`session_id_for_canonical_project_root`] bildet den
-/// Stamm, damit `/resume` die Sitzungen eines Projekts weiterhin erkennt. Der
-/// angehängte Startzeitpunkt in Nanosekunden macht jeden Start unterscheidbar.
-/// Fällt die Systemuhr hinter die Epoche zurück, wird `0` verwendet — dann
-/// kollidieren zwei Starts derselben Nanosekunde, was den Verlauf zusammenführt
-/// statt etwas zu verlieren.
-///
-/// # Argumente
-/// - `project_root` (`&Path`): kanonischer Projekt-Root.
-///
-/// # Rückgabe
-/// Eine [`SessionId`] der Form `local-tui-<projekt-hash>-<nanos>`.
-fn new_session_id(project_root: &std::path::Path) -> SessionId {
-    let project = session_id_for_canonical_project_root(project_root);
-    let started = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    SessionId::from_str(format!("{}-{started:x}", project.as_str()))
-}
-
-/// Wählt die Session-ID für diesen Start.
-///
-/// # Beschreibung
-/// Mit `--resume` (oder `/resume`) reicht der Aufrufer die gewünschte ID
-/// herein, und genau diese Sitzung wird fortgesetzt. Ohne eine solche Auswahl
-/// beginnt jeder Start eine **neue** Sitzung: eine feste, aus dem Projektpfad
-/// abgeleitete ID würde den Verlauf des letzten Laufs stillschweigend
-/// weiterführen, obwohl niemand darum gebeten hat.
-///
-/// # Argumente
-/// - `project_root` (`&Path`): kanonischer Projekt-Root.
-/// - `existing_session_id` (`Option<SessionId>`): ausdrücklich gewählte Sitzung.
-///
-/// # Rückgabe
-/// Die zu verwendende [`SessionId`].
-fn selected_session_id(
-    project_root: &std::path::Path,
-    existing_session_id: Option<SessionId>,
-) -> SessionId {
-    existing_session_id.unwrap_or_else(|| new_session_id(project_root))
-}
-
 fn resume_request(raw: &str) -> Option<TuiRunOutcome> {
     let mut words = raw.split_whitespace();
     if words.next()? != "/resume" {
@@ -1285,280 +1198,13 @@ fn hydrate_visible_history(app: &mut ChatApp, history: &ConversationHistory) {
     }
 }
 
-fn install_loaded_history(
+pub(crate) fn install_loaded_history(
     session: &mut AgentSession,
     app: &mut ChatApp,
     history: ConversationHistory,
 ) {
     hydrate_visible_history(app, &history);
     *session.history_mut() = history;
-}
-
-fn sandbox_for_project(
-    sandbox: &SandboxSpec,
-    project_root: &std::path::Path,
-) -> Result<SandboxSpec, String> {
-    let tenant = TenantId::from_str("local-tui");
-    let workspace = WorkspaceId::from_str("project");
-    let registry = WorkspaceRegistry::build(
-        project_root,
-        [WorkspaceRegistration {
-            tenant: tenant.clone(),
-            workspace: workspace.clone(),
-            root: project_root.to_path_buf(),
-        }],
-    )
-    .map_err(|error| format!("could not bind project workspace: {error}"))?;
-    let binding = registry
-        .resolve(&tenant, &workspace)
-        .map_err(|error| format!("could not resolve project workspace: {error}"))?;
-    Ok(SandboxSpec::from_resolved(
-        binding,
-        sandbox.permissions().clone(),
-    ))
-}
-
-/// Generates a fresh root trace for the local TUI session.
-///
-/// This call site is a root: a local TUI session has no parent whose trace it
-/// could inherit, so the `trace_id` that ties together the session's work
-/// originates here. Mirrors `harw-core`'s `new_span_id` random source
-/// (`harw-core/src/child_controller.rs`) instead of inventing a second one:
-/// `uuid::Uuid::new_v4` supplies the full 32 hex characters for `trace_id`, a
-/// second, independent draw supplies the first 16 for `span_id`. Both are
-/// already valid lowercase hex of the required length by construction, so
-/// [`TraceContext::new`] rejecting them is unreachable in practice — but
-/// [`trusted_tui_spawn_context`] is not fallible, so a rejection is logged
-/// and degrades to no trace rather than panicking.
-fn new_tui_root_trace() -> Option<TraceContext> {
-    let trace_id = Uuid::new_v4().simple().to_string();
-    let span_id = Uuid::new_v4().simple().to_string()[..16].to_owned();
-    match TraceContext::new(trace_id, span_id) {
-        Ok(trace) => Some(trace),
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "could not build root trace context for the local TUI session"
-            );
-            None
-        }
-    }
-}
-
-/// Baut die Wurzel-Kontext-Decke der lokalen TUI-Sitzung.
-///
-/// # Description
-/// Diese Sitzung hat keinen Elternteil, dessen bereits geschnittene Decke
-/// sie erben könnte — die Decke entsteht hier einmal, im selben Sinn wie
-/// [`new_tui_root_trace`] den Wurzel-Trace einmal erzeugt (siehe
-/// `harw_core::SpawnContext::ceiling` für die Vererbungsregel selbst).
-/// `max_trust` ist [`TrustClass::Instruction`] (der höchste Rang), damit
-/// kein Fragment allein wegen seiner Vertrauensklasse abgelehnt wird — ein
-/// lokaler TUI-Operator mit voller Sandbox-Autorität ist nicht weniger
-/// vertrauenswürdig als das restriktivste Kontextfragment.
-///
-/// Nur `harw_core::HISTORY_TAIL_SECTION` ist über die Crate-Grenzen hinweg
-/// als öffentliche Konstante erreichbar; Sektionsnamen anderer
-/// Kontext-Provider sind crate-privat. Die Wurzel-Decke umfasst deshalb
-/// vorerst nur `history.tail` — eine bewusste, dokumentierte Lücke.
-fn local_tui_root_context_ceiling() -> harw_context::ContextCeiling {
-    let history_tail = harw_context::SectionName::try_new(harw_core::HISTORY_TAIL_SECTION)
-        .expect("HISTORY_TAIL_SECTION is a valid section name by construction");
-    harw_context::ContextCeiling {
-        sections: [history_tail].into_iter().collect(),
-        max_trust: harw_context::TrustClass::Instruction,
-        budget: harw_context::ContextBudgetSpec {
-            total: harw_lens_types::BudgetSpec { total: 1_000_000 },
-            per_section: std::collections::BTreeMap::new(),
-        },
-    }
-}
-
-/// Builds the immutable child-spawn authority for the local TUI session.
-///
-/// The sandbox is supplied by the trusted runtime composition root after
-/// project binding. Model output and tool-call arguments never participate in
-/// constructing this context.
-fn trusted_tui_spawn_context(sandbox: &SandboxSpec) -> SpawnContext {
-    SpawnContext {
-        sandbox: sandbox.clone(),
-        suggestions: None,
-        capability_snapshot: None,
-        approval_actor: Some(ApprovalActor::Operator {
-            id: "local-tui".to_owned(),
-        }),
-        organizational_role: AgentRoleId::RootOrchestrator,
-        // Root: no parent exists whose trace could be inherited — see
-        // `new_tui_root_trace`.
-        trace: new_tui_root_trace(),
-        // Root: no parent exists whose already-cut ceiling could be
-        // inherited, so the ceiling is created here, once — see
-        // `local_tui_root_context_ceiling`.
-        ceiling: Some(local_tui_root_context_ceiling()),
-    }
-}
-
-fn assemble_tui_registry(
-    cwd: std::path::PathBuf,
-) -> Result<harw_registry_defaults::AssembledRegistry, TuiError> {
-    assemble_default_registry(cwd)
-        .map_err(|error| TuiError::Core(format!("could not assemble default registry: {error}")))
-}
-
-/// Hängt einen weiteren [`ApprovalHandler`] an eine bereits gebaute Registry an.
-///
-/// # Beschreibung
-/// AP W5-03, Bedingung 2: **derselbe** `Arc<TuiApprovalHandler>` muss in der
-/// Klont einen [`TuiApprovalHandler`]-Zeiger als Trait-Objekt.
-///
-/// # Beschreibung
-/// Die Umwandlung `Arc<TuiApprovalHandler>` → `Arc<dyn ApprovalHandler>` ist eine
-/// Unsized-Coercion und braucht eine eigene Stelle, an der sie stattfindet.
-/// `let x: Arc<dyn ApprovalHandler> = Arc::clone(&handler)` **compiliert nicht**:
-/// bei der UFCS-Form `Arc::clone` wird der Typparameter aus dem *erwarteten* Typ
-/// inferiert, Rust wählt also `T = dyn ApprovalHandler` und verlangt bereits ein
-/// `&Arc<dyn ApprovalHandler>` als Argument — die Coercion käme zu spät.
-///
-/// Bei der Methodensyntax `handler.clone()` steht `T` dagegen durch den Receiver
-/// fest; die Coercion geschieht beim Zurückgeben. Deshalb genau diese Form.
-///
-/// # Argumente
-/// - `handler` (`&Arc<TuiApprovalHandler>`): der geteilte Handler.
-///
-/// # Rückgabe
-/// Derselbe Handler als `Arc<dyn ApprovalHandler>` — **kein** zweiter Handler,
-/// nur ein zweiter Zeiger. Das ist Bedingung 2 aus `approval.rs`: Registry und
-/// Treiber müssen denselben Handler sehen, sonst fände der Treiber die
-/// Rückkanäle nicht und löste jede Frage als Ablehnung auf.
-fn as_dyn_approval_handler(handler: &Arc<TuiApprovalHandler>) -> Arc<dyn ApprovalHandler> {
-    handler.clone()
-}
-
-/// [`ExtensionRegistry`] und im [`ApprovalDriver`] liegen. `ExtensionRegistry`
-/// bietet nur für Tool-Provider ein nachträgliches `add_*`; für Freigabe-Handler
-/// existiert ausschließlich der Builder. Diese Funktion baut die Registry
-/// deshalb aus ihren eigenen Gettern neu auf — jeder Beitrag ist ein `Arc`, es
-/// wird also nichts dupliziert, nur der Zeiger umgehängt — und hängt `handler`
-/// **hinter** die bestehenden Handler.
-///
-/// Die Reihenfolge ist bedeutsam: `harw_core::turn_loop::check_approval` bricht
-/// beim ersten Nicht-`Allow` ab. Die `DefaultApprovalPolicy` aus
-/// `harw-registry-defaults` bleibt damit die entscheidende Politik; der
-/// TUI-Handler läuft im Scope [`crate::approval::ApprovalScope::Deferred`] und
-/// dient nur als Frage-/Antwortkanal, den der [`ApprovalDriver`] anhand des vom
-/// Kern festgehaltenen Pausezustands bedient.
-///
-/// # Argumente
-/// - `registry` ([`ExtensionRegistry`]): die zusammengebaute Registry; Besitz
-///   geht über.
-/// - `handler` (`Arc<dyn ApprovalHandler>`): der zusätzlich zu registrierende
-///   Handler.
-///
-/// # Rückgabe
-/// Eine neue [`ExtensionRegistry`] mit identischen Beiträgen plus `handler`.
-///
-/// # Errors
-/// [`ContextProviderRegistrationError`]: einer der aus `registry`
-/// übernommenen Kontextanbieter deklariert einen leeren oder bereits
-/// vergebenen Namensraum. Da `registry` bereits eine gültig zusammengesetzte
-/// Registry ist, ist dieser Fehler hier praktisch unerreichbar — die Prüfung
-/// wird trotzdem nicht mit `expect()` verschluckt.
-fn registry_with_approval_handler(
-    registry: ExtensionRegistry,
-    handler: Arc<dyn ApprovalHandler>,
-) -> Result<ExtensionRegistry, ContextProviderRegistrationError> {
-    let mut builder = ExtensionRegistry::builder();
-    for provider in registry.tool_providers() {
-        builder = builder.tool_provider(Arc::clone(provider));
-    }
-    for provider in registry.context_providers() {
-        builder = builder.context_provider(Arc::clone(provider))?;
-    }
-    for provider in registry.instructions_providers() {
-        builder = builder.instructions_provider(Arc::clone(provider));
-    }
-    for existing in registry.approval_handlers() {
-        builder = builder.approval_handler(Arc::clone(existing));
-    }
-    builder = builder.approval_handler(handler);
-    for observer in registry.turn_observers() {
-        builder = builder.turn_observer(Arc::clone(observer));
-    }
-    if let Some(spawner) = registry.spawner() {
-        builder = builder.spawner(Arc::clone(spawner));
-    }
-    Ok(builder.build())
-}
-
-/// Hängt die Beiträge der Composition-Root an eine bestehende Registry.
-///
-/// # Beschreibung
-/// Gegenstück zu [`registry_with_approval_handler`] für die Beiträge, die
-/// `harw-tui` nicht selbst bauen kann: der Ziel-Kontext-Provider stammt aus
-/// `harw-plan-bridge`, die zusätzliche Freigabe-Politik aus `harw-core` — beide
-/// kennt nur die Composition-Root, die sie als Trait-Objekte durchreicht.
-///
-/// Auch hier wird **angehängt**, nicht ersetzt: die vorhandenen Beitragenden
-/// bleiben und behalten ihre Reihenfolge. Für Freigabe-Politiken ist das die
-/// sicherheitsrelevante Eigenschaft — `harw_core::turn_loop::check_approval`
-/// nimmt die erste Nicht-`Allow`-Entscheidung, eine angehängte Politik kann
-/// also nur zusätzlich einschränken, nie lockern.
-///
-/// # Argumente
-/// - `registry` ([`ExtensionRegistry`]): die bereits zusammengebaute Registry;
-///   Besitz geht über.
-/// - `services` (`&TuiPlanServices`): das Bündel der Composition-Root; nur die
-///   Felder `context_providers` und `approval_handlers` werden gelesen.
-///
-/// # Rückgabe
-/// Eine neue [`ExtensionRegistry`] mit allen bisherigen plus den übergebenen
-/// Beiträgen. Es wird nichts dupliziert — jeder Beitrag ist ein `Arc`, nur der
-/// Zeiger wird umgehängt.
-///
-/// # Errors
-/// [`ContextProviderRegistrationError`]: ein Kontextanbieter aus `registry`
-/// oder aus `services.context_providers` deklariert einen leeren oder
-/// bereits vergebenen Namensraum — insbesondere wenn ein von der
-/// Composition-Root beigetragener Anbieter denselben Namensraum wie ein
-/// bereits registrierter beansprucht.
-fn registry_with_plan_contributions(
-    registry: ExtensionRegistry,
-    services: &TuiPlanServices,
-) -> Result<ExtensionRegistry, ContextProviderRegistrationError> {
-    if services.context_providers.is_empty() && services.approval_handlers.is_empty() {
-        return Ok(registry);
-    }
-    let mut builder = ExtensionRegistry::builder();
-    for provider in registry.tool_providers() {
-        builder = builder.tool_provider(Arc::clone(provider));
-    }
-    for provider in registry.context_providers() {
-        builder = builder.context_provider(Arc::clone(provider))?;
-    }
-    for provider in &services.context_providers {
-        builder = builder.context_provider(Arc::clone(provider))?;
-    }
-    for provider in registry.instructions_providers() {
-        builder = builder.instructions_provider(Arc::clone(provider));
-    }
-    for existing in registry.approval_handlers() {
-        builder = builder.approval_handler(Arc::clone(existing));
-    }
-    for handler in &services.approval_handlers {
-        builder = builder.approval_handler(Arc::clone(handler));
-    }
-    for observer in registry.turn_observers() {
-        builder = builder.turn_observer(Arc::clone(observer));
-    }
-    if let Some(spawner) = registry.spawner() {
-        builder = builder.spawner(Arc::clone(spawner));
-    }
-    tracing::info!(
-        context_providers = services.context_providers.len(),
-        approval_handlers = services.approval_handlers.len(),
-        "tui.registry.plan_contributions_appended"
-    );
-    Ok(builder.build())
 }
 
 /// Übersetzt einen [`ApprovalDriverError`] in einen [`TuiError`], ohne die
@@ -1575,7 +1221,7 @@ fn registry_with_plan_contributions(
 ///
 /// # Rückgabe
 /// [`TuiError::Core`] mit vollständiger Ursachenkette.
-fn tui_error_from_approval_driver(error: ApprovalDriverError) -> TuiError {
+pub(crate) fn tui_error_from_approval_driver(error: ApprovalDriverError) -> TuiError {
     let mut message = error.to_string();
     let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&error);
     while let Some(cause) = source {
@@ -1587,925 +1233,6 @@ fn tui_error_from_approval_driver(error: ApprovalDriverError) -> TuiError {
     }
     tracing::error!(error = %message, "tui.approval.driver_failed");
     TuiError::Core(message)
-}
-
-/// Rejects a session when prompt discovery and tool authority resolve to
-/// different project roots.
-///
-/// The registry contributes project context and instruction documents to the
-/// model prompt, while the sandbox constrains the tools that prompt can use.
-/// They must describe the same canonical project root; continuing otherwise
-/// could expose instructions from one project while granting tools access to
-/// another.
-fn ensure_tui_context_roots_align(
-    prompt_project_root: &std::path::Path,
-    sandbox_project_root: &std::path::Path,
-) -> Result<(), TuiError> {
-    if prompt_project_root == sandbox_project_root {
-        return Ok(());
-    }
-
-    Err(TuiError::Core(format!(
-        "refusing to start TUI with mismatched prompt discovery root `{}` and tool sandbox root `{}`",
-        prompt_project_root.display(),
-        sandbox_project_root.display(),
-    )))
-}
-
-/// Vertrauenswürdiger, **rollenspezifisch eingeschränkter** Registry-Bauer für
-/// Kinder der lokalen TUI.
-///
-/// # Beschreibung
-/// AP W5-04. Vorher bekam jedes Kind die **volle** TUI-Registry
-/// ([`assemble_default_registry`], Profil `Full`) — also `fs.write` und
-/// `shell.exec`, unabhängig von seiner Rolle. Diese Fassung fragt stattdessen
-/// [`profile_for_role`] und baut die Registry über
-/// [`harw_registry_defaults::profile::assemble_registry`] mit genau dem Profil,
-/// das die Rolle vorsieht. Die Zuordnung Rolle → Profil existiert damit
-/// **einmal** im Workspace; ein eigener `match` über Rollennamen würde von ihr
-/// abdriften.
-///
-/// Eine Instanz bedient **alle** registrierten Rollen (Muster aus
-/// `harw-cli/src/chat.rs::OneShotChildRegistryFactory`). Der frühere
-/// Ein-Rolle-pro-Factory-Zuschnitt entfällt: [`ManagedAgentSpawner`] ruft die
-/// Factory ohnehin nur für bereits admittierte, registrierte Rollen auf, und
-/// eine gemeinsame Instanz senkt die eingebauten Agentendefinitionen genau
-/// einmal statt einmal je Rolle.
-///
-/// # Abweichung von der Referenz
-/// Zusätzlich zum One-shot-Muster prüft [`Self::build_registry`] weiterhin über
-/// [`ensure_tui_context_roots_align`], dass die Projekterkennung des Kindes
-/// denselben Wurzelpfad liefert wie die des Elternteils. Diese Prüfung ist
-/// TUI-spezifisch (der interaktive Pfad lebt länger als ein One-shot-Turn, ein
-/// Verzeichniswechsel unter laufender Session ist dort real möglich) und wird
-/// deshalb bewusst beibehalten.
-///
-/// # Sicherheitsregel
-/// Diese Schicht ist **eine von dreien**. Sie verengt die Werkzeug-Sichtbarkeit
-/// und weicht weder die IR-Aktivierung (siehe [`Self::executable_agent_ir`])
-/// noch die Sandbox-Reduktion des Kerns auf. Eine unbekannte Rolle erhält das
-/// Default-Profil ([`harw_registry_defaults::profile::RegistryProfile::Full`]) —
-/// genau den Satz des Elternteils, nie mehr.
-struct TuiChildRegistryFactory {
-    /// Startpunkt der Projekterkennung für jede Kind-Registry.
-    discovery_cwd: std::path::PathBuf,
-    /// Der Projekt-Root des Elternteils; jede Kind-Registry muss ihn treffen.
-    project_root: std::path::PathBuf,
-    /// Der Modellanbieter, den jedes Kind für seinen Turn wiederverwendet.
-    model: Arc<dyn ModelProvider>,
-    /// Die eingebauten Rollen, bereits zu [`ExecutableAgentIr`] gesenkt,
-    /// geschlüsselt nach Rollennamen.
-    builtin_definitions: HashMap<String, ExecutableAgentIr>,
-}
-
-impl TuiChildRegistryFactory {
-    /// Senkt die eingebauten Agentendefinitionen einmalig und hält sie für die
-    /// Lebensdauer des Spawners.
-    ///
-    /// # Argumente
-    /// - `discovery_cwd` (`&std::path::Path`): Startpunkt der Projekterkennung.
-    /// - `project_root` (`&std::path::Path`): Projekt-Root des Elternteils.
-    /// - `model` (`Arc<dyn ModelProvider>`): der von jedem Kind wiederverwendete
-    ///   Modellanbieter (derselbe wie im Eltern-Turn).
-    ///
-    /// # Rückgabe
-    /// `Ok(Self)` mit allen eingebauten Rollen aus
-    /// [`role_names::ALL`] gesenkt.
-    ///
-    /// # Fehler
-    /// [`TuiError::Core`], wenn eine eingebettete Agentendefinition nicht senkt.
-    /// Praktisch unerreichbar: die TOML-Quellen sind zur Bauzeit eingebettet und
-    /// werden von `harw-registry-defaults` selbst getestet.
-    ///
-    /// # Nebenläufigkeit
-    /// Reine Konstruktion; kein geteilter Zustand.
-    fn new(
-        discovery_cwd: &std::path::Path,
-        project_root: &std::path::Path,
-        model: Arc<dyn ModelProvider>,
-    ) -> Result<Self, TuiError> {
-        // `existing` bleibt leer: die TUI kennt zu einem konfigurierten
-        // Rollennamen keine gesenkte IR, die eine eingebaute überschreiben
-        // dürfte. Ein leeres Set senkt daher genau die eingebauten Rollen.
-        let builtin_definitions =
-            harw_registry_defaults::embedded_agents::builtin_agent_definitions(&HashMap::new())
-                .map_err(|error| {
-                    TuiError::Core(format!(
-                        "could not lower builtin agent definitions for TUI child spawning: {error}"
-                    ))
-                })?;
-        Ok(Self {
-            discovery_cwd: discovery_cwd.to_path_buf(),
-            project_root: project_root.to_path_buf(),
-            model,
-            builtin_definitions,
-        })
-    }
-}
-
-impl ChildRegistryFactory for TuiChildRegistryFactory {
-    /// Baut die Registry eines Kindes nach dem Profil seiner Rolle.
-    ///
-    /// # Argumente
-    /// - `role` (`&str`): der registrierte Rollenname.
-    /// - `_input` (`&SpawnInput`): ungenutzt — die Registry hängt allein an
-    ///   `role`, niemals an Modell-JSON.
-    /// - `_suggestions` (`Option<&harw_catalog::AgentSuggestions>`): ungenutzt;
-    ///   Vorschläge werden nie zu registrierten Werkzeugen.
-    ///
-    /// # Rückgabe
-    /// `Ok(ExtensionRegistry)` mit genau den Tool-Providern des Profils aus
-    /// [`profile_for_role`].
-    ///
-    /// # Fehler
-    /// [`AgentSpawnError`], wenn die Projekterkennung fehlschlägt oder der
-    /// erkannte Projekt-Root nicht dem des Elternteils entspricht.
-    ///
-    /// # Nebenläufigkeit
-    /// Zustandslos außer Lesezugriff auf `self`; aus mehreren Threads aufrufbar.
-    fn build_registry(
-        &self,
-        role: &str,
-        _input: &SpawnInput,
-        _suggestions: Option<&harw_catalog::AgentSuggestions>,
-    ) -> Result<ExtensionRegistry, AgentSpawnError> {
-        let profile = profile_for_role(role).unwrap_or_default();
-        let overrides = IdentityOverrides {
-            agent_name: Some(role.to_owned()),
-            ..IdentityOverrides::default()
-        };
-        let assembled = harw_registry_defaults::profile::assemble_registry(
-            profile,
-            self.discovery_cwd.clone(),
-            overrides,
-        )
-        .map_err(|error| AgentSpawnError {
-            message: format!("could not assemble child registry for role '{role}': {error}"),
-        })?;
-        ensure_tui_context_roots_align(&assembled.project.project_root, &self.project_root)
-            .map_err(|error| AgentSpawnError {
-                message: format!("could not validate child registry for role '{role}': {error}"),
-            })?;
-        tracing::debug!(
-            role,
-            profile = ?profile,
-            read_only = profile.is_read_only(),
-            "tui.child_registry.assembled"
-        );
-        Ok(assembled.registry)
-    }
-
-    /// Liefert den für den Eltern-Turn gewählten Modellanbieter.
-    ///
-    /// # Argumente
-    /// - `_role` (`&str`): ungenutzt — [`ManagedAgentSpawner`] fragt nur für
-    ///   bereits admittierte, registrierte Rollen.
-    ///
-    /// # Rückgabe
-    /// `Ok(Arc<dyn ModelProvider>)` — immer derselbe geteilte Zeiger.
-    ///
-    /// # Fehler
-    /// Nie: der Anbieter ist zur Konstruktionszeit bereits aufgelöst.
-    fn model_for(&self, _role: &str) -> Result<Arc<dyn ModelProvider>, AgentSpawnError> {
-        Ok(Arc::clone(&self.model))
-    }
-
-    /// Liefert die eingebaute Agent-IR einer der Rollen aus [`role_names::ALL`].
-    ///
-    /// # Argumente
-    /// - `role` (`&str`): der registrierte Rollenname.
-    ///
-    /// # Rückgabe
-    /// `Some(&ExecutableAgentIr)` für eine eingebaute Rolle, sonst `None`. Der
-    /// Kern zieht daraus Tool-Aktivierung, Budget und Pause-Sperre des Kindes —
-    /// diese Schicht schwächt das nicht ab, sondern versorgt es.
-    fn executable_agent_ir(&self, role: &str) -> Option<&ExecutableAgentIr> {
-        self.builtin_definitions.get(role)
-    }
-}
-
-fn configured_child_organizational_role(role: &str) -> Result<AgentRoleId, TuiError> {
-    match role {
-        "worker" => Ok(AgentRoleId::Worker),
-        "child-orchestrator" => Ok(AgentRoleId::ChildOrchestrator),
-        unsupported => Err(TuiError::Core(format!(
-            "configured TUI child role '{unsupported}' is not permitted by the root spawn policy"
-        ))),
-    }
-}
-
-/// Leitet die Kind-Grenzwerte aus dem Laufzeitprofil des gewählten Modells ab.
-///
-/// # Beschreibung
-/// AP W5-04. `harw-core` hängt bewusst nicht von `harw-model-catalog` ab und
-/// bietet deshalb kein `limits_from_runtime_profile`; die dokumentierte
-/// crate-lokale Form ist [`ChildLimits::with_max_children`], die ein
-/// Consumer-Crate „mit `profile.max_child_fanout as usize`" aufruft. `harw-tui`
-/// kennt beide Crates und tut genau das.
-///
-/// Die Ableitung ist **monoton reduzierend**: [`ChildLimits::with_max_children`]
-/// klammert gegen [`ChildLimits::conservative`] und kann die konservative Grenze
-/// nur senken. Ein Profil mit `max_child_fanout == 0`
-/// ([`harw_model_catalog::runtime::DelegationPolicy::Forbidden`]) wird von
-/// dieser Kernfunktion auf `1` angehoben — das ist ihr dokumentiertes Verhalten
-/// („ein Deckel von 0 wäre keine Grenze, sondern ein Ausfall") und bleibt
-/// bewusst unangetastet, damit es im Workspace nur eine Auslegung gibt.
-///
-/// # Argumente
-/// - `runtime_config` (`&harw_config::ResolvedConfig`): die aufgelöste
-///   Konfiguration; `harness.default_model` benennt das Modell.
-///
-/// # Rückgabe
-/// [`ChildLimits`] mit gedeckeltem `max_active_children_per_parent`; ohne
-/// gesetztes Default-Modell [`ChildLimits::conservative`].
-fn tui_child_limits(runtime_config: &harw_config::ResolvedConfig) -> ChildLimits {
-    let Some(model) = runtime_config.harness.default_model.as_deref() else {
-        return ChildLimits::conservative();
-    };
-    let profile = harw_model_catalog::profile_for(model);
-    let limits = ChildLimits::with_max_children(usize::from(profile.max_child_fanout));
-    tracing::debug!(
-        model,
-        max_child_fanout = profile.max_child_fanout,
-        max_active_children_per_parent = limits.max_active_children_per_parent,
-        "tui.child_limits.derived_from_runtime_profile"
-    );
-    limits
-}
-
-/// Constructs the local TUI's child-spawn authority without mirroring its
-/// root [`AgentSession`] in the child manager.
-///
-/// Registriert zwei Rollenmengen über **eine** gemeinsame
-/// [`TuiChildRegistryFactory`]:
-/// 1. die eingebauten Rollen aus [`role_names::ALL`] — jede mit dem Profil aus
-///    [`profile_for_role`] und der eingebauten Agent-IR, organisatorisch
-///    [`AgentRoleId::Worker`] (genau wie im One-shot-Pfad),
-/// 2. die in `[agents]` konfigurierten Rollen mit ihrem konfigurierten
-///    organisatorischen Rang.
-///
-/// Rollennamen der ersten Menge stammen ausschließlich aus [`role_names`], nie
-/// aus Literalen. Konfigurierte Rollen werden **nach** den eingebauten
-/// registriert: trägt eine Konfiguration denselben Namen, gewinnt sie.
-///
-/// Ein leeres `[agents]`-Set bleibt ein Fehler: der bisherige fail-closed
-/// Zuschnitt („kein Kind-Spawnen ohne konfigurierte Kindrollen") wird durch die
-/// eingebauten Rollen nicht aufgeweicht.
-// clippy::too_many_arguments: die acht Parameter sind fachlich unabhängig
-// (Session-Identität, Spawn-Kontext, Reasoning-Effort, globale Config, zwei
-// getrennte Dateisystem-Wurzeln, Model-Provider, Event-Sender) und stammen an
-// der einzigen Aufrufstelle aus disjunkten Teilen der Composition Root. Eine
-// künstliche Parameter-Struct hätte hier kein zweites Verwendungsziel und
-// würde nur die Signatur verschleiern, statt sie zu klären.
-#[allow(clippy::too_many_arguments)]
-fn build_tui_managed_spawner(
-    session_id: SessionId,
-    spawn_context: SpawnContext,
-    reasoning_effort: Option<harw_types::ReasoningEffort>,
-    runtime_config: &harw_config::ResolvedConfig,
-    discovery_cwd: &std::path::Path,
-    project_root: &std::path::Path,
-    model: Arc<dyn ModelProvider>,
-    event_tx: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
-) -> Result<Arc<ManagedAgentSpawner>, TuiError> {
-    if runtime_config.agents.is_empty() {
-        return Err(TuiError::Core(
-            "refusing to expose child spawning without configured child role definitions"
-                .to_owned(),
-        ));
-    }
-
-    let mut configured_roles = BTreeMap::new();
-    for (name, definition) in &runtime_config.agents {
-        if name.trim().is_empty() {
-            return Err(TuiError::Core(
-                "refusing to register an empty configured child role name".to_owned(),
-            ));
-        }
-        let organizational_role = configured_child_organizational_role(&definition.role)?;
-        configured_roles.insert(name.clone(), organizational_role);
-    }
-
-    let factory: Arc<dyn ChildRegistryFactory> = Arc::new(TuiChildRegistryFactory::new(
-        discovery_cwd,
-        project_root,
-        model,
-    )?);
-
-    let manager = Arc::new(Mutex::new(SessionManager::new(event_tx)));
-    let mut spawner = ManagedAgentSpawner::new(manager, tui_child_limits(runtime_config));
-    // 1. Eingebaute, read-only zugeschnittene Rollen — Namen aus `role_names`.
-    for role in role_names::ALL {
-        spawner = spawner.with_role(
-            (*role).to_owned(),
-            AgentRole::Agent {
-                name: (*role).to_owned(),
-            },
-            AgentRoleId::Worker,
-            Arc::clone(&factory),
-        );
-    }
-    // 2. Konfigurierte Rollen; gleichnamige Konfiguration gewinnt.
-    for (name, organizational_role) in configured_roles {
-        spawner = spawner.with_role(
-            name.clone(),
-            AgentRole::Agent { name },
-            organizational_role,
-            Arc::clone(&factory),
-        );
-    }
-
-    spawner
-        .with_external_root_parent(session_id, spawn_context, reasoning_effort)
-        .map(Arc::new)
-        .map_err(|error| {
-            TuiError::Core(format!(
-                "could not register trusted TUI root for child spawning: {error}"
-            ))
-        })
-}
-
-/// Bündelt die per-Session konfigurierten Services eines modell-initiierten
-/// Tool-Aufrufs.
-///
-/// # Description
-/// `runtime_config`, `memory`, `job_store`, `controller`, `managed_spawner`
-/// und `state_store` gehören fachlich zusammen: [`tui_model_tool_context`]
-/// überführt sie 1:1 in die [`ServiceMap`] des jeweiligen `OpContext`, und
-/// [`add_tui_model_tool_provider`] reicht sie unverändert an jeden über den
-/// Provider gebauten Aufruf weiter. Das Bündeln hält beide Funktionen unter
-/// der clippy-Grenze von sieben Parametern, ohne die einzelnen Felder
-/// künstlich zu verstecken.
-///
-/// # Felder
-/// - `managed_spawner` (`Option<&Arc<ManagedAgentSpawner>>`): `None` means no
-///   child-spawning authority was configured for this session (the resolved
-///   `agents` config was empty). In that case the [`ManagedAgentSpawner`]
-///   service is intentionally **not** inserted into the [`ServiceMap`], so a
-///   subsequent `/agent` operation call degrades to `OpError::NotAvailable`
-///   instead of aborting the chat turn. `Some(spawner)` registers the
-///   spawner service exactly as before, enabling child spawning.
-struct TuiModelToolServices<'a> {
-    runtime_config: Option<&'a Arc<harw_config::ResolvedConfig>>,
-    memory: Option<&'a Arc<dyn harw_memory::Memory>>,
-    job_store: Option<&'a Arc<harw_session_store::JobStore>>,
-    controller: &'a Arc<TuiSessionController>,
-    managed_spawner: Option<&'a Arc<ManagedAgentSpawner>>,
-    state_store: &'a Arc<dyn StateStore>,
-}
-
-/// Builds an operation context for a model-initiated tool call.
-///
-/// # Description
-/// The execution context is the sole source of per-call authority. All
-/// services are captured from the trusted TUI composition root; model tool
-/// arguments never participate in this construction.
-///
-/// # Arguments
-/// - `services` (`&TuiModelToolServices<'_>`): see [`TuiModelToolServices`],
-///   in particular its `managed_spawner` field for the `None`/`Some`
-///   contract.
-///
-/// # Returns
-/// `OpContext` — the fully assembled per-call context, carrying the
-/// operation registry and every optional service that was configured.
-fn tui_model_tool_context(
-    execution_context: &harw_extension_api::ToolExecutionContext,
-    operations: &[Arc<dyn harw_operations::Operation>],
-    services: &TuiModelToolServices<'_>,
-) -> OpContext {
-    let mut operation_registry = OperationRegistry::new();
-    for operation in operations {
-        operation_registry.register(Arc::clone(operation));
-    }
-
-    let mut service_map = ServiceMap::new();
-    service_map.insert(operation_registry);
-    if let Some(config) = services.runtime_config {
-        service_map.insert(Arc::clone(config));
-    }
-    if let Some(memory) = services.memory {
-        service_map.insert(Arc::clone(memory));
-    }
-    if let Some(job_store) = services.job_store {
-        service_map.insert(Arc::clone(job_store));
-    }
-    let shared_controller: SharedSessionController =
-        Arc::clone(services.controller) as SharedSessionController;
-    service_map.insert(shared_controller);
-    if let Some(managed_spawner) = services.managed_spawner {
-        service_map.insert(Arc::clone(managed_spawner));
-    }
-    service_map.insert(Arc::clone(services.state_store));
-
-    OpContext::new(
-        execution_context.session_id().clone(),
-        execution_context.turn_id().clone(),
-        execution_context.sandbox().clone(),
-        service_map,
-    )
-}
-
-/// Appends the model-facing operation provider without changing registry
-/// approval handlers. Existing default approval behavior therefore continues
-/// to gate unknown and operation tools.
-///
-/// # Arguments
-/// - `services` (`&TuiModelToolServices<'_>`): forwarded unchanged into every
-///   [`tui_model_tool_context`] built for this provider. See
-///   [`TuiModelToolServices`] for the `managed_spawner` `None`/`Some`
-///   contract.
-fn add_tui_model_tool_provider(
-    extension_registry: &mut harw_extension_api::ExtensionRegistry,
-    operations: &[Arc<dyn harw_operations::Operation>],
-    services: &TuiModelToolServices<'_>,
-) {
-    let provider_operations = operations.to_vec();
-    let context_operations = operations.to_vec();
-    let runtime_config = services.runtime_config.cloned();
-    let memory = services.memory.cloned();
-    let job_store = services.job_store.cloned();
-    let controller = Arc::clone(services.controller);
-    let managed_spawner = services.managed_spawner.cloned();
-    let state_store = Arc::clone(services.state_store);
-    let provider = ModelToolProvider::new(provider_operations, move |execution_context| {
-        let services = TuiModelToolServices {
-            runtime_config: runtime_config.as_ref(),
-            memory: memory.as_ref(),
-            job_store: job_store.as_ref(),
-            controller: &controller,
-            managed_spawner: managed_spawner.as_ref(),
-            state_store: &state_store,
-        };
-        tui_model_tool_context(execution_context, &context_operations, &services)
-    });
-    extension_registry.add_tool_provider(Arc::new(provider));
-}
-
-/// Startet den interaktiven ratatui-Chat gegen den gegebenen Modell-Provider.
-///
-/// # Beschreibung
-/// Baut eine [`harw_core::AgentSession`] (Rolle [`harw_types::AgentRole::Assistant`],
-/// leere Extension-Registry, unbounded Event-Channel) und verwendet den vom
-/// Composition Root injizierten [`StateStore`]. Dadurch kann der CLI-Aufrufer
-/// einen [`harw_core::TranscriptStateStore`] für durable TUI-Verläufe liefern;
-/// die TUI fällt nicht implizit auf [`harw_core::InMemoryStateStore`] zurück.
-/// Anschließend aktiviert sie Raw-Mode/Alternate-Screen hinter einem
-/// RAII-Guard (`TerminalGuard`) und betreibt den asynchronen internen
-/// Event-Loop über einen `current_thread`-Tokio-Runtime.
-///
-/// Baut zusätzlich die `/`-Command-Adapter-Pipeline aus der übergebenen
-/// [`OperationRegistry`] (`CommandAdapter::from_operation` pro registrierter
-/// Op) sowie eine frische [`SessionId`] und übergibt beides zusammen mit der
-/// `sandbox` an [`ChatApp::new`], sodass `/command`-Zeilen echt über
-/// `harw-ops` dispatcht werden (siehe [`crate::command_exec::execute_command`]).
-///
-/// # Argumente
-/// - `model` (`Box<dyn ModelProvider>`): der Provider, an den jeder Turn geht.
-/// - `operations` (`OperationRegistry`): die 16 `harw-ops`-Kern-Operationen
-///   (typischerweise via `harw_ops::register_all`), aus denen die
-///   `/`-Command-Adapter gebaut werden.
-/// - `sandbox` (`SandboxSpec`): Authority-Boundary für alle
-///   Operation-Dispatches dieser Chat-Session.
-///
-/// # Rückgabe
-/// `Ok(())` bei sauberem Verlassen des Loops.
-///
-/// # Fehler
-/// - [`TuiError::Io`]: bei Terminal-Setup, Zeichnen oder Event-I/O.
-/// - [`TuiError::Core`]: wenn der Turn-Loop einen Fehler meldet.
-///
-/// # Nebenläufigkeit
-/// Läuft synchron im aufrufenden Thread; treibt den async-Loop über einen
-/// lokalen `current_thread`-Runtime und startet einen Eingabe-Reader-Thread.
-pub fn run_chat_tui(
-    model: Box<dyn ModelProvider>,
-    store: Box<dyn StateStore>,
-    job_store: Arc<harw_session_store::JobStore>,
-    runtime_config: Arc<harw_config::ResolvedConfig>,
-    operations: OperationRegistry,
-    sandbox: SandboxSpec,
-    memory: Option<std::sync::Arc<dyn harw_memory::Memory>>,
-) -> Result<(), TuiError> {
-    run_chat_tui_resumable(
-        model,
-        store,
-        job_store,
-        runtime_config,
-        None,
-        operations,
-        sandbox,
-        memory,
-        None,
-        None,
-    )
-}
-
-/// Runs the local TUI with optional durable-session resume support.
-///
-/// `existing_session_id` selects the exact initial session when present. The
-/// optional `resume_selector` remains caller-owned: `/resume` asks it for the
-/// selectable IDs, while `/resume <selector>` asks it to resolve the supplied
-/// exact/prefix selector. A successful resolution rebuilds all session-scoped
-/// runtime state without dropping raw mode or leaving the alternate screen.
-#[allow(clippy::too_many_arguments)]
-pub fn run_chat_tui_resumable(
-    model: Box<dyn ModelProvider>,
-    store: Box<dyn StateStore>,
-    job_store: Arc<harw_session_store::JobStore>,
-    runtime_config: Arc<harw_config::ResolvedConfig>,
-    selected_executable_agent_ir: Option<ExecutableAgentIr>,
-    operations: OperationRegistry,
-    sandbox: SandboxSpec,
-    memory: Option<std::sync::Arc<dyn harw_memory::Memory>>,
-    existing_session_id: Option<SessionId>,
-    resume_selector: Option<&dyn ResumeSessionSelector>,
-) -> Result<(), TuiError> {
-    run_chat_tui_resumable_with_plan(
-        model,
-        store,
-        job_store,
-        runtime_config,
-        selected_executable_agent_ir,
-        operations,
-        sandbox,
-        memory,
-        existing_session_id,
-        resume_selector,
-        None,
-    )
-}
-
-/// Wie [`run_chat_tui_resumable`], zusätzlich mit den Plan-/Ziel-Diensten der
-/// Composition-Root.
-///
-/// # Beschreibung
-/// AP W5-10b. `harw-tui` öffnet selbst niemals einen Plan- oder Goal-Store; die
-/// Composition-Root baut beide genau einmal gegen das aktive Profil und reicht
-/// sie hier durch. Nur mit ihnen kann der Renderer ein `PlanUpdated`-Ereignis
-/// als [`PlanGraphCell`] und `/goal check` als [`GoalCell`] darstellen; ohne sie
-/// bleibt beides eine Systemzeile.
-///
-/// Diese Funktion existiert **zusätzlich** zu [`run_chat_tui_resumable`], damit
-/// die bestehende Signatur (und damit der Aufruf in `harw-cli/src/chat.rs`)
-/// unverändert gültig bleibt.
-///
-/// # Argumente
-/// Wie [`run_chat_tui_resumable`], zusätzlich:
-/// - `plan_services` (`Option<TuiPlanServices>`): bereits gebaute Plan-/Ziel-
-///   Stores; `None` schaltet die beiden Zellen ab, ohne den Chat zu berühren.
-///
-/// # Fehler
-/// Wie [`run_chat_tui_resumable`].
-#[allow(clippy::too_many_arguments)]
-pub fn run_chat_tui_resumable_with_plan(
-    model: Box<dyn ModelProvider>,
-    store: Box<dyn StateStore>,
-    job_store: Arc<harw_session_store::JobStore>,
-    runtime_config: Arc<harw_config::ResolvedConfig>,
-    selected_executable_agent_ir: Option<ExecutableAgentIr>,
-    operations: OperationRegistry,
-    sandbox: SandboxSpec,
-    memory: Option<std::sync::Arc<dyn harw_memory::Memory>>,
-    existing_session_id: Option<SessionId>,
-    resume_selector: Option<&dyn ResumeSessionSelector>,
-    plan_services: Option<TuiPlanServices>,
-) -> Result<(), TuiError> {
-    let model: Arc<dyn ModelProvider> = model.into();
-    let store: Arc<dyn StateStore> = store.into();
-    // Assemble the coding-agent registry (fs, shell, instructions, project
-    // discovery). Both filesystem and project-discovery failures are fatal:
-    // falling back to an empty registry or an uncanonicalized cwd would make
-    // the session's trust boundary ambiguous.
-    let cwd = std::env::current_dir().map_err(|error| {
-        TuiError::Core(format!(
-            "could not determine current working directory: {error}"
-        ))
-    })?;
-    let canonical_cwd = cwd.canonicalize().map_err(|error| {
-        TuiError::Core(format!(
-            "could not canonicalize current working directory: {error}"
-        ))
-    })?;
-    let assembled = assemble_tui_registry(canonical_cwd.clone())?;
-    let project_root = assembled.project.project_root;
-    let sandbox = sandbox_for_project(&sandbox, &project_root).map_err(TuiError::Core)?;
-    let session_id = selected_session_id(&project_root, existing_session_id);
-    let operation_list: Vec<Arc<dyn harw_operations::Operation>> =
-        operations.iter().map(Arc::clone).collect();
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(TuiError::from)?;
-
-    let SessionRuntime {
-        mut session,
-        mut app,
-        mut event_rx,
-        mut turn_event_rx,
-        mut approval_driver,
-        mut approvals,
-    } = build_session_runtime(
-        session_id,
-        &operation_list,
-        &sandbox,
-        &canonical_cwd,
-        &project_root,
-        &job_store,
-        &runtime_config,
-        memory.as_ref(),
-        selected_executable_agent_ir.as_ref(),
-        Arc::clone(&model),
-        Arc::clone(&store),
-        plan_services.as_ref(),
-    )?;
-    let history = runtime
-        .block_on(store.load_history(session.id()))
-        .map_err(|error| TuiError::Core(format!("durable history load failed: {error}")))?;
-    install_loaded_history(&mut session, &mut app, history);
-    app.push_lines(vec![Line::from(WELCOME)]);
-    let mut gateway = ResumableGateway::new(session, Arc::clone(&store), Arc::clone(&model));
-    let mut guard = TerminalGuard::enter()?;
-
-    let result = runtime.block_on(async {
-        let (tui_tx, mut tui_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
-        let (harw_tx, mut harw_rx) = harw_event_channel();
-        let (frame_req, frame_rx) = frame_channel();
-        tokio::spawn(frame_scheduler(frame_rx, tui_tx.clone()));
-        let _reader = spawn_input_reader(tui_tx);
-        frame_req.schedule_frame();
-
-        loop {
-            match run_loop(
-                &mut guard,
-                &mut app,
-                &mut gateway,
-                &mut event_rx,
-                &mut turn_event_rx,
-                &mut tui_rx,
-                &harw_tx,
-                &mut harw_rx,
-                &frame_req,
-                &approval_driver,
-                &mut approvals,
-            )
-            .await?
-            {
-                TuiRunOutcome::Quit => return Ok(()),
-                TuiRunOutcome::Resume { selector: None } => {
-                    let message = match resume_selector {
-                        Some(selector) => match selector.available_sessions() {
-                            Ok(ids) if ids.is_empty() => {
-                                "No resumable sessions available.".to_owned()
-                            }
-                            Ok(ids) => format!(
-                                "Select a session with /resume <selector>:\n{}",
-                                ids.iter()
-                                    .map(SessionId::as_str)
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            ),
-                            Err(error) => format!("Could not list resumable sessions: {error}"),
-                        },
-                        None => "Session resume is not configured.".to_owned(),
-                    };
-                    app.push_line(Role::System, message);
-                    frame_req.schedule_frame();
-                }
-                TuiRunOutcome::Resume {
-                    selector: Some(raw_selector),
-                } => {
-                    let Some(selector) = resume_selector else {
-                        app.push_line(Role::System, "Session resume is not configured.");
-                        frame_req.schedule_frame();
-                        continue;
-                    };
-                    let selected = match selector.resolve_session(&raw_selector) {
-                        Ok(selected) => selected,
-                        Err(error) => {
-                            app.push_line(
-                                Role::System,
-                                format!("Could not resolve session: {error}"),
-                            );
-                            frame_req.schedule_frame();
-                            continue;
-                        }
-                    };
-                    let SessionRuntime {
-                        session: mut next_session,
-                        app: mut next_app,
-                        event_rx: next_event_rx,
-                        turn_event_rx: next_turn_event_rx,
-                        approval_driver: next_driver,
-                        approvals: next_approvals,
-                    } = build_session_runtime(
-                        selected,
-                        &operation_list,
-                        &sandbox,
-                        &canonical_cwd,
-                        &project_root,
-                        &job_store,
-                        &runtime_config,
-                        memory.as_ref(),
-                        selected_executable_agent_ir.as_ref(),
-                        Arc::clone(&model),
-                        Arc::clone(&store),
-                        plan_services.as_ref(),
-                    )?;
-                    let history = gateway
-                        .store()
-                        .load_history(next_session.id())
-                        .await
-                        .map_err(|error| {
-                            TuiError::Core(format!("durable history load failed: {error}"))
-                        })?;
-                    install_loaded_history(&mut next_session, &mut next_app, history);
-                    next_app.push_lines(vec![Line::from(WELCOME)]);
-                    gateway.replace_session(next_session);
-                    app = next_app;
-                    event_rx = next_event_rx;
-                    turn_event_rx = next_turn_event_rx;
-                    // Treiber und Fragekanal gehören zum Handler der **neuen**
-                    // Registry; sie müssen zusammen mit ihr ersetzt werden,
-                    // sonst fände der Treiber die Rückkanäle nicht mehr.
-                    approval_driver = next_driver;
-                    approvals = next_approvals;
-                    frame_req.schedule_frame();
-                }
-            }
-        }
-    });
-    // `guard` wird hier gedroppt und stellt das Terminal zurück, auch im Fehlerfall.
-    drop(guard);
-    result
-}
-
-/// Alles, was eine frisch aufgebaute (oder per `/resume` ersetzte) Chat-Session
-/// an den Event-Loop übergibt.
-///
-/// # Beschreibung
-/// Ein eigener Typ statt eines Tupels, weil AP W5-03 zwei weitere, **paarweise
-/// zusammengehörige** Werte hinzufügt: der [`ApprovalDriver`] und der
-/// [`ApprovalPromptReceiver`] gehören zum selben `Arc<TuiApprovalHandler>`, der
-/// zugleich in der [`ExtensionRegistry`] dieser Session liegt. Ein Tupel würde
-/// diese Kopplung verstecken.
-struct SessionRuntime {
-    /// Die aufgebaute Session.
-    session: AgentSession,
-    /// Der zugehörige Renderer-Zustand.
-    app: ChatApp,
-    /// Turn-granulare Session-Ereignisse (Token-Summary).
-    event_rx: tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
-    /// Werkzeug-/Kind-/Plan-granulare Turn-Ereignisse.
-    turn_event_rx: tokio::sync::mpsc::UnboundedReceiver<TurnEvent>,
-    /// Treiber über beide Pausearten; hält denselben Handler wie die Registry.
-    approval_driver: ApprovalDriver,
-    /// Fragekanal zum Renderer; **muss** gepollt werden, sonst läuft jede Frage
-    /// in den Timeout und gilt damit als Ablehnung.
-    approvals: ApprovalPromptReceiver,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn build_session_runtime(
-    session_id: SessionId,
-    operations: &[Arc<dyn harw_operations::Operation>],
-    sandbox: &SandboxSpec,
-    discovery_cwd: &std::path::Path,
-    project_root: &std::path::Path,
-    job_store: &Arc<harw_session_store::JobStore>,
-    runtime_config: &Arc<harw_config::ResolvedConfig>,
-    memory: Option<&Arc<dyn harw_memory::Memory>>,
-    selected_executable_agent_ir: Option<&ExecutableAgentIr>,
-    model: Arc<dyn ModelProvider>,
-    state_store: Arc<dyn StateStore>,
-    plan_services: Option<&TuiPlanServices>,
-) -> Result<SessionRuntime, TuiError> {
-    // Re-discover from the original canonical cwd so this registry carries the
-    // same nested instruction cascade as the initial root selection. The
-    // sandbox was already bound to that initial root; reject a filesystem
-    // change that makes this second discovery resolve elsewhere.
-    let assembled = assemble_tui_registry(discovery_cwd.to_path_buf())?;
-    ensure_tui_context_roots_align(&assembled.project.project_root, project_root)?;
-    // AP W5-03, Bedingung 2: genau ein Handler, dessen `Arc` gleichzeitig in
-    // der Registry dieser Session und im `ApprovalDriver` liegt.
-    let (approval_handler, approvals) = TuiApprovalHandler::new();
-    let approval_driver = ApprovalDriver::new(Arc::clone(&approval_handler));
-    let registered_handler = as_dyn_approval_handler(&approval_handler);
-    let mut extension_registry =
-        registry_with_approval_handler(assembled.registry, registered_handler)?;
-    // Die von der Composition-Root mitgegebenen Beiträge — Ziel-Kontext und
-    // zusätzliche Freigabe-Politik. Ohne diesen Schritt bleibt ein per `--goal`
-    // gesetztes Ziel im Store liegen, ohne je einen Turn zu erreichen, und die
-    // aus `[policy] require_approval_for` kompilierte Politik wirkt nirgends.
-    if let Some(services) = plan_services {
-        extension_registry = registry_with_plan_contributions(extension_registry, services)?;
-    }
-    let session_controller = Arc::new(TuiSessionController::new());
-    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (turn_event_tx, turn_event_rx) = tokio::sync::mpsc::unbounded_channel();
-    // AP W5-03, Bedingung 1: `approval_actor` ist hier `Some(Operator)`. Ohne
-    // ihn scheitert der Kern schon vor jedem `AwaitingApproval` mit
-    // `CoreError::MissingApprovalActor`.
-    let root_spawn_context = trusted_tui_spawn_context(sandbox);
-    debug_assert!(
-        root_spawn_context.approval_actor.is_some(),
-        "the TUI spawn context must carry an approval actor"
-    );
-    // Child spawning is only exposed when at least one child role has been
-    // configured. An empty role set is not an error here: the chat turn must
-    // still succeed, just without the `/agent` spawn capability, which then
-    // degrades gracefully to `OpError::NotAvailable` when invoked.
-    let managed_spawner = if runtime_config.agents.is_empty() {
-        None
-    } else {
-        Some(build_tui_managed_spawner(
-            session_id.clone(),
-            root_spawn_context,
-            None,
-            runtime_config,
-            discovery_cwd,
-            project_root,
-            model,
-            event_tx.clone(),
-        )?)
-    };
-    add_tui_model_tool_provider(
-        &mut extension_registry,
-        operations,
-        &TuiModelToolServices {
-            runtime_config: Some(runtime_config),
-            memory,
-            job_store: Some(job_store),
-            controller: &session_controller,
-            managed_spawner: managed_spawner.as_ref(),
-            state_store: &state_store,
-        },
-    );
-    let mut session = build_tui_agent_session(
-        session_id.clone(),
-        extension_registry,
-        event_tx,
-        turn_event_tx,
-        sandbox,
-        selected_executable_agent_ir,
-    );
-    let adapters = operations
-        .iter()
-        .flat_map(|operation| CommandAdapter::from_operation(Arc::clone(operation)))
-        .collect();
-    let mut app = ChatApp::with_memory(adapters, sandbox.clone(), session_id, memory.cloned())
-        .with_job_store(Arc::clone(job_store))
-        .with_runtime_config(Arc::clone(runtime_config))
-        .with_session_controller(session_controller)
-        .with_project_root(project_root.display().to_string())
-        .with_managed_spawner(managed_spawner);
-    if let Some(services) = plan_services {
-        app = app.with_plan_services(services.clone());
-        // Startmodus aus `--mode` bzw. `[mode] default`. Er wird **vor** dem
-        // ersten Turn gesetzt, weil `set_mode` Tool-Aktivierung und
-        // Sandbox-Obergrenze schneidet — mitten in einem Turn wäre das die
-        // falsche Stelle.
-        if let Some(mode) = services.initial_mode {
-            session.set_mode(mode);
-            tracing::info!(mode = mode.as_str(), "tui.session.initial_mode");
-        }
-    }
-    app.set_active_mode(session.mode());
-    Ok(SessionRuntime {
-        session,
-        app,
-        event_rx,
-        turn_event_rx,
-        approval_driver,
-        approvals,
-    })
-}
-
-/// Constructs the TUI-owned session after the trusted spawn context has been
-/// established. A selected executable policy is applied exactly once here,
-/// before any turn can be processed.
-fn build_tui_agent_session(
-    session_id: SessionId,
-    extension_registry: harw_extension_api::ExtensionRegistry,
-    event_tx: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
-    turn_event_tx: tokio::sync::mpsc::UnboundedSender<TurnEvent>,
-    sandbox: &SandboxSpec,
-    selected_executable_agent_ir: Option<&ExecutableAgentIr>,
-) -> AgentSession {
-    let session = AgentSession::new_with_id(
-        session_id,
-        AgentRole::Assistant,
-        None,
-        extension_registry,
-        event_tx,
-    )
-    .with_spawn_context(trusted_tui_spawn_context(sandbox));
-    let session = match selected_executable_agent_ir {
-        Some(policy) => session.with_executable_agent_ir(policy),
-        None => session,
-    };
-    session.with_turn_event_sink(turn_event_tx)
 }
 
 /// Zeitfenster, in dem ein zweites Ctrl+C/Ctrl+D den Chat beendet.
@@ -2539,10 +1266,15 @@ struct QuitArm {
 /// - [`TuiEvent::Resize`] → Redraw anfordern,
 /// - [`HarwEvent::Submit`] → Turn treiben + Antwort streamen,
 /// - [`HarwEvent::SystemMessage`] → Systemzeile in interne History (`cells`),
-/// - [`HarwEvent::Command`] → `/command`-Zeile asynchron über die
-///   Operation-Adapter-Pipeline ausführen ([`crate::command_exec::execute_command`]
-///   mit `app.adapters()` / `app.sandbox()` / `app.session_id()`) und das
-///   Ergebnis wie bei `SystemMessage` in die History übernehmen,
+/// - [`HarwEvent::Command`] → `/resume` beendet den Loop mit
+///   [`TuiRunOutcome::Resume`]; `/tools` läuft lokal und gedeckelt über
+///   [`crate::tools_command::dispatch_tools_command_bounded`]; jede andere
+///   `/command`-Zeile läuft asynchron über die Operation-Adapter-Pipeline
+///   ([`crate::command_exec::execute_command_as`] mit `app.adapters()` /
+///   `app.sandbox()` / `app.session_id()`, Berechtigungsstufe aus dem
+///   Principal der Montage, Dienste aus deren Slash-Fläche; ohne Montage die
+///   Zeile "Fehler: keine Runtime-Montage") und das Ergebnis wie bei
+///   `SystemMessage` in die History übernehmen,
 /// - [`HarwEvent::Quit`] → Loop verlassen,
 /// - [`SessionEvent::TurnCompleted`] (über `event_rx`) → Token-Summary in
 ///   [`ChatApp::total_usage`] akkumulieren; andere `SessionEvent`-Varianten
@@ -2576,7 +1308,7 @@ struct QuitArm {
 /// Läuft auf dem `current_thread`-Runtime. Spawnt den Frame-Scheduler als
 /// Tokio-Task und den Eingabe-Reader als OS-Thread.
 #[allow(clippy::too_many_arguments)]
-async fn run_loop(
+pub(crate) async fn run_loop(
     guard: &mut TerminalGuard,
     app: &mut ChatApp,
     gateway: &mut dyn crate::gateway::ChatGateway,
@@ -2702,12 +1434,16 @@ async fn run_loop(
                                     })
                                     .collect()
                             };
-                            // Phase 2: mutate activation via the parsed args.
-                            let activation = gateway.session_mut().activation_mut();
-                            Some(crate::tools_command::dispatch_tools_command(
+                            // Phase 2: take the session ceiling (base ∩ mode) as an
+                            // owned value first, then mutate activation via the
+                            // parsed args. `/tools` may narrow, but never widen
+                            // beyond this ceiling (W2d-1/F-T, E8).
+                            let ceiling = gateway.session_mut().mode_ceiling();
+                            Some(crate::tools_command::dispatch_tools_command_bounded(
                                 &args,
                                 &tool_names,
-                                activation,
+                                gateway.session_mut().activation_mut(),
+                                &ceiling,
                             ))
                         } else {
                             None
@@ -2725,21 +1461,26 @@ async fn run_loop(
                             // `/command`-Zeile asynchron über die Operation-Adapter-
                             // Pipeline ausführen; identischer Render-/Redraw-Pfad wie
                             // bei `SystemMessage` (mehrzeilige Ausgaben an `\n`
-                            // aufteilen).
-                            let output = execute_command_as(
-                                app.adapters(),
-                                app.sandbox(),
-                                app.session_id(),
-                                LOCAL_TUI_OPERATION_PERMISSION,
-                                &raw,
-                                &CommandServices {
-                                    runtime_config: app.runtime_config(),
-                                    memory: app.memory(),
-                                    controller: app.session_controller(),
-                                    job_store: app.job_store(),
-                                },
-                            )
-                            .await;
+                            // aufteilen). Berechtigungsstufe und Slash-Dienste
+                            // stammen aus der Runtime-Montage; die Dienste werden
+                            // erst nach erfolgreicher Admission gebaut.
+                            let output = match app.runtime() {
+                                Some(rt) => {
+                                    execute_command_as(
+                                        app.adapters(),
+                                        app.sandbox(),
+                                        app.session_id(),
+                                        runtime_commands::caller_tier(rt.principal()),
+                                        &raw,
+                                        || runtime_commands::slash_service_map(rt.services()),
+                                    )
+                                    .await
+                                }
+                                None => {
+                                    tracing::error!("tui.command.no_runtime_assembly");
+                                    "Fehler: keine Runtime-Montage".to_owned()
+                                }
+                            };
                             let lines: Vec<Line<'static>> = output
                                 .split('\n')
                                 .map(|line| Line::from(line.to_owned()))
@@ -3093,7 +1834,7 @@ fn is_goal_check_command(raw: &str) -> bool {
 ///
 /// # Nebenläufigkeit
 /// Läuft als eigener Tokio-Task auf dem `current_thread`-Runtime.
-async fn frame_scheduler(
+pub(crate) async fn frame_scheduler(
     mut frame_rx: tokio::sync::mpsc::UnboundedReceiver<()>,
     tui_tx: tokio::sync::mpsc::UnboundedSender<TuiEvent>,
 ) {
@@ -3999,7 +2740,7 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> bool {
 /// Enthüllt die Antwort simuliert gestreamt, zeilenweise via [`StreamCollector`].
 ///
 /// # Beschreibung
-/// Da [`ModelProvider`] keine Token-Deltas liefert, wird der Volltext hier in
+/// Da [`harw_core::ModelProvider`] keine Token-Deltas liefert, wird der Volltext hier in
 /// kleinen Häppchen ([`REVEAL_CHUNK_CHARS`]) durch einen [`StreamCollector`]
 /// geschoben. Sobald eine vollständige Zeile vorliegt, wird sie als
 /// [`AssistantHistoryCell`] in `app.cells` gepusht und ein Frame gezeichnet.
@@ -4312,8 +3053,7 @@ pub enum TuiError {
     /// Vom Core/Turn-Loop gemeldeter Fehler (als Text übernommen).
     Core(String),
     /// Ein Kontextanbieter deklariert einen leeren oder bereits vergebenen
-    /// Namensraum beim Zusammenbau der Registry
-    /// ([`registry_with_approval_handler`], [`registry_with_plan_contributions`]).
+    /// Namensraum beim Zusammenbau einer Registry durch die Composition-Root.
     ContextProviderRegistration(ContextProviderRegistrationError),
 }
 
@@ -4378,17 +3118,43 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+    use harw_agent_dsl::ExecutableAgentIr;
+    use harw_agent_dsl::roles::AgentRoleId;
     use harw_core::{
-        ApprovalResolution, InMemoryStateStore, ModelFuture, ModelRequest, ModelResponse,
+        ApprovalResolution, InMemoryStateStore, ModelFuture, ModelProvider, ModelRequest,
+        ModelResponse, SpawnContext,
     };
+    use harw_extension_api::approval_mode::ApprovalModeCell;
     use harw_extension_api::{
-        AgentSpawner, ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName,
-        ToolOutput, ToolProvider, ToolSpec,
+        ExtensionRegistry, ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture,
+        ToolName, ToolOutput, ToolProvider, ToolSpec,
     };
     use harw_operations::SessionController;
+    use harw_operations::registry::OperationRegistry;
+    use harw_registry_defaults::profile::role_names;
     use harw_tools::serde_json::{Value, json};
     use harw_tools::{FunctionToolSpec, JsonSchema};
-    use harw_types::{ItemId, ToolCallId, TurnId};
+    use harw_types::{AgentRole, ApprovalActor, ItemId, ToolCallId, TurnId};
+
+    use crate::approval::TuiApprovalHandler;
+    use crate::command_exec::build_services;
+
+    // ────────────────────────────────────────────────────────────────────
+    // W2d-2 / T2b (CONTRACTS-W2d2 §2 T2b): dieses Testmodul lief bis W2d-2
+    // gegen Montage-Helfer, die app.rs selbst besaß (`build_tui_agent_session`,
+    // `trusted_tui_spawn_context`, `assemble_tui_registry`,
+    // `registry_with_approval_handler`, `build_tui_managed_spawner`,
+    // `TuiChildRegistryFactory`, `tui_child_limits`, `TuiModelToolServices`,
+    // `LOCAL_TUI_OPERATION_PERMISSION`, die Projekt-Wurzel-Session-ID-Ableitung).
+    // Seit W2d-2 montiert app.rs nichts mehr selbst (`crate::runtime_root`,
+    // `harw_runtime::RuntimeAssembly`). Tests, die ausschließlich das Verhalten
+    // dieser gelöschten Montage-Helfer prüften, sind entfernt — ihre Abdeckung
+    // steht jetzt in harw-runtime/harw-registry-defaults/harw-core (siehe
+    // docs/remediation/ledger/W2d2/T2b.md). Tests, die echtes TUI-Verhalten
+    // prüfen (Popup, Tastatur, Freigabefluss, `/mode`, Zellen-Rendering),
+    // bleiben erhalten; wo sie eine Session brauchten, bauen sie sie jetzt
+    // direkt über `AgentSession::new_with_id(..).with_spawn_context(..)`.
+    // ────────────────────────────────────────────────────────────────────
 
     /// Baut eine gültige Test-`SandboxSpec` gegen ein eindeutiges Temp-Verzeichnis
     /// (Muster übernommen aus `harw-operations/src/adapter/command.rs`).
@@ -4428,6 +3194,30 @@ mod tests {
     /// `command_exec.rs`).
     fn test_chat_app() -> ChatApp {
         ChatApp::new(Vec::new(), test_sandbox(), SessionId::new())
+    }
+
+    /// Test-lokaler Ersatz für das gelöschte `trusted_tui_spawn_context`
+    /// (W2d-2/T2b, CONTRACTS-W2d2 §2 T2b): dieselben Feldwerte, die die
+    /// gelöschte Funktion für den lokalen TUI-Root vergab — ein
+    /// `ApprovalActor::Operator { id: "local-tui" }`, keine Vorschläge, kein
+    /// Capability-Snapshot, Organisationsrolle `RootOrchestrator`. Anders als
+    /// die Montage-Funktion trägt dieser Testwert keinen frischen Trace und
+    /// keine Kontext-Decke — beide sind für die hier verbliebenen Tests
+    /// (Freigabefluss, Modus-Wechsel, ausführbare Policy) ohne Bedeutung; ihre
+    /// jeweilige Erzeugung ist in `harw-runtime/src/trace.rs` und
+    /// `harw-runtime/src/ceiling.rs` eigenständig getestet.
+    fn test_spawn_context(sandbox: &SandboxSpec) -> SpawnContext {
+        SpawnContext {
+            sandbox: sandbox.clone(),
+            suggestions: None,
+            capability_snapshot: None,
+            approval_actor: Some(ApprovalActor::Operator {
+                id: "local-tui".to_owned(),
+            }),
+            organizational_role: AgentRoleId::RootOrchestrator,
+            trace: None,
+            ceiling: None,
+        }
     }
 
     #[test]
@@ -4518,6 +3308,11 @@ forbidden = [{forbidden}]
         harw_agent_dsl::lower(&resolved).expect("lower test executable policy")
     }
 
+    /// W2d-2/T2b: `build_tui_agent_session` ist entfallen (Montage lebt jetzt in
+    /// `harw_runtime::RuntimeAssembly`); die Session wird direkt über
+    /// `AgentSession::new_with_id(..).with_spawn_context(..).with_turn_event_sink(..)`
+    /// gebaut (CONTRACTS-W2d2 §2 T2b). Das geprüfte Verhalten
+    /// (`with_executable_agent_ir` schneidet die Werkzeugfläche) ist unverändert.
     #[test]
     fn selected_executable_policy_limits_tui_session_tools_and_retains_snapshot() {
         let policy = test_executable_agent_ir(&["stop"], &[]);
@@ -4526,14 +3321,16 @@ forbidden = [{forbidden}]
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
         let (turn_event_tx, _turn_event_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let session = build_tui_agent_session(
+        let session = AgentSession::new_with_id(
             SessionId::new(),
-            harw_extension_api::ExtensionRegistry::builder().build(),
+            AgentRole::Assistant,
+            None,
+            ExtensionRegistry::builder().build(),
             event_tx,
-            turn_event_tx,
-            &sandbox,
-            Some(&policy),
-        );
+        )
+        .with_spawn_context(test_spawn_context(&sandbox))
+        .with_turn_event_sink(turn_event_tx)
+        .with_executable_agent_ir(&policy);
 
         assert!(
             session
@@ -4549,20 +3346,23 @@ forbidden = [{forbidden}]
         assert_eq!(session.executable_snapshot_id(), Some(&snapshot_id));
     }
 
+    /// W2d-2/T2b: siehe oben — ohne `with_executable_agent_ir` bleibt die
+    /// volle Werkzeugfläche sichtbar.
     #[test]
     fn absent_executable_policy_preserves_full_tui_session_visibility() {
         let sandbox = test_sandbox();
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
         let (turn_event_tx, _turn_event_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        let session = build_tui_agent_session(
+        let session = AgentSession::new_with_id(
             SessionId::new(),
-            harw_extension_api::ExtensionRegistry::builder().build(),
-            event_tx,
-            turn_event_tx,
-            &sandbox,
+            AgentRole::Assistant,
             None,
-        );
+            ExtensionRegistry::builder().build(),
+            event_tx,
+        )
+        .with_spawn_context(test_spawn_context(&sandbox))
+        .with_turn_event_sink(turn_event_tx);
 
         assert!(
             session
@@ -4586,377 +3386,6 @@ forbidden = [{forbidden}]
         let mut registry = OperationRegistry::new();
         harw_ops::register_all(&mut registry);
         registry.iter().map(Arc::clone).collect()
-    }
-
-    fn test_managed_spawner(
-        sandbox: &SandboxSpec,
-    ) -> (Arc<ManagedAgentSpawner>, Arc<dyn StateStore>, SessionId) {
-        let mut runtime_config = harw_config::ResolvedConfig::default();
-        runtime_config.agents.insert(
-            "worker".to_owned(),
-            harw_config::AgentToml {
-                name: "worker".to_owned(),
-                role: "worker".to_owned(),
-                description: String::new(),
-                system_file: None,
-                providers: Vec::new(),
-                models: Vec::new(),
-                skills: Vec::new(),
-                suggestions: harw_config::AgentSuggestionsToml::default(),
-                primary_provider: None,
-                secondary_providers: Vec::new(),
-                timeout_seconds: 120,
-                max_retries: 2,
-            },
-        );
-        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let state_store: Arc<dyn StateStore> = Arc::new(harw_core::InMemoryStateStore::new());
-        let model: Arc<dyn ModelProvider> = Arc::new(harw_core::EchoModelProvider::new("ok"));
-        let cwd = std::env::current_dir().expect("test cwd");
-        let root_session_id = SessionId::new();
-        let spawner = build_tui_managed_spawner(
-            root_session_id.clone(),
-            trusted_tui_spawn_context(sandbox),
-            None,
-            &runtime_config,
-            &cwd,
-            &cwd,
-            model,
-            event_tx,
-        )
-        .expect("configured TUI child role must register a trusted root");
-        (spawner, state_store, root_session_id)
-    }
-
-    #[test]
-    fn model_operation_provider_is_appended_to_tui_registry() {
-        let mut extension_registry = harw_extension_api::ExtensionRegistry::builder().build();
-        let operations = test_operations();
-        let controller = Arc::new(TuiSessionController::new());
-        let sandbox = test_sandbox();
-        let (managed_spawner, state_store, _) = test_managed_spawner(&sandbox);
-
-        add_tui_model_tool_provider(
-            &mut extension_registry,
-            &operations,
-            &TuiModelToolServices {
-                runtime_config: None,
-                memory: None,
-                job_store: None,
-                controller: &controller,
-                managed_spawner: Some(&managed_spawner),
-                state_store: &state_store,
-            },
-        );
-
-        assert_eq!(extension_registry.tool_providers().len(), 1);
-        assert!(extension_registry.approval_handlers().is_empty());
-        let tool_names: Vec<String> = extension_registry.tool_providers()[0]
-            .tools()
-            .into_iter()
-            .map(|tool| tool.name().to_owned())
-            .collect();
-        assert!(
-            tool_names.iter().any(|name| name == "stop"),
-            "the registered provider must expose the operation model tools"
-        );
-    }
-
-    #[test]
-    fn model_tool_context_binds_execution_sandbox_and_trusted_services() {
-        let operations = test_operations();
-        let controller = Arc::new(TuiSessionController::new());
-        let sandbox = test_sandbox();
-        let (managed_spawner, state_store, _) = test_managed_spawner(&sandbox);
-        let execution_context = harw_extension_api::ToolExecutionContext::new(
-            SessionId::new(),
-            harw_types::TurnId::new(),
-            sandbox.clone(),
-        );
-
-        let context = tui_model_tool_context(
-            &execution_context,
-            &operations,
-            &TuiModelToolServices {
-                runtime_config: None,
-                memory: None,
-                job_store: None,
-                controller: &controller,
-                managed_spawner: Some(&managed_spawner),
-                state_store: &state_store,
-            },
-        );
-
-        assert_eq!(context.session_id(), execution_context.session_id());
-        assert_eq!(context.turn_id(), execution_context.turn_id());
-        assert_eq!(context.sandbox(), &sandbox);
-        assert_eq!(
-            context
-                .service::<OperationRegistry>()
-                .expect("operation registry service")
-                .len(),
-            operations.len()
-        );
-        let expected_controller: SharedSessionController =
-            Arc::clone(&controller) as SharedSessionController;
-        let bound_controller = context
-            .service::<SharedSessionController>()
-            .expect("shared session controller service");
-        assert!(Arc::ptr_eq(bound_controller, &expected_controller));
-        let bound_spawner = context
-            .service::<Arc<ManagedAgentSpawner>>()
-            .expect("managed spawner service");
-        assert!(Arc::ptr_eq(bound_spawner, &managed_spawner));
-        let bound_store = context
-            .service::<Arc<dyn StateStore>>()
-            .expect("state store service");
-        assert!(Arc::ptr_eq(bound_store, &state_store));
-    }
-
-    #[test]
-    fn model_tool_context_omits_spawner_service_when_no_spawner_is_configured() {
-        let operations = test_operations();
-        let controller = Arc::new(TuiSessionController::new());
-        let sandbox = test_sandbox();
-        let state_store: Arc<dyn StateStore> = Arc::new(harw_core::InMemoryStateStore::new());
-        let execution_context = harw_extension_api::ToolExecutionContext::new(
-            SessionId::new(),
-            harw_types::TurnId::new(),
-            sandbox.clone(),
-        );
-
-        let context = tui_model_tool_context(
-            &execution_context,
-            &operations,
-            &TuiModelToolServices {
-                runtime_config: None,
-                memory: None,
-                job_store: None,
-                controller: &controller,
-                managed_spawner: None,
-                state_store: &state_store,
-            },
-        );
-
-        assert!(
-            context.service::<Arc<ManagedAgentSpawner>>().is_none(),
-            "an empty configured agent set must not register a spawner service"
-        );
-        assert_eq!(context.session_id(), execution_context.session_id());
-        assert_eq!(
-            context
-                .service::<OperationRegistry>()
-                .expect("operation registry service")
-                .len(),
-            operations.len()
-        );
-    }
-
-    #[test]
-    fn model_tool_provider_registers_without_a_managed_spawner() {
-        let mut extension_registry = harw_extension_api::ExtensionRegistry::builder().build();
-        let operations = test_operations();
-        let controller = Arc::new(TuiSessionController::new());
-        let state_store: Arc<dyn StateStore> = Arc::new(harw_core::InMemoryStateStore::new());
-
-        add_tui_model_tool_provider(
-            &mut extension_registry,
-            &operations,
-            &TuiModelToolServices {
-                runtime_config: None,
-                memory: None,
-                job_store: None,
-                controller: &controller,
-                managed_spawner: None,
-                state_store: &state_store,
-            },
-        );
-
-        assert_eq!(
-            extension_registry.tool_providers().len(),
-            1,
-            "the model tool provider must still be appended when no agent roles are configured"
-        );
-        let tool_names: Vec<String> = extension_registry.tool_providers()[0]
-            .tools()
-            .into_iter()
-            .map(|tool| tool.name().to_owned())
-            .collect();
-        assert!(
-            tool_names.iter().any(|name| name == "stop"),
-            "the turn must still expose operation tools without a spawner"
-        );
-    }
-
-    #[tokio::test]
-    async fn managed_spawner_admits_configured_worker_from_trusted_external_root() {
-        let sandbox = test_sandbox();
-        let (managed_spawner, _state_store, root_session_id) = test_managed_spawner(&sandbox);
-        let handoff_call_id = ToolCallId::new();
-
-        let child = managed_spawner
-            .spawn_child(
-                "worker",
-                SpawnInput {
-                    parent_session_id: root_session_id.clone(),
-                    handoff_call_id: handoff_call_id.clone(),
-                    instructions: Some("inspect the assigned task".to_owned()),
-                    context: Default::default(),
-                    // No ceiling demand of its own: inherits the trusted
-                    // external root's ceiling unchanged.
-                    ceiling: None,
-                },
-                sandbox,
-                None,
-            )
-            .await
-            .map_err(|error| TuiError::Core(format!("configured worker admission failed: {error}")))
-            .expect("the trusted external root must admit its configured worker role");
-
-        let record = managed_spawner
-            .child_record(&child)
-            .expect("a successfully admitted child must retain its active record");
-        assert_eq!(record.child, child);
-        assert_eq!(record.parent, root_session_id);
-        assert_eq!(record.handoff_call_id, handoff_call_id);
-        assert_eq!(record.role, "worker");
-        assert_eq!(record.depth, 1);
-        assert_eq!(managed_spawner.active_children_for(&record.parent), 1);
-    }
-
-    #[test]
-    fn managed_spawner_refuses_an_unconfigured_child_role_set() {
-        let sandbox = test_sandbox();
-        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let runtime_config = harw_config::ResolvedConfig::default();
-        let model: Arc<dyn ModelProvider> = Arc::new(harw_core::EchoModelProvider::new("ok"));
-        let cwd = std::env::current_dir().expect("test cwd");
-
-        let result = build_tui_managed_spawner(
-            SessionId::new(),
-            trusted_tui_spawn_context(&sandbox),
-            None,
-            &runtime_config,
-            &cwd,
-            &cwd,
-            model,
-            event_tx,
-        );
-        let error = match result {
-            Ok(_) => panic!("an empty role configuration must fail closed"),
-            Err(error) => error,
-        };
-
-        match error {
-            TuiError::Core(message) => assert!(message.contains("without configured child role")),
-            TuiError::Io(_) => panic!("role registration failure must be a typed TUI error"),
-            TuiError::ContextProviderRegistration(_) => {
-                panic!("role registration failure is not a provider-namespace error")
-            }
-        }
-    }
-
-    #[test]
-    fn trusted_spawn_context_preserves_runtime_sandbox_authority() {
-        let sandbox = test_sandbox();
-
-        let context = trusted_tui_spawn_context(&sandbox);
-
-        assert_eq!(context.sandbox, sandbox);
-        assert!(context.suggestions.is_none());
-        assert!(context.capability_snapshot.is_none());
-        assert_eq!(
-            context.approval_actor,
-            Some(ApprovalActor::Operator {
-                id: "local-tui".to_owned(),
-            })
-        );
-        assert_eq!(context.organizational_role, AgentRoleId::RootOrchestrator);
-    }
-
-    /// AW1-01c: the local TUI spawn context is a root — it carries a
-    /// freshly-generated trace with the right hex shapes and no parent span.
-    #[test]
-    fn trusted_spawn_context_carries_a_freshly_generated_root_trace() {
-        let sandbox = test_sandbox();
-
-        let context = trusted_tui_spawn_context(&sandbox);
-
-        let trace = context.trace.expect("local TUI root must carry a trace");
-        assert_eq!(trace.trace_id.len(), 32);
-        assert!(trace.trace_id.bytes().all(|b| b.is_ascii_hexdigit()));
-        assert_eq!(trace.trace_id, trace.trace_id.to_lowercase());
-        assert_eq!(trace.span_id.len(), 16);
-        assert!(trace.span_id.bytes().all(|b| b.is_ascii_hexdigit()));
-        assert_eq!(trace.span_id, trace.span_id.to_lowercase());
-        assert!(
-            trace.parent_span_id.is_none(),
-            "a root trace must not carry a parent span"
-        );
-    }
-
-    /// AW1-01c: two local TUI sessions must not look like the same session —
-    /// the random source must not be broken/constant.
-    #[test]
-    fn trusted_spawn_context_root_traces_differ_across_two_calls() {
-        let sandbox = test_sandbox();
-
-        let first = trusted_tui_spawn_context(&sandbox)
-            .trace
-            .expect("first call must carry a trace");
-        let second = trusted_tui_spawn_context(&sandbox)
-            .trace
-            .expect("second call must carry a trace");
-
-        assert_ne!(first.trace_id, second.trace_id);
-    }
-
-    #[tokio::test]
-    async fn local_tui_permissions_are_accessible_but_maintainer_commands_are_blocked() {
-        let sandbox = test_sandbox();
-        let operations = test_operations();
-        let adapters = operations
-            .iter()
-            .flat_map(|operation| CommandAdapter::from_operation(Arc::clone(operation)))
-            .collect::<Vec<_>>();
-        let controller = Arc::new(TuiSessionController::new());
-
-        let permissions = execute_command_as(
-            &adapters,
-            &sandbox,
-            &SessionId::new(),
-            LOCAL_TUI_OPERATION_PERMISSION,
-            "/permissions",
-            &CommandServices {
-                runtime_config: None,
-                memory: None,
-                controller: &controller,
-                job_store: None,
-            },
-        )
-        .await;
-        assert!(permissions.contains("Freigabemodus"), "{permissions}");
-        assert!(permissions.contains("ask|auto|full"), "{permissions}");
-
-        let output = execute_command_as(
-            &adapters,
-            &sandbox,
-            &SessionId::new(),
-            LOCAL_TUI_OPERATION_PERMISSION,
-            "/plugins",
-            &CommandServices {
-                runtime_config: None,
-                memory: None,
-                controller: &controller,
-                job_store: None,
-            },
-        )
-        .await;
-
-        assert_eq!(
-            output,
-            "Berechtigung verweigert: /plugins erfordert Maintainer; aktuelle Stufe ist Operator"
-        );
     }
 
     #[test]
@@ -5246,63 +3675,6 @@ forbidden = [{forbidden}]
     }
 
     #[test]
-    fn session_id_mapper_is_stable_and_opaque() {
-        let root = std::path::Path::new("/workspace/project-alpha");
-        let first = session_id_for_canonical_project_root(root);
-        let second = session_id_for_canonical_project_root(root);
-        assert_eq!(first, second);
-        assert!(!first.as_str().contains("project-alpha"));
-        assert!(
-            !first.as_str().starts_with("local-tui:"),
-            "derived TUI session IDs must not use the legacy colon separator"
-        );
-
-        let hash = first
-            .as_str()
-            .strip_prefix("local-tui-")
-            .expect("derived TUI session IDs use the portable local-tui- prefix");
-        assert_eq!(hash.len(), 16);
-        assert!(
-            hash.bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-            "derived TUI session ID hash must be lowercase hexadecimal"
-        );
-    }
-
-    #[test]
-    fn session_id_mapper_separates_project_roots() {
-        assert_ne!(
-            session_id_for_canonical_project_root(std::path::Path::new("/workspace/a")),
-            session_id_for_canonical_project_root(std::path::Path::new("/workspace/b")),
-        );
-    }
-
-    #[test]
-    fn explicit_session_id_overrides_project_derived_id() {
-        let explicit = SessionId::from_str("resume-this-exact-session");
-        assert_eq!(
-            selected_session_id(
-                std::path::Path::new("/workspace/unrelated-project"),
-                Some(explicit.clone()),
-            ),
-            explicit,
-        );
-    }
-
-    #[test]
-    fn ordinary_starts_create_distinct_sessions_for_the_same_project() {
-        let root = std::path::Path::new("/workspace/project");
-        let first = selected_session_id(root, None);
-        let second = selected_session_id(root, None);
-        assert_ne!(first, second);
-        assert!(
-            first
-                .as_str()
-                .starts_with(session_id_for_canonical_project_root(root).as_str())
-        );
-    }
-
-    #[test]
     fn resume_command_becomes_a_runtime_request_only_for_valid_shapes() {
         assert_eq!(
             resume_request("/resume"),
@@ -5375,7 +3747,7 @@ forbidden = [{forbidden}]
             SessionId::from_str("resumed-session"),
             AgentRole::Assistant,
             None,
-            harw_extension_api::ExtensionRegistry::builder().build(),
+            ExtensionRegistry::builder().build(),
             event_tx,
         );
         let mut app = test_chat_app();
@@ -5406,42 +3778,6 @@ forbidden = [{forbidden}]
         ] {
             assert!(!visible.contains(secret));
         }
-    }
-
-    #[test]
-    fn tui_registry_discovery_failure_is_typed_and_fail_closed() {
-        let missing_root = std::env::temp_dir().join(format!(
-            "harw-tui-missing-project-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("system clock must be after the Unix epoch")
-                .as_nanos()
-        ));
-
-        let error = match assemble_tui_registry(missing_root) {
-            Ok(_) => panic!("missing project must fail"),
-            Err(error) => error,
-        };
-
-        match error {
-            TuiError::Core(message) => {
-                assert!(message.contains("could not assemble default registry"));
-                assert!(message.contains("project discovery failed"));
-            }
-            TuiError::Io(_) => panic!("registry discovery must use the typed core error path"),
-            TuiError::ContextProviderRegistration(_) => {
-                panic!("registry discovery failure is not a provider-namespace error")
-            }
-        }
-    }
-
-    #[test]
-    fn tui_context_root_alignment_accepts_the_shared_project_root() {
-        let root = std::path::Path::new("/workspace/project");
-
-        ensure_tui_context_roots_align(root, root)
-            .expect("a shared project root must be safe to start");
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -5533,27 +3869,32 @@ forbidden = [{forbidden}]
         }
     }
 
-    /// Baut eine Session **wie `build_session_runtime`**: die `DefaultApprovalPolicy`
-    /// entscheidet, der TUI-Handler wird über [`registry_with_approval_handler`]
-    /// dahinter gehängt, und der Spawn-Kontext stammt aus
-    /// [`trusted_tui_spawn_context`] (und trägt damit den Approval-Actor).
+    /// Baut eine Session mit derselben Freigabekette wie die Laufzeit-Montage:
+    /// `DefaultApprovalPolicy` entscheidet zuerst, der TUI-Handler hängt direkt
+    /// dahinter (W2d-2/T2b — Test-lokaler Ersatz für das gelöschte
+    /// `registry_with_approval_handler`: beide Handler werden in einem
+    /// Builder-Aufruf in genau dieser Reihenfolge registriert, statt eine
+    /// Basis-Registry nachträglich um den TUI-Handler zu erweitern). Der
+    /// Spawn-Kontext kommt aus [`test_spawn_context`] und trägt damit den
+    /// Approval-Actor.
     fn approval_test_session(
         handler: &Arc<TuiApprovalHandler>,
         executions: &Arc<AtomicUsize>,
         sandbox: &SandboxSpec,
     ) -> AgentSession {
-        let base = ExtensionRegistry::builder()
+        let registered = as_dyn_approval_handler(handler);
+        let registry = ExtensionRegistry::builder()
             .tool_provider(Arc::new(CountingToolProvider {
                 executions: Arc::clone(executions),
             }))
-            .approval_handler(Arc::new(harw_registry_defaults::DefaultApprovalPolicy))
+            .approval_handler(Arc::new(harw_registry_defaults::DefaultApprovalPolicy::new(
+                ApprovalModeCell::default(),
+            )))
+            .approval_handler(registered)
             .build();
-        let registered = as_dyn_approval_handler(handler);
-        let registry = registry_with_approval_handler(base, registered)
-            .expect("test registry has no namespace collision");
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
         AgentSession::new(AgentRole::Assistant, None, registry, event_tx)
-            .with_spawn_context(trusted_tui_spawn_context(sandbox))
+            .with_spawn_context(test_spawn_context(sandbox))
     }
 
     /// Ergebnis eines headless getriebenen Freigabeturns.
@@ -5658,56 +3999,6 @@ forbidden = [{forbidden}]
             driven.executions, 0,
             "eine Ablehnung darf das Werkzeug nicht ausführen"
         );
-    }
-
-    /// Bedingung 2: derselbe `Arc` liegt in der Registry und im Treiber, und er
-    /// wird **hinter** die bestehende Politik gehängt.
-    #[test]
-    fn tui_approval_handler_is_appended_behind_the_existing_policy() {
-        let base = ExtensionRegistry::builder()
-            .approval_handler(Arc::new(harw_registry_defaults::DefaultApprovalPolicy))
-            .build();
-        let (handler, _prompts) = TuiApprovalHandler::new();
-        let driver = ApprovalDriver::new(Arc::clone(&handler));
-        let registered = as_dyn_approval_handler(&handler);
-
-        let registry = registry_with_approval_handler(base, registered)
-            .expect("test registry has no namespace collision");
-
-        assert_eq!(
-            registry.approval_handlers().len(),
-            2,
-            "die bestehende Politik darf nicht ersetzt werden"
-        );
-        let expected = as_dyn_approval_handler(driver.handler());
-        assert!(
-            Arc::ptr_eq(&registry.approval_handlers()[1], &expected),
-            "Registry und Treiber müssen denselben Handler halten"
-        );
-    }
-
-    /// Der Handler-Umbau darf keinen anderen Registry-Beitrag verlieren.
-    #[test]
-    fn appending_the_approval_handler_preserves_every_other_contribution() {
-        let executions = Arc::new(AtomicUsize::new(0));
-        let base = ExtensionRegistry::builder()
-            .tool_provider(Arc::new(CountingToolProvider {
-                executions: Arc::clone(&executions),
-            }))
-            .build();
-        let (handler, _prompts) = TuiApprovalHandler::new();
-
-        let registered = as_dyn_approval_handler(&handler);
-        let registry = registry_with_approval_handler(base, registered)
-            .expect("test registry has no namespace collision");
-
-        assert_eq!(registry.tool_providers().len(), 1);
-        let names: Vec<String> = registry.tool_providers()[0]
-            .tools()
-            .into_iter()
-            .map(|tool| tool.name().to_owned())
-            .collect();
-        assert_eq!(names, vec![APPROVAL_TEST_TOOL.to_owned()]);
     }
 
     /// Bedingung 3: nur ein ausdrückliches `y` gibt frei.
@@ -5831,155 +4122,68 @@ forbidden = [{forbidden}]
         }
     }
 
-    // ────────────────────────────────────────────────────────────────────
-    // AP W5-04 — rollenspezifische Kind-Registry.
-    // ────────────────────────────────────────────────────────────────────
-
-    fn test_child_registry_factory() -> (TuiChildRegistryFactory, std::path::PathBuf) {
-        let cwd = match std::env::current_dir() {
-            Ok(cwd) => cwd,
-            Err(error) => panic!("test cwd must be readable: {error}"),
-        };
-        let assembled = match assemble_tui_registry(cwd.clone()) {
-            Ok(assembled) => assembled,
-            Err(error) => panic!("the workspace must be a discoverable project: {error}"),
-        };
-        let project_root = assembled.project.project_root.clone();
-        let model: Arc<dyn ModelProvider> = Arc::new(harw_core::EchoModelProvider::new("ok"));
-        let factory = match TuiChildRegistryFactory::new(&cwd, &project_root, model) {
-            Ok(factory) => factory,
-            Err(error) => panic!("the builtin agent definitions must lower: {error}"),
-        };
-        (factory, project_root)
-    }
-
-    fn test_spawn_input() -> SpawnInput {
-        SpawnInput {
-            parent_session_id: SessionId::new(),
-            handoff_call_id: ToolCallId::new(),
-            instructions: Some("erkunde das Projekt".to_owned()),
-            context: Default::default(),
-            // Keine eigene Deckenforderung: erbt die Decke des Elternteils.
-            ceiling: None,
-        }
-    }
-
-    fn registered_tool_names(registry: &ExtensionRegistry) -> Vec<String> {
-        registry
-            .tool_providers()
+    /// TUI-Berechtigungen (E4: lokaler Principal-Tier `Operator`, siehe
+    /// CONTRACTS-W2d2 §4). W2d-2/T2b: `LOCAL_TUI_OPERATION_PERMISSION` ist mit
+    /// der Montage entfallen — die Produktionsfläche löst die Stufe jetzt über
+    /// `runtime_commands::caller_tier(rt.principal())` auf, deren Ergebnis für
+    /// den lokalen TUI-Principal laut E4 `PermissionTier::Operator` ist; dieser
+    /// Test benutzt denselben Wert direkt. `CommandServices` ist durch die
+    /// Closure `F: FnOnce() -> ServiceMap` ersetzt (CE, CONTRACTS-W2d2 §1.2).
+    #[tokio::test]
+    async fn local_tui_permissions_are_accessible_but_maintainer_commands_are_blocked() {
+        let sandbox = test_sandbox();
+        let operations = test_operations();
+        let adapters = operations
             .iter()
-            .flat_map(|provider| provider.tools())
-            .map(|tool| tool.name().to_owned())
-            .collect()
-    }
+            .flat_map(|operation| CommandAdapter::from_operation(Arc::clone(operation)))
+            .collect::<Vec<_>>();
+        let controller = Arc::new(TuiSessionController::new());
 
-    /// Kernanforderung W5-04: die Explorer-Registry kennt weder `fs.write` noch
-    /// `shell.exec` — namentlich geprüft, nicht nur über das Profil.
-    #[test]
-    fn explorer_child_registry_has_no_write_and_no_shell_tool() {
-        let (factory, _project_root) = test_child_registry_factory();
+        let permissions = execute_command_as(
+            &adapters,
+            &sandbox,
+            &SessionId::new(),
+            harw_operations::PermissionTier::Operator,
+            "/permissions",
+            || build_services(&adapters, None, None, &controller, None),
+        )
+        .await;
+        assert!(permissions.contains("Freigabemodus"), "{permissions}");
+        assert!(permissions.contains("ask|auto|full"), "{permissions}");
 
-        let registry = match factory.build_registry(role_names::EXPLORER, &test_spawn_input(), None)
-        {
-            Ok(registry) => registry,
-            Err(error) => panic!("the explorer role must assemble: {}", error.message),
-        };
+        let output = execute_command_as(
+            &adapters,
+            &sandbox,
+            &SessionId::new(),
+            harw_operations::PermissionTier::Operator,
+            "/plugins",
+            || build_services(&adapters, None, None, &controller, None),
+        )
+        .await;
 
-        let names = registered_tool_names(&registry);
-        assert!(
-            !names.iter().any(|name| name == "fs.write"),
-            "der Explorer darf `fs.write` nicht sehen, sah: {names:?}"
-        );
-        assert!(
-            !names.iter().any(|name| name == "shell.exec"),
-            "der Explorer darf `shell.exec` nicht sehen, sah: {names:?}"
-        );
-        assert!(
-            names.iter().any(|name| name == "fs.read"),
-            "der Explorer muss lesend arbeiten können, sah: {names:?}"
-        );
-    }
-
-    /// Die Rolle-→-Profil-Zuordnung stammt ausschließlich aus
-    /// `harw-registry-defaults`; eine unbekannte Rolle bekommt das
-    /// Eltern-Profil, nie mehr.
-    #[test]
-    fn child_registry_profiles_come_from_the_shared_role_mapping() {
-        let (factory, _project_root) = test_child_registry_factory();
-
-        for role in role_names::ALL {
-            let registry = match factory.build_registry(role, &test_spawn_input(), None) {
-                Ok(registry) => registry,
-                Err(error) => panic!("role '{role}' must assemble: {}", error.message),
-            };
-            let names = registered_tool_names(&registry);
-            assert!(
-                !names.iter().any(|name| name == "shell.exec"),
-                "keine eingebaute Rolle darf `shell.exec` sehen ({role}): {names:?}"
-            );
-            assert!(
-                factory.executable_agent_ir(role).is_some(),
-                "jede eingebaute Rolle muss ihre Agent-IR mitbringen ({role})"
-            );
-        }
-
-        // Eine konfigurierte, nicht eingebaute Rolle fällt auf das volle
-        // Eltern-Profil zurück — und bringt keine eingebaute IR mit.
-        let fallback = match factory.build_registry("worker", &test_spawn_input(), None) {
-            Ok(registry) => registry,
-            Err(error) => panic!("a configured role must assemble: {}", error.message),
-        };
-        assert!(
-            registered_tool_names(&fallback)
-                .iter()
-                .any(|name| name == "fs.write"),
-            "eine konfigurierte Rolle behält den Werkzeugsatz des Elternteils"
-        );
-        assert!(factory.executable_agent_ir("worker").is_none());
-    }
-
-    /// Die Kind-Grenzen kommen aus dem Laufzeitprofil des gewählten Modells und
-    /// können die konservative Grenze nur senken.
-    #[test]
-    fn child_limits_are_derived_monotonically_from_the_runtime_profile() {
-        let mut config = harw_config::ResolvedConfig::default();
         assert_eq!(
-            tui_child_limits(&config),
-            ChildLimits::conservative(),
-            "ohne Default-Modell bleibt es bei der konservativen Grenze"
+            output,
+            "Berechtigung verweigert: /plugins erfordert Maintainer; aktuelle Stufe ist Operator"
         );
-
-        config.harness.default_model = Some("claude-opus-4-8".to_owned());
-        let limits = tui_child_limits(&config);
-        let conservative = ChildLimits::conservative();
-        assert!(
-            limits.max_active_children_per_parent <= conservative.max_active_children_per_parent,
-            "die Ableitung darf nur senken"
-        );
-        assert!(limits.max_active_children_per_parent >= 1);
-        assert_eq!(limits.max_depth, conservative.max_depth);
-        assert_eq!(limits.lease_seconds, conservative.lease_seconds);
     }
 
-    // ────────────────────────────────────────────────────────────────────
-    // AP W5-05 — `/mode` an der Turn-Grenze.
-    // ────────────────────────────────────────────────────────────────────
-
-    /// `/mode explore` wirkt genau an der Turn-Grenze — vorher nicht, nachher
-    /// vollständig — und erscheint danach in der Statuszeile.
+    /// `/mode` an der Turn-Grenze (AP W5-05). W2d-2/T2b: die Session wird über
+    /// `AgentSession::new_with_id(..).with_spawn_context(..).with_turn_event_sink(..)`
+    /// gebaut statt über das gelöschte `build_tui_agent_session`.
     #[test]
     fn mode_request_is_applied_at_the_turn_boundary() {
         let sandbox = test_sandbox();
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
         let (turn_event_tx, _turn_event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut session = build_tui_agent_session(
+        let mut session = AgentSession::new_with_id(
             SessionId::new(),
-            harw_extension_api::ExtensionRegistry::builder().build(),
-            event_tx,
-            turn_event_tx,
-            &sandbox,
+            AgentRole::Assistant,
             None,
-        );
+            ExtensionRegistry::builder().build(),
+            event_tx,
+        )
+        .with_spawn_context(test_spawn_context(&sandbox))
+        .with_turn_event_sink(turn_event_tx);
         let controller = Arc::new(TuiSessionController::new());
         let mut app = ChatApp::new(Vec::new(), sandbox, SessionId::new())
             .with_session_controller(Arc::clone(&controller));
@@ -6022,14 +4226,15 @@ forbidden = [{forbidden}]
         let sandbox = test_sandbox();
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
         let (turn_event_tx, _turn_event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut session = build_tui_agent_session(
+        let mut session = AgentSession::new_with_id(
             SessionId::new(),
-            harw_extension_api::ExtensionRegistry::builder().build(),
-            event_tx,
-            turn_event_tx,
-            &sandbox,
+            AgentRole::Assistant,
             None,
-        );
+            ExtensionRegistry::builder().build(),
+            event_tx,
+        )
+        .with_spawn_context(test_spawn_context(&sandbox))
+        .with_turn_event_sink(turn_event_tx);
         let controller = Arc::new(TuiSessionController::new());
         let mut app = ChatApp::new(Vec::new(), sandbox, SessionId::new())
             .with_session_controller(Arc::clone(&controller));
@@ -6196,27 +4401,6 @@ forbidden = [{forbidden}]
         let app = test_chat_app();
 
         assert!(goal_cell_for_command(&app, "/goal check").is_none());
-    }
-
-    #[test]
-    fn tui_context_root_alignment_rejects_mismatched_prompt_and_tool_roots() {
-        let error = ensure_tui_context_roots_align(
-            std::path::Path::new("/workspace/prompt-project"),
-            std::path::Path::new("/workspace/tool-project"),
-        )
-        .expect_err("mismatched prompt and tool roots must fail closed");
-
-        match error {
-            TuiError::Core(message) => {
-                assert!(message.contains("mismatched prompt discovery root"));
-                assert!(message.contains("/workspace/prompt-project"));
-                assert!(message.contains("/workspace/tool-project"));
-            }
-            TuiError::Io(_) => panic!("root mismatch must use the typed core error path"),
-            TuiError::ContextProviderRegistration(_) => {
-                panic!("root mismatch is not a provider-namespace error")
-            }
-        }
     }
 }
 

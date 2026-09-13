@@ -1,9 +1,12 @@
 //! Die eine Montage aller `harw`-Einstiege (`RuntimeAssembly`).
 //!
 //! # Beschreibung
-//! Neun Einstiegspfade bauten die Laufzeit bisher je selbst zusammen
-//! (`harw-tui/src/app.rs:1297-2509`, `harw-cli/src/{chat,main,web,gateway,
-//! job_worker}.rs`). Sie unterschieden sich dabei in Dingen, die sich nicht
+//! Neun Einstiegspfade bauten die Laufzeit bis Welle W2d-2 je selbst zusammen
+//! (die TUI-Montage in `harw-tui/src/app.rs` und die Montagen in
+//! `harw-cli/src/{chat,main,web,gateway,job_worker}.rs`; seither rufen die
+//! Einstiege [`RuntimeAssembly::builder`], etwa `run_tui` in
+//! `harw-tui/src/runtime_root.rs` und `job_assembly` in
+//! `harw-cli/src/runtime_jobs.rs`). Sie unterschieden sich dabei in Dingen, die sich nicht
 //! unterscheiden dürfen: Sandbox-Rechte wurden literal hingeschrieben statt
 //! aus dem Einstieg abgeleitet, die Wurzeldecke gab es in zwei Fassungen, der
 //! Wurzel-Trace entstand vier Mal innerhalb des Spawn-Kontexts (G-044), die
@@ -14,10 +17,15 @@
 //! Reihenfolge ist Teil des Vertrags, weil jeder Schritt den nächsten
 //! begrenzt:
 //!
+//! 0. [`RuntimeAssemblyBuilder::narrowing`] — die Verengung des Aufrufers
+//!    wird gegen die Profil-Whitelist geprüft, bevor etwas geladen wird.
 //! 1. [`load_config`] — Konfiguration **mit** Vertrauensbericht.
 //! 2. [`discover_project`] — **genau einmal**; jeder spätere Bedarf
 //!    (Kind-Registries) benutzt das Ergebnis.
-//! 3. [`root_sandbox`] — Rechte ausschließlich aus [`EntryKind::profile`].
+//! 3. [`root_sandbox`] — Rechte ausschließlich aus [`EntryKind::profile`],
+//!    gegebenenfalls geschnitten mit [`RuntimeNarrowing::permissions`];
+//!    gebunden an den erkannten Projekt-Root oder an den engeren
+//!    [`RuntimeNarrowing::workspace_root`].
 //! 4. [`root_ceiling`] — eine Wurzeldecke je [`CeilingPolicy`].
 //! 5. [`new_root_trace`] + **ein** [`SpawnContext`], geklont für Sitzung und
 //!    Spawner: Wurzel-Turn und Kinder hängen an derselben `trace_id`.
@@ -38,12 +46,14 @@
 //! [`RuntimeServicesParts::spawner`] ist ein Feld, das bei der Konstruktion
 //! feststeht (G-061 verlangt den Spawner auf der Slash-Fläche), der
 //! Kind-Fabrik-Konstruktor braucht den bereits gebauten Modellanbieter
-//! (`harw-tui/src/app.rs:1885`), und ein Contributor, der nach der
+//! ([`RuntimeChildRegistryFactory::with_definitions`] in `build_spawner`),
+//! und ein Contributor, der nach der
 //! Service-Montage liefe, könnte weder Operation noch Werkzeug beisteuern.
 //! Modell → Spawner → Contributors → Services ist deshalb die einzige
 //! Ordnung, in der jeder Schritt auf fertigen Eingaben steht.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -68,11 +78,13 @@ use harw_protocol::events::{SessionEvent, TurnEvent};
 use harw_provider_http::SecretResolver;
 use harw_registry_defaults::embedded_agents::builtin_agent_definitions;
 use harw_registry_defaults::profile::{
-    IdentityOverrides, assemble_registry_for_project, role_names,
+    IdentityOverrides, RegistryProfile, assemble_registry_for_project, role_names,
 };
-use harw_sandbox::{NetworkScope, SandboxSpec};
+use harw_sandbox::{
+    NetworkScope, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+};
 use harw_session_store::{ApprovalStore, JobStore};
-use harw_types::{AgentRole, Principal, SessionId, TurnId};
+use harw_types::{AgentRole, Principal, SessionId, TenantId, TurnId, WorkspaceId};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::approval::ApprovalChain;
@@ -307,6 +319,230 @@ fn root_activation(ir: Option<&ExecutableAgentIr>) -> SessionActivation {
     activation
 }
 
+/// Eine Verengung, die der Aufrufer über die Rechte seines Einstiegs legt.
+///
+/// # Beschreibung
+/// Manche Einstiege führen innerhalb ihrer Zeile der Reduktionstabelle
+/// ([`EntryKind::profile`]) Arbeit aus, die **weniger** dürfen soll — etwa ein
+/// Plan-Knoten-Job, dessen Knotenart nur lesend recherchiert (CONTRACTS-W2d2
+/// §1.1, E10). Eine `RuntimeNarrowing` beschreibt diese Verengung auf vier
+/// Achsen und kann Rechte **nie erweitern**:
+///
+/// - `registry_profile`: der Werkzeugsatz. Erlaubt ist nur, was die
+///   Profil-Whitelist des Einstiegs zulässt (siehe
+///   [`RuntimeAssemblyBuilder::narrowing`]); alles andere bricht den Bau ab.
+/// - `identity`: ersetzt die Vorgabe-Identität der Registry vollständig;
+///   ein gesetztes [`RuntimeSpec::active_agent`] behält Vorrang beim
+///   Agentennamen.
+/// - `permissions`: Obergrenze der Sandbox-Rechte; die Wurzel-Sandbox wird mit
+///   ihr **geschnitten** ([`SandboxSpec::restrict`]), nie ersetzt.
+/// - `workspace_root`: bindet die Wurzel-Sandbox an genau dieses Verzeichnis
+///   statt an den erkannten Projekt-Root. Der kanonische Pfad muss gleich dem
+///   kanonischen Projekt-Root oder ein Nachfahre davon sein (Vergleich über
+///   Pfad-Komponenten); Projekterkennung, Konfiguration und Vertrauensbericht
+///   bleiben am erkannten Projekt.
+///
+/// Aktivierung, Spawner-Politik und Freigabekette bleiben unberührt.
+///
+/// # Nebenläufigkeit
+/// Reiner Wert (`Clone`), `Send + Sync`.
+#[derive(Debug, Clone)]
+pub struct RuntimeNarrowing {
+    /// Gewünschter Werkzeugsatz; muss in der Whitelist des Einstiegsprofils liegen.
+    pub registry_profile: RegistryProfile,
+    /// Identität der Registry; ersetzt die Vorgabe des Einstiegs.
+    pub identity: IdentityOverrides,
+    /// Obergrenze der Sandbox-Rechte; wird mit den Profilrechten geschnitten.
+    pub permissions: PermissionSet,
+    /// Bindet die Root-Sandbox an genau dieses Verzeichnis statt an den erkannten Projekt-Root.
+    /// Muss kanonisch gleich dem erkannten Root oder ein Nachfahre davon sein (nur enger), sonst
+    /// [`RuntimeError::Sandbox`].
+    pub workspace_root: Option<PathBuf>,
+}
+
+/// Mandant und Alias der reinen Enthaltenseins-Prüfung in [`sandbox_root`].
+///
+/// Die Registry dieser Prüfung lebt nur für die Dauer des Aufrufs; die
+/// eigentliche Bindung entsteht danach über [`root_sandbox`] mit dem
+/// Mandanten des Einstiegs.
+const NARROWED_ROOT_TENANT: &str = "narrowing";
+/// Workspace-Alias der Enthaltenseins-Prüfung (siehe [`NARROWED_ROOT_TENANT`]).
+const NARROWED_ROOT_WORKSPACE: &str = "workspace-root";
+
+/// Das Verzeichnis, an das die Wurzel-Sandbox gebunden wird.
+///
+/// # Beschreibung
+/// Ohne [`RuntimeNarrowing::workspace_root`] ist das der erkannte
+/// `project_root`. Mit ihm wird der verlangte Pfad über
+/// [`WorkspaceRegistry::build`] mit `project_root` als Harness-Root
+/// kanonisiert: dieselbe Mechanik, die jede Sandbox-Bindung benutzt
+/// (einmal `canonicalize`, Verzeichnisprüfung, Komponenten-Vergleich
+/// `starts_with` gegen den kanonischen Harness-Root). Es entsteht keine
+/// eigene Symlink-Auflösung. Gleichheit mit dem Projekt-Root ist erlaubt,
+/// jeder Pfad außerhalb wird abgelehnt.
+///
+/// Relative Pfade werden fail-closed abgelehnt: sie hätten sonst eine
+/// stille Basis (den Projekt-Root), die der Aufrufer nicht benannt hat.
+///
+/// # Fehler
+/// [`RuntimeError::Sandbox`], wenn der Pfad relativ ist, nicht existiert,
+/// kein Verzeichnis ist oder außerhalb des erkannten Projekt-Roots liegt.
+fn sandbox_root(
+    project_root: &Path,
+    narrowing: Option<&RuntimeNarrowing>,
+) -> RuntimeResult<PathBuf> {
+    let Some(requested) = narrowing.and_then(|narrowing| narrowing.workspace_root.as_deref())
+    else {
+        return Ok(project_root.to_path_buf());
+    };
+    if !requested.is_absolute() {
+        return Err(RuntimeError::Sandbox {
+            detail: format!(
+                "refusing to bind the root sandbox to the relative workspace root {}: \
+                 a narrowed workspace root must be absolute",
+                requested.display()
+            ),
+        });
+    }
+    let tenant = TenantId::from_str(NARROWED_ROOT_TENANT);
+    let workspace = WorkspaceId::from_str(NARROWED_ROOT_WORKSPACE);
+    let registry = WorkspaceRegistry::build(
+        project_root,
+        [WorkspaceRegistration {
+            tenant: tenant.clone(),
+            workspace: workspace.clone(),
+            root: requested.to_path_buf(),
+        }],
+    )
+    .map_err(|error| RuntimeError::Sandbox {
+        detail: format!(
+            "refusing to bind the root sandbox to workspace root {}: it must be the discovered \
+             project root {} or a directory below it: {error}",
+            requested.display(),
+            project_root.display()
+        ),
+    })?;
+    let binding = registry
+        .resolve(&tenant, &workspace)
+        .map_err(|error| RuntimeError::Sandbox {
+            detail: format!(
+                "could not resolve the narrowed workspace root {}: {error}",
+                requested.display()
+            ),
+        })?;
+    Ok(binding.canonical_root().to_path_buf())
+}
+
+/// Stellt sicher, dass die gebaute Sandbox genau an `expected` gebunden ist.
+///
+/// # Beschreibung
+/// [`root_sandbox`] kanonisiert den übergebenen, bereits kanonischen Pfad
+/// erneut. Wurde zwischen beiden Schritten eine Pfadkomponente ausgetauscht,
+/// wiche die Bindung ab; das wird hier fail-closed abgefangen.
+///
+/// # Fehler
+/// [`RuntimeError::Sandbox`] bei jeder Abweichung.
+fn ensure_bound_to(sandbox: &SandboxSpec, expected: &Path) -> RuntimeResult<()> {
+    let bound = sandbox.workspace().canonical_root();
+    if bound == expected {
+        Ok(())
+    } else {
+        Err(RuntimeError::Sandbox {
+            detail: format!(
+                "the root sandbox is bound to {} but the narrowed workspace root is {}",
+                bound.display(),
+                expected.display()
+            ),
+        })
+    }
+}
+
+/// Prüft eine gewünschte Werkzeugsatz-Verengung gegen das Einstiegsprofil.
+///
+/// # Beschreibung
+/// Fail-closed Whitelist (CONTRACTS-W2d2 §1.1): Einstieg `Full` erlaubt
+/// `Full | ReadOnlyExplore | NoTools`, Einstieg `NoTools` nur `NoTools`, jede
+/// andere Kombination wird abgelehnt. Das `match` ist bewusst ohne
+/// Auffang-Arm im ersten Tupelelement: eine neue [`RegistryProfile`]-Variante
+/// bricht den Compiler, statt still zugelassen zu werden.
+///
+/// `ReadOnlyExplore` ist **keine** Werkzeug-Teilmenge von `Full`: es bringt
+/// `deps.*` mit, das `Full` nicht registriert. Die Whitelist bleibt trotzdem
+/// wie vertraglich festgelegt; abgesichert wird über die Sandbox, weil kein
+/// Einstiegsprofil [`harw_sandbox::Permission::ReadCargoRegistry`] trägt und
+/// die geschnittene Sandbox dieses Recht deshalb nie erhalten kann.
+///
+/// # Fehler
+/// [`RuntimeError::Registry`] für jede nicht zugelassene Kombination.
+fn narrowed_registry_profile(
+    entry: EntryKind,
+    entry_profile: RegistryProfile,
+    requested: RegistryProfile,
+) -> RuntimeResult<RegistryProfile> {
+    use RegistryProfile::{Full, NoTools, Planning, ReadOnlyExplore, Research};
+
+    match (entry_profile, requested) {
+        (Full, Full | ReadOnlyExplore | NoTools) | (NoTools, NoTools) => Ok(requested),
+        (Full, Research | Planning)
+        | (NoTools, Full | ReadOnlyExplore | Research | Planning)
+        | (ReadOnlyExplore | Research | Planning, _) => Err(RuntimeError::Registry {
+            detail: format!(
+                "refusing to narrow entry {entry:?} from registry profile {entry_profile:?} \
+                 to {requested:?}: a narrowing may only reduce the tool set"
+            ),
+        }),
+    }
+}
+
+/// Schneidet die Wurzel-Sandbox mit der Rechte-Obergrenze einer Verengung.
+///
+/// # Beschreibung
+/// Ohne Verengung bleibt `sandbox` unverändert. Mit Verengung entsteht
+/// `sandbox.restrict(&narrowing.permissions)`; das Ergebnis wird zusätzlich
+/// gegen die Profilrechte geprüft, damit auch eine künftige Änderung an
+/// [`root_sandbox`] oder [`SandboxSpec::restrict`] nie still mehr Rechte
+/// ergibt, als die Tabelle dem Einstieg zuspricht.
+///
+/// # Fehler
+/// [`RuntimeError::Sandbox`], wenn das Ergebnis die Profilrechte überschreitet.
+fn narrowed_sandbox(
+    sandbox: SandboxSpec,
+    profile: &EntryProfile,
+    narrowing: Option<&RuntimeNarrowing>,
+) -> RuntimeResult<SandboxSpec> {
+    let sandbox = match narrowing {
+        Some(narrowing) => sandbox.restrict(&narrowing.permissions),
+        None => sandbox,
+    };
+    if sandbox.permissions().is_subset_of(&profile.permissions) {
+        Ok(sandbox)
+    } else {
+        Err(RuntimeError::Sandbox {
+            detail: format!(
+                "the root sandbox permissions {:?} exceed the entry profile permissions {:?}",
+                sandbox.permissions(),
+                profile.permissions
+            ),
+        })
+    }
+}
+
+/// Die Registry-Identität des Wurzel-Agenten.
+///
+/// # Beschreibung
+/// Ohne Verengung: Vorgabe-Identität mit `agent_name = spec.active_agent`.
+/// Mit Verengung: deren `identity` ersetzt die Vorgabe; ein gesetztes
+/// `active_agent` hat beim Agentennamen Vorrang.
+fn root_identity(spec: &RuntimeSpec, narrowing: Option<&RuntimeNarrowing>) -> IdentityOverrides {
+    let mut identity = narrowing
+        .map(|narrowing| narrowing.identity.clone())
+        .unwrap_or_default();
+    if spec.active_agent.is_some() || narrowing.is_none() {
+        identity.agent_name.clone_from(&spec.active_agent);
+    }
+    identity
+}
+
 /// Baut eine [`RuntimeAssembly`] Schritt für Schritt.
 ///
 /// # Beschreibung
@@ -326,6 +562,9 @@ pub struct RuntimeAssemblyBuilder {
     /// Löst `secrets:`-Referenzen beim Bau von [`ModelSource::Configured`]
     /// auf; ohne ihn schlägt jedes `auth = "secrets:…"` fehl (Befund C2a).
     secret_resolver: Option<Arc<dyn SecretResolver + Send + Sync>>,
+    /// Verengung von Werkzeugsatz, Identität und Sandbox-Rechten durch den
+    /// Aufrufer (CONTRACTS-W2d2 §1.1); `None` heißt „Profil unverändert".
+    narrowing: Option<RuntimeNarrowing>,
 }
 
 impl std::fmt::Debug for RuntimeAssemblyBuilder {
@@ -340,6 +579,13 @@ impl std::fmt::Debug for RuntimeAssemblyBuilder {
             .field("session_events", &self.session_events.is_some())
             .field("contributors", &self.contributors.len())
             .field("secret_resolver", &self.secret_resolver.is_some())
+            .field(
+                "narrowing",
+                &self
+                    .narrowing
+                    .as_ref()
+                    .map(|narrowing| narrowing.registry_profile),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -389,8 +635,10 @@ impl RuntimeAssemblyBuilder {
     /// seiner Konstruktion entgegen (`harw-core/src/session_manager.rs:19`),
     /// also lange bevor [`RuntimeAssembly::new_root_session`] gerufen wird.
     /// Der Aufrufer übergibt denselben Sender, den er später an
-    /// `new_root_session` gibt — genau wie heute im TUI, wo `event_tx` vor
-    /// Spawner **und** Sitzung entsteht (`harw-tui/src/app.rs:2420-2455`).
+    /// `new_root_session` gibt — im TUI-Einstieg etwa legt
+    /// `TuiSessionWiring::install` (`harw-tui/src/runtime_root.rs`) den Sender
+    /// in den Builder, und `run_tui` reicht einen Klon desselben Senders an
+    /// [`RuntimeAssembly::new_root_session`].
     #[must_use]
     pub fn session_events(mut self, events: UnboundedSender<SessionEvent>) -> Self {
         self.session_events = Some(events);
@@ -438,11 +686,44 @@ impl RuntimeAssemblyBuilder {
         self
     }
 
+    /// Legt eine Verengung über die Rechte des Einstiegs.
+    ///
+    /// # Beschreibung
+    /// Fail-closed Bau-Semantik (CONTRACTS-W2d2 §1.1), durchgesetzt in
+    /// [`Self::build`] **vor** jedem anderen Montageschritt:
+    ///
+    /// | Einstiegsprofil | zulässige `registry_profile` |
+    /// |---|---|
+    /// | `Full` | `Full`, `ReadOnlyExplore`, `NoTools` |
+    /// | `NoTools` | `NoTools` |
+    /// | jedes andere | keine |
+    ///
+    /// Die Sandbox wird zu `root_sandbox(entry, root).restrict(&permissions)`
+    /// und liegt damit immer innerhalb der Profilrechte; dieselbe Sandbox
+    /// steht im [`SpawnContext`], Kinder erben also nie mehr. `root` ist der
+    /// erkannte Projekt-Root oder, falls gesetzt, der kanonische
+    /// [`RuntimeNarrowing::workspace_root`] (gleich dem Projekt-Root oder ein
+    /// Nachfahre davon, sonst [`RuntimeError::Sandbox`]).
+    /// `identity` ersetzt die Vorgabe-Identität, [`RuntimeSpec::active_agent`]
+    /// behält Vorrang beim Agentennamen. Aktivierung, Spawner-Politik,
+    /// Freigabekette und [`RuntimeAssembly::profile`] (die unveränderte
+    /// Tabellenzeile) bleiben unberührt.
+    ///
+    /// # Argumente
+    /// - `narrowing` ([`RuntimeNarrowing`]): die Verengung; ein zweiter Aufruf
+    ///   ersetzt den ersten.
+    #[must_use]
+    pub fn narrowing(mut self, narrowing: RuntimeNarrowing) -> Self {
+        self.narrowing = Some(narrowing);
+        self
+    }
+
     /// Montiert den Lauf.
     ///
     /// # Rückgabe
     /// Eine [`RuntimeAssembly`], deren Rechte vollständig aus
-    /// [`EntryKind::profile`] folgen.
+    /// [`EntryKind::profile`] folgen, gegebenenfalls verengt durch
+    /// [`Self::narrowing`].
     ///
     /// # Fehler
     /// - [`RuntimeError::Provider`], wenn [`Self::model`] fehlt oder das
@@ -451,9 +732,15 @@ impl RuntimeAssemblyBuilder {
     /// - [`RuntimeError::Config`] / [`RuntimeError::Trust`] aus
     ///   [`load_config`].
     /// - [`RuntimeError::Discovery`], wenn die Projekterkennung scheitert.
-    /// - [`RuntimeError::Sandbox`] aus [`root_sandbox`].
-    /// - [`RuntimeError::Registry`], wenn die Registry nicht montiert oder ein
-    ///   benannter Agent nicht aufgelöst werden kann.
+    /// - [`RuntimeError::Sandbox`] aus [`root_sandbox`], oder wenn
+    ///   [`RuntimeNarrowing::workspace_root`] relativ ist, nicht existiert oder
+    ///   außerhalb des erkannten Projekt-Roots liegt.
+    /// - [`RuntimeError::Registry`], wenn die Registry nicht montiert, ein
+    ///   benannter Agent nicht aufgelöst werden kann oder eine
+    ///   [`Self::narrowing`] einen nicht zugelassenen Werkzeugsatz verlangt.
+    /// - [`RuntimeError::Sandbox`] auch, wenn die verengte Sandbox die
+    ///   Profilrechte überschritte (konstruktionsbedingt unerreichbar, aber
+    ///   geprüft).
     /// - [`RuntimeError::Spawner`], wenn ein Einstieg mit
     ///   [`SpawnerPolicy::BuiltinRoles`] ohne [`Self::session_events`] gebaut
     ///   wird oder die Wurzelregistrierung scheitert.
@@ -469,6 +756,7 @@ impl RuntimeAssemblyBuilder {
             contributors,
             root_session_id,
             secret_resolver,
+            narrowing,
         } = self;
 
         let model_source = model.ok_or_else(|| RuntimeError::Provider {
@@ -479,6 +767,17 @@ impl RuntimeAssemblyBuilder {
         })?;
 
         let profile = spec.entry.profile();
+
+        // 0. Verengung des Aufrufers — fail-closed, bevor irgendetwas gelesen
+        //    oder gebaut wird (CONTRACTS-W2d2 §1.1).
+        let registry_profile = match narrowing.as_ref() {
+            Some(narrowing) => narrowed_registry_profile(
+                spec.entry,
+                profile.registry_profile,
+                narrowing.registry_profile,
+            )?,
+            None => profile.registry_profile,
+        };
 
         // 1. Konfiguration mit Vertrauensbericht.
         let (config, trust_report) = load_config(&spec)?;
@@ -492,7 +791,17 @@ impl RuntimeAssemblyBuilder {
         })?;
 
         // 3./4. Sandbox und Decke aus dem Einstiegsprofil.
-        let sandbox = root_sandbox(spec.entry, &project.project_root)?;
+        //      Eine Verengung schneidet die Sandbox, sie ersetzt sie nie; ein
+        //      `workspace_root` bindet sie enger (nie außerhalb des Projekts).
+        let bound_root = sandbox_root(&project.project_root, narrowing.as_ref())?;
+        let unrestricted = root_sandbox(spec.entry, &bound_root)?;
+        if narrowing
+            .as_ref()
+            .is_some_and(|narrowing| narrowing.workspace_root.is_some())
+        {
+            ensure_bound_to(&unrestricted, &bound_root)?;
+        }
+        let sandbox = narrowed_sandbox(unrestricted, &profile, narrowing.as_ref())?;
         let ceiling = root_ceiling(profile.ceiling);
 
         // 5. Ein Trace, ein Spawn-Kontext.
@@ -532,12 +841,9 @@ impl RuntimeAssemblyBuilder {
         let activation = root_activation(agent_ir.as_ref());
 
         // 7. Registry: ein Projektkontext, eine Kette.
-        let overrides = IdentityOverrides {
-            agent_name: spec.active_agent.clone(),
-            ..IdentityOverrides::default()
-        };
+        let overrides = root_identity(&spec, narrowing.as_ref());
         let assembled = assemble_registry_for_project(
-            profile.registry_profile,
+            registry_profile,
             &project,
             overrides,
             chain.mode().clone(),
@@ -794,8 +1100,9 @@ fn build_operations(surface: OperationSurface, plan: Option<&PlanServices>) -> O
 /// Der zweite und eigentliche Teil von Z2c-01. Bis W2c legte die Montage jeder
 /// Fläche dieselbe volle Operations-Registry in die `ServiceMap`, und ob eine
 /// Operation dem **Modell** als Werkzeug angeboten wurde, entschied allein der
-/// Einstieg außerhalb der Montage (`harw-tui/src/app.rs:2018-2041`,
-/// `harw-cli/src/chat.rs:779-799`). `Analyze` und `Web`, denen die
+/// Einstieg außerhalb der Montage (die inzwischen entfernten Modell-Tool-
+/// Montagen der TUI in `harw-tui/src/app.rs` und des One-Shot-Pfads in
+/// `harw-cli/src/chat.rs`). `Analyze` und `Web`, denen die
 /// Vertragstabelle „nur Commands" zuspricht, bekamen damit faktisch die volle
 /// Modell-Tool-Fläche.
 ///
@@ -1040,6 +1347,7 @@ impl RuntimeAssembly {
             contributors: Vec::new(),
             root_session_id: None,
             secret_resolver: None,
+            narrowing: None,
         }
     }
 
@@ -1142,6 +1450,44 @@ impl RuntimeAssembly {
     #[must_use]
     pub fn services(&self) -> &RuntimeServices {
         &self.services
+    }
+
+    /// Die Plan-Dienste, die dem Builder übergeben wurden.
+    ///
+    /// # Beschreibung
+    /// Delegiert an [`RuntimeServices::plan`]; es gibt genau eine
+    /// Planungsfläche je Lauf (CONTRACTS-W2d2 §1.1).
+    ///
+    /// # Rückgabe
+    /// `Some(&PlanServices)` nach [`RuntimeAssemblyBuilder::plan_services`],
+    /// sonst `None`.
+    #[must_use]
+    pub fn plan_services(&self) -> Option<&PlanServices> {
+        self.services.plan()
+    }
+
+    /// Das Gedächtnis, das dem Builder übergeben wurde.
+    ///
+    /// # Beschreibung
+    /// Delegiert an [`RuntimeServices::memory`] (CONTRACTS-W2d2 §1.1).
+    ///
+    /// # Rückgabe
+    /// `Some(&Arc<dyn Memory>)` nach [`RuntimeAssemblyBuilder::memory`],
+    /// sonst `None`.
+    #[must_use]
+    pub fn memory(&self) -> Option<&Arc<dyn Memory>> {
+        self.services.memory()
+    }
+
+    /// Die Freigabemodus-Zelle dieses Laufs.
+    ///
+    /// # Beschreibung
+    /// Dieselbe Zelle, die in jeder Service-Map liegt, die die Freigabekette
+    /// liest und die [`Self::new_root_session`] als
+    /// [`RootSession::approval_mode`] ausgibt; Klone teilen ihren Zustand.
+    #[must_use]
+    pub const fn approval_mode(&self) -> &ApprovalModeCell {
+        &self.approval_mode
     }
 
     /// Der Wurzel-Modellanbieter.
@@ -1631,5 +1977,419 @@ mod tests {
     fn test_runtime_assembly_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<RuntimeAssembly>();
+    }
+
+    // ── Accessoren und Verengung (CONTRACTS-W2d2 §1.1, R0) ──────────────────
+
+    /// Ein leeres Projekt mit eigenem Root-Space — dasselbe Muster wie
+    /// `fixture()` in `harw-runtime/tests/rights_matrix.rs`, ohne
+    /// Prozess-Zustand (kein `set_current_dir`, kein `set_var`).
+    struct BuildFixture {
+        _dir: tempfile::TempDir,
+        home: std::path::PathBuf,
+        project: std::path::PathBuf,
+    }
+
+    fn build_fixture() -> BuildFixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&project).expect("project");
+        // Projekt-Marker, damit `discover_project` genau hier stehen bleibt.
+        std::fs::write(project.join("Cargo.toml"), "[workspace]\n").expect("marker");
+        BuildFixture {
+            _dir: dir,
+            home,
+            project,
+        }
+    }
+
+    /// Ein Builder mit Echo-Modell und In-Memory-Verlauf. Nur für Einstiege
+    /// mit [`SpawnerPolicy::None`] baubar (kein `session_events` gesetzt).
+    fn fixture_builder(entry: EntryKind, fixture: &BuildFixture) -> RuntimeAssemblyBuilder {
+        let spec = RuntimeSpec {
+            entry,
+            home: fixture.home.clone(),
+            cwd: fixture.project.clone(),
+            principal: harw_types::Principal::trusted_ingress(
+                harw_types::PrincipalKind::Human,
+                "r0",
+                harw_types::IngressSurface::Tui,
+                harw_types::PermissionTier::Owner,
+            ),
+            mode_override: None,
+            active_agent: None,
+            reasoning_effort: None,
+        };
+        let state_store: Arc<dyn StateStore> = Arc::new(harw_core::InMemoryStateStore::new());
+        RuntimeAssembly::builder(spec)
+            .model(ModelSource::Echo("echo: r0".to_owned()))
+            .stores(RuntimeStores {
+                state_store,
+                job_store: None,
+                approval_store: None,
+            })
+    }
+
+    /// Jede [`harw_sandbox::Permission`] — die weiteste denkbare Obergrenze.
+    fn every_permission() -> PermissionSet {
+        use harw_sandbox::Permission;
+        PermissionSet::from_policy([
+            Permission::ReadWorkspace,
+            Permission::WriteWorkspace,
+            Permission::ExecuteProcess,
+            Permission::NetworkAccess,
+            Permission::ReadSecrets,
+            Permission::ManagePlugins,
+            Permission::ReadCargoRegistry,
+        ])
+    }
+
+    #[test]
+    fn test_plan_services_accessor_returns_builder_input() {
+        let fixture = build_fixture();
+        let findings = Arc::new(harw_plan_bridge::FindingStore::new("/nonexistent/r0/plans"));
+        let plan = PlanServices {
+            plan: Arc::new(harw_plan::InMemoryPlanStore::new()),
+            goal: Arc::new(harw_plan::InMemoryGoalStore::new()),
+            findings: Arc::clone(&findings),
+            plan_config: harw_plan::PlanToolConfig::enabled_defaults(),
+        };
+        let assembly = fixture_builder(EntryKind::LocalEcho, &fixture)
+            .plan_services(plan)
+            .build()
+            .expect("LocalEcho montiert");
+
+        let Some(returned) = assembly.plan_services() else {
+            panic!("plan_services() muss die Builder-Eingabe liefern");
+        };
+        assert!(
+            Arc::ptr_eq(&returned.findings, &findings),
+            "plan_services() liefert genau den übergebenen Wert"
+        );
+        let Some(via_services) = assembly.services().plan() else {
+            panic!("RuntimeServices::plan() muss dieselbe Planungsfläche liefern");
+        };
+        assert!(Arc::ptr_eq(&via_services.findings, &findings));
+    }
+
+    #[test]
+    fn test_memory_accessor_none_without_memory() {
+        let fixture = build_fixture();
+        let assembly = fixture_builder(EntryKind::LocalEcho, &fixture)
+            .build()
+            .expect("LocalEcho montiert");
+        assert!(assembly.memory().is_none());
+        assert!(assembly.services().memory().is_none());
+        assert!(assembly.plan_services().is_none());
+    }
+
+    #[test]
+    fn test_approval_mode_accessor_shares_the_services_cell() {
+        let fixture = build_fixture();
+        let assembly = fixture_builder(EntryKind::LocalEcho, &fixture)
+            .build()
+            .expect("LocalEcho montiert");
+        assert_eq!(assembly.approval_mode().get(), ApprovalMode::Delegated);
+        assembly.approval_mode().set(ApprovalMode::AlwaysAsk);
+        assert_eq!(
+            assembly.services().approval_mode().get(),
+            ApprovalMode::AlwaysAsk,
+            "approval_mode() ist dieselbe Zelle wie in den Service-Maps"
+        );
+    }
+
+    #[test]
+    fn test_narrowing_readonly_on_full_entry_drops_write_tools() {
+        let fixture = build_fixture();
+        let baseline = fixture_builder(EntryKind::LocalEcho, &fixture)
+            .build()
+            .expect("LocalEcho montiert")
+            .rights_snapshot();
+        assert!(baseline.tools.iter().any(|tool| tool == "fs.write"));
+        assert!(baseline.tools.iter().any(|tool| tool == "shell.exec"));
+
+        let narrowed = fixture_builder(EntryKind::LocalEcho, &fixture)
+            .narrowing(RuntimeNarrowing {
+                registry_profile: RegistryProfile::ReadOnlyExplore,
+                identity: IdentityOverrides::default(),
+                permissions: PermissionSet::from_policy([harw_sandbox::Permission::ReadWorkspace]),
+                workspace_root: None,
+            })
+            .build()
+            .expect("Full → ReadOnlyExplore ist zugelassen");
+        let snapshot = narrowed.rights_snapshot();
+
+        assert!(!snapshot.tools.iter().any(|tool| tool == "fs.write"));
+        assert!(!snapshot.tools.iter().any(|tool| tool == "shell.exec"));
+        assert!(snapshot.tools.iter().any(|tool| tool == "fs.read"));
+        let read_only = RegistryProfile::ReadOnlyExplore.registered_tool_names();
+        assert!(
+            snapshot
+                .tools
+                .iter()
+                .all(|tool| read_only.contains(&tool.as_str())),
+            "nur Werkzeuge des Profils ReadOnlyExplore: {:?}",
+            snapshot.tools
+        );
+        assert_eq!(snapshot.permissions, vec!["ReadWorkspace".to_owned()]);
+        assert_eq!(
+            narrowed.spawn_context().sandbox.permissions(),
+            narrowed.sandbox().permissions(),
+            "der Spawn-Kontext trägt dieselbe verengte Sandbox"
+        );
+        assert_eq!(
+            narrowed.profile().registry_profile,
+            RegistryProfile::Full,
+            "die Tabellenzeile selbst bleibt unverändert"
+        );
+    }
+
+    #[test]
+    fn test_narrowing_rejects_full_on_notools_entry() {
+        let fixture = build_fixture();
+        let error = fixture_builder(EntryKind::JobPrompt, &fixture)
+            .narrowing(RuntimeNarrowing {
+                registry_profile: RegistryProfile::Full,
+                identity: IdentityOverrides::default(),
+                permissions: every_permission(),
+                workspace_root: None,
+            })
+            .build()
+            .expect_err("NoTools → Full muss abgelehnt werden");
+        assert!(matches!(error, RuntimeError::Registry { .. }), "{error}");
+
+        // Die übrige Whitelist, geprüft an der reinen Entscheidung.
+        use RegistryProfile::{Full, NoTools, Planning, ReadOnlyExplore, Research};
+        let entry = EntryKind::JobPrompt;
+        for requested in [Full, ReadOnlyExplore, Research, Planning] {
+            assert!(
+                narrowed_registry_profile(entry, NoTools, requested).is_err(),
+                "NoTools → {requested:?}"
+            );
+        }
+        for requested in [Research, Planning] {
+            assert!(
+                narrowed_registry_profile(entry, Full, requested).is_err(),
+                "Full → {requested:?}"
+            );
+        }
+        for entry_profile in [ReadOnlyExplore, Research, Planning] {
+            for requested in RegistryProfile::ALL {
+                assert!(
+                    narrowed_registry_profile(entry, entry_profile, *requested).is_err(),
+                    "{entry_profile:?} → {requested:?}"
+                );
+            }
+        }
+        for requested in [Full, ReadOnlyExplore, NoTools] {
+            assert_eq!(
+                narrowed_registry_profile(entry, Full, requested).ok(),
+                Some(requested)
+            );
+        }
+
+        // NoTools → NoTools montiert und bleibt werkzeuglos.
+        let same = fixture_builder(EntryKind::JobPrompt, &fixture)
+            .narrowing(RuntimeNarrowing {
+                registry_profile: NoTools,
+                identity: IdentityOverrides::default(),
+                permissions: every_permission(),
+                workspace_root: None,
+            })
+            .build()
+            .expect("NoTools → NoTools ist zugelassen");
+        assert!(same.rights_snapshot().tools.is_empty());
+    }
+
+    #[test]
+    fn test_narrowing_permissions_never_exceed_profile() {
+        let fixture = build_fixture();
+        for entry in [
+            EntryKind::LocalEcho,
+            EntryKind::Doctor,
+            EntryKind::Web,
+            EntryKind::McpServe,
+            EntryKind::JobPlanNode,
+        ] {
+            let profile = entry.profile();
+            let assembly = fixture_builder(entry, &fixture)
+                .narrowing(RuntimeNarrowing {
+                    registry_profile: profile.registry_profile,
+                    identity: IdentityOverrides::default(),
+                    permissions: every_permission(),
+                    workspace_root: None,
+                })
+                .build()
+                .unwrap_or_else(|error| panic!("{entry:?} montiert nicht: {error}"));
+            let granted = assembly.sandbox().permissions();
+            assert!(granted.is_subset_of(&profile.permissions), "{entry:?}");
+            assert_eq!(
+                granted,
+                &profile.permissions,
+                "{entry:?}: die weiteste Obergrenze ergibt genau die Profilrechte"
+            );
+            assert_eq!(assembly.spawn_context().sandbox.permissions(), granted);
+            assert!(!granted.contains(harw_sandbox::Permission::NetworkAccess));
+            assert!(!granted.contains(harw_sandbox::Permission::ReadCargoRegistry));
+        }
+
+        // Eine engere Obergrenze schneidet; ein fremdes Recht kommt nie hinzu.
+        let assembly = fixture_builder(EntryKind::LocalEcho, &fixture)
+            .narrowing(RuntimeNarrowing {
+                registry_profile: RegistryProfile::Full,
+                identity: IdentityOverrides::default(),
+                permissions: PermissionSet::from_policy([
+                    harw_sandbox::Permission::ReadWorkspace,
+                    harw_sandbox::Permission::NetworkAccess,
+                ]),
+                workspace_root: None,
+            })
+            .build()
+            .expect("LocalEcho montiert");
+        assert_eq!(
+            assembly.sandbox().permissions(),
+            &PermissionSet::from_policy([harw_sandbox::Permission::ReadWorkspace])
+        );
+    }
+
+    #[test]
+    fn test_root_identity_active_agent_wins_over_narrowing() {
+        let fixture = build_fixture();
+        let mut spec = fixture_builder(EntryKind::LocalEcho, &fixture).spec;
+        let narrowing = RuntimeNarrowing {
+            registry_profile: RegistryProfile::ReadOnlyExplore,
+            identity: IdentityOverrides {
+                agent_name: Some("plan-node".to_owned()),
+                role_description: Some("research node".to_owned()),
+                extra_context: vec!["node 7".to_owned()],
+            },
+            permissions: PermissionSet::empty(),
+            workspace_root: None,
+        };
+
+        let replaced = root_identity(&spec, Some(&narrowing));
+        assert_eq!(replaced.agent_name.as_deref(), Some("plan-node"));
+        assert_eq!(replaced.role_description.as_deref(), Some("research node"));
+        assert_eq!(replaced.extra_context, vec!["node 7".to_owned()]);
+
+        spec.active_agent = Some("explorer".to_owned());
+        let with_agent = root_identity(&spec, Some(&narrowing));
+        assert_eq!(with_agent.agent_name.as_deref(), Some("explorer"));
+        assert_eq!(with_agent.role_description.as_deref(), Some("research node"));
+
+        let default = root_identity(&spec, None);
+        assert_eq!(default.agent_name.as_deref(), Some("explorer"));
+        assert!(default.role_description.is_none());
+    }
+
+    #[test]
+    fn test_narrowing_workspace_root_descendant_binds_sandbox_to_it() {
+        let fixture = build_fixture();
+        let workspace = fixture.project.join("nested").join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let canonical_workspace = workspace.canonicalize().expect("canonical workspace");
+        let canonical_project = fixture.project.canonicalize().expect("canonical project");
+
+        // Projekterkennung ab dem Unterordner endet am markierten Elternprojekt.
+        let mut builder = fixture_builder(EntryKind::JobPlanNode, &fixture);
+        builder.spec.cwd.clone_from(&workspace);
+        let assembly = builder
+            .narrowing(RuntimeNarrowing {
+                registry_profile: RegistryProfile::ReadOnlyExplore,
+                identity: IdentityOverrides::default(),
+                permissions: PermissionSet::from_policy([harw_sandbox::Permission::ReadWorkspace]),
+                workspace_root: Some(workspace.clone()),
+            })
+            .build()
+            .expect("ein Nachfahre des Projekt-Roots ist zugelassen");
+
+        assert_eq!(
+            assembly.project().project_root,
+            canonical_project,
+            "Projekterkennung bleibt am markierten Projekt"
+        );
+        assert_eq!(
+            assembly.sandbox().workspace().canonical_root(),
+            canonical_workspace.as_path(),
+            "die Sandbox ist an den Workspace-Unterordner gebunden"
+        );
+        assert_eq!(
+            assembly.spawn_context().sandbox.workspace().canonical_root(),
+            canonical_workspace.as_path(),
+            "der Spawn-Kontext trägt dieselbe engere Bindung"
+        );
+        assert_eq!(
+            assembly.sandbox().permissions(),
+            &PermissionSet::from_policy([harw_sandbox::Permission::ReadWorkspace])
+        );
+
+        // Gleichheit mit dem Projekt-Root ist ebenfalls zugelassen.
+        let same = fixture_builder(EntryKind::LocalEcho, &fixture)
+            .narrowing(RuntimeNarrowing {
+                registry_profile: RegistryProfile::Full,
+                identity: IdentityOverrides::default(),
+                permissions: every_permission(),
+                workspace_root: Some(fixture.project.clone()),
+            })
+            .build()
+            .expect("der Projekt-Root selbst ist zugelassen");
+        assert_eq!(
+            same.sandbox().workspace().canonical_root(),
+            canonical_project.as_path()
+        );
+    }
+
+    #[test]
+    fn test_narrowing_workspace_root_outside_project_is_rejected() {
+        let fixture = build_fixture();
+        let Some(parent) = fixture.project.parent().map(Path::to_path_buf) else {
+            panic!("das Fixture-Projekt hat ein Elternverzeichnis");
+        };
+        let sibling = parent.join("sibling");
+        std::fs::create_dir_all(&sibling).expect("sibling");
+
+        let narrowing_to = |root: PathBuf| RuntimeNarrowing {
+            registry_profile: RegistryProfile::Full,
+            identity: IdentityOverrides::default(),
+            permissions: every_permission(),
+            workspace_root: Some(root),
+        };
+
+        for (label, root) in [
+            ("Elternverzeichnis", parent.clone()),
+            ("Geschwisterverzeichnis", sibling.clone()),
+            // String-Präfix, aber kein Pfad-Nachfahre: `<tmp>/project` vs. `<tmp>/project-evil`.
+            ("Präfix-Geschwister", {
+                let evil = parent.join("project-evil");
+                std::fs::create_dir_all(&evil).expect("prefix sibling");
+                evil
+            }),
+            ("Ausbruch über ..", fixture.project.join("..").join("sibling")),
+            ("fehlendes Verzeichnis", fixture.project.join("missing")),
+            ("relativer Pfad", PathBuf::from("nested")),
+        ] {
+            let error = fixture_builder(EntryKind::LocalEcho, &fixture)
+                .narrowing(narrowing_to(root))
+                .build()
+                .expect_err(label);
+            assert!(
+                matches!(error, RuntimeError::Sandbox { .. }),
+                "{label}: {error}"
+            );
+        }
+
+        // Ein Symlink im Projekt, der hinausführt, wird nach der Kanonisierung abgelehnt.
+        #[cfg(unix)]
+        {
+            let link = fixture.project.join("escape-link");
+            std::os::unix::fs::symlink(&sibling, &link).expect("symlink");
+            let error = fixture_builder(EntryKind::LocalEcho, &fixture)
+                .narrowing(narrowing_to(link))
+                .build()
+                .expect_err("Symlink nach außen");
+            assert!(matches!(error, RuntimeError::Sandbox { .. }), "{error}");
+        }
     }
 }

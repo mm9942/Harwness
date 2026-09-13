@@ -3,8 +3,9 @@
 //! Ohne Subcommand startet `harw` den interaktiven ratatui-Chat (`chat`),
 //! nachdem der Root-Space `~/.harw` sichergestellt und — beim Erststart — der
 //! Onboarding-Wizard (`onboarding`) durchlaufen wurde. Die Subcommands
-//! (`init`, `onboard`, `doctor`, `serve`, `classify`, `run`) decken
-//! Einrichtung, Validierung, den MCP-Listener und Bootstrap-Pfade ab. Die
+//! (`init`, `onboard`, `doctor`, `serve`, `web`, `project`, `classify`, `run`)
+//! decken Einrichtung, Validierung, den MCP-Listener, die Web-Oberfläche,
+//! Projekt-Trust und Bootstrap-Pfade ab. Die
 //! Argument-Grammatik lebt in `cli` (clap); Hilfe erscheint nur bei
 //! `--help`/`-h`.
 
@@ -24,8 +25,8 @@ mod lifecycle;
 mod mcp_auth;
 mod observe;
 mod onboarding;
+mod project_trust;
 mod resume;
-mod root_context;
 mod runtime_entry;
 mod runtime_gateway;
 mod runtime_jobs;
@@ -43,19 +44,15 @@ use harw_config::{
     SecretRef, discover_config,
 };
 use harw_core::{
-    AgentSession, ConfigApprovalPolicy, EchoModelProvider, InteractionMode, JobExecutionRegistry,
-    ModelMessage, ModelProvider, SpawnContext, TranscriptStateStore, TurnInput, TurnOutcome,
+    InteractionMode, JobExecutionRegistry, ModelMessage, ModelProvider, TurnInput, TurnOutcome,
     run_turn,
 };
-use harw_extension_api::ExtensionRegistry;
-use harw_extension_api::registry::ContextProviderRegistrationError;
+use harw_extension_api::ContextProvider;
 use harw_mcp_server::{
     BoundMcpListener, DurableMcpSupervisor, McpAuthenticator, McpEventBus, McpJobCapability,
     McpListenerConfig, McpPrincipal, McpSupervisor, PrincipalRegistry, StaticBearerAuthenticator,
 };
-use harw_observe::TraceContext;
-use harw_operations::registry::OperationRegistry;
-use harw_operations::{OpContext, OpInput, ServiceMap};
+use harw_operations::{OpInput, ServiceMap};
 use harw_plan::goal::{Goal, GoalAction, GoalId, GoalStatus, GoalStore};
 use harw_plan::types::{Criterion, VerificationStep};
 use harw_plan::{
@@ -66,19 +63,18 @@ use harw_plan_bridge::{
     FindingStore, GoalContextProvider, offset_from_timestamp, register_plan_services,
 };
 use harw_provider_http::SecretResolver;
-use harw_sandbox::{
-    Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-};
-use harw_session_store::{JobStore, TranscriptStore};
+use harw_runtime::{EntryKind, ModelSource, RuntimeSpec, RuntimeStores, ServiceSurface};
+use harw_session_store::JobStore;
 use harw_tui::classify_input;
-use harw_types::{AgentRole, ApprovalActor, SessionId, TenantId, ThreadRef, TurnId, WorkspaceId};
+use harw_types::{
+    ApprovalActor, IngressSurface, SessionId, TenantId, ThreadRef, TurnId, WorkspaceId,
+};
 use tokio::runtime::Builder;
-use uuid::Uuid;
 use worker_cancellation::RegistryWorkerCancellationSink;
 
 use cli::{AnalyzeArgs, Cli, Command};
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Latest configuration revision understood by this CLI.
 ///
@@ -214,21 +210,33 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             // Modus und Ziel werden *vor* dem Chat aufgelöst: ein unbekannter
             // Modusname darf keine Session starten, und ein `--goal` muss im
             // Goal-Store stehen, bevor der erste Turn Kontext einsammelt.
+            // Die Spec dient hier nur dem Config-Laden (Home, cwd, Repo-Trust);
+            // die eigentliche Montage baut `chat::run_chat`.
+            let (entry, surface) = if cli.chat.prompt.is_some() {
+                (EntryKind::OneShot, IngressSurface::Cli)
+            } else {
+                (EntryKind::Tui, IngressSurface::Tui)
+            };
+            let spec = local_runtime_spec(home_override.clone(), entry, surface)?;
             let startup = prepare_planning_startup(
-                home_override.clone(),
+                &spec,
                 requested_mode.as_deref(),
                 requested_goal.as_deref(),
             )?;
             // Dieselben Store-Instanzen weiterreichen, nicht neue öffnen: zwei
             // Schreiber auf einem Plan-Verzeichnis wären stiller Datenverlust.
-            // Mitgegeben werden zusätzlich Ziel-Kontext, Freigabe-Politik und
-            // Startmodus — ohne sie erreichte die Planungsfläche keinen Turn.
-            let runtime = startup.services.as_chat_runtime(
-                startup.goal_context.as_ref(),
-                &startup.approval_policy,
-                startup.mode,
-            );
-            chat::run_chat(home_override, cli.chat.prompt, cli.chat.resume, runtime)
+            // Die Freigabepolitik aus `[policy]` baut die Montage selbst.
+            let chat_startup = chat::ChatStartup {
+                mode: startup.mode,
+                plan: startup.services.to_runtime(),
+                goal_context: startup.goal_context,
+            };
+            chat::run_chat(
+                home_override,
+                cli.chat.prompt,
+                cli.chat.resume,
+                chat_startup,
+            )
         }
         Some(Command::Init) => cmd_init(home_override),
         Some(Command::Onboard) => {
@@ -237,7 +245,10 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             onboarding::run_wizard(&home)
         }
         Some(Command::Doctor { config_dir }) => {
-            doctor(resolve_layers(home_override.clone(), config_dir)?)?;
+            let layers = resolve_layers(home_override.clone(), config_dir)?;
+            // Ohne auflösbares Home bleibt es bei der Config-Zusammenfassung.
+            let home = home::resolve_home(home_override.clone()).ok();
+            doctor(layers, home.as_deref())?;
             lifecycle::health(home_override)
         }
         Some(Command::Gateway { telemetry }) => gateway::run(home_override, telemetry),
@@ -245,12 +256,13 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             let (layers, storage_root, home) = resolve_serve_paths(home_override, config_dir)?;
             serve_mcp(layers, storage_root, home)
         }
-        Some(Command::Web { config_dir, socket }) => {
-            // `storage_root` gehört zu `serve`s Job-Store-Layout (`jobs/…`);
-            // `harw web` braucht keinen Job-Store, siehe `crate::web`-Moduldoku.
-            let (layers, _storage_root, home) = resolve_serve_paths(home_override, config_dir)?;
-            web::serve_web(layers, home, socket)
+        Some(Command::Web { socket }) => {
+            // `harw web` kennt kein `--config-dir` mehr: der Root-Space kommt
+            // ausschließlich aus `--home` bzw. `HARW_HOME` (siehe `crate::web`).
+            let home = web_home(home::resolve_home(home_override))?;
+            web::serve_web(Some(home), socket)
         }
+        Some(Command::Project { action }) => project_trust::run(home_override, action),
         Some(Command::Classify { input }) => {
             let text = input.join(" ");
             println!(
@@ -304,9 +316,12 @@ fn run_startup_migrations(
             harw_home::ensure_home(&home).map_err(|error| error.to_string())?;
             harw_home::config_layers(&home).map_err(|error| error.to_string())?
         }
-        Some(Command::Doctor { config_dir })
-        | Some(Command::Serve { config_dir })
-        | Some(Command::Web { config_dir, .. }) => {
+        Some(Command::Web { .. }) => {
+            let home = web_home(home::resolve_home(home_override))?;
+            harw_home::ensure_home(&home).map_err(|error| error.to_string())?;
+            harw_home::config_layers(&home).map_err(|error| error.to_string())?
+        }
+        Some(Command::Doctor { config_dir }) | Some(Command::Serve { config_dir }) => {
             match config_dir {
                 Some(dir) => vec![dir.clone()],
                 None => {
@@ -325,6 +340,7 @@ fn run_startup_migrations(
             | Command::Service { .. }
             | Command::Catalog { .. }
             | Command::Auth { .. }
+            | Command::Project { .. }
             | Command::Uninstall { .. },
         ) => return Ok(()),
     };
@@ -335,6 +351,22 @@ fn run_startup_migrations(
         .filter(|path| path.is_file())
         .collect::<Vec<_>>();
     migrate_config_paths(&config_paths)
+}
+
+/// Resolves the mandatory HARW home of `harw web` and names the flag on failure.
+///
+/// `harw web` has no `--config-dir` fallback (CONTRACTS-W2d2 §1.3): without a
+/// resolvable home there is neither a trust report nor an approval store. The
+/// resolution result is passed in (instead of calling
+/// [`home::resolve_home`] here) so the error path is testable without
+/// touching process environment variables.
+///
+/// # Errors
+/// Returns the resolver's error prefixed with a hint to `--home` / `HARW_HOME`.
+fn web_home(resolved: Result<PathBuf, String>) -> Result<PathBuf, String> {
+    resolved.map_err(|error| {
+        format!("harw web requires a HARW home (--home or HARW_HOME): {error}")
+    })
 }
 
 /// Runs the installer-owned migration runner for each discovered config layer.
@@ -430,7 +462,7 @@ fn serve_mcp(
             .as_ref()
             .map(|resolver| resolver as &dyn SecretResolver),
     )?;
-    let principals = build_principal_registry(&config);
+    let principals = build_principal_registry(&config)?;
     // Prompt-Jobs laufen nur für aktuell konfigurierte MCP-Principals
     // (`job_worker::check_prompt_claim_scope`).
     let configured_submitters = Arc::new(crate::runtime_jobs::configured_principal_ids(&config));
@@ -478,6 +510,22 @@ fn serve_mcp(
         "serve.job_worker.plan_services"
     );
 
+    // Jeder Job montiert seine eigene `RuntimeAssembly` unter diesem Home und
+    // dem Arbeitsverzeichnis des Dienstes. Ohne Home enden Jobs sichtbar als
+    // blockiert (E3, `job_worker::JobWorkerContext::runtime_root`).
+    let runtime_root = match home.as_deref() {
+        Some(home_path) => Some(job_worker::JobRuntimeRoot {
+            home: home_path.to_path_buf(),
+            cwd: std::env::current_dir().map_err(|error| error.to_string())?,
+        }),
+        None => None,
+    };
+    let worker_context = Arc::new(job_worker::JobWorkerContext {
+        transcript_root,
+        configured_submitters,
+        runtime_root,
+    });
+
     let runtime = Builder::new_current_thread()
         .enable_all()
         .build()
@@ -506,18 +554,16 @@ fn serve_mcp(
         let worker_store = Arc::clone(&store);
         let worker_executions = Arc::clone(&executions);
         let worker_provider = Arc::clone(&provider);
-        let worker_transcript_root = transcript_root.clone();
         let worker_plan_services = plan_node_services.clone();
-        let worker_submitters = Arc::clone(&configured_submitters);
+        let worker_context = Arc::clone(&worker_context);
         let worker = tokio::spawn(async move {
             job_worker::run_job_worker(
                 worker_store,
                 worker_executions,
                 worker_provider,
-                &worker_transcript_root,
                 worker_plan_services,
                 shutdown_rx,
-                worker_submitters,
+                worker_context,
             )
             .await;
         });
@@ -638,7 +684,12 @@ fn open_serve_secret_resolver(
 /// transport enforces. `principal_key` is the authenticator-issued identity
 /// (the principal's configured `id`); the submitter actor granted `*Own`
 /// capabilities is the same `id`, matching the local single-operator model.
-fn build_principal_registry(config: &ResolvedConfig) -> PrincipalRegistry {
+///
+/// # Errors
+/// Fails closed when a principal `id` is configured more than once
+/// ([`PrincipalRegistry::try_insert`]); startup must abort instead of serving
+/// with an ambiguous identity.
+fn build_principal_registry(config: &ResolvedConfig) -> Result<PrincipalRegistry, String> {
     let mut registry = PrincipalRegistry::new();
     for principal in &config.harness.mcp_listener.principals {
         let capabilities = principal
@@ -652,19 +703,21 @@ fn build_principal_registry(config: &ResolvedConfig) -> PrincipalRegistry {
                 McpJobCapabilityToml::CancelWorkspace => McpJobCapability::CancelWorkspace,
             })
             .collect::<Vec<_>>();
-        registry.insert(
-            principal.id.clone(),
-            McpPrincipal::from_trusted_ingress(
-                ApprovalActor::Operator {
-                    id: principal.id.clone(),
-                },
-                TenantId::from_str(principal.tenant.clone()),
-                WorkspaceId::from_str(principal.workspace.clone()),
-                capabilities,
-            ),
-        );
+        registry
+            .try_insert(
+                principal.id.clone(),
+                McpPrincipal::from_trusted_ingress(
+                    ApprovalActor::Operator {
+                        id: principal.id.clone(),
+                    },
+                    TenantId::from_str(principal.tenant.clone()),
+                    WorkspaceId::from_str(principal.workspace.clone()),
+                    capabilities,
+                ),
+            )
+            .map_err(|error| error.to_string())?;
     }
-    registry
+    Ok(registry)
 }
 
 /// Resolves every configured principal's credential and builds the
@@ -686,9 +739,14 @@ fn build_authenticator(
 }
 
 /// Runs one complete local harness turn with the intentionally non-networked
-/// bootstrap provider. This makes the CLI exercise the real session FSM,
-/// history persistence seam, and turn loop without silently claiming to be a
-/// production model integration.
+/// bootstrap provider. This makes the CLI exercise the real runtime assembly
+/// (`EntryKind::LocalEcho`), session FSM, history persistence seam, and turn
+/// loop without silently claiming to be a production model integration.
+///
+/// # Errors
+/// Returns a `String` when the working directory is unreadable, the profile
+/// session storage cannot be prepared, the runtime assembly or root session
+/// cannot be built, the turn fails or pauses, or no assistant text is produced.
 fn run_local_echo(input: &str, home: &Path) -> Result<String, String> {
     let runtime = Builder::new_current_thread()
         .enable_all()
@@ -696,29 +754,43 @@ fn run_local_echo(input: &str, home: &Path) -> Result<String, String> {
         .map_err(|error| format!("could not start local runtime: {error}"))?;
 
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
-    let assembled = harw_registry_defaults::assemble_default_registry(cwd)
-        .map_err(|error| error.to_string())?;
-    let spawn_context = build_local_spawn_context(&assembled.project.project_root)?;
-    let registry = assembled.registry;
+    let sessions_root = runtime_entry::profile_sessions_root(home)?;
+    let state_store = runtime_entry::transcript_state_store(&sessions_root, run_thread_for_session);
+    let spec = runtime_entry::runtime_spec(
+        EntryKind::LocalEcho,
+        home,
+        &cwd,
+        runtime_entry::local_principal(IngressSurface::Cli),
+    );
+    let assembly = runtime_entry::build_assembly(
+        spec,
+        ModelSource::Echo(format!("echo: {input}")),
+        RuntimeStores {
+            state_store,
+            job_store: None,
+            approval_store: None,
+        },
+        None,
+    )?;
 
     runtime.block_on(async {
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut session = AgentSession::new(AgentRole::Assistant, None, registry, event_tx)
-            .with_spawn_context(spawn_context);
-        let profile_name = harw_home::active_profile_name(home);
-        let profile = harw_home::profile_dir(home, &profile_name).map_err(|error| {
-            format!("could not resolve active profile storage for run: {error}")
-        })?;
-        let store = TranscriptStateStore::new(
-            TranscriptStore::new(&profile.join("sessions")),
-            run_thread_for_session,
-        );
-        let model = EchoModelProvider::new(format!("echo: {input}"));
+        let (turn_tx, _turn_rx) = tokio::sync::mpsc::unbounded_channel();
+        let root_session_id = assembly.root_session_id().clone();
+        let mut session = assembly
+            .new_root_session(root_session_id.clone(), event_tx, turn_tx, None)
+            .map_err(|error| format!("could not create the local root session: {error}"))?
+            .session;
 
-        match run_turn(&mut session, &model, &store, TurnInput::user(input))
-            .await
-            .map_err(|error| error.to_string())?
-        {
+        let outcome = run_turn(
+            &mut session,
+            assembly.model().as_ref(),
+            assembly.state_store().as_ref(),
+            TurnInput::user(input),
+        )
+        .await;
+        assembly.close_session(&root_session_id);
+        match outcome.map_err(|error| error.to_string())? {
             TurnOutcome::Completed => {}
             TurnOutcome::AwaitingChild { .. } | TurnOutcome::AwaitingApproval { .. } => {
                 return Err("local echo provider unexpectedly paused a turn".to_owned());
@@ -743,73 +815,6 @@ fn run_local_echo(input: &str, home: &Path) -> Result<String, String> {
 /// for the lifetime of the durable transcript.
 fn run_thread_for_session(session_id: &SessionId) -> ThreadRef {
     ThreadRef::from_str(format!("cli-run-session:{}", session_id.as_str()))
-}
-
-/// Generates a fresh root trace for one local `harw run` session.
-///
-/// This call site is a root: a local run has no parent whose trace it could
-/// inherit, so the `trace_id` that ties together this session's work
-/// originates here. Mirrors `harw-core`'s `new_span_id` random source
-/// (`harw-core/src/child_controller.rs`) instead of inventing a second one:
-/// `uuid::Uuid::new_v4` supplies the full 32 hex characters for `trace_id`, a
-/// second, independent draw supplies the first 16 for `span_id`. Both are
-/// already valid lowercase hex of the required length by construction;
-/// [`TraceContext::new`] still validates rather than setting fields directly.
-fn new_local_root_trace() -> Result<TraceContext, String> {
-    let trace_id = Uuid::new_v4().simple().to_string();
-    let span_id = Uuid::new_v4().simple().to_string()[..16].to_owned();
-    TraceContext::new(trace_id, span_id)
-        .map_err(|error| format!("could not build local root trace context: {error}"))
-}
-
-/// Builds the trusted authority for the local echo session.
-///
-/// The default registry's tools are composed from the discovered project, so
-/// their execution context must be bound to that same canonical root. The
-/// root, permissions, approval actor, and organizational role all come from
-/// this trusted composition boundary; none are copied from the user prompt.
-pub(crate) fn build_local_spawn_context(project_root: &Path) -> Result<SpawnContext, String> {
-    let tenant = TenantId::from_str("cli");
-    let workspace = WorkspaceId::from_str("project");
-    let registry = WorkspaceRegistry::build(
-        project_root,
-        [WorkspaceRegistration {
-            tenant: tenant.clone(),
-            workspace: workspace.clone(),
-            root: PathBuf::from("."),
-        }],
-    )
-    .map_err(|error| error.to_string())?;
-    let binding = registry
-        .resolve(&tenant, &workspace)
-        .map_err(|error| error.to_string())?;
-    let organizational_role = serde_json::from_str("\"root-orchestrator\"")
-        .map_err(|error| format!("could not resolve local organizational role: {error}"))?;
-    let trace = new_local_root_trace()?;
-
-    Ok(SpawnContext {
-        sandbox: SandboxSpec::from_resolved(
-            binding,
-            PermissionSet::from_policy([
-                Permission::ReadWorkspace,
-                Permission::WriteWorkspace,
-                Permission::ExecuteProcess,
-            ]),
-        ),
-        suggestions: None,
-        capability_snapshot: None,
-        approval_actor: Some(ApprovalActor::Operator {
-            id: "local-cli".to_owned(),
-        }),
-        organizational_role,
-        // Root: no parent exists whose trace could be inherited — see
-        // `new_local_root_trace`.
-        trace: Some(trace),
-        // Root: no parent exists whose already-cut ceiling could be
-        // inherited, so the ceiling is created here, once — see
-        // `root_context::local_root_context_ceiling`.
-        ceiling: Some(root_context::local_root_context_ceiling()),
-    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -858,68 +863,6 @@ const PLAN_NODE_JOB_ACTOR: &str = "job:plan-node-worker";
 
 /// Aufzählung der gültigen Interaktionsmodi für Fehlermeldungen.
 const VALID_MODE_NAMES: &str = "chat, plan, explore, work";
-
-/// Beim Start aufgelöster Interaktionsmodus, kodiert als Diskriminante.
-///
-/// `Relaxed` genügt aus demselben Grund wie bei [`LOG_SENSITIVE`]: der Wert
-/// wird einmal vor dem Start weiterer Threads geschrieben und danach nur
-/// gelesen.
-static STARTUP_MODE: AtomicU8 = AtomicU8::new(0);
-
-/// Kodiert einen [`InteractionMode`] als Diskriminante für [`STARTUP_MODE`].
-fn mode_code(mode: InteractionMode) -> u8 {
-    match mode {
-        InteractionMode::Chat => 0,
-        InteractionMode::Plan => 1,
-        InteractionMode::Explore => 2,
-        InteractionMode::Work => 3,
-    }
-}
-
-/// Dekodiert eine Diskriminante aus [`STARTUP_MODE`].
-///
-/// Unbekannte Werte können nur durch einen Programmierfehler entstehen; sie
-/// fallen auf [`InteractionMode::Chat`] zurück, den Modus ohne Ceiling.
-fn mode_from_code(code: u8) -> InteractionMode {
-    match code {
-        1 => InteractionMode::Plan,
-        2 => InteractionMode::Explore,
-        3 => InteractionMode::Work,
-        _ => InteractionMode::Chat,
-    }
-}
-
-/// Gibt den beim Start aufgelösten Interaktionsmodus zurück.
-///
-/// # Description
-///
-/// Der Modus stammt aus `--mode` oder — ohne Flag — aus `[mode] default`. Er
-/// wird von [`prepare_planning_startup`] genau einmal gesetzt, bevor
-/// asynchrone Aufgaben starten. Module, die den Modus brauchen (Chat-Einstieg,
-/// TUI-Session), lesen ihn hier statt ihn erneut zu parsen — analog zu
-/// [`log_sensitive_enabled`].
-///
-/// # Returns
-///
-/// Den typisierten [`InteractionMode`]; vor dem Start ist das
-/// [`InteractionMode::Chat`].
-///
-/// # Concurrency
-///
-/// Lock-frei; aus jedem Thread und jeder Task aufrufbar.
-///
-/// # Examples
-///
-/// ```rust,no_run
-/// # fn example() {
-/// if harw_cli::startup_mode() == harw_core::InteractionMode::Explore {
-///     tracing::info!("session starts read-only");
-/// }
-/// # }
-/// ```
-pub fn startup_mode() -> InteractionMode {
-    mode_from_code(STARTUP_MODE.load(Ordering::Relaxed))
-}
 
 /// Löst den Interaktionsmodus einer neuen Session auf.
 ///
@@ -1014,7 +957,7 @@ fn parse_plan_node_kind(name: &str) -> Result<PlanNodeKind, String> {
 ///
 /// Genau **eine** so gebaute Konfiguration geht anschließend sowohl in die
 /// [`ServiceMap`] (über [`register_plan_services`]) als auch in die
-/// [`OperationRegistry`] (über [`harw_ops::register_plan_tools`]). Beide aus
+/// `OperationRegistry` (über [`harw_ops::register_plan_tools`]). Beide aus
 /// derselben Quelle zu speisen ist der Kern dieses Moduls: eine registrierte
 /// Operation ohne passenden Store — oder ein Store ohne Operationen — wäre der
 /// schwerste Fehler dieser Datei.
@@ -1081,8 +1024,8 @@ pub(crate) struct PlanServices {
     pub(crate) goal: Option<Arc<dyn GoalStore>>,
     /// Derselbe Finding-Store, den `services` trägt.
     ///
-    /// Wird gehalten, damit der One-shot-Pfad ([`chat::OneShotPlanServices`])
-    /// **dieselben** Instanzen bekommt, statt zweite Stores auf demselben
+    /// Wird gehalten, damit [`PlanServices::to_runtime`] der Montage
+    /// **dieselben** Instanzen gibt, statt zweite Stores auf demselben
     /// Verzeichnis zu öffnen — zwei Schreiber auf einem Plan-Verzeichnis wären
     /// stiller Datenverlust.
     pub(crate) findings: Option<Arc<FindingStore>>,
@@ -1094,60 +1037,27 @@ pub(crate) struct PlanServices {
 }
 
 impl PlanServices {
-    /// Reicht Stores **und** Laufzeit-Beiträge an den Chat-Pfad weiter.
+    /// Reicht die Stores als [`harw_runtime::PlanServices`] an eine Montage weiter.
     ///
-    /// # Beschreibung
-    /// Trotz des Namens gilt das für **beide** Chat-Wege — den interaktiven wie
-    /// den One-shot-Turn. Der Name stammt aus der Zeit, als nur der One-shot-Pfad
-    /// die Dienste bekam; genau diese Halbverbindung war der Grund, warum die
-    /// Planungsfläche in der TUI unerreichbar blieb.
+    /// # Description
+    /// Alle drei Stores oder keiner: eine halb geöffnete Planungsfläche wird nie
+    /// an [`harw_runtime::RuntimeAssemblyBuilder::plan_services`] gereicht. Es
+    /// werden **keine** neuen Stores erzeugt — die `Arc`s zeigen auf dieselben
+    /// Instanzen wie die [`ServiceMap`]; zwei Schreiber auf einem
+    /// Plan-Verzeichnis wären stiller Datenverlust.
     ///
-    /// Mitgegeben werden nicht nur die Stores, sondern auch die
-    /// Kontext-Beitragenden und Freigabe-Politiken. Ohne sie wäre der Zielsatz
-    /// zwar persistiert, aber kein Turn bekäme ihn zu sehen.
+    /// # Returns
+    /// `Some(_)`, wenn Plan-, Goal- **und** Finding-Store vorliegen; sonst `None`.
     ///
-    /// # Argumente
-    /// - `goal_context` (`Option<&Arc<GoalContextProvider>>`): der Ziel-Kontext
-    ///   dieser Laufzeit, falls die Planungsfläche aktiv ist.
-    /// - `approval_policy` (`&ConfigApprovalPolicy`): die aus
-    ///   `[policy] require_approval_for` kompilierte Zusatzpolitik.
-    /// - `mode` ([`InteractionMode`]): der aufgelöste Startmodus.
-    ///
-    /// # Rückgabe
-    /// `Some(_)`, wenn die Planungsfläche aktiv ist und alle drei Stores
-    /// vorliegen; sonst `None`. Es werden **keine** neuen Stores erzeugt —
-    /// die `Arc`s zeigen auf dieselben Instanzen wie die `ServiceMap`.
-    fn as_chat_runtime(
-        &self,
-        goal_context: Option<&Arc<GoalContextProvider>>,
-        approval_policy: &ConfigApprovalPolicy,
-        mode: InteractionMode,
-    ) -> Option<chat::OneShotPlanServices> {
-        let (plan, goal, findings) = (
-            self.plan.as_ref()?,
-            self.goal.as_ref()?,
-            self.findings.as_ref()?,
-        );
-        // Die Coercion braucht je eine eigene Bindung: `Arc<T>` → `Arc<dyn Tr>`
-        // greift bei der Zuweisung, nicht innerhalb von `Arc::clone`.
-        let context_providers = goal_context
-            .map(|provider| {
-                let concrete = Arc::clone(provider);
-                let erased: Arc<dyn harw_extension_api::ContextProvider> = concrete;
-                vec![erased]
-            })
-            .unwrap_or_default();
-        let policy: Arc<dyn harw_extension_api::ApprovalHandler> =
-            Arc::new(approval_policy.clone());
-
-        Some(chat::OneShotPlanServices {
-            plan_store: Arc::clone(plan),
-            goal_store: Arc::clone(goal),
-            finding_store: Arc::clone(findings),
+    /// # Concurrency
+    /// Klont nur `Arc`-Zeiger und die Konfiguration.
+    #[must_use]
+    pub(crate) fn to_runtime(&self) -> Option<harw_runtime::PlanServices> {
+        Some(harw_runtime::PlanServices {
+            plan: Arc::clone(self.plan.as_ref()?),
+            goal: Arc::clone(self.goal.as_ref()?),
+            findings: Arc::clone(self.findings.as_ref()?),
             plan_config: self.config.clone(),
-            context_providers,
-            approval_handlers: vec![policy],
-            initial_mode: Some(mode),
         })
     }
 }
@@ -1278,40 +1188,37 @@ pub(crate) fn build_plan_services(
 /// Registriert Kern- und Planungs-Operationen in einer frischen Registry.
 ///
 /// # Description
-/// Dieselbe [`PlanToolConfig`], die [`build_plan_services`] bekommen hat, gated
-/// hier die sechs Planungs-Operationen. Ist sie abgeschaltet, erscheinen `plan`,
-/// `goal`, `explore`, `research_deps`, `research_web` und `analyze` gar nicht
-/// erst in der Werkzeugliste — das ist strukturell stärker als eine Ablehnung
-/// zur Laufzeit.
+/// Nur noch Testhilfe: Produktionspfade finden Operationen über
+/// [`harw_runtime::RuntimeAssembly::operations`]. Dieselbe [`PlanToolConfig`],
+/// die [`build_plan_services`] bekommen hat, gated hier die sechs
+/// Planungs-Operationen. Ist sie abgeschaltet, erscheinen `plan`, `goal`,
+/// `explore`, `research_deps`, `research_web` und `analyze` gar nicht erst in
+/// der Werkzeugliste.
 ///
 /// # Arguments
 /// - `config` (`&PlanToolConfig`): das Gate; geliehen.
 ///
 /// # Returns
-/// Die gefüllte [`OperationRegistry`] und die Anzahl registrierter
+/// Die gefüllte `OperationRegistry` und die Anzahl registrierter
 /// Planungs-Operationen (`0` oder [`harw_ops::PLAN_TOOL_COUNT`]).
-///
-/// # Concurrency
-/// Baut lokal und gibt Eigentum zurück; keine gemeinsamen Daten.
-pub(crate) fn build_operation_registry(config: &PlanToolConfig) -> (OperationRegistry, usize) {
-    let mut registry = OperationRegistry::new();
+#[cfg(test)]
+pub(crate) fn build_operation_registry(
+    config: &PlanToolConfig,
+) -> (harw_operations::registry::OperationRegistry, usize) {
+    let mut registry = harw_operations::registry::OperationRegistry::new();
     harw_ops::register_all(&mut registry);
     let plan_tools = harw_ops::register_plan_tools(&mut registry, config);
-    tracing::info!(
-        total = registry.len(),
-        plan_tools,
-        "operations.registry.assembled"
-    );
     (registry, plan_tools)
 }
 
 /// Das Ergebnis der Startup-Komposition der Planungsfläche.
 ///
 /// # Description
-/// Trägt alles, was eine Laufzeit braucht, um Planung, Ziel und Approval-Politik
-/// zusammen zu betreiben. Die [`ExtensionRegistry`] entsteht erst auf Anfrage
-/// über [`PlanningStartup::compose_extension_registry`], damit der Chat-Pfad die
-/// Default-Registry nicht doppelt zusammenbaut.
+/// Trägt, was ein Einstieg vor der Montage selbst auflöst (E6): den
+/// Startmodus, die eine [`PlanToolConfig`], den Ziel-Kontext und die
+/// Plan-Dienste. Der Chat-Einstieg reicht daraus `chat::ChatStartup` weiter,
+/// `harw analyze` montiert damit [`EntryKind::Analyze`]. Freigabepolitik und
+/// Extension-Registry baut die [`harw_runtime::RuntimeAssembly`].
 ///
 /// # Concurrency
 /// Alle Felder sind `Send + Sync` oder werden verschoben; der Typ selbst wird
@@ -1321,101 +1228,10 @@ struct PlanningStartup {
     mode: InteractionMode,
     /// Die eine Konfiguration hinter Stores *und* Operationen.
     plan_config: PlanToolConfig,
-    /// Aus `[policy].require_approval_for` kompilierte Zusatz-Politik.
-    approval_policy: ConfigApprovalPolicy,
     /// Ziel-Kontext-Beitragender; `None`, wenn die Planungsfläche aus ist.
-    goal_context: Option<Arc<GoalContextProvider>>,
+    goal_context: Option<Arc<dyn ContextProvider>>,
     /// Plan-Dienste inklusive gefüllter [`ServiceMap`].
     services: PlanServices,
-}
-
-impl PlanningStartup {
-    /// Ergänzt eine zusammengebaute [`ExtensionRegistry`] um Plan-Beiträge.
-    ///
-    /// # Description
-    /// `harw_registry_defaults::assemble_default_registry` liefert eine fertig
-    /// gebaute Registry; `ExtensionRegistry` bietet nachträglich aber nur
-    /// `add_tool_provider`, weder `add_approval_handler` noch
-    /// `add_context_provider`. Diese Methode baut sie deshalb über den Builder
-    /// neu auf und klont dabei ausschließlich `Arc`-Zeiger — kein Beitrag der
-    /// Basis geht verloren, keiner wird ersetzt.
-    ///
-    /// Die [`ConfigApprovalPolicy`] wird **hinter** die vorhandenen Handler
-    /// gehängt. `harw_core::turn_loop::check_approval` nimmt die erste
-    /// Nicht-`Allow`-Entscheidung; anhängen kann eine bestehende Sperre daher
-    /// nie lockern, sondern nur zusätzliche Werkzeuge unter Vorbehalt stellen —
-    /// genau die Semantik von `[policy] require_approval_for`.
-    ///
-    /// Der [`GoalContextProvider`] kommt als weiterer `ContextProvider` hinzu.
-    /// Weil er sein Fragment in jedem Turn frisch aus den Stores bildet,
-    /// überleben Ziel und offene Kriterien einen `/compact` und einen
-    /// Modellwechsel.
-    ///
-    /// # Arguments
-    /// - `base` (`&ExtensionRegistry`): die Default-Registry, geliehen.
-    ///
-    /// # Returns
-    /// Eine neue [`ExtensionRegistry`] mit allen Beiträgen der Basis plus den
-    /// Plan-Beiträgen.
-    ///
-    /// # Errors
-    /// [`ContextProviderRegistrationError`]: einer der übernommenen oder neu
-    /// hinzugefügten Kontextanbieter (einschließlich des
-    /// [`GoalContextProvider`]) deklariert einen leeren oder bereits von
-    /// einem anderen Anbieter beanspruchten Namensraum. Da `base` bereits
-    /// eine gültig zusammengesetzte Registry ist, kann dieser Fehler in der
-    /// Praxis nur auftreten, wenn der `GoalContextProvider` selbst einen
-    /// bereits vergebenen Namensraum beansprucht.
-    ///
-    /// # Concurrency
-    /// Klont nur `Arc`-Zeiger (`Arc::clone`), niemals die inneren Daten.
-    fn compose_extension_registry(
-        &self,
-        base: &ExtensionRegistry,
-    ) -> Result<ExtensionRegistry, ContextProviderRegistrationError> {
-        let mut builder = ExtensionRegistry::builder();
-        for provider in base.tool_providers() {
-            builder = builder.tool_provider(Arc::clone(provider));
-        }
-        for provider in base.context_providers() {
-            builder = builder.context_provider(Arc::clone(provider))?;
-        }
-        for provider in base.instructions_providers() {
-            builder = builder.instructions_provider(Arc::clone(provider));
-        }
-        for handler in base.approval_handlers() {
-            builder = builder.approval_handler(Arc::clone(handler));
-        }
-        for observer in base.turn_observers() {
-            builder = builder.turn_observer(Arc::clone(observer));
-        }
-        if let Some(spawner) = base.spawner() {
-            builder = builder.spawner(Arc::clone(spawner));
-        }
-
-        // Zusätzlich zur bestehenden `DefaultApprovalPolicy`, nie an ihrer Stelle.
-        builder = builder.approval_handler(Arc::new(self.approval_policy.clone()));
-        if let Some(provider) = &self.goal_context {
-            // Zwei Schritte, nicht einer: `Arc::clone` ist generisch über `T`, und
-            // `T` wird aus dem *erwarteten* Typ inferiert. Schreibt man den
-            // Zieltyp direkt an die Bindung, wählt Rust `T = dyn ContextProvider`
-            // und verlangt bereits `&Arc<dyn ContextProvider>` als Argument — die
-            // Unsized-Coercion käme zu spät. Also erst auf dem konkreten Typ
-            // klonen, dann bei der Zuweisung coercen.
-            let concrete = Arc::clone(provider);
-            let provider: Arc<dyn harw_extension_api::ContextProvider> = concrete;
-            builder = builder.context_provider(provider)?;
-        }
-
-        let composed = builder.build();
-        tracing::info!(
-            approval_handlers = composed.approval_handlers().len(),
-            context_providers = composed.context_providers().len(),
-            goal_context = self.goal_context.is_some(),
-            "plan.registry.composed"
-        );
-        Ok(composed)
-    }
 }
 
 /// Legt das Startziel an und bindet es an den Plan.
@@ -1539,35 +1355,6 @@ fn seed_startup_goal(
     ))
 }
 
-/// Setzt die Planungsfläche für einen Prozessstart zusammen.
-///
-/// # Description
-/// Der eigentliche Composition-Root. Reihenfolge ist Absicht:
-/// 1. Root-Space auflösen und sicherstellen, Config-Layer laden.
-/// 2. `--mode` bzw. `[mode] default` typisieren — ein unbekannter Name bricht
-///    hier ab, bevor irgendein Store entsteht.
-/// 3. `[tools.plan]` in **eine** [`PlanToolConfig`] übersetzen.
-/// 4. Mit genau dieser Konfiguration die Dienste bauen
-///    ([`build_plan_services`]).
-/// 5. [`GoalContextProvider`] und [`ConfigApprovalPolicy`] vorbereiten.
-/// 6. Ein `--goal` anlegen und binden.
-///
-/// # Arguments
-/// - `home_override` (`Option<PathBuf>`): expliziter Root-Space (`--home`).
-/// - `requested_mode` (`Option<&str>`): Wert von `--mode`, geliehen.
-/// - `requested_goal` (`Option<&str>`): Wert von `--goal`, geliehen.
-///
-/// # Returns
-/// Den [`PlanningStartup`] mit `ServiceMap`, Konfiguration, Approval-Politik und
-/// Ziel-Kontext.
-///
-/// # Errors
-/// Ein `String` bei Home-Auflösung, Config-Ladefehler, unbekanntem Modus,
-/// ungültiger `[tools.plan]`-Sektion, nicht öffenbarem Store oder abgelehnter
-/// Ziel-Mutation.
-///
-/// # Concurrency
-/// Schreibt [`STARTUP_MODE`] einmalig, bevor asynchrone Aufgaben starten.
 /// Baut die Plan-Dienste, mit denen der Job-Worker `plan-node`-Jobs ausführt.
 ///
 /// # Beschreibung
@@ -1578,11 +1365,13 @@ fn seed_startup_goal(
 ///
 /// Die übergebene Sandbox ist die **Obergrenze**, nicht die Arbeits-Sandbox: der
 /// Worker leitet für jeden Knoten aus dessen Mutationsvertrag eine engere ab und
-/// weist alles ab, was darüber hinausginge. Sie trägt deshalb genau die zwei
-/// Dateisystem-Berechtigungen, aus denen ein Vertrag überhaupt etwas ableiten
-/// kann — bewusst **ohne** `ExecuteProcess` und `NetworkAccess`: der
-/// Mutationsvertrag kennt heute kein Feld, das solche Autorität begründen könnte,
-/// und was nicht begründbar ist, wird nicht gewährt.
+/// weist alles ab, was darüber hinausginge. Sie stammt aus
+/// [`harw_runtime::root_sandbox`] für [`EntryKind::JobPlanNode`] und trägt damit
+/// genau die Profilrechte dieses Einstiegs — die zwei Dateisystem-Berechtigungen,
+/// aus denen ein Vertrag überhaupt etwas ableiten kann, bewusst **ohne**
+/// `ExecuteProcess` und `NetworkAccess`: der Mutationsvertrag kennt heute kein
+/// Feld, das solche Autorität begründen könnte, und was nicht begründbar ist,
+/// wird nicht gewährt.
 ///
 /// # Argumente
 /// - `home` (`&Path`): HARW-Home; darunter liegen `plans/` und `goals/`.
@@ -1596,8 +1385,9 @@ fn seed_startup_goal(
 /// `plan-node`-Job sichtbar als blockiert.
 ///
 /// # Fehler
-/// - `Err(String)`: die Plan-Dienste oder die Workspace-Registrierung ließen
-///   sich nicht aufbauen.
+/// - `Err(String)`: die Plan-Dienste ließen sich nicht aufbauen oder
+///   `project_root` ließ sich nicht als Workspace binden
+///   ([`harw_runtime::RuntimeError::Sandbox`]).
 fn build_plan_node_services(
     home: &Path,
     config: &PlanToolConfig,
@@ -1608,24 +1398,8 @@ fn build_plan_node_services(
         return Ok(None);
     };
 
-    let tenant = TenantId::from_str("cli");
-    let workspace = WorkspaceId::from_str("project");
-    let registry = WorkspaceRegistry::build(
-        project_root,
-        [WorkspaceRegistration {
-            tenant: tenant.clone(),
-            workspace: workspace.clone(),
-            root: PathBuf::from("."),
-        }],
-    )
-    .map_err(|error| error.to_string())?;
-    let binding = registry
-        .resolve(&tenant, &workspace)
+    let ceiling = harw_runtime::root_sandbox(EntryKind::JobPlanNode, project_root)
         .map_err(|error| error.to_string())?;
-    let ceiling = SandboxSpec::from_resolved(
-        binding,
-        PermissionSet::from_policy([Permission::ReadWorkspace, Permission::WriteWorkspace]),
-    );
 
     Ok(Some(Arc::new(job_worker::PlanNodeServices::new(
         plan,
@@ -1634,18 +1408,81 @@ fn build_plan_node_services(
     ))))
 }
 
-fn prepare_planning_startup(
+/// Baut die [`RuntimeSpec`] eines lokalen Einstiegs.
+///
+/// # Description
+/// Löst den Root-Space (`--home` vor `HARW_HOME`) und das Arbeitsverzeichnis
+/// auf und setzt den lokalen Principal der Eingangsfläche
+/// ([`runtime_entry::local_principal`]). Modus und Agent bleiben `None`; der
+/// Aufrufer setzt sie nach [`prepare_planning_startup`] selbst (E6).
+///
+/// # Arguments
+/// - `home_override` (`Option<PathBuf>`): expliziter Root-Space (`--home`).
+/// - `entry` ([`EntryKind`]): der Einstieg.
+/// - `surface` ([`IngressSurface`]): `Tui` oder `Cli`.
+///
+/// # Errors
+/// Ein `String`, wenn weder Home noch Arbeitsverzeichnis auflösbar sind.
+fn local_runtime_spec(
     home_override: Option<PathBuf>,
+    entry: EntryKind,
+    surface: IngressSurface,
+) -> Result<RuntimeSpec, String> {
+    let home = home::resolve_home(home_override)?;
+    let cwd = std::env::current_dir().map_err(|error| format!("cwd: {error}"))?;
+    Ok(runtime_entry::runtime_spec(
+        entry,
+        &home,
+        &cwd,
+        runtime_entry::local_principal(surface),
+    ))
+}
+
+/// Setzt die Planungsfläche für einen Prozessstart zusammen.
+///
+/// # Description
+/// Der eigentliche Composition-Root. Reihenfolge ist Absicht:
+/// 1. Root-Space sicherstellen, Konfiguration über [`harw_runtime::load_config`]
+///    laden (Layer, Repo-Trust, Validierung — dieselbe Quelle wie die Montage).
+/// 2. `--mode` bzw. `[mode] default` typisieren — ein unbekannter Name bricht
+///    hier ab, bevor irgendein Store entsteht. Der Modus ist ein Rückgabewert,
+///    kein Prozesszustand.
+/// 3. `[tools.plan]` in **eine** [`PlanToolConfig`] übersetzen.
+/// 4. Mit genau dieser Konfiguration die Dienste bauen
+///    ([`build_plan_services`]).
+/// 5. Den [`GoalContextProvider`] vorbereiten.
+/// 6. Ein `--goal` anlegen und binden.
+///
+/// Die Freigabepolitik aus `[policy] require_approval_for` baut die
+/// [`harw_runtime::RuntimeAssembly`] selbst; sie ist deshalb nicht Teil des
+/// Ergebnisses.
+///
+/// # Arguments
+/// - `spec` (`&RuntimeSpec`): Spec des Einstiegs; `home` und `cwd` bestimmen
+///   die Config-Layer.
+/// - `requested_mode` (`Option<&str>`): Wert von `--mode`, geliehen.
+/// - `requested_goal` (`Option<&str>`): Wert von `--goal`, geliehen.
+///
+/// # Returns
+/// Den [`PlanningStartup`] mit Modus, Konfiguration, Ziel-Kontext und
+/// Plan-Diensten.
+///
+/// # Errors
+/// Ein `String` bei Home-, Config- oder Trust-Ladefehler, unbekanntem Modus,
+/// ungültiger `[tools.plan]`-Sektion, nicht öffenbarem Store oder abgelehnter
+/// Ziel-Mutation.
+///
+/// # Concurrency
+/// Rein synchron; kein globaler Zustand.
+fn prepare_planning_startup(
+    spec: &RuntimeSpec,
     requested_mode: Option<&str>,
     requested_goal: Option<&str>,
 ) -> Result<PlanningStartup, String> {
-    let home = home::resolve_home(home_override)?;
-    harw_home::ensure_home(&home).map_err(|error| error.to_string())?;
-    let layers = harw_home::config_layers(&home).map_err(|error| error.to_string())?;
-    let config = discover_config(&layers).map_err(|error| error.to_string())?;
+    harw_home::ensure_home(&spec.home).map_err(|error| error.to_string())?;
+    let (config, _trust) = harw_runtime::load_config(spec).map_err(|error| error.to_string())?;
 
     let mode = resolve_startup_mode(requested_mode, &config.harness.mode.default)?;
-    STARTUP_MODE.store(mode_code(mode), Ordering::Relaxed);
     tracing::info!(
         mode = mode.as_str(),
         explicit = requested_mode.is_some(),
@@ -1653,17 +1490,23 @@ fn prepare_planning_startup(
     );
 
     let plan_config = plan_tool_config_from_section(&config.harness.tools.plan)?;
-    let services =
-        build_plan_services(&home, &plan_config, DEFAULT_PLAN_SPACE, DEFAULT_GOAL_SPACE)?;
+    let services = build_plan_services(
+        &spec.home,
+        &plan_config,
+        DEFAULT_PLAN_SPACE,
+        DEFAULT_GOAL_SPACE,
+    )?;
 
     let goal_context = match (services.goal.as_ref(), services.plan.as_ref()) {
-        (Some(goal), Some(plan)) => Some(Arc::new(GoalContextProvider::new(
-            Arc::clone(goal),
-            Arc::clone(plan),
-        ))),
+        (Some(goal), Some(plan)) => {
+            let provider: Arc<dyn ContextProvider> = Arc::new(GoalContextProvider::new(
+                Arc::clone(goal),
+                Arc::clone(plan),
+            ));
+            Some(provider)
+        }
         _ => None,
     };
-    let approval_policy = ConfigApprovalPolicy::from_policy_section(&config.harness.policy);
 
     if let Some(statement) = requested_goal {
         let summary = seed_startup_goal(&services, statement, STARTUP_GOAL_ID)?;
@@ -1674,7 +1517,6 @@ fn prepare_planning_startup(
     Ok(PlanningStartup {
         mode,
         plan_config,
-        approval_policy,
         goal_context,
         services,
     })
@@ -1737,21 +1579,39 @@ fn analyze_tokens(args: &AnalyzeArgs) -> Result<Vec<String>, String> {
     Ok(tokens)
 }
 
+/// Fehlermeldung, wenn `harw analyze` ohne Planungsfläche aufgerufen wird.
+///
+/// Eine Stelle für beide Fälle — abgeschaltetes Gate und fehlende Operation —,
+/// damit der Hinweis auf den Konfigurationsschlüssel nie auseinanderläuft.
+fn analyze_plan_surface_disabled() -> String {
+    "die Planungsfläche ist abgeschaltet; `analyze` ist damit nicht registriert. \
+     Setze `[tools.plan] enabled = true` in der Konfiguration."
+        .to_owned()
+}
+
 /// Führt `harw analyze` gegen die `analyze`-Operation aus.
 ///
 /// # Description
-/// Baut denselben Composition-Root wie der Chat-Einstieg
-/// ([`prepare_planning_startup`]), registriert Kern- und Planungs-Operationen
-/// aus derselben [`PlanToolConfig`] und ruft dann die `analyze`-Operation über
-/// ihre Command-Fläche auf. Ist die Planungsfläche abgeschaltet, ist `/analyze`
-/// gar nicht registriert — die Fehlermeldung nennt dann den
-/// Konfigurationsschlüssel statt eines leeren Ergebnisses.
+/// Baut denselben Planungs-Startup wie der Chat-Einstieg
+/// ([`prepare_planning_startup`]) und montiert dann eine
+/// [`harw_runtime::RuntimeAssembly`] für [`EntryKind::Analyze`]
+/// (`OperationSurface::CommandsOnly`, `SpawnerPolicy::BuiltinRoles`) mit den
+/// Plan-Diensten aus [`PlanServices::to_runtime`]. `/analyze` wird in
+/// [`harw_runtime::RuntimeAssembly::operations`] gesucht und über die
+/// Slash-Fläche ([`ServiceSurface::Slash`]) mit der Sandbox der Montage
+/// ausgeführt. Ist die Planungsfläche abgeschaltet, ist `/analyze` gar nicht
+/// registriert — die Fehlermeldung nennt dann den Konfigurationsschlüssel.
 ///
-/// Ein echter Fan-out verlangt zusätzlich einen Agent-Spawner und einen
-/// `StateStore` im Kontext (`harw_core_bridge::fanout_children`). Beide gehören
-/// zur Session-Laufzeit, nicht zu diesem einmaligen Prozess; ohne sie meldet die
-/// Operation fail-closed `NotAvailable`. `--dry-run` liefert dagegen den
-/// vollständigen Wellenplan.
+/// Modell (E7): `--dry-run` montiert ein nie aufgerufenes
+/// [`ModelSource::Echo`]; sonst [`ModelSource::Configured`] samt versiegeltem
+/// Secret-Resolver ([`runtime_entry::configured_secret_resolver`]), weil ein
+/// echter Fan-out Kind-Agenten über den Spawner der Montage startet.
+///
+/// Der Sitzungs-Ereigniskanal ist Pflicht für `SpawnerPolicy::BuiltinRoles`;
+/// sein Empfänger bleibt bis zum Ende gebunden, damit Sendungen nicht an
+/// einem geschlossenen Kanal enden. Eine Wurzelsitzung entsteht nicht: die
+/// Operation läuft direkt unter [`harw_runtime::RuntimeAssembly::root_session_id`],
+/// der beim Bau als Spawner-Wurzel registrierten Kennung.
 ///
 /// # Arguments
 /// - `home_override` (`Option<PathBuf>`): expliziter Root-Space (`--home`).
@@ -1760,11 +1620,12 @@ fn analyze_tokens(args: &AnalyzeArgs) -> Result<Vec<String>, String> {
 /// - `args` (`&AnalyzeArgs`): die geparsten `analyze`-Flags, geliehen.
 ///
 /// # Returns
-/// `Ok(())`, nachdem der JSON-Bericht der Operation ausgegeben wurde.
+/// `Ok(())`, nachdem der Bericht der Operation ausgegeben wurde.
 ///
 /// # Errors
 /// Ein `String` bei widersprüchlichen Flags, abgeschalteter Planungsfläche,
-/// fehlgeschlagener Projektauflösung oder abgelehnter Operation.
+/// Config-/Trust-/Montagefehlern (inkl. fehlender Provider-Einrichtung ohne
+/// `--dry-run`) oder abgelehnter Operation.
 ///
 /// # Concurrency
 /// Baut eine eigene Single-Thread-Tokio-Runtime für den einen Operationsaufruf.
@@ -1776,45 +1637,62 @@ fn cmd_analyze(
 ) -> Result<(), String> {
     // Flag-Widersprüche vor jeder Datei- oder Netzarbeit melden.
     let tokens = analyze_tokens(args)?;
-    let startup = prepare_planning_startup(home_override, requested_mode, requested_goal)?;
-
-    let (operations, plan_tools) = build_operation_registry(&startup.plan_config);
-    if plan_tools == 0 {
-        return Err(
-            "die Planungsfläche ist abgeschaltet; `analyze` ist damit nicht registriert. \
-             Setze `[tools.plan] enabled = true` in der Konfiguration."
-                .to_owned(),
-        );
+    let mut spec = local_runtime_spec(home_override, EntryKind::Analyze, IngressSurface::Cli)?;
+    let startup = prepare_planning_startup(&spec, requested_mode, requested_goal)?;
+    if !startup.plan_config.is_enabled() {
+        return Err(analyze_plan_surface_disabled());
     }
-    let operation = operations
+    let plan = startup
+        .services
+        .to_runtime()
+        .ok_or_else(analyze_plan_surface_disabled)?;
+    spec.mode_override = Some(startup.mode);
+
+    let (model, secret_resolver) = if args.dry_run {
+        (ModelSource::Echo("harw analyze --dry-run".to_owned()), None)
+    } else {
+        let (config, _trust) =
+            harw_runtime::load_config(&spec).map_err(|error| error.to_string())?;
+        (
+            ModelSource::Configured,
+            runtime_entry::configured_secret_resolver(&spec.home, &config)?,
+        )
+    };
+
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut builder = harw_runtime::RuntimeAssembly::builder(spec)
+        .model(model)
+        .stores(RuntimeStores {
+            state_store: Arc::new(harw_core::InMemoryStateStore::new()),
+            job_store: None,
+            approval_store: None,
+        })
+        .plan_services(plan)
+        .session_events(event_tx);
+    if let Some(resolver) = secret_resolver {
+        builder = builder.secret_resolver(resolver);
+    }
+    let assembly = builder.build().map_err(|error| error.to_string())?;
+
+    let operation = assembly
+        .operations()
         .find_by_command("/analyze")
         .map(Arc::clone)
-        .ok_or_else(|| "die Operation `/analyze` ist nicht registriert".to_owned())?;
-
-    let cwd = std::env::current_dir().map_err(|error| format!("cwd: {error}"))?;
-    let assembled = harw_registry_defaults::assemble_default_registry(cwd)
-        .map_err(|error| error.to_string())?;
-    let project_root = assembled.project.project_root.clone();
-    // Die zusammengesetzte Registry trägt die zusätzliche `ConfigApprovalPolicy`
-    // und den `GoalContextProvider`; beide gehören zur Session-Laufzeit, deren
-    // Aufbau `harw-cli/src/chat.rs` besitzt.
-    let composed = startup
-        .compose_extension_registry(&assembled.registry)
-        .map_err(|error| error.to_string())?;
+        .ok_or_else(analyze_plan_surface_disabled)?;
     tracing::info!(
         mode = startup.mode.as_str(),
-        approval_handlers = composed.approval_handlers().len(),
-        context_providers = composed.context_providers().len(),
-        project_root = %project_root.display(),
-        "analyze.runtime.composed"
+        goal_context = startup.goal_context.is_some(),
+        operations = assembly.operations().len(),
+        cwd = %assembly.spec().cwd.display(),
+        "analyze.runtime.assembled"
     );
 
-    let sandbox = build_local_spawn_context(&project_root)?.sandbox;
-    let mut services = startup.services.services;
-    // Wie im One-Shot-Pfad (`chat.rs`): die Registry ist vertrauenswürdige
-    // Composition-Root-Data, die Operationen wie `/help` selbst brauchen.
-    services.insert(operations);
-    let ctx = OpContext::new(SessionId::new(), TurnId::new(), sandbox, services);
+    let ctx = assembly.op_context(
+        ServiceSurface::Slash,
+        assembly.root_session_id().clone(),
+        TurnId::new(),
+        assembly.sandbox().clone(),
+    );
 
     let runtime = Builder::new_current_thread()
         .enable_all()
@@ -1831,7 +1709,23 @@ fn cmd_analyze(
     Ok(())
 }
 
-fn doctor(layers: Vec<PathBuf>) -> Result<(), String> {
+/// Prüft die Konfiguration für `harw doctor` und gibt eine Zusammenfassung aus.
+///
+/// # Description
+/// Validiert die Config-Layer wie bisher und druckt deren Kennzahlen. Ist ein
+/// HARW-Home auflösbar, montiert `doctor` zusätzlich die Runtime
+/// ([`runtime_entry::doctor_assembly`]) und druckt deren effektive Rechte
+/// ([`print_runtime_rights`]).
+///
+/// # Arguments
+/// - `layers` (`Vec<PathBuf>`): die Config-Layer.
+/// - `home` (`Option<&Path>`): aufgelöster Root-Space, falls vorhanden.
+///
+/// # Errors
+/// Ein `String`, wenn die Config nicht geladen oder validiert werden kann.
+/// Ein Montagefehler ist **kein** Fehler dieses Befehls: er erscheint als
+/// Warnzeile, der Exit-Code bleibt der der Config-Prüfung.
+fn doctor(layers: Vec<PathBuf>, home: Option<&Path>) -> Result<(), String> {
     let config = discover_config(&layers).map_err(|error| error.to_string())?;
     config.validate().map_err(|error| error.to_string())?;
     println!("Harwness configuration is valid.");
@@ -1857,7 +1751,51 @@ fn doctor(layers: Vec<PathBuf>) -> Result<(), String> {
         config.harness.mcp_listener.listen_addr
     );
     println!("mcp_listener_path={}", config.harness.mcp_listener.path);
+    if let Some(home) = home {
+        print_runtime_rights(home);
+    }
     Ok(())
+}
+
+/// Druckt die effektiven Rechte der Doctor-Montage oder eine Warnzeile.
+///
+/// # Description
+/// Montiert [`EntryKind::Doctor`] unter `home` und dem Arbeitsverzeichnis und
+/// gibt aus [`harw_runtime::RuntimeAssembly::rights_snapshot`] Einstieg,
+/// Rechte, Werkzeuganzahl, Approval-Kette und ein etwaiges nicht
+/// vertrauenswürdiges Repository aus. Scheitert Arbeitsverzeichnis oder
+/// Montage, erscheint genau eine `runtime_warning=`-Zeile.
+///
+/// # Arguments
+/// - `home` (`&Path`): aufgelöster Root-Space.
+fn print_runtime_rights(home: &Path) {
+    let assembly = std::env::current_dir()
+        .map_err(|error| format!("cwd: {error}"))
+        .and_then(|cwd| runtime_entry::doctor_assembly(home, &cwd));
+    let assembly = match assembly {
+        Ok(assembly) => assembly,
+        Err(error) => {
+            println!("runtime_warning=runtime assembly failed: {error}");
+            return;
+        }
+    };
+    let rights = assembly.rights_snapshot();
+    println!("runtime_entry={:?}", rights.entry);
+    println!("runtime_permissions={}", rights.permissions.join(", "));
+    println!("runtime_tools={}", rights.tools.len());
+    println!(
+        "runtime_approval_chain={}",
+        rights
+            .approval_chain
+            .iter()
+            .map(|(label, kind)| format!("{label}:{kind:?}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    match rights.untrusted_repo {
+        Some(repo) => println!("runtime_untrusted_repo={}", repo.display()),
+        None => println!("runtime_untrusted_repo=none"),
+    }
 }
 
 #[cfg(test)]
@@ -1926,115 +1864,6 @@ mod tests {
         );
 
         std::fs::remove_dir_all(home).expect("remove temporary home");
-    }
-
-    #[test]
-    fn local_spawn_context_binds_registered_tools_to_discovered_root() {
-        let project = tempfile::tempdir().expect("create project directory");
-        let assembled = harw_registry_defaults::assemble_default_registry(project.path().into())
-            .expect("assemble default registry");
-        let context = build_local_spawn_context(&assembled.project.project_root)
-            .expect("build local spawn context");
-        let registered_tools = assembled
-            .registry
-            .tool_providers()
-            .iter()
-            .flat_map(|provider| provider.tools())
-            .collect::<Vec<_>>();
-        let expected_root = assembled
-            .project
-            .project_root
-            .canonicalize()
-            .expect("canonical project root");
-
-        assert!(
-            !registered_tools.is_empty(),
-            "default tools must be registered"
-        );
-        assert_eq!(
-            context.sandbox.workspace().canonical_root(),
-            expected_root.as_path()
-        );
-        assert_eq!(context.sandbox.workspace().tenant().as_str(), "cli");
-        assert_eq!(context.sandbox.workspace().workspace().as_str(), "project");
-        assert!(
-            context
-                .sandbox
-                .permissions()
-                .contains(Permission::ReadWorkspace)
-        );
-        assert!(
-            context
-                .sandbox
-                .permissions()
-                .contains(Permission::WriteWorkspace)
-        );
-        assert!(
-            context
-                .sandbox
-                .permissions()
-                .contains(Permission::ExecuteProcess)
-        );
-        assert!(
-            !context
-                .sandbox
-                .permissions()
-                .contains(Permission::NetworkAccess)
-        );
-    }
-
-    #[test]
-    fn local_spawn_context_uses_fixed_operator_approval_and_root_role() {
-        let project = tempfile::tempdir().expect("create project directory");
-        let context = build_local_spawn_context(project.path()).expect("build spawn context");
-
-        assert_eq!(
-            context.approval_actor,
-            Some(ApprovalActor::Operator {
-                id: "local-cli".to_owned(),
-            })
-        );
-        assert_eq!(
-            serde_json::to_string(&context.organizational_role).expect("serialize role"),
-            "\"root-orchestrator\""
-        );
-    }
-
-    /// AW1-01c: the local-run spawn context is a root — it carries a
-    /// freshly-generated trace with the right hex shapes and no parent span.
-    #[test]
-    fn local_spawn_context_carries_a_freshly_generated_root_trace() {
-        let project = tempfile::tempdir().expect("create project directory");
-        let context = build_local_spawn_context(project.path()).expect("build spawn context");
-
-        let trace = context.trace.expect("local root must carry a trace");
-        assert_eq!(trace.trace_id.len(), 32);
-        assert!(trace.trace_id.bytes().all(|b| b.is_ascii_hexdigit()));
-        assert_eq!(trace.trace_id, trace.trace_id.to_lowercase());
-        assert_eq!(trace.span_id.len(), 16);
-        assert!(trace.span_id.bytes().all(|b| b.is_ascii_hexdigit()));
-        assert_eq!(trace.span_id, trace.span_id.to_lowercase());
-        assert!(
-            trace.parent_span_id.is_none(),
-            "a root trace must not carry a parent span"
-        );
-    }
-
-    /// AW1-01c: two local runs must not look like the same run — the random
-    /// source must not be broken/constant.
-    #[test]
-    fn local_spawn_context_root_traces_differ_across_two_calls() {
-        let project = tempfile::tempdir().expect("create project directory");
-        let first = build_local_spawn_context(project.path())
-            .expect("build first spawn context")
-            .trace
-            .expect("first call must carry a trace");
-        let second = build_local_spawn_context(project.path())
-            .expect("build second spawn context")
-            .trace
-            .expect("second call must carry a trace");
-
-        assert_ne!(first.trace_id, second.trace_id);
     }
 
     #[test]
@@ -2305,84 +2134,83 @@ mod tests {
         assert!(error.contains("work"), "{error}");
     }
 
+    /// `to_runtime` reicht eine Planungsfläche nur vollständig weiter — und
+    /// zwar mit **denselben** Store-Instanzen, nicht mit neu geöffneten.
     #[test]
-    fn startup_mode_round_trips_every_interaction_mode() {
-        for mode in [
-            InteractionMode::Chat,
-            InteractionMode::Plan,
-            InteractionMode::Explore,
-            InteractionMode::Work,
-        ] {
-            assert_eq!(mode_from_code(mode_code(mode)), mode);
-        }
+    fn test_plan_services_to_runtime_requires_all_three_stores() {
+        let disabled = super::PlanServices {
+            services: ServiceMap::new(),
+            plan: None,
+            goal: None,
+            findings: None,
+            config: PlanToolConfig::default(),
+        };
+        assert!(disabled.to_runtime().is_none());
 
-        // Der Prozess-globale Zustand wird hier bewusst gesetzt und wieder
-        // zurückgesetzt; kein anderer Test dieser Datei liest ihn.
-        STARTUP_MODE.store(mode_code(InteractionMode::Explore), Ordering::Relaxed);
-        assert_eq!(startup_mode(), InteractionMode::Explore);
-        STARTUP_MODE.store(mode_code(InteractionMode::Chat), Ordering::Relaxed);
-    }
+        let partial = super::PlanServices {
+            services: ServiceMap::new(),
+            plan: Some(Arc::new(InMemoryPlanStore::new())),
+            goal: Some(Arc::new(InMemoryGoalStore::new())),
+            findings: None,
+            config: PlanToolConfig::default(),
+        };
+        assert!(
+            partial.to_runtime().is_none(),
+            "eine halb geöffnete Planungsfläche darf nie an die Montage gehen"
+        );
 
-    /// Die Laufzeit-Weitergabe an den Chat trägt **alle** Beiträge, nicht nur
-    /// die Stores.
-    ///
-    /// Der Bottom-up-Abgleich hatte genau hier die Lücke gefunden: die Stores
-    /// gingen durch, Ziel-Kontext, Freigabe-Politik und Startmodus nicht. Ein
-    /// per `--goal` gesetztes Ziel lag danach zwar im Store, erreichte aber
-    /// keinen einzigen Modell-Turn.
-    #[test]
-    fn chat_runtime_carries_goal_context_policy_and_mode_not_only_stores() {
         let config = PlanToolConfig::enabled_defaults();
-        let (_home, services) = plan_services_over_temp_home(&config);
-        let goal_context = match (services.goal.as_ref(), services.plan.as_ref()) {
-            (Some(goal), Some(plan)) => Some(Arc::new(GoalContextProvider::new(
-                Arc::clone(goal),
-                Arc::clone(plan),
-            ))),
-            _ => None,
+        let (_home, complete) = plan_services_over_temp_home(&config);
+        let Some(runtime) = complete.to_runtime() else {
+            panic!("bei aktiver Planungsfläche müssen alle drei Stores vorliegen");
         };
-        let policy = ConfigApprovalPolicy::new(["fs.write".to_owned()]);
-
-        let runtime = services.as_chat_runtime(
-            goal_context.as_ref(),
-            &policy,
-            InteractionMode::Explore,
-        );
-
-        let Some(runtime) = runtime else {
-            panic!("bei aktiver Planungsfläche muss eine Laufzeit entstehen");
+        let (Some(plan), Some(goal), Some(findings)) = (
+            complete.plan.as_ref(),
+            complete.goal.as_ref(),
+            complete.findings.as_ref(),
+        ) else {
+            panic!("die Fixture hat alle drei Stores");
         };
-        assert_eq!(
-            runtime.context_providers.len(),
-            1,
-            "der Ziel-Kontext muss durchgereicht werden, sonst sieht ihn kein Turn"
-        );
-        assert_eq!(
-            runtime.approval_handlers.len(),
-            1,
-            "die Zusatzpolitik muss durchgereicht werden"
-        );
-        assert_eq!(runtime.initial_mode, Some(InteractionMode::Explore));
-        assert!(
-            runtime.plan_config.is_enabled(),
-            "die Konfiguration muss mitreisen — sie ist das Gate für register_plan_tools"
-        );
+        assert!(Arc::ptr_eq(&runtime.plan, plan), "derselbe Plan-Store");
+        assert!(Arc::ptr_eq(&runtime.goal, goal), "derselbe Goal-Store");
+        assert!(Arc::ptr_eq(&runtime.findings, findings), "derselbe Finding-Store");
+        assert!(runtime.plan_config.is_enabled(), "die Konfiguration reist mit");
+        assert_eq!(runtime.plan_config.max_nodes, complete.config.max_nodes);
     }
 
-    /// Ohne Planungsfläche entsteht keine Laufzeit — und damit auch keine
-    /// halbfertige, die Beiträge ohne Stores trüge.
+    /// Der Startmodus ist ein Rückgabewert, kein Prozesszustand: zwei
+    /// Auflösungen hintereinander liefern je ihren eigenen Modus.
     #[test]
-    fn chat_runtime_is_absent_when_the_plan_surface_is_disabled() {
-        let config = PlanToolConfig::default();
-        let (_home, services) = plan_services_over_temp_home(&config);
-        let policy = ConfigApprovalPolicy::new(Vec::<String>::new());
-
-        let runtime = services.as_chat_runtime(None, &policy, InteractionMode::Chat);
-
-        assert!(
-            runtime.is_none(),
-            "ohne Stores darf keine Chat-Laufzeit entstehen"
+    fn test_prepare_planning_startup_resolves_mode_without_global_state() {
+        let home = tempfile::tempdir().expect("create temporary home");
+        let cwd = tempfile::tempdir().expect("create temporary cwd");
+        let spec = runtime_entry::runtime_spec(
+            EntryKind::Tui,
+            home.path(),
+            cwd.path(),
+            runtime_entry::local_principal(IngressSurface::Tui),
         );
+
+        let explore = prepare_planning_startup(&spec, Some("explore"), None)
+            .expect("explicit explore mode resolves");
+        let explore_mode = explore.mode;
+        assert_eq!(
+            explore.services.to_runtime().is_some(),
+            explore.plan_config.is_enabled(),
+            "Plan-Dienste für die Montage genau dann, wenn [tools.plan] aktiv ist"
+        );
+        drop(explore);
+
+        let work = prepare_planning_startup(&spec, Some("work"), None)
+            .expect("explicit work mode resolves");
+        assert_eq!(explore_mode, InteractionMode::Explore);
+        assert_eq!(work.mode, InteractionMode::Work);
+        drop(work);
+
+        let Err(error) = prepare_planning_startup(&spec, Some("voelliger-unsinn"), None) else {
+            panic!("ein unbekannter Modus darf keinen Start ergeben");
+        };
+        assert!(error.contains("voelliger-unsinn"), "{error}");
     }
 
     #[test]
@@ -2436,50 +2264,6 @@ mod tests {
         let (_home, services) = plan_services_over_temp_home(&config);
 
         assert!(seed_startup_goal(&services, "   ", STARTUP_GOAL_ID).is_err());
-    }
-
-    #[test]
-    fn composed_registry_appends_plan_contributions_without_replacing_defaults() {
-        let project = tempfile::tempdir().expect("create project directory");
-        let assembled = harw_registry_defaults::assemble_default_registry(project.path().into())
-            .expect("assemble default registry");
-        let base_tools = assembled.registry.tool_providers().len();
-        let base_approvals = assembled.registry.approval_handlers().len();
-        let base_contexts = assembled.registry.context_providers().len();
-
-        let config = PlanToolConfig::enabled_defaults();
-        let (_home, services) = plan_services_over_temp_home(&config);
-        let goal_context = Some(Arc::new(GoalContextProvider::new(
-            Arc::clone(services.goal.as_ref().expect("Goal-Store vorhanden")),
-            Arc::clone(services.plan.as_ref().expect("Plan-Store vorhanden")),
-        )));
-        let startup = PlanningStartup {
-            mode: InteractionMode::Plan,
-            plan_config: config,
-            approval_policy: ConfigApprovalPolicy::new(["shell".to_owned()]),
-            goal_context,
-            services,
-        };
-
-        let composed = startup
-            .compose_extension_registry(&assembled.registry)
-            .expect("no namespace collision is possible in this fixture");
-
-        assert_eq!(
-            composed.tool_providers().len(),
-            base_tools,
-            "die Werkzeugliste darf sich durch die Plan-Komposition nicht ändern"
-        );
-        assert_eq!(
-            composed.approval_handlers().len(),
-            base_approvals + 1,
-            "die Config-Politik tritt neben die DefaultApprovalPolicy, nicht an ihre Stelle"
-        );
-        assert_eq!(
-            composed.context_providers().len(),
-            base_contexts + 1,
-            "der Ziel-Kontext kommt als zusätzlicher Beitragender hinzu"
-        );
     }
 
     #[test]
@@ -2811,7 +2595,8 @@ mod tests {
                 ],
             });
 
-        let registry = build_principal_registry(&config);
+        let registry =
+            build_principal_registry(&config).expect("distinct principal ids build a registry");
         let principal = registry
             .get("mia-local")
             .expect("configured principal is present in the registry");
@@ -2852,7 +2637,8 @@ mod tests {
                 });
         }
 
-        let registry = build_principal_registry(&config);
+        let registry =
+            build_principal_registry(&config).expect("distinct principal ids build a registry");
         assert!(
             registry
                 .get("submitter")
@@ -2866,6 +2652,63 @@ mod tests {
                 .expect("configured reader is present")
                 .capabilities()
                 .contains(&McpJobCapability::SubmitOwn)
+        );
+    }
+
+    #[test]
+    fn test_build_principal_registry_rejects_duplicate_id() {
+        let mut config = ResolvedConfig::default();
+        for workspace in ["first", "second"] {
+            config
+                .harness
+                .mcp_listener
+                .principals
+                .push(harw_config::McpPrincipalToml {
+                    id: "twice".to_owned(),
+                    credential_ref: "env:HARW_TEST_UNUSED".parse().expect("valid secret ref"),
+                    tenant: "mia".to_owned(),
+                    workspace: workspace.to_owned(),
+                    job_capabilities: vec![McpJobCapabilityToml::SubmitOwn],
+                });
+        }
+
+        match build_principal_registry(&config) {
+            Ok(_) => panic!("a duplicated principal id must abort registry construction"),
+            Err(error) => {
+                assert!(error.contains("'twice'"), "{error}");
+                assert!(error.contains("more than once"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_dispatch_web_without_home_names_home_flag() {
+        let error = web_home(Err("could not determine the home directory".to_owned()))
+            .expect_err("an unresolvable home must stop harw web");
+        assert!(error.contains("--home"), "{error}");
+        assert!(error.contains("HARW_HOME"), "{error}");
+        assert!(
+            error.contains("could not determine the home directory"),
+            "{error}"
+        );
+
+        let home = PathBuf::from("/tmp/harw-web-home");
+        assert_eq!(web_home(Ok(home.clone())), Ok(home));
+    }
+
+    #[test]
+    fn test_run_startup_migrations_project_skips_home_resolution() {
+        let parent = tempfile::tempdir().expect("create temporary parent");
+        let missing_home = parent.path().join("absent-harw-home");
+        let command = Cli::try_parse_from(["harw", "project", "status"])
+            .expect("project status parses")
+            .command;
+
+        run_startup_migrations(&command, Some(missing_home.clone()))
+            .expect("project commands do not migrate configuration");
+        assert!(
+            !missing_home.exists(),
+            "project commands must not scaffold a home during startup migrations"
         );
     }
 

@@ -177,56 +177,16 @@ pub fn handle_tools_command(
 /// gathered while only a shared `&session` borrow was held. The caller drops
 /// that borrow before calling this function with `&mut activation`.
 ///
-/// For sub-commands that do not need the snapshot (`on`, `off`, `reset`,
-/// `profile`), the snapshot is ignored. For the list sub-command (`args == ""`),
-/// the snapshot is used to build the listing output.
+/// Dispatches a `/tools` command, never letting the session's activation
+/// exceed `ceiling` (Welle W2d-1/B, Befund `w4-tui-control.md` §5; Fix
+/// W2d-1/F-T, Befunde T2/T3/T7).
 ///
-/// Veraltet ab W2d-2: diese Funktion prüft keine Decke (Basis ∩ Modus) —
-/// `on <tool>`, `reset` und `profile <name>` können die Decke der Session
-/// überschreiten. Aufrufer wechseln zu
-/// [`dispatch_tools_command_bounded`]. Kein `#[deprecated]`, da das in
-/// `app.rs` clippy `-D warnings` brechen würde, solange die Migration (Welle
-/// D5) dort nicht nachgezogen ist.
-///
-/// # Arguments
-/// - `args` (`&str`): everything after `/tools` in the user's input (trimmed by caller).
-/// - `tool_snapshot` (`&[(String, bool)]`): `(tool_name, is_enabled)` pairs
-///   collected from the registry while holding a shared session borrow.
-/// - `activation` (`&mut SessionActivation`): current session activation;
-///   mutated by state-changing sub-commands.
-///
-/// # Returns
-/// A [`ToolsCommandOutcome`] ready for rendering.
-pub fn dispatch_tools_command(
-    args: &str,
-    tool_snapshot: &[(String, bool)],
-    activation: &mut SessionActivation,
-) -> ToolsCommandOutcome {
-    let trimmed = args.trim();
-    let parts: Vec<&str> = if trimmed.is_empty() {
-        Vec::new()
-    } else {
-        trimmed.split_whitespace().collect()
-    };
-
-    match parts.as_slice() {
-        [] => list_from_snapshot(tool_snapshot, activation),
-        ["on", name] => set_tool(activation, name, true),
-        ["off", name] => set_tool(activation, name, false),
-        ["reset"] => reset_all(activation),
-        ["reset", name] => reset_one(activation, name),
-        ["profile", p] => set_profile(activation, p),
-        _ => ToolsCommandOutcome::Error(
-            "usage: /tools | /tools on <name> | /tools off <name> \
-             | /tools reset [<name>] | /tools profile <minimal|coding|full>"
-                .to_string(),
-        ),
-    }
-}
-
-/// Dispatches a `/tools` command the same way as [`dispatch_tools_command`],
-/// but never lets the session's activation exceed `ceiling` (Welle W2d-1/B,
-/// Befund `w4-tui-control.md` §5; Fix W2d-1/F-T, Befunde T2/T3/T7).
+/// Entfernt W2d-2/CE (E8): der frühere unbegrenzte `dispatch_tools_command`
+/// (ohne Deckenprüfung) hatte in `tools_command.rs` keine eigenen Tests und
+/// wurde ersatzlos gestrichen — jeder Aufrufer verwendet ab jetzt diese
+/// begrenzte Variante. Die Sub-Handler `list_from_snapshot`, `set_tool`,
+/// `reset_all`, `reset_one` und `set_profile` bleiben bestehen, da
+/// [`handle_tools_command`] und diese Funktion sie weiterhin nutzen.
 ///
 /// # Description
 /// `ceiling` is the session's tool ceiling: base activation ∩ mode activation
@@ -342,8 +302,8 @@ fn list_tools(registry: &ExtensionRegistry, activation: &SessionActivation) -> T
 /// Lists tools from a pre-collected `(name, enabled)` snapshot.
 ///
 /// # Description
-/// Used by [`dispatch_tools_command`] when the caller cannot hold a shared
-/// registry borrow alongside a mutable activation borrow (split-borrow
+/// Used by [`dispatch_tools_command_bounded`] when the caller cannot hold a
+/// shared registry borrow alongside a mutable activation borrow (split-borrow
 /// constraint in the TUI run-loop). The snapshot captures `(name, is_enabled)`
 /// pairs before any mutation occurs; the profile header is read freshly from
 /// `activation` (only `profile()` is needed, which is always safe to call).

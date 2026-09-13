@@ -330,6 +330,41 @@ impl RuntimeServices {
         &self.parts.approval_mode
     }
 
+    /// Die geöffnete Planungsfläche dieser Komposition.
+    ///
+    /// # Beschreibung
+    /// Lesezugriff auf genau den Wert aus [`RuntimeServicesParts::plan`]; die
+    /// Fabrik klont nichts. Einstiege, die Plan-Speicher außerhalb einer
+    /// [`ServiceMap`] brauchen (etwa die TUI für ihren Planbaum), lesen sie
+    /// hier, statt eine zweite Planungsfläche zu öffnen (CONTRACTS-W2d2 §1.1).
+    ///
+    /// # Rückgabe
+    /// `Some(&PlanServices)`, wenn die Planungsfläche offen ist, sonst `None`.
+    ///
+    /// # Nebenläufigkeit
+    /// Reiner Lesezugriff; keine Sperren.
+    #[must_use]
+    pub fn plan(&self) -> Option<&PlanServices> {
+        self.parts.plan.as_ref()
+    }
+
+    /// Das Gedächtnis dieser Komposition.
+    ///
+    /// # Beschreibung
+    /// Lesezugriff auf genau den Wert aus [`RuntimeServicesParts::memory`]
+    /// (CONTRACTS-W2d2 §1.1). Wer ein eigenes `Arc` braucht, klont den Zeiger
+    /// mit `Arc::clone`, nie das Gedächtnis selbst.
+    ///
+    /// # Rückgabe
+    /// `Some(&Arc<dyn Memory>)`, wenn ein Gedächtnis konfiguriert ist, sonst `None`.
+    ///
+    /// # Nebenläufigkeit
+    /// Reiner Lesezugriff; keine Sperren.
+    #[must_use]
+    pub fn memory(&self) -> Option<&Arc<dyn Memory>> {
+        self.parts.memory.as_ref()
+    }
+
     /// Baut die [`ServiceMap`] einer Fläche.
     ///
     /// # Beschreibung
@@ -865,5 +900,31 @@ mod tests {
         };
         assert_eq!(principal, services.principal());
         assert_eq!(principal.id(), "w2b-04");
+    }
+
+    // ── Accessoren (CONTRACTS-W2d2 §1.1) ─────────────────────────────────────
+
+    #[test]
+    fn test_plan_returns_the_parts_plan_services() {
+        let parts = full_parts();
+        let expected_findings = parts
+            .plan
+            .as_ref()
+            .map(|plan| Arc::clone(&plan.findings));
+        let services = RuntimeServices::new(parts);
+        let (Some(plan), Some(expected)) = (services.plan(), expected_findings) else {
+            panic!("full_parts() setzt Plan-Dienste, plan() muss sie liefern");
+        };
+        assert!(
+            Arc::ptr_eq(&plan.findings, &expected),
+            "plan() liefert genau den übergebenen Wert, keine Kopie"
+        );
+        assert!(RuntimeServices::new(minimal_parts()).plan().is_none());
+    }
+
+    #[test]
+    fn test_memory_none_without_memory() {
+        assert!(RuntimeServices::new(minimal_parts()).memory().is_none());
+        assert!(RuntimeServices::new(full_parts()).memory().is_some());
     }
 }

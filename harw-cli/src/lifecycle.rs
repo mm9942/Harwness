@@ -2,16 +2,9 @@
 //! `catalog`, `uninstall`. Dünne Verdrahtung auf `harw-install`/
 //! `harw-model-catalog`; die Logik lebt in den jeweiligen Descriptor-Modulen.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use harw_core::SpawnContext;
 use harw_install::{Platform, ServiceSpec, UninstallScope, UpdateChecker, detect_service_manager};
-use harw_observe::TraceContext;
-use harw_sandbox::{
-    Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-};
-use harw_types::{ApprovalActor, TenantId, WorkspaceId};
-use uuid::Uuid;
 
 use crate::cli::ServiceAction;
 use crate::home::resolve_home;
@@ -35,10 +28,8 @@ pub fn health(home_override: Option<PathBuf>) -> Result<(), String> {
 /// Builds the install checks with evidence from this CLI's real composition
 /// root. `harw-install` deliberately cannot construct or infer this evidence
 /// itself because it does not own the registry or session boundary.
-fn health_checks(
-    home: &std::path::Path,
-) -> Result<Vec<Box<dyn harw_install::DoctorCheck>>, String> {
-    let evidence = runtime_composition_evidence()?;
+fn health_checks(home: &Path) -> Result<Vec<Box<dyn harw_install::DoctorCheck>>, String> {
+    let evidence = runtime_composition_evidence(home)?;
     Ok(vec![
         Box::new(harw_install::doctor::SystemCheck),
         Box::new(harw_install::doctor::SandboxCheck),
@@ -49,92 +40,24 @@ fn health_checks(
     ])
 }
 
-/// Observes the default registry, the trusted spawn context, and the approval
-/// handler assembled for the same CLI project path. A failed assembly is
-/// returned rather than converted into positive or guessed evidence.
-fn runtime_composition_evidence() -> Result<harw_install::doctor::RuntimeCompositionEvidence, String>
-{
+/// Observes the tool composition, the trusted spawn context, and the approval
+/// boundary that `harw doctor`'s own runtime entry
+/// ([`crate::runtime_entry::doctor_assembly`]) actually assembles for `home`.
+/// A failed assembly is returned rather than converted into positive or
+/// guessed evidence.
+fn runtime_composition_evidence(
+    home: &Path,
+) -> Result<harw_install::doctor::RuntimeCompositionEvidence, String> {
     let cwd = std::env::current_dir().map_err(|error| format!("cwd: {error}"))?;
-    let assembled = harw_registry_defaults::assemble_default_registry(cwd)
-        .map_err(|error| error.to_string())?;
-    let advertised_tools = assembled
-        .registry
-        .tool_providers()
-        .iter()
-        .flat_map(|provider| provider.tools())
-        .map(|tool| tool.name().to_owned())
-        .collect();
-    build_doctor_spawn_context(&assembled.project.project_root)?;
+    let assembly = crate::runtime_entry::doctor_assembly(home, &cwd)?;
+    let rights = assembly.rights_snapshot();
+    let has_trusted_spawn_context = assembly.spawn_context().approval_actor.is_some();
+    let has_approval_boundary = !rights.approval_chain.is_empty();
 
     Ok(harw_install::doctor::RuntimeCompositionEvidence {
-        advertised_tools: Some(advertised_tools),
-        has_trusted_spawn_context: Some(true),
-        has_approval_boundary: Some(assembled.registry.approval_handlers().len() == 1),
-    })
-}
-
-/// Generates a fresh root trace for one `harw doctor` run.
-///
-/// This call site is a root: a doctor invocation has no parent whose trace it
-/// could inherit, so the `trace_id` that ties together this run's evidence
-/// gathering originates here. Mirrors `harw-core`'s `new_span_id` random
-/// source (`harw-core/src/child_controller.rs`) instead of inventing a second
-/// one: `uuid::Uuid::new_v4` supplies the full 32 hex characters for
-/// `trace_id`, a second, independent draw supplies the first 16 for
-/// `span_id`. Both are already valid lowercase hex of the required length by
-/// construction; [`TraceContext::new`] still validates rather than setting
-/// fields directly.
-fn new_doctor_root_trace() -> Result<TraceContext, String> {
-    let trace_id = Uuid::new_v4().simple().to_string();
-    let span_id = Uuid::new_v4().simple().to_string()[..16].to_owned();
-    TraceContext::new(trace_id, span_id)
-        .map_err(|error| format!("could not build doctor root trace context: {error}"))
-}
-
-/// Constructs the same trusted sandbox/approval binding used by one-shot CLI
-/// turns, so the doctor result reflects an observed `SpawnContext` rather than
-/// a structural assumption about the registry.
-fn build_doctor_spawn_context(project_root: &std::path::Path) -> Result<SpawnContext, String> {
-    let tenant = TenantId::from_str("cli");
-    let workspace = WorkspaceId::from_str("project");
-    let registry = WorkspaceRegistry::build(
-        project_root,
-        [WorkspaceRegistration {
-            tenant: tenant.clone(),
-            workspace: workspace.clone(),
-            root: PathBuf::from("."),
-        }],
-    )
-    .map_err(|error| error.to_string())?;
-    let binding = registry
-        .resolve(&tenant, &workspace)
-        .map_err(|error| error.to_string())?;
-    let organizational_role = serde_json::from_str("\"root-orchestrator\"")
-        .map_err(|error| format!("could not resolve doctor organizational role: {error}"))?;
-    let trace = new_doctor_root_trace()?;
-
-    Ok(SpawnContext {
-        sandbox: SandboxSpec::from_resolved(
-            binding,
-            PermissionSet::from_policy([
-                Permission::ReadWorkspace,
-                Permission::WriteWorkspace,
-                Permission::ExecuteProcess,
-            ]),
-        ),
-        suggestions: None,
-        capability_snapshot: None,
-        approval_actor: Some(ApprovalActor::Operator {
-            id: "local-cli".to_owned(),
-        }),
-        organizational_role,
-        // Root: no parent exists whose trace could be inherited — see
-        // `new_doctor_root_trace`.
-        trace: Some(trace),
-        // Root: no parent exists whose already-cut ceiling could be
-        // inherited, so the ceiling is created here, once — see
-        // `crate::root_context::local_root_context_ceiling`.
-        ceiling: Some(crate::root_context::local_root_context_ceiling()),
+        advertised_tools: Some(rights.tools),
+        has_trusted_spawn_context: Some(has_trusted_spawn_context),
+        has_approval_boundary: Some(has_approval_boundary),
     })
 }
 
@@ -267,17 +190,25 @@ pub fn uninstall(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     #[test]
     fn health_evidence_observes_default_cli_composition() {
-        let evidence = runtime_composition_evidence().expect("assemble CLI composition");
+        let home = tempfile::tempdir().expect("create temporary HARW home");
+
+        let evidence =
+            runtime_composition_evidence(home.path()).expect("assemble CLI composition");
 
         // Die Liste ist bewusst vollständig ausgeschrieben und nicht auf eine
         // Mindestmenge geprüft: eine Änderung der Werkzeugfläche der Standard-
         // Zusammenstellung soll auffallen, nicht durchrutschen. `fs.glob` und
         // `fs.grep` kamen mit den Recherche-Werkzeugen hinzu (AP W2-01/02).
-        let base = [
+        // `rights_snapshot().tools` liefert sortiert und dublettenfrei
+        // (harw-runtime/src/assembly.rs `rights_snapshot`), deshalb wird hier
+        // als Menge statt per `starts_with`-Präfix verglichen.
+        let base: HashSet<&str> = [
             "fs.read",
             "fs.write",
             "fs.list",
@@ -285,8 +216,10 @@ mod tests {
             "fs.glob",
             "fs.grep",
             "shell.exec",
-        ];
-        let browser = [
+        ]
+        .into_iter()
+        .collect();
+        let browser: HashSet<&str> = [
             "browser.open",
             "browser.observe",
             "browser.find",
@@ -294,56 +227,21 @@ mod tests {
             "browser.wait",
             "browser.events",
             "browser.close",
-        ];
-        let advertised = evidence.advertised_tools.expect("advertised tool evidence");
-        let advertised = advertised.iter().map(String::as_str).collect::<Vec<_>>();
-        assert!(advertised.starts_with(&base));
+        ]
+        .into_iter()
+        .collect();
         // Workspace --all-features unifies the registry's optional browser
         // feature into this binary, even though the CLI has no such feature.
-        let optional = &advertised[base.len()..];
+        let with_browser: HashSet<&str> = base.union(&browser).copied().collect();
+
+        let advertised = evidence.advertised_tools.expect("advertised tool evidence");
+        let advertised: HashSet<&str> = advertised.iter().map(String::as_str).collect();
         assert!(
-            optional.is_empty() || optional == browser,
-            "unexpected optional tool surface: {optional:?}"
+            advertised == base || advertised == with_browser,
+            "unexpected tool surface: {advertised:?}"
         );
         assert_eq!(evidence.has_trusted_spawn_context, Some(true));
         assert_eq!(evidence.has_approval_boundary, Some(true));
-    }
-
-    /// AW1-01c: the doctor spawn context is a root — it carries a
-    /// freshly-generated trace with the right hex shapes and no parent span.
-    #[test]
-    fn doctor_context_carries_a_freshly_generated_root_trace() {
-        let project = tempfile::tempdir().expect("create project directory");
-        let context = build_doctor_spawn_context(project.path()).expect("build spawn context");
-
-        let trace = context.trace.expect("doctor root must carry a trace");
-        assert_eq!(trace.trace_id.len(), 32);
-        assert!(trace.trace_id.bytes().all(|b| b.is_ascii_hexdigit()));
-        assert_eq!(trace.trace_id, trace.trace_id.to_lowercase());
-        assert_eq!(trace.span_id.len(), 16);
-        assert!(trace.span_id.bytes().all(|b| b.is_ascii_hexdigit()));
-        assert_eq!(trace.span_id, trace.span_id.to_lowercase());
-        assert!(
-            trace.parent_span_id.is_none(),
-            "a root trace must not carry a parent span"
-        );
-    }
-
-    /// AW1-01c: two doctor runs must not look like the same run — the random
-    /// source must not be broken/constant.
-    #[test]
-    fn doctor_context_root_traces_differ_across_two_calls() {
-        let project = tempfile::tempdir().expect("create project directory");
-        let first = build_doctor_spawn_context(project.path())
-            .expect("build first spawn context")
-            .trace
-            .expect("first call must carry a trace");
-        let second = build_doctor_spawn_context(project.path())
-            .expect("build second spawn context")
-            .trace
-            .expect("second call must carry a trace");
-
-        assert_ne!(first.trace_id, second.trace_id);
     }
 
     #[test]

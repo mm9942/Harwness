@@ -18,7 +18,9 @@
 //! Die Konfiguration wird vertrauensbewusst über
 //! [`harw_runtime::load_config`] für dieselbe Spec geladen
 //! ([`crate::runtime_web::web_spec`]); die frühere Layer-Liste aus
-//! `crate::resolve_serve_paths` wird dafür nicht mehr gelesen.
+//! `crate::resolve_serve_paths` wird nicht mehr gelesen — seit W2d-2/W1 nimmt
+//! [`serve_web`] dafür überhaupt keinen Layer-Parameter mehr entgegen, es gibt
+//! kein `--config-dir` für `harw web`.
 //!
 //! # Warum er nicht ungefragt läuft
 //! `harw web` bindet nur, weil der Subcommand explizit aufgerufen wurde —
@@ -161,11 +163,10 @@ const EVENT_BUS_CAPACITY: usize = 64;
 /// Prozess endet.
 ///
 /// # Arguments
-/// - `_layers` (`Vec<PathBuf>`): wird nicht mehr gelesen; die Konfiguration
-///   kommt aus der `RuntimeAssembly` (Trust-Bericht). Bleibt für die
-///   Signaturstabilität des Aufrufers in `main.rs`.
 /// - `home` (`Option<PathBuf>`): das aufgelöste HARW-Home. **Pflicht** —
 ///   `None` ist ein Fehler (siehe Moduldoc, Abschnitt „HARW-Home ist Pflicht").
+///   Es gibt keinen `--config-dir`-Ersatz: ohne `--home`/`HARW_HOME` bricht
+///   `harw web` sofort ab.
 /// - `socket_override` (`Option<PathBuf>`): `--socket`; hat Vorrang vor
 ///   `<home>/web.sock`.
 ///
@@ -183,9 +184,6 @@ const EVENT_BUS_CAPACITY: usize = 64;
 /// # Concurrency
 /// Baut eine eigene einthreadige `tokio`-Runtime, siehe Moduldoc.
 pub(crate) fn serve_web(
-    // Konfiguration kommt aus der RuntimeAssembly (Trust-Bericht); Layer-Liste
-    // bleibt für Signaturstabilität.
-    _layers: Vec<PathBuf>,
     home: Option<PathBuf>,
     socket_override: Option<PathBuf>,
 ) -> Result<(), String> {

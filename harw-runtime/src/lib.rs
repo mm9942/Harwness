@@ -20,8 +20,8 @@ pub mod trace;
 
 pub use approval::ApprovalChain;
 pub use assembly::{
-    RootSession, RuntimeAssembly, RuntimeAssemblyBuilder, RuntimeStores, SessionLifecycleHook,
-    TurnLimits, default_approval_mode,
+    RootSession, RuntimeAssembly, RuntimeAssemblyBuilder, RuntimeNarrowing, RuntimeStores,
+    SessionLifecycleHook, TurnLimits, default_approval_mode,
 };
 pub use budget::child_limits;
 pub use ceiling::root_ceiling;

@@ -125,14 +125,23 @@ pub enum Command {
     /// Läuft **nicht** ungefragt: ohne diesen Subcommand bindet kein
     /// Prozess `harw-web`s Socket. Bedient dieselbe [`harw_operations`]-
     /// Registry, die auch der Chat- und `analyze`-Pfad zusammenstellen
-    /// (siehe `crate::web`-Moduldoku).
+    /// (siehe `crate::web`-Moduldoku). Der Root-Space wird ausschließlich
+    /// über `--home` bzw. `HARW_HOME` aufgelöst — erfordert `--home` bzw.
+    /// `HARW_HOME`.
     Web {
-        /// Statt der Home-Layer genau dieses Verzeichnis verwenden.
-        #[arg(long, value_name = "DIR")]
-        config_dir: Option<PathBuf>,
         /// Socket-Pfad überschreiben (Vorgabe: `<home>/web.sock`).
         #[arg(long, value_name = "PATH")]
         socket: Option<PathBuf>,
+    },
+    /// Projekt-Freigabe (Trust) für ein Verzeichnis verwalten.
+    ///
+    /// Steuert `<home>/trusted-projects.toml` (siehe
+    /// [`harw_home::trust`]): ein freigegebenes Projekt darf sein
+    /// repo-lokales `.harw` als zusätzlichen Config-Layer beisteuern.
+    Project {
+        /// Auszuführende Trust-Aktion.
+        #[command(subcommand)]
+        action: ProjectAction,
     },
     /// Eine Eingabezeile mit dem Front-End-Klassifikator einordnen.
     Classify {
@@ -266,6 +275,32 @@ pub enum ServiceAction {
     Uninstall,
 }
 
+/// Aktionen des `harw project`-Subcommands.
+///
+/// Ohne `path` wirkt jede Aktion auf das aktuelle Arbeitsverzeichnis
+/// (siehe `crate::project_trust`).
+#[derive(Debug, Subcommand)]
+pub enum ProjectAction {
+    /// Gibt das Projekt frei (bzw. erneuert die Freigabe).
+    Trust {
+        /// Projekt-Root; ohne Angabe das aktuelle Arbeitsverzeichnis.
+        #[arg(value_name = "DIR")]
+        path: Option<PathBuf>,
+    },
+    /// Entzieht die Freigabe für das Projekt.
+    Untrust {
+        /// Projekt-Root; ohne Angabe das aktuelle Arbeitsverzeichnis.
+        #[arg(value_name = "DIR")]
+        path: Option<PathBuf>,
+    },
+    /// Zeigt den Vertrauensstatus des Projekts.
+    Status {
+        /// Projekt-Root; ohne Angabe das aktuelle Arbeitsverzeichnis.
+        #[arg(value_name = "DIR")]
+        path: Option<PathBuf>,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,5 +429,60 @@ mod tests {
             (Err(a), Err(b)) => assert_eq!(a.kind(), b.kind()),
             (a, b) => panic!("beide Reihenfolgen müssen gleich scheitern, bekam {a:?} / {b:?}"),
         }
+    }
+
+    #[test]
+    fn test_project_trust_subcommands_parse() {
+        let trust = match Cli::try_parse_from(["harw", "project", "trust", "/tmp/proj"]) {
+            Ok(cli) => cli,
+            Err(err) => panic!("`harw project trust /tmp/proj` sollte parsen: {err}"),
+        };
+        let Some(Command::Project {
+            action: ProjectAction::Trust { path },
+        }) = trust.command
+        else {
+            panic!("erwartete Command::Project(Trust), bekam {:?}", trust.command);
+        };
+        assert_eq!(path, Some(PathBuf::from("/tmp/proj")));
+
+        let untrust = match Cli::try_parse_from(["harw", "project", "untrust"]) {
+            Ok(cli) => cli,
+            Err(err) => panic!("`harw project untrust` sollte parsen: {err}"),
+        };
+        let Some(Command::Project {
+            action: ProjectAction::Untrust { path },
+        }) = untrust.command
+        else {
+            panic!(
+                "erwartete Command::Project(Untrust), bekam {:?}",
+                untrust.command
+            );
+        };
+        assert_eq!(path, None);
+
+        let status = match Cli::try_parse_from(["harw", "project", "status", "."]) {
+            Ok(cli) => cli,
+            Err(err) => panic!("`harw project status .` sollte parsen: {err}"),
+        };
+        let Some(Command::Project {
+            action: ProjectAction::Status { path },
+        }) = status.command
+        else {
+            panic!(
+                "erwartete Command::Project(Status), bekam {:?}",
+                status.command
+            );
+        };
+        assert_eq!(path, Some(PathBuf::from(".")));
+    }
+
+    #[test]
+    fn test_web_rejects_config_dir_flag() {
+        let result = Cli::try_parse_from(["harw", "web", "--config-dir", "/tmp/cfg"]);
+
+        assert!(
+            result.is_err(),
+            "`harw web --config-dir` darf nicht mehr parsen, bekam {result:?}"
+        );
     }
 }

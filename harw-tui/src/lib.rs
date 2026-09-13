@@ -25,6 +25,7 @@ pub(crate) mod input_editor;
 pub(crate) mod input_reader;
 mod registry;
 pub(crate) mod runtime_commands;
+pub(crate) mod runtime_root;
 pub(crate) mod sanitize;
 pub mod session_controller;
 pub mod setup;
@@ -34,7 +35,7 @@ pub(crate) mod style;
 pub mod tools_command;
 pub(crate) mod tui_event;
 
-pub use app::{ChatApp, TuiError, run_chat_tui};
+pub use app::{ChatApp, TuiError};
 pub use approval::{
     ApprovalDriver, ApprovalDriverError, ApprovalPrompt, ApprovalScope, ChildTurnDriver,
     ResumeStage, TuiApprovalHandler,
@@ -49,4 +50,5 @@ pub use registry::{
     CapabilitySet, CommandAction, CommandRegistry, DispatchContext, InvocationSurface,
     ShellCapability,
 };
+pub use runtime_root::{TuiAssemblyFactory, TuiResume, TuiRunOptions, TuiSessionWiring, run_tui};
 pub use setup::{SetupApp, SetupOutcome, SetupStage, run_setup};
