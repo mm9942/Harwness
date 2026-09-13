@@ -1404,7 +1404,7 @@ mod tests {
 
         let report = evaluate(&parsed);
         assert_eq!(report.checked, 0, "Prosa zählt nicht als geprüfter Bereich");
-        assert!(report.is_green());
+        assert!(!report.is_green(), "reine Prosa prüft nichts (G-102)");
     }
 
     #[test]

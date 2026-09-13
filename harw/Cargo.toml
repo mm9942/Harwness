@@ -5,10 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 description = "HARW SDK facade — the single crate external users depend on."
 
+# `cargo_metadata` wurde entfernt (Befund G-080): `harw/tests/version_coherence.rs`
+# rief darüber einen `cargo metadata`-Subprozess auf, der in der sandboxten
+# Remediation-Umgebung nicht erlaubt ist und den Test dauerhaft rot machte.
+# Der Test parst seither die Workspace- und Mitglieds-Manifeste sowie
+# `Cargo.lock` selbst mit dem `toml`-Crate (bereits über
+# `[workspace.dependencies]` gepinnt, siehe Wurzel-`Cargo.toml`).
 [dev-dependencies]
-cargo_metadata = "0.23.1"
 time = "0.3.45"
 tokio = { version = "1.52.4", features = ["rt", "macros", "sync"] }
+toml = { workspace = true }
 
 [dependencies]
 harw-extension-api = { path = "../harw-extension-api" }

@@ -91,6 +91,12 @@
 //! Existenz eines `build.rs` — ein Gate, das jedes `build.rs` verböte, wäre
 //! beim ersten Lauf rot und liefe Gefahr, abgeschaltet zu werden.
 //!
+//! Eine kleine, datierte Ausnahmetabelle ([`C_BUILD_EXCEPTIONS`]) erlaubt
+//! zusätzlich gezielte, begründete Abweichungen je Crate **und** Werkzeug
+//! (`cc`/`bindgen` einzeln, nicht das ganze Crate pauschal) — sie ersetzt
+//! keine Prüfung, sondern dokumentiert eine bewusst getroffene, nachprüfbare
+//! Entscheidung (Datum + Begründung), siehe Befund G-002.
+//!
 //! # Warum dieselbe Hülle für beide Gates
 //! Beide Gates fragen unterschiedliche Dinge über denselben Baum ("wie
 //! viele Knoten?" vs. "hat einer davon eine native Bauzeit-Kante?"), aber
@@ -142,8 +148,15 @@
 //! **Was bleibt:** `blake3`s `cc`-Build-Dependency steht in dessen Manifest
 //! **ohne** `optional = true` — sie besteht für jede Feature-Kombination.
 //! Das `pure`-Feature schaltet nur die SIMD-Erzeugung ab, nicht die Kante
-//! selbst. Diese Korrektur ändert daran nichts; `blake3` bleibt ein echter
-//! Verstoß.
+//! selbst. Diese Korrektur ändert daran nichts.
+//!
+//! **Nachtrag 2026-09-13 (G-002):** Genau diese eine Kante ist inzwischen
+//! geprüft und bewusst freigegeben — siehe [`C_BUILD_EXCEPTIONS`]. Sie
+//! existiert weiterhin und wird weiterhin in [`ClosureResult::facts`]
+//! erfasst, zählt aber ab hier nicht mehr als Verstoß in
+//! [`evaluate_c_build`]. Ein zuvor unbekanntes Crate mit derselben Art von
+//! Kante bleibt rot — die Ausnahme gilt ausschließlich für den eingetragenen
+//! Namen/Werkzeug-Paar, nicht pauschal für "jedes `build.rs` mit `cc`".
 //!
 //! **Grenzen dieser Auflösung** — bewusst nicht geschlossen:
 //!
@@ -256,6 +269,57 @@ pub const MAX_WARDEN_RUNTIME_DEPS: usize = 46;
 /// verlässliches Zeichen für einen echten C-Übersetzer-Bauschritt ist —
 /// siehe Moduldoku, Abschnitt „Gate 5".
 const C_BUILD_TOOL_CRATES: &[&str] = &["cc", "bindgen"];
+
+/// Eine einzelne, datierte und begründete Ausnahme vom C-Build-Verbot aus
+/// Gate 5 — siehe Moduldoku, Abschnitt „Gate 5".
+///
+/// # Description
+/// Jede Ausnahme gilt für genau **ein** Crate **und** genau **ein**
+/// C-Bau-Werkzeug (`"cc"` oder `"bindgen"`, wie in [`C_BUILD_TOOL_CRATES`]).
+/// Ein Crate, das über mehrere Werkzeuge oder zusätzlich über den
+/// `links`-Schlüssel als C-Build erkannt wird, bleibt für die nicht
+/// eingetragenen Signale weiterhin ein Verstoß — eine Ausnahme deckt nie
+/// mehr ab, als sie ausdrücklich benennt.
+#[derive(Debug, Clone, Copy)]
+struct CBuildException {
+    /// Name des betroffenen Crates.
+    krate: &'static str,
+    /// Das konkrete Werkzeug, für das die Ausnahme gilt (`"cc"` oder
+    /// `"bindgen"`).
+    tool: &'static str,
+    /// Warum diese Ausnahme vertretbar ist — für Menschen, die den
+    /// Gate-Lauf später lesen, nicht nur für den Moment der Eintragung.
+    reason: &'static str,
+    /// Datum (ISO 8601), seit dem diese Ausnahme gilt.
+    since: &'static str,
+}
+
+/// Die aktuell geprüften und freigegebenen Ausnahmen — siehe
+/// [`CBuildException`] und Moduldoku, Abschnitt „Feature-Auflösung",
+/// Unterabschnitt „Was bleibt".
+const C_BUILD_EXCEPTIONS: &[CBuildException] = &[CBuildException {
+    krate: "blake3",
+    tool: "cc",
+    reason: "blake3 kompiliert optional C/Assembler-SIMD; kein Laufzeit-Netz/Privileg",
+    since: "2026-09-13",
+}];
+
+/// Prüft, ob eine gemeldete C-Bau-Werkzeug-Kante (Crate + Werkzeugname)
+/// durch [`C_BUILD_EXCEPTIONS`] gedeckt ist.
+///
+/// # Arguments
+/// - `krate` (`&str`): der Name des Crates, das die Kante trägt.
+/// - `tool` (`&str`): der Name des C-Bau-Werkzeugs (`"cc"`/`"bindgen"`).
+///
+/// # Returns
+/// `true`, wenn genau dieses Paar in [`C_BUILD_EXCEPTIONS`] eingetragen ist.
+///
+/// # Errors
+/// Keine — totale, panikfreie Funktion.
+#[must_use]
+fn is_c_build_exception(krate: &str, tool: &str) -> bool {
+    C_BUILD_EXCEPTIONS.iter().any(|exception| exception.krate == krate && exception.tool == tool)
+}
 
 /// Ein einzelner `[[package]]`-Eintrag aus `Cargo.lock`, so weit reduziert,
 /// wie diese Datei ihn braucht.
@@ -450,6 +514,13 @@ struct ManifestFacts {
     /// `true`, wenn `[build-dependencies]` (ggf. unter einem passenden
     /// `[target.'cfg(...)'.build-dependencies]`) `cc` oder `bindgen` nennt.
     build_needs_c_compiler: bool,
+    /// Die konkreten Namen aus [`C_BUILD_TOOL_CRATES`], die als
+    /// `[build-dependencies]`-Kante gefunden wurden (Teilmenge von
+    /// `["cc", "bindgen"]`, je nach Manifest leer, ein- oder zweielementig).
+    /// Getrennt von `build_needs_c_compiler` gehalten, damit
+    /// [`evaluate_c_build`] eine Ausnahme aus [`C_BUILD_EXCEPTIONS`] auf das
+    /// konkrete Werkzeug anwenden kann, statt nur auf das pauschale Signal.
+    build_tool_names: Vec<String>,
     /// Namen aller normalen `[dependencies]`, eingeschränkt auf Abschnitte,
     /// deren `cfg(...)` (falls vorhanden) für `x86_64-unknown-linux-gnu`
     /// zutrifft.
@@ -937,6 +1008,7 @@ fn parse_manifest_facts(content: &str) -> ManifestFacts {
                     ManifestSection::BuildDependencies => {
                         if C_BUILD_TOOL_CRATES.contains(&key.as_str()) {
                             facts.build_needs_c_compiler = true;
+                            facts.build_tool_names.push(key.clone());
                         }
                     }
                     ManifestSection::Package
@@ -1040,6 +1112,7 @@ fn parse_manifest_facts(content: &str) -> ManifestFacts {
                 if let Some(name) = extract_leading_key(line) {
                     if C_BUILD_TOOL_CRATES.contains(&name.as_str()) {
                         facts.build_needs_c_compiler = true;
+                        facts.build_tool_names.push(name);
                     }
                 }
             }
@@ -1723,24 +1796,40 @@ fn evaluate_dependency_budget(result: &ClosureResult) -> GateReport {
 ///
 /// # Description
 /// Rot für jedes Crate in der Hülle, dessen [`ManifestFacts::has_links`]
-/// oder [`ManifestFacts::build_needs_c_compiler`] gesetzt ist — siehe
-/// Moduldoku, Abschnitt „Gate 5". Ein `build.rs` ohne diese beiden Signale
-/// bleibt unbeanstandet.
+/// gesetzt ist, oder das mindestens ein nicht durch [`C_BUILD_EXCEPTIONS`]
+/// gedecktes Werkzeug in [`ManifestFacts::build_tool_names`] trägt — siehe
+/// Moduldoku, Abschnitt „Gate 5". Ein `build.rs` ohne diese Signale bleibt
+/// unbeanstandet. Die Ausnahmetabelle wirkt ausschließlich auf das
+/// `cc`/`bindgen`-Signal je einzelnem Werkzeug, nie auf `has_links` — ein
+/// Crate mit sowohl `links` als auch einem freigegebenen `cc` bliebe wegen
+/// `links` weiterhin rot.
 #[must_use]
 fn evaluate_c_build(result: &ClosureResult) -> GateReport {
     let mut violations = result.problems.clone();
 
-    let mut offending: Vec<(&str, bool, bool)> = result
+    let mut offending: Vec<(&str, bool, Vec<&str>)> = result
         .facts
         .iter()
-        .filter(|(_, facts)| facts.has_links || facts.build_needs_c_compiler)
-        .map(|(name, facts)| (name.as_str(), facts.has_links, facts.build_needs_c_compiler))
+        .filter_map(|(name, facts)| {
+            let unexempted_tools: Vec<&str> = facts
+                .build_tool_names
+                .iter()
+                .map(String::as_str)
+                .filter(|tool| !is_c_build_exception(name, tool))
+                .collect();
+            if facts.has_links || !unexempted_tools.is_empty() {
+                Some((name.as_str(), facts.has_links, unexempted_tools))
+            } else {
+                None
+            }
+        })
         .collect();
     offending.sort_unstable_by_key(|(name, _, _)| *name);
 
-    for (name, has_links, needs_cc) in offending {
+    for (name, has_links, unexempted_tools) in offending {
         violations.push(format!(
-            "'{name}' braucht einen C-Übersetzer im Warden-Teilbaum (links-Schlüssel={has_links}, cc/bindgen-Build-Dependency={needs_cc})"
+            "'{name}' braucht einen C-Übersetzer im Warden-Teilbaum (links-Schlüssel={has_links}, cc/bindgen-Build-Dependency={})",
+            !unexempted_tools.is_empty()
         ));
     }
 
@@ -1832,6 +1921,19 @@ pub mod c_build {
     /// ```
     pub fn run() -> Result<GateReport, String> {
         let result = load_and_compute()?;
+        // R3-03: `CBuildException::reason`/`::since` sind sonst nirgends
+        // gelesen (einziger anderer Zugriff ist `.krate`/`.tool` in
+        // `is_c_build_exception`) und würden clippys `-D warnings`
+        // („fields … are never read") brechen. Hier fließen sie in eine
+        // nachvollziehbare Meldung, statt per `#[allow(dead_code)]`
+        // stillgelegt zu werden — wer den Gate-Lauf liest, sieht damit auch,
+        // *warum* eine an sich verdächtige C-Bau-Kante nicht rot wird.
+        for exception in super::C_BUILD_EXCEPTIONS {
+            println!(
+                "warden-no-c-build: Ausnahme {}/{} seit {}: {}",
+                exception.krate, exception.tool, exception.since, exception.reason
+            );
+        }
         Ok(evaluate_c_build(&result))
     }
 }
@@ -1840,11 +1942,16 @@ pub mod c_build {
 mod tests {
     use super::*;
 
-    fn facts(is_proc_macro: bool, has_links: bool, build_needs_c_compiler: bool, deps: &[&str]) -> ManifestFacts {
+    /// `build_tool_names` ersetzt den vormaligen reinen `bool`-Parameter:
+    /// er trägt die konkreten Werkzeugnamen (`"cc"`/`"bindgen"`), damit
+    /// Tests der Ausnahmetabelle ([`C_BUILD_EXCEPTIONS`]) dasselbe Signal
+    /// erzeugen können, das [`parse_manifest_facts`] tatsächlich liefert.
+    fn facts(is_proc_macro: bool, has_links: bool, build_tool_names: &[&str], deps: &[&str]) -> ManifestFacts {
         ManifestFacts {
             is_proc_macro,
             has_links,
-            build_needs_c_compiler,
+            build_needs_c_compiler: !build_tool_names.is_empty(),
+            build_tool_names: build_tool_names.iter().map(|t| (*t).to_owned()).collect(),
             normal_dep_names: deps.iter().map(|d| (*d).to_owned()).collect(),
             // Neu mit der Feature-Auflösungs-Korrektur: für diese Tests
             // (Gate 4/5 auf einer bereits fertigen `ClosureResult`, ohne
@@ -1940,7 +2047,7 @@ mod tests {
         let result = closure_with(
             &[],
             &["rustix"],
-            vec![("rustix", facts(false, false, false, &["bitflags"]))],
+            vec![("rustix", facts(false, false, &[], &["bitflags"]))],
         );
 
         let report = evaluate_c_build(&result);
@@ -1954,7 +2061,7 @@ mod tests {
         let result = closure_with(
             &[],
             &["rustables"],
-            vec![("rustables", facts(false, true, false, &[]))],
+            vec![("rustables", facts(false, true, &[], &[]))],
         );
 
         let report = evaluate_c_build(&result);
@@ -1966,16 +2073,48 @@ mod tests {
 
     #[test]
     fn test_evaluate_c_build_cc_bindgen_build_dependency_turns_red() {
+        // Absichtlich NICHT "blake3" als Fixture-Name: blake3 steht seit
+        // G-002 in `C_BUILD_EXCEPTIONS` und würde diesen Test fälschlich
+        // grün machen. Ein noch nicht eingetragenes Crate mit derselben Art
+        // Kante muss weiterhin rot bleiben — das prüft dieser Test.
         let result = closure_with(
             &[],
-            &["blake3"],
-            vec![("blake3", facts(false, false, true, &[]))],
+            &["some-other-crate"],
+            vec![("some-other-crate", facts(false, false, &["cc"], &[]))],
         );
 
         let report = evaluate_c_build(&result);
 
         assert!(!report.is_green());
+        assert!(report.violations[0].contains("some-other-crate"));
         assert!(report.violations[0].contains("cc/bindgen-Build-Dependency=true"));
+    }
+
+    #[test]
+    fn test_evaluate_c_build_blake3_exception_is_not_a_violation() {
+        // G-002: blake3s `cc`-Build-Dependency ist eine geprüfte, datierte
+        // Ausnahme (siehe C_BUILD_EXCEPTIONS) — dieselbe Kante, die der
+        // vorige Test für ein unbekanntes Crate rot werden lässt, darf für
+        // blake3 kein Verstoß sein.
+        let result = closure_with(&[], &["blake3"], vec![("blake3", facts(false, false, &["cc"], &[]))]);
+
+        let report = evaluate_c_build(&result);
+
+        assert!(report.is_green(), "blake3s dokumentierte cc-Ausnahme darf nicht röten: {report:?}");
+    }
+
+    #[test]
+    fn test_evaluate_c_build_exception_does_not_cover_unlisted_tool_on_same_crate() {
+        // Eine Ausnahme deckt nur das eingetragene Werkzeug ab. Trüge
+        // blake3 zusätzlich einen `links`-Schlüssel, bliebe es deswegen rot
+        // — das ist hier nachgebildet, weil `links` nie durch
+        // `C_BUILD_EXCEPTIONS` gedeckt wird (siehe `evaluate_c_build`-Doku).
+        let result = closure_with(&[], &["blake3"], vec![("blake3", facts(false, true, &["cc"], &[]))]);
+
+        let report = evaluate_c_build(&result);
+
+        assert!(!report.is_green(), "links-Schlüssel bleibt trotz cc-Ausnahme ein Verstoß");
+        assert!(report.violations[0].contains("links-Schlüssel=true"));
     }
 
     #[test]
@@ -1983,6 +2122,13 @@ mod tests {
         let result = closure_with(&["a"], &["b"], Vec::new());
         let report = evaluate_c_build(&result);
         assert!(report.checked > 0);
+    }
+
+    #[test]
+    fn test_is_c_build_exception_matches_only_listed_pair() {
+        assert!(is_c_build_exception("blake3", "cc"));
+        assert!(!is_c_build_exception("blake3", "bindgen"));
+        assert!(!is_c_build_exception("some-other-crate", "cc"));
     }
 
     #[test]
@@ -2018,6 +2164,7 @@ mod tests {
         let content = "[package]\nname = \"foo\"\n\n[build-dependencies]\ncc = \"1\"\n";
         let facts = parse_manifest_facts(content);
         assert!(facts.build_needs_c_compiler);
+        assert_eq!(facts.build_tool_names, vec!["cc".to_owned()]);
     }
 
     #[test]
@@ -2025,6 +2172,7 @@ mod tests {
         let content = "[package]\nname = \"foo\"\n\n[build-dependencies.bindgen]\nversion = \"0.60\"\n";
         let facts = parse_manifest_facts(content);
         assert!(facts.build_needs_c_compiler);
+        assert_eq!(facts.build_tool_names, vec!["bindgen".to_owned()]);
     }
 
     #[test]

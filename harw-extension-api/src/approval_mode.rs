@@ -38,6 +38,7 @@
 //! ```
 
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, RwLock};
 
 /// Wie viel ein Werkzeugaufruf ohne Rückfrage tun darf.
 ///
@@ -145,6 +146,113 @@ impl std::fmt::Display for ApprovalMode {
     }
 }
 
+/// Geteilte, klonbare Zelle für einen [`ApprovalMode`] — die Instanz-Variante
+/// zum prozessweiten [`current`]/[`set`].
+///
+/// # Verantwortlichkeit
+/// Wo [`current`]/[`set`] einen einzigen, globalen Zustand für den gesamten
+/// Prozess führen, trägt `ApprovalModeCell` ihren Zustand selbst: mehrere
+/// Klone teilen sich denselben Modus (nützlich, wenn z. B. eine Sitzung und
+/// ihre Kind-Sitzungen denselben Modus sehen sollen, ohne den globalen
+/// Prozesszustand zu berühren), während [`Self::detached`] eine unabhängige
+/// Kopie erzeugt, die ab diesem Zeitpunkt keinen Zustand mehr teilt.
+///
+/// # Nebenläufigkeit
+/// Innen ein `Arc<RwLock<ApprovalMode>>`: viele gleichzeitige Leser, ein
+/// Schreiber. Ein vergifteter Lock (ein anderer Thread ist während des
+/// Haltens der Sperre paniert) blockiert [`Self::get`]/[`Self::set`] nicht —
+/// beide entnehmen den zuletzt geschriebenen Wert über `into_inner` aus dem
+/// vergifteten Guard, statt ihrerseits zu paniken. Ein vergifteter Lock
+/// bedeutet hier nur „ein Leser/Schreiber ist mittendrin abgebrochen", nicht
+/// „der Wert ist beschädigt" — `ApprovalMode` ist ein einfaches `Copy`-Enum,
+/// das keine Invariante über mehrere Felder hinweg halten muss.
+///
+/// # Beispiele
+/// ```rust
+/// use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
+///
+/// let cell = ApprovalModeCell::new(ApprovalMode::AlwaysAsk);
+/// let shared = cell.clone();
+/// shared.set(ApprovalMode::FullAccess);
+/// assert_eq!(cell.get(), ApprovalMode::FullAccess);
+///
+/// let detached = cell.detached();
+/// detached.set(ApprovalMode::AlwaysAsk);
+/// assert_eq!(cell.get(), ApprovalMode::FullAccess);
+/// ```
+#[derive(Clone)]
+pub struct ApprovalModeCell(Arc<RwLock<ApprovalMode>>);
+
+impl ApprovalModeCell {
+    /// Erzeugt eine neue Zelle mit `mode` als Startwert.
+    ///
+    /// # Arguments
+    /// - `mode` (`ApprovalMode`): der anfängliche Modus dieser Zelle.
+    #[must_use]
+    pub fn new(mode: ApprovalMode) -> Self {
+        Self(Arc::new(RwLock::new(mode)))
+    }
+
+    /// Liest den aktuellen Modus dieser Zelle.
+    ///
+    /// # Rückgabe
+    /// Den zuletzt über [`Self::set`] (auf dieser Zelle oder einem geteilten
+    /// Klon davon) geschriebenen Modus.
+    ///
+    /// # Nebenläufigkeit
+    /// Blockiert nie dauerhaft: ein vergifteter Lock wird über `into_inner`
+    /// aufgelöst statt weiterzureichen (siehe Typ-Doku).
+    #[must_use]
+    pub fn get(&self) -> ApprovalMode {
+        match self.0.read() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    /// Setzt den Modus dieser Zelle. Jeder geteilte Klon sieht die Änderung
+    /// beim nächsten [`Self::get`].
+    ///
+    /// # Arguments
+    /// - `mode` (`ApprovalMode`): der neue Modus.
+    ///
+    /// # Nebenläufigkeit
+    /// Blockiert nie dauerhaft: ein vergifteter Lock wird über `into_inner`
+    /// aufgelöst statt weiterzureichen (siehe Typ-Doku).
+    pub fn set(&self, mode: ApprovalMode) {
+        match self.0.write() {
+            Ok(mut guard) => *guard = mode,
+            Err(poisoned) => *poisoned.into_inner() = mode,
+        }
+    }
+
+    /// Erzeugt eine unabhängige Kopie: eine neue Zelle mit demselben
+    /// aktuellen Wert, aber ohne geteilten Zustand mit `self`. Spätere
+    /// [`Self::set`]-Aufrufe auf der einen Zelle sind in der anderen nicht
+    /// sichtbar.
+    ///
+    /// # Rückgabe
+    /// Eine neue, eigenständige `ApprovalModeCell`.
+    #[must_use]
+    pub fn detached(&self) -> Self {
+        Self::new(self.get())
+    }
+}
+
+impl std::fmt::Debug for ApprovalModeCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApprovalModeCell").field("mode", &self.get()).finish()
+    }
+}
+
+impl Default for ApprovalModeCell {
+    /// Startet mit [`ApprovalMode::default`] (`Delegated`) — derselbe
+    /// Startwert wie das prozessweite [`current`]/[`set`].
+    fn default() -> Self {
+        Self::new(ApprovalMode::default())
+    }
+}
+
 // Der aktive Modus. Startwert 1 ist `Delegated`.
 static ACTIVE: AtomicU8 = AtomicU8::new(1);
 
@@ -177,7 +285,7 @@ pub fn set(mode: ApprovalMode) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApprovalMode, current, set};
+    use super::{ApprovalMode, ApprovalModeCell, current, set};
 
     #[test]
     fn test_parse_recognizes_all_short_names() {
@@ -239,5 +347,51 @@ mod tests {
 
         set(ApprovalMode::Delegated);
         assert_eq!(current(), ApprovalMode::Delegated);
+    }
+
+    #[test]
+    fn cell_new_returns_the_given_start_value() {
+        let cell = ApprovalModeCell::new(ApprovalMode::FullAccess);
+        assert_eq!(cell.get(), ApprovalMode::FullAccess);
+    }
+
+    #[test]
+    fn cell_default_is_delegated() {
+        assert_eq!(ApprovalModeCell::default().get(), ApprovalMode::Delegated);
+    }
+
+    #[test]
+    fn cell_clone_shares_state() {
+        let cell = ApprovalModeCell::new(ApprovalMode::AlwaysAsk);
+        let clone = cell.clone();
+
+        clone.set(ApprovalMode::FullAccess);
+
+        assert_eq!(
+            cell.get(),
+            ApprovalMode::FullAccess,
+            "a clone must share state with its origin"
+        );
+    }
+
+    #[test]
+    fn cell_detached_does_not_share_state() {
+        let cell = ApprovalModeCell::new(ApprovalMode::AlwaysAsk);
+        let detached = cell.detached();
+
+        detached.set(ApprovalMode::FullAccess);
+
+        assert_eq!(
+            cell.get(),
+            ApprovalMode::AlwaysAsk,
+            "detached() must copy the current value but not share future writes"
+        );
+        assert_eq!(detached.get(), ApprovalMode::FullAccess);
+    }
+
+    #[test]
+    fn cell_detached_starts_at_current_value_not_default() {
+        let cell = ApprovalModeCell::new(ApprovalMode::FullAccess);
+        assert_eq!(cell.detached().get(), ApprovalMode::FullAccess);
     }
 }

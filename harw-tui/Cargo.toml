@@ -40,6 +40,7 @@ tracing = "0.1.44"
 harw-observe = { path = "../harw-observe" }
 uuid = { version = "1", features = ["v4"] }
 harw-home = { version = "0.2.0", path = "../harw-home" }
+harw-runtime = { path = "../harw-runtime" }
 
 [dev-dependencies]
 harw-tools = { path = "../harw-tools" }

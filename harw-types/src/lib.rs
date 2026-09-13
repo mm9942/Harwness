@@ -1,8 +1,9 @@
 //! `harw-types` — Phase-0-Vokabular des Harness.
 //!
 //! Reine serde-Daten: ID-Newtypes, `AgentRole`, `RiskLevel`, `ReviewDecision`,
-//! `MessagePhase`, `TokenUsage`, `ReasoningEffort`. Keine `tokio`-, `reqwest`-
-//! oder Provider-Abhängigkeiten. Höchste Stabilität, maximaler Fan-in.
+//! `MessagePhase`, `TokenUsage`, `ReasoningEffort`, `Principal`/`PermissionTier`.
+//! Keine `tokio`-, `reqwest`- oder Provider-Abhängigkeiten. Höchste Stabilität,
+//! maximaler Fan-in.
 //!
 //! ID values coming from configuration, wire data, or other untrusted sources
 //! must use each type's `try_from_str`, `parse`, or `FromStr` implementation.
@@ -16,6 +17,7 @@ pub mod digest;
 pub mod error;
 pub mod ids;
 pub mod impact;
+pub mod principal;
 pub mod provider_ids;
 pub mod reasoning;
 pub mod roles;
@@ -29,6 +31,7 @@ pub use ids::{
     SensorId, SessionId, TenantId, ThreadId, ThreadRef, ToolCallId, TurnId, WorkId, WorkspaceId,
 };
 pub use impact::{ImpactAssessment, ImpactConfidence, ImpactDomain, ImpactSeverity};
+pub use principal::{IngressSurface, PermissionTier, Principal, PrincipalKind};
 pub use provider_ids::{AgentName, CustomerId, ModelId, ModelName, ProviderId, ProviderName};
 pub use reasoning::ReasoningEffort;
 pub use roles::{AgentRole, MessagePhase, ReviewDecision, RiskLevel};

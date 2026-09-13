@@ -342,6 +342,100 @@ impl SessionActivation {
     pub fn enable_context(&mut self, label: &str) {
         self.context_disabled.remove(label);
     }
+
+    // -----------------------------------------------------------------------
+    // Intersection
+    // -----------------------------------------------------------------------
+
+    /// Computes the intersection of `self` and `other`: a tool or label is
+    /// visible in the result only if it would be visible under **both**
+    /// activations. Monotone — the result never permits more than either
+    /// input alone, only ever less or equal.
+    ///
+    /// # Instructions and context labels
+    /// For these, "visible" is the default state — only `disable_*` narrows
+    /// it, for an unbounded space of possible labels. The intersection is
+    /// therefore exactly the union of the two disabled-label sets: a label
+    /// ends up disabled in the result iff it was disabled on at least one
+    /// side, which is precisely "enabled on both" negated.
+    ///
+    /// # Tools
+    /// For tools, the default depends on [`ToolProfile`]: `Full` means "every
+    /// name, including ones neither side has ever heard of", while
+    /// `Coding`/`Minimal` mean "only a fixed, finite allow-list (or none)".
+    /// Because [`ToolName`] is an open-ended space, the result cannot just
+    /// combine the two sets of overrides — it has to also account for what
+    /// each side does with a name *neither side mentions explicitly*.
+    ///
+    /// The construction: first, collect every name that appears in either
+    /// side's `tools_disabled`, `tools_enabled_extra`, or profile allow-list
+    /// into a finite candidate set. For every other, unmentioned name, both
+    /// sides fall back to their profile's default, and "both allow it" is
+    /// possible only when both profiles are `Full` (a finite `Coding`
+    /// allow-list, by construction, never allows a name outside itself, and
+    /// `Minimal` allows nothing outside overrides). So:
+    /// - If both sides are `Full`: the result profile is `Full` too, with an
+    ///   explicit `tools_disabled` entry for every candidate name that is not
+    ///   allowed by both sides (everything else stays allowed by the `Full`
+    ///   default, correctly).
+    /// - Otherwise: the result profile is `Minimal` (nothing allowed by
+    ///   default), with an explicit `tools_enabled_extra` entry for every
+    ///   candidate name that *is* allowed by both sides.
+    ///
+    /// Either way, [`Self::is_tool_enabled`] on the result agrees with
+    /// `self.is_tool_enabled(name) && other.is_tool_enabled(name)` for every
+    /// possible `name`, not just the ones either side mentions.
+    ///
+    /// # Arguments
+    /// - `other` (`&Self`): the activation to intersect with.
+    ///
+    /// # Returns
+    /// A new `SessionActivation` representing the intersection.
+    #[must_use]
+    pub fn intersect(&self, other: &Self) -> Self {
+        let mut candidates: HashSet<ToolName> = HashSet::new();
+        candidates.extend(self.tools_disabled.iter().cloned());
+        candidates.extend(self.tools_enabled_extra.iter().cloned());
+        candidates.extend(other.tools_disabled.iter().cloned());
+        candidates.extend(other.tools_enabled_extra.iter().cloned());
+        if let Some(set) = self.tool_profile.allowlist() {
+            candidates.extend(set);
+        }
+        if let Some(set) = other.tool_profile.allowlist() {
+            candidates.extend(set);
+        }
+
+        let both_full = self.tool_profile == ToolProfile::Full && other.tool_profile == ToolProfile::Full;
+        let mut result = if both_full {
+            Self::new(ToolProfile::Full)
+        } else {
+            Self::new(ToolProfile::Minimal)
+        };
+
+        for name in candidates {
+            let allowed_by_both = self.is_tool_enabled(&name) && other.is_tool_enabled(&name);
+            if both_full {
+                if !allowed_by_both {
+                    result.disable_tool(name);
+                }
+            } else if allowed_by_both {
+                result.enable_tool(name);
+            }
+        }
+
+        result.instructions_disabled = self
+            .instructions_disabled
+            .union(&other.instructions_disabled)
+            .cloned()
+            .collect();
+        result.context_disabled = self
+            .context_disabled
+            .union(&other.context_disabled)
+            .cloned()
+            .collect();
+
+        result
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -433,5 +527,167 @@ mod tests {
         assert!(!act.is_context_enabled("workspace_files"));
         act.enable_context("workspace_files");
         assert!(act.is_context_enabled("workspace_files"));
+    }
+
+    // -----------------------------------------------------------------------
+    // intersect
+    // -----------------------------------------------------------------------
+
+    /// Checks the defining property directly: for every probed name/label,
+    /// the intersection agrees with the logical AND of the two inputs.
+    fn assert_is_and_of(a: &SessionActivation, b: &SessionActivation, probes: &[&str]) {
+        let i = a.intersect(b);
+        for name in probes {
+            let t = tool(name);
+            assert_eq!(
+                i.is_tool_enabled(&t),
+                a.is_tool_enabled(&t) && b.is_tool_enabled(&t),
+                "tool {name:?}: intersection must equal a AND b"
+            );
+            assert_eq!(
+                i.is_instructions_enabled(name),
+                a.is_instructions_enabled(name) && b.is_instructions_enabled(name),
+                "instructions {name:?}: intersection must equal a AND b"
+            );
+            assert_eq!(
+                i.is_context_enabled(name),
+                a.is_context_enabled(name) && b.is_context_enabled(name),
+                "context {name:?}: intersection must equal a AND b"
+            );
+        }
+    }
+
+    const PROBE_NAMES: &[&str] = &[
+        "fs.read",
+        "fs.write",
+        "fs.list",
+        "fs.search",
+        "shell.exec",
+        "custom.tool",
+        "db.query",
+        "baseline",
+        "unlabeled",
+        "workspace_files",
+    ];
+
+    #[test]
+    fn intersect_of_full_and_full_is_full() {
+        let a = SessionActivation::new(ToolProfile::Full);
+        let b = SessionActivation::new(ToolProfile::Full);
+        assert_is_and_of(&a, &b, PROBE_NAMES);
+        let i = a.intersect(&b);
+        assert!(i.is_tool_enabled(&tool("anything.at.all")));
+    }
+
+    #[test]
+    fn intersect_of_full_and_minimal_denies_everything() {
+        let a = SessionActivation::new(ToolProfile::Full);
+        let b = SessionActivation::new(ToolProfile::Minimal);
+        assert_is_and_of(&a, &b, PROBE_NAMES);
+        let i = a.intersect(&b);
+        assert!(!i.is_tool_enabled(&tool("fs.read")));
+        assert!(!i.is_tool_enabled(&tool("anything.at.all")));
+    }
+
+    #[test]
+    fn intersect_of_full_and_coding_matches_coding_allowlist() {
+        let a = SessionActivation::new(ToolProfile::Full);
+        let b = SessionActivation::new(ToolProfile::Coding);
+        assert_is_and_of(&a, &b, PROBE_NAMES);
+        let i = a.intersect(&b);
+        assert!(i.is_tool_enabled(&tool("fs.read")));
+        assert!(i.is_tool_enabled(&tool("shell.exec")));
+        assert!(!i.is_tool_enabled(&tool("custom.tool")));
+    }
+
+    #[test]
+    fn intersect_respects_disabled_override_on_either_side() {
+        let mut a = SessionActivation::new(ToolProfile::Full);
+        a.disable_tool(tool("shell.exec"));
+        let b = SessionActivation::new(ToolProfile::Full);
+        assert_is_and_of(&a, &b, PROBE_NAMES);
+        let i = a.intersect(&b);
+        assert!(!i.is_tool_enabled(&tool("shell.exec")));
+        assert!(i.is_tool_enabled(&tool("fs.read")));
+    }
+
+    #[test]
+    fn intersect_respects_enabled_extra_beyond_minimal_profile() {
+        let mut a = SessionActivation::new(ToolProfile::Minimal);
+        a.enable_tool(tool("custom.tool"));
+        let mut b = SessionActivation::new(ToolProfile::Minimal);
+        b.enable_tool(tool("custom.tool"));
+        assert_is_and_of(&a, &b, PROBE_NAMES);
+        let i = a.intersect(&b);
+        assert!(i.is_tool_enabled(&tool("custom.tool")));
+        assert!(!i.is_tool_enabled(&tool("fs.read")));
+    }
+
+    #[test]
+    fn intersect_instructions_and_context_union_disabled_labels() {
+        let mut a = SessionActivation::default();
+        a.disable_instructions("baseline");
+        a.disable_context("workspace_files");
+        let mut b = SessionActivation::default();
+        b.disable_instructions("other");
+        assert_is_and_of(&a, &b, PROBE_NAMES);
+        let i = a.intersect(&b);
+        assert!(!i.is_instructions_enabled("baseline"));
+        assert!(!i.is_instructions_enabled("other"));
+        assert!(!i.is_context_enabled("workspace_files"));
+    }
+
+    #[test]
+    fn intersect_is_subset_of_both_inputs() {
+        let mut a = SessionActivation::new(ToolProfile::Full);
+        a.disable_tool(tool("shell.exec"));
+        let mut b = SessionActivation::new(ToolProfile::Coding);
+        b.disable_tool(tool("fs.write"));
+        let i = a.intersect(&b);
+        for name in PROBE_NAMES {
+            let t = tool(name);
+            if i.is_tool_enabled(&t) {
+                assert!(a.is_tool_enabled(&t), "result allows {name:?} but a does not");
+                assert!(b.is_tool_enabled(&t), "result allows {name:?} but b does not");
+            }
+        }
+    }
+
+    #[test]
+    fn intersect_is_commutative_in_permission() {
+        let mut a = SessionActivation::new(ToolProfile::Full);
+        a.disable_tool(tool("shell.exec"));
+        let mut b = SessionActivation::new(ToolProfile::Coding);
+        b.enable_tool(tool("custom.tool"));
+        b.disable_instructions("baseline");
+
+        let ab = a.intersect(&b);
+        let ba = b.intersect(&a);
+
+        for name in PROBE_NAMES {
+            let t = tool(name);
+            assert_eq!(ab.is_tool_enabled(&t), ba.is_tool_enabled(&t));
+            assert_eq!(ab.is_instructions_enabled(name), ba.is_instructions_enabled(name));
+            assert_eq!(ab.is_context_enabled(name), ba.is_context_enabled(name));
+        }
+    }
+
+    #[test]
+    fn intersect_is_idempotent() {
+        let mut a = SessionActivation::new(ToolProfile::Coding);
+        a.enable_tool(tool("custom.tool"));
+        a.disable_tool(tool("fs.write"));
+        a.disable_context("workspace_files");
+
+        let once = a.intersect(&a);
+        let twice = once.intersect(&a);
+
+        for name in PROBE_NAMES {
+            let t = tool(name);
+            assert_eq!(once.is_tool_enabled(&t), a.is_tool_enabled(&t));
+            assert_eq!(twice.is_tool_enabled(&t), a.is_tool_enabled(&t));
+            assert_eq!(once.is_instructions_enabled(name), a.is_instructions_enabled(name));
+            assert_eq!(once.is_context_enabled(name), a.is_context_enabled(name));
+        }
     }
 }

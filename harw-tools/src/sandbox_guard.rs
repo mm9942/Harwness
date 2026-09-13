@@ -9,8 +9,9 @@
 //! - [`require_permission`] — generic single-permission guard.
 //! - [`require_host_access`] — network guard combining `Permission::NetworkAccess`
 //!   with the sandbox's [`harw_sandbox::NetworkScope`] host allow-list.
-//! - [`host_from_url`] — dependency-free URL-to-hostname extraction used to feed
-//!   [`require_host_access`].
+//! - [`host_from_url`] — URL-to-hostname extraction used to feed
+//!   [`require_host_access`]; delegates to [`harw_sandbox::EgressUrl::parse`]
+//!   (WHATWG parsing, the same parser reqwest uses to connect).
 //!
 //! # Concurrency
 //! Pure functions; `Send + Sync` at all call sites.
@@ -38,7 +39,7 @@
 //! ```
 
 use crate::{executor::ToolExecutionContext, output::ToolOutput};
-use harw_sandbox::Permission;
+use harw_sandbox::{EgressUrl, Permission};
 
 /// Returns `Some(ToolOutput::error(...))` when the sandbox does NOT grant the
 /// required permission. Callers wrap the result in `Ok(...)` so the check reads
@@ -167,21 +168,28 @@ pub fn require_host_access(
     None
 }
 
-/// Extrahiert den Hostnamen aus einer URL ohne externe Dependency.
+/// Extrahiert den normalisierten Hostnamen aus einer absoluten `http`/`https`-URL.
 ///
 /// # Description
-/// Trennt zunächst ein Schema ab (alles bis einschließlich des ersten `"://"`,
-/// falls vorhanden). Vom Rest wird alles ab dem ersten `'/'`, `'?'` oder `'#'`
-/// verworfen (Pfad, Query, Fragment). Von der verbleibenden Autorität wird die
-/// Userinfo vor einem `'@'` verworfen und der Port nach einem `':'` abgetrennt.
-/// Der verbleibende Hostname wird kleingeschrieben zurückgegeben.
+/// Delegiert vollständig an [`harw_sandbox::EgressUrl::parse`], also an den
+/// WHATWG-Parser des `url`-Crates — denselben, den `reqwest` beim
+/// Verbindungsaufbau verwendet. Geprüfter und tatsächlich kontaktierter Host
+/// können dadurch nicht auseinanderlaufen: `https://evil.com\@docs.rs/` liefert
+/// `evil.com`, weil `\` bei Spezial-Schemata die Autorität beendet (Befund
+/// F-002). Domains kommen als IDNA-Punycode, kleingeschrieben und ohne
+/// abschließenden Punkt zurück; IP-Literale in `std`-Darstellung, IPv6 ohne
+/// eckige Klammern (`https://[::1]:8080/` → `::1`, Befund F-167).
+///
+/// Die frühere, eigene String-Zerlegung ist ersatzlos entfallen. Bewusst
+/// strenger als vorher (fail closed): URLs ohne Schema, mit anderem Schema als
+/// `http`/`https` oder mit Userinfo (`user:pw@host`) liefern `None`.
 ///
 /// # Arguments
-/// - `url` (`&str`): beliebige URL, mit oder ohne Schema, mit oder ohne Userinfo/Port.
+/// - `url` (`&str`): absolute URL.
 ///
 /// # Returns
-/// `Some(String)` mit dem kleingeschriebenen, reinen Hostnamen, oder `None`, wenn
-/// die Eingabe leer/ungültig ist oder nach der Extraktion kein Host übrig bleibt.
+/// `Some(String)` mit dem normalisierten Host, oder `None`, wenn
+/// [`harw_sandbox::EgressUrl::parse`] die Eingabe ablehnt.
 ///
 /// # Panics
 /// Nie.
@@ -194,45 +202,12 @@ pub fn require_host_access(
 ///     host_from_url("https://docs.rs/serde/latest/serde/"),
 ///     Some("docs.rs".to_owned())
 /// );
+/// assert_eq!(host_from_url("https://evil.com\\@docs.rs/"), Some("evil.com".to_owned()));
 /// assert_eq!(host_from_url(""), None);
 /// ```
 #[must_use]
 pub fn host_from_url(url: &str) -> Option<String> {
-    let trimmed = url.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    // Schema abtrennen: alles bis einschließlich "://" verwerfen, falls vorhanden.
-    let after_scheme = match trimmed.find("://") {
-        Some(idx) => &trimmed[idx + 3..],
-        None => trimmed,
-    };
-
-    // Autorität endet am ersten '/', '?' oder '#' (Beginn von Pfad/Query/Fragment).
-    let end = after_scheme
-        .find(['/', '?', '#'])
-        .unwrap_or(after_scheme.len());
-    let authority = &after_scheme[..end];
-
-    // Userinfo vor dem letzten '@' verwerfen (z. B. "user:pw@host").
-    let host_and_port = match authority.rfind('@') {
-        Some(idx) => &authority[idx + 1..],
-        None => authority,
-    };
-
-    // Port nach ':' abtrennen.
-    let host = match host_and_port.find(':') {
-        Some(idx) => &host_and_port[..idx],
-        None => host_and_port,
-    };
-
-    let host = host.trim();
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_lowercase())
-    }
+    EgressUrl::parse(url).ok().map(|parsed| parsed.host_str())
 }
 
 #[cfg(test)]
@@ -455,19 +430,92 @@ mod tests {
         );
     }
 
-    /// URL mit Userinfo, gemischter Groß-/Kleinschreibung und Port → lowercase Host ohne Port.
+    /// Gemischte Groß-/Kleinschreibung und Port → lowercase Host ohne Port.
     #[test]
-    fn test_host_from_url_strips_userinfo_port_and_lowercases() {
+    fn test_host_from_url_strips_port_and_lowercases() {
         assert_eq!(
-            host_from_url("http://user:pw@Example.COM:8443/x"),
+            host_from_url("http://Example.COM:8443/x"),
             Some("example.com".to_owned())
         );
     }
 
-    /// URL ohne Schema → Host wird trotzdem korrekt erkannt.
+    /// Userinfo wird nicht mehr abgeschnitten, sondern abgelehnt (fail closed).
     #[test]
-    fn test_host_from_url_without_scheme() {
-        assert_eq!(host_from_url("docs.rs/x"), Some("docs.rs".to_owned()));
+    fn test_host_from_url_rejects_userinfo() {
+        assert_eq!(host_from_url("http://user:pw@Example.COM:8443/x"), None);
+        assert_eq!(host_from_url("https://docs.rs@evil.com/"), None);
+    }
+
+    /// URL ohne Schema → `None`: reqwest könnte sie ohnehin nicht senden.
+    #[test]
+    fn test_host_from_url_without_scheme_returns_none() {
+        assert_eq!(host_from_url("docs.rs/x"), None);
+    }
+
+    /// Andere Schemata als http/https → `None`.
+    #[test]
+    fn test_host_from_url_rejects_non_http_scheme() {
+        assert_eq!(host_from_url("ftp://docs.rs/"), None);
+        assert_eq!(host_from_url("file:///etc/passwd"), None);
+    }
+
+    /// F-002: `\` beendet bei Spezial-Schemata die Autorität — geprüft wird der
+    /// Host, zu dem `url`/reqwest tatsächlich verbinden.
+    #[test]
+    fn test_host_from_url_backslash_bypass_yields_real_host() {
+        assert_eq!(
+            host_from_url("https://evil.com\\@docs.rs/"),
+            Some("evil.com".to_owned())
+        );
+        assert_eq!(
+            host_from_url("https://evil.com\\.docs.rs/"),
+            Some("evil.com".to_owned())
+        );
+    }
+
+    /// F-167: IPv6-Literale liefern die Adresse ohne Klammern und Port.
+    #[test]
+    fn test_host_from_url_ipv6_literal() {
+        let host = host_from_url("https://[::1]:8080/");
+        assert_eq!(host.as_deref(), Some("::1"));
+    }
+
+    /// IDNA → Punycode, abschließender Punkt entfernt, prozentkodierter Host dekodiert.
+    #[test]
+    fn test_host_from_url_normalizes_like_whatwg() {
+        let cases = [
+            ("https://bücher.de/", "xn--bcher-kva.de"),
+            ("https://Docs.RS./", "docs.rs"),
+            ("https://%64ocs.rs/", "docs.rs"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(host_from_url(input).as_deref(), Some(expected), "{input}");
+        }
+    }
+
+    /// Ende-zu-Ende über den Guard: der Backslash-Trick kommt an einem auf
+    /// `docs.rs` beschränkten Scope nicht mehr vorbei, ein absoluter Name mit
+    /// abschließendem Punkt bleibt erlaubt.
+    #[test]
+    fn test_require_host_access_blocks_backslash_bypass() {
+        let (_base, spec) = make_sandbox_with_hosts(
+            "host_blocks_backslash_bypass",
+            vec![Permission::NetworkAccess],
+            vec!["docs.rs"],
+        );
+        let ctx = make_ctx(spec);
+
+        let at_bypass = host_from_url("https://evil.com\\@docs.rs/").expect("Host");
+        let dot_bypass = host_from_url("https://evil.com\\.docs.rs/").expect("Host");
+        for host in [at_bypass, dot_bypass] {
+            assert!(
+                require_host_access(&ctx, &host, "http.fetch").is_some(),
+                "{host:?} darf nicht als docs.rs durchgehen"
+            );
+        }
+
+        let host = host_from_url("https://static.docs.rs./x").expect("Host");
+        assert!(require_host_access(&ctx, &host, "http.fetch").is_none());
     }
 
     /// Leere Eingabe → `None`.

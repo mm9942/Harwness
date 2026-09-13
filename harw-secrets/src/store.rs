@@ -17,20 +17,21 @@ use secrecy::{ExposeSecret, SecretBox};
 use serde::{Deserialize, Serialize};
 
 use crate::audit::chain::{
-    canonical_bytes, AuditLog, PersistedChainStatus, AUDIT_FORMAT_VERSION, AUDIT_MAGIC,
+    AUDIT_FORMAT_VERSION, AUDIT_MAGIC, AuditLog, PersistedChainStatus, canonical_bytes,
 };
 use crate::audit::checkpoint::CheckpointLog;
 use crate::audit::event::{Actor, SubjectRef};
 use crate::error::{AuditResult, SecretsError, SecretsResult};
 use crate::id::{KeyVersion, SecretId};
 use crate::kek::KekProvenance;
-use crate::policy::CryptoPolicy;
-use crate::record::{SecretMetadata, SecretRecord};
+use crate::policy::{CryptoPolicy, KemAlgo};
+use crate::record::{SecretEnvelopeFormat, SecretMetadata, SecretRecord};
 
 /// Verified KEK material supplied by the configured key-provenance boundary.
-/// The public bytes are the canonical serialization of a validated HPKE
-/// recipient key. The matching deterministic HPKE seed is retained in a
-/// zeroizing container and exposed only to the v3 envelope open call.
+/// The public bytes are the canonical serialization of the validated hybrid
+/// HPKE recipient key for the store policy's KEM. The matching 32-byte root
+/// KEK seed is retained in a zeroizing container and exposed only to envelope
+/// open/rewrap calls, which derive the per-KEM recipient seed from it.
 pub struct KekMaterial {
     public_key: Vec<u8>,
     hpke_seed: SecretBox<[u8]>,
@@ -40,10 +41,11 @@ impl KekMaterial {
     /// Construct material from validated recipient public bytes and its exact
     /// 32-byte deterministic HPKE seed.
     ///
-    /// This constructor deliberately does not accept a serialized ML-KEM
-    /// secret key. Callers must derive and validate the recipient key pair at
-    /// the provenance boundary, then retain only the seed necessary to
-    /// reproduce the HPKE recipient private key during envelope opening.
+    /// This constructor deliberately does not accept an expanded or
+    /// KEM-specific recipient private key (such as the output of
+    /// [`crate::kek::derive_secret_key`]): `hpke_seed` must be the root KEK
+    /// seed. Callers must derive and validate the recipient public key at the
+    /// provenance boundary (see [`crate::kek::load_kek_material`]).
     pub fn new(public_key: Vec<u8>, hpke_seed: SecretBox<[u8]>) -> SecretsResult<Self> {
         let actual = hpke_seed.expose_secret().len();
         if actual != 32 {
@@ -413,6 +415,9 @@ impl SecretStore {
         let next_key_version = self.key_version.next();
         let now = jiff::Timestamp::now();
         let mut rotated_index = self.index.clone();
+        // Next-generation public keys for record KEMs other than the store
+        // policy's, derived at most once per KEM from the next root seed.
+        let mut derived_next_public_keys: Vec<(KemAlgo, Vec<u8>)> = Vec::new();
 
         for stored in rotated_index.values_mut() {
             if stored.record.key_version != self.key_version {
@@ -422,10 +427,29 @@ impl SecretStore {
                     expected: self.key_version,
                 });
             }
+            // Each record is rewrapped under the KEM it was sealed with, not
+            // the current store policy (a record from before a policy change
+            // would otherwise fail with `Seal(InvalidRecipientPublicKey)`).
+            // Non-V2 records keep the supplied key so `rewrap_v2` reports its
+            // format error first, exactly as before.
+            let next_public: &[u8] = if stored.record.kem_algo == self.policy.kem
+                || stored.record.envelope_format != SecretEnvelopeFormat::DekWrappedV2
+            {
+                &next_key_material.public_key
+            } else {
+                next_public_key_for_kem(
+                    &mut derived_next_public_keys,
+                    CryptoPolicy {
+                        kem: stored.record.kem_algo,
+                        aead: stored.record.aead_algo,
+                    },
+                    &next_key_material.hpke_seed,
+                )?
+            };
             stored.record.wrapped_dek = crate::envelope::rewrap_v2(
                 current_material.hpke_seed.expose_secret(),
                 &stored.record,
-                &next_key_material.public_key,
+                next_public,
                 next_key_version,
             )?;
             stored.record.key_version = next_key_version;
@@ -465,12 +489,21 @@ impl SecretStore {
     }
 
     /// Durably remove a secret before dropping it from the in-process index.
+    ///
+    /// If the audit state cannot be persisted afterwards, the removed entry is
+    /// restored byte for byte from the raw durable bytes read before removal.
     pub fn delete(&mut self, id: &SecretId) -> SecretsResult<()> {
-        let stored = self
-            .index
-            .get(id)
-            .cloned()
-            .ok_or(SecretsError::NotFound { id: *id })?;
+        if !self.index.contains_key(id) {
+            return Err(SecretsError::NotFound { id: *id });
+        }
+        let directory = secrets_root(&self.root);
+        let file_name = secret_file_name(id);
+        // Keep the raw durable bytes, not a re-serialization: records under a
+        // retired pure ML-KEM level can no longer be serialized
+        // (`skip_serializing`), and only a byte-exact restore cannot alter a
+        // record. These bytes are sealed ciphertext, never plaintext or KEK
+        // material.
+        let original_entry = fs::read(directory.join(&file_name))?;
         remove_persisted_secret(&self.root, id)?;
         let mut next_audit = self.audit.clone();
         next_audit.append(
@@ -479,10 +512,8 @@ impl SecretStore {
             vec![SubjectRef::new("secret", &format_secret_id(id))],
         );
         if let Err(error) = persist_audit_state(&self.root, &next_audit, &self.checkpoints) {
-            // Re-persist the pre-delete sealed entry, never plaintext or KEK
-            // material. Preserve the audit error if this best-effort rollback
-            // also fails.
-            let _ = persist_secret(&self.root, &stored);
+            // Preserve the audit error if this best-effort rollback also fails.
+            let _ = atomic_write(&directory, &file_name, &original_entry);
             return Err(error);
         }
         self.audit = next_audit;
@@ -688,6 +719,28 @@ fn promote_staged_secrets_directory(root: &Path) -> SecretsResult<SecretsDirecto
         root: root.to_owned(),
         had_active_directory,
     })
+}
+
+/// Public key of the next KEK generation for `policy.kem`, derived from the
+/// next root seed at most once per KEM and cached in `cache`.
+///
+/// # Errors
+/// Same as [`crate::kek::derive_public_key`], notably
+/// [`SecretsError::UnsupportedLegacyKem`] for a retired pure ML-KEM record.
+fn next_public_key_for_kem<'a>(
+    cache: &'a mut Vec<(KemAlgo, Vec<u8>)>,
+    policy: CryptoPolicy,
+    next_seed: &SecretBox<[u8]>,
+) -> SecretsResult<&'a [u8]> {
+    let position = match cache.iter().position(|(kem, _)| *kem == policy.kem) {
+        Some(position) => position,
+        None => {
+            let public_key = crate::kek::derive_public_key(&policy, next_seed)?;
+            cache.push((policy.kem, public_key));
+            cache.len() - 1
+        }
+    };
+    Ok(&cache[position].1)
 }
 
 fn persist_secret(root: &Path, stored: &StoredSecret) -> SecretsResult<()> {
@@ -927,18 +980,19 @@ fn provenance_kind(provenance: &KekProvenance) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{atomic::AtomicU64, Arc, Barrier};
+    use std::sync::{Arc, Barrier, atomic::AtomicU64};
 
-    use crypt_guard::pq_hpke::{derive_recipient_key_pair, Kem};
     use secrecy::ExposeSecret;
 
     use crate::audit::chain::sha256;
     use crate::error::AuditError;
+    use crate::kek::derive_public_key;
+    use crate::policy::KemAlgo;
 
     use super::*;
 
     fn store_with_key_material() -> SecretStore {
-        let policy = CryptoPolicy::ml_kem_512();
+        let policy = CryptoPolicy::strongest();
         SecretStore::with_key_material(
             test_root("in-process"),
             policy,
@@ -951,7 +1005,7 @@ mod tests {
     }
 
     fn store_with_root(root: PathBuf) -> SecretStore {
-        let policy = CryptoPolicy::ml_kem_512();
+        let policy = CryptoPolicy::strongest();
         SecretStore::with_key_material(
             root,
             policy,
@@ -971,19 +1025,16 @@ mod tests {
         ))
     }
 
-    fn hpke_kem(policy: CryptoPolicy) -> Kem {
-        match policy.kem {
-            crate::policy::KemAlgo::MlKem512 => Kem::MlKem512,
-            crate::policy::KemAlgo::MlKem768 => Kem::MlKem768,
-            crate::policy::KemAlgo::MlKem1024 => Kem::MlKem1024,
-        }
+    /// Hybrid public key via the production derivation boundary
+    /// (`RecipientPrivateKey::from_seed_bytes` + `public_key`).
+    fn hybrid_public_key(policy: CryptoPolicy, seed: [u8; 32]) -> Vec<u8> {
+        derive_public_key(&policy, &SecretBox::new(seed.to_vec().into_boxed_slice()))
+            .expect("deterministic hybrid HPKE public key")
     }
 
     fn keypair_bytes(policy: CryptoPolicy) -> (Vec<u8>, [u8; 32]) {
         let seed = [0xA5; 32];
-        let recipient = derive_recipient_key_pair(hpke_kem(policy), &seed)
-            .expect("deterministic HPKE recipient keypair");
-        (recipient.public_key().as_bytes().to_vec(), seed)
+        (hybrid_public_key(policy, seed), seed)
     }
 
     fn test_material(policy: CryptoPolicy) -> KekMaterial {
@@ -998,9 +1049,7 @@ mod tests {
     }
 
     fn material_from_seed(policy: CryptoPolicy, seed: [u8; 32]) -> KekMaterial {
-        let recipient = derive_recipient_key_pair(hpke_kem(policy), &seed)
-            .expect("deterministic HPKE recipient keypair");
-        material_from_hpke_parts(recipient.public_key().as_bytes().to_vec(), seed)
+        material_from_hpke_parts(hybrid_public_key(policy, seed), seed)
     }
 
     #[test]
@@ -1128,7 +1177,7 @@ mod tests {
     fn create_without_validated_key_material_is_refused() {
         let mut store = SecretStore::new(
             PathBuf::from("/tmp/harw-secrets-test"),
-            CryptoPolicy::ml_kem_512(),
+            CryptoPolicy::strongest(),
             KekProvenance::EnvSeed {
                 var: "HARW_TEST_SEED".to_owned(),
             },
@@ -1238,7 +1287,7 @@ mod tests {
     #[test]
     fn sealed_entries_survive_a_store_restart() {
         let root = test_root("restart-round-trip");
-        let policy = CryptoPolicy::ml_kem_512();
+        let policy = CryptoPolicy::strongest();
         let (public, seed) = keypair_bytes(policy);
         let mut store = SecretStore::with_key_material(
             root.clone(),
@@ -1283,7 +1332,7 @@ mod tests {
     #[test]
     fn opening_with_a_new_generation_rejects_durable_old_generation_records() {
         let root = test_root("rotation-incomplete-open");
-        let policy = CryptoPolicy::ml_kem_512();
+        let policy = CryptoPolicy::strongest();
         let (public, seed) = keypair_bytes(policy);
         let mut store = SecretStore::with_key_material(
             root.clone(),
@@ -1336,74 +1385,276 @@ mod tests {
 
     #[test]
     fn rotation_rewraps_only_deks_and_reopens_with_next_material() {
-        let root = test_root("rotation-rewrap");
-        let policy = CryptoPolicy::ml_kem_512();
-        let old_material = material_from_seed(policy, [0xA5; 32]);
-        let next_material = material_from_seed(policy, [0x5A; 32]);
-        let mut store = SecretStore::with_key_material(
+        for policy in [
+            CryptoPolicy::ml_kem_768_p256(),
+            CryptoPolicy::ml_kem_768_x25519(),
+            CryptoPolicy::strongest(),
+        ] {
+            let root = test_root("rotation-rewrap");
+            let old_material = material_from_seed(policy, [0xA5; 32]);
+            let next_material = material_from_seed(policy, [0x5A; 32]);
+            let mut store = SecretStore::with_key_material(
+                root.clone(),
+                policy,
+                KekProvenance::EnvSeed {
+                    var: "HARW_TEST_SEED".to_owned(),
+                },
+                KeyVersion::initial(),
+                old_material,
+            );
+            let value = SecretBox::new(b"rotation-token".to_vec().into_boxed_slice());
+            let id = store
+                .create("provider-token", "provider-auth", &value)
+                .expect("create record for rotation");
+            let before = store.record(&id).expect("record before rotation");
+            assert_eq!(before.kem_algo, policy.kem);
+
+            store.rotate(next_material).expect("rotate V2 record");
+
+            let after = store.record(&id).expect("record after rotation");
+            assert_eq!(after.envelope_format, before.envelope_format);
+            assert_eq!(after.kem_algo, policy.kem);
+            assert_eq!(after.ciphertext, before.ciphertext);
+            assert_eq!(after.nonce, before.nonce);
+            assert_ne!(after.wrapped_dek, before.wrapped_dek);
+            assert_eq!(after.key_version, KeyVersion::initial().next());
+            assert_eq!(
+                store
+                    .metadata(&id)
+                    .expect("metadata after rotation")
+                    .key_version,
+                KeyVersion::initial().next()
+            );
+            assert_eq!(
+                store
+                    .audit_log()
+                    .events()
+                    .last()
+                    .expect("rotation audit")
+                    .action,
+                "secret.rotate"
+            );
+
+            let reopened = SecretStore::open_with_key_material(
+                root,
+                policy,
+                KekProvenance::EnvSeed {
+                    var: "HARW_TEST_SEED".to_owned(),
+                },
+                KeyVersion::initial().next(),
+                material_from_seed(policy, [0x5A; 32]),
+            )
+            .expect("reopen rotated store with next material");
+            assert_eq!(
+                reopened
+                    .get(&id)
+                    .expect("open with next material")
+                    .expose_secret()
+                    .as_ref(),
+                b"rotation-token"
+            );
+        }
+    }
+
+    /// Durable store at `root` holding one record named `provider-token` whose
+    /// KEM wire name was reset to the retired pure `ml_kem_768`, as written
+    /// before the hybrid switch. Returns its id, entry path, and raw bytes.
+    fn legacy_kem_store_on_disk(root: &Path) -> (SecretId, PathBuf, Vec<u8>) {
+        let mut store = store_with_root(root.to_owned());
+        let value = SecretBox::new(b"legacy-kem-token".to_vec().into_boxed_slice());
+        let id = store
+            .create("provider-token", "provider-auth", &value)
+            .expect("create sealed record");
+
+        let path = secrets_root(root).join(secret_file_name(&id));
+        let mut durable: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).expect("read durable entry"))
+                .expect("durable entry is JSON");
+        durable["record"]["kem_algo"] = serde_json::Value::String("ml_kem_768".to_owned());
+        let legacy_bytes = serde_json::to_vec(&durable).expect("encode legacy entry");
+        fs::write(&path, &legacy_bytes).expect("write legacy entry");
+        (id, path, legacy_bytes)
+    }
+
+    fn reopen_strongest(root: &Path) -> SecretStore {
+        let policy = CryptoPolicy::strongest();
+        SecretStore::open_with_key_material(
+            root.to_owned(),
+            policy,
+            KekProvenance::EnvSeed {
+                var: "HARW_TEST_SEED".to_owned(),
+            },
+            KeyVersion::initial(),
+            material_from_seed(policy, [0xA5; 32]),
+        )
+        .expect("legacy records remain loadable")
+    }
+
+    #[test]
+    fn legacy_pure_ml_kem_records_load_but_can_neither_be_opened_nor_rotated() {
+        let root = test_root("legacy-kem");
+        let policy = CryptoPolicy::strongest();
+        let (id, path, legacy_bytes) = legacy_kem_store_on_disk(&root);
+
+        let mut reopened = reopen_strongest(&root);
+
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened.list().len(), 1);
+        assert_eq!(
+            reopened.record(&id).expect("legacy record").kem_algo,
+            KemAlgo::LegacyMlKem768
+        );
+        assert!(matches!(
+            reopened.get(&id),
+            Err(SecretsError::UnsupportedLegacyKem { algo }) if algo == "ml_kem_768"
+        ));
+        for reference in ["secrets:provider-token".to_owned(), format!("secrets:{id}")] {
+            assert!(matches!(
+                reopened.get_by_reference(&reference),
+                Err(SecretsError::UnsupportedLegacyKem { algo }) if algo == "ml_kem_768"
+            ));
+        }
+        let without_key_material = SecretStore::open(
             root.clone(),
             policy,
             KekProvenance::EnvSeed {
                 var: "HARW_TEST_SEED".to_owned(),
             },
             KeyVersion::initial(),
-            old_material,
-        );
-        let value = SecretBox::new(b"rotation-token".to_vec().into_boxed_slice());
-        let id = store
-            .create("provider-token", "provider-auth", &value)
-            .expect("create record for rotation");
-        let before = store.record(&id).expect("record before rotation");
-
-        store.rotate(next_material).expect("rotate V2 record");
-
-        let after = store.record(&id).expect("record after rotation");
-        assert_eq!(after.envelope_format, before.envelope_format);
-        assert_eq!(after.ciphertext, before.ciphertext);
-        assert_eq!(after.nonce, before.nonce);
-        assert_ne!(after.wrapped_dek, before.wrapped_dek);
-        assert_eq!(after.key_version, KeyVersion::initial().next());
+        )
+        .expect("legacy records load without key material");
+        assert_eq!(without_key_material.list().len(), 1);
         assert_eq!(
-            store
+            without_key_material
                 .metadata(&id)
-                .expect("metadata after rotation")
-                .key_version,
-            KeyVersion::initial().next()
+                .expect("legacy metadata")
+                .name,
+            "provider-token"
         );
+        assert!(matches!(
+            reopened.rotate(material_from_seed(policy, [0x5A; 32])),
+            Err(SecretsError::UnsupportedLegacyKem { algo }) if algo == "ml_kem_768"
+        ));
+        assert_eq!(reopened.key_version(), KeyVersion::initial());
         assert_eq!(
-            store
-                .audit_log()
-                .events()
-                .last()
-                .expect("rotation audit")
-                .action,
-            "secret.rotate"
+            fs::read(&path).expect("legacy entry after failed rotation"),
+            legacy_bytes
+        );
+    }
+
+    #[test]
+    fn failed_audit_after_deleting_a_legacy_record_restores_its_raw_bytes() {
+        let root = test_root("legacy-delete-audit-rollback");
+        let (id, path, legacy_bytes) = legacy_kem_store_on_disk(&root);
+        let mut reopened = reopen_strongest(&root);
+        // A re-serialization based rollback cannot restore this record.
+        assert!(serde_json::to_vec(&reopened.index[&id]).is_err());
+
+        // Same audit-failure injection as
+        // `failed_audit_after_delete_restores_the_exact_sealed_entry`.
+        fs::remove_file(root.join(CHECKPOINT_FILE)).expect("remove checkpoint file");
+        fs::create_dir(root.join(CHECKPOINT_FILE)).expect("block checkpoint file");
+
+        assert!(matches!(reopened.delete(&id), Err(SecretsError::Io(_))));
+
+        assert!(reopened.contains(&id));
+        assert_eq!(reopened.audit_log().len(), 0);
+        assert_eq!(
+            fs::read(&path).expect("restored legacy entry"),
+            legacy_bytes,
+            "rollback must restore the exact raw legacy record bytes"
         );
 
+        // Disk and index stay consistent across a restart.
+        fs::remove_dir(root.join(CHECKPOINT_FILE)).expect("unblock checkpoint file");
+        let restarted = reopen_strongest(&root);
+        assert_eq!(
+            restarted.record(&id).expect("legacy record after restart").kem_algo,
+            KemAlgo::LegacyMlKem768
+        );
+    }
+
+    #[test]
+    fn rotation_rewraps_each_record_under_its_own_recorded_kem() {
+        let root = test_root("rotation-mixed-kem");
+        let old_policy = CryptoPolicy::ml_kem_768_x25519();
+        let new_policy = CryptoPolicy::strongest();
+        let provenance = || KekProvenance::EnvSeed {
+            var: "HARW_TEST_SEED".to_owned(),
+        };
+
+        let mut old_store = SecretStore::with_key_material(
+            root.clone(),
+            old_policy,
+            provenance(),
+            KeyVersion::initial(),
+            material_from_seed(old_policy, [0xA5; 32]),
+        );
+        let old_id = old_store
+            .create(
+                "old-token",
+                "provider-auth",
+                &SecretBox::new(b"old-kem-token".to_vec().into_boxed_slice()),
+            )
+            .expect("create record under the previous policy");
+        drop(old_store);
+
+        // Policy change: same root seed, new store KEM.
+        let mut store = SecretStore::open_with_key_material(
+            root.clone(),
+            new_policy,
+            provenance(),
+            KeyVersion::initial(),
+            material_from_seed(new_policy, [0xA5; 32]),
+        )
+        .expect("reopen under the new policy");
+        let new_id = store
+            .create(
+                "new-token",
+                "provider-auth",
+                &SecretBox::new(b"new-kem-token".to_vec().into_boxed_slice()),
+            )
+            .expect("create record under the new policy");
+
+        store
+            .rotate(material_from_seed(new_policy, [0x5A; 32]))
+            .expect("rotate a store holding records of two KEMs");
+
+        assert_eq!(
+            store.record(&old_id).expect("old record").kem_algo,
+            old_policy.kem
+        );
+        assert_eq!(
+            store.record(&new_id).expect("new record").kem_algo,
+            new_policy.kem
+        );
         let reopened = SecretStore::open_with_key_material(
             root,
-            policy,
-            KekProvenance::EnvSeed {
-                var: "HARW_TEST_SEED".to_owned(),
-            },
+            new_policy,
+            provenance(),
             KeyVersion::initial().next(),
-            material_from_seed(policy, [0x5A; 32]),
+            material_from_seed(new_policy, [0x5A; 32]),
         )
-        .expect("reopen rotated store with next material");
-        assert_eq!(
-            reopened
-                .get(&id)
-                .expect("open with next material")
-                .expose_secret()
-                .as_ref(),
-            b"rotation-token"
-        );
+        .expect("reopen rotated mixed store");
+        for (id, expected) in [
+            (old_id, b"old-kem-token".as_slice()),
+            (new_id, b"new-kem-token".as_slice()),
+        ] {
+            assert_eq!(
+                reopened
+                    .get(&id)
+                    .expect("open rotated record")
+                    .expose_secret()
+                    .as_ref(),
+                expected
+            );
+        }
     }
 
     #[test]
     fn legacy_rotation_is_rejected_without_mutating_memory_or_disk() {
         let root = test_root("legacy-rotation");
-        let policy = CryptoPolicy::ml_kem_512();
+        let policy = CryptoPolicy::strongest();
         let mut store = SecretStore::with_key_material(
             root.clone(),
             policy,
@@ -1445,7 +1696,7 @@ mod tests {
     #[test]
     fn open_recovers_a_backup_when_interrupted_promotion_has_no_active_directory() {
         let root = test_root("rotation-recovery");
-        let policy = CryptoPolicy::ml_kem_512();
+        let policy = CryptoPolicy::strongest();
         let mut store = SecretStore::with_key_material(
             root.clone(),
             policy,
@@ -1511,7 +1762,7 @@ mod tests {
     #[test]
     fn durable_delete_survives_a_store_restart() {
         let root = test_root("delete-restart");
-        let policy = CryptoPolicy::ml_kem_512();
+        let policy = CryptoPolicy::strongest();
         let (public, seed) = keypair_bytes(policy);
         let mut store = SecretStore::with_key_material(
             root.clone(),
@@ -1554,7 +1805,7 @@ mod tests {
         fs::create_dir_all(&directory).expect("create secrets directory");
         fs::write(directory.join(secret_file_name(&id)), b"not valid JSON")
             .expect("write malformed entry");
-        let policy = CryptoPolicy::ml_kem_512();
+        let policy = CryptoPolicy::strongest();
         let (public, seed) = keypair_bytes(policy);
 
         assert!(matches!(

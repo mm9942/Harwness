@@ -85,6 +85,7 @@ rustix = { workspace = true, features = ["process"] }
 harw-observe-file = { path = "../harw-observe-file" }
 harw-observe-prom = { path = "../harw-observe-prom" }
 harw-observe-otlp = { path = "../harw-observe-otlp" }
+harw-runtime = { path = "../harw-runtime" }
 
 [dev-dependencies]
 tempfile = "3"

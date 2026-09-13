@@ -95,12 +95,11 @@ impl OperationCategory {
 /// Geordnete Mindest-Berechtigungsstufe für eine Operation.
 ///
 /// # Beschreibung
-/// Die Varianten sind totalgeordnet (`PartialOrd + Ord`), von niedrigster
-/// (`Observer`) bis höchster (`Owner`) Berechtigungsstufe. Ein Aufrufer
-/// mit Stufe `X` darf alle Operationen ausführen, deren `permission <= X`.
-///
-/// Diese Definition ist eigenständig in `harw-operations`, damit die Crate
-/// nicht von `harw-tui` oder einem anderen höherstufigen Crate abhängt.
+/// Re-Export von [`harw_types::PermissionTier`]: die Definition zog in Welle
+/// W0b nach `harw-types` (`harw-types/src/principal.rs`), damit
+/// `harw_types::Principal` denselben Typ trägt. Pfad, Varianten und Ordnung
+/// bleiben für alle Nutzer von `harw_operations::operation::PermissionTier`
+/// unverändert.
 ///
 /// # Beispiel
 /// ```rust
@@ -108,17 +107,7 @@ impl OperationCategory {
 ///
 /// assert!(PermissionTier::Maintainer > PermissionTier::Operator);
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum PermissionTier {
-    /// Lesezugriff; keine zustandsverändernden Aktionen.
-    Observer,
-    /// Standardnutzer; darf Operationen im normalen Betrieb ausführen.
-    Operator,
-    /// Erweiterte Rechte; darf Konfiguration und Ressourcen verwalten.
-    Maintainer,
-    /// Vollzugriff; darf alle Operationen einschließlich destruktiver Aktionen ausführen.
-    Owner,
-}
+pub use harw_types::PermissionTier;
 
 // ── Oberflächen ─────────────────────────────────────────────────────────────
 

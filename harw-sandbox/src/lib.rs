@@ -41,6 +41,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 mod bwrap;
 pub use bwrap::{BwrapCommandPlan, BwrapLauncher};
 
+pub mod egress;
+pub use egress::{EgressHost, EgressUrl, EgressUrlError, host_matches_suffix};
+
 /// Operationsklassen, die eine Sandbox autorisieren kann.
 ///
 /// Es gibt bewusst keine Permission für beliebigen Dateisystemzugriff außerhalb
@@ -161,7 +164,10 @@ impl Default for PermissionSet {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EgressTarget {
-    /// Genau dieser Hostname, ohne Subdomains.
+    /// Genau dieser Hostname, ohne Subdomains. Verglichen wird
+    /// ASCII-case-insensitiv und — konsistent zu [`Self::DnsSuffix`] — mit
+    /// Toleranz für je *einen* abschließenden Punkt auf beiden Seiten
+    /// (`docs.rs.` ≙ `docs.rs`); ein leerer Name trifft nie.
     Host(String),
     /// Dieser Name und alles darunter, an Punktgrenzen — siehe
     /// [`NetworkScope::allows`].
@@ -540,7 +546,7 @@ impl EgressTarget {
     // damit `NetworkScope::allows` nicht je Ziel neu normalisiert.
     fn matches_normalized_host(&self, needle: &str) -> bool {
         match self {
-            Self::Host(allowed) => needle.eq_ignore_ascii_case(allowed),
+            Self::Host(allowed) => host_matches_exact(allowed, needle),
             Self::DnsSuffix(allowed) => host_matches(allowed, needle),
             Self::Cidr(_) => false,
         }
@@ -569,29 +575,21 @@ fn normalize_host(host: &str) -> String {
     host.trim().trim_start_matches('.').to_ascii_lowercase()
 }
 
-// Exakter Treffer oder Suffix-Treffer an einer Punkt-Grenze. `needle` ist bereits
-// normalisiert; `allowed` wird defensiv behandelt, weil ein deserialisierter
-// Scope die Normalisierung von `from_hosts` nicht durchlaufen hat.
+// Exakter Treffer oder Suffix-Treffer an einer Punkt-Grenze. Die Regel selbst
+// lebt genau einmal in `egress::host_matches_suffix` (case-insensitiv, leere
+// Einträge treffen nie, je ein abschließender Punkt toleriert); `needle` ist
+// hier bereits normalisiert, `allowed` wird dort defensiv behandelt, weil ein
+// deserialisierter Scope die Normalisierung von `from_hosts` nicht durchlaufen hat.
 fn host_matches(allowed: &str, needle: &str) -> bool {
-    // Ein leerer Eintrag wäre Suffix jedes Namens und darf nie treffen.
-    if allowed.is_empty() {
-        return false;
-    }
-    if needle.eq_ignore_ascii_case(allowed) {
-        return true;
-    }
-    if needle.len() <= allowed.len() {
-        return false;
-    }
-    let start = needle.len() - allowed.len();
-    // `get` statt Indexierung: bei einer Nicht-Zeichengrenze gibt es keinen
-    // Treffer statt eines Panics.
-    let Some(suffix) = needle.get(start..) else {
-        return false;
-    };
-    // `start >= 1`, da `needle` echt länger als `allowed` ist. Ein Byte einer
-    // Mehrbyte-Sequenz ist nie `b'.'`, der Grenzvergleich bleibt also korrekt.
-    suffix.eq_ignore_ascii_case(allowed) && needle.as_bytes()[start - 1] == b'.'
+    egress::host_matches_suffix(allowed, needle)
+}
+
+// Exakter Namensvergleich für `EgressTarget::Host`: dieselbe Trailing-Dot- und
+// Leer-Behandlung wie `egress::host_matches_suffix`, aber ohne Suffix-Regel.
+fn host_matches_exact(allowed: &str, needle: &str) -> bool {
+    let allowed = allowed.strip_suffix('.').unwrap_or(allowed);
+    let needle = needle.strip_suffix('.').unwrap_or(needle);
+    !allowed.is_empty() && needle.eq_ignore_ascii_case(allowed)
 }
 
 // Paarweise Schnittregel für `EgressTarget`, siehe `NetworkScope::intersection`
@@ -1592,5 +1590,53 @@ mod tests {
                 "intersection must stay inside the right-hand scope"
             );
         }
+    }
+
+    // W0B-04: `NetworkScope::allows` nutzt die eine Suffix-Regel aus
+    // `egress::host_matches_suffix` — Punktgrenze bleibt, ein abschließender
+    // Punkt (absoluter DNS-Name) wird toleriert.
+    #[test]
+    fn network_scope_allows_uses_egress_suffix_rule() {
+        let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);
+        assert!(scope.allows("docs.rs."));
+        assert!(scope.allows("Static.Docs.RS."));
+        assert!(!scope.allows("notdocs.rs"));
+        assert!(!scope.allows("docs.rs.evil.com"));
+        assert!(!scope.allows("evil.com"));
+
+        let url = EgressUrl::parse("https://evil.com\\@docs.rs/").unwrap();
+        assert!(!scope.allows(&url.host_str()));
+    }
+
+    // Z0-F4 / R2-08: `EgressTarget::Host` toleriert wie `DnsSuffix` genau einen
+    // abschließenden Punkt, bleibt aber exakt (keine Subdomains).
+    #[test]
+    fn egress_target_host_tolerates_one_trailing_dot() {
+        let plain = EgressTarget::Host("docs.rs".to_owned());
+        let absolute = EgressTarget::Host("Docs.RS.".to_owned());
+        for target in [&plain, &absolute] {
+            assert!(target.matches_host("docs.rs"), "{target:?}");
+            assert!(target.matches_host("DOCS.rs."), "{target:?}");
+            assert!(!target.matches_host("docs.rs.."), "{target:?}");
+            assert!(!target.matches_host("static.docs.rs"), "{target:?}");
+            assert!(!target.matches_host("notdocs.rs"), "{target:?}");
+        }
+        for empty in ["", "."] {
+            let target = EgressTarget::Host(empty.to_owned());
+            assert!(!target.matches_host("."), "{empty:?}");
+            assert!(!target.matches_host("docs.rs"), "{empty:?}");
+        }
+
+        // Der Schnitt `Host("docs.rs.") ∩ DnsSuffix("docs.rs")` ist
+        // `Host("docs.rs.")` — und dieses Ergebnis lässt `docs.rs` jetzt auch zu.
+        let host = scope_of([EgressTarget::Host("docs.rs.".to_owned())]);
+        let suffix = scope_of([EgressTarget::DnsSuffix("docs.rs".to_owned())]);
+        let effective = host.intersection(&suffix);
+        assert_eq!(effective, host);
+        assert!(effective.allows("docs.rs"));
+        assert!(effective.allows("docs.rs."));
+        assert!(!effective.allows("api.docs.rs"));
+        assert!(effective.is_subset_of(&host));
+        assert!(effective.is_subset_of(&suffix));
     }
 }

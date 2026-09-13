@@ -447,7 +447,7 @@ fn read_persisted_record(cursor: &mut Cursor<'_>) -> AuditResult<([u8; 32], [u8;
 /// # Examples
 /// ```rust,no_run
 /// use std::path::Path;
-/// use harw_secrets::audit::chain::{load_and_verify_persisted_chain, PersistedChainStatus};
+/// use harw_secrets::audit::chain::{PersistedChainStatus, load_and_verify_persisted_chain};
 ///
 /// match load_and_verify_persisted_chain(Path::new("/var/lib/harw/secrets/audit.log")) {
 ///     Ok(PersistedChainStatus::Absent) => { /* nothing recorded yet */ }

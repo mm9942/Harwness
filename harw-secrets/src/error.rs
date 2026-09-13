@@ -36,11 +36,21 @@ pub enum SecretsError {
     #[msg("KEK provenance '{kind}' unavailable: {reason}")]
     KekUnavailable { kind: String, reason: String },
 
-    /// Deterministic derivation of the KEK's ML-KEM keypair failed. The
+    /// Deterministic derivation of the KEK's hybrid ML-KEM keypair failed. The
     /// underlying error is retained for typed handling and its safe diagnostic
     /// text is included without exposing seed or derived key material.
-    #[msg("crypt_guard KEK-to-ML-KEM keypair derivation failed: {source}")]
+    #[msg("crypt_guard KEK-to-hybrid-ML-KEM keypair derivation failed: {source}")]
     KekDerivation { source: crypt_guard::pq_hpke::Error },
+
+    /// A policy or durable record names a retired pure ML-KEM level
+    /// (`ml_kem_512`/`ml_kem_768`/`ml_kem_1024`). `crypt_guard` 3.0.1 derives
+    /// deterministic recipient keys only for hybrid KEMs, so such envelopes can
+    /// neither be sealed nor opened. Only the algorithm wire name is retained;
+    /// record contents and key material must never enter this error.
+    #[msg(
+        "KEM algorithm '{algo}' is a retired pure ML-KEM level and is no longer supported; re-create the secret under a hybrid KEM"
+    )]
+    UnsupportedLegacyKem { algo: String },
 
     /// A deterministic HPKE seed has a length other than the required 32
     /// bytes. Only the length is retained; seed bytes must never enter errors.
@@ -225,6 +235,22 @@ mod tests {
         );
         assert!(!display.contains("seed bytes"));
         assert!(!format!("{error:?}").contains("seed bytes"));
+    }
+
+    #[test]
+    fn unsupported_legacy_kem_display_contains_only_the_algorithm_name() {
+        let error = SecretsError::UnsupportedLegacyKem {
+            algo: "ml_kem_768".to_owned(),
+        };
+        let display = error.to_string();
+
+        assert_eq!(
+            display,
+            "KEM algorithm 'ml_kem_768' is a retired pure ML-KEM level and is no longer supported; re-create the secret under a hybrid KEM"
+        );
+        assert!(error.source().is_none());
+        assert!(!display.contains("seed bytes"));
+        assert!(!display.contains("plaintext-secret"));
     }
 
     #[test]

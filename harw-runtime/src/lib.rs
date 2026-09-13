@@ -3,3 +3,12 @@
 //! Gerüst aus Welle W0a. Verträge (`spec`, `error`) liefert Agent W0B-05,
 //! die Montage die Wellen W2b/W2c gemäß `docs/remediation/CONTRACTS.md` §runtime.
 #![forbid(unsafe_code)]
+
+pub mod error;
+pub mod spec;
+
+pub use error::{RuntimeError, RuntimeResult};
+pub use spec::{
+    AskResolution, CeilingPolicy, EntryKind, EntryProfile, OperationSurface, RightsSnapshot,
+    RootBudget, RuntimeSpec, SpawnerPolicy,
+};

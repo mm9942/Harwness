@@ -7,7 +7,10 @@ rust-version.workspace = true
 [dependencies]
 aes-gcm-siv = "0.11.1"
 chacha20poly1305 = "0.10.1"
-crypt_guard = "3.0.1"
+# Exact pin: persisted secrets depend on crypt_guard's draft-pinned hybrid
+# seed-to-key derivation. Any upgrade must re-bless `tests/fixtures/kem_kat.txt`
+# and ship a migration plan (see `kek.rs` KAT tests).
+crypt_guard = "=3.0.1"
 getrandom = { version = "0.4.2", features = ["std"] }
 harw-macros = { path = "../harw-macros" }
 harw-observe = { path = "../harw-observe" }
@@ -19,14 +22,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10.9"
 uuid = { version = "1.23.5", features = ["serde", "v7"] }
-# External deps are LISTED here for the parent to `cargo add` (this worker never
-# runs cargo). Exact versions/features resolved by the parent. See design
-# docs/design/secrets-and-audit.md §5.1.
-# TODO(parent cargo add): crypt_guard  # PQC AEAD sealing (ML-KEM) + ML-DSA checkpoint signing; keep ml-kem-backend + ml-dsa-backend defaults, no legacy-pqclean. crates.io dep, never a path dep.
-# TODO(parent cargo add): secrecy [features=alloc]  # SecretString / SecretBox<[u8]> in-memory secret material (match harw-provider). NOTE: SecretBox<[u8]> needs secrecy >= 0.10; §5.1 pins 0.8 (SecretVec) — parent to reconcile.
-# TODO(parent cargo add): uuid [features=v7]  # UUIDv7 SecretId / AuditEventId (time-ordered)
-# TODO(parent cargo add): jiff  # Timestamp for records + audit events (NOT chrono)
-# TODO(parent cargo add): sha2  # SHA-256 for the audit hash-chain + checkpoint chaining (§4.2). Not in §5.1's list; required to implement chaining fully — see drift notes.
 
 [features]
 default = []

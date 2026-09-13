@@ -281,9 +281,53 @@ pub trait InstructionsProvider: Send + Sync {
     fn load<'a>(&'a self) -> ExtFuture<'a, LoadedInstructions>;
 }
 
+/// Grobe Einordnung, welche Art von Freigabe-Entscheider ein
+/// [`ApprovalHandler`] ist — reine Introspektion (Diagnose, Logging,
+/// Auswahl unter mehreren registrierten Handlern), keine Verhaltenssteuerung.
+///
+/// # Beschreibung
+/// Ein Wert hier behauptet nichts über die *Qualität* der Entscheidung, nur
+/// über ihre *Herkunftsart*. Vorgabe (siehe [`ApprovalHandler::kind`]) ist
+/// [`Self::Other`] — ein Handler muss eine spezifischere Einordnung aktiv
+/// wählen, sie fällt ihm nie zu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ApprovalHandlerKind {
+    /// Entscheidet anhand einer statischen, aus Konfiguration geladenen Politik.
+    ConfigPolicy,
+    /// Die eingebaute Standardpolitik ohne externe Konfiguration.
+    DefaultPolicy,
+    /// Fragt eine anwesende Person direkt (z. B. über ein TUI-Prompt).
+    Interactive,
+    /// Fragt über einen entfernten Kanal (z. B. Chat, Webhook) nach.
+    Channel,
+    /// Persistiert die Entscheidung dauerhaft (z. B. für spätere Wiedergabe/Audit).
+    Durable,
+    /// Keine der obigen Kategorien, oder nicht deklariert.
+    Other,
+}
+
 /// Guardrail: prüft vor Tool-Ausführung.
+///
+/// # Vertrag
+/// [`Self::review`] ist seiteneffektfrei: es öffnet keine Prompts, schreibt
+/// nichts und darf beliebig oft aufgerufen werden, ohne dass sich das
+/// Ergebnis für denselben `call` je nach Aufrufreihenfolge ändert. Ein
+/// Handler, der eine Person tatsächlich fragen muss (z. B. [`ApprovalDecision::AskUser`]),
+/// tut das nicht in `review` selbst, sondern verweist über die
+/// zurückgegebene `ItemId` auf eine spätere, separate Interaktion.
 pub trait ApprovalHandler: Send + Sync {
     fn review<'a>(&'a self, call: &'a ToolCall) -> ExtFuture<'a, ApprovalDecision>;
+
+    /// Grobe Einordnung dieses Handlers. Vorgabe: [`ApprovalHandlerKind::Other`].
+    fn kind(&self) -> ApprovalHandlerKind {
+        ApprovalHandlerKind::Other
+    }
+
+    /// Menschenlesbarer, stabiler Kurzname für Diagnose/Introspektion.
+    /// Vorgabe: `"unnamed"`.
+    fn label(&self) -> &'static str {
+        "unnamed"
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -545,5 +589,50 @@ mod tests {
             "own.label",
             "an overriding provider's own label must survive untouched, never becoming 'unlabeled'"
         );
+    }
+
+    /// Ein `ApprovalHandler`, der ausschließlich `review` implementiert --
+    /// steht für jeden der fünf bestehenden Handler im Workspace, die
+    /// `kind`/`label` noch nicht kennen (siehe Ledger).
+    struct BareApprovalHandler;
+
+    impl ApprovalHandler for BareApprovalHandler {
+        fn review<'a>(&'a self, _call: &'a ToolCall) -> ExtFuture<'a, ApprovalDecision> {
+            Box::pin(async { ApprovalDecision::Allow })
+        }
+    }
+
+    #[test]
+    fn approval_handler_kind_defaults_to_other() {
+        assert_eq!(BareApprovalHandler.kind(), ApprovalHandlerKind::Other);
+    }
+
+    #[test]
+    fn approval_handler_label_defaults_to_unnamed() {
+        assert_eq!(BareApprovalHandler.label(), "unnamed");
+    }
+
+    /// Ein Handler, der beide Vorgaben überschreibt -- belegt, dass die
+    /// Vorgaben echte Defaults sind, keine erzwungenen Endwerte.
+    struct NamedApprovalHandler;
+
+    impl ApprovalHandler for NamedApprovalHandler {
+        fn review<'a>(&'a self, _call: &'a ToolCall) -> ExtFuture<'a, ApprovalDecision> {
+            Box::pin(async { ApprovalDecision::Allow })
+        }
+
+        fn kind(&self) -> ApprovalHandlerKind {
+            ApprovalHandlerKind::Interactive
+        }
+
+        fn label(&self) -> &'static str {
+            "named-handler"
+        }
+    }
+
+    #[test]
+    fn approval_handler_kind_and_label_can_be_overridden() {
+        assert_eq!(NamedApprovalHandler.kind(), ApprovalHandlerKind::Interactive);
+        assert_eq!(NamedApprovalHandler.label(), "named-handler");
     }
 }

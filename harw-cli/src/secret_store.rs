@@ -10,7 +10,8 @@ use harw_config::{KekConfig, KekProvenance as ConfigKekProvenance, ResolvedConfi
 use harw_provider_http::SecretResolver;
 use harw_secrets::audit::chain::PersistedChainStatus;
 use harw_secrets::{
-    AuditResult, CryptoPolicy, KekProvenance, KeyVersion, SecretStore, load_kek_material,
+    AuditResult, CryptoPolicy, KekProvenance, KeyVersion, SecretStore, SecretsError,
+    load_kek_material,
 };
 use secrecy::SecretString;
 use secrecy_08::ExposeSecret as _;
@@ -33,10 +34,25 @@ impl SecretResolver for ConfiguredSecretResolver {
         let secret = self
             .store
             .get_by_reference(reference)
-            .map_err(|_| "sealed secret could not be resolved".to_owned())?;
+            .map_err(resolve_error_message)?;
         let value = String::from_utf8(secret.expose_secret().as_ref().to_vec())
             .map_err(|_| "sealed secret is not valid UTF-8".to_owned())?;
         Ok(SecretString::from(value))
+    }
+}
+
+/// Maps a store error to an operator-facing message without secret content.
+///
+/// A record sealed under a retired pure ML-KEM level is reported with a
+/// migration hint (only the algorithm name is shown); every other error stays
+/// masked.
+fn resolve_error_message(error: SecretsError) -> String {
+    match error {
+        SecretsError::UnsupportedLegacyKem { algo } => format!(
+            "sealed secret uses the retired KEM '{algo}' and can no longer be opened; \
+             re-create the secret under a hybrid KEM (see docs/setup/crypt-guard.md)"
+        ),
+        _ => "sealed secret could not be resolved".to_owned(),
     }
 }
 
@@ -302,6 +318,63 @@ mod tests {
         assert_eq!(error, "sealed secret is not valid UTF-8");
         assert!(!error.contains("255"));
         assert!(!error.contains("binary-provider-token"));
+    }
+
+    #[test]
+    fn resolver_reports_a_retired_kem_with_a_migration_hint() {
+        let home = TempDir::new().expect("temporary home");
+        let key_path = write_test_kek(home.path());
+        {
+            let mut store = store_with_test_kek(home.path(), &key_path);
+            store
+                .create(
+                    "provider-token",
+                    "provider authentication",
+                    &SecretBox::new(b"legacy-token".to_vec().into_boxed_slice()),
+                )
+                .expect("seal test token");
+        }
+        // Reset the durable KEM name to a retired pure ML-KEM level, as written
+        // before the hybrid switch.
+        let entry = fs::read_dir(home.path().join("sealed-secrets").join("secrets"))
+            .expect("sealed secrets directory")
+            .next()
+            .expect("one sealed entry")
+            .expect("sealed entry")
+            .path();
+        let mut durable: serde_json::Value =
+            serde_json::from_slice(&fs::read(&entry).expect("read sealed entry"))
+                .expect("sealed entry is JSON");
+        durable["record"]["kem_algo"] = serde_json::Value::String("ml_kem_768".to_owned());
+        let legacy_entry = serde_json::to_vec(&durable).expect("encode legacy entry");
+        fs::write(&entry, legacy_entry).expect("write legacy entry");
+
+        let policy = CryptoPolicy::strongest();
+        let provenance = KekProvenance::KeyFile { path: key_path };
+        let key_material = load_kek_material(&policy, &provenance).expect("load test KEK material");
+        let store = SecretStore::open_with_key_material(
+            home.path().join("sealed-secrets"),
+            policy,
+            provenance,
+            KeyVersion::initial(),
+            key_material,
+        )
+        .expect("legacy record still loads");
+        let resolver = ConfiguredSecretResolver::new(store);
+
+        let error = resolver
+            .resolve("secrets:provider-token")
+            .expect_err("retired KEM must not resolve");
+        assert!(error.contains("retired KEM 'ml_kem_768'"));
+        assert!(error.contains("re-create the secret"));
+        assert!(error.contains("docs/setup/crypt-guard.md"));
+        assert!(!error.contains("legacy-token"));
+
+        let masked = resolver
+            .resolve("secrets:missing-provider-token")
+            .expect_err("unknown reference must not resolve");
+        assert_eq!(masked, "sealed secret could not be resolved");
+        assert!(!masked.contains("missing-provider-token"));
     }
 
     /// Der wichtigste Test dieses Knotens: die periodische Kettenprüfung

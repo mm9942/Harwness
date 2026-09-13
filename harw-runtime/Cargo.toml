@@ -5,6 +5,33 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# Gemeinsame Runtime-Montage (L12): darf nur von `harw-tui` und `harw-cli`
+# genutzt werden, sonst entsteht ein Zyklus.
+harw-agent-dsl = { path = "../harw-agent-dsl" }
+harw-config = { path = "../harw-config" }
+harw-context = { path = "../harw-context" }
+harw-core = { path = "../harw-core" }
+harw-extension-api = { path = "../harw-extension-api" }
+harw-home = { path = "../harw-home" }
+harw-job-runtime = { path = "../harw-job-runtime" }
+harw-macros = { path = "../harw-macros" }
+harw-memory = { path = "../harw-memory" }
+harw-model-catalog = { path = "../harw-model-catalog" }
+harw-observe = { path = "../harw-observe" }
+harw-operations = { path = "../harw-operations" }
+harw-ops = { path = "../harw-ops" }
+harw-plan = { path = "../harw-plan" }
+harw-plan-bridge = { path = "../harw-plan-bridge" }
+harw-project-discovery = { path = "../harw-project-discovery" }
+harw-provider-http = { path = "../harw-provider-http" }
+harw-registry-defaults = { path = "../harw-registry-defaults" }
+harw-sandbox = { path = "../harw-sandbox" }
+harw-session-store = { path = "../harw-session-store" }
+harw-types = { path = "../harw-types" }
+# Kein `[workspace.dependencies]`-Eintrag für tokio; Version = Cargo.lock.
+tokio = { version = "1.53.0", features = ["rt"] }
+tracing = { workspace = true }
+serde = { workspace = true }
 
 [lints]
 workspace = true

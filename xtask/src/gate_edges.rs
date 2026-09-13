@@ -370,10 +370,10 @@ mod tests {
     }
 
     #[test]
-    fn test_evaluate_empty_graph_is_green_with_zero_checked() {
+    fn test_evaluate_empty_graph_is_red_with_zero_checked() {
         let report = evaluate(&graph(Vec::new()));
 
-        assert!(report.is_green());
+        assert!(!report.is_green(), "leerer Graph prüft nichts (G-102)");
         assert_eq!(report.checked, 0);
     }
 

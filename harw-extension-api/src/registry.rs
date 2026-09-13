@@ -200,6 +200,37 @@ impl ExtensionRegistry {
     pub fn context_provider_namespace(&self, namespace: &str) -> Option<(&'static str, TrustClass)> {
         self.context_provider_namespaces.get(namespace).copied()
     }
+
+    /// Wandelt eine fertige Registry zurück in einen [`ExtensionRegistryBuilder`].
+    ///
+    /// # Description
+    /// Die Umkehrung von [`ExtensionRegistryBuilder::build`]: alle Provider
+    /// (Werkzeuge, Kontext, Instructions, Freigabe-Handler, Turn-Observer,
+    /// Spawner) sowie die vollständige Namensraum-Tabelle
+    /// (`context_provider_namespaces`, siehe Moduldoku) wandern unverändert in
+    /// den zurückgegebenen Builder. Das erlaubt es, eine bestehende, bereits
+    /// gebaute Registry weiterzukomponieren (z. B. um sie um zusätzliche
+    /// Provider zu erweitern, bevor sie erneut gebaut wird) ohne die
+    /// Namensraum-Prüfung für die bereits registrierten Context-Provider zu
+    /// wiederholen oder zu umgehen: ein weiterer `context_provider(..)`-Aufruf
+    /// auf dem zurückgegebenen Builder prüft neue Provider weiterhin gegen die
+    /// hier übernommenen, bereits beanspruchten Namensräume.
+    ///
+    /// # Returns
+    /// Einen neuen `ExtensionRegistryBuilder`, der exakt den Zustand von
+    /// `self` trägt.
+    #[must_use]
+    pub fn into_builder(self) -> ExtensionRegistryBuilder {
+        ExtensionRegistryBuilder {
+            tool_providers: self.tool_providers,
+            context_providers: self.context_providers,
+            instructions_providers: self.instructions_providers,
+            approval_handlers: self.approval_handlers,
+            turn_observers: self.turn_observers,
+            spawner: self.spawner,
+            context_provider_namespaces: self.context_provider_namespaces,
+        }
+    }
 }
 
 /// Ein `#[harw_macros::context_provider]`-erzeugter Typ implementiert dies
@@ -870,5 +901,74 @@ mod tests {
             registry.context_provider_namespace("fixed"),
             Some(("Fixed", TrustClass::Instruction))
         );
+    }
+
+    /// `into_builder` muss Provider und Namensräume unverändert erhalten --
+    /// ein Roundtrip `build().into_builder().build()` darf keine registrierte
+    /// Angabe verlieren oder verändern.
+    #[test]
+    fn into_builder_roundtrip_preserves_providers_and_namespaces() {
+        let registry = ExtensionRegistry::builder()
+            .tool_provider(Arc::new(NamedToolProvider {
+                tool_name: "tools.roundtrip",
+            }))
+            .context_provider_declared(
+                "Plan",
+                Arc::new(FixedDeclaredProvider {
+                    namespace: "plan",
+                    max_trust: TrustClass::Evidence,
+                }),
+            )
+            .expect("plan namespace registers")
+            .build();
+
+        let rebuilt = registry.into_builder().build();
+
+        let tool_names: Vec<_> = rebuilt
+            .tool_providers()
+            .iter()
+            .flat_map(|provider| provider.tools())
+            .map(|tool| tool.name().to_owned())
+            .collect();
+        assert_eq!(tool_names, vec!["tools.roundtrip".to_owned()]);
+        assert_eq!(rebuilt.context_providers().len(), 1);
+        assert_eq!(
+            rebuilt.context_provider_namespace("plan"),
+            Some(("Plan", TrustClass::Evidence)),
+            "into_builder must carry the namespace claim table through unchanged"
+        );
+    }
+
+    /// `into_builder` erlaubt es, weitere Provider anzuhängen, bevor erneut
+    /// gebaut wird -- und die Namensraum-Prüfung wirkt dabei weiterhin gegen
+    /// die aus der ursprünglichen Registry übernommenen Namensräume.
+    #[test]
+    fn into_builder_still_enforces_namespace_check_for_new_providers() {
+        let registry = ExtensionRegistry::builder()
+            .context_provider_declared(
+                "Plan",
+                Arc::new(FixedDeclaredProvider {
+                    namespace: "plan",
+                    max_trust: TrustClass::Evidence,
+                }),
+            )
+            .expect("plan namespace registers")
+            .build();
+
+        let error = registry
+            .into_builder()
+            .context_provider_declared(
+                "RoguePlan",
+                Arc::new(FixedDeclaredProvider {
+                    namespace: "plan",
+                    max_trust: TrustClass::Instruction,
+                }),
+            )
+            .expect_err("the namespace claim carried over from the built registry must still be enforced");
+
+        assert!(matches!(
+            error,
+            ContextProviderRegistrationError::NamespaceAlreadyClaimed { .. }
+        ));
     }
 }

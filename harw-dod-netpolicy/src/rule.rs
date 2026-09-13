@@ -102,10 +102,8 @@ impl NetRule {
     /// `harw_sandbox::NetworkScope::allows` für die jeweilige Zielart:
     /// [`Self::AllowHost`] vergleicht case-insensitiv exakt,
     /// [`Self::AllowDnsSuffix`] verlangt einen Treffer an einer Punktgrenze
-    /// (siehe [`host_matches`]). [`Self::AllowCidr`] ist nie ein
-    /// Host-Treffer. `harw-sandbox` exportiert diese Vergleichsfunktionen
-    /// nicht öffentlich; siehe die Moduldoc von `crate` zum daraus
-    /// entstehenden Kopplungsrisiko.
+    /// (siehe [`host_matches`], das an `harw_sandbox::host_matches_suffix`
+    /// delegiert). [`Self::AllowCidr`] ist nie ein Host-Treffer.
     ///
     /// # Arguments
     /// - `needle` (`&str`): bereits über [`normalize_host`] normalisierter
@@ -158,23 +156,14 @@ pub(crate) fn normalize_host(host: &str) -> String {
 
 // Exakter Treffer oder Suffix-Treffer an einer Punktgrenze. `needle` muss
 // bereits über `normalize_host` normalisiert sein; `allowed` wird defensiv
-// behandelt. Identische Semantik zu harw_sandbox's privatem `host_matches`
-// (siehe dortige Begründung der Punktgrenzen-Regel).
+// behandelt. Delegiert an `harw_sandbox::host_matches_suffix` (Re-Export von
+// `harw_sandbox::egress::host_matches_suffix`, `harw-sandbox/src/lib.rs:45`)
+// statt einer eigenen Kopie: zwei Kopien derselben Sicherheitsregel drifteten
+// bereits einmal auseinander (Review Z0-R2, Befund R2-02) — `harw-sandbox`
+// toleriert seit W0B-04 je einen abschließenden Punkt auf beiden Seiten
+// (`egress.rs:305-326`), diese Crate hatte das nicht nachgezogen.
 fn host_matches(allowed: &str, needle: &str) -> bool {
-    if allowed.is_empty() {
-        return false;
-    }
-    if needle.eq_ignore_ascii_case(allowed) {
-        return true;
-    }
-    if needle.len() <= allowed.len() {
-        return false;
-    }
-    let start = needle.len() - allowed.len();
-    let Some(suffix) = needle.get(start..) else {
-        return false;
-    };
-    suffix.eq_ignore_ascii_case(allowed) && needle.as_bytes()[start - 1] == b'.'
+    harw_sandbox::host_matches_suffix(allowed, needle)
 }
 
 #[cfg(test)]
@@ -230,6 +219,27 @@ mod tests {
         assert!(rule.allows_host("static.docs.rs"));
         assert!(!rule.allows_host("evildocs.rs"));
         assert!(!rule.allows_addr("10.0.0.1".parse().expect("valid IP")));
+    }
+
+    /// `host_matches` delegiert an `harw_sandbox::host_matches_suffix`
+    /// (`harw-sandbox/src/egress.rs:305-326`), das seit W0B-04 je einen
+    /// abschließenden Punkt auf beiden Seiten toleriert (Review Z0-R2,
+    /// Befund R2-02). Ein FQDN mit abschließendem Punkt aus einem
+    /// DNS-Kontext wird deshalb nicht mehr fail-closed abgelehnt, sondern
+    /// wie sein absoluter Name behandelt.
+    #[test]
+    fn test_allow_dns_suffix_rule_tolerates_one_trailing_dot() {
+        let rule = NetRule::AllowDnsSuffix {
+            suffix: "docs.rs".to_owned(),
+        };
+        assert!(rule.allows_host("docs.rs."));
+        assert!(rule.allows_host("static.docs.rs."));
+
+        let rule_with_trailing_dot = NetRule::AllowDnsSuffix {
+            suffix: "docs.rs.".to_owned(),
+        };
+        assert!(rule_with_trailing_dot.allows_host("docs.rs"));
+        assert!(rule_with_trailing_dot.allows_host("static.docs.rs"));
     }
 
     #[test]

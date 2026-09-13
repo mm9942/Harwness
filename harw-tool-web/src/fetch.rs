@@ -86,7 +86,7 @@
 
 use crate::error::{WebToolError, WebToolResult};
 use harw_macros::Tool;
-use harw_sandbox::NetworkScope;
+use harw_sandbox::{EgressUrl, EgressUrlError, NetworkScope};
 use harw_tools::{ToolExecutionContext, ToolOutput, ToolsError};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -291,19 +291,23 @@ enum RawOutcome {
 /// # Description
 /// Erste und strengste Prüfung der Ausgangstür: nur `https://` ist erlaubt
 /// (Vergleich ASCII-case-insensitiv, damit `HTTPS://` nicht durchfällt), und
-/// der Host muss sich mit [`harw_tools::host_from_url`] bestimmen lassen. Ein
-/// leerer Host würde sonst an [`harw_sandbox::NetworkScope::allows`]
-/// weitergereicht und wäre ein Fail-open-Risiko.
+/// der Host muss sich mit [`harw_sandbox::egress::EgressUrl::parse`] bestimmen
+/// lassen — demselben WHATWG-Parser, den `reqwest` beim Verbindungsaufbau
+/// verwendet. Eine URL mit Userinfo (`user:pw@host`) wird abgelehnt statt die
+/// Zugangsdaten stillschweigend abzuschneiden.
 ///
 /// # Arguments
 /// - `url` (`&str`): die zu prüfende URL, mit oder ohne umgebende Leerzeichen.
 ///
 /// # Returns
-/// Den kleingeschriebenen Hostnamen ohne Port und Userinfo.
+/// Den kleingeschriebenen Hostnamen ohne Port; URLs mit Userinfo werden
+/// abgelehnt statt die Zugangsdaten abzuschneiden.
 ///
 /// # Errors
 /// - [`WebToolError::SchemeNotAllowed`]: das Schema ist nicht `https://`.
-/// - [`WebToolError::HostNotResolvable`]: aus der URL ließ sich kein Host lesen.
+/// - [`WebToolError::HostNotResolvable`]: aus der URL ließ sich kein Host lesen
+///   (auch bei Userinfo, fehlendem Host oder einem für den Parser ungültigen
+///   Host).
 ///
 /// # Concurrency
 /// Reine Funktion; von jedem Thread aufrufbar.
@@ -317,18 +321,25 @@ enum RawOutcome {
 /// ```
 pub fn validate_target(url: &str) -> WebToolResult<String> {
     let trimmed = url.trim();
-    let is_https = trimmed
-        .get(..8)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"));
-    if !is_https {
+    let parsed = EgressUrl::parse(trimmed).map_err(|error| match error {
+        EgressUrlError::UnsupportedScheme(_) => WebToolError::SchemeNotAllowed {
+            url: trimmed.to_owned(),
+        },
+        EgressUrlError::Parse
+        | EgressUrlError::UserinfoPresent
+        | EgressUrlError::MissingHost
+        | EgressUrlError::InvalidHost => WebToolError::HostNotResolvable {
+            url: trimmed.to_owned(),
+        },
+    })?;
+
+    if !parsed.is_https() {
         return Err(WebToolError::SchemeNotAllowed {
             url: trimmed.to_owned(),
         });
     }
 
-    harw_tools::host_from_url(trimmed).ok_or_else(|| WebToolError::HostNotResolvable {
-        url: trimmed.to_owned(),
-    })
+    Ok(parsed.host_str())
 }
 
 /// Prüft den `Content-Type` einer Antwort gegen die Positivliste.
@@ -1545,12 +1556,24 @@ mod tests {
         );
     }
 
-    /// Port und Userinfo gehören nicht in den Host der Allowlist-Prüfung.
+    /// Der Port gehört nicht in den Host der Allowlist-Prüfung.
     #[test]
-    fn test_validate_target_strips_port_and_userinfo() {
+    fn test_validate_target_strips_port_and_lowercases() {
         assert_eq!(
-            validate_target("https://user:pw@Docs.RS:8443/x").expect("gültig"),
+            validate_target("https://Docs.RS:8443/x").expect("gültig"),
             "docs.rs"
+        );
+    }
+
+    /// Eine URL mit Userinfo wird abgelehnt statt die Zugangsdaten
+    /// stillschweigend abzuschneiden (`EgressUrl::parse` ->
+    /// `EgressUrlError::UserinfoPresent`, siehe `validate_target`).
+    #[test]
+    fn test_validate_target_rejects_userinfo() {
+        let err = validate_target("https://user:pw@Docs.RS:8443/x").expect_err("Userinfo");
+        assert!(
+            matches!(err, WebToolError::HostNotResolvable { .. }),
+            "unerwartet: {err:?}"
         );
     }
 

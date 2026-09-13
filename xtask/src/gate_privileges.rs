@@ -811,7 +811,7 @@ mod tests {
 
         let report = evaluate(&g);
 
-        assert!(report.is_green());
+        assert!(!report.is_green(), "leerer Deps-Graph prüft nichts (G-102)");
         assert_eq!(report.checked, 0);
         assert_eq!(
             missing_binaries(&g),
@@ -951,10 +951,10 @@ mod tests {
     }
 
     #[test]
-    fn test_evaluate_empty_graph_is_green_with_zero_checked() {
+    fn test_evaluate_empty_graph_is_red_with_zero_checked() {
         let report = evaluate(&graph(Vec::new()));
 
-        assert!(report.is_green());
+        assert!(!report.is_green(), "leerer Graph prüft nichts (G-102)");
         assert_eq!(report.checked, 0);
         assert_eq!(missing_binaries(&graph(Vec::new())).len(), 4);
     }

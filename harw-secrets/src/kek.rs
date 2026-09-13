@@ -4,9 +4,11 @@
 //! env-seed are alternatives.
 //!
 //! The `0600` refuse-to-start permission check is implemented in full (it is
-//! the one behavior the doc marks as a hard startup gate). Native v3 PQ HPKE
-//! recipient-key derivation from the seed goes through `crypt_guard`; OS
-//! keyring retrieval goes through the optional `keyring` crate.
+//! the one behavior the doc marks as a hard startup gate). Hybrid v3 PQ HPKE
+//! recipient-key derivation from the 32-byte seed goes through `crypt_guard`
+//! (`RecipientPrivateKey::from_seed_bytes` + `public_key`) after a per-KEM
+//! SHA-256 domain separation of the root seed (`derive_kem_seed`); OS keyring
+//! retrieval goes through the optional `keyring` crate.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -16,12 +18,24 @@ use std::fs::{File, OpenOptions};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::io::Read;
 
-use crypt_guard::pq_hpke::{derive_recipient_key_pair, Kem};
+use crypt_guard::pq_hpke::{RecipientPrivateKey, RecipientPublicKey};
+use secrecy::zeroize::Zeroizing;
 use secrecy::{ExposeSecret, SecretBox};
+use sha2::digest::generic_array::GenericArray;
+use sha2::{Digest, Sha256};
 
 use crate::error::{SecretsError, SecretsResult};
 use crate::policy::{CryptoPolicy, KemAlgo};
 use crate::store::KekMaterial;
+
+/// Length of the root KEK seed and of every per-KEM hybrid recipient seed
+/// (`HYBRID_SEED_BYTES` in `crypt_guard-3.0.1/src/hpke_pq/mod.rs:1698`).
+pub(crate) const KEK_SEED_LEN: usize = 32;
+
+/// Domain-separation prefix for per-KEM recipient seeds. The full context is
+/// `KEM_SEED_CONTEXT ‖ KemAlgo::wire_name ‖ 0x00`; changing any part makes
+/// every persisted store unreadable.
+const KEM_SEED_CONTEXT: &[u8] = b"harw-secrets kek seed v2 ";
 
 /// Where the KEK seed / secret half comes from (§3). Selected via config, never
 /// auto-detected, so headless behavior stays predictable.
@@ -218,12 +232,19 @@ fn load_key_file_seed(path: &Path) -> SecretsResult<SecretBox<[u8]>> {
 }
 
 /// Load the configured KEK seed once and deterministically derive its paired
-/// native v3 PQ HPKE material for `policy`.
+/// hybrid PQ HPKE material for `policy`.
 ///
 /// This is the provenance-to-store boundary: the seed remains in its
-/// zeroizing container while the native recipient pair is derived exactly once,
-/// then the deterministic seed is retained in [`KekMaterial`]'s zeroizing
-/// container.
+/// zeroizing container while the hybrid recipient public key is derived
+/// exactly once, then the deterministic seed is retained in [`KekMaterial`]'s
+/// zeroizing container.
+///
+/// # Errors
+/// - [`SecretsError::KekUnavailable`]: the provenance cannot supply exactly 32
+///   seed bytes.
+/// - [`SecretsError::UnsupportedLegacyKem`]: `policy` names a retired pure
+///   ML-KEM level.
+/// - [`SecretsError::KekDerivation`]: `crypt_guard` rejected the derivation.
 pub fn load_kek_material(
     policy: &CryptoPolicy,
     provenance: &KekProvenance,
@@ -231,56 +252,116 @@ pub fn load_kek_material(
     let seed = load_seed(provenance)?;
     let public_key = derive_public_key(policy, &seed)?;
 
-    // `KekMaterial` needs the original 32-byte provenance seed to reproduce
-    // the recipient keypair while opening v3 envelopes. Do not retain the
-    // expanded recipient private-key representation here.
+    // `KekMaterial` retains the original 32-byte root seed. Opening an
+    // envelope derives the per-KEM recipient seed from it on demand
+    // (`derive_kem_seed` with the record's KEM), so records of every hybrid
+    // KEM stay openable and nothing KEM-specific is retained here.
     KekMaterial::new(public_key, seed)
 }
 
-/// Derive the KEK's native PQ HPKE public key (needed to seal) from `seed` per
+/// Derive the KEK's hybrid PQ HPKE public key (needed to seal) from `seed` per
 /// `policy`.
+///
+/// The derivation is deterministic: the same root seed and the same KEM always
+/// yield the same public-key bytes. The recipient key is derived from the
+/// domain-separated per-KEM seed (`derive_kem_seed`), never from the root
+/// seed directly, so no two hybrid KEMs share key material.
+///
+/// # Errors
+/// - [`SecretsError::KekUnavailable`]: `seed` is not exactly 32 bytes long.
+/// - [`SecretsError::UnsupportedLegacyKem`]: `policy` names a retired pure
+///   ML-KEM level.
+/// - [`SecretsError::KekDerivation`]: `crypt_guard` rejected the seed or the
+///   derivation.
 pub fn derive_public_key(policy: &CryptoPolicy, seed: &SecretBox<[u8]>) -> SecretsResult<Vec<u8>> {
-    let seed = validated_seed(seed)?;
-    let key_pair = derive_recipient_key_pair(kem_for_policy(policy), &seed)
-        .map_err(|source| SecretsError::KekDerivation { source })?;
-    Ok(key_pair.public_key().as_bytes().to_vec())
+    let (_, public_key) = derive_recipient(policy, seed)?;
+    Ok(public_key.as_bytes().to_vec())
 }
 
-/// Derive the KEK's native PQ HPKE secret key (needed to unseal) from `seed` per
-/// `policy`, returned in a zeroizing `SecretBox`.
+/// Derive the KEM-specific hybrid recipient secret seed for `policy.kem` from
+/// the root KEK `seed`, returned in a zeroizing `SecretBox`.
+///
+/// The result is **not** the root KEK seed: it is the domain-separated seed
+/// from `derive_kem_seed`, i.e. exactly the bytes
+/// `crypt_guard::pq_hpke::RecipientPrivateKey::from_seed_bytes` expects for
+/// `policy.kem`. The public-key derivation still runs so an unusable seed is
+/// reported here.
+///
+/// # Security
+/// - The returned bytes are the complete recipient private key for
+///   `policy.kem`: they open every envelope wrapped for that KEM under this
+///   KEK generation. Never log, persist, or transmit them.
+/// - Do not pass them to [`crate::envelope::open`] or
+///   [`KekMaterial::new`]: both take the **root** KEK seed and apply the domain
+///   separation themselves; a derived seed would be derived a second time and
+///   fail to open anything.
+/// - The root KEK seed is strictly more sensitive (it yields the recipient
+///   keys of all hybrid KEMs); it is only held inside [`KekMaterial`].
+///
+/// # Errors
+/// Same as [`derive_public_key`].
 pub fn derive_secret_key(
     policy: &CryptoPolicy,
     seed: &SecretBox<[u8]>,
 ) -> SecretsResult<SecretBox<[u8]>> {
+    let (private_key, _) = derive_recipient(policy, seed)?;
+    Ok(SecretBox::new(private_key.as_seed_bytes().to_vec().into_boxed_slice()))
+}
+
+/// Derive the 32-byte hybrid recipient seed of `kem` from the root KEK seed.
+///
+/// `SHA-256("harw-secrets kek seed v2 " ‖ kem.wire_name() ‖ 0x00 ‖ seed)`.
+/// Without this step crypt_guard 3.0.1 would expand the same root seed to the
+/// *same* ML-KEM-768 key for `MlKem768P256` and `MlKem768X25519`
+/// (`SHAKE256(seed)[..64]` in both, `hpke_pq/mod.rs:2238-2250`, `:2350-2360`).
+/// Every production path that calls `RecipientPrivateKey::from_seed_bytes`
+/// must go through this function.
+///
+/// The caller is responsible for checking that `seed` is exactly
+/// [`KEK_SEED_LEN`] bytes; this function hashes whatever it is given.
+pub(crate) fn derive_kem_seed(kem: KemAlgo, seed: &[u8]) -> Zeroizing<[u8; KEK_SEED_LEN]> {
+    let mut hasher = Sha256::new();
+    hasher.update(KEM_SEED_CONTEXT);
+    hasher.update(kem.wire_name().as_bytes());
+    hasher.update([0_u8]);
+    hasher.update(seed);
+    let mut derived = Zeroizing::new([0_u8; KEK_SEED_LEN]);
+    // Write straight into the zeroizing buffer instead of returning a
+    // non-zeroizing digest copy.
+    hasher.finalize_into(GenericArray::from_mut_slice(&mut derived[..]));
+    derived
+}
+
+/// Shared derivation: validate the root seed, resolve the KEM, derive the
+/// per-KEM seed, build the private key from it, and compute the matching
+/// hybrid public key.
+fn derive_recipient(
+    policy: &CryptoPolicy,
+    seed: &SecretBox<[u8]>,
+) -> SecretsResult<(RecipientPrivateKey, RecipientPublicKey)> {
     let seed = validated_seed(seed)?;
-    let key_pair = derive_recipient_key_pair(kem_for_policy(policy), &seed)
+    let kem = policy.kem.hpke_kem()?;
+    let kem_seed = derive_kem_seed(policy.kem, seed);
+    let private_key = RecipientPrivateKey::from_seed_bytes(kem, &kem_seed[..])
         .map_err(|source| SecretsError::KekDerivation { source })?;
-    Ok(SecretBox::new(
-        key_pair
-            .private_key()
-            .as_seed_bytes()
-            .to_vec()
-            .into_boxed_slice(),
-    ))
+    let public_key = private_key
+        .public_key()
+        .map_err(|source| SecretsError::KekDerivation { source })?;
+    Ok((private_key, public_key))
 }
 
-fn validated_seed(seed: &SecretBox<[u8]>) -> SecretsResult<[u8; 32]> {
-    seed.expose_secret()
-        .as_ref()
-        .try_into()
-        .map_err(|_| SecretsError::KekUnavailable {
+/// Check the root seed length without copying the seed bytes out of their
+/// zeroizing container.
+fn validated_seed(seed: &SecretBox<[u8]>) -> SecretsResult<&[u8]> {
+    let bytes: &[u8] = seed.expose_secret();
+    if bytes.len() != KEK_SEED_LEN {
+        return Err(SecretsError::KekUnavailable {
             kind: "seed".to_owned(),
-            reason: "expected exactly 32 bytes for deterministic native PQ HPKE derivation"
+            reason: "expected exactly 32 bytes for deterministic hybrid PQ HPKE derivation"
                 .to_owned(),
-        })
-}
-
-fn kem_for_policy(policy: &CryptoPolicy) -> Kem {
-    match policy.kem {
-        KemAlgo::MlKem512 => Kem::MlKem512,
-        KemAlgo::MlKem768 => Kem::MlKem768,
-        KemAlgo::MlKem1024 => Kem::MlKem1024,
+        });
     }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -289,6 +370,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use secrecy::ExposeSecret;
+
+    use crate::policy::{AeadAlgo, KemAlgo};
 
     use super::*;
 
@@ -342,7 +425,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn key_file_rejects_a_symlink_instead_of_following_it() {
-        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::os::unix::fs::{PermissionsExt, symlink};
 
         let target = temp_seed_path();
         let link = temp_seed_path();
@@ -478,37 +561,61 @@ mod tests {
         SecretBox::new(vec![byte; 32].into_boxed_slice())
     }
 
-    fn native_private_seed_representation(policy: &CryptoPolicy, seed: &[u8; 32]) -> Vec<u8> {
-        derive_recipient_key_pair(kem_for_policy(policy), seed)
-            .expect("derive native recipient keypair")
-            .private_key()
-            .as_seed_bytes()
+    fn hybrid_policies() -> [CryptoPolicy; 3] {
+        [
+            CryptoPolicy::ml_kem_768_p256(),
+            CryptoPolicy::ml_kem_768_x25519(),
+            CryptoPolicy::strongest(),
+        ]
+    }
+
+    /// crypt_guard public key for the domain-separated per-KEM seed, i.e. what
+    /// production derivation must produce.
+    fn crypt_guard_public_key(policy: &CryptoPolicy, seed: &[u8; 32]) -> Vec<u8> {
+        crypt_guard_raw_public_key(policy, &derive_kem_seed(policy.kem, seed))
+    }
+
+    /// crypt_guard public key for `seed` used verbatim, without harw's domain
+    /// separation (control value only).
+    fn crypt_guard_raw_public_key(policy: &CryptoPolicy, seed: &[u8; 32]) -> Vec<u8> {
+        RecipientPrivateKey::from_seed_bytes(policy.kem.hpke_kem().expect("hybrid KEM"), seed)
+            .expect("hybrid recipient private key from seed")
+            .public_key()
+            .expect("hybrid recipient public key")
+            .as_bytes()
             .to_vec()
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
     #[test]
     fn deterministic_derivation_is_stable_for_a_seed_and_policy() {
-        let policy = CryptoPolicy::ml_kem_768();
+        let policy = CryptoPolicy::ml_kem_768_x25519();
         let seed = test_seed(0xA5);
 
         let public_first = derive_public_key(&policy, &seed).expect("derive first public key");
         let secret_first = derive_secret_key(&policy, &seed).expect("derive first secret key");
         let public_second = derive_public_key(&policy, &seed).expect("derive second public key");
         let secret_second = derive_secret_key(&policy, &seed).expect("derive second secret key");
-        let expected_private_seed = native_private_seed_representation(&policy, &[0xA5; 32]);
 
         assert!(!public_first.is_empty());
+        assert_eq!(public_first, crypt_guard_public_key(&policy, &[0xA5; 32]));
+        // The secret key is the domain-separated per-KEM seed, never the root
+        // KEK seed.
         assert_eq!(
             secret_first.expose_secret().as_ref(),
-            expected_private_seed.as_slice()
+            derive_kem_seed(policy.kem, &[0xA5; 32]).as_slice()
         );
+        assert_ne!(secret_first.expose_secret().as_ref(), [0xA5; 32].as_slice());
         assert_eq!(public_first, public_second);
         assert_eq!(secret_first.expose_secret(), secret_second.expose_secret());
     }
 
     #[test]
     fn changing_the_seed_changes_derived_key_material() {
-        let policy = CryptoPolicy::ml_kem_512();
+        let policy = CryptoPolicy::ml_kem_768_p256();
         let first_seed = test_seed(0x11);
         let second_seed = test_seed(0x22);
 
@@ -527,22 +634,19 @@ mod tests {
     }
 
     #[test]
-    fn every_kem_policy_derives_stable_native_hpke_material() {
+    fn every_hybrid_kem_policy_derives_stable_hpke_material() {
         let seed = test_seed(0x5A);
+        let mut public_keys = Vec::new();
 
-        for policy in [
-            CryptoPolicy::ml_kem_512(),
-            CryptoPolicy::ml_kem_768(),
-            CryptoPolicy::strongest(),
-        ] {
+        for policy in hybrid_policies() {
             let public = derive_public_key(&policy, &seed).expect("derive public key");
             let secret = derive_secret_key(&policy, &seed).expect("derive secret key");
-            let expected_private_seed = native_private_seed_representation(&policy, &[0x5A; 32]);
 
             assert!(!public.is_empty());
+            assert_eq!(public, crypt_guard_public_key(&policy, &[0x5A; 32]));
             assert_eq!(
                 secret.expose_secret().as_ref(),
-                expected_private_seed.as_slice()
+                derive_kem_seed(policy.kem, &[0x5A; 32]).as_slice()
             );
             assert_eq!(
                 public,
@@ -554,21 +658,179 @@ mod tests {
                     .expect("re-derive secret key")
                     .expose_secret()
             );
+            public_keys.push(public);
         }
+
+        // Full keys differ per KEM. That the ML-KEM-768 halves of the P-256
+        // and X25519 variants differ as well is asserted separately in
+        // `ml_kem_768_p256_and_x25519_do_not_share_the_ml_kem_key`.
+        assert_ne!(public_keys[0], public_keys[1]);
+        assert_ne!(public_keys[0], public_keys[2]);
+        assert_ne!(public_keys[1], public_keys[2]);
+    }
+
+    /// `ML_KEM_768_PUBLIC_KEY_BYTES` is `pub(crate)` in crypt_guard
+    /// (`hpke_pq/mod.rs:363`), hence mirrored here. Hybrid public keys are
+    /// `ML-KEM key ‖ classical point` (`hpke_pq/mod.rs:2238-2264`, `:2350-2367`).
+    const ML_KEM_768_PUBLIC_KEY_BYTES: usize = 1_184;
+
+    #[test]
+    fn ml_kem_768_p256_and_x25519_do_not_share_the_ml_kem_key() {
+        let seed = test_seed(0x5A);
+        let p256_policy = CryptoPolicy::ml_kem_768_p256();
+        let x25519_policy = CryptoPolicy::ml_kem_768_x25519();
+
+        let p256 = derive_public_key(&p256_policy, &seed).expect("derive P-256 public key");
+        let x25519 = derive_public_key(&x25519_policy, &seed).expect("derive X25519 public key");
+
+        assert_eq!(p256.len(), ML_KEM_768_PUBLIC_KEY_BYTES + 65);
+        assert_eq!(x25519.len(), ML_KEM_768_PUBLIC_KEY_BYTES + 32);
+        assert_ne!(
+            p256[..ML_KEM_768_PUBLIC_KEY_BYTES],
+            x25519[..ML_KEM_768_PUBLIC_KEY_BYTES],
+            "domain separation must give each hybrid KEM its own ML-KEM key"
+        );
+
+        // Determinism is preserved.
+        assert_eq!(
+            p256,
+            derive_public_key(&p256_policy, &seed).expect("re-derive P-256 public key")
+        );
+        assert_eq!(
+            x25519,
+            derive_public_key(&x25519_policy, &seed).expect("re-derive X25519 public key")
+        );
+
+        // Control: without the domain separation crypt_guard 3.0.1 expands the
+        // root seed to the same ML-KEM-768 key for both variants.
+        let raw_p256 = crypt_guard_raw_public_key(&p256_policy, &[0x5A; 32]);
+        let raw_x25519 = crypt_guard_raw_public_key(&x25519_policy, &[0x5A; 32]);
+        assert_eq!(
+            raw_p256[..ML_KEM_768_PUBLIC_KEY_BYTES],
+            raw_x25519[..ML_KEM_768_PUBLIC_KEY_BYTES]
+        );
+        assert_ne!(p256, raw_p256);
+        assert_ne!(x25519, raw_x25519);
+    }
+
+    /// Fixed 32-byte seed shared by both known-answer tests.
+    const KAT_SEED: [u8; 32] = [0xA5; 32];
+
+    #[test]
+    fn kem_seed_domain_separation_matches_independent_sha256_known_answers() {
+        // Computed outside Rust (Python `hashlib.sha256` and coreutils
+        // `sha256sum`, identical results) over
+        // `b"harw-secrets kek seed v2 " + wire_name + b"\x00" + bytes([0xA5]) * 32`.
+        for (kem, expected) in [
+            (
+                KemAlgo::MlKem768P256,
+                "3a2a668ae08e165d95311b4f7a903ae0b391dfef51a5a7c1124b593ff1d9525c",
+            ),
+            (
+                KemAlgo::MlKem1024P384,
+                "eb1373c4b5548c51e71575ce45502fc28e945dacb1e253f2d01a379d349db16e",
+            ),
+            (
+                KemAlgo::MlKem768X25519,
+                "0d18909288ff23572828dcd32579a7e8ef4d47e0f2b6ac173efa3fe9800559bf",
+            ),
+        ] {
+            assert_eq!(hex(derive_kem_seed(kem, &KAT_SEED).as_slice()), expected);
+        }
+    }
+
+    /// Blessed fixture pinning crypt_guard's hybrid seed-to-public-key
+    /// derivation (R1-01). Format: one `<kem wire name> <sha256 hex>` line per
+    /// hybrid KEM.
+    const KEM_KAT_FIXTURE: &str = "tests/fixtures/kem_kat.txt";
+
+    /// Set to `1` exactly once, after reviewing a crypt_guard (re)pin, to write
+    /// [`KEM_KAT_FIXTURE`] from the current derivation.
+    const BLESS_ENV: &str = "HARW_BLESS";
+
+    #[test]
+    fn hybrid_public_key_derivation_matches_blessed_known_answers() {
+        let seed = SecretBox::new(KAT_SEED.to_vec().into_boxed_slice());
+        let actual: String = hybrid_policies()
+            .iter()
+            .map(|policy| {
+                let public = derive_public_key(policy, &seed).expect("derive KAT public key");
+                format!(
+                    "{} {}\n",
+                    policy.kem.wire_name(),
+                    hex(&crate::audit::chain::sha256(&public))
+                )
+            })
+            .collect();
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(KEM_KAT_FIXTURE);
+
+        if std::env::var_os(BLESS_ENV).is_some_and(|value| value == "1") {
+            std::fs::create_dir_all(path.parent().expect("fixture directory"))
+                .expect("create KEM KAT fixture directory");
+            std::fs::write(&path, &actual).expect("write blessed KEM KAT fixture");
+            return;
+        }
+
+        let expected = match std::fs::read_to_string(&path) {
+            Ok(expected) => expected,
+            Err(error) => panic!(
+                "KEM known-answer fixture '{}' is missing or unreadable ({error}). \
+                 Bless it once, after reviewing the crypt_guard pin, with \
+                 `{BLESS_ENV}=1 cargo test -p harw-secrets \
+                 hybrid_public_key_derivation_matches_blessed_known_answers`, \
+                 then commit the file.",
+                path.display()
+            ),
+        };
+        assert_eq!(
+            expected.trim_end(),
+            actual.trim_end(),
+            "hybrid public-key derivation changed (crypt_guard upgrade or harw domain \
+             separation): every persisted secret store would become unreadable"
+        );
     }
 
     #[test]
     fn deterministic_derivation_rejects_a_non_32_byte_seed() {
-        let short_seed = SecretBox::new(vec![0u8; 31].into_boxed_slice());
+        for length in [0, 31, 33, 64] {
+            let seed = SecretBox::new(vec![0u8; length].into_boxed_slice());
 
-        assert!(matches!(
-            derive_public_key(&CryptoPolicy::ml_kem_512(), &short_seed),
-            Err(SecretsError::KekUnavailable { .. })
-        ));
-        assert!(matches!(
-            derive_secret_key(&CryptoPolicy::ml_kem_512(), &short_seed),
-            Err(SecretsError::KekUnavailable { .. })
-        ));
+            for policy in hybrid_policies() {
+                assert!(matches!(
+                    derive_public_key(&policy, &seed),
+                    Err(SecretsError::KekUnavailable { kind, .. }) if kind == "seed"
+                ));
+                assert!(matches!(
+                    derive_secret_key(&policy, &seed),
+                    Err(SecretsError::KekUnavailable { kind, .. }) if kind == "seed"
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn deterministic_derivation_refuses_legacy_pure_ml_kem_policies() {
+        let seed = test_seed(0x42);
+
+        for (kem, wire) in [
+            (KemAlgo::LegacyMlKem512, "ml_kem_512"),
+            (KemAlgo::LegacyMlKem768, "ml_kem_768"),
+            (KemAlgo::LegacyMlKem1024, "ml_kem_1024"),
+        ] {
+            let policy = CryptoPolicy {
+                kem,
+                aead: AeadAlgo::XChaCha20Poly1305,
+            };
+
+            assert!(matches!(
+                derive_public_key(&policy, &seed),
+                Err(SecretsError::UnsupportedLegacyKem { algo }) if algo == wire
+            ));
+            assert!(matches!(
+                derive_secret_key(&policy, &seed),
+                Err(SecretsError::UnsupportedLegacyKem { algo }) if algo == wire
+            ));
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -584,7 +846,7 @@ mod tests {
                 .expect("set temporary seed permissions");
         }
 
-        let policy = CryptoPolicy::ml_kem_768();
+        let policy = CryptoPolicy::strongest();
         let provenance = KekProvenance::KeyFile {
             path: seed_path.clone(),
         };
@@ -615,7 +877,7 @@ mod tests {
 
         assert!(matches!(
             load_kek_material(
-                &CryptoPolicy::ml_kem_512(),
+                &CryptoPolicy::strongest(),
                 &KekProvenance::KeyFile { path: path.clone() },
             ),
             Err(SecretsError::KekUnavailable { .. })

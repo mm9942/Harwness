@@ -5,6 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# Einzige Abhängigkeit (CONTRACTS.md §fsutil): `fs` liefert `openat`/`openat2`,
+# `OFlags::NOFOLLOW` plattformkorrekt (aarch64: 0o100000, nicht 0o400000),
+# `statat`/`fstat`/`Dir`/`renameat`; `process` liefert `geteuid`.
+rustix = { workspace = true, features = ["fs", "process"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

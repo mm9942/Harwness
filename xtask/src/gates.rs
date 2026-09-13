@@ -58,9 +58,19 @@ pub struct GateReport {
 
 impl GateReport {
     /// Ob dieses Gate grün ist.
+    ///
+    /// # Description
+    /// Grün heißt **zwei** Dinge zugleich: keine Verstöße *und* mindestens
+    /// ein geprüfter Kandidat. Vor dieser Korrektur (Befund G-102) genügte
+    /// ein leerer `violations`-Vektor allein — ein Gate, das aus einem
+    /// stillen Fehler heraus nichts prüft (`checked == 0`), meldete sich
+    /// dadurch als grün, obwohl es gar keine Aussage getroffen hat. Das ist
+    /// exakt die Verwechslung, gegen die `checked` laut Moduldoku eingeführt
+    /// wurde — sie muss auch hier gelten, nicht nur beim Anzeigen der
+    /// Zusammenfassung.
     #[must_use]
     pub fn is_green(&self) -> bool {
-        self.violations.is_empty()
+        self.checked > 0 && self.violations.is_empty()
     }
 
     /// Die Zusammenfassung, wie sie ausgegeben wird.
@@ -68,6 +78,13 @@ impl GateReport {
     pub fn summary(&self) -> String {
         if self.is_green() {
             format!("{}: grün ({} geprüft)", self.name, self.checked)
+        } else if self.checked == 0 {
+            // R3-05: eigener Zweig für den G-102-Fall, statt in die
+            // generische Verstoßzahl-Meldung zu fallen — „0 Verstöße bei 0
+            // geprüften Kandidaten" liest sich wie ein Erfolg, ist aber
+            // genau der stille Nicht-Prüf-Zustand, den `is_green` jetzt rot
+            // meldet.
+            format!("{}: rot – nichts geprüft (checked == 0)", self.name)
         } else {
             format!(
                 "{}: {} Verstöße bei {} geprüften Kandidaten",
@@ -119,11 +136,125 @@ pub fn run(args: &[String]) -> Result<(), String> {
         return Ok(());
     }
 
+    Err(failure_message(&failures))
+}
+
+/// Baut die `Err`-Meldung aus den rot gemeldeten Gates.
+///
+/// # Description
+/// Getrennt von [`run`], damit der G-102-Fall (`checked == 0` ohne
+/// Verstöße) ohne einen echten, dateisystemabhängigen Gate-Lauf getestet
+/// werden kann. Ohne den `checked == 0`-Zweig bliebe die Verstoß-Schleife
+/// für ein solches Gate leer, und `Err` trüge eine leere Zeile — ein Fehler
+/// ohne jede Aussage, genau der stille Zustand, den G-102 sichtbar machen
+/// soll (R3-05).
+#[must_use]
+fn failure_message(failures: &[&GateReport]) -> String {
     let mut message = String::new();
     for report in failures {
+        if report.checked == 0 {
+            message.push_str(&format!("Gate {} hat nichts geprüft (checked == 0)\n", report.name));
+        }
         for violation in &report.violations {
             message.push_str(&format!("{}: {violation}\n", report.name));
         }
     }
-    Err(message.trim_end().to_owned())
+    message.trim_end().to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GateReport;
+
+    /// Befund G-102: ein Gate, das nichts geprüft hat (`checked == 0`),
+    /// darf nicht als grün gelten — auch wenn `violations` zufällig leer
+    /// ist, weil niemand hineingeschrieben hat.
+    #[test]
+    fn test_is_green_empty_report_is_red() {
+        let report = GateReport {
+            name: "test-gate",
+            checked: 0,
+            violations: Vec::new(),
+        };
+        assert!(!report.is_green(), "ein leerer Report (checked == 0) darf nicht grün sein");
+    }
+
+    #[test]
+    fn test_is_green_checked_without_violations_is_green() {
+        let report = GateReport {
+            name: "test-gate",
+            checked: 5,
+            violations: Vec::new(),
+        };
+        assert!(report.is_green());
+    }
+
+    #[test]
+    fn test_is_green_with_violations_is_red_regardless_of_checked() {
+        let report = GateReport {
+            name: "test-gate",
+            checked: 5,
+            violations: vec!["irgendein Verstoß".to_owned()],
+        };
+        assert!(!report.is_green());
+    }
+
+    /// R3-05: `summary()` braucht für den G-102-Fall (`checked == 0`, keine
+    /// Verstöße) eine eigene, lesbare Zeile statt „0 Verstöße bei 0
+    /// geprüften Kandidaten" — letzteres liest sich wie ein Erfolg.
+    #[test]
+    fn test_summary_zero_checked_without_violations_says_nothing_checked() {
+        let report = GateReport {
+            name: "test-gate",
+            checked: 0,
+            violations: Vec::new(),
+        };
+        let summary = report.summary();
+        assert!(
+            summary.contains("nichts geprüft"),
+            "Zusammenfassung sollte den G-102-Fall benennen: {summary:?}"
+        );
+        assert!(!summary.contains("grün"), "{summary:?}");
+    }
+
+    #[test]
+    fn test_summary_with_violations_still_reports_violation_count() {
+        let report = GateReport {
+            name: "test-gate",
+            checked: 3,
+            violations: vec!["irgendein Verstoß".to_owned()],
+        };
+        assert_eq!(report.summary(), "test-gate: 1 Verstöße bei 3 geprüften Kandidaten");
+    }
+
+    /// R3-05: `run()`s Fehlermeldung darf für ein rotes Gate mit
+    /// `checked == 0` und ohne Verstöße nicht leer bleiben — ein Fehler
+    /// ohne jede Aussage verdeckt genau den Zustand, den G-102 aufdecken
+    /// soll. Getestet über [`super::failure_message`] statt über `run()`
+    /// selbst, weil `run()` echte, dateisystemabhängige Gates aufruft.
+    #[test]
+    fn test_failure_message_zero_checked_without_violations_is_not_empty() {
+        let report = GateReport {
+            name: "leeres-gate",
+            checked: 0,
+            violations: Vec::new(),
+        };
+        let message = super::failure_message(&[&report]);
+        assert!(!message.is_empty(), "Meldung darf bei checked == 0 nicht leer sein");
+        assert!(message.contains("leeres-gate"), "{message:?}");
+        assert!(message.contains("nichts geprüft"), "{message:?}");
+    }
+
+    #[test]
+    fn test_failure_message_with_violations_lists_each_violation() {
+        let report = GateReport {
+            name: "rotes-gate",
+            checked: 2,
+            violations: vec!["Verstoß A".to_owned(), "Verstoß B".to_owned()],
+        };
+        let message = super::failure_message(&[&report]);
+        assert!(message.contains("rotes-gate: Verstoß A"), "{message:?}");
+        assert!(message.contains("rotes-gate: Verstoß B"), "{message:?}");
+        assert!(!message.contains("nichts geprüft"), "{message:?}");
+    }
 }

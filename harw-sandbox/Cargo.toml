@@ -8,6 +8,9 @@ rust-version.workspace = true
 harw-types = { path = "../harw-types" }
 ipnet = { workspace = true }
 serde = { version = "1", features = ["derive"] }
+# W0B-04: WHATWG-URL-Parsing für `egress::EgressUrl` — derselbe Parser wie
+# in reqwest, damit geprüfter und verbundener Host nie auseinanderlaufen.
+url = "2.5.8"
 
 [lints]
 workspace = true

@@ -8,8 +8,8 @@
 //! log) and ML-DSA signing/verification are implemented with `crypt_guard`.
 
 use crypt_guard::sign::{
-    ml_dsa::{MlDsa65Impl, MlDsaSignature, MlDsaSigningKey, MlDsaVerifyingKey},
     SignAlgorithm,
+    ml_dsa::{MlDsa65Impl, MlDsaSignature, MlDsaSigningKey, MlDsaVerifyingKey},
 };
 use jiff::Timestamp;
 use secrecy::{ExposeSecret as _, SecretBox};

@@ -46,7 +46,9 @@ pub struct SecretRecord {
     /// ML-KEM encapsulation ciphertext duplicated from the CGv2 envelope. It
     /// binds the record-level metadata to the envelope's derived DEK reference.
     pub wrapped_dek: Vec<u8>,
-    /// KEM level that produced `wrapped_dek`.
+    /// Hybrid KEM that produced `wrapped_dek`. Retired pure ML-KEM levels
+    /// (`KemAlgo::Legacy*`) still deserialize, but such records can no longer
+    /// be opened or re-serialized.
     pub kem_algo: KemAlgo,
     /// AEAD cipher that produced `ciphertext`.
     pub aead_algo: AeadAlgo,
@@ -85,7 +87,7 @@ mod tests {
             ciphertext: vec![0xde, 0xad, 0xbe, 0xef],
             nonce: vec![0x01, 0x02, 0x03],
             wrapped_dek: vec![0xca, 0xfe, 0xba, 0xbe],
-            kem_algo: KemAlgo::MlKem768,
+            kem_algo: KemAlgo::MlKem768X25519,
             aead_algo: AeadAlgo::XChaCha20Poly1305,
             key_version: KeyVersion(7),
         };
@@ -120,7 +122,7 @@ mod tests {
             "ciphertext":[222,173,190,239],
             "nonce":[1,2,3],
             "wrapped_dek":[202,254,186,190],
-            "kem_algo":"ml_kem_768",
+            "kem_algo":"ml_kem_768_x25519",
             "aead_algo":"x_chacha20_poly1305",
             "key_version":7
         }"#;
@@ -134,8 +136,29 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&decoded).expect("legacy record reserializes"),
-            r#"{"id":"018f1c2e-4d5a-7b80-9123-456789abcdef","envelope_format":"direct_hpke_v1","ciphertext":[222,173,190,239],"nonce":[1,2,3],"wrapped_dek":[202,254,186,190],"kem_algo":"ml_kem_768","aead_algo":"x_chacha20_poly1305","key_version":7}"#
+            r#"{"id":"018f1c2e-4d5a-7b80-9123-456789abcdef","envelope_format":"direct_hpke_v1","ciphertext":[222,173,190,239],"nonce":[1,2,3],"wrapped_dek":[202,254,186,190],"kem_algo":"ml_kem_768_x25519","aead_algo":"x_chacha20_poly1305","key_version":7}"#
         );
+    }
+
+    #[test]
+    fn record_with_legacy_pure_ml_kem_deserializes_but_does_not_reserialize() {
+        let legacy_kem_json = r#"{
+            "id":"018f1c2e-4d5a-7b80-9123-456789abcdef",
+            "envelope_format":"dek_wrapped_v2",
+            "ciphertext":[222,173,190,239],
+            "nonce":[1,2,3],
+            "wrapped_dek":[202,254,186,190],
+            "kem_algo":"ml_kem_1024",
+            "aead_algo":"aes_gcm_siv",
+            "key_version":3
+        }"#;
+
+        let decoded: SecretRecord =
+            serde_json::from_str(legacy_kem_json).expect("legacy KEM record deserializes");
+
+        assert_eq!(decoded.kem_algo, KemAlgo::LegacyMlKem1024);
+        assert!(decoded.kem_algo.is_legacy());
+        assert!(serde_json::to_string(&decoded).is_err());
     }
 
     #[test]
