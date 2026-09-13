@@ -6,10 +6,18 @@ rust-version.workspace = true
 
 [dependencies]
 uuid = { version = "1.23.5", features = ["v7"] }
+# Projekt-Trust (W1-06a): Digest über die sicherheitsrelevanten Dateien eines
+# repo-lokalen `.harw`, symlinkfestes Lesen/Walken und atomares 0600-Schreiben
+# des Trust-Stores, TOML-(De-)Serialisierung von `trusted-projects.toml`.
+# Bewusst KEINE Abhängigkeit auf `harw-config` (Zyklus: harw-config-Tests und
+# spätere Aufrufer kombinieren beide Crates, nicht umgekehrt).
+blake3 = { workspace = true }
+harw-fsutil = { path = "../harw-fsutil" }
+serde = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 harw-config = { path = "../harw-config" }
-toml = "0.8"
 
 [lints]
 workspace = true

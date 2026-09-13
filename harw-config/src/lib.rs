@@ -20,7 +20,10 @@ pub mod skill_toml;
 pub use agent_toml::{AgentSuggestionsToml, AgentToml};
 pub use auth_toml::{AuthConfig, CredentialEntry, KekConfig, KekProvenance, SecretRef};
 pub use channel_toml::{ChannelFileToml, ChannelSectionToml, ChannelToml, TelegramChannelToml};
-pub use discovery::{HasName, ResolvedConfig, default_config_layers, discover_config};
+pub use discovery::{
+    HasName, ResolvedConfig, default_config_layers, discover_config,
+    discover_config_with_restricted,
+};
 pub use dotenv::{
     check_dotenv_permissions, load_dotenv, load_env_layer, parse_dotenv_text, resolve_env_ref,
 };

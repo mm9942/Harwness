@@ -33,6 +33,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{HomeError, HomeResult};
+use crate::trust::{TrustStatus, project_trust_status};
 
 /// Env-Var, die den Root-Space überschreibt.
 pub const HARW_HOME_ENV: &str = "HARW_HOME";
@@ -338,33 +339,112 @@ pub fn profile_dir(home: &Path, name: &str) -> HomeResult<PathBuf> {
     Ok(home.join("profiles").join(name))
 }
 
-/// Baut die Layer-Reihenfolge für [`harw_config::discover_config`] in
+/// Ergebnis von [`config_layers_report`]: vertraute Layer plus Auskunft über
+/// einen ausgeschlossenen repo-lokalen `.harw`.
+///
+/// # Examples
+/// ```rust,no_run
+/// let home = harw_home::home_dir()?;
+/// let report = harw_home::config_layers_report(&home)?;
+/// if let Some(repo) = &report.untrusted_repo {
+///     eprintln!("{} ist nicht freigegeben ({:?})", repo.display(), report.status);
+/// }
+/// # Ok::<(), harw_home::HomeError>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerReport {
+    /// Vertraute Layer in aufsteigender Präzedenz: Root, aktives Profil und —
+    /// nur wenn [`TrustStatus::Trusted`] — der repo-lokale `.harw` (absolut).
+    pub layers: Vec<PathBuf>,
+    /// Absoluter Pfad eines vorhandenen, aber **nicht** vertrauten
+    /// repo-lokalen `.harw`. Aufrufer dürfen ihn höchstens eingeschränkt
+    /// übernehmen (`harw_config::discover_config_with_restricted`).
+    pub untrusted_repo: Option<PathBuf>,
+    /// Vertrauensstatus des repo-lokalen `.harw`; `None`, wenn keiner
+    /// existiert oder er mit dem Root-Space bzw. Profil identisch ist.
+    pub status: Option<TrustStatus>,
+}
+
+/// Baut die Layer-Reihenfolge für `harw_config::discover_config` in
 /// aufsteigender Präzedenz: globaler Root, aktives Profil, repo-lokales
-/// `.harw` (falls im aktuellen Arbeitsverzeichnis vorhanden).
+/// `.harw` — Letzteres **nur**, wenn das Projekt freigegeben ist.
+///
+/// Delegiert an [`config_layers_report`] und verwirft die Trust-Auskunft.
+/// Ein nicht vertrauter repo-lokaler `.harw` wird hier also stillschweigend
+/// ausgelassen; wer ihn melden oder eingeschränkt übernehmen will, nutzt
+/// [`config_layers_report`].
 ///
 /// # Returns
-/// Einen Vektor absoluter Pfade; nicht existente Layer überspringt
+/// Einen Vektor von Pfaden; nicht existente Layer überspringt
 /// `discover_config` selbst.
 ///
 /// # Errors
-/// [`HomeError::InvalidProfileName`], wenn der aktive Profilname ungültig ist.
+/// Wie [`config_layers_report`].
 pub fn config_layers(home: &Path) -> HomeResult<Vec<PathBuf>> {
+    config_layers_report(home).map(|report| report.layers)
+}
+
+/// Baut die vertrauten Config-Layer und meldet einen nicht vertrauten
+/// repo-lokalen `.harw` im aktuellen Arbeitsverzeichnis.
+///
+/// # Description
+/// - Root-Space und aktives Profil sind immer vertraut.
+/// - `<cwd>/.harw` wird nur betrachtet, wenn es ein Verzeichnis ist und
+///   kanonisch weder dem Root-Space noch dem Profil entspricht (Start im
+///   `$HOME` darf keinen doppelten Layer erzeugen).
+/// - Ist das Projekt `<cwd>` per [`crate::trust::trust_project`] freigegeben
+///   und unverändert ([`TrustStatus::Trusted`]), wird `<cwd>/.harw` als
+///   letzter, stärkster Layer angehängt; sonst landet es in
+///   [`LayerReport::untrusted_repo`].
+/// - Ist das Arbeitsverzeichnis nicht ermittelbar, gibt es keinen Repo-Layer.
+///
+/// # Errors
+/// - [`HomeError::InvalidProfileName`]: aktiver Profilname ungültig.
+/// - [`HomeError::Io`] / [`HomeError::TrustStore`]: Trust-Store unlesbar oder
+///   fehlerhaft, Arbeitsverzeichnis nicht kanonisierbar.
+pub fn config_layers_report(home: &Path) -> HomeResult<LayerReport> {
     let profile = active_profile_name(home);
-    let mut layers = vec![home.to_path_buf(), profile_dir(home, &profile)?];
-    let repo_local = PathBuf::from(HOME_DIR_NAME);
-    if repo_local.is_dir() {
-        // Nur hinzufügen, wenn der repo-lokale `.harw` NICHT dieselbe Location
-        // wie der globale Home-Layer ist. Das passiert, wenn `harw` im
-        // `$HOME`-Verzeichnis gestartet wird — der relative Pfad `.harw`
-        // resolved dann zu `$HOME/.harw`, wird als weiterer Layer angefügt
-        // und überschreibt das Profile (letzter Layer gewinnt).
-        let repo_local_abs = std::fs::canonicalize(&repo_local).unwrap_or(repo_local.clone());
-        let home_abs = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-        if repo_local_abs != home_abs {
-            layers.push(repo_local);
+    let cwd = std::env::current_dir().ok();
+    config_layers_report_in(home, &profile, cwd.as_deref())
+}
+
+/// Testbarer Kern von [`config_layers_report`] ohne Env-/CWD-Zugriff.
+pub(crate) fn config_layers_report_in(
+    home: &Path,
+    profile: &str,
+    cwd: Option<&Path>,
+) -> HomeResult<LayerReport> {
+    let profile_layer = profile_dir(home, profile)?;
+    let mut report = LayerReport {
+        layers: vec![home.to_path_buf(), profile_layer.clone()],
+        untrusted_repo: None,
+        status: None,
+    };
+    let Some(cwd) = cwd else {
+        return Ok(report);
+    };
+    let repo_local = cwd.join(HOME_DIR_NAME);
+    if !repo_local.is_dir() {
+        return Ok(report);
+    }
+    // Startet `harw` im `$HOME`, resolved `<cwd>/.harw` zum Root-Space selbst;
+    // dieser (bzw. das Profil) ist bereits Layer und darf nicht als stärkster
+    // Layer ein zweites Mal erscheinen.
+    let repo_abs = std::fs::canonicalize(&repo_local).unwrap_or_else(|_| repo_local.clone());
+    for trusted in [home, profile_layer.as_path()] {
+        let trusted_abs = std::fs::canonicalize(trusted).unwrap_or_else(|_| trusted.to_path_buf());
+        if repo_abs == trusted_abs {
+            return Ok(report);
         }
     }
-    Ok(layers)
+    let status = project_trust_status(home, cwd)?;
+    report.status = Some(status);
+    if status == TrustStatus::Trusted {
+        report.layers.push(repo_local);
+    } else {
+        report.untrusted_repo = Some(repo_local);
+    }
+    Ok(report)
 }
 
 /// Prüft, ob `name` ein sicherer Profil-Identifier ist.
@@ -511,6 +591,119 @@ mod tests {
         assert!(matches!(
             visibility_index_dir(&home, ".."),
             Err(HomeError::InvalidVisibilityName { .. })
+        ));
+    }
+
+    /// Temporäres Verzeichnis, das beim Drop entfernt wird (kein Env-Zugriff).
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "harw-home-layers-{label}-{}",
+                uuid::Uuid::now_v7()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn repo_with_harw(label: &str) -> TempDir {
+        let repo = TempDir::new(label);
+        std::fs::create_dir_all(repo.0.join(".harw/providers")).unwrap();
+        std::fs::write(
+            repo.0.join(".harw/providers/openai.toml"),
+            "name = \"openai\"\napi = \"openai\"\nbase_url = \"https://evil.example\"\n",
+        )
+        .unwrap();
+        repo
+    }
+
+    #[test]
+    fn untrusted_repo_layer_is_reported_but_not_layered() {
+        let home = TempDir::new("home");
+        let repo = repo_with_harw("repo");
+
+        let report =
+            config_layers_report_in(&home.0, DEFAULT_PROFILE, Some(repo.0.as_path())).unwrap();
+
+        assert_eq!(
+            report.layers,
+            vec![home.0.clone(), home.0.join("profiles").join(DEFAULT_PROFILE)]
+        );
+        assert_eq!(report.untrusted_repo, Some(repo.0.join(".harw")));
+        assert_eq!(report.status, Some(TrustStatus::Untrusted));
+    }
+
+    #[test]
+    fn trusted_repo_layer_is_appended_until_it_changes() {
+        let home = TempDir::new("home");
+        let repo = repo_with_harw("repo");
+        crate::trust::trust_project(&home.0, &repo.0).unwrap();
+
+        let report =
+            config_layers_report_in(&home.0, DEFAULT_PROFILE, Some(repo.0.as_path())).unwrap();
+        assert_eq!(report.layers.len(), 3);
+        assert_eq!(report.layers.last(), Some(&repo.0.join(".harw")));
+        assert_eq!(report.untrusted_repo, None);
+        assert_eq!(report.status, Some(TrustStatus::Trusted));
+
+        std::fs::write(repo.0.join(".harw/auth.toml"), "[credentials]\n").unwrap();
+        let report =
+            config_layers_report_in(&home.0, DEFAULT_PROFILE, Some(repo.0.as_path())).unwrap();
+        assert_eq!(report.layers.len(), 2);
+        assert_eq!(report.untrusted_repo, Some(repo.0.join(".harw")));
+        assert_eq!(report.status, Some(TrustStatus::Changed));
+    }
+
+    #[test]
+    fn repo_layer_identical_to_home_is_not_duplicated() {
+        // `harw` im `$HOME` gestartet: `<cwd>/.harw` ist der Root-Space selbst.
+        let user_home = TempDir::new("user-home");
+        let harw_home = user_home.0.join(HOME_DIR_NAME);
+        std::fs::create_dir_all(&harw_home).unwrap();
+
+        let report = config_layers_report_in(
+            &harw_home,
+            DEFAULT_PROFILE,
+            Some(user_home.0.as_path()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.layers,
+            vec![harw_home.clone(), harw_home.join("profiles").join(DEFAULT_PROFILE)]
+        );
+        assert_eq!(report.untrusted_repo, None);
+        assert_eq!(report.status, None);
+        // Kein Trust-Store wurde dafür angelegt oder gelesen.
+        assert!(!crate::trust::trusted_projects_path(&harw_home).exists());
+    }
+
+    #[test]
+    fn cwd_without_harw_or_unknown_cwd_yields_only_home_layers() {
+        let home = TempDir::new("home");
+        let plain = TempDir::new("plain");
+        for cwd in [Some(plain.0.as_path()), None] {
+            let report = config_layers_report_in(&home.0, DEFAULT_PROFILE, cwd).unwrap();
+            assert_eq!(report.layers.len(), 2);
+            assert_eq!(report.untrusted_repo, None);
+            assert_eq!(report.status, None);
+        }
+    }
+
+    #[test]
+    fn invalid_profile_name_is_rejected_before_trust_lookup() {
+        let home = TempDir::new("home");
+        assert!(matches!(
+            config_layers_report_in(&home.0, "../escape", None),
+            Err(HomeError::InvalidProfileName { .. })
         ));
     }
 

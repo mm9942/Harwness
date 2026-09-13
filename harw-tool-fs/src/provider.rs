@@ -215,7 +215,20 @@ fn fs_read_spec() -> ToolSpec {
         JsonSchema {
             schema_type: Some(JsonSchemaType::Integer),
             description: Some(
-                "Optional byte limit for this call. Cannot exceed the provider's configured limit."
+                "Optional byte limit for this call. Cannot exceed the provider's configured \
+                 limit (at most 65536)."
+                    .to_owned(),
+            ),
+            ..Default::default()
+        },
+    );
+    props.insert(
+        "offset".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::Integer),
+            description: Some(
+                "Optional byte offset to start reading at. Use the offset reported in the \
+                 truncation hint to continue reading a large file."
                     .to_owned(),
             ),
             ..Default::default()
@@ -227,8 +240,9 @@ fn fs_read_spec() -> ToolSpec {
         description:
             "Read a file relative to the workspace root. Returns file content as UTF-8 text. \
              Binary files are returned with lossy UTF-8 decoding. \
-             Path traversal (e.g. '../') is rejected. Directories cannot be read. \
-             Response size is limited by max_bytes."
+             Path traversal (e.g. '../') and symlinks are rejected. Directories cannot be read. \
+             Content longer than min(max_bytes, 64 KiB) is truncated, not refused; the reply \
+             then ends with a hint naming the offset to continue from."
                 .to_owned(),
         parameters: JsonSchema {
             schema_type: Some(JsonSchemaType::Object),
@@ -264,9 +278,10 @@ fn fs_write_spec() -> ToolSpec {
 
     ToolSpec::Function(FunctionToolSpec {
         name: ToolName::new("fs.write"),
-        description: "Write content to a file relative to the workspace root. \
-             Creates the file if it does not exist; overwrites if it does. \
-             Requires WriteWorkspace permission. Path traversal is rejected."
+        description: "Write content to a file relative to the workspace root, atomically. \
+             Creates the file if it does not exist; overwrites if it does. Parent directories \
+             are not created. Requires WriteWorkspace permission. Path traversal, symlinked \
+             path components and the protected areas .git/ and .harw/ are rejected."
             .to_owned(),
         parameters: JsonSchema {
             schema_type: Some(JsonSchemaType::Object),
@@ -303,8 +318,9 @@ fn fs_list_spec() -> ToolSpec {
     ToolSpec::Function(FunctionToolSpec {
         name: ToolName::new("fs.list"),
         description: "List the contents of a directory relative to the workspace root. \
-             Returns a JSON array of {name, kind, size} objects. \
-             'kind' is 'file', 'dir', or 'other'. \
+             Returns {entries: [{name, kind, size}], stopped?}, sorted by name. \
+             'kind' is 'file', 'dir', or 'other' (symlinks are reported as 'other' and are \
+             never followed). 'stopped' names the limit that cut the listing short. \
              Requires ReadWorkspace permission."
             .to_owned(),
         parameters: JsonSchema {
@@ -346,7 +362,8 @@ fn fs_search_spec() -> ToolSpec {
         JsonSchema {
             schema_type: Some(JsonSchemaType::Integer),
             description: Some(
-                "Maximum number of matching lines to return. Default: 100.".to_owned(),
+                "Maximum number of matching lines to return. Default: 100, maximum 1000."
+                    .to_owned(),
             ),
             ..Default::default()
         },
@@ -356,9 +373,11 @@ fn fs_search_spec() -> ToolSpec {
         name: ToolName::new("fs.search"),
         description:
             "Recursively search files for a query string (case-sensitive substring match). \
-             Returns a JSON array of {path, line, text} objects. \
-             Skips .git, target, and node_modules directories. \
-             Depth is limited to 8 levels. \
+             Returns {matches: [{path, line, text}], stopped?, skipped_files?}. \
+             Symlinks are never followed. Skips .git, target, and node_modules directories. \
+             Depth defaults to 8 levels (hard maximum 32); at most 1000 matches, 50000 \
+             entries, 10 seconds and 64 KiB of output. Files larger than 8 MiB are skipped. \
+             'stopped' names the limit that cut the search short. \
              Requires ReadWorkspace permission."
                 .to_owned(),
         parameters: JsonSchema {
@@ -406,7 +425,6 @@ mod tests {
         harw_tools::executor::ToolExecutionContext::new(SessionId::new(), TurnId::new(), sandbox)
     }
 
-    #[allow(dead_code)]
     fn make_call(name: &str, args: serde_json::Value) -> harw_tools::ToolCall {
         harw_tools::ToolCall {
             id: ToolCallId::new(),

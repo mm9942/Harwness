@@ -12,6 +12,8 @@ chacha20poly1305 = "0.10.1"
 # and ship a migration plan (see `kek.rs` KAT tests).
 crypt_guard = "=3.0.1"
 getrandom = { version = "0.4.2", features = ["std"] }
+# F-006: symlinkfestes Öffnen (korrektes O_NOFOLLOW je Architektur, CONTRACTS.md §fsutil).
+harw-fsutil = { path = "../harw-fsutil" }
 harw-macros = { path = "../harw-macros" }
 harw-observe = { path = "../harw-observe" }
 jiff = { workspace = true }

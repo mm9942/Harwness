@@ -10,8 +10,13 @@
 //! - **Scaffolding** ([`scaffold`]): idempotentes Anlegen von Verzeichnissen
 //!   und Default-Dateien; existierende Dateien werden nie überschrieben.
 //!   Secrets ausschließlich in `auth.toml` (chmod 600).
-//! - **Layer-Zusammenstellung** ([`paths::config_layers`]): baut die
-//!   aufsteigende Präzedenzkette für [`harw_config::discover_config`].
+//! - **Layer-Zusammenstellung** ([`paths::config_layers`],
+//!   [`paths::config_layers_report`]): baut die aufsteigende Präzedenzkette
+//!   für `harw_config::discover_config`. Ein repo-lokales `./.harw` ist nur
+//!   dann Layer, wenn das Projekt freigegeben ist.
+//! - **Projekt-Trust** ([`trust`]): `trusted-projects.toml` mit kanonischem
+//!   Root, Eigentümer-UID und BLAKE3-Digest der sicherheitsrelevanten
+//!   `.harw`-Dateien.
 //!
 //! # Verantwortungsabgrenzung
 //! Dieses Crate löst **keine** Secrets auf und lädt **keine** Config — es
@@ -39,9 +44,14 @@
 pub mod error;
 pub mod paths;
 pub mod scaffold;
+pub mod trust;
 
 pub use error::{HomeError, HomeResult};
 pub use paths::{
-    active_profile_name, active_profile_path, auth_path, config_layers, home_dir, profile_dir,
+    LayerReport, active_profile_name, active_profile_path, auth_path, config_layers,
+    config_layers_report, home_dir, profile_dir,
 };
 pub use scaffold::{Scaffolded, ensure_home};
+pub use trust::{
+    TrustRecord, TrustStatus, TrustStore, project_trust_status, trust_project, untrust_project,
+};

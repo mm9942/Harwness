@@ -1676,13 +1676,19 @@ mod tests {
         }
     }
 
+    /// W1-05: `plan`/`goal` deklarieren `model_tool(approval = "always")`
+    /// (`harw-ops/src/plan.rs:479`, `harw-ops/src/goal.rs:321`) und wurden aus
+    /// `agents/planner.toml` `[tools].admitted` entfernt — der Planner hatte im
+    /// Kind nie einen Executor dafür. `may_change_plan = false` bleibt
+    /// wahrheitsgemäß; die Rückgabe läuft weiterhin über den
+    /// `plan-proposal`-Contract.
     #[test]
-    fn test_planner_admits_plan_and_goal_operations() {
+    fn test_planner_does_not_admit_plan_or_goal_operations() {
         let definitions = builtin();
         let planner = &definitions[role_names::PLANNER];
         let admitted = planner.tool_surface().admitted();
-        assert!(admitted.iter().any(|name| name == "plan"));
-        assert!(admitted.iter().any(|name| name == "goal"));
+        assert!(!admitted.iter().any(|name| name == "plan"));
+        assert!(!admitted.iter().any(|name| name == "goal"));
         assert_eq!(
             planner.return_pipeline().contract(),
             Some("harwness.return.plan-proposal@1")

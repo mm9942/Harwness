@@ -6,45 +6,16 @@
 //! are skipped; every newline-terminated non-blank line is decoded into a
 //! `TranscriptRecord`.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-
-#[cfg(any(
-    target_os = "android",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "haiku",
-    target_os = "illumos",
-    target_os = "ios",
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "solaris",
-))]
-use std::os::unix::fs::OpenOptionsExt;
 
 use crate::error::{SessionStoreError, SessionStoreResult};
 use crate::record::TranscriptRecord;
 
 const MAX_RECORD_BYTES: usize = 1024 * 1024;
-
-#[cfg(any(target_os = "android", target_os = "linux"))]
-const O_NOFOLLOW: i32 = 0o400000;
-
-#[cfg(any(
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "haiku",
-    target_os = "illumos",
-    target_os = "ios",
-    target_os = "macos",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "solaris",
-))]
-const O_NOFOLLOW: i32 = 0x100;
 
 /// Streaming, non-buffering iterator over a transcript file's records.
 pub struct TranscriptReader {
@@ -63,24 +34,19 @@ impl TranscriptReader {
             Err(error) => return Err(SessionStoreError::Io(error)),
         }
 
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(any(
-            target_os = "android",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "haiku",
-            target_os = "illumos",
-            target_os = "ios",
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "netbsd",
-            target_os = "openbsd",
-            target_os = "solaris",
-        ))]
-        options.custom_flags(O_NOFOLLOW);
-
-        let file = options.open(path).map_err(SessionStoreError::Io)?;
+        // F-006: das architekturabhängig falsche `O_NOFOLLOW` wurde durch
+        // `harw_fsutil::open_nofollow` ersetzt (plattformkorrekt über
+        // `rustix::fs::OFlags::NOFOLLOW`).
+        #[cfg(unix)]
+        let file =
+            harw_fsutil::open_nofollow(path, harw_fsutil::OpenMode::read_only())
+                .map_err(SessionStoreError::Io)?;
+        #[cfg(not(unix))]
+        let file = {
+            let mut options = OpenOptions::new();
+            options.read(true);
+            options.open(path).map_err(SessionStoreError::Io)?
+        };
         Ok(Self {
             reader: BufReader::new(file),
         })

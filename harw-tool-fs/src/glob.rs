@@ -1,6 +1,7 @@
 //! `fs.glob` — Tool-Executor für Glob-basierte Dateisuche im Workspace.
 //!
-//! Spec-Referenz: AP W2-01..03, Abschnitt "1. `glob.rs` — `fs.glob`".
+//! Spec-Referenz: AP W2-01..03, Abschnitt "1. `glob.rs` — `fs.glob`";
+//! Sicherheits- und Grenzenüberarbeitung: W1-02 (F-058, F-118).
 //!
 //! # Verantwortung
 //! Dieses Modul besitzt den `fs.glob`-Executor:
@@ -8,11 +9,19 @@
 //!   auch Quelle der JSON-Schema-Spezifikation.
 //! - `fs_glob` (per `#[harw_macros::tool]` zu [`FsGlobTool`] erweitert): findet
 //!   Dateien unterhalb eines Start-Verzeichnisses, die auf ein Glob-Muster
-//!   passen. Traversierung über die `ignore`-Crate (respektiert `.gitignore`;
-//!   `target/` und `.git/` werden zusätzlich hart ausgeschlossen). Matching
-//!   über `globset` mit `literal_separator(true)`, damit `*` keine `/`
-//!   überspringt. Pfadauflösung ausschließlich über
-//!   `ctx.sandbox().workspace().resolve_existing()`.
+//!   passen.
+//!
+//! # Traversierung (W1-02)
+//! Gewalkt wird über [`crate::tree::walk_tree`] auf Basis von
+//! `harw_fsutil::walk_beneath`: Symlinks werden nie gefolgt (Symlink-Einträge
+//! gelten nicht als Datei), Unterverzeichnisse werden relativ zum
+//! Eltern-Deskriptor geöffnet. `.gitignore`/`.ignore` werden weiterhin
+//! beachtet, aber nur innerhalb des Workspace (siehe `tree`-Modul);
+//! `target/` und `.git/` bleiben harte Ausschlüsse. Das Muster wird — wie
+//! dokumentiert — gegen den Pfad **relativ zur Workspace-Wurzel** geprüft
+//! (`globset` mit `literal_separator(true)`). Grenzen: höchstens 1000
+//! Treffer, Tiefe 32, 50 000 Einträge, 10 s, Ausgabe höchstens 64 KiB; der
+//! Abbruchgrund steht im Feld `stopped`.
 //!
 //! # Schlüsseltypen
 //! - [`GlobArgs`]
@@ -20,22 +29,32 @@
 //!
 //! # Nebenläufigkeit
 //! [`FsGlobTool`] ist `Send + Sync` (Unit-Struct). `fs.glob` ist `parallel_safe`.
+//! Der Walk läuft über `spawn_blocking`.
 //!
 //! # Fehler
 //! Permission-Fehler (erzwungen durch den Makro-Prolog vor der
 //! Deserialisierung), ungültige Glob-Muster und Pfadauflösungsfehler münden
 //! alle in `Ok(ToolOutput::error(...))`. Kein Panic.
 
+use crate::blocking::run_blocking;
+use crate::tree::{
+    HARD_MAX_RESULTS, MAX_OUTPUT_BYTES, StopReason, WalkOptions, Workspace, normalize_relative,
+    walk_tree,
+};
 use globset::GlobBuilder;
+use harw_fsutil::EntryType;
 use harw_macros::Tool;
 use harw_tools::{ToolExecutionContext, ToolOutput, ToolsError};
-use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
+use std::ops::ControlFlow;
 use std::path::Path;
 
 /// Standard-Obergrenze für `fs.glob`-Treffer.
 pub const DEFAULT_MAX_RESULTS: usize = 200;
+
+/// Geschätzter JSON-Overhead je Treffer (Quoting, Komma).
+const MATCH_OVERHEAD_BYTES: usize = 4;
 
 /// Verzeichnis- bzw. Dateinamen, die unabhängig von `.gitignore` immer
 /// übersprungen werden.
@@ -52,7 +71,7 @@ pub struct GlobArgs {
     pub pattern: String,
     /// Optionales Unterverzeichnis, ab dem gesucht wird.
     pub path: Option<String>,
-    /// Obergrenze der Treffer (Default 200).
+    /// Obergrenze der Treffer (Default 200, Maximum 1000).
     #[tool(default = 200)]
     #[serde(default)]
     pub max_results: Option<usize>,
@@ -63,16 +82,19 @@ pub struct GlobArgs {
 struct GlobResult {
     /// Gefundene Pfade, relativ zur Workspace-Wurzel, alphabetisch sortiert.
     matches: Vec<String>,
-    /// Hinweistext, wenn das Ergebnis auf `max_results` gekappt wurde.
+    /// Hinweistext, wenn das Ergebnis gekappt wurde.
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+    /// Abbruchgrund, falls das Ergebnis unvollständig ist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stopped: Option<&'static str>,
 }
 
 /// Prüft, ob ein Datei- oder Verzeichnisname unabhängig von `.gitignore`
 /// hart ausgeschlossen werden soll (`target`, `.git`).
-fn is_hard_excluded(name: &OsStr) -> bool {
+fn is_hard_excluded(name: &OsStr, _is_dir: bool) -> bool {
     name.to_str()
-        .is_some_and(|s| HARD_EXCLUDED_NAMES.contains(&s))
+        .is_some_and(|name| HARD_EXCLUDED_NAMES.contains(&name))
 }
 
 /// Führt die `fs.glob`-Suche aus: findet Dateien unterhalb eines
@@ -80,7 +102,8 @@ fn is_hard_excluded(name: &OsStr) -> bool {
 ///
 /// Berechtigungsprüfung (`ReadWorkspace`) und JSON-Deserialisierung laufen im
 /// von `#[harw_macros::tool]` generierten Prolog von [`FsGlobTool`], bevor
-/// diese Funktion aufgerufen wird.
+/// diese Funktion aufgerufen wird. Die eigentliche Arbeit läuft blockierend
+/// in `spawn_blocking`.
 ///
 /// # Errors
 /// Liefert nie `Err`; Pfad-, Muster- oder I/O-Fehler werden als
@@ -92,88 +115,100 @@ fn is_hard_excluded(name: &OsStr) -> bool {
     parallel_safe
 )]
 async fn fs_glob(context: &ToolExecutionContext, args: GlobArgs) -> Result<ToolOutput, ToolsError> {
-    let workspace = context.sandbox().workspace();
+    let root = context.sandbox().workspace().canonical_root().to_path_buf();
+    run_blocking("fs.glob", move || Ok(glob_blocking(&root, &args))).await
+}
 
-    let start_relative = args.path.as_deref().unwrap_or(".");
-    let start_resolved = match workspace.resolve_existing(Path::new(start_relative)) {
-        Ok(path) => path,
-        Err(err) => return Ok(ToolOutput::error(err.to_string())),
+/// Synchroner Kern von [`fs_glob`].
+fn glob_blocking(root: &Path, args: &GlobArgs) -> ToolOutput {
+    let start_input = args.path.as_deref().unwrap_or(".");
+    let start_rel = match normalize_relative(start_input) {
+        Ok(rel) => rel,
+        Err(reason) => return ToolOutput::error(format!("fs.glob: {reason}")),
     };
-    if !start_resolved.is_dir() {
-        return Ok(ToolOutput::error(format!(
-            "fs.glob: '{start_relative}' ist kein Verzeichnis"
-        )));
-    }
 
-    let matcher = match GlobBuilder::new(&args.pattern).literal_separator(true).build() {
+    let matcher = match GlobBuilder::new(&args.pattern)
+        .literal_separator(true)
+        .build()
+    {
         Ok(glob) => glob.compile_matcher(),
         Err(err) => {
-            return Ok(ToolOutput::error(format!(
+            return ToolOutput::error(format!(
                 "fs.glob: ungültiges Muster '{}': {err}",
                 args.pattern
-            )));
+            ));
         }
     };
 
-    let workspace_root = workspace.canonical_root().to_path_buf();
-    let cap = args.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1);
-
-    let mut walk_builder = WalkBuilder::new(&start_resolved);
-    walk_builder
-        .hidden(false)
-        .parents(true)
-        .git_ignore(true)
-        .require_git(false)
-        .filter_entry(|entry| entry.depth() == 0 || !is_hard_excluded(entry.file_name()));
+    let workspace = match Workspace::open(root) {
+        Ok(workspace) => workspace,
+        Err(err) => return ToolOutput::error(format!("fs.glob: Workspace nicht lesbar: {err}")),
+    };
+    let cap = args
+        .max_results
+        .unwrap_or(DEFAULT_MAX_RESULTS)
+        .min(HARD_MAX_RESULTS)
+        .max(1);
 
     let mut matches: Vec<String> = Vec::new();
-
-    for entry in walk_builder.build() {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-            continue;
+    let mut output_bytes = 0usize;
+    let walked = walk_tree(
+        &workspace,
+        &start_rel,
+        WalkOptions::standard(true, is_hard_excluded),
+        |entry| {
+            if entry.entry_type != EntryType::File || !matcher.is_match(entry.rel) {
+                return ControlFlow::Continue(());
+            }
+            if matches.len() >= cap {
+                return ControlFlow::Break(StopReason::ResultLimit);
+            }
+            let found = entry.rel.display().to_string();
+            let cost = found.len() + MATCH_OVERHEAD_BYTES;
+            if output_bytes + cost > MAX_OUTPUT_BYTES {
+                return ControlFlow::Break(StopReason::OutputLimit);
+            }
+            output_bytes += cost;
+            matches.push(found);
+            ControlFlow::Continue(())
+        },
+    );
+    let stop = match walked {
+        Ok(stop) => stop,
+        Err(err) => {
+            return ToolOutput::error(format!(
+                "fs.glob: '{start_input}' ist kein lesbares Verzeichnis \
+                 (Symlinks werden nicht verfolgt): {err}"
+            ));
         }
-
-        let match_relative = entry
-            .path()
-            .strip_prefix(&start_resolved)
-            .unwrap_or_else(|_| entry.path());
-        if !matcher.is_match(match_relative) {
-            continue;
-        }
-
-        let output_relative = entry
-            .path()
-            .strip_prefix(&workspace_root)
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| entry.path().display().to_string());
-        matches.push(output_relative);
-    }
+    };
 
     matches.sort();
+    let note = match stop {
+        Some(StopReason::ResultLimit) => Some(format!(
+            "Ergebnis auf {cap} Treffer begrenzt; es gibt weitere Treffer, die nicht angezeigt \
+             werden."
+        )),
+        Some(reason) => Some(format!(
+            "Ergebnis unvollständig (Grenze '{}' erreicht).",
+            reason.as_str()
+        )),
+        None => None,
+    };
 
-    let truncated = matches.len() > cap;
-    if truncated {
-        matches.truncate(cap);
-    }
-
-    let note = truncated.then(|| {
-        format!(
-            "Ergebnis auf {cap} Treffer begrenzt; es gibt weitere Treffer, die nicht angezeigt werden."
-        )
-    });
-
-    let payload = serde_json::to_value(GlobResult { matches, note })
-        .unwrap_or(serde_json::Value::Array(vec![]));
-    Ok(ToolOutput::json(payload))
+    let payload = serde_json::to_value(GlobResult {
+        matches,
+        note,
+        stopped: stop.map(StopReason::as_str),
+    })
+    .unwrap_or(serde_json::Value::Array(vec![]));
+    ToolOutput::json(payload)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{Fixture, SECRET, call as tool_call, render};
     use harw_sandbox::{
         Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
     };
@@ -356,5 +391,64 @@ mod tests {
             }
             other => panic!("expected error output, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_fs_glob_does_not_follow_symlinks() {
+        let fixture = Fixture::new();
+        fixture.plant_escapes();
+        fs::write(fixture.ws.join("nested/own.rs"), "// own").unwrap();
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace]);
+
+        let output = fs_glob(&ctx, glob_args("**/*", None, None)).await.unwrap();
+        let matches = extract_matches(output);
+        assert_eq!(matches, vec!["nested/own.rs".to_owned()]);
+
+        for path in ["link_dir", "loop", "nested/up", "../outside"] {
+            let args = glob_args("**/*", Some(path), None);
+            let output = fs_glob(&ctx, args).await.unwrap();
+            assert!(matches!(output, ToolOutput::Error { .. }), "{path}: {output:?}");
+            assert!(!render(&output).contains(SECRET));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fs_glob_pattern_is_relative_to_workspace_root() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.ws.join("src/nested")).unwrap();
+        fs::write(fixture.ws.join("src/nested/lib.rs"), "").unwrap();
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace]);
+
+        let args = glob_args("src/**/*.rs", Some("src"), None);
+        let output = fs_glob(&ctx, args).await.unwrap();
+        assert_eq!(extract_matches(output), vec!["src/nested/lib.rs".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn test_fs_glob_caps_results_at_hard_limit() {
+        let fixture = Fixture::new();
+        for i in 0..(HARD_MAX_RESULTS + 5) {
+            fs::write(fixture.ws.join(format!("f{i:05}.rs")), "").unwrap();
+        }
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace]);
+        let args = glob_args("*.rs", None, Some(usize::MAX));
+        let output = fs_glob(&ctx, args).await.unwrap();
+        match output {
+            ToolOutput::Json { content } => {
+                assert_eq!(content["matches"].as_array().unwrap().len(), HARD_MAX_RESULTS);
+                assert_eq!(content["stopped"], "result_limit");
+            }
+            other => panic!("expected json output, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fs_glob_executor_runs_blocking_work() {
+        let fixture = Fixture::new();
+        fs::write(fixture.ws.join("a.rs"), "").unwrap();
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace]);
+        let call = tool_call("fs.glob", serde_json::json!({ "pattern": "*.rs" }));
+        let output = FsGlobTool.execute(&ctx, &call).await.unwrap();
+        assert_eq!(extract_matches(output), vec!["a.rs".to_owned()]);
     }
 }

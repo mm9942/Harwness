@@ -30,8 +30,97 @@
 //! ```
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+
+// ---------------------------------------------------------------------------
+// Paste-Burst-Erkennung (P0.10 / Register G-051)
+// ---------------------------------------------------------------------------
+//
+// Ohne funktionierendes Bracketed Paste (`Event::Paste`, siehe `tui_event.rs`/
+// `app.rs`, außerhalb dieses Moduls) liefert crossterm einen eingefügten Text
+// stattdessen als schnellen Strom einzelner `KeyCode::Char`/`KeyCode::Enter`-
+// Ereignisse. Ohne Gegenmaßnahme träfe jedes eingefügte `\n` auf den normalen
+// `KeyCode::Enter`-Zweig in `handle_key` und würde den bis dahin aufgelaufenen
+// Puffer sofort absenden — beginnt dieser Teilpuffer mit `/` oder `!`, würde er
+// über `classify_input` (`input.rs:17-33`) automatisch als Slash-/Shell-Befehl
+// ausgeführt, ohne dass der Nutzer je bewusst Enter für genau diese Zeile
+// gedrückt hat.
+//
+// `PasteBurstDetector` ist eine reine Zustandsmaschine ohne Bezug zum
+// Editor-Puffer: sie bekommt für jedes Zeichen-/Enter-Ereignis einen
+// Zeitstempel übergeben (`observe`) und entscheidet rein aus den zeitlichen
+// Abständen, ob gerade ein Burst läuft. Die Zeitquelle ist damit injizierbar
+// (kein `Instant::now()` im internen Zustand) — Tests können deterministische
+// `Instant`-Werte vorgeben.
+
+/// Maximaler Abstand zwischen zwei Tastaturereignissen, damit sie noch als
+/// Teil desselben Paste-Bursts gelten.
+const PASTE_BURST_INTERVAL: Duration = Duration::from_millis(8);
+
+/// Mindestanzahl aufeinanderfolgender schneller Ereignisse (Zeichen und Enter
+/// zählen gleichermaßen), ab der ein Burst als aktiv gilt.
+const PASTE_BURST_MIN_EVENTS: u32 = 3;
+
+/// Erkennt Paste-Bursts anhand der zeitlichen Abstände zwischen
+/// Zeichen-/Enter-Tastaturereignissen.
+///
+/// # Beschreibung
+/// Reine Zustandsmaschine ohne Seiteneffekte auf den Editor-Puffer. Für jedes
+/// Zeichen- oder Enter-Ereignis wird [`observe`](Self::observe) mit einem
+/// Zeitstempel aufgerufen. Liegen mindestens [`PASTE_BURST_MIN_EVENTS`]
+/// aufeinanderfolgende Ereignisse mit einem Abstand unter
+/// [`PASTE_BURST_INTERVAL`] vor, gilt ein Burst als aktiv. Ein einzelnes
+/// Ereignis mit größerem Abstand (Ruhephase) beendet einen laufenden Burst
+/// sofort wieder — ein danach folgendes, bewusst gedrücktes Enter wird also
+/// wieder normal behandelt.
+///
+/// # Nebenläufigkeit
+/// Nicht `Send`/`Sync` erforderlich; wird ausschließlich vom [`InputEditor`]
+/// auf demselben Thread genutzt.
+#[derive(Debug, Clone, Default)]
+struct PasteBurstDetector {
+    /// Zeitstempel des zuletzt beobachteten Ereignisses.
+    last_event_at: Option<Instant>,
+    /// Anzahl aufeinanderfolgender schneller Ereignisse (Abstand < Schwellwert).
+    fast_streak: u32,
+    /// Ob aktuell ein Burst als aktiv gilt.
+    active: bool,
+}
+
+impl PasteBurstDetector {
+    /// Meldet ein Zeichen- oder Enter-Ereignis zum Zeitpunkt `now`.
+    ///
+    /// # Argumente
+    /// - `now` (`Instant`): Zeitstempel des Ereignisses (injizierbar für Tests).
+    ///
+    /// # Returns
+    /// `true`, wenn ab diesem Ereignis (einschließlich) ein Paste-Burst als
+    /// aktiv gilt.
+    fn observe(&mut self, now: Instant) -> bool {
+        // `Instant::duration_since` sättigt seit Rust 1.60 bei `now < prev`
+        // auf `Duration::ZERO`, statt zu paniken — hier unkritisch, da ein
+        // (theoretisch) rückwärtslaufender Zeitstempel dann als "schnell"
+        // gilt, was höchstens einen Burst zu früh erkennt, nie zu spät.
+        let is_fast = self
+            .last_event_at
+            .is_some_and(|prev| now.duration_since(prev) < PASTE_BURST_INTERVAL);
+        self.last_event_at = Some(now);
+        if is_fast {
+            self.fast_streak = self.fast_streak.saturating_add(1);
+        } else {
+            // Ruhephase (oder erstes Ereignis überhaupt) beendet einen
+            // laufenden Burst sofort.
+            self.fast_streak = 1;
+            self.active = false;
+        }
+        if self.fast_streak >= PASTE_BURST_MIN_EVENTS {
+            self.active = true;
+        }
+        self.active
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Öffentliche Typen
@@ -63,6 +152,9 @@ pub struct InputEditor {
     last_recalled: Option<String>,
     /// Max History-Länge (Ring-Buffer).
     history_cap: usize,
+    /// Zustandsmaschine zur Paste-Burst-Erkennung (siehe [`PasteBurstDetector`],
+    /// P0.10 / Register G-051).
+    paste_burst: PasteBurstDetector,
 }
 
 /// Rückgabe von [`InputEditor::handle_key`]: was der Aufrufer tun soll.
@@ -124,6 +216,7 @@ impl InputEditor {
             history_snapshot: None,
             last_recalled: None,
             history_cap,
+            paste_burst: PasteBurstDetector::default(),
         }
     }
 
@@ -599,7 +692,11 @@ impl InputEditor {
     /// [`InputAction`] zurück, die dem Aufrufer mitteilt, was als Nächstes zu tun ist.
     ///
     /// Verhalten (Tabelle aus dem Design-Dokument):
-    /// - `Enter` (nicht-leer, keine Modifier) → `Submit(text)`
+    /// - `Enter` (nicht-leer, keine Modifier, **kein aktiver Paste-Burst**) →
+    ///   `Submit(text)`
+    /// - `Enter` während eines erkannten Paste-Bursts (siehe
+    ///   [`PasteBurstDetector`], P0.10 / G-051) → `insert_newline` + `Redraw`
+    ///   statt Submit
     /// - `Shift+Enter` oder `Ctrl+J` → `insert_newline` + `Redraw`
     /// - `Enter` auf leerem Buffer → `Passthrough`
     /// - Druckbares Zeichen (ohne Ctrl) → `insert_char` + `Redraw`
@@ -641,6 +738,23 @@ impl InputEditor {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> InputAction {
+        self.handle_key_at(key, Instant::now())
+    }
+
+    /// Wie [`handle_key`](Self::handle_key), aber mit injizierbarer Zeitquelle für
+    /// deterministische Paste-Burst-Erkennung (siehe [`PasteBurstDetector`],
+    /// P0.10 / Register G-051). `handle_key` ist ein dünner Wrapper, der
+    /// `Instant::now()` übergibt; für Tests wird direkt diese Funktion mit
+    /// konstruierten `Instant`-Werten aufgerufen.
+    ///
+    /// # Argumente
+    /// - `key` ([`KeyEvent`]): Das zu verarbeitende Tastatur-Event.
+    /// - `now` (`Instant`): Zeitstempel des Ereignisses, ausschließlich für die
+    ///   Paste-Burst-Heuristik relevant.
+    ///
+    /// # Returns
+    /// [`InputAction`] die dem Aufrufer signalisiert, was zu tun ist.
+    pub fn handle_key_at(&mut self, key: KeyEvent, now: Instant) -> InputAction {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         // Alle anderen Modifier (ALT etc.) ignorieren für unbekannte Keys → Passthrough
@@ -656,6 +770,16 @@ impl InputEditor {
                 InputAction::Redraw
             }
             KeyCode::Enter => {
+                // Paste-Burst-Schutz (P0.10 / G-051): Enter innerhalb eines
+                // erkannten Bursts fügt nur einen Zeilenumbruch ein, statt den
+                // Puffer abzusenden. Absenden geschieht erst nach einer
+                // Ruhephase (Abstand ≥ PASTE_BURST_INTERVAL) und einem danach
+                // bewusst gedrückten Enter — genau dieses Enter meldet
+                // `observe` dann wieder als "kein Burst".
+                if self.paste_burst.observe(now) {
+                    self.insert_newline();
+                    return InputAction::Redraw;
+                }
                 let text = self.buffer.trim().to_owned();
                 if text.is_empty() {
                     InputAction::Passthrough
@@ -668,6 +792,7 @@ impl InputEditor {
 
             // Druckbare Zeichen (kein Ctrl)
             KeyCode::Char(ch) if !ctrl => {
+                self.paste_burst.observe(now);
                 self.insert_char(ch);
                 InputAction::Redraw
             }
@@ -1199,5 +1324,103 @@ mod tests {
         ed.insert_str("x"); // text = "xsecond", cursor at 1, not at 0 or len
         let action = ed.handle_key(key(KeyCode::Up));
         assert_eq!(action, InputAction::Passthrough); // gate fails, no recall
+    }
+
+    // -----------------------------------------------------------------------
+    // Paste-Burst-Erkennung (P0.10 / Register G-051)
+    // -----------------------------------------------------------------------
+
+    // 25. paste_burst_detector_activates_after_min_events
+    #[test]
+    fn test_paste_burst_detector_activates_after_min_events() {
+        let mut det = PasteBurstDetector::default();
+        let t0 = Instant::now();
+        // Erstes Ereignis: nie "schnell", da kein Vorgänger existiert.
+        assert!(!det.observe(t0));
+        // Zweites Ereignis 1ms später: streak=2, noch nicht aktiv (< PASTE_BURST_MIN_EVENTS).
+        assert!(!det.observe(t0 + Duration::from_millis(1)));
+        // Drittes Ereignis 1ms später: streak=3 → Burst aktiv.
+        assert!(det.observe(t0 + Duration::from_millis(2)));
+        // Burst bleibt aktiv, solange die Abstände klein bleiben.
+        assert!(det.observe(t0 + Duration::from_millis(3)));
+    }
+
+    // 26. paste_burst_detector_quiet_gap_resets
+    #[test]
+    fn test_paste_burst_detector_quiet_gap_resets() {
+        let mut det = PasteBurstDetector::default();
+        let t0 = Instant::now();
+        assert!(!det.observe(t0));
+        assert!(!det.observe(t0 + Duration::from_millis(1)));
+        assert!(det.observe(t0 + Duration::from_millis(2)));
+        // Ruhephase (50ms, deutlich über PASTE_BURST_INTERVAL) beendet den
+        // Burst sofort wieder, auch für genau dieses Ereignis.
+        assert!(!det.observe(t0 + Duration::from_millis(52)));
+    }
+
+    // 27. paste_burst_multiline_slash_bang_stays_in_buffer
+    //
+    // Kernszenario aus G-051: ohne funktionierendes Bracketed Paste kommt ein
+    // Copy-Paste von "/quit\n!rm -rf x\n" als schneller Strom einzelner
+    // Char-/Enter-Events an. Ohne Burst-Erkennung würde das erste `\n` sofort
+    // "/quit" absenden (→ Slash-Befehl), das zweite "!rm -rf x" (→ Shell-
+    // Befehl). Mit Burst-Erkennung bleibt der komplette Text im Puffer.
+    #[test]
+    fn test_paste_burst_multiline_slash_bang_stays_in_buffer() {
+        let mut ed = InputEditor::new();
+        let text = "/quit\n!rm -rf x\n";
+        let mut t = Instant::now();
+        for ch in text.chars() {
+            let key_event = if ch == '\n' {
+                key(KeyCode::Enter)
+            } else {
+                key(KeyCode::Char(ch))
+            };
+            let action = ed.handle_key_at(key_event, t);
+            assert!(
+                !matches!(action, InputAction::Submit(_)),
+                "Burst-Ereignis {ch:?} darf niemals absenden"
+            );
+            t += Duration::from_millis(1); // deutlich unter PASTE_BURST_INTERVAL
+        }
+        assert_eq!(ed.text(), text);
+        assert!(!ed.is_empty());
+    }
+
+    // 28. normal_typing_with_slow_enter_submits
+    //
+    // Gegenprobe: normales, langsames Tippen (Abstände deutlich über dem
+    // Burst-Schwellwert) darf durch die neue Erkennung nicht beeinträchtigt
+    // werden — ein bewusst gedrücktes Enter sendet weiterhin ab.
+    #[test]
+    fn test_normal_typing_with_slow_enter_submits() {
+        let mut ed = InputEditor::new();
+        let mut t = Instant::now();
+        for ch in "hallo".chars() {
+            ed.handle_key_at(key(KeyCode::Char(ch)), t);
+            t += Duration::from_millis(50); // deutlich über PASTE_BURST_INTERVAL
+        }
+        let action = ed.handle_key_at(key(KeyCode::Enter), t);
+        assert_eq!(action, InputAction::Submit("hallo".to_owned()));
+        assert!(ed.is_empty());
+    }
+
+    // 29. paste_event_with_slash_command_does_not_auto_submit
+    //
+    // Der Bracketed-Paste-Pfad (app.rs: `Event::Paste` → `insert_str`) läuft
+    // nie über `handle_key`/`handle_key_at` und kann daher nie automatisch
+    // absenden, unabhängig vom Inhalt oder der Anzahl enthaltener `\n`. Erst
+    // ein danach bewusst gedrücktes Enter (normaler Abstand) sendet den
+    // gesamten eingefügten Block als eine Einheit ab.
+    #[test]
+    fn test_paste_event_with_slash_command_does_not_auto_submit() {
+        let mut ed = InputEditor::new();
+        ed.insert_str("/cmd\n!echo hi\n");
+        assert_eq!(ed.text(), "/cmd\n!echo hi\n");
+        assert!(!ed.is_empty());
+
+        let action = ed.handle_key_at(key(KeyCode::Enter), Instant::now());
+        assert_eq!(action, InputAction::Submit("/cmd\n!echo hi\n".to_owned()));
+        assert!(ed.is_empty());
     }
 }

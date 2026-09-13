@@ -2503,8 +2503,11 @@ dependencies = [
 name = "harw-home"
 version = "0.2.0"
 dependencies = [
+ "blake3",
  "harw-config",
- "toml 0.8.23",
+ "harw-fsutil",
+ "serde",
+ "toml 1.1.3+spec-1.1.0",
  "uuid",
 ]
 
@@ -2748,6 +2751,7 @@ version = "0.2.0"
 dependencies = [
  "harw-context",
  "harw-extension-api",
+ "harw-fsutil",
  "harw-lens-types",
  "harw-types",
  "jiff",
@@ -3014,13 +3018,16 @@ version = "0.2.0"
 dependencies = [
  "harw-config",
  "harw-core",
+ "harw-fsutil",
  "harw-provider",
+ "harw-sandbox",
  "harw-tools",
  "harw-types",
  "keyring",
  "reqwest 0.12.28",
  "secrecy 0.10.3",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -3105,6 +3112,7 @@ dependencies = [
  "chacha20poly1305",
  "crypt_guard",
  "getrandom 0.4.3",
+ "harw-fsutil",
  "harw-macros",
  "harw-observe",
  "jiff",
@@ -3156,6 +3164,7 @@ name = "harw-session-store"
 version = "0.2.0"
 dependencies = [
  "fs4",
+ "harw-fsutil",
  "harw-job-runtime",
  "harw-macros",
  "harw-observe",
@@ -3204,6 +3213,7 @@ version = "0.2.0"
 dependencies = [
  "globset",
  "harw-extension-api",
+ "harw-fsutil",
  "harw-macros",
  "harw-sandbox",
  "harw-tools",

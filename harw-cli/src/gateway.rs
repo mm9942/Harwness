@@ -4,7 +4,7 @@
 //! langlebige Runtime am Leben und supervidiert vier Subsysteme:
 //!
 //! - **Agenten/Gateway** — der Provider-Weg (nativer Anthropic/Foundry via
-//!   [`harw_provider_http::build_provider`]), an den Nachrichten als Turns gehen.
+//!   [`harw_provider_http::build_provider_with_home`]), an den Nachrichten als Turns gehen.
 //! - **Channels/Telegram** — bewusst fail-closed, bis der sichere Adapter
 //!   einen transport-gebundenen Ingress bereitstellt.
 //! - **Knowledge/Workbench** — [`harw_knowledge::KnowledgeStore`] wird am
@@ -97,7 +97,7 @@ use harw_secrets::audit::telemetry::AUDIT_CHAIN_BREAK;
 use harw_secrets::{AuditError, AuditResult};
 use harw_session_store::{RecordKind, TranscriptStore};
 use harw_types::{AgentRole, ChannelId, SessionId, ThreadRef};
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 
 use crate::home::resolve_home;
 
@@ -404,10 +404,15 @@ async fn supervise(
     // ohne `Send`/`Arc` korrekt.
     let provider_result: Result<Box<dyn ModelProvider>, ()> =
         match crate::secret_store::open_configured_secret_resolver(home, &config) {
-            Ok(Some(resolver)) => {
-                harw_provider_http::build_provider_with_resolver(&config, &resolver).map_err(|_| ())
+            Ok(Some(resolver)) => harw_provider_http::build_provider_with_home(
+                &config,
+                home,
+                Some(&resolver as &dyn harw_provider_http::SecretResolver),
+            )
+            .map_err(|_| ()),
+            Ok(None) => {
+                harw_provider_http::build_provider_with_home(&config, home, None).map_err(|_| ())
             }
-            Ok(None) => harw_provider_http::build_provider(&config).map_err(|_| ()),
             Err(_) => Err(()),
         };
 
@@ -478,12 +483,12 @@ async fn supervise(
                 std::future::pending::<()>().await
             }
             TelegramIngressMode::Enabled(plan) => {
-                if let Err(error) =
-                    start_telegram_long_poll(*plan, telegram_provider, telegram_profile).await
-                {
-                    tracing::error!(error = %error, "Telegram ingress setup failed closed");
-                }
-                std::future::pending::<()>().await
+                // Weder ein Start-Fehler (z. B. kein Netz beim Boot) noch ein
+                // späteres Enden des Poll-Threads darf Telegram für den Rest
+                // der Gateway-Laufzeit stillegen (S6/S9) — beides führt hier
+                // zu einem Neustart mit Backoff statt zu einer aufgegebenen
+                // Aufgabe.
+                supervise_telegram_long_poll(*plan, telegram_provider, telegram_profile).await
             }
         }
     };
@@ -917,11 +922,36 @@ fn resolve_telegram_secret(reference: &SecretRef, config: &ResolvedConfig) -> Op
     }
 }
 
+/// Netzwerk-Timeouts für den Telegram-Bot-Client: `reqwest::Client::new()`
+/// (der bisherige Konstruktor) kennt weder Connect- noch Request-Timeout, ein
+/// stilles Netzloch hängt `getUpdates`/`sendMessage` sonst unbegrenzt (S7).
+const TELEGRAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Request-Timeout für `getMe`/`sendMessage`/`editMessageText` (kurzlebige
+/// Aufrufe ohne Long-Poll-Wartezeit).
+const TELEGRAM_CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// Request-Timeout für `getUpdates`: muss über dem an Telegram übergebenen
+/// Long-Poll-`timeout_secs` (`LongPollConfig::new`s Vorgabe, 30 s) liegen,
+/// sonst würde der Client jede normale Leerantwort selbst als Timeout werten.
+const TELEGRAM_LONG_POLL_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Baut einen `reqwest::Client` mit Connect- und Request-Timeout für einen
+/// Telegram-Nutzungszweck. Reiner Konstruktions-Helfer ohne eigenen Zustand.
+fn telegram_http_client(request_timeout: Duration) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(TELEGRAM_CONNECT_TIMEOUT)
+        .timeout(request_timeout)
+        .build()
+        .map_err(|_| "Telegram HTTP client could not be built".to_owned())
+}
+
 async fn start_telegram_long_poll(
-    plan: TelegramIngressPlan,
+    plan: &TelegramIngressPlan,
     provider: Arc<dyn ModelProvider>,
     profile: PathBuf,
-) -> Result<(), String> {
+) -> Result<
+    std::thread::JoinHandle<harw_channel_telegram_transport::TransportResult<()>>,
+    String,
+> {
     let channel_id = ChannelId::try_from(plan.binding.id.clone())
         .map_err(|_| "Telegram channel id is invalid".to_owned())?;
     let mut channel_config = TelegramChannelConfig::new(channel_id.clone());
@@ -948,7 +978,8 @@ async fn start_telegram_long_poll(
         _ => return Err("Telegram topic mode is invalid".to_owned()),
     };
 
-    let bot_client = TelegramClient::new(plan.bot_token.clone());
+    let bot_http = telegram_http_client(TELEGRAM_CLIENT_REQUEST_TIMEOUT)?;
+    let bot_client = TelegramClient::with_http_client(bot_http, plan.bot_token.expose_secret());
     let bot = bot_client
         .get_me()
         .await
@@ -990,17 +1021,88 @@ async fn start_telegram_long_poll(
     let shutdown = LongPollShutdown::default();
     let offset_store =
         TelegramOffsetStore::new(profile.join("channel-state").join("telegram-offset"));
+    let poll_http = telegram_http_client(TELEGRAM_LONG_POLL_REQUEST_TIMEOUT)?;
     let long_poll = LongPollConfig::new(
-        TelegramClient::new(plan.bot_token),
+        TelegramClient::with_http_client(poll_http, plan.bot_token.expose_secret()),
         channel_id.as_str(),
         bot,
         offset_store,
         ingress_tx,
         shutdown,
     );
-    spawn_long_poll_thread(long_poll)
-        .map_err(|_| "Telegram long-poll thread could not start".to_owned())?;
-    Ok(())
+    spawn_long_poll_thread(long_poll).map_err(|_| "Telegram long-poll thread could not start".to_owned())
+}
+
+/// Treibt [`start_telegram_long_poll`] mit Neustart-Backoff an.
+///
+/// Zwei Fälle dürfen Telegram nicht dauerhaft stillegen (S6/S9): ein
+/// Start-Fehler (z. B. kein Netz beim Boot, `get_me` schlägt fehl) und ein
+/// späteres Enden des Poll-Threads (voller Sink über zu viele Wiederholungen
+/// hinweg, ein I/O-Fehler im Offset-Store, ein Panic). Beide Fälle führen
+/// hier zu einem erneuten Versuch nach [`telegram_restart_backoff`] statt zu
+/// einem für den Rest der Gateway-Laufzeit aufgegebenen `channels`-Zweig.
+/// Läuft nie sichtbar aus (`!`), genau wie das bisherige
+/// `std::future::pending::<()>().await` — [`supervise`]s `select!` behandelt
+/// diesen Zweig also unverändert als „läuft, bis ein anderer Zweig fertig
+/// wird".
+async fn supervise_telegram_long_poll(
+    plan: TelegramIngressPlan,
+    provider: Arc<dyn ModelProvider>,
+    profile: PathBuf,
+) -> ! {
+    let mut attempt: u32 = 0;
+    loop {
+        match start_telegram_long_poll(&plan, Arc::clone(&provider), profile.clone()).await {
+            Ok(handle) => {
+                // Ein erfolgreicher Start setzt den Backoff zurück: nur
+                // *aufeinanderfolgende* Fehlschläge sollen länger werden.
+                attempt = 0;
+                // Das blockierende `JoinHandle::join()` gehört nicht auf die
+                // Tokio-Event-Loop dieser Task.
+                match tokio::task::spawn_blocking(move || handle.join()).await {
+                    Ok(Ok(Ok(()))) => {
+                        tracing::warn!(
+                            "Telegram long-poll runner stopped cleanly; restarting with backoff"
+                        );
+                    }
+                    Ok(Ok(Err(error))) => {
+                        tracing::error!(error = %error, "Telegram long-poll runner stopped; restarting with backoff");
+                    }
+                    Ok(Err(_)) => {
+                        tracing::error!(
+                            "Telegram long-poll runner panicked; restarting with backoff"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::error!(
+                            "Telegram long-poll supervision task panicked; restarting with backoff"
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "Telegram ingress setup failed; retrying with backoff");
+            }
+        }
+        let backoff = telegram_restart_backoff(attempt);
+        attempt = attempt.saturating_add(1);
+        tokio::time::sleep(backoff).await;
+    }
+}
+
+/// Reine Entscheidungsfunktion für den Telegram-Neustart-Backoff:
+/// exponentiell (Faktor 2) ab 1 s, gedeckelt auf 60 s, ohne Jitter — bewusst
+/// deterministisch statt zufällig, damit sie ohne Zeitsteuerung testbar
+/// bleibt. `attempt` zählt aufeinanderfolgende Fehlschläge seit dem letzten
+/// erfolgreichen Start (`0` = erster erneuter Versuch nach dem ersten
+/// Fehlschlag).
+fn telegram_restart_backoff(attempt: u32) -> Duration {
+    const INITIAL: Duration = Duration::from_secs(1);
+    const MAX: Duration = Duration::from_secs(60);
+    INITIAL
+        .checked_mul(1u32 << attempt.min(6))
+        .unwrap_or(MAX)
+        .min(MAX)
 }
 
 /// Zählt persistente Workbench-Scopes unter `<knowledge>/workbench/`.
@@ -1724,6 +1826,21 @@ pinned_identities = [123456789]
         assert!(diagnostic.contains("fail closed"));
         assert!(diagnostic.contains("credential"));
         assert!(!diagnostic.contains("TELEGRAM_TEST_TOKEN"));
+    }
+
+    #[test]
+    fn telegram_restart_backoff_grows_exponentially_and_resets_at_zero() {
+        assert_eq!(telegram_restart_backoff(0), Duration::from_secs(1));
+        assert_eq!(telegram_restart_backoff(1), Duration::from_secs(2));
+        assert_eq!(telegram_restart_backoff(2), Duration::from_secs(4));
+        assert_eq!(telegram_restart_backoff(3), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn telegram_restart_backoff_caps_instead_of_growing_unbounded() {
+        assert_eq!(telegram_restart_backoff(6), Duration::from_secs(60));
+        assert_eq!(telegram_restart_backoff(100), Duration::from_secs(60));
+        assert_eq!(telegram_restart_backoff(u32::MAX), Duration::from_secs(60));
     }
 
     #[test]

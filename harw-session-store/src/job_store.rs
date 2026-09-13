@@ -10,27 +10,15 @@
 //! ein hier verlorener Fortschritt hieße stillen Stillstand statt eines
 //! bloß veralteten Zustands.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-#[cfg(any(
-    target_os = "android",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "haiku",
-    target_os = "illumos",
-    target_os = "ios",
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "solaris",
-))]
-use std::os::unix::fs::OpenOptionsExt;
-
 use fs4::FileExt;
+use harw_fsutil::OpenMode;
 use harw_job_runtime::{
     JobCancellation, JobClaim, JobCompletion, JobOutcome, JobRuntimeError, JobState, Lease,
     LeaseToken, StoredJob,
@@ -42,21 +30,9 @@ use tempfile::NamedTempFile;
 
 use crate::error::{SessionStoreError, SessionStoreResult};
 
-#[cfg(any(target_os = "android", target_os = "linux"))]
-const O_NOFOLLOW: i32 = 0o400000;
-
-#[cfg(any(
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "haiku",
-    target_os = "illumos",
-    target_os = "ios",
-    target_os = "macos",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "solaris",
-))]
-const O_NOFOLLOW: i32 = 0x100;
+/// Default create-mode für `create`-Aufrufe, identisch zum bisherigen Verhalten:
+/// `std::fs::OpenOptions` legt ohne `.mode(...)` mit `0o666` (abzüglich `umask`) an.
+const DEFAULT_CREATE_MODE: u32 = 0o666;
 
 /// Query for an eventually-consistent job list snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -557,9 +533,18 @@ impl JobStore {
             .join(safe_component(work_id)?)
             .with_extension("lock");
         reject_symlink(&path, "job lock")?;
-        let mut options = OpenOptions::new();
-        options.create(true).truncate(false).read(true).write(true);
-        let file = open_without_following_symlinks(&mut options, &path)?;
+        let file = open_without_following_symlinks(
+            OpenMode {
+                read: true,
+                write: true,
+                create: true,
+                create_new: false,
+                truncate: false,
+                append: false,
+                mode: DEFAULT_CREATE_MODE,
+            },
+            &path,
+        )?;
         FileExt::try_lock(&file).map_err(|error| match error {
             fs4::TryLockError::WouldBlock => SessionStoreError::JobLockContended {
                 work_id: work_id.clone(),
@@ -571,11 +556,12 @@ impl JobStore {
 
     fn read_record(&self, path: &Path, work_id: &WorkId) -> SessionStoreResult<StoredJob> {
         reject_symlink(path, "job record")?;
-        let mut options = OpenOptions::new();
-        options.read(true);
-        let mut file = open_without_following_symlinks(&mut options, path).map_err(|error| {
-            if matches!(&error, SessionStoreError::Io(io) if io.kind() == std::io::ErrorKind::NotFound)
-            {
+        let open_result = open_without_following_symlinks(OpenMode::read_only(), path);
+        let mut file = open_result.map_err(|error| {
+            if matches!(
+                &error,
+                SessionStoreError::Io(io) if io.kind() == std::io::ErrorKind::NotFound
+            ) {
                 SessionStoreError::JobNotFound {
                     work_id: work_id.clone(),
                 }
@@ -719,26 +705,27 @@ fn reject_symlink(path: &Path, description: &str) -> SessionStoreResult<()> {
     path_exists_without_following_symlinks(path, description).map(|_| ())
 }
 
-fn open_without_following_symlinks(
-    options: &mut OpenOptions,
-    path: &Path,
-) -> SessionStoreResult<File> {
-    #[cfg(any(
-        target_os = "android",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "haiku",
-        target_os = "illumos",
-        target_os = "ios",
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "solaris",
-    ))]
-    options.custom_flags(O_NOFOLLOW);
-
-    options.open(path).map_err(SessionStoreError::Io)
+/// Öffnet `path` ohne dem letzten Pfadglied als Symlink zu folgen
+/// (F-006: das architekturabhängig falsche `O_NOFOLLOW` wurde durch
+/// `harw_fsutil::open_nofollow` ersetzt, das die Konstante über
+/// `rustix::fs::OFlags::NOFOLLOW` plattformkorrekt bezieht).
+fn open_without_following_symlinks(mode: OpenMode, path: &Path) -> SessionStoreResult<File> {
+    #[cfg(unix)]
+    {
+        harw_fsutil::open_nofollow(path, mode).map_err(SessionStoreError::Io)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut options = OpenOptions::new();
+        options
+            .read(mode.read)
+            .write(mode.write || mode.append)
+            .create(mode.create)
+            .create_new(mode.create_new)
+            .truncate(mode.truncate)
+            .append(mode.append);
+        options.open(path).map_err(SessionStoreError::Io)
+    }
 }
 
 fn symlink_error(path: &Path, description: &str) -> SessionStoreError {

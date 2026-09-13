@@ -14,7 +14,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use std::io::Read;
 
@@ -64,18 +64,11 @@ pub fn check_key_file_permissions(path: &Path) -> SecretsResult<()> {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn open_key_file(path: &Path) -> SecretsResult<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    // Linux's `O_NOFOLLOW` prevents the final component from being a symlink.
-    // Other targets fail closed below rather than relying on an unverified
-    // platform-specific flag value.
-    const O_NOFOLLOW: i32 = 0o400_000;
-
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(O_NOFOLLOW)
-        .open(path)
-        .map_err(SecretsError::Io)
+    // F-006: das vormals hier hartkodierte `O_NOFOLLOW = 0o400_000` ist auf
+    // aarch64 tatsächlich `O_LARGEFILE` (Symlink-Schutz wirkungslos).
+    // `harw_fsutil::open_nofollow` bezieht die Konstante stattdessen
+    // architekturkorrekt über `rustix::fs::OFlags::NOFOLLOW`.
+    harw_fsutil::open_nofollow(path, harw_fsutil::OpenMode::read_only()).map_err(SecretsError::Io)
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

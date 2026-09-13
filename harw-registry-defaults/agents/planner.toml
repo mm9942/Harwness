@@ -3,7 +3,12 @@
 # Erzeugt einen Planvorschlag; er veraendert den autoritativen Plan nicht selbst.
 # `plan` und `goal` sind Operationen der Composition-Root, nicht dieses Crates —
 # `harw-registry-defaults` registriert fuer dieses Profil nur die read-only
-# Tool-Provider.
+# Tool-Provider. Seit W1-05 (Register F-014, G-003) admittiert der Planner
+# `plan`/`goal` deshalb nicht mehr: seine Kind-Registry traegt keinen
+# Executor dafuer (`may_change_plan = false` ist damit wahrheitsgemaess), und
+# die fruehere Admission zwang beide ueber `RegistryProfile::tool_names` in
+# `AUTO_APPROVED_TOOLS`, obwohl sie `model_tool(approval = "always")`
+# deklarieren. Den Plan veraendert nur die Root-Session — mit Rueckfrage.
 
 schema = "harwness.agent/v1"
 id = "harwness.agent.planner@1"
@@ -46,8 +51,6 @@ admitted = [
   # Index abfragt; ohne ihn muesste der Planner dieselbe Frage nur noch per
   # `fs.grep`/`fs.search` erraten.
   "lens.ask",
-  "plan",
-  "goal",
 ]
 forbidden = ["fs.write", "shell.exec", "web.fetch", "web.docs_rs", "web.crates_io"]
 

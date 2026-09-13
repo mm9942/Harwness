@@ -9,26 +9,14 @@
 //! compaction writes to a sibling `tempfile`, atomically persists it over the
 //! live file, then syncs that parent directory.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-#[cfg(any(
-    target_os = "android",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "haiku",
-    target_os = "illumos",
-    target_os = "ios",
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "solaris",
-))]
-use std::os::unix::fs::OpenOptionsExt;
-
 use fs4::FileExt;
+use harw_fsutil::OpenMode;
 use harw_types::SessionId;
 use tempfile::NamedTempFile;
 
@@ -43,21 +31,9 @@ const TRANSCRIPT_EXT: &str = "jsonl";
 const LEGACY_TUI_ID_PREFIX: &str = "local-tui:";
 const LEGACY_TUI_ID_HEX_LEN: usize = 16;
 
-#[cfg(any(target_os = "android", target_os = "linux"))]
-const O_NOFOLLOW: i32 = 0o400000;
-
-#[cfg(any(
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "haiku",
-    target_os = "illumos",
-    target_os = "ios",
-    target_os = "macos",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "solaris",
-))]
-const O_NOFOLLOW: i32 = 0x100;
+/// Default create-mode for `create`-Aufrufe, identisch zum bisherigen Verhalten:
+/// `std::fs::OpenOptions` legt ohne `.mode(...)` mit `0o666` (abzüglich `umask`) an.
+const DEFAULT_CREATE_MODE: u32 = 0o666;
 
 /// Root-anchored, append-only transcript store keyed by `SessionId`.
 pub struct TranscriptStore {
@@ -214,37 +190,45 @@ fn lock_transcript(path: &Path, session_id: &SessionId) -> SessionStoreResult<Fi
 }
 
 fn open_transcript_for_append(path: &Path) -> SessionStoreResult<File> {
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
-    open_without_following_symlinks(&mut options, path)
+    open_without_following_symlinks(OpenMode::append_create(DEFAULT_CREATE_MODE), path)
 }
 
 fn open_lock_file(path: &Path) -> SessionStoreResult<File> {
-    let mut options = OpenOptions::new();
-    options.create(true).write(true);
-    open_without_following_symlinks(&mut options, path)
+    open_without_following_symlinks(
+        OpenMode {
+            read: false,
+            write: true,
+            create: true,
+            create_new: false,
+            truncate: false,
+            append: false,
+            mode: DEFAULT_CREATE_MODE,
+        },
+        path,
+    )
 }
 
-fn open_without_following_symlinks(
-    options: &mut OpenOptions,
-    path: &Path,
-) -> SessionStoreResult<File> {
-    #[cfg(any(
-        target_os = "android",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "haiku",
-        target_os = "illumos",
-        target_os = "ios",
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "solaris",
-    ))]
-    options.custom_flags(O_NOFOLLOW);
-
-    options.open(path).map_err(SessionStoreError::Io)
+/// Öffnet `path` ohne dem letzten Pfadglied als Symlink zu folgen
+/// (F-006: das architekturabhängig falsche `O_NOFOLLOW` wurde durch
+/// `harw_fsutil::open_nofollow` ersetzt, das die Konstante über
+/// `rustix::fs::OFlags::NOFOLLOW` plattformkorrekt bezieht).
+fn open_without_following_symlinks(mode: OpenMode, path: &Path) -> SessionStoreResult<File> {
+    #[cfg(unix)]
+    {
+        harw_fsutil::open_nofollow(path, mode).map_err(SessionStoreError::Io)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut options = OpenOptions::new();
+        options
+            .read(mode.read)
+            .write(mode.write || mode.append)
+            .create(mode.create)
+            .create_new(mode.create_new)
+            .truncate(mode.truncate)
+            .append(mode.append);
+        options.open(path).map_err(SessionStoreError::Io)
+    }
 }
 
 fn reject_symlink(path: &Path, description: &str) -> SessionStoreResult<()> {

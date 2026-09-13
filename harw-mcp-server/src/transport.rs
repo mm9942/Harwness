@@ -1,12 +1,14 @@
 //! Loopback-only HTTP/1 adapter for the Streamable HTTP MCP session boundary.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Channel, Full, combinators::BoxBody};
+use harw_session_store::SessionStoreError;
+use http_body_util::{BodyExt, Channel, Full, LengthLimitError, Limited, combinators::BoxBody};
 use hyper::body::{Body, Incoming};
 use hyper::header::{ACCEPT, ALLOW, CONTENT_TYPE, HeaderValue, ORIGIN};
 use hyper::service::service_fn;
@@ -28,7 +30,9 @@ use crate::supervisor::{
 };
 
 const PATH: &str = "/mcp";
-const VERSION: &str = "2025-06-18";
+/// Single source of truth for the advertised MCP protocol version (Z1-R3-04):
+/// re-exported from the crate root instead of redefining the literal here.
+use crate::MCP_PROTOCOL_VERSION as VERSION;
 const SESSION_HEADER: &str = "mcp-session-id";
 const PROTOCOL_HEADER: &str = "mcp-protocol-version";
 const MAX_BODY_BYTES: usize = 64 * 1024;
@@ -38,7 +42,98 @@ type McpResponse = Response<BoxBody<Bytes, Infallible>>;
 /// Maps an authenticated `principal_key` to its resolved workspace authority.
 /// Built once at composition time from server-trusted configuration; never
 /// derived from an MCP request.
-pub type PrincipalRegistry = HashMap<String, McpPrincipal>;
+///
+/// Principal-IDs sind eindeutig: Früher war dies ein `HashMap`-Alias, bei dem
+/// ein zweiter Eintrag mit gleicher ID den ersten stillschweigend überschrieb
+/// (F-069 / A1). Dadurch konnten beide Credentials die Rechte des letzten
+/// Eintrags erben, z. B. `CancelWorkspace` in einem fremden Tenant.
+/// [`PrincipalRegistry::try_insert`] weist Duplikate deshalb ab.
+#[derive(Debug, Clone, Default)]
+pub struct PrincipalRegistry {
+    principals: HashMap<String, McpPrincipal>,
+    /// IDs, die über den Kompatibilitätspfad [`PrincipalRegistry::insert`]
+    /// mehrfach konfiguriert wurden. Sie bleiben dauerhaft ohne Rechte
+    /// (fail-closed), auch wenn später noch ein Eintrag folgt.
+    conflicted: HashSet<String>,
+}
+
+/// Eine Principal-ID war bereits registriert (oder als widersprüchlich
+/// gesperrt). Der bestehende Eintrag bleibt unverändert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DuplicatePrincipalId {
+    pub principal_key: String,
+}
+
+impl fmt::Display for DuplicatePrincipalId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "MCP principal id '{}' is configured more than once",
+            self.principal_key
+        )
+    }
+}
+
+impl std::error::Error for DuplicatePrincipalId {}
+
+impl PrincipalRegistry {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registriert `principal_key` genau einmal. Ein Duplikat wird mit
+    /// [`DuplicatePrincipalId`] abgewiesen, der erste Eintrag bleibt
+    /// unverändert. Die Komposition muss den Start dann abbrechen.
+    pub fn try_insert(
+        &mut self,
+        principal_key: String,
+        principal: McpPrincipal,
+    ) -> Result<(), DuplicatePrincipalId> {
+        let taken =
+            self.conflicted.contains(&principal_key) || self.principals.contains_key(&principal_key);
+        if taken {
+            return Err(DuplicatePrincipalId { principal_key });
+        }
+        self.principals.insert(principal_key, principal);
+        Ok(())
+    }
+
+    /// Kompatibilitätspfad für Aufrufer, die noch nicht auf
+    /// [`PrincipalRegistry::try_insert`] umgestellt sind (`harw-cli`
+    /// `build_principal_registry`, Folgearbeit D7). Anders als das frühere
+    /// `HashMap::insert` überschreibt ein Duplikat nichts: Die ID verliert
+    /// fail-closed **alle** Rechte (leerer Tool-Katalog, keine Tool-Aufrufe),
+    /// statt die Rechte des letzten Eintrags zu erben.
+    pub fn insert(&mut self, principal_key: String, principal: McpPrincipal) {
+        if let Err(duplicate) = self.try_insert(principal_key, principal) {
+            // Nur die ID ins Log, keine Credentials.
+            eprintln!(
+                "harw-mcp-server: {duplicate}; principal disabled until the configuration is fixed"
+            );
+            self.principals.remove(&duplicate.principal_key);
+            self.conflicted.insert(duplicate.principal_key);
+        }
+    }
+
+    #[must_use]
+    pub fn get(&self, principal_key: &str) -> Option<&McpPrincipal> {
+        if self.conflicted.contains(principal_key) {
+            return None;
+        }
+        self.principals.get(principal_key)
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.principals.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.principals.is_empty()
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct McpListenerConfig {
@@ -200,7 +295,7 @@ async fn handle(
             )
             .await
         }
-        Method::DELETE => delete(request, state).await,
+        Method::DELETE => delete(request, state, &principal.principal_key).await,
         Method::GET => get(request, state, principal.principal_key, event_bus).await,
         _ => Ok(method_not_allowed()),
     }
@@ -271,9 +366,17 @@ fn valid_origin_port_suffix(port: &str) -> bool {
         && port.parse::<u16>().is_ok()
 }
 
+/// Beendet eine Session nur für ihren Eigentümer (F-047 / A3).
+///
+/// Existenz-Leckage vermeiden: „unbekannt“, „abgelaufen“ und „gehört einem
+/// anderen Principal“ liefern dieselbe Antwort (404 ohne Body). Deshalb wird
+/// das Eigentum **vor** dem vom Client gelieferten Protokoll-Header geprüft;
+/// sonst verriete ein 400 bei falscher Version, dass die fremde Session
+/// existiert.
 async fn delete(
     request: Request<Incoming>,
     state: Arc<Mutex<McpSessionRegistry>>,
+    principal_key: &str,
 ) -> Result<McpResponse, Infallible> {
     let id = request
         .headers()
@@ -287,12 +390,21 @@ async fn delete(
         return Ok(empty_response(StatusCode::BAD_REQUEST));
     };
     let mut sessions = state.lock().await;
-    match sessions.require(id, protocol, jiff::Timestamp::now()) {
-        Ok(_) => match sessions.remove(id) {
-            Ok(()) => Ok(empty_response(StatusCode::NO_CONTENT)),
-            Err(error) => Ok(session_error_response(&error)),
-        },
-        Err(error) => Ok(session_error_response(&error)),
+    // Nachschlagen mit der serverseitigen Version: Jede Session wird mit
+    // `VERSION` angelegt, ein Fehler hier bedeutet also „nicht vorhanden“.
+    let session = match sessions.require(id, VERSION, jiff::Timestamp::now()) {
+        Ok(session) if session.principal_key == principal_key => session,
+        Ok(_) | Err(_) => return Ok(empty_response(StatusCode::NOT_FOUND)),
+    };
+    if protocol != session.protocol_version {
+        return Ok(session_error_response(&McpServerError::ProtocolMismatch {
+            expected: session.protocol_version,
+            actual: protocol.to_owned(),
+        }));
+    }
+    match sessions.remove(id) {
+        Ok(()) => Ok(empty_response(StatusCode::NO_CONTENT)),
+        Err(_) => Ok(empty_response(StatusCode::NOT_FOUND)),
     }
 }
 
@@ -334,6 +446,9 @@ async fn post(
             None,
         ));
     }
+    // Früher Abbruch, wenn `Content-Length` das Limit bereits überschreitet.
+    // Bei `Transfer-Encoding: chunked` gibt es keine Obergrenze im
+    // `size_hint`; dort greift erst `Limited` unten (F-046).
     if request
         .body()
         .size_hint()
@@ -342,13 +457,10 @@ async fn post(
     {
         return Ok(response(StatusCode::PAYLOAD_TOO_LARGE, Value::Null, None));
     }
-    let bytes = match request.into_body().collect().await {
-        Ok(body) => body.to_bytes(),
-        Err(_) => return Ok(response(StatusCode::BAD_REQUEST, Value::Null, None)),
+    let bytes = match read_limited_body(request.into_body()).await {
+        Ok(bytes) => bytes,
+        Err(status) => return Ok(response(status, Value::Null, None)),
     };
-    if bytes.len() > MAX_BODY_BYTES {
-        return Ok(response(StatusCode::PAYLOAD_TOO_LARGE, Value::Null, None));
-    }
     let message: Value = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
         Err(_) => return Ok(response(StatusCode::BAD_REQUEST, Value::Null, None)),
@@ -463,6 +575,24 @@ async fn post(
     Ok(json_rpc_error(id, -32601, "method not found", None))
 }
 
+/// Sammelt den Request-Body höchstens bis `MAX_BODY_BYTES`. `Limited` zählt die
+/// tatsächlich gelesenen Datenframes und bricht ab, sobald das Limit
+/// überschritten würde; unabhängig davon, ob `Content-Length` oder chunked
+/// übertragen wird. So wächst der Puffer nie über das Limit hinaus.
+async fn read_limited_body<B>(body: B) -> Result<Bytes, StatusCode>
+where
+    B: Body<Data = Bytes>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    match Limited::new(body, MAX_BODY_BYTES).collect().await {
+        Ok(collected) => Ok(collected.to_bytes()),
+        Err(error) if error.downcast_ref::<LengthLimitError>().is_some() => {
+            Err(StatusCode::PAYLOAD_TOO_LARGE)
+        }
+        Err(_) => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
 /// Opens the server-to-client stream for an initialized MCP session.  The
 /// stream is deliberately backed by the bounded per-session event bus; a slow
 /// client receives an explicit lag event rather than unbounded buffering.
@@ -519,18 +649,17 @@ async fn get(
     tokio::spawn(async move {
         loop {
             let frame = match subscription.recv().await {
-                Ok(event) => format!(
-                    "event: lifecycle\\ndata: {}\\n\\n",
-                    serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_owned())
+                Ok(event) => sse_frame(
+                    "lifecycle",
+                    &serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_owned()),
                 ),
-                Err(McpEventReceiveError::Lagged { skipped }) => format!(
-                    "event: lagged\\ndata: {}\\n\\n",
-                    json!({"skipped": skipped})
-                ),
+                Err(McpEventReceiveError::Lagged { skipped }) => {
+                    sse_frame("lagged", &json!({"skipped": skipped}).to_string())
+                }
                 Err(McpEventReceiveError::Closed) => break,
                 Err(McpEventReceiveError::Empty) => continue,
             };
-            if sender.send_data(Bytes::from(frame)).await.is_err() {
+            if sender.send_data(frame).await.is_err() {
                 break;
             }
         }
@@ -545,6 +674,14 @@ async fn get(
         HeaderValue::from_static("no-cache"),
     );
     Ok(response)
+}
+
+/// Baut einen SSE-Frame mit echten Zeilenumbrüchen (`\n`). Früher standen im
+/// Rust-Literal `\\n`, also Backslash + `n`; kein SSE-Client hat so je ein
+/// Event dispatcht (F-046). `data` muss einzeilig sein: kompaktes
+/// `serde_json` maskiert Zeilenumbrüche in Strings, daher gilt das hier.
+fn sse_frame(event: &str, data: &str) -> Bytes {
+    Bytes::from(format!("event: {event}\ndata: {data}\n\n"))
 }
 
 /// Tool descriptors filtered to the capabilities the caller's resolved
@@ -859,13 +996,27 @@ fn optional_positive_u64(
     Ok(Some(value))
 }
 
+/// Store-Fehler gehen nur generisch an den Client (R12): Texte wie
+/// `symlink_error` oder `CorruptJob.detail` enthalten absolute Pfade bzw.
+/// interne Details. Das vollständige Detail landet nur im Server-Log (stderr).
 fn supervisor_error_response(id: Option<Value>, error: &McpSupervisorError) -> McpResponse {
-    let code = match error {
-        McpSupervisorError::NotAuthorized => -32001,
-        McpSupervisorError::InvalidSubmission(_) => -32602,
-        McpSupervisorError::JobStore(_) => -32000,
-    };
-    json_rpc_error(id, code, &error.to_string(), None)
+    match error {
+        McpSupervisorError::NotAuthorized => json_rpc_error(id, -32001, &error.to_string(), None),
+        McpSupervisorError::InvalidSubmission(_) => {
+            json_rpc_error(id, -32602, &error.to_string(), None)
+        }
+        McpSupervisorError::JobStore(store_error) => {
+            eprintln!("harw-mcp-server: {error}");
+            json_rpc_error(id, -32000, redacted_store_error_message(store_error), None)
+        }
+    }
+}
+
+fn redacted_store_error_message(error: &SessionStoreError) -> &'static str {
+    match error {
+        SessionStoreError::JobNotFound { .. } => "job was not found",
+        _ => "durable job operation failed",
+    }
 }
 
 async fn request_session(
@@ -989,6 +1140,149 @@ mod tests {
             .find_map(|line| line.strip_prefix("mcp-session-id: "))
             .expect("initialize returns a session header")
             .to_owned()
+    }
+
+    /// Reads back the `protocolVersion` the server actually advertised in an
+    /// `initialize` response body, instead of assuming it matches the local
+    /// `VERSION` constant (Z1-R3-04: `VERSION` and the session registry's own
+    /// protocol constant used to be defined twice and could drift apart).
+    fn advertised_protocol_version(response: &str) -> String {
+        const MARKER: &str = "\"protocolVersion\":\"";
+        let start = response
+            .find(MARKER)
+            .expect("initialize response advertises a protocol version")
+            + MARKER.len();
+        let rest = &response[start..];
+        let end = rest
+            .find('"')
+            .expect("advertised protocol version is a quoted string");
+        rest[..end].to_owned()
+    }
+
+    /// Schreibt den Request und liest bis EOF; ein Reset nach der Antwort
+    /// (Server schließt mit ungelesenem Rest-Body) beendet das Lesen, ohne
+    /// bereits Gelesenes zu verwerfen.
+    async fn round_trip_bytes_lenient(address: SocketAddr, request: &[u8]) -> String {
+        let mut stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("listener accepts test connection");
+        // Schreibfehler sind hier erwartbar: Der Server darf nach dem 413
+        // schließen, während noch Rest-Body unterwegs ist.
+        let _ = stream.write_all(request).await;
+        let mut response = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match stream.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => response.extend_from_slice(&buffer[..read]),
+            }
+        }
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// Kodiert `body` als HTTP/1.1-chunked-Request mit den angegebenen
+    /// Chunk-Größen (Summe muss `body.len()` ergeben).
+    fn chunked_post_request(bearer: &str, body: &[u8], chunk_sizes: &[usize]) -> Vec<u8> {
+        let mut request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {bearer}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n"
+        )
+        .into_bytes();
+        let mut offset = 0;
+        for size in chunk_sizes {
+            request.extend_from_slice(format!("{size:X}\r\n").as_bytes());
+            request.extend_from_slice(&body[offset..offset + size]);
+            request.extend_from_slice(b"\r\n");
+            offset += size;
+        }
+        assert_eq!(offset, body.len(), "chunk sizes cover the whole body");
+        request.extend_from_slice(b"0\r\n\r\n");
+        request
+    }
+
+    /// Liest genau einen HTTP/1.1-Chunk (Größenzeile, Nutzdaten, CRLF).
+    async fn read_http_chunk<R>(reader: &mut R) -> Vec<u8>
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
+        let mut size_line = Vec::new();
+        reader
+            .read_until(b'\n', &mut size_line)
+            .await
+            .expect("chunk size line reads");
+        let size_text = String::from_utf8(size_line).expect("chunk size is ASCII");
+        let size = usize::from_str_radix(size_text.trim_end(), 16).expect("chunk size is hex");
+        let mut payload = vec![0_u8; size];
+        reader
+            .read_exact(&mut payload)
+            .await
+            .expect("chunk payload reads");
+        let mut crlf = [0_u8; 2];
+        reader
+            .read_exact(&mut crlf)
+            .await
+            .expect("chunk trailer reads");
+        assert_eq!(&crlf, b"\r\n");
+        payload
+    }
+
+    /// Entfernt den `date`-Header, damit zwei Antworten byteweise vergleichbar sind.
+    fn without_date_header(response: &str) -> String {
+        response
+            .split("\r\n")
+            .filter(|line| !line.to_ascii_lowercase().starts_with("date:"))
+            .collect::<Vec<_>>()
+            .join("\r\n")
+    }
+
+    /// Opens and initializes a session, returning its id together with the
+    /// protocol version the server actually advertised in the `initialize`
+    /// response (see `advertised_protocol_version`).
+    async fn open_initialized_session(address: SocketAddr, bearer: &str) -> (String, String) {
+        let initialize = round_trip(
+            address,
+            post_request_as(
+                bearer,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {"protocolVersion": VERSION}
+                }),
+                "",
+            ),
+        )
+        .await;
+        assert!(initialize.starts_with("HTTP/1.1 200"), "{initialize}");
+        let id = session_id(&initialize);
+        let advertised = advertised_protocol_version(&initialize);
+        let initialized = round_trip(
+            address,
+            post_request_as(
+                bearer,
+                &json!({"jsonrpc":"2.0", "method":"notifications/initialized"}),
+                &format!("Mcp-Session-Id: {id}\r\nMcp-Protocol-Version: {advertised}\r\n"),
+            ),
+        )
+        .await;
+        assert!(initialized.starts_with("HTTP/1.1 202"), "{initialized}");
+        (id, advertised)
+    }
+
+    fn delete_request(bearer: &str, session: &str, protocol: &str) -> String {
+        format!(
+            "DELETE /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {bearer}\r\nMcp-Session-Id: {session}\r\nMcp-Protocol-Version: {protocol}\r\nConnection: close\r\n\r\n"
+        )
+    }
+
+    fn test_principal(actor: &str, capabilities: Vec<McpJobCapability>) -> McpPrincipal {
+        McpPrincipal::from_trusted_ingress(
+            ApprovalActor::Operator {
+                id: actor.to_owned(),
+            },
+            harw_types::TenantId::from_str("test-tenant"),
+            harw_types::WorkspaceId::from_str("test-workspace"),
+            capabilities,
+        )
     }
 
     #[test]
@@ -1122,7 +1416,7 @@ mod tests {
         )
         .await;
         assert!(initialize.starts_with("HTTP/1.1 200"), "{initialize}");
-        assert!(initialize.contains("\"protocolVersion\":\"2025-06-18\""));
+        assert!(initialize.contains(&format!("\"protocolVersion\":\"{VERSION}\"")));
         let id = session_id(&initialize);
 
         let initialized = round_trip(
@@ -1355,7 +1649,7 @@ mod tests {
         assert!(headers.starts_with("HTTP/1.1 200"), "{headers}");
         assert!(headers.to_ascii_lowercase().contains("text/event-stream"));
 
-        event_bus
+        let event = event_bus
             .publish(
                 &id,
                 jiff::Timestamp::now(),
@@ -1365,14 +1659,26 @@ mod tests {
                 },
             )
             .expect("event is delivered to GET subscriber");
-        let mut data = [0_u8; 1024];
-        let read = tokio::time::timeout(std::time::Duration::from_secs(2), reader.read(&mut data))
-            .await
-            .expect("event arrives")
-            .expect("event read");
-        let data = String::from_utf8_lossy(&data[..read]);
-        assert!(data.contains("event: lifecycle"), "{data}");
-        assert!(data.contains("sequence"), "{data}");
+        // Erwartete Bytes bewusst unabhängig von `sse_frame` gebaut: echte
+        // Zeilenumbrüche, kein literales Backslash-n.
+        let expected = format!(
+            "event: lifecycle\ndata: {}\n\n",
+            serde_json::to_string(&event).expect("event serializes")
+        );
+        let payload = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_http_chunk(&mut reader),
+        )
+        .await
+        .expect("event arrives");
+        assert_eq!(
+            payload,
+            expected.as_bytes(),
+            "{}",
+            String::from_utf8_lossy(&payload)
+        );
+        assert!(payload.ends_with(b"\n\n"));
+        assert!(!payload.windows(2).any(|pair| pair == b"\\n"));
 
         shutdown_tx.send(true).expect("server accepts shutdown");
         server
@@ -1452,34 +1758,27 @@ mod tests {
         let event_bus = Arc::new(McpEventBus::new(4).expect("event bus"));
 
         let mut principals = PrincipalRegistry::new();
-        principals.insert(
-            "mia-owner".to_owned(),
-            McpPrincipal::from_trusted_ingress(
-                ApprovalActor::Operator {
-                    id: "mia".to_owned(),
-                },
-                harw_types::TenantId::from_str("test-tenant"),
-                harw_types::WorkspaceId::from_str("test-workspace"),
-                vec![
-                    McpJobCapability::SubmitOwn,
-                    McpJobCapability::ReadOwn,
-                    McpJobCapability::CancelOwn,
-                ],
-            ),
-        );
+        principals
+            .try_insert(
+                "mia-owner".to_owned(),
+                test_principal(
+                    "mia",
+                    vec![
+                        McpJobCapability::SubmitOwn,
+                        McpJobCapability::ReadOwn,
+                        McpJobCapability::CancelOwn,
+                    ],
+                ),
+            )
+            .expect("unique principal id registers");
         // A different, unrelated actor: authenticates but has no capability
         // over this job's scope.
-        principals.insert(
-            "someone-else".to_owned(),
-            McpPrincipal::from_trusted_ingress(
-                ApprovalActor::Operator {
-                    id: "not-mia".to_owned(),
-                },
-                harw_types::TenantId::from_str("test-tenant"),
-                harw_types::WorkspaceId::from_str("test-workspace"),
-                vec![McpJobCapability::ReadOwn],
-            ),
-        );
+        principals
+            .try_insert(
+                "someone-else".to_owned(),
+                test_principal("not-mia", vec![McpJobCapability::ReadOwn]),
+            )
+            .expect("unique principal id registers");
 
         let listener = BoundMcpListener::bind_with_supervisor_and_events(
             McpListenerConfig {
@@ -1813,6 +2112,356 @@ mod tests {
         )
         .await;
         assert!(denied_call.contains("\"code\":-32001"), "{denied_call}");
+
+        shutdown_tx.send(true).expect("server accepts shutdown");
+        server
+            .await
+            .expect("server task joins")
+            .expect("server shuts down cleanly");
+    }
+
+    #[test]
+    fn sse_frames_use_real_line_breaks() {
+        let lagged = sse_frame("lagged", &json!({"skipped": 3}).to_string());
+        assert_eq!(&lagged[..], b"event: lagged\ndata: {\"skipped\":3}\n\n");
+    }
+
+    #[test]
+    fn principal_registry_rejects_duplicate_ids_and_keeps_first_entry() {
+        let mut registry = PrincipalRegistry::new();
+        registry
+            .try_insert(
+                "alice".to_owned(),
+                test_principal("alice", vec![McpJobCapability::ReadOwn]),
+            )
+            .expect("first id registers");
+        let duplicate = registry.try_insert(
+            "alice".to_owned(),
+            test_principal("alice", vec![McpJobCapability::CancelWorkspace]),
+        );
+        assert_eq!(
+            duplicate,
+            Err(DuplicatePrincipalId {
+                principal_key: "alice".to_owned(),
+            })
+        );
+        let kept = registry.get("alice").expect("first entry is kept");
+        assert!(kept.capabilities().contains(&McpJobCapability::ReadOwn));
+        assert!(
+            !kept
+                .capabilities()
+                .contains(&McpJobCapability::CancelWorkspace)
+        );
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn principal_registry_compat_insert_disables_duplicate_ids_fail_closed() {
+        let mut registry = PrincipalRegistry::new();
+        registry.insert(
+            "bob".to_owned(),
+            test_principal("bob", vec![McpJobCapability::ReadOwn]),
+        );
+        registry.insert(
+            "bob".to_owned(),
+            test_principal("bob", vec![McpJobCapability::CancelWorkspace]),
+        );
+        assert!(registry.get("bob").is_none());
+        // Ein dritter Eintrag darf die gesperrte ID nicht wiederbeleben.
+        registry.insert(
+            "bob".to_owned(),
+            test_principal("bob", vec![McpJobCapability::SubmitOwn]),
+        );
+        assert!(registry.get("bob").is_none());
+        assert!(registry.is_empty());
+        assert!(
+            registry
+                .try_insert("bob".to_owned(), test_principal("bob", Vec::new()))
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn store_error_details_are_redacted_for_clients() {
+        async fn body_of(response: McpResponse) -> String {
+            let bytes = response
+                .into_body()
+                .collect()
+                .await
+                .expect("infallible body collects")
+                .to_bytes();
+            String::from_utf8(bytes.to_vec()).expect("JSON body is UTF-8")
+        }
+
+        let corrupt = supervisor_error_response(
+            Some(json!(1)),
+            &McpSupervisorError::JobStore(SessionStoreError::CorruptJob {
+                work_id: harw_types::WorkId::from_str("work-secret-path"),
+                detail: "/home/mia/.harw/profiles/default/jobs/work-secret-path.json".to_owned(),
+            }),
+        );
+        let corrupt = body_of(corrupt).await;
+        assert!(corrupt.contains("\"code\":-32000"), "{corrupt}");
+        assert!(corrupt.contains("durable job operation failed"), "{corrupt}");
+        assert!(!corrupt.contains("/home"), "{corrupt}");
+        assert!(!corrupt.contains("corrupt"), "{corrupt}");
+
+        let io = supervisor_error_response(
+            Some(json!(2)),
+            &McpSupervisorError::JobStore(SessionStoreError::Io(std::io::Error::other(
+                "refusing symlink at /var/lib/harw/jobs/x.json",
+            ))),
+        );
+        let io = body_of(io).await;
+        assert!(!io.contains("/var/lib"), "{io}");
+        assert!(!io.contains("symlink"), "{io}");
+
+        let missing = supervisor_error_response(
+            Some(json!(3)),
+            &McpSupervisorError::JobStore(SessionStoreError::JobNotFound {
+                work_id: harw_types::WorkId::from_str("work-unknown"),
+            }),
+        );
+        let missing = body_of(missing).await;
+        assert!(missing.contains("job was not found"), "{missing}");
+        assert!(!missing.contains("work-unknown"), "{missing}");
+
+        // Nicht-Store-Fehler behalten ihre (pfadfreie) Meldung.
+        let denied = body_of(supervisor_error_response(
+            Some(json!(4)),
+            &McpSupervisorError::NotAuthorized,
+        ))
+        .await;
+        assert!(denied.contains("\"code\":-32001"), "{denied}");
+    }
+
+    #[tokio::test]
+    async fn oversized_bodies_are_rejected_with_413_even_when_chunked() {
+        let listener = BoundMcpListener::bind_authenticated(
+            McpListenerConfig {
+                address: "127.0.0.1:0".parse().expect("valid loopback address"),
+                max_sessions: 4,
+                session_ttl: SignedDuration::from_secs(60),
+            },
+            Arc::new(StaticBearerAuthenticator::new(vec![(
+                "test-principal".to_owned(),
+                b"test-token".to_vec(),
+            )])),
+        )
+        .await
+        .expect("loopback listener binds");
+        let address = listener.local_addr().expect("bound listener has address");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server = tokio::spawn(listener.serve_until(shutdown_rx));
+
+        // Grenzfall: chunked genau MAX_BODY_BYTES (gültiges, mit Leerzeichen
+        // aufgefülltes JSON) wird angenommen.
+        let mut at_limit = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": VERSION}
+        })
+        .to_string()
+        .into_bytes();
+        at_limit.resize(MAX_BODY_BYTES, b' ');
+        let accepted = round_trip_bytes_lenient(
+            address,
+            &chunked_post_request("test-token", &at_limit, &[8192; 8]),
+        )
+        .await;
+        assert!(accepted.starts_with("HTTP/1.1 200"), "{accepted}");
+
+        // chunked ohne Content-Length: ein Byte über dem Limit, verteilt auf
+        // viele Chunks; das letzte Byte kippt `Limited`.
+        let over_limit = vec![b' '; MAX_BODY_BYTES + 1];
+        let mut chunks = vec![8192; 8];
+        chunks.push(1);
+        let rejected = round_trip_bytes_lenient(
+            address,
+            &chunked_post_request("test-token", &over_limit, &chunks),
+        )
+        .await;
+        assert!(rejected.starts_with("HTTP/1.1 413"), "{rejected}");
+
+        // Weit über dem Limit, ebenfalls chunked.
+        let far_over = vec![b' '; MAX_BODY_BYTES * 4];
+        let rejected_far = round_trip_bytes_lenient(
+            address,
+            &chunked_post_request("test-token", &far_over, &[MAX_BODY_BYTES; 4]),
+        )
+        .await;
+        assert!(rejected_far.starts_with("HTTP/1.1 413"), "{rejected_far}");
+
+        // Content-Length über dem Limit greift schon vor dem Lesen.
+        let declared = format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-token\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        );
+        let rejected_declared = round_trip_bytes_lenient(address, declared.as_bytes()).await;
+        assert!(
+            rejected_declared.starts_with("HTTP/1.1 413"),
+            "{rejected_declared}"
+        );
+
+        shutdown_tx.send(true).expect("server accepts shutdown");
+        server
+            .await
+            .expect("server task joins")
+            .expect("server shuts down cleanly");
+    }
+
+    #[tokio::test]
+    async fn foreign_delete_is_indistinguishable_from_unknown_session_and_keeps_it() {
+        let listener = BoundMcpListener::bind_authenticated(
+            McpListenerConfig {
+                address: "127.0.0.1:0".parse().expect("valid loopback address"),
+                max_sessions: 4,
+                session_ttl: SignedDuration::from_secs(60),
+            },
+            Arc::new(StaticBearerAuthenticator::new(vec![
+                ("principal-a".to_owned(), b"token-a".to_vec()),
+                ("principal-b".to_owned(), b"token-b".to_vec()),
+            ])),
+        )
+        .await
+        .expect("loopback listener binds");
+        let address = listener.local_addr().expect("bound listener has address");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server = tokio::spawn(listener.serve_until(shutdown_rx));
+
+        let (id, advertised) = open_initialized_session(address, "token-a").await;
+
+        let foreign = round_trip(address, delete_request("token-b", &id, &advertised)).await;
+        assert!(foreign.starts_with("HTTP/1.1 404"), "{foreign}");
+        let foreign_wrong_protocol =
+            round_trip(address, delete_request("token-b", &id, "1999-01-01")).await;
+        assert!(
+            foreign_wrong_protocol.starts_with("HTTP/1.1 404"),
+            "{foreign_wrong_protocol}"
+        );
+        let unknown = round_trip(
+            address,
+            delete_request("token-b", "harw-no-such-session", &advertised),
+        )
+        .await;
+        assert!(unknown.starts_with("HTTP/1.1 404"), "{unknown}");
+        // Keine Existenz-Leckage: fremd und unbekannt sind byteidentisch.
+        assert_eq!(without_date_header(&foreign), without_date_header(&unknown));
+        assert_eq!(
+            without_date_header(&foreign_wrong_protocol),
+            without_date_header(&unknown)
+        );
+
+        // Die Session von A besteht weiter.
+        let still_usable = round_trip(
+            address,
+            post_request_as(
+                "token-a",
+                &json!({"jsonrpc":"2.0", "id":2, "method":"tools/list"}),
+                &format!("Mcp-Session-Id: {id}\r\nMcp-Protocol-Version: {advertised}\r\n"),
+            ),
+        )
+        .await;
+        assert!(still_usable.starts_with("HTTP/1.1 200"), "{still_usable}");
+
+        // Der Eigentümer erhält weiterhin Protokollfehler und darf löschen —
+        // und zwar mit genau der Protokollversion, die der Server im
+        // `initialize`-Handschlag beworben hat (Z1-R3-04: `VERSION` und die
+        // Protokollkonstante der Session-Registrierung liefen früher als
+        // getrennte Literale und konnten auseinanderlaufen; DELETE hätte dann
+        // still mit 404 statt 204 geantwortet).
+        let owner_wrong_protocol =
+            round_trip(address, delete_request("token-a", &id, "1999-01-01")).await;
+        assert!(
+            owner_wrong_protocol.starts_with("HTTP/1.1 400"),
+            "{owner_wrong_protocol}"
+        );
+        let owner = round_trip(address, delete_request("token-a", &id, &advertised)).await;
+        assert!(owner.starts_with("HTTP/1.1 204"), "{owner}");
+        let again = round_trip(address, delete_request("token-a", &id, &advertised)).await;
+        assert!(again.starts_with("HTTP/1.1 404"), "{again}");
+
+        shutdown_tx.send(true).expect("server accepts shutdown");
+        server
+            .await
+            .expect("server task joins")
+            .expect("server shuts down cleanly");
+    }
+
+    #[tokio::test]
+    async fn duplicate_principal_ids_never_inherit_foreign_rights_over_tcp() {
+        let mut principals = PrincipalRegistry::new();
+        // Strikter Pfad: das Duplikat wird abgewiesen, der erste Eintrag gilt.
+        principals
+            .try_insert(
+                "strict".to_owned(),
+                test_principal("strict", vec![McpJobCapability::ReadOwn]),
+            )
+            .expect("first strict id registers");
+        assert!(
+            principals
+                .try_insert(
+                    "strict".to_owned(),
+                    test_principal("strict", vec![McpJobCapability::CancelWorkspace]),
+                )
+                .is_err()
+        );
+        // Kompatibilitätspfad: das Duplikat sperrt die ID komplett.
+        principals.insert(
+            "compat".to_owned(),
+            test_principal("compat", vec![McpJobCapability::ReadOwn]),
+        );
+        principals.insert(
+            "compat".to_owned(),
+            test_principal("compat", vec![McpJobCapability::CancelWorkspace]),
+        );
+
+        let listener = BoundMcpListener::bind_with_supervisor(
+            McpListenerConfig {
+                address: "127.0.0.1:0".parse().expect("valid loopback address"),
+                max_sessions: 4,
+                session_ttl: SignedDuration::from_secs(60),
+            },
+            Arc::new(StaticBearerAuthenticator::new(vec![
+                ("strict".to_owned(), b"strict-token".to_vec()),
+                ("compat".to_owned(), b"compat-token".to_vec()),
+            ])),
+            principals,
+            None,
+        )
+        .await
+        .expect("loopback listener binds");
+        let address = listener.local_addr().expect("bound listener has address");
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server = tokio::spawn(listener.serve_until(shutdown_rx));
+
+        let (strict_id, _) = open_initialized_session(address, "strict-token").await;
+        let strict_catalog = round_trip(
+            address,
+            post_request_as(
+                "strict-token",
+                &json!({"jsonrpc":"2.0", "id":2, "method":"tools/list"}),
+                &format!("Mcp-Session-Id: {strict_id}\r\nMcp-Protocol-Version: {VERSION}\r\n"),
+            ),
+        )
+        .await;
+        assert!(strict_catalog.starts_with("HTTP/1.1 200"), "{strict_catalog}");
+        assert!(strict_catalog.contains("harw_job_status"), "{strict_catalog}");
+        assert!(!strict_catalog.contains("harw_job_cancel"), "{strict_catalog}");
+
+        let (compat_id, _) = open_initialized_session(address, "compat-token").await;
+        let compat_catalog = round_trip(
+            address,
+            post_request_as(
+                "compat-token",
+                &json!({"jsonrpc":"2.0", "id":2, "method":"tools/list"}),
+                &format!("Mcp-Session-Id: {compat_id}\r\nMcp-Protocol-Version: {VERSION}\r\n"),
+            ),
+        )
+        .await;
+        assert!(compat_catalog.starts_with("HTTP/1.1 200"), "{compat_catalog}");
+        assert!(compat_catalog.contains("\"tools\":[]"), "{compat_catalog}");
 
         shutdown_tx.send(true).expect("server accepts shutdown");
         server

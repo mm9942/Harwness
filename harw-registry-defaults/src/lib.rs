@@ -62,22 +62,45 @@ pub use profile::{
 /// Die Werkzeuge, die ohne Nutzerrückfrage ausgeführt werden dürfen.
 ///
 /// # Beschreibung
-/// Die Liste umfasst **genau** die read-only Oberfläche: lesende
-/// Dateisystem-Werkzeuge, die Dependency-Werkzeuge, die Web-Recherche (deren
-/// Netzgrenze die Host-Allowlist der Sandbox zieht, nicht die Freigabe), die
-/// lesenden Status-Operationen sowie die Plan-/Ziel-/Delegations-Operationen
-/// der Composition-Root.
+/// Die Liste umfasst ausschließlich Werkzeuge, die **nachweislich** nur lesen
+/// und an keiner Fläche eine Freigabe (`ApprovalPolicy != None`) deklarieren:
+/// lesende Dateisystem-Werkzeuge, die Dependency-Werkzeuge, `lens.ask`, die
+/// Web-Recherche (deren Netzgrenze die Host-Allowlist der Sandbox zieht, nicht
+/// die Freigabe) und die lesenden Status-Operationen `status`/`ps`.
 ///
-/// Sie ist bewusst vollständig: fehlte hier ein read-only Werkzeug, bliebe
-/// jeder Explore-Fan-out an einer Rückfrage hängen, die ein Kind-Agent nie
-/// beantworten kann ([`profile::RegistryProfile`]-Kinder laufen mit
-/// `allow_pause = false`). Umgekehrt bleibt alles Mutierende — `fs.write`,
-/// `shell.exec`, `stop` — und jedes unbekannte Werkzeug freigabepflichtig.
+/// Alles Mutierende — `fs.write`, `shell.exec`, `stop`, `plan`, `goal` —, alles
+/// mit Nebenwirkung über einen anderen Weg (`diff`, `explore`, `research_*`,
+/// `analyze`) und jedes unbekannte Werkzeug bleibt freigabepflichtig
+/// (fail-closed).
 ///
-/// Der Test `approval_allow_list_covers_every_read_only_profile_tool` hält die
-/// Liste an die Profil-Werkzeuglisten gekoppelt, damit sie nicht veralten kann.
+/// Die Liste ist eine **Obergrenze**, keine Garantie:
+/// `harw_core::turn_loop::check_approval` befragt jeden registrierten
+/// `ApprovalHandler` und
+/// aggregiert `Deny` > `AskUser` > `Allow`. Ein hinter
+/// [`DefaultApprovalPolicy`] angehängter Handler (etwa `ConfigApprovalPolicy`
+/// aus `[policy].require_approval_for`) kann ein hier gelistetes Werkzeug
+/// deshalb nur weiter einschränken, nie ein nicht gelistetes lockern — das gilt
+/// erst mit der Aggregation (W1-05); vorher entschied der erste Nicht-`Allow`.
+///
+/// # Kopplung an die Deklarationen
+/// - `harw-ops/tests/approval_declaration_gate.rs` prüft gegen die echte
+///   Operations-Registry: keine Operation mit `Surface::ModelTool { approval
+///   != None }` darf hier stehen.
+/// - Die Tests `auto_approved_tools_are_a_subset_of_the_read_only_surface` und
+///   `tools_with_a_declared_approval_are_never_auto_approved` (unten) prüfen
+///   die Richtung *Allowlist ⊆ read-only*. Die frühere Richtung (jedes
+///   beworbene Planning-Werkzeug muss auto-freigegeben sein) hatte
+///   `plan`/`goal` in die Liste gezwungen (Befund F-014/G-003); die
+///   Fan-out-Deckung gilt deshalb nur noch für Werkzeuge, die **dieses Crate**
+///   selbst registriert (`read_only_profile_tools_registered_here_stay_auto_approved`).
 pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // Lesende Dateisystem-Werkzeuge (`harw-tool-fs`).
+    //
+    // `fs.search` bleibt vorerst auto-freigegeben: der Symlink-Escape-Befund
+    // (W3 A1) wird im Werkzeug selbst gehärtet (W1-02), nicht über die
+    // Freigabe. Eine Rückfrage würde jeden read-only Fan-out blockieren
+    // (Kinder laufen mit `allow_pause = false`), ohne den Escape im
+    // `FullAccess`-Modus zu schließen.
     "fs.read",
     "fs.list",
     "fs.search",
@@ -99,18 +122,21 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     "web.fetch",
     "web.docs_rs",
     "web.crates_io",
-    // Lesende Status-Operationen.
+    // Lesende Status-Operationen (`harw-ops`, `model_tool(readonly, approval =
+    // "none")`, ohne Seitenpfad in andere Executor).
     "status",
     "ps",
-    "diff",
-    // Plan-/Ziel-/Delegations-Operationen der Composition-Root.
-    "plan",
-    "goal",
-    "explore",
-    "research_deps",
-    "research_web",
-    "analyze",
-    "mode",
+    // Bewusst entfernt (W1-05, Register F-014, G-003, G-004, F-043, G-068):
+    // - `plan`, `goal`: deklarieren `model_tool(approval = "always")` und
+    //   mutieren PlanStore bzw. Ziel; die Auto-Freigabe überstimmte die
+    //   Deklaration (Approval-Bypass im Root, Modus `Delegated`).
+    // - `explore`, `research_deps`, `research_web`, `analyze`: als `readonly`
+    //   gelabelt, schreiben aber Findings/PlanStore und starten Kind-Agenten
+    //   (Kosten, Budget) — keine read-only Oberfläche.
+    // - `diff`: ruft den `shell.exec`-Executor direkt auf und umginge damit
+    //   dessen Freigabe; `git diff` wertet zudem Repo-Konfiguration aus.
+    // - `mode`: hat keine Modell-Tool-Fläche; der Eintrag war wirkungslos und
+    //   hätte ein gleichnamiges Fremdwerkzeug (Plugin/MCP) freigeschaltet.
 ];
 
 /// Default approval boundary for the built-in coding-agent tool set.
@@ -301,12 +327,15 @@ mod tests {
     }
 
     #[test]
-    fn approval_allow_list_covers_every_read_only_profile_tool() {
-        // Jede read-only Profil-Werkzeugliste muss vollständig freigegeben sein:
-        // sonst blockiert ein Fan-out an einer Rückfrage, die ein Kind mit
-        // `allow_pause = false` nie beantworten kann.
+    fn read_only_profile_tools_registered_here_stay_auto_approved() {
+        // Fan-out-Schutz: ein Kind mit `allow_pause = false` kann keine
+        // Rückfrage beantworten. Gedeckt werden aber nur die Werkzeuge, die
+        // **dieses Crate** registriert (`registered_tool_names`) — nie die
+        // beworbenen Operationen der Composition-Root. Genau diese Kopplung
+        // an `tool_names()` hatte `plan`/`goal` in die Allowlist gezwungen
+        // (F-014/G-003).
         for profile in RegistryProfile::ALL.iter().filter(|p| p.is_read_only()) {
-            for tool in profile.tool_names() {
+            for tool in profile.registered_tool_names() {
                 assert!(
                     !DefaultApprovalPolicy::requires_explicit_approval(&call(tool)),
                     "{profile:?}: {tool} fehlt in AUTO_APPROVED_TOOLS"
@@ -315,14 +344,82 @@ mod tests {
         }
     }
 
+    /// Lesende Operationen der Composition-Root (`harw-ops`), die
+    /// `model_tool(readonly, approval = "none")` deklarieren und keinen
+    /// fremden Executor aufrufen (`harw-ops/src/status.rs`, `ps.rs`).
+    const READ_ONLY_ROOT_OPERATIONS: &[&str] = &["status", "ps"];
+
     #[test]
-    fn approval_allow_list_covers_every_builtin_role_tool() {
+    fn auto_approved_tools_are_a_subset_of_the_read_only_surface() {
+        // Umkehrung der früheren Deckungsprüfung: nicht „jedes Profil-Werkzeug
+        // muss in die Allowlist“, sondern „jeder Allowlist-Eintrag muss
+        // nachweislich read-only sein“.
+        let mut read_only_surface: Vec<&str> = READ_ONLY_ROOT_OPERATIONS.to_vec();
+        for profile in RegistryProfile::ALL.iter().filter(|p| p.is_read_only()) {
+            read_only_surface.extend(profile.registered_tool_names());
+        }
+        for tool in AUTO_APPROVED_TOOLS {
+            assert!(
+                read_only_surface.contains(tool),
+                "{tool} steht in AUTO_APPROVED_TOOLS, gehört aber zu keiner \
+                 read-only Oberfläche"
+            );
+        }
+        // Was nur `Full` registriert (fs.write, shell.exec, browser.*), ist
+        // per Definition nicht read-only und darf nie auto-freigegeben sein.
+        for tool in RegistryProfile::Full.registered_tool_names() {
+            if !read_only_surface.contains(&tool) {
+                assert!(
+                    DefaultApprovalPolicy::requires_explicit_approval(&call(tool)),
+                    "{tool} registriert nur Full und darf nicht auto-freigegeben sein"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tools_with_a_declared_approval_are_never_auto_approved() {
+        // Operationen mit `model_tool(approval = "always")`
+        // (`harw-ops/src/plan.rs`, `goal.rs`, `stop.rs`) sowie die in W1-05
+        // entfernten Einträge mit Nebenwirkung. Die registry-getriebene,
+        // vollständige Prüfung liegt in
+        // `harw-ops/tests/approval_declaration_gate.rs` (dieses Crate darf
+        // `harw-ops` nicht einmal als Dev-Dependency ziehen — Zyklus).
+        for name in [
+            "plan",
+            "goal",
+            "stop",
+            "explore",
+            "research_deps",
+            "research_web",
+            "analyze",
+            "diff",
+            "mode",
+        ] {
+            assert!(
+                DefaultApprovalPolicy::requires_explicit_approval(&call(name)),
+                "{name} deklariert eine Freigabe bzw. hat Nebenwirkungen und \
+                 darf nicht auto-freigegeben sein"
+            );
+        }
+    }
+
+    #[test]
+    fn no_builtin_role_advertises_a_tool_outside_its_registered_set() {
+        // Ohne `PLANNING_OPERATION_TOOLS` bewirbt keine Rolle mehr ein
+        // Werkzeug, das ihre Registry nicht trägt — insbesondere nicht
+        // `plan`/`goal` beim Planner, die im Kind nie einen Executor hatten.
         for role in role_names::ALL {
             let profile = profile_for_role(role).expect("eingebaute Rolle braucht ein Profil");
+            assert_eq!(
+                profile.tool_names(),
+                profile.registered_tool_names(),
+                "Rolle {role}: beworbene und registrierte Werkzeuge müssen übereinstimmen"
+            );
             for tool in profile.tool_names() {
                 assert!(
                     !DefaultApprovalPolicy::requires_explicit_approval(&call(tool)),
-                    "Rolle {role}: {tool} fehlt in AUTO_APPROVED_TOOLS"
+                    "Rolle {role}: {tool} würde im Kind an einer Rückfrage hängen"
                 );
             }
         }

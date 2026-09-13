@@ -868,15 +868,20 @@ fn active_profile_job_store_root(home: &Path) -> Result<PathBuf, String> {
 /// konfigurierten Resolver bleibt der bisherige direkte Provider-Aufbau
 /// erhalten.
 ///
-/// Nutzt [`harw_provider_http::build_provider`], das anhand des `api`-Felds des
-/// Default-Providers zwischen dem nativen Anthropic-Messages-Transport
-/// (`anthropic-messages`, inkl. Azure-Foundry-Gateway) und dem
-/// OpenAI-kompatiblen Transport wählt.
+/// Nutzt [`harw_provider_http::build_provider_with_home`], das anhand des
+/// `api`-Felds des Default-Providers zwischen dem nativen
+/// Anthropic-Messages-Transport (`anthropic-messages`, inkl.
+/// Azure-Foundry-Gateway) und dem OpenAI-kompatiblen Transport wählt und
+/// `file:`/`file-json:`-Referenzen unterhalb von `<home>/secrets/` auflöst.
 fn build_model(home: &Path, config: &ResolvedConfig) -> Result<Box<dyn ModelProvider>, String> {
     let resolver = crate::secret_store::open_configured_secret_resolver(home, config)?;
     let result = match resolver {
-        Some(resolver) => harw_provider_http::build_provider_with_resolver(config, &resolver),
-        None => harw_provider_http::build_provider(config),
+        Some(resolver) => harw_provider_http::build_provider_with_home(
+            config,
+            home,
+            Some(&resolver as &dyn harw_provider_http::SecretResolver),
+        ),
+        None => harw_provider_http::build_provider_with_home(config, home, None),
     };
     result.map_err(|error| {
         format!("Provider-Einrichtung unvollständig: {error}. Prüfe harw onboard.")

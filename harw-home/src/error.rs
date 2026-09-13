@@ -34,6 +34,25 @@ pub enum HomeError {
         /// Der abgelehnte Rohname.
         name: String,
     },
+    /// Der Trust-Store (`<home>/trusted-projects.toml`) ist unlesbar,
+    /// fehlerhaft oder nicht serialisierbar (Format, Version, Duplikate,
+    /// nicht-UTF-8-Pfad). Die Datei wird in diesem Fall nie stillschweigend
+    /// als leer behandelt.
+    TrustStore {
+        /// Pfad der Trust-Store-Datei.
+        path: PathBuf,
+        /// Menschenlesbare Ursache.
+        reason: String,
+    },
+    /// Ein Projekt kann nicht vertraut werden, weil sein `.harw` keine
+    /// eindeutige, symlinkfreie Grundlage für den Digest bietet (Symlink,
+    /// Sondertyp, Größen-/Anzahl-/Tiefengrenze).
+    UntrustableProject {
+        /// Betroffener Pfad (Projekt-`.harw` oder Eintrag darin).
+        path: PathBuf,
+        /// Menschenlesbare Ursache.
+        reason: String,
+    },
     /// Ein Dateisystem-Zugriff schlug fehl; `path` benennt das Ziel.
     Io {
         /// Pfad, an dem der I/O-Fehler auftrat.
@@ -64,6 +83,14 @@ impl fmt::Display for HomeError {
             Self::InvalidVisibilityName { name } => write!(
                 f,
                 "invalid visibility name {name:?}; use only ASCII letters, digits, '-' or '_'"
+            ),
+            Self::TrustStore { path, reason } => {
+                write!(f, "trust store {} is invalid: {reason}", path.display())
+            }
+            Self::UntrustableProject { path, reason } => write!(
+                f,
+                "project configuration at {} cannot be trusted: {reason}",
+                path.display()
             ),
             Self::Io { path, source } => {
                 write!(f, "filesystem error at {}: {source}", path.display())

@@ -3,20 +3,40 @@
 //! # Verantwortung
 //! Dieses Modul besitzt den `fs.write`-Executor:
 //! - [`FsWriteExecutor`]: implementiert [`ToolExecutor`]; schreibt eine Datei in
-//!   den Workspace. Prüft `WriteWorkspace`-Permission und delegiert Path-Resolution
-//!   an `ctx.sandbox().workspace().resolve_for_create()`.
+//!   den Workspace. Prüft `WriteWorkspace`-Permission, lehnt geschützte Pfade
+//!   ab, öffnet das Elternverzeichnis symlinkfrei unterhalb der
+//!   Workspace-Wurzel und schreibt atomar über [`harw_fsutil::write_atomic`].
+//!
+//! # Sicherheitsregeln (W1-02)
+//! - **Geschützte Pfade:** jede Pfadkomponente `.git` oder `.harw`
+//!   (ASCII-Groß-/Kleinschreibung egal) wird abgelehnt — Git-Hooks und
+//!   `.git/config` führen sonst Code auf dem Host aus, `.harw/` ist die
+//!   repo-lokale Konfigurationsebene.
+//! - **Elternverzeichnis:** wird mit `open_beneath` geöffnet (kein Pfadglied
+//!   darf ein Symlink sein) und `write_atomic` über `/proc/self/fd/<fd>`
+//!   übergeben, sodass ein nachträglicher Tausch eines Verzeichnisses gegen
+//!   einen Symlink den Schreibort nicht mehr umlenkt (Rückfall ohne `/proc`:
+//!   Pfad unter der Wurzel mit dokumentiertem Restfenster, siehe
+//!   `tree`-Modul).
+//! - **Zielname:** ein Symlink am Ziel wird ersetzt, nie gefolgt. Rechte-Bits
+//!   werden nur von einer vorhandenen **regulären** Datei übernommen
+//!   (`lstat`, `& 0o777`), nie vom Ziel eines Symlinks; neue Dateien erhalten
+//!   `0644`.
+//! - Elternverzeichnisse werden nicht angelegt.
 //!
 //! # Schlüsseltypen
 //! - [`FsWriteExecutor`]
 //!
 //! # Nebenläufigkeit
 //! [`FsWriteExecutor`] ist `Send + Sync`. `fs.write` ist NICHT `parallel_safe`
-//! (Writes sind nicht commutative).
+//! (Writes sind nicht commutative). Die Datei-IO läuft im Blocking-Pool.
 //!
 //! # Fehler
 //! Permission-Fehler → `Ok(ToolOutput::error(...))`. Kein Panic.
 
 use crate::error::FsToolError;
+use crate::tree::{Workspace, normalize_relative};
+use harw_fsutil::{AtomicWriteOptions, write_atomic};
 use harw_sandbox::Permission;
 use harw_tools::{
     ToolCall, ToolOutput,
@@ -24,80 +44,27 @@ use harw_tools::{
     executor::{ToolExecutionContext, ToolExecutor, ToolExecutorFuture},
 };
 use serde::Deserialize;
-use std::{
-    fs::{self as std_fs, File, OpenOptions},
-    io::{self, Write},
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Component, Path};
 
-static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// Rechte-Bits neu angelegter Dateien (unabhängig vom `umask`).
+const NEW_FILE_MODE: u32 = 0o644;
 
-const TEMP_FILE_PREFIX: &str = ".harw-write-";
+/// Pfadkomponenten, unter die `fs.write` nie schreibt.
+const PROTECTED_COMPONENTS: &[&str] = &[".git", ".harw"];
 
-fn atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "destination path has no parent directory",
-        )
-    })?;
-    let file_name = path.file_name().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "destination path has no file name",
-        )
-    })?;
-    let existing_permissions = std_fs::metadata(path)
-        .ok()
-        .map(|metadata| metadata.permissions());
-
-    let (temp_path, mut temp_file) = create_temp_file(parent, file_name)?;
-    let write_result = (|| {
-        temp_file.write_all(content)?;
-        temp_file.sync_all()?;
-
-        if let Some(permissions) = existing_permissions {
-            temp_file.set_permissions(permissions)?;
-            temp_file.sync_all()?;
-        }
-
-        drop(temp_file);
-        std_fs::rename(&temp_path, path)?;
-        File::open(parent)?.sync_all()
-    })();
-
-    if write_result.is_err() {
-        let _ = std_fs::remove_file(&temp_path);
-    }
-
-    write_result
-}
-
-fn create_temp_file(parent: &Path, file_name: &std::ffi::OsStr) -> io::Result<(PathBuf, File)> {
-    for _ in 0..32 {
-        let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temp_path = parent.join(format!(
-            "{TEMP_FILE_PREFIX}{}-{sequence}-{}",
-            std::process::id(),
-            file_name.to_string_lossy()
-        ));
-
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-        {
-            Ok(file) => return Ok((temp_path, file)),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(err),
-        }
-    }
-
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "could not allocate a unique temporary file",
-    ))
+/// Liefert die erste geschützte Komponente von `relative`, falls vorhanden.
+fn protected_component(relative: &Path) -> Option<&'static str> {
+    relative.components().find_map(|component| {
+        let Component::Normal(part) = component else {
+            return None;
+        };
+        let part = part.to_str()?;
+        PROTECTED_COMPONENTS
+            .iter()
+            .copied()
+            .find(|protected| part.eq_ignore_ascii_case(protected))
+    })
 }
 
 /// Deserialisierte Argumente für `fs.write`.
@@ -112,9 +79,9 @@ struct FsWriteArgs {
 /// Führt `fs.write`-Aufrufe aus.
 ///
 /// # Description
-/// Schreibt `content` in eine Datei relativ zum Workspace-Root des
-/// Sandbox-Kontexts. Prüft `WriteWorkspace`-Permission und delegiert
-/// Path-Resolution an `ctx.sandbox().workspace().resolve_for_create()`.
+/// Schreibt `content` atomar in eine Datei relativ zum Workspace-Root des
+/// Sandbox-Kontexts. Prüft `WriteWorkspace`-Permission, lehnt geschützte
+/// Pfade (`.git`, `.harw`) ab und öffnet das Elternverzeichnis symlinkfrei.
 ///
 /// # Concurrency
 /// `Send + Sync`; über [`std::sync::Arc`] teilbar. Schreiboperationen sind
@@ -122,7 +89,7 @@ struct FsWriteArgs {
 ///
 /// # Errors
 /// Permission-Fehler → `Ok(ToolOutput::error(...))`.
-/// I/O/Arg-Fehler → `Ok(ToolOutput::error(...))`.
+/// I/O/Pfad-Fehler → `Ok(ToolOutput::error(...))`.
 ///
 /// # Examples
 /// ```rust,no_run
@@ -132,7 +99,7 @@ struct FsWriteArgs {
 pub struct FsWriteExecutor;
 
 impl FsWriteExecutor {
-    /// Führt den Schreib-Vorgang synchron aus und gibt ein [`ToolOutput`] zurück.
+    /// Führt den Schreib-Vorgang synchron (blockierend) aus.
     ///
     /// # Errors
     /// Gibt `Err(ToolsError::InvalidArguments)` bei ungültigen JSON-Argumenten.
@@ -163,18 +130,52 @@ impl FsWriteExecutor {
             }
         };
 
-        // Safe path resolution via sandbox (creates parent if needed via resolve_for_create)
-        let relative = PathBuf::from(&args.path);
-        let resolved = match ctx.sandbox().workspace().resolve_for_create(&relative) {
-            Ok(p) => p,
-            Err(err) => {
-                return Ok(ToolOutput::error(err.to_string()));
-            }
+        let relative = match normalize_relative(&args.path) {
+            Ok(rel) => rel,
+            Err(reason) => return Ok(ToolOutput::error(format!("fs.write: {reason}"))),
+        };
+        if let Some(protected) = protected_component(&relative) {
+            return Ok(ToolOutput::error(format!(
+                "fs.write: '{}' liegt im geschützten Bereich '{protected}/' und wird nicht \
+                 geschrieben",
+                args.path
+            )));
+        }
+        let (Some(name), Some(parent_rel)) = (relative.file_name(), relative.parent()) else {
+            return Ok(ToolOutput::error(format!(
+                "fs.write: '{}' enthält keinen Dateinamen",
+                args.path
+            )));
         };
 
-        // Write via a durable same-directory temporary file and atomic rename.
+        // Elternverzeichnis symlinkfrei öffnen (legt nichts an).
+        let workspace = match Workspace::open(ctx.sandbox().workspace().canonical_root()) {
+            Ok(workspace) => workspace,
+            Err(err) => return Ok(ToolOutput::error(FsToolError::Io(err).to_string())),
+        };
+        let parent = match workspace.open_dir(parent_rel) {
+            Ok(parent) => parent,
+            Err(err) => {
+                return Ok(ToolOutput::error(format!(
+                    "fs.write: Elternverzeichnis von '{}' ist nicht nutzbar \
+                     (Symlinks werden nicht verfolgt, Verzeichnisse nicht angelegt): {err}",
+                    args.path
+                )));
+            }
+        };
+        // Solange `parent` offen ist, bezeichnet dieser Pfad genau das geöffnete
+        // Verzeichnis (`/proc/self/fd/<fd>`).
+        let target = workspace.dir_path(&parent, parent_rel).join(name);
+
+        // Rechte nur von einer vorhandenen regulären Datei übernehmen (lstat).
+        let mode = match std::fs::symlink_metadata(&target) {
+            Ok(meta) if meta.file_type().is_file() => meta.permissions().mode() & 0o777,
+            _ => NEW_FILE_MODE,
+        };
+
+        // Atomar über Tempdatei + rename; ein Ziel-Symlink wird ersetzt.
         let byte_count = args.content.len();
-        match atomic_write(&resolved, args.content.as_bytes()) {
+        match write_atomic(&target, args.content.as_bytes(), AtomicWriteOptions::with_mode(mode)) {
             Ok(()) => Ok(ToolOutput::text(format!(
                 "wrote {byte_count} bytes to {}",
                 args.path
@@ -200,20 +201,24 @@ impl ToolExecutor for FsWriteExecutor {
     /// - [`ToolsError::InvalidArguments`]: fehlende oder fehlerhafte JSON-Argumente.
     ///
     /// # Concurrency
-    /// Nicht parallel-safe (Writes nicht commutative).
+    /// Nicht parallel-safe (Writes nicht commutative); läuft im Blocking-Pool.
     fn execute<'a>(
         &'a self,
         context: &'a ToolExecutionContext,
         call: &'a ToolCall,
     ) -> ToolExecutorFuture<'a> {
-        let result = self.write_file(context, call);
-        Box::pin(async move { result })
+        let context = context.clone();
+        let call = call.clone();
+        Box::pin(crate::blocking::run_blocking("fs.write", move || {
+            FsWriteExecutor.write_file(&context, &call)
+        }))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{Fixture, SECRET, call, render};
     use harw_sandbox::{
         Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
     };
@@ -278,12 +283,13 @@ mod tests {
         // Verify the file was actually written
         let written = fs::read_to_string(ws.join("output.txt")).unwrap();
         assert_eq!(written, "hello from test");
-        assert!(
-            fs::read_dir(&ws).unwrap().all(|entry| !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(TEMP_FILE_PREFIX)),
+        let names: Vec<String> = fs::read_dir(&ws)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["output.txt".to_owned()],
             "temporary write file should be renamed or cleaned up"
         );
     }
@@ -357,5 +363,105 @@ mod tests {
             matches!(result, Err(ToolsError::InvalidArguments { .. })),
             "expected InvalidArguments, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn test_fs_write_rejects_protected_paths() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.ws.join(".git/hooks")).unwrap();
+        fs::create_dir_all(fixture.ws.join(".harw")).unwrap();
+        fs::create_dir_all(fixture.ws.join("vendor/lib/.GIT")).unwrap();
+        let ctx = fixture.ctx(vec![Permission::WriteWorkspace]);
+
+        for path in [
+            ".git/hooks/pre-commit",
+            ".git/config",
+            "./.git/hooks/post-checkout",
+            ".git",
+            ".harw/config.toml",
+            "vendor/lib/.GIT/config",
+        ] {
+            let args = serde_json::json!({ "path": path, "content": "#!/bin/sh" });
+            let call = call("fs.write", args);
+            match FsWriteExecutor.write_file(&ctx, &call).unwrap() {
+                ToolOutput::Error { message } => {
+                    assert!(message.contains("geschützt"), "{path}: {message}");
+                }
+                other => panic!("{path}: expected error, got {other:?}"),
+            }
+        }
+        assert!(!fixture.ws.join(".git/hooks/pre-commit").exists());
+        assert!(!fixture.ws.join(".git/config").exists());
+        assert!(!fixture.ws.join(".harw/config.toml").exists());
+        assert!(!fixture.ws.join("vendor/lib/.GIT/config").exists());
+        // Ähnliche, aber ungeschützte Namen bleiben schreibbar.
+        let call = call("fs.write", serde_json::json!({ "path": ".gitignore", "content": "x" }));
+        assert!(matches!(
+            FsWriteExecutor.write_file(&ctx, &call).unwrap(),
+            ToolOutput::Text { .. }
+        ));
+    }
+
+    #[test]
+    fn test_fs_write_replaces_target_symlink_without_following() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = Fixture::new();
+        let secret = fixture.outside.join("secret.txt");
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        fixture.plant_escapes();
+        let ctx = fixture.ctx(vec![Permission::WriteWorkspace]);
+
+        let call = call("fs.write", serde_json::json!({ "path": "link_file", "content": "neu" }));
+        let output = FsWriteExecutor.write_file(&ctx, &call).unwrap();
+        assert!(matches!(output, ToolOutput::Text { .. }), "{output:?}");
+        assert_eq!(fs::read_to_string(&secret).unwrap(), SECRET, "Ziel darf unberührt bleiben");
+        let replaced = fixture.ws.join("link_file");
+        let meta = fs::symlink_metadata(&replaced).unwrap();
+        assert!(meta.file_type().is_file(), "Symlink muss durch Datei ersetzt sein");
+        assert_eq!(fs::read_to_string(&replaced).unwrap(), "neu");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o644, "keine Mode-Kopie vom Symlink-Ziel");
+    }
+
+    #[test]
+    fn test_fs_write_rejects_symlinked_parent_and_traversal() {
+        let fixture = Fixture::new();
+        fixture.plant_escapes();
+        let ctx = fixture.ctx(vec![Permission::WriteWorkspace]);
+
+        let escapes = [
+            "link_dir/planted.txt",
+            "loop/planted.txt",
+            "nested/up/planted.txt",
+            "../planted.txt",
+            "/tmp/planted.txt",
+            "missing/planted.txt",
+        ];
+        for path in escapes {
+            let call = call("fs.write", serde_json::json!({ "path": path, "content": "x" }));
+            let output = FsWriteExecutor.write_file(&ctx, &call).unwrap();
+            assert!(matches!(output, ToolOutput::Error { .. }), "{path}: {output:?}");
+            assert!(!render(&output).contains(fixture.outside.to_str().unwrap()));
+        }
+        assert!(!fixture.outside.join("planted.txt").exists());
+        assert!(!fixture.ws.join("planted.txt").exists());
+        assert!(!fixture.ws.join("missing").exists(), "Elternverzeichnisse werden nicht angelegt");
+    }
+
+    #[test]
+    fn test_fs_write_race_parent_replaced_by_symlink() {
+        let fixture = Fixture::new();
+        fs::create_dir_all(fixture.ws.join("out")).unwrap();
+        let ctx = fixture.ctx(vec![Permission::WriteWorkspace]);
+        let call = call("fs.write", serde_json::json!({ "path": "out/file.txt", "content": "x" }));
+        let output = FsWriteExecutor.write_file(&ctx, &call).unwrap();
+        assert!(matches!(output, ToolOutput::Text { .. }), "{output:?}");
+
+        // Wettlauf-Surrogat: Elternverzeichnis gegen Symlink nach außen getauscht.
+        fs::rename(fixture.ws.join("out"), fixture.ws.join("out_old")).unwrap();
+        std::os::unix::fs::symlink(&fixture.outside, fixture.ws.join("out")).unwrap();
+        let output = FsWriteExecutor.write_file(&ctx, &call).unwrap();
+        assert!(matches!(output, ToolOutput::Error { .. }), "{output:?}");
+        assert!(!fixture.outside.join("file.txt").exists());
     }
 }

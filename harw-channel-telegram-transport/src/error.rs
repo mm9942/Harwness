@@ -125,7 +125,16 @@ impl std::error::Error for TelegramTransportError {
 
 impl From<reqwest::Error> for TelegramTransportError {
     fn from(value: reqwest::Error) -> Self {
-        Self::Transport(value)
+        // Die Bot-API-URL enthält den Token im Pfad (`/bot<token>/…`).
+        // `reqwest::Error` haengt diese URL sowohl an `Display` als auch an
+        // `Debug` an (siehe reqwest 0.12.28 `error.rs`); `Self::Transport`s
+        // eigenes `Display`/`Debug` ist zwar bereits inhaltsfrei (siehe oben),
+        // aber `source()` gibt genau diesen `reqwest::Error` unverändert
+        // zurück (`impl Error for TelegramTransportError` unten) und jeder
+        // Fehlerreporter, der die `source()`-Kette ausgibt, würde den Token
+        // sonst leaken (F-041/S8). `without_url()` entfernt die URL, bevor
+        // der Fehler überhaupt in diese Variante gelangt.
+        Self::Transport(value.without_url())
     }
 }
 
@@ -200,6 +209,35 @@ mod tests {
             "failed to atomically replace durable Telegram offset"
         );
         assert_secret_redacted(error, secret_path);
+    }
+
+    #[tokio::test]
+    async fn reqwest_conversion_strips_the_bot_token_bearing_url_from_source_too() {
+        let secret = "123456:telegram-bot-secret-token";
+        let client = reqwest::Client::new();
+        // Ein geschlossener Loopback-Port scheitert sofort beim Verbindungsaufbau,
+        // ganz ohne echten Netzwerkzugriff, und reqwest haengt dabei die
+        // angefragte URL (inkl. Bot-Token im Pfad) an den Fehler.
+        let request_error = client
+            .get(format!("http://127.0.0.1:1/bot{secret}/getMe"))
+            .send()
+            .await
+            .expect_err("connecting to a closed local port must fail");
+        assert!(
+            request_error.url().is_some(),
+            "precondition: reqwest attaches the request URL to a transport error"
+        );
+
+        let error = TelegramTransportError::from(request_error);
+
+        // `source()` gibt den gewrappten `reqwest::Error` unveraendert zurueck;
+        // dessen Display/Debug duerfen nach der Konvertierung kein Token mehr
+        // enthalten (F-041/S8), nicht nur `TelegramTransportError`s eigenes
+        // redigiertes Display/Debug.
+        let source = std::error::Error::source(&error).expect("transport error keeps its source");
+        assert!(!source.to_string().contains(secret));
+        assert!(!format!("{source:?}").contains(secret));
+        assert_secret_redacted(error, secret);
     }
 
     #[test]

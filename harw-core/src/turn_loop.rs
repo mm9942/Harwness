@@ -454,26 +454,59 @@ fn emit(session: &AgentSession, event: TurnEvent) {
     }
 }
 
-/// Prüft einen `ToolCall` gegen alle `ApprovalHandler`.
+/// Prüft einen `ToolCall` gegen alle `ApprovalHandler` und aggregiert.
 ///
-/// Der erste Handler, der nicht `Allow` zurückgibt, gewinnt (Deny/AskUser
-/// haben Vorrang). Ohne Handler gilt `Allow`.
+/// # Beschreibung
+/// **Jeder** registrierte Handler wird befragt, genau einmal und in
+/// Registrierungsreihenfolge. Das Ergebnis folgt der strengsten Stimme:
+///
+/// `Deny` > `AskUser` > `Allow`
+///
+/// - Sagt irgendein Handler `Deny`, gilt das **erste** `Deny` (dessen
+///   Begründung), auch wenn ein früherer Handler `AskUser` geliefert hat.
+/// - Sonst gilt das **erste** `AskUser` samt seiner `ItemId`; spätere
+///   `AskUser`-Anfragen werden verworfen.
+/// - Nur wenn alle `Allow` sagen (oder kein Handler registriert ist), gilt
+///   `Allow`.
+///
+/// Früher gewann der erste Nicht-`Allow`: ein vorn registriertes `AskUser`
+/// (etwa `DefaultApprovalPolicy`) überstimmte ein später registriertes `Deny`
+/// (etwa `ConfigApprovalPolicy`), der Nutzer konnte also freigeben, was eine
+/// Politik verboten hatte (W1-05, Register G-004). Mit der Aggregation kann ein
+/// angehängter Handler nur noch einschränken, nie lockern.
+///
+/// Ein `Deny` bricht die Befragung **nicht** ab: die Einmal-Befragung je
+/// Handler bleibt die Invariante, ein Kurzschluss würde dagegen die
+/// Befragungszahl von der Handler-Reihenfolge abhängig machen. `review` ist
+/// laut Vertrag seiteneffektfrei (`harw_extension_api::ApprovalHandler`,
+/// W0B-07); die weiteren Aufrufe öffnen deshalb keine zusätzlichen Prompts.
 ///
 /// # Invariante
 /// Ein `ApprovalHandler` wird pro Tool-Call **höchstens einmal** befragt: er
-/// darf Nutzer-Interaktion auslösen, eine Approval-`ItemId` vergeben oder einen
-/// Audit-Eintrag schreiben. Wer diese Funktion außerhalb des sequenziellen
-/// Tool-Loops aufruft (siehe [`PreparedApprovals`]), muss die Entscheidung
-/// deshalb weiterreichen statt sie später erneut einzuholen.
+/// darf eine Approval-`ItemId` vergeben oder einen Audit-Eintrag schreiben.
+/// Wer diese Funktion außerhalb des sequenziellen Tool-Loops aufruft (siehe
+/// [`PreparedApprovals`]), muss die Entscheidung deshalb weiterreichen statt
+/// sie später erneut einzuholen.
 pub async fn check_approval(session: &AgentSession, call: &ToolCall) -> ApprovalDecision {
+    let mut first_ask: Option<ApprovalDecision> = None;
+    let mut first_deny: Option<ApprovalDecision> = None;
     for handler in session.registry().approval_handlers() {
         let decision = handler.review(call).await;
-        match &decision {
-            ApprovalDecision::Allow => continue,
-            _ => return decision,
+        match decision {
+            ApprovalDecision::Allow => {}
+            ApprovalDecision::AskUser(_) => {
+                if first_ask.is_none() {
+                    first_ask = Some(decision);
+                }
+            }
+            ApprovalDecision::Deny(_) => {
+                if first_deny.is_none() {
+                    first_deny = Some(decision);
+                }
+            }
         }
     }
-    ApprovalDecision::Allow
+    first_deny.or(first_ask).unwrap_or(ApprovalDecision::Allow)
 }
 
 /// Guardrail-Entscheidungen, die für eine Modellantwort bereits eingeholt
@@ -487,7 +520,10 @@ pub async fn check_approval(session: &AgentSession, call: &ToolCall) -> Approval
 /// Vorprüfung ihre Entscheidungen hier ab; der sequenzielle Fallback verbraucht
 /// sie, statt erneut zu fragen (siehe [`check_approval`]).
 ///
-/// Die Vorprüfung bricht beim ersten Nicht-`Allow` ab. Für die dahinter
+/// Jeder Eintrag ist bereits die **aggregierte** Entscheidung aller Handler
+/// (`Deny` > `AskUser` > `Allow`, siehe [`check_approval`]) — Vorprüfung und
+/// sequenzieller Pfad entscheiden damit identisch. Die Vorprüfung bricht beim
+/// ersten Call ab, dessen Aggregat nicht `Allow` ist. Für die dahinter
 /// liegenden Calls steht deshalb kein Eintrag bereit — die werden im
 /// sequenziellen Pfad ganz normal, also ebenfalls genau einmal, geprüft.
 ///
@@ -1739,6 +1775,11 @@ async fn try_execute_parallel_calls(
 /// `Allow` ist.
 ///
 /// # Beschreibung
+/// Die Entscheidung je Call stammt aus [`check_approval`] und ist damit
+/// dieselbe Aggregation über **alle** Handler (`Deny` > `AskUser` > `Allow`)
+/// wie im sequenziellen Pfad — ein später registriertes `Deny` kann auch hier
+/// nicht von einem früheren `AskUser` verdeckt werden.
+///
 /// Jede eingeholte Entscheidung — auch die abschlägige — wird in `prepared`
 /// hinterlegt, damit der sequenzielle Fallback sie verbrauchen kann statt
 /// denselben Handler erneut zu fragen. Ohne registrierten `ApprovalHandler`
@@ -2609,6 +2650,23 @@ mod tests {
             .with_spawn_context(test_spawn_context())
     }
 
+    /// Wie [`guarded_session`], aber mit mehreren Handlern in genau der
+    /// übergebenen Registrierungsreihenfolge (W1-05: Aggregation).
+    fn multi_guarded_session(
+        provider: Arc<dyn ToolProvider>,
+        handlers: &[Arc<CountingApproval>],
+    ) -> AgentSession {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut builder = ExtensionRegistryBuilder::default().tool_provider(provider);
+        for handler in handlers {
+            // Erst konkret klonen, dann beim Argument zu `Arc<dyn …>` coercen.
+            let handler: Arc<CountingApproval> = Arc::clone(handler);
+            builder = builder.approval_handler(handler);
+        }
+        AgentSession::new(AgentRole::Assistant, None, builder.build(), tx)
+            .with_spawn_context(test_spawn_context())
+    }
+
     fn call(id: &ToolCallId, name: &str) -> ToolCall {
         ToolCall {
             id: id.clone(),
@@ -2826,6 +2884,136 @@ mod tests {
 
         assert!(matches!(outcome, TurnOutcome::Completed));
         assert_eq!(handler.total_reviews(), 1);
+    }
+
+    // ------------------------------------------------------------------
+    // W1-05: Aggregation Deny > AskUser > Allow über alle Handler
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn check_approval_lets_a_later_deny_beat_an_earlier_ask_user() {
+        // Regression G-004: früher gewann das vorn registrierte `AskUser`, der
+        // Nutzer hätte freigeben können, was eine spätere Politik verbietet.
+        let id = ToolCallId::new();
+        let asking = Arc::new(CountingApproval::new(vec![(
+            id.clone(),
+            ApprovalDecision::AskUser(harw_types::ItemId::new()),
+        )]));
+        let denying = Arc::new(CountingApproval::new(vec![(
+            id.clone(),
+            ApprovalDecision::Deny("policy".to_owned()),
+        )]));
+        let session = multi_guarded_session(
+            StubToolProvider::with_names(&["lookup"]),
+            &[Arc::clone(&asking), Arc::clone(&denying)],
+        );
+
+        let decision = check_approval(&session, &call(&id, "lookup")).await;
+
+        match decision {
+            ApprovalDecision::Deny(reason) => assert_eq!(reason, "policy"),
+            other => panic!("ein späteres Deny muss gewinnen, war: {other:?}"),
+        }
+        assert_eq!(asking.reviews_for(&id), 1, "jeder Handler genau einmal");
+        assert_eq!(denying.reviews_for(&id), 1, "jeder Handler genau einmal");
+    }
+
+    #[tokio::test]
+    async fn check_approval_allows_only_when_every_handler_allows() {
+        let id = ToolCallId::new();
+        let first = Arc::new(CountingApproval::allow_everything());
+        let second = Arc::new(CountingApproval::allow_everything());
+        let session = multi_guarded_session(
+            StubToolProvider::with_names(&["lookup"]),
+            &[Arc::clone(&first), Arc::clone(&second)],
+        );
+
+        let decision = check_approval(&session, &call(&id, "lookup")).await;
+
+        assert!(matches!(decision, ApprovalDecision::Allow));
+        assert_eq!(first.reviews_for(&id), 1);
+        assert_eq!(second.reviews_for(&id), 1);
+    }
+
+    #[tokio::test]
+    async fn check_approval_keeps_the_first_ask_user_over_allow_and_later_requests() {
+        let id = ToolCallId::new();
+        let first_request = harw_types::ItemId::new();
+        let asking = Arc::new(CountingApproval::new(vec![(
+            id.clone(),
+            ApprovalDecision::AskUser(first_request.clone()),
+        )]));
+        let allowing = Arc::new(CountingApproval::allow_everything());
+        let asking_later = Arc::new(CountingApproval::new(vec![(
+            id.clone(),
+            ApprovalDecision::AskUser(harw_types::ItemId::new()),
+        )]));
+        let session = multi_guarded_session(
+            StubToolProvider::with_names(&["lookup"]),
+            &[
+                Arc::clone(&asking),
+                Arc::clone(&allowing),
+                Arc::clone(&asking_later),
+            ],
+        );
+
+        let decision = check_approval(&session, &call(&id, "lookup")).await;
+
+        match decision {
+            ApprovalDecision::AskUser(request) => assert_eq!(
+                request, first_request,
+                "die erste Anfrage-ID gilt, spätere werden verworfen"
+            ),
+            other => panic!("AskUser + Allow muss AskUser ergeben, war: {other:?}"),
+        }
+        assert_eq!(asking.reviews_for(&id), 1);
+        assert_eq!(allowing.reviews_for(&id), 1);
+        assert_eq!(asking_later.reviews_for(&id), 1);
+    }
+
+    #[tokio::test]
+    async fn parallel_preflight_aggregates_a_later_deny_over_an_earlier_ask_user() {
+        // Der Parallel-Vorprüfpfad muss identisch aggregieren: statt einer
+        // Approval-Pause (früheres `AskUser`) wird der Call abgelehnt, der
+        // erlaubte Call läuft, und kein Handler wird doppelt gefragt.
+        let allowed = ToolCallId::new();
+        let contested = ToolCallId::new();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let asking = Arc::new(CountingApproval::new(vec![(
+            contested.clone(),
+            ApprovalDecision::AskUser(harw_types::ItemId::new()),
+        )]));
+        let denying = Arc::new(CountingApproval::new(vec![(
+            contested.clone(),
+            ApprovalDecision::Deny("policy".to_owned()),
+        )]));
+        let provider = StubParallelProvider::instant(&["lookup"], Arc::clone(&executions));
+        let mut session =
+            multi_guarded_session(provider, &[Arc::clone(&asking), Arc::clone(&denying)]);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![
+            response_with(vec![call(&allowed, "lookup"), call(&contested, "lookup")]),
+            crate::model::ModelResponse::text("weiter ohne den abgelehnten Call"),
+        ]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("aggregate"))
+            .await
+            .expect("ein Deny beendet den Turn nicht");
+
+        assert!(
+            matches!(outcome, TurnOutcome::Completed),
+            "Deny muss AskUser schlagen, der Turn darf nicht pausieren: {outcome:?}"
+        );
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "nur der erlaubte Call darf ausgeführt werden"
+        );
+        for handler in [&asking, &denying] {
+            assert_eq!(handler.reviews_for(&allowed), 1);
+            assert_eq!(handler.reviews_for(&contested), 1);
+            assert_eq!(handler.total_reviews(), 2);
+        }
     }
 
     #[test]

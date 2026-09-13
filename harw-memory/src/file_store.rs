@@ -18,26 +18,14 @@
 //!   workflow.json
 //! ```
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
+#[cfg(not(unix))]
+use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-#[cfg(any(
-    target_os = "android",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "haiku",
-    target_os = "illumos",
-    target_os = "ios",
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "solaris",
-))]
-use std::os::unix::fs::OpenOptionsExt;
-
+use harw_fsutil::OpenMode;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -62,21 +50,9 @@ const SIGNAL_FILE_CORRECTION: &str = "corrections.jsonl";
 const SIGNAL_FILE_REFLECTION: &str = "reflections.jsonl";
 const SIGNAL_FILE_PATTERN: &str = "patterns.jsonl";
 
-#[cfg(any(target_os = "android", target_os = "linux"))]
-const O_NOFOLLOW: i32 = 0o400000;
-
-#[cfg(any(
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "haiku",
-    target_os = "illumos",
-    target_os = "ios",
-    target_os = "macos",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "solaris",
-))]
-const O_NOFOLLOW: i32 = 0x100;
+/// Default-Anlege-Modus, identisch zum bisherigen Verhalten: `std::fs::OpenOptions`
+/// legt ohne `.mode(...)` mit `0o666` (abzüglich `umask`) an.
+const DEFAULT_CREATE_MODE: u32 = 0o666;
 
 /// Datei-basiertes Memory-Backend.
 ///
@@ -400,13 +376,14 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> MemoryResult<()> {
         path: tmp.clone(),
         source: e,
     })?;
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    let mut file =
-        open_without_following_symlinks(&mut options, &tmp).map_err(|e| MemoryError::Io {
-            path: tmp.clone(),
-            source: e,
-        })?;
+    let mut file = open_without_following_symlinks(
+        OpenMode::write_truncate(DEFAULT_CREATE_MODE),
+        &tmp,
+    )
+    .map_err(|e| MemoryError::Io {
+        path: tmp.clone(),
+        source: e,
+    })?;
     file.write_all(bytes).map_err(|e| MemoryError::Io {
         path: tmp.clone(),
         source: e,
@@ -450,28 +427,30 @@ fn read_optional_string_without_following_symlinks(path: &Path) -> io::Result<Op
 
 fn open_file_without_following_symlinks(path: &Path) -> io::Result<File> {
     reject_symlink(path)?;
-    let mut options = OpenOptions::new();
-    options.read(true);
-    open_without_following_symlinks(&mut options, path)
+    open_without_following_symlinks(OpenMode::read_only(), path)
 }
 
-fn open_without_following_symlinks(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
-    #[cfg(any(
-        target_os = "android",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "haiku",
-        target_os = "illumos",
-        target_os = "ios",
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "solaris",
-    ))]
-    options.custom_flags(O_NOFOLLOW);
-
-    options.open(path)
+/// Öffnet `path` ohne dem letzten Pfadglied als Symlink zu folgen
+/// (F-006: das architekturabhängig falsche `O_NOFOLLOW` wurde durch
+/// `harw_fsutil::open_nofollow` ersetzt, das die Konstante über
+/// `rustix::fs::OFlags::NOFOLLOW` plattformkorrekt bezieht).
+fn open_without_following_symlinks(mode: OpenMode, path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        harw_fsutil::open_nofollow(path, mode)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut options = OpenOptions::new();
+        options
+            .read(mode.read)
+            .write(mode.write || mode.append)
+            .create(mode.create)
+            .create_new(mode.create_new)
+            .truncate(mode.truncate)
+            .append(mode.append);
+        options.open(path)
+    }
 }
 
 fn reject_symlink(path: &Path) -> io::Result<()> {
@@ -577,13 +556,14 @@ impl Memory for FileMemoryStore {
             path: path.clone(),
             source: e,
         })?;
-        let mut options = OpenOptions::new();
-        options.create(true).append(true);
-        let mut file =
-            open_without_following_symlinks(&mut options, &path).map_err(|e| MemoryError::Io {
-                path: path.clone(),
-                source: e,
-            })?;
+        let mut file = open_without_following_symlinks(
+            OpenMode::append_create(DEFAULT_CREATE_MODE),
+            &path,
+        )
+        .map_err(|e| MemoryError::Io {
+            path: path.clone(),
+            source: e,
+        })?;
         writeln!(file, "{line}").map_err(|e| MemoryError::Io {
             path: path.clone(),
             source: e,

@@ -441,7 +441,7 @@ fn serve_mcp(
     let store = Arc::new(JobStore::new(&storage_root));
     let executions = Arc::new(JobExecutionRegistry::new());
     let provider: Arc<dyn ModelProvider> =
-        build_serve_provider(&config, secret_resolver.as_ref())?.into();
+        build_serve_provider(&config, home.as_deref(), secret_resolver.as_ref())?.into();
     let transcript_root = storage_root.join("jobs").join("transcripts");
     std::fs::create_dir_all(&transcript_root)
         .map_err(|error| format!("could not create job transcript root: {error}"))?;
@@ -526,13 +526,25 @@ fn serve_mcp(
     })
 }
 
+/// Baut den Provider für `harw serve`.
+///
+/// # Arguments
+/// - `home` (`Option<&Path>`): aktives harw-Home. Liegt es vor, werden
+///   `file:`/`file-json:`-Credentials (von `harw onboard` und `harw-oauth`
+///   erzeugt) unterhalb von `<home>/secrets/` aufgelöst; ohne Home schlagen
+///   sie fail-closed fehl (`build_provider`).
 fn build_serve_provider(
     config: &ResolvedConfig,
+    home: Option<&Path>,
     resolver: Option<&secret_store::ConfiguredSecretResolver>,
 ) -> Result<Box<dyn ModelProvider>, String> {
-    match resolver {
-        Some(resolver) => harw_provider_http::build_provider_with_resolver(config, resolver),
-        None => harw_provider_http::build_provider(config),
+    let resolver = resolver.map(|resolver| resolver as &dyn SecretResolver);
+    match home {
+        Some(home) => harw_provider_http::build_provider_with_home(config, home, resolver),
+        None => match resolver {
+            Some(resolver) => harw_provider_http::build_provider_with_resolver(config, resolver),
+            None => harw_provider_http::build_provider(config),
+        },
     }
     .map_err(|error| format!("could not construct configured model provider: {error}"))
 }
@@ -2094,6 +2106,52 @@ mod tests {
             std::env::temp_dir().join(format!("harw-cli-test-{label}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir creates");
         dir
+    }
+
+    /// Z1-R2-03: `harw serve` muss `file:`-Credentials auflösen, die
+    /// `harw onboard` (`onboarding.rs` `write_secret_file`) und `harw-oauth`
+    /// unterhalb von `<home>/secrets/` anlegen. Ohne Home bleibt der Pfad
+    /// bewusst fail-closed
+    /// (`harw_provider_http::FILE_CREDENTIAL_NO_HOME_REASON`).
+    #[test]
+    fn build_serve_provider_resolves_file_credentials_only_with_a_home() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let home = unique_temp_dir("serve-provider-file-credential");
+        let secrets = home.join("secrets");
+        std::fs::create_dir_all(&secrets).expect("secrets dir creates");
+        let token = secrets.join("gateway.key");
+        std::fs::write(&token, "gateway-file-key").expect("secret writes");
+        std::fs::set_permissions(&token, std::fs::Permissions::from_mode(0o600))
+            .expect("secret is private");
+
+        let provider = ProviderToml {
+            name: "gateway".to_owned(),
+            api: "openai-chat".to_owned(),
+            base_url: "https://gateway.example/v1".to_owned(),
+            auth: Some(SecretRef::File(
+                token.to_str().expect("UTF-8 fixture path").to_owned(),
+            )),
+            auth_header: Some("bearer".to_owned()),
+            api_key: None,
+            headers: std::collections::HashMap::new(),
+            models: vec!["model".to_owned()],
+            enabled: true,
+            origin_allowlist: OriginAllowlistToml::default(),
+        };
+        let mut config = ResolvedConfig::default();
+        config.harness.default_provider = Some("gateway".to_owned());
+        config.harness.default_model = Some("model".to_owned());
+        config.providers.insert("gateway".to_owned(), provider);
+
+        build_serve_provider(&config, Some(home.as_path()), None)
+            .expect("file credential below <home>/secrets resolves for serve");
+        let error = build_serve_provider(&config, None, None)
+            .expect_err("file credential must stay fail-closed without a home");
+        assert!(!error.contains("gateway-file-key"), "leaked secret: {error}");
+        assert!(!error.contains("gateway.key"), "leaked path: {error}");
+
+        std::fs::remove_dir_all(&home).expect("remove temporary home");
     }
 
     // ── Planungsfläche: Composition-Root (AP W5-08) ───────────────────────────

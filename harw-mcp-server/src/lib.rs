@@ -8,6 +8,12 @@
 
 #![forbid(unsafe_code)]
 
+/// The MCP Streamable HTTP protocol version this server implements and
+/// advertises during `initialize`. This is the single source of truth for
+/// the crate; `transport.rs` imports it instead of redefining the literal
+/// (see Z1-R3-04 / Z1-F4).
+pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+
 pub mod auth;
 pub mod events;
 pub mod session;
@@ -25,7 +31,9 @@ pub use supervisor::{
     McpRequestContext, McpSupervisor, McpSupervisorError, UnavailableWorkerCancellationSink,
     WorkerCancellationSink, WorkerCancellationStatus,
 };
-pub use transport::{BoundMcpListener, McpListenerConfig, PrincipalRegistry};
+pub use transport::{
+    BoundMcpListener, DuplicatePrincipalId, McpListenerConfig, PrincipalRegistry,
+};
 
 /// The MCP operation surface that can honestly be advertised by a listener
 /// composition.

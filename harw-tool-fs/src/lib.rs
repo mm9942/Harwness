@@ -16,11 +16,22 @@
 //! - [`FsGlobTool`], [`FsGrepTool`]: makro-generierte Executors für `fs.glob`/`fs.grep`.
 //! - [`FsToolError`]: crate-weiter Fehlertyp.
 //!
+//! # Sicherheit (W1-02)
+//! Alle Pfade werden über [`harw_fsutil::open_beneath`] relativ zum
+//! Deskriptor der Workspace-Wurzel geöffnet; kein Pfadglied darf ein Symlink
+//! sein. Walks laufen über `harw_fsutil::walk_beneath` (interne Basis:
+//! `tree`-Modul) mit harten Grenzen für Treffer, Tiefe, Einträge, Laufzeit,
+//! Dateigröße und Ausgabemenge; der Abbruchgrund steht als `stopped` im
+//! Ergebnis. `fs.write` schreibt atomar über `harw_fsutil::write_atomic` und
+//! lehnt `.git/`- und `.harw/`-Pfade ab.
+//!
 //! # Nebenläufigkeit
-//! Alle Typen sind `Send + Sync`. Lesende Tools sind als `parallel_safe` markiert.
+//! Alle Typen sind `Send + Sync`. Lesende Tools sind als `parallel_safe`
+//! markiert. Walks und Datei-IO laufen in `tokio::task::spawn_blocking`.
 
 #![forbid(unsafe_code)]
 
+mod blocking;
 pub mod error;
 pub mod glob;
 pub mod grep;
@@ -28,6 +39,9 @@ pub mod list;
 pub mod provider;
 pub mod read;
 pub mod search;
+#[cfg(test)]
+mod test_support;
+mod tree;
 pub mod write;
 
 pub use error::FsToolError;

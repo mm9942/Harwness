@@ -23,7 +23,11 @@ use harw_macros::HarwError;
 ///
 /// # Varianten
 /// - [`WebError::Bind`]: Der Unix-Socket-Listener konnte nicht gebunden werden.
-/// - [`WebError::Accept`]: Eine eingehende Verbindung konnte nicht angenommen werden.
+/// - [`WebError::SocketInUse`]: Unter dem Socket-Pfad lauscht bereits ein
+///   anderer Prozess (oder das Gegenteil ist nicht belegbar).
+/// - [`WebError::SocketPathOccupied`]: Unter dem Socket-Pfad liegt etwas
+///   anderes als ein Socket (reguläre Datei, Symlink, Verzeichnis, …).
+/// - [`WebError::Accept`]: `accept()` scheiterte fatal (Listener unbrauchbar).
 /// - [`WebError::PeerCredentialsUnavailable`]: `SO_PEERCRED` einer angenommenen
 ///   Verbindung war nicht lesbar.
 /// - [`WebError::DuplicateRoute`]: Zwei Operationen deklarieren denselben
@@ -49,8 +53,27 @@ pub enum WebError {
         path: String,
     },
 
-    /// Eine eingehende Verbindung konnte nicht angenommen werden.
-    #[msg("eingehende Web-Verbindung konnte nicht angenommen werden")]
+    /// Unter `path` liegt ein Socket, dessen Lebendigkeit nicht widerlegt
+    /// werden konnte (ein `connect` gelang, lief in die Frist oder scheiterte
+    /// anders als mit `ECONNREFUSED`). Die Datei wurde **nicht** entfernt.
+    #[msg("Web-Socket '{path}' ist noch in Benutzung — wird nicht ersetzt")]
+    SocketInUse {
+        /// Der belegte Socket-Pfad.
+        path: String,
+    },
+
+    /// Unter `path` liegt kein Socket (reguläre Datei, Symlink, Verzeichnis,
+    /// …). Die Datei wurde **nicht** angefasst.
+    #[msg("Web-Socket-Pfad '{path}' ist durch eine Nicht-Socket-Datei belegt — wird nicht entfernt")]
+    SocketPathOccupied {
+        /// Der belegte Pfad.
+        path: String,
+    },
+
+    /// `accept()` scheiterte fatal — der Listener selbst ist unbrauchbar
+    /// (vorübergehende Fehler wie `EMFILE` führen nicht hierher, siehe
+    /// `crate::server`-Moduldoku).
+    #[msg("Web-Listener unbrauchbar: accept() scheiterte fatal")]
     Accept,
 
     /// Die Peer-Identität (`SO_PEERCRED`) einer angenommenen Verbindung
@@ -108,6 +131,37 @@ mod tests {
     }
 
     #[test]
+    fn test_display_socket_in_use_contains_path() {
+        let err = WebError::SocketInUse {
+            path: "/run/harw/web.sock".to_owned(),
+        };
+        let text = err.to_string();
+        assert!(text.contains("/run/harw/web.sock"));
+        assert!(text.contains("in Benutzung"));
+    }
+
+    #[test]
+    fn test_display_socket_path_occupied_contains_path() {
+        let err = WebError::SocketPathOccupied {
+            path: "/tmp/fremd".to_owned(),
+        };
+        let text = err.to_string();
+        assert!(text.contains("/tmp/fremd"));
+        assert!(text.contains("Nicht-Socket"));
+    }
+
+    #[test]
+    fn test_socket_variants_are_distinct_from_bind() {
+        let path = "/p".to_owned();
+        let in_use = WebError::SocketInUse { path: path.clone() }.to_string();
+        let occupied = WebError::SocketPathOccupied { path: path.clone() }.to_string();
+        let bind = WebError::Bind { path }.to_string();
+        assert_ne!(in_use, occupied);
+        assert_ne!(in_use, bind);
+        assert_ne!(occupied, bind);
+    }
+
+    #[test]
     fn test_display_duplicate_route_contains_all_names() {
         let err = WebError::DuplicateRoute {
             path: "/api/x".to_owned(),
@@ -129,6 +183,16 @@ mod tests {
     #[test]
     fn test_source_is_none_for_content_free_variants() {
         assert!(WebError::Accept.source().is_none());
+        assert!(
+            WebError::SocketInUse { path: String::new() }
+                .source()
+                .is_none()
+        );
+        assert!(
+            WebError::SocketPathOccupied { path: String::new() }
+                .source()
+                .is_none()
+        );
         assert!(WebError::PeerCredentialsUnavailable.source().is_none());
         assert!(WebError::InvalidEventCapacity.source().is_none());
     }

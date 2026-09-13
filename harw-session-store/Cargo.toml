@@ -8,6 +8,8 @@ rust-version.workspace = true
 harw-types = { path = "../harw-types" }
 harw-macros = { path = "../harw-macros" }
 harw-job-runtime = { path = "../harw-job-runtime" }
+# F-006: symlinkfestes Öffnen (korrektes O_NOFOLLOW je Architektur, CONTRACTS.md §fsutil).
+harw-fsutil = { path = "../harw-fsutil" }
 # AW1-01: ChildLeaseRecord carries a TraceContext (frozen wire form,
 # docs/aw-contract-master.md §A.4). Path dependency only — no version pin.
 harw-observe = { path = "../harw-observe" }

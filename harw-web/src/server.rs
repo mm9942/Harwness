@@ -50,9 +50,33 @@
 //! alle Verbindungs-Tasks geordnet abbricht und einsammelt statt sie
 //! herrenlos weiterlaufen zu lassen).
 //!
+//! # Belastbarkeit (P0.12, F-184/F-185)
+//! - **Rumpfgrenze:** Jeder Anfragerumpf wird über
+//!   [`http_body_util::Limited`] gelesen — die Grenze greift damit auch bei
+//!   `Transfer-Encoding: chunked` ohne `Content-Length`, bevor mehr als
+//!   `MAX_BODY_BYTES` im Speicher liegen (→ `413`).
+//! - **Timeouts:** `header_read_timeout` am hyper-HTTP/1-Builder (mit
+//!   [`hyper_util::rt::TokioTimer`]) schließt Verbindungen, die ihre Kopfzeilen
+//!   nicht rechtzeitig senden — das gilt auch für untätige Keep-Alive-
+//!   Verbindungen, weil hyper den Zeitgeber bei jedem neuen Kopf startet.
+//!   Das Lesen des Rumpfs ist zusätzlich durch `tokio::time::timeout`
+//!   begrenzt (→ `408`). Die Laufzeit einer Operation selbst und der
+//!   SSE-Strom sind bewusst **nicht** begrenzt.
+//! - **`accept()`-Fehler:** Vorübergehende Fehler (`EMFILE`, `ECONNABORTED`,
+//!   `ENOBUFS`, …) werden protokolliert; die Annahme pausiert mit
+//!   exponentiellem, gedeckeltem Backoff, der Server läuft weiter. Nur Fehler,
+//!   die einen unbrauchbaren Listener belegen (`EBADF`, `ENOTSOCK`, `EINVAL`,
+//!   `EFAULT`, `EOPNOTSUPP`), beenden die Schleife.
+//! - **Socket-Pfad:** Eine vorhandene Datei wird nur entfernt, wenn sie ein
+//!   Socket ist **und** ein `connect` mit `ECONNREFUSED` belegt, dass niemand
+//!   mehr lauscht. Reguläre Dateien, Symlinks und lebende Sockets werden nie
+//!   angefasst.
+//!
 //! # Fehlertypen
-//! [`crate::error::WebError::Bind`] beim Binden, [`crate::error::WebError::Accept`]
-//! bei einem dauerhaft scheiternden `accept()`. Fehler einzelner Anfragen
+//! [`crate::error::WebError::Bind`], [`crate::error::WebError::SocketInUse`]
+//! und [`crate::error::WebError::SocketPathOccupied`] beim Binden,
+//! [`crate::error::WebError::Accept`] bei einem fatalen `accept()`-Fehler.
+//! Fehler einzelner Anfragen
 //! (JSON-Parsing, Operationsfehler) werden nie als [`crate::error::WebError`]
 //! propagiert — sie werden als HTTP-Antwort mit passendem Statuscode
 //! beantwortet (`handle` ist `Result<_, Infallible>`, wie bei
@@ -92,20 +116,21 @@
 //! ```
 
 use std::convert::Infallible;
-use std::path::PathBuf;
+use std::os::unix::fs::FileTypeExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Channel, Full};
+use http_body_util::{BodyExt, Channel, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper::header::{ACCEPT, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 
@@ -128,6 +153,20 @@ const MAX_BODY_BYTES: usize = 64 * 1024;
 const EVENTS_PATH: &str = "/events";
 /// Abstand zwischen zwei [`WebEventKind::Heartbeat`]-Ereignissen.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+/// Frist, in der ein Client die Kopfzeilen einer Anfrage vollständig senden
+/// muss — auch die nächste Anfrage einer untätigen Keep-Alive-Verbindung.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Frist, in der der (durch [`MAX_BODY_BYTES`] begrenzte) Rumpf vollständig
+/// eingetroffen sein muss.
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Erste Pause nach einem vorübergehenden `accept()`-Fehler.
+const ACCEPT_BACKOFF_BASE: Duration = Duration::from_millis(10);
+/// Obergrenze der Pause nach wiederholten `accept()`-Fehlern.
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+/// Frist für den Lebendigkeits-`connect` auf einen vorgefundenen Socket.
+/// Läuft sie ab, gilt der Socket als lebend (volle Warteschlange) und wird
+/// nicht entfernt.
+const STALE_SOCKET_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 type WebResponse = Response<BoxBody<Bytes, Infallible>>;
 
@@ -178,9 +217,13 @@ impl BoundWebServer {
     /// Einen gebundenen, noch nicht bedienenden `BoundWebServer`.
     ///
     /// # Errors
-    /// [`WebError::Bind`], wenn der Socket-Pfad nicht gebunden werden kann
-    /// (Verzeichnis fehlt, keine Berechtigung, Pfad bereits durch einen
-    /// anderen Prozess belegt).
+    /// - [`WebError::SocketInUse`], wenn unter dem Pfad ein Socket liegt, auf
+    ///   dem noch jemand lauscht (oder dessen Lebendigkeit sich nicht
+    ///   widerlegen lässt).
+    /// - [`WebError::SocketPathOccupied`], wenn unter dem Pfad etwas anderes
+    ///   als ein Socket liegt (reguläre Datei, Verzeichnis, Symlink, …).
+    /// - [`WebError::Bind`], wenn der Socket-Pfad aus anderen Gründen nicht
+    ///   gebunden werden kann (Verzeichnis fehlt, keine Berechtigung).
     ///
     /// # Concurrency
     /// Bindet einmalig; keine Nebenläufigkeit vor dem ersten `serve`-Aufruf.
@@ -191,14 +234,7 @@ impl BoundWebServer {
         context_factory: Arc<WebContextFactory>,
         events: Arc<WebEventBus>,
     ) -> Result<Self, WebError> {
-        let path_display = config.socket_path.display().to_string();
-        let bind_err = || WebError::Bind {
-            path: path_display.clone(),
-        };
-        // Rest eines vorherigen, nicht sauber beendeten Laufs entfernen —
-        // dasselbe Vorgehen wie `harw_sentinel::ipc::IpcListener::bind`.
-        let _ = std::fs::remove_file(&config.socket_path);
-        let listener = UnixListener::bind(&config.socket_path).map_err(|_| bind_err())?;
+        let listener = bind_unix_listener(&config.socket_path).await?;
         Ok(Self {
             listener,
             socket_path: config.socket_path,
@@ -221,7 +257,8 @@ impl BoundWebServer {
     /// `Ok(())`, wenn die Annahmeschleife regulär endet (siehe [`Self::serve_until`]).
     ///
     /// # Errors
-    /// [`WebError::Accept`], wenn `accept()` dauerhaft scheitert.
+    /// [`WebError::Accept`], wenn `accept()` fatal scheitert (siehe
+    /// [`Self::serve_until`]).
     pub async fn serve(self) -> Result<(), WebError> {
         let (_tx, rx) = watch::channel(false);
         self.serve_until(rx).await
@@ -240,13 +277,23 @@ impl BoundWebServer {
     /// sie herrenlos weiterlaufen zu lassen (dasselbe Muster wie
     /// `harw_mcp_server::transport::BoundMcpListener::serve_until`).
     ///
+    /// Ein vorübergehender `accept()`-Fehler (z. B. `EMFILE` bei erschöpften
+    /// Dateideskriptoren, `ECONNABORTED`) beendet den Server **nicht**: er wird
+    /// über `tracing` protokolliert, und die Annahme pausiert für
+    /// `accept_backoff` (exponentiell ab `ACCEPT_BACKOFF_BASE`, gedeckelt
+    /// bei `ACCEPT_BACKOFF_MAX`). Während der Pause laufen Heartbeat,
+    /// Shutdown-Überwachung und das Einsammeln beendeter Verbindungen weiter.
+    /// Die erste erfolgreiche Annahme setzt den Backoff zurück.
+    ///
     /// # Arguments
     /// - `shutdown` (`tokio::sync::watch::Receiver<bool>`): wird auf `true`
     ///   gesetzt, um die Schleife geordnet zu beenden.
     ///
     /// # Errors
-    /// [`WebError::Accept`], wenn `accept()` dauerhaft scheitert (z. B. der
-    /// Socket extern geschlossen wird).
+    /// [`WebError::Accept`], wenn `accept()` fatal scheitert
+    /// (siehe `is_fatal_accept_error`: der Listener selbst ist unbrauchbar).
+    /// Auch dann werden alle laufenden Verbindungs-Tasks zuvor abgebrochen
+    /// und eingesammelt.
     ///
     /// # Concurrency
     /// Jede Verbindung läuft in einer eigenen `tokio::task`, gesammelt in
@@ -259,6 +306,14 @@ impl BoundWebServer {
         // Heartbeat unerwünscht (kein Ereignis nötig, bevor überhaupt Zeit
         // vergangen ist).
         heartbeat.tick().await;
+
+        // Anzahl unmittelbar aufeinanderfolgender vorübergehender
+        // `accept()`-Fehler — steuert die Länge der nächsten Pause.
+        let mut accept_failures: u32 = 0;
+        // Solange gesetzt, ist der `accept`-Zweig deaktiviert und der
+        // Pausen-Zweig wartet bis zu diesem Zeitpunkt.
+        let mut accept_paused_until: Option<tokio::time::Instant> = None;
+        let mut outcome: Result<(), WebError> = Ok(());
 
         loop {
             tokio::select! {
@@ -273,8 +328,41 @@ impl BoundWebServer {
                 completed = connections.join_next(), if !connections.is_empty() => {
                     let _ = completed;
                 }
-                accepted = self.listener.accept() => {
-                    let (stream, _addr) = accepted.map_err(|_| WebError::Accept)?;
+                // `select!` wertet den Ausdruck auch bei deaktiviertem Zweig
+                // aus (pollt ihn aber nicht) — daher `unwrap_or_else` statt
+                // eines Panik-Pfads.
+                () = tokio::time::sleep_until(
+                    accept_paused_until.unwrap_or_else(tokio::time::Instant::now)
+                ), if accept_paused_until.is_some() => {
+                    accept_paused_until = None;
+                }
+                accepted = self.listener.accept(), if accept_paused_until.is_none() => {
+                    let stream = match accepted {
+                        Ok((stream, _addr)) => {
+                            accept_failures = 0;
+                            stream
+                        }
+                        Err(error) => {
+                            if is_fatal_accept_error(&error) {
+                                tracing::error!(
+                                    error = %error,
+                                    "fataler accept()-Fehler am Web-Listener — Server wird beendet"
+                                );
+                                outcome = Err(WebError::Accept);
+                                break;
+                            }
+                            let delay = accept_backoff(accept_failures);
+                            accept_failures = accept_failures.saturating_add(1);
+                            tracing::warn!(
+                                error = %error,
+                                consecutive_failures = accept_failures,
+                                backoff_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                                "vorübergehender accept()-Fehler am Web-Listener — Annahme pausiert, Server läuft weiter"
+                            );
+                            accept_paused_until = Some(tokio::time::Instant::now() + delay);
+                            continue;
+                        }
+                    };
                     let Ok(peer) = read_peer_credentials(&stream) else {
                         // Ohne Peer-Identität keine einzige HTTP-Anfrage —
                         // die Verbindung wird beim Drop des Streams geschlossen.
@@ -285,7 +373,8 @@ impl BoundWebServer {
                     let context_factory = Arc::clone(&self.context_factory);
                     let events = Arc::clone(&self.events);
                     connections.spawn(async move {
-                        let _ = Builder::new(TokioExecutor::new())
+                        let builder = http_connection_builder(HEADER_READ_TIMEOUT);
+                        let _ = builder
                             .serve_connection(
                                 TokioIo::new(stream),
                                 service_fn(move |request| {
@@ -306,8 +395,111 @@ impl BoundWebServer {
         }
         connections.abort_all();
         while connections.join_next().await.is_some() {}
-        Ok(())
+        outcome
     }
+}
+
+/// Bindet den Unix-Socket, ohne je fremde Dateien zu löschen.
+///
+/// # Description
+/// Liegt unter `path` bereits etwas, entscheidet `symlink_metadata` (folgt
+/// **keinem** Symlink):
+/// - kein Socket (reguläre Datei, Verzeichnis, Symlink, …) →
+///   [`WebError::SocketPathOccupied`], nichts wird angefasst;
+/// - ein Socket → ein Lebendigkeits-`connect` (begrenzt durch
+///   [`STALE_SOCKET_PROBE_TIMEOUT`]). Nur `ECONNREFUSED` belegt einen toten
+///   Socket (Rest eines nicht sauber beendeten Laufs); nur dann wird er
+///   entfernt. Gelingt der `connect`, läuft die Frist ab oder scheitert er
+///   anders (z. B. `EACCES`), gilt der Socket als belegt →
+///   [`WebError::SocketInUse`].
+///
+/// Zwischen Prüfung und `remove_file` bleibt ein Zeitfenster (TOCTOU), in dem
+/// ein Dritter den Pfad austauschen könnte; das Verzeichnis des Sockets muss
+/// deshalb dem Betreiber gehören (Deploy-Sache, nicht dieses Moduls).
+///
+/// # Errors
+/// [`WebError::SocketPathOccupied`], [`WebError::SocketInUse`] oder
+/// [`WebError::Bind`] (Metadaten nicht lesbar, Entfernen oder Binden
+/// gescheitert).
+async fn bind_unix_listener(path: &Path) -> Result<UnixListener, WebError> {
+    let path_display = || path.display().to_string();
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_socket() {
+                return Err(WebError::SocketPathOccupied {
+                    path: path_display(),
+                });
+            }
+            let probe = tokio::time::timeout(STALE_SOCKET_PROBE_TIMEOUT, UnixStream::connect(path)).await;
+            match probe {
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    // Toter Socket: niemand lauscht mehr — nur dieser Fall
+                    // darf die Datei entfernen.
+                    std::fs::remove_file(path).map_err(|_| WebError::Bind {
+                        path: path_display(),
+                    })?;
+                }
+                // Verbindung gelungen, Frist abgelaufen oder ein anderer
+                // Fehler: Lebendigkeit nicht widerlegt → nie löschen.
+                _ => {
+                    return Err(WebError::SocketInUse {
+                        path: path_display(),
+                    });
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            return Err(WebError::Bind {
+                path: path_display(),
+            });
+        }
+    }
+    UnixListener::bind(path).map_err(|_| WebError::Bind {
+        path: path_display(),
+    })
+}
+
+/// Baut den HTTP/1-Verbindungs-Builder mit Kopfzeilen-Timeout.
+///
+/// # Description
+/// `http1_only` überspringt die Protokollerkennung des `auto`-Builders (die
+/// ohne Zeitgeber auf die ersten Bytes warten würde), sodass der Timeout ab
+/// Verbindungsbeginn gilt. `header_read_timeout` verlangt einen gesetzten
+/// Timer (hyper-util-Doku: ohne Timer Panik) — daher immer zusammen mit
+/// [`TokioTimer`].
+fn http_connection_builder(header_read_timeout: Duration) -> Builder<TokioExecutor> {
+    let mut builder = Builder::new(TokioExecutor::new()).http1_only();
+    builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout);
+    builder
+}
+
+/// Ob ein `accept()`-Fehler den Listener selbst als unbrauchbar ausweist.
+///
+/// # Description
+/// Fatal sind nur Fehler, die sich durch Warten nie beheben: ungültiger oder
+/// fremder Deskriptor (`EBADF`, `ENOTSOCK`), Socket lauscht nicht (`EINVAL`),
+/// ungültige Adresse (`EFAULT`), Operation nicht unterstützt (`EOPNOTSUPP`).
+/// Alles andere — insbesondere `EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM`
+/// (Ressourcenknappheit), `ECONNABORTED`/`EPROTO` (Client brach ab),
+/// `EINTR`/`EAGAIN` — ist vorübergehend, ebenso ein Fehler ohne
+/// Betriebssystem-Fehlernummer.
+fn is_fatal_accept_error(error: &std::io::Error) -> bool {
+    use rustix::io::Errno;
+    const FATAL: [Errno; 5] = [Errno::BADF, Errno::NOTSOCK, Errno::INVAL, Errno::FAULT, Errno::OPNOTSUPP];
+    Errno::from_io_error(error).is_some_and(|errno| FATAL.contains(&errno))
+}
+
+/// Pause nach dem `failures`-ten aufeinanderfolgenden vorübergehenden
+/// `accept()`-Fehler (0-basiert): `ACCEPT_BACKOFF_BASE · 2^failures`,
+/// gedeckelt bei [`ACCEPT_BACKOFF_MAX`].
+fn accept_backoff(failures: u32) -> Duration {
+    ACCEPT_BACKOFF_BASE
+        .saturating_mul(1_u32 << failures.min(16))
+        .min(ACCEPT_BACKOFF_MAX)
 }
 
 /// Bearbeitet eine einzelne HTTP-Anfrage einer bereits identifizierten Verbindung.
@@ -356,7 +548,7 @@ async fn handle(
             }),
         )),
         RouteDecision::Execute { route, caller_tier } => {
-            let args = match read_json_body(request).await {
+            let args = match read_json_body(request, MAX_BODY_BYTES, BODY_READ_TIMEOUT).await {
                 Ok(value) => value,
                 Err(response) => return Ok(response),
             };
@@ -460,43 +652,64 @@ fn sse_response(events: Arc<WebEventBus>) -> WebResponse {
 /// Liest und dekodiert den JSON-Rumpf eines freigegebenen Aufrufs.
 ///
 /// # Description
-/// Prüft `Content-Length` (falls vorhanden) und die tatsächliche
-/// Rumpfgröße gegen [`MAX_BODY_BYTES`], bevor überhaupt dekodiert wird. Ein
-/// leerer Rumpf (typisch für `GET`) wird als `serde_json::Value::Null`
-/// behandelt — dieselbe Bedeutung wie bei einer `Surface::ModelTool`-Fläche
-/// ohne Argumente.
+/// Prüft zuerst einen angegebenen `Content-Length` gegen `max_bytes`
+/// (schnelle Ablehnung ohne Lesen). Danach wird der Rumpf **ausschließlich**
+/// über [`Limited`] gelesen: sobald die tatsächlich eingetroffenen
+/// Datenrahmen `max_bytes` überschreiten, bricht das Lesen mit
+/// [`LengthLimitError`] ab — unabhängig davon, ob der Client
+/// `Content-Length` oder `Transfer-Encoding: chunked` benutzt. Es liegen also
+/// nie mehr als `max_bytes` Rumpfdaten im Speicher. Das gesamte Lesen ist
+/// durch `read_timeout` begrenzt. Ein leerer Rumpf (typisch für `GET`) wird
+/// als `serde_json::Value::Null` behandelt — dieselbe Bedeutung wie bei einer
+/// `Surface::ModelTool`-Fläche ohne Argumente.
+///
+/// # Arguments
+/// - `request` (`Request<Incoming>`): die freigegebene Anfrage.
+/// - `max_bytes` (`usize`): Rumpfobergrenze (produktiv [`MAX_BODY_BYTES`]).
+/// - `read_timeout` (`Duration`): Lesefrist (produktiv [`BODY_READ_TIMEOUT`]).
 ///
 /// # Returns
 /// - `Ok(value)`: dekodierte JSON-Argumente.
-/// - `Err(response)`: eine fertige Fehlerantwort (400/413), die `handle`
+/// - `Err(response)`: eine fertige Fehlerantwort (400/408/413), die `handle`
 ///   unverändert zurückgibt.
-async fn read_json_body(request: Request<Incoming>) -> Result<serde_json::Value, WebResponse> {
+async fn read_json_body(
+    request: Request<Incoming>,
+    max_bytes: usize,
+    read_timeout: Duration,
+) -> Result<serde_json::Value, WebResponse> {
+    let payload_too_large = || {
+        json_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &serde_json::json!({"error": "payload_too_large"}),
+        )
+    };
     let declared_len = request
         .headers()
         .get(CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok());
-    if declared_len.is_some_and(|len| len > MAX_BODY_BYTES as u64) {
-        return Err(json_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            &serde_json::json!({"error": "payload_too_large"}),
-        ));
+    if declared_len.is_some_and(|len| len > max_bytes as u64) {
+        return Err(payload_too_large());
     }
-    let bytes = match request.into_body().collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => {
+    let limited = Limited::new(request.into_body(), max_bytes);
+    let bytes = match tokio::time::timeout(read_timeout, limited.collect()).await {
+        Ok(Ok(collected)) => collected.to_bytes(),
+        Ok(Err(error)) if error.downcast_ref::<LengthLimitError>().is_some() => {
+            return Err(payload_too_large());
+        }
+        Ok(Err(_)) => {
             return Err(json_response(
                 StatusCode::BAD_REQUEST,
                 &serde_json::json!({"error": "bad_request"}),
             ));
         }
+        Err(_elapsed) => {
+            return Err(json_response(
+                StatusCode::REQUEST_TIMEOUT,
+                &serde_json::json!({"error": "request_timeout"}),
+            ));
+        }
     };
-    if bytes.len() > MAX_BODY_BYTES {
-        return Err(json_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            &serde_json::json!({"error": "payload_too_large"}),
-        ));
-    }
     if bytes.is_empty() {
         return Ok(serde_json::Value::Null);
     }
@@ -574,13 +787,133 @@ fn json_response(status: StatusCode, body: &serde_json::Value) -> WebResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{forbidden_reason_str, json_response, method_not_allowed_response, status_for_op_error};
-    use crate::router::{ForbiddenReason, WebMethod};
-    use harw_operations::error::OpError;
-    use hyper::StatusCode;
+    use std::convert::Infallible;
+    use std::os::unix::fs::FileTypeExt;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::Duration;
 
-    // Diese Tests berühren ausschließlich in-memory `Response`/`StatusCode`-Werte —
-    // kein Socket, keine Netzwerkverbindung (siehe Modul- und Crate-Moduldoku).
+    use super::{
+        ACCEPT_BACKOFF_BASE, ACCEPT_BACKOFF_MAX, BoundWebServer, HEADER_READ_TIMEOUT, MAX_BODY_BYTES,
+        WebContextFactory, WebServerConfig, accept_backoff, bind_unix_listener, forbidden_reason_str,
+        http_connection_builder, is_fatal_accept_error, json_response, method_not_allowed_response,
+        read_json_body, status_for_op_error,
+    };
+    use crate::authz::StaticUidTierMap;
+    use crate::error::WebError;
+    use crate::events::WebEventBus;
+    use crate::peer::PeerCredentials;
+    use crate::router::{ForbiddenReason, WebMethod, WebRouteTable};
+    use harw_operations::context::OpContext;
+    use harw_operations::error::OpError;
+    use harw_operations::operation::PermissionTier;
+    use harw_operations::registry::OperationRegistry;
+    use hyper::StatusCode;
+    use hyper::service::service_fn;
+    use hyper_util::rt::TokioIo;
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{UnixListener, UnixStream};
+
+    // Die ersten Tests berühren nur in-memory `Response`/`StatusCode`-Werte.
+    // Die Tests ab „Echter Unix-Socket" binden echte Sockets in einem
+    // Tempdir (W1-11, F-184/F-185) — nie an einem geteilten Pfad.
+
+    /// Obergrenze, die ein einzelner Socket-Test insgesamt warten darf.
+    const TEST_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// Liest bis zum Ende der ersten Antwortzeile (`HTTP/1.1 413 …`).
+    ///
+    /// Liefert den bis dahin gelesenen Text; schließt der Server ohne
+    /// Antwort, ist das Ergebnis leer. Lesefehler (z. B. `ECONNRESET`, wenn
+    /// der Server nach einer Ablehnung ungelesene Daten verwirft) beenden das
+    /// Lesen wie ein EOF — was vorher ankam, bleibt erhalten.
+    async fn read_status_line(reader: &mut (impl AsyncRead + Unpin)) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            if let Some(end) = buffer.windows(2).position(|window| window == b"\r\n") {
+                return String::from_utf8_lossy(&buffer[..end]).into_owned();
+            }
+            match reader.read(&mut chunk).await {
+                Ok(0) | Err(_) => return String::from_utf8_lossy(&buffer).into_owned(),
+                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+            }
+        }
+    }
+
+    /// Verbindet sich mit `path`, schreibt `raw` in einer eigenen Task und
+    /// liefert die Statuszeile der Antwort.
+    ///
+    /// Die Schreibhälfte bleibt offen, bis die Antwort gelesen ist — ein
+    /// EOF des Clients kann das Ergebnis also nicht verfälschen. Das
+    /// Schreiben läuft nebenläufig, damit ein Server, der nach einer
+    /// Ablehnung nicht weiterliest, den Test nicht blockiert.
+    async fn send_and_read_status_line(path: &Path, raw: Vec<u8>) -> String {
+        let stream = UnixStream::connect(path)
+            .await
+            .expect("Testserver lauscht am Tempdir-Socket");
+        let (mut reader, mut writer) = stream.into_split();
+        let writer_task = tokio::spawn(async move {
+            // `EPIPE` ist erwartbar, wenn der Server nach `413` schließt.
+            let _ = writer.write_all(&raw).await;
+            writer
+        });
+        let status = tokio::time::timeout(TEST_DEADLINE, read_status_line(&mut reader))
+            .await
+            .expect("Antwort (oder Verbindungsende) innerhalb der Testfrist");
+        writer_task.abort();
+        status
+    }
+
+    /// Bedient genau eine Verbindung mit dem **produktiven**
+    /// Verbindungs-Builder; der Dienst ruft das produktive
+    /// [`read_json_body`] mit [`MAX_BODY_BYTES`] und spiegelt das dekodierte
+    /// JSON als `200`.
+    ///
+    /// Eine vollständige `Execute`-Route über [`BoundWebServer`] ist in
+    /// dieser Crate nicht testbar: `OpContext` braucht eine `SandboxSpec`
+    /// aus `harw-sandbox`, das keine Abhängigkeit von `harw-web` ist.
+    fn spawn_body_reader(
+        listener: UnixListener,
+        header_read_timeout: Duration,
+        body_read_timeout: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let Ok((stream, _addr)) = listener.accept().await else {
+                return;
+            };
+            let builder = http_connection_builder(header_read_timeout);
+            let _ = builder
+                .serve_connection(
+                    TokioIo::new(stream),
+                    service_fn(move |request| async move {
+                        let response = match read_json_body(request, MAX_BODY_BYTES, body_read_timeout).await {
+                            Ok(value) => json_response(StatusCode::OK, &value),
+                            Err(response) => response,
+                        };
+                        Ok::<_, Infallible>(response)
+                    }),
+                )
+                .await;
+        })
+    }
+
+    /// Baut eine vollständige `POST`-Anfrage mit `Transfer-Encoding: chunked`
+    /// und **ohne** `Content-Length`.
+    fn chunked_post(chunks: &[Vec<u8>]) -> Vec<u8> {
+        let mut raw = b"POST /api/x HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        for chunk in chunks {
+            raw.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            raw.extend_from_slice(chunk);
+            raw.extend_from_slice(b"\r\n");
+        }
+        raw.extend_from_slice(b"0\r\n\r\n");
+        raw
+    }
+
+    fn socket_tempdir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("Tempdir für den Test-Socket anlegbar")
+    }
 
     #[test]
     fn test_status_for_op_error_maps_each_variant() {
@@ -653,5 +986,269 @@ mod tests {
             .to_bytes();
         let decoded: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    // ── Echter Unix-Socket: Rumpfgrenze und Timeouts (F-184) ────────────────
+
+    #[tokio::test]
+    async fn test_chunked_body_over_limit_in_many_chunks_yields_413() {
+        let dir = socket_tempdir();
+        let path = dir.path().join("w.sock");
+        let server = spawn_body_reader(UnixListener::bind(&path).unwrap(), HEADER_READ_TIMEOUT, TEST_DEADLINE);
+        // Kein einzelner Chunk überschreitet die Grenze, erst die Summe —
+        // genau der Fall, den eine reine `Content-Length`-Prüfung übersieht.
+        let chunk = vec![b'a'; 30 * 1024];
+        let raw = chunked_post(&[chunk.clone(), chunk.clone(), chunk]);
+        let status = send_and_read_status_line(&path, raw).await;
+        assert!(status.starts_with("HTTP/1.1 413"), "erwartet 413, erhalten: {status:?}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_chunked_single_chunk_one_byte_over_limit_yields_413() {
+        let dir = socket_tempdir();
+        let path = dir.path().join("w.sock");
+        let server = spawn_body_reader(UnixListener::bind(&path).unwrap(), HEADER_READ_TIMEOUT, TEST_DEADLINE);
+        let raw = chunked_post(&[vec![b' '; MAX_BODY_BYTES + 1]]);
+        let status = send_and_read_status_line(&path, raw).await;
+        assert!(status.starts_with("HTTP/1.1 413"), "erwartet 413, erhalten: {status:?}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_chunked_body_within_limit_is_decoded() {
+        let dir = socket_tempdir();
+        let path = dir.path().join("w.sock");
+        let server = spawn_body_reader(UnixListener::bind(&path).unwrap(), HEADER_READ_TIMEOUT, TEST_DEADLINE);
+        let raw = chunked_post(&[b"{\"a\":".to_vec(), b"1}".to_vec()]);
+        let status = send_and_read_status_line(&path, raw).await;
+        assert!(status.starts_with("HTTP/1.1 200"), "erwartet 200, erhalten: {status:?}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_declared_content_length_over_limit_yields_413_without_body() {
+        let dir = socket_tempdir();
+        let path = dir.path().join("w.sock");
+        let server = spawn_body_reader(UnixListener::bind(&path).unwrap(), HEADER_READ_TIMEOUT, TEST_DEADLINE);
+        let raw = format!(
+            "POST /api/x HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        )
+        .into_bytes();
+        let status = send_and_read_status_line(&path, raw).await;
+        assert!(status.starts_with("HTTP/1.1 413"), "erwartet 413, erhalten: {status:?}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_stalled_body_yields_408_after_body_read_timeout() {
+        let dir = socket_tempdir();
+        let path = dir.path().join("w.sock");
+        let server = spawn_body_reader(
+            UnixListener::bind(&path).unwrap(),
+            HEADER_READ_TIMEOUT,
+            Duration::from_millis(100),
+        );
+        // 20 Byte angekündigt, 4 gesendet, Verbindung bleibt offen.
+        let raw = b"POST /api/x HTTP/1.1\r\nHost: localhost\r\nContent-Length: 20\r\n\r\n{\"a\"".to_vec();
+        let status = send_and_read_status_line(&path, raw).await;
+        assert!(status.starts_with("HTTP/1.1 408"), "erwartet 408, erhalten: {status:?}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_incomplete_headers_close_connection_after_header_read_timeout() {
+        let dir = socket_tempdir();
+        let path = dir.path().join("w.sock");
+        let server = spawn_body_reader(
+            UnixListener::bind(&path).unwrap(),
+            Duration::from_millis(100),
+            TEST_DEADLINE,
+        );
+        // Kopf nie abgeschlossen (kein Leerzeilen-Ende); die Schreibhälfte
+        // bleibt offen — das Verbindungsende kann nur vom Server kommen.
+        let raw = b"GET / HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+        let status = send_and_read_status_line(&path, raw).await;
+        assert_eq!(status, "", "hyper schließt nach Header-Timeout ohne Antwort");
+        server.abort();
+    }
+
+    // ── Echter Unix-Socket: Socket-Bind (F-185) ───────────────────────────────
+
+    #[tokio::test]
+    async fn test_bind_on_fresh_path_creates_socket() {
+        let dir = socket_tempdir();
+        let path = dir.path().join("w.sock");
+        let _listener = bind_unix_listener(&path).await.expect("freier Pfad bindbar");
+        assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_socket());
+    }
+
+    #[tokio::test]
+    async fn test_bind_refuses_live_socket_and_leaves_it_serving() {
+        let dir = socket_tempdir();
+        let path = dir.path().join("w.sock");
+        let live = UnixListener::bind(&path).unwrap();
+
+        let result = bind_unix_listener(&path).await;
+        assert!(matches!(result, Err(WebError::SocketInUse { .. })), "erhalten: {result:?}");
+
+        // Die Datei ist noch da und der ursprüngliche Listener nimmt weiter an.
+        assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_socket());
+        let client = UnixStream::connect(&path).await.expect("lebender Socket erreichbar");
+        let accepted = tokio::time::timeout(TEST_DEADLINE, async {
+            // Der Lebendigkeits-`connect` von `bind_unix_listener` liegt ggf.
+            // zuerst in der Warteschlange — beide Verbindungen annehmen.
+            let first = live.accept().await;
+            let second = live.accept().await;
+            (first.is_ok(), second.is_ok())
+        })
+        .await
+        .expect("ursprünglicher Listener nimmt Verbindungen an");
+        assert_eq!(accepted, (true, true));
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn test_bind_replaces_dead_socket() {
+        let dir = socket_tempdir();
+        let path = dir.path().join("w.sock");
+        // Rest eines abgestürzten Laufs: Socket-Datei ohne Lauscher.
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_socket());
+
+        let listener = bind_unix_listener(&path).await.expect("toter Socket wird ersetzt");
+        let client = UnixStream::connect(&path).await.expect("neuer Socket erreichbar");
+        let accepted = tokio::time::timeout(TEST_DEADLINE, listener.accept())
+            .await
+            .expect("neuer Listener nimmt an");
+        assert!(accepted.is_ok());
+        drop(client);
+    }
+
+    #[tokio::test]
+    async fn test_bind_refuses_regular_file_and_leaves_content_unchanged() {
+        let dir = socket_tempdir();
+        let path = dir.path().join("w.sock");
+        std::fs::write(&path, b"fremde Daten").unwrap();
+
+        let result = bind_unix_listener(&path).await;
+        assert!(matches!(result, Err(WebError::SocketPathOccupied { .. })), "erhalten: {result:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"fremde Daten");
+    }
+
+    #[tokio::test]
+    async fn test_bind_refuses_symlink_and_leaves_link_and_target_unchanged() {
+        let dir = socket_tempdir();
+        let target = dir.path().join("ziel.txt");
+        let path = dir.path().join("w.sock");
+        std::fs::write(&target, b"Ziel bleibt").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        let result = bind_unix_listener(&path).await;
+        assert!(matches!(result, Err(WebError::SocketPathOccupied { .. })), "erhalten: {result:?}");
+        assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&target).unwrap(), b"Ziel bleibt");
+    }
+
+    #[tokio::test]
+    async fn test_bind_refuses_symlink_to_dead_socket_and_removes_nothing() {
+        let dir = socket_tempdir();
+        let target = dir.path().join("tot.sock");
+        let path = dir.path().join("w.sock");
+        drop(std::os::unix::net::UnixListener::bind(&target).unwrap());
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        // Ein `connect` durch den Symlink ergäbe `ECONNREFUSED` — trotzdem
+        // darf weder der Link noch sein Ziel verschwinden.
+        let result = bind_unix_listener(&path).await;
+        assert!(matches!(result, Err(WebError::SocketPathOccupied { .. })), "erhalten: {result:?}");
+        assert!(std::fs::symlink_metadata(&path).unwrap().file_type().is_symlink());
+        assert!(std::fs::symlink_metadata(&target).unwrap().file_type().is_socket());
+    }
+
+    // ── accept()-Fehler (F-185) ───────────────────────────────────────────────
+
+    #[test]
+    fn test_accept_backoff_grows_exponentially_and_is_capped() {
+        assert_eq!(accept_backoff(0), ACCEPT_BACKOFF_BASE);
+        assert_eq!(accept_backoff(1), ACCEPT_BACKOFF_BASE * 2);
+        assert_eq!(accept_backoff(2), ACCEPT_BACKOFF_BASE * 4);
+        assert_eq!(accept_backoff(u32::MAX), ACCEPT_BACKOFF_MAX);
+        let mut previous = Duration::ZERO;
+        for failures in 0..64 {
+            let delay = accept_backoff(failures);
+            assert!(delay >= previous, "Backoff darf nie schrumpfen");
+            assert!(delay <= ACCEPT_BACKOFF_MAX, "Backoff hat eine Obergrenze");
+            previous = delay;
+        }
+    }
+
+    #[test]
+    fn test_transient_accept_errors_are_not_fatal() {
+        use rustix::io::Errno;
+        for errno in [
+            Errno::MFILE,
+            Errno::NFILE,
+            Errno::NOBUFS,
+            Errno::NOMEM,
+            Errno::CONNABORTED,
+            Errno::PROTO,
+            Errno::INTR,
+            Errno::AGAIN,
+            Errno::PERM,
+        ] {
+            let error = std::io::Error::from_raw_os_error(errno.raw_os_error());
+            assert!(!is_fatal_accept_error(&error), "vorübergehend: {error}");
+        }
+        assert!(!is_fatal_accept_error(&std::io::Error::other("ohne Fehlernummer")));
+    }
+
+    #[test]
+    fn test_unusable_listener_accept_errors_are_fatal() {
+        use rustix::io::Errno;
+        for errno in [Errno::BADF, Errno::NOTSOCK, Errno::INVAL, Errno::FAULT, Errno::OPNOTSUPP] {
+            let error = std::io::Error::from_raw_os_error(errno.raw_os_error());
+            assert!(is_fatal_accept_error(&error), "fatal: {error}");
+        }
+    }
+
+    // ── Echter Unix-Socket: Annahmeschleife Ende-zu-Ende ─────────────────────
+
+    #[tokio::test]
+    async fn test_serve_until_answers_over_real_socket_and_stops_on_shutdown() {
+        let dir = socket_tempdir();
+        let path = dir.path().join("w.sock");
+        let routes = WebRouteTable::from_registry(&OperationRegistry::new()).unwrap();
+        // Leere Routentabelle: `decide_route` liefert nie `Execute`, die
+        // Fabrik wird also nie aufgerufen.
+        let context_factory: Arc<WebContextFactory> =
+            Arc::new(|_peer: &PeerCredentials, _tier: PermissionTier| -> OpContext {
+                unreachable!("leere Routentabelle: decide_route liefert nie Execute")
+            });
+        let server = BoundWebServer::bind(
+            WebServerConfig { socket_path: path.clone() },
+            routes,
+            Arc::new(StaticUidTierMap::with_default(vec![], PermissionTier::Observer)),
+            context_factory,
+            Arc::new(WebEventBus::new(8).unwrap()),
+        )
+        .await
+        .expect("Tempdir-Socket bindbar");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let client = async {
+            let raw = b"GET /api/gibt-es-nicht HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec();
+            let status = send_and_read_status_line(&path, raw).await;
+            shutdown_tx.send(true).expect("Server hält den Empfänger");
+            status
+        };
+        let (served, status) = tokio::time::timeout(TEST_DEADLINE, async {
+            tokio::join!(server.serve_until(shutdown_rx), client)
+        })
+        .await
+        .expect("Server endet nach Shutdown-Signal");
+        assert!(status.starts_with("HTTP/1.1 404"), "erwartet 404, erhalten: {status:?}");
+        assert!(served.is_ok());
     }
 }

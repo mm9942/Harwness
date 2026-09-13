@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -35,6 +36,11 @@ pub struct TelegramChannel {
     /// when it stops. The mutex therefore protects handoff only, never a
     /// blocking receive.
     ingress: Option<Arc<Mutex<Option<Receiver<InboundEvent>>>>>,
+    /// Counts events dropped by the pinning gate in [`Self::forward_ingress_event`]
+    /// before any durable replay claim or journal write happens (F-040/S5).
+    /// In-memory only, without sender/message content, so a flood of
+    /// unpinned traffic stays observable without becoming persistence.
+    rejected_unpinned: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for TelegramChannel {
@@ -45,6 +51,10 @@ impl std::fmt::Debug for TelegramChannel {
             .field("sandbox", &self.sandbox)
             .field("pairing", &self.pairing)
             .field("ingress", &self.ingress)
+            .field(
+                "rejected_unpinned_sender_count",
+                &self.rejected_unpinned.load(Ordering::Relaxed),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -58,6 +68,7 @@ impl TelegramChannel {
             approval_tokens: Arc::new(ApprovalTokenStore::new()),
             sandbox: TelegramSandbox::reduced_default(),
             ingress: None,
+            rejected_unpinned: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -80,6 +91,7 @@ impl TelegramChannel {
             approval_tokens: Arc::new(ApprovalTokenStore::new()),
             sandbox: TelegramSandbox::reduced_default(),
             ingress: Some(Arc::new(Mutex::new(Some(ingress)))),
+            rejected_unpinned: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -144,6 +156,24 @@ impl TelegramChannel {
     /// an `Admitted` verdict or admission/JobIntent downstream.
     fn is_paired(tenant: &TenantId) -> bool {
         tenant.as_str() != UNPAIRED_TENANT
+    }
+
+    /// Whether `event` carries an identified sender on the pinning allowlist.
+    /// Pure and stateless (no I/O, no store access) so it can run before any
+    /// durable work — this is the single pinning check shared by the
+    /// pre-claim gate in [`Self::forward_ingress_event`] and [`Self::admit`].
+    fn sender_pinned(&self, event: &InboundEvent) -> bool {
+        event
+            .sender
+            .as_ref()
+            .is_some_and(|sender| self.config.is_sender_identity_pinned(&sender.id))
+    }
+
+    /// Number of ingress events dropped by the pinning gate so far (F-040).
+    /// Diagnostic only: process-local, resets on restart, never persisted.
+    #[must_use]
+    pub fn rejected_unpinned_sender_count(&self) -> u64 {
+        self.rejected_unpinned.load(Ordering::Relaxed)
     }
 
     /// Returns the intersection-only capability profile for this remote binding.
@@ -212,10 +242,15 @@ impl TelegramChannel {
 
     /// Processes one transport-normalized event through the Telegram perimeter.
     ///
-    /// Replay is claimed before any session work; channel mismatches are never
-    /// recorded. Only events that survive durable pairing/session resolution and
-    /// admission enter the runtime sink. The reduced sandbox remains attached to
-    /// this adapter and is never widened by ingress.
+    /// Pinning is checked before the replay claim, before channel mismatches
+    /// are otherwise treated as durable-eligible, and before any session
+    /// work: an unpinned sender must not be able to make this binding write a
+    /// single file or journal entry (F-040/F-041 remediation of S5 — the plan
+    /// and §2.3 both require unauthenticated traffic to create no journal
+    /// entries). Only events that survive pinning, durable replay claiming,
+    /// pairing/session resolution, and admission enter the runtime sink. The
+    /// reduced sandbox remains attached to this adapter and is never widened
+    /// by ingress.
     fn forward_ingress_event(
         &self,
         event: InboundEvent,
@@ -225,9 +260,18 @@ impl TelegramChannel {
             return Ok(());
         }
         self.validate_channel(&event)?;
-        // Telegram update delivery is at-least-once. The structural gate above
-        // ensures this binding can make replay claiming durable before the
-        // event reaches a potentially billable runtime sink.
+        // Zustandsloses Pinning-Gate zuerst: kein Claim, keine Journal-/
+        // Dateischreibung für einen nicht gepinnten Absender. Nur ein
+        // In-Memory-Zähler beobachtet das, niemals der Nachrichteninhalt oder
+        // die Sender-Identität selbst.
+        if !self.sender_pinned(&event) {
+            self.rejected_unpinned.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
+        // Telegram update delivery is at-least-once. The structural and
+        // pinning gates above ensure this binding can make replay claiming
+        // durable before the event reaches a potentially billable runtime
+        // sink.
         if !self.claim_update(&event)? {
             return Ok(());
         }
@@ -282,11 +326,7 @@ impl ChannelAdapter for TelegramChannel {
     }
 
     fn admit(&self, event: &InboundEvent, key: &SessionKey) -> Admission {
-        if event
-            .sender
-            .as_ref()
-            .is_none_or(|sender| !self.config.is_sender_identity_pinned(&sender.id))
-        {
+        if !self.sender_pinned(event) {
             return Admission::Rejected(RejectionReason::NotAllowlisted);
         }
         if self.validate_channel(event).is_err() {
@@ -750,6 +790,36 @@ mod tests {
 
         adapter.run_ingress(sink_tx).unwrap();
         assert!(sink_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn ingress_drops_unpinned_sender_before_claiming_replay_or_pairing() {
+        let (_dir, store) = store();
+        let channel = ChannelId::from_str("telegram:ops");
+        pair(&store, &channel, "100", "ops");
+        let (ingress_tx, ingress_rx) = mpsc::channel();
+        let adapter = TelegramChannel::with_ingress_receiver(config(channel), store, ingress_rx);
+        let (sink_tx, sink_rx) = mpsc::channel();
+
+        let mut inbound = event("100", true);
+        inbound.sender = Some(SenderRef {
+            id: "mallory".to_owned(),
+            display_name: None,
+        });
+        ingress_tx.send(inbound.clone()).unwrap();
+        drop(ingress_tx);
+
+        adapter.run_ingress(sink_tx).unwrap();
+
+        // Kein Treffer im Sink ...
+        assert!(sink_rx.try_recv().is_err());
+        // ... und vor allem: die Replay-Claim-Datei/Journal wurde nie
+        // angelegt. Ein anschließender `claim_update` desselben Updates ist
+        // also weiterhin der *erste* Claim (liefert `true`), nicht der
+        // zweite (F-040/S5).
+        assert!(adapter.claim_update(&inbound).unwrap());
+        // Nur der zustandslose Zähler hat den Vorgang beobachtet.
+        assert_eq!(adapter.rejected_unpinned_sender_count(), 1);
     }
 
     #[test]

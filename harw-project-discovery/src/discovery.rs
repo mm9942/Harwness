@@ -16,11 +16,19 @@
 //!
 //! 1. Canonicalise `cwd`.
 //! 2. Walk upward (max `max_walk_depth` steps), testing each directory for any
-//!    configured root marker. First match → `project_root`.
+//!    configured root marker. First match → `project_root`. The walk never
+//!    accepts `$HOME` itself as root unless `cwd` already *is* `$HOME` (a
+//!    marker such as a dotfiles `~/.git` or a stray `~/package.json` must not
+//!    turn the whole home directory into the workspace — Befund S1/F-028),
+//!    and a marker directory is only trusted if it is owned by the current
+//!    user and not world-writable (Befund S1/F-028).
 //! 3. Collect the directory chain from `project_root` to `cwd` (inclusive),
 //!    root first.
 //! 4. For each directory in the chain, try each `doc_filenames` entry in order;
-//!    load the first one found, subject to per-doc and total byte budgets.
+//!    load the first one found, subject to per-doc and total byte budgets. A
+//!    candidate that cannot be read (e.g. `EACCES`) or is not valid UTF-8 is
+//!    skipped with a `warn!` diagnostic instead of aborting the whole
+//!    discovery (Befund S2/F-165).
 //!
 //! # Concurrency
 //!
@@ -28,9 +36,12 @@
 //!
 //! # Errors
 //!
-//! - [`DiscoveryError::InvalidCwd`] — `cwd.canonicalize()` fails.
-//! - [`DiscoveryError::Io`] — unexpected I/O error during directory traversal.
-//! - [`DiscoveryError::Utf8`] — a doc file is not valid UTF-8.
+//! - [`DiscoveryError::InvalidCwd`] — `cwd.canonicalize()` fails. This is the
+//!   only error [`discover_project`] currently returns: per-doc I/O/UTF-8
+//!   problems are skipped and logged (see point 4 above), not propagated.
+//! - [`DiscoveryError::Io`] / [`DiscoveryError::Utf8`] remain part of the
+//!   public error type for API stability but are not constructed by this
+//!   crate today.
 
 use std::fmt;
 use std::io::{self, Read};
@@ -160,6 +171,26 @@ pub struct DiscoveryConfig {
     ///
     /// If no marker is found within this many hops, `cwd` is used as the root.
     pub max_walk_depth: usize,
+
+    /// The current user's home directory, used as an upper boundary for the
+    /// root-marker walk (Befund S1/F-028).
+    ///
+    /// `find_project_root` never climbs past this directory, and never
+    /// accepts `home_dir` itself as the project root unless `cwd` already
+    /// equals it (there is no narrower candidate left to prefer). This stops
+    /// a marker placed directly in the home directory — a dotfiles bare
+    /// repo's `~/.git`, or a stray `~/package.json` left behind by an
+    /// unrelated `npm install` — from turning the *entire* home directory
+    /// into a writable/executable sandbox for an unrelated `cwd` underneath
+    /// it.
+    ///
+    /// Defaults to `$HOME` (read once via [`std::env::var_os`] in
+    /// [`DiscoveryConfig::default`]) so production callers need no extra
+    /// wiring, but the field itself makes the boundary deterministically
+    /// testable via [`DiscoveryConfig::with_home_dir`] without mutating the
+    /// process environment (`std::env::set_var`). `None` means no home
+    /// boundary is enforced (e.g. `$HOME` is unset).
+    pub home_dir: Option<PathBuf>,
 }
 
 impl Default for DiscoveryConfig {
@@ -179,6 +210,7 @@ impl Default for DiscoveryConfig {
             max_bytes_per_doc: 32 * 1024,
             max_total_bytes: 128 * 1024,
             max_walk_depth: 64,
+            home_dir: std::env::var_os("HOME").map(PathBuf::from),
         }
     }
 }
@@ -258,6 +290,36 @@ impl DiscoveryConfig {
     /// ```
     pub fn with_doc_filenames(mut self, d: Vec<String>) -> Self {
         self.doc_filenames = d;
+        self
+    }
+
+    /// Replaces the home-directory boundary and returns `self` for chaining.
+    ///
+    /// # Description
+    ///
+    /// See [`DiscoveryConfig::home_dir`] for the full rationale. Passing
+    /// `None` disables the boundary entirely (the walk may climb past what
+    /// would otherwise be `$HOME`).
+    ///
+    /// # Arguments
+    ///
+    /// - `home` (`Option<PathBuf>`): the new home-directory boundary.
+    ///
+    /// # Returns
+    ///
+    /// `Self` with `home_dir` replaced.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use harw_project_discovery::DiscoveryConfig;
+    /// use std::path::PathBuf;
+    ///
+    /// let cfg = DiscoveryConfig::new().with_home_dir(Some(PathBuf::from("/home/test")));
+    /// assert_eq!(cfg.home_dir, Some(PathBuf::from("/home/test")));
+    /// ```
+    pub fn with_home_dir(mut self, home: Option<PathBuf>) -> Self {
+        self.home_dir = home;
         self
     }
 }
@@ -380,9 +442,10 @@ pub fn discover_project(
         "project root resolved"
     );
 
-    // Phase 3 — doc cascade collect
+    // Phase 3 — doc cascade collect. Per-doc I/O/UTF-8 failures are skipped
+    // and logged inside `collect_docs`, never propagated (Befund S2/F-165).
     let chain = build_dir_chain(&project_root, &cwd);
-    let docs = collect_docs(&chain, config)?;
+    let docs = collect_docs(&chain, config);
 
     Ok(ProjectContext {
         cwd,
@@ -393,11 +456,33 @@ pub fn discover_project(
 
 // ─── Internals ───────────────────────────────────────────────────────────────
 
-/// Walks upward from `cwd` looking for a root marker.
+/// Walks upward from `cwd` looking for a trusted root marker.
 ///
-/// Returns the first ancestor (inclusive of `cwd`) that contains any marker,
-/// or `cwd` itself after `max_walk_depth` hops without a match.
+/// Returns the first ancestor (inclusive of `cwd`) that contains any marker
+/// in a directory owned by the current user and not world-writable, or `cwd`
+/// itself after `max_walk_depth` hops (or the `$HOME` boundary) without a
+/// match.
+///
+/// # `$HOME` boundary (Befund S1/F-028)
+///
+/// If `config.home_dir` is set, the walk never climbs past it, and never
+/// accepts `home_dir` itself as the project root unless `cwd` already equals
+/// it. Without this, a dotfiles bare repo's `~/.git` or a stray
+/// `~/package.json` would silently turn the user's entire home directory
+/// into a read/write/execute sandbox for any `cwd` started underneath it —
+/// see the module-level docs and `docs/remediation/ledger/W1/W1-07.md`.
 fn find_project_root(cwd: &Path, config: &DiscoveryConfig) -> PathBuf {
+    // Kanonisieren, damit der Komponentenvergleich mit dem bereits
+    // kanonisierten `cwd`-Pfad exakt ist (Symlinks in `$HOME` selbst wären
+    // sonst ein Ausweichweg um die Grenze). Schlägt das fehl (z. B. `$HOME`
+    // existiert nicht), gibt es keine wirksame Grenze — wie bisher ohne
+    // dieses Feld.
+    let home_dir = config
+        .home_dir
+        .as_deref()
+        .and_then(|h| h.canonicalize().ok());
+    let current_uid = current_uid();
+
     let mut current = cwd.to_owned();
     for depth in 0..=config.max_walk_depth {
         trace!(
@@ -405,9 +490,28 @@ fn find_project_root(cwd: &Path, config: &DiscoveryConfig) -> PathBuf {
             depth,
             "checking for root markers"
         );
-        if has_any_marker(&current, &config.root_markers) {
+
+        let at_home = home_dir.as_deref() == Some(current.as_path());
+        if at_home && current != cwd {
+            debug!(
+                home = %current.display(),
+                cwd = %cwd.display(),
+                "reached $HOME boundary above cwd; refusing to treat it as project root"
+            );
+            break;
+        }
+
+        if is_trusted_root_candidate(&current, config, current_uid) {
             return current;
         }
+
+        if at_home {
+            // `current == cwd == home_dir`: kein Marker gefunden, und
+            // `$HOME` ist ohnehin die Obergrenze der Suche — nicht weiter
+            // nach oben laufen.
+            break;
+        }
+
         match current.parent() {
             Some(parent) => current = parent.to_owned(),
             None => break,
@@ -416,7 +520,7 @@ fn find_project_root(cwd: &Path, config: &DiscoveryConfig) -> PathBuf {
     warn!(
         cwd = %cwd.display(),
         max_depth = config.max_walk_depth,
-        "no root marker found within walk depth; falling back to cwd"
+        "no trusted root marker found within walk depth; falling back to cwd"
     );
     cwd.to_owned()
 }
@@ -424,6 +528,93 @@ fn find_project_root(cwd: &Path, config: &DiscoveryConfig) -> PathBuf {
 /// Returns `true` if `dir` contains any entry from `markers` (file or dir).
 fn has_any_marker(dir: &Path, markers: &[String]) -> bool {
     markers.iter().any(|m| dir.join(m).exists())
+}
+
+/// Returns the current process's real user id, or `None` if it cannot be
+/// determined without adding a new dependency.
+///
+/// `harw-project-discovery`'s `Cargo.toml` is out of scope for this change
+/// (see `docs/remediation/ledger/W1/W1-07.md`), so this does not use
+/// `rustix::process::geteuid()` the way `harw-fsutil::perm` does. On Linux,
+/// `/proc/self` is a symlink whose owning uid is the process's real uid
+/// (`proc(5)`), so a plain `std::fs::metadata` stat gives an exact answer
+/// without `unsafe` or a libc/rustix dependency. Elsewhere, the
+/// owner check in [`is_trusted_root_candidate`] is skipped (`None`); the
+/// world-writable check still applies.
+#[cfg(target_os = "linux")]
+fn current_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata("/proc/self").ok().map(|m| m.uid())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_uid() -> Option<u32> {
+    None
+}
+
+/// Returns `true` if `dir` contains any root marker **and** `dir` itself is
+/// safe to trust as sandbox authority: owned by `current_uid` (when known)
+/// and not world-writable (Befund S1/F-028).
+///
+/// A directory that fails either check is treated exactly as if it had no
+/// marker at all — the walk continues upward (or falls back to `cwd`) rather
+/// than erroring, so a hostile ancestor (e.g. a world-writable `/tmp` with a
+/// marker planted by another local user) can only narrow authority, never
+/// widen it silently.
+#[cfg(unix)]
+fn is_trusted_root_candidate(dir: &Path, config: &DiscoveryConfig, current_uid: Option<u32>) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    if !has_any_marker(dir, &config.root_markers) {
+        return false;
+    }
+
+    let metadata = match std::fs::metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            warn!(
+                dir = %dir.display(),
+                %error,
+                "cannot stat root-marker directory; treating as untrusted"
+            );
+            return false;
+        }
+    };
+
+    if let Some(uid) = current_uid {
+        if metadata.uid() != uid {
+            warn!(
+                dir = %dir.display(),
+                owner = metadata.uid(),
+                current_uid = uid,
+                "root-marker directory is not owned by the current user; ignoring marker"
+            );
+            return false;
+        }
+    }
+
+    if metadata.mode() & 0o002 != 0 {
+        warn!(
+            dir = %dir.display(),
+            mode = format!("{:o}", metadata.mode() & 0o777),
+            "root-marker directory is world-writable; ignoring marker"
+        );
+        return false;
+    }
+
+    true
+}
+
+/// Non-Unix fallback: only the marker-presence check applies (no
+/// owner/mode metadata via `std::os::unix::fs::MetadataExt` on this
+/// platform).
+#[cfg(not(unix))]
+fn is_trusted_root_candidate(
+    dir: &Path,
+    config: &DiscoveryConfig,
+    _current_uid: Option<u32>,
+) -> bool {
+    has_any_marker(dir, &config.root_markers)
 }
 
 /// Builds the directory chain from `root` to `cwd` (inclusive), root first.
@@ -456,10 +647,16 @@ fn build_dir_chain(root: &Path, cwd: &Path) -> Vec<PathBuf> {
 }
 
 /// Collects doc files from the directory chain, respecting byte budgets.
-fn collect_docs(
-    chain: &[PathBuf],
-    config: &DiscoveryConfig,
-) -> Result<Vec<DiscoveredDoc>, DiscoveryError> {
+///
+/// A candidate that cannot be stat'ed/opened/read (e.g. `EACCES`, deleted
+/// mid-walk) or is not valid UTF-8 is skipped with a `warn!` diagnostic and
+/// the next `doc_filenames` entry in the same directory is tried instead —
+/// exactly like the existing symlink-skip below. Discovery as a whole never
+/// aborts because of a single bad doc file (Befund S2/F-165): a foreign
+/// repository must not be able to deny service to `harw` (or to child-agent
+/// spawns, which re-run discovery) just by shipping an unreadable or
+/// mis-encoded `AGENTS.md`.
+fn collect_docs(chain: &[PathBuf], config: &DiscoveryConfig) -> Vec<DiscoveredDoc> {
     let mut docs = Vec::new();
     let mut total_loaded: u64 = 0;
 
@@ -469,7 +666,14 @@ fn collect_docs(
             let metadata = match candidate.symlink_metadata() {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(DiscoveryError::Io(error)),
+                Err(error) => {
+                    warn!(
+                        path = %candidate.display(),
+                        %error,
+                        "cannot stat project instruction candidate; skipping"
+                    );
+                    continue;
+                }
             };
 
             if metadata.file_type().is_symlink() {
@@ -501,21 +705,37 @@ fn collect_docs(
             let bytes = if cap == 0 {
                 Vec::new()
             } else {
-                let mut file = std::fs::File::open(&candidate)?.take(cap);
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes)?;
-                bytes
+                match read_capped(&candidate, cap) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        warn!(
+                            path = %candidate.display(),
+                            %error,
+                            "cannot read project instruction candidate; skipping"
+                        );
+                        continue;
+                    }
+                }
             };
-            let content = if was_truncated {
+
+            if was_truncated {
                 warn!(
                     path = %candidate.display(),
                     file_size,
                     cap,
                     "doc file exceeds per-doc cap; truncating"
                 );
-                truncate_utf8_boundary(bytes, true)?
-            } else {
-                truncate_utf8_boundary(bytes, false)?
+            }
+
+            let content = match truncate_utf8_boundary(bytes, was_truncated) {
+                Some(content) => content,
+                None => {
+                    warn!(
+                        path = %candidate.display(),
+                        "project instruction candidate is not valid UTF-8; skipping"
+                    );
+                    continue;
+                }
             };
 
             let loaded_len = content.len() as u64;
@@ -539,23 +759,31 @@ fn collect_docs(
         }
     }
 
-    Ok(docs)
+    docs
+}
+
+/// Opens `path` and reads at most `cap` bytes.
+fn read_capped(path: &Path, cap: u64) -> io::Result<Vec<u8>> {
+    let mut file = std::fs::File::open(path)?.take(cap);
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// Converts bounded file bytes to UTF-8 without splitting a character.
 ///
 /// An incomplete sequence at the end is valid truncation only when the file
 /// exceeded the read budget. Invalid UTF-8 elsewhere, or in an untruncated
-/// file, remains an error.
-fn truncate_utf8_boundary(bytes: Vec<u8>, was_truncated: bool) -> Result<String, DiscoveryError> {
+/// file, yields `None` — the caller skips the candidate and logs a
+/// diagnostic instead of aborting discovery (Befund S2/F-165).
+fn truncate_utf8_boundary(bytes: Vec<u8>, was_truncated: bool) -> Option<String> {
     match String::from_utf8(bytes) {
-        Ok(content) => Ok(content),
+        Ok(content) => Some(content),
         Err(error) if was_truncated && error.utf8_error().error_len().is_none() => {
             let valid_up_to = error.utf8_error().valid_up_to();
-            String::from_utf8(error.into_bytes()[..valid_up_to].to_vec())
-                .map_err(DiscoveryError::Utf8)
+            String::from_utf8(error.into_bytes()[..valid_up_to].to_vec()).ok()
         }
-        Err(error) => Err(DiscoveryError::Utf8(error)),
+        Err(_) => None,
     }
 }
 
@@ -834,5 +1062,160 @@ mod tests {
         let cfg = default_cfg();
         let ctx = discover_project(&root, &cfg).unwrap();
         assert_eq!(ctx.project_root, ctx.cwd);
+    }
+
+    // ── W1-07 (F-028/S1): $HOME-Grenze ───────────────────────────────────────
+
+    #[test]
+    fn test_home_dir_with_git_is_not_promoted_to_root_for_descendant_cwd() {
+        // Simuliert ein Dotfiles-Bare-Repo `~/.git` (oder ein verirrtes
+        // `~/package.json`): der Nutzer startet in einem Unterverzeichnis
+        // von `$HOME`, ohne eigenen Marker. Ohne die Home-Grenze würde die
+        // Suche `$HOME` als Root wählen und damit das gesamte Home
+        // beschreib-/ausführbar machen.
+        let home = TempDir::new().unwrap();
+        let home_path = home.path().canonicalize().unwrap();
+        mkdir(&home_path, ".git");
+
+        let sub = mkdir(&home_path, "Downloads/tool-xyz");
+
+        let cfg = DiscoveryConfig {
+            home_dir: Some(home_path.clone()),
+            ..default_cfg()
+        };
+
+        let ctx = discover_project(&sub, &cfg).unwrap();
+
+        // Bestehende Semantik ohne Marker: cwd wird Root.
+        assert_eq!(ctx.project_root, sub);
+        assert_ne!(ctx.project_root, home_path);
+    }
+
+    #[test]
+    fn test_home_dir_itself_may_be_root_when_cwd_equals_home() {
+        // Startet der Nutzer harw direkt in `$HOME` (cwd == home), gibt es
+        // keine engere Wahl als `$HOME` selbst — ein dort liegender Marker
+        // wird akzeptiert (mit den normalen Eigentümer-/Rechteprüfungen).
+        let home = TempDir::new().unwrap();
+        let home_path = home.path().canonicalize().unwrap();
+        mkdir(&home_path, ".git");
+
+        let cfg = DiscoveryConfig {
+            home_dir: Some(home_path.clone()),
+            ..default_cfg()
+        };
+
+        let ctx = discover_project(&home_path, &cfg).unwrap();
+        assert_eq!(ctx.project_root, home_path);
+    }
+
+    #[test]
+    fn test_home_dir_none_disables_boundary() {
+        // `with_home_dir(None)` schaltet die Grenze ausdrücklich ab — Marker
+        // in `$HOME` verhalten sich dann wie jeder andere Vorfahre.
+        let home = TempDir::new().unwrap();
+        let home_path = home.path().canonicalize().unwrap();
+        mkdir(&home_path, ".git");
+        let sub = mkdir(&home_path, "sub");
+
+        let cfg = DiscoveryConfig::new()
+            .with_root_markers(vec![".git".to_string()])
+            .with_home_dir(None);
+
+        let ctx = discover_project(&sub, &cfg).unwrap();
+        assert_eq!(ctx.project_root, home_path);
+    }
+
+    // ── W1-07 (F-028/S1): Eigentümer/Weltschreibbarkeit ──────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn test_world_writable_marker_dir_is_ignored() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        mkdir(&root, ".git");
+        // Simuliert z. B. ein weltbeschreibbares `/tmp`, in das ein anderer
+        // lokaler Nutzer einen Marker legen konnte.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let sub = mkdir(&root, "sub");
+
+        // `max_walk_depth: 1` begrenzt die Suche auf `sub` (cwd) und `root`,
+        // damit der Test nicht von zufälligen Markern in echten
+        // Vorfahren-Verzeichnissen des Testsystems abhängt.
+        let cfg = DiscoveryConfig {
+            max_walk_depth: 1,
+            ..default_cfg()
+        };
+
+        let ctx = discover_project(&sub, &cfg).unwrap();
+
+        // Der weltbeschreibbare Marker-Ordner wird ignoriert; ohne weiteren
+        // (vertrauenswürdigen) Marker fällt die Suche auf cwd zurück.
+        assert_eq!(ctx.project_root, sub);
+
+        // Aufräumen, damit TempDir sich beim Drop löschen lässt (0o777 auf
+        // dem Wurzelverzeichnis stört das Aufräumen selbst nicht, aber
+        // restriktivere Testumgebungen könnten empfindlich sein).
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    // ── W1-07 (F-165/S2): einzelne Dokumente überspringen statt abbrechen ───
+
+    #[cfg(unix)]
+    #[test]
+    fn test_discover_skips_unreadable_doc_and_loads_rest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        mkdir(&root, ".git");
+        let mid = mkdir(&root, "mid");
+
+        write(&root, "HARW.md", "unreadable");
+        fs::set_permissions(root.join("HARW.md"), fs::Permissions::from_mode(0o000)).unwrap();
+        write(&mid, "HARW.md", "readable mid doc");
+
+        let ctx = discover_project(&mid, &default_cfg()).unwrap();
+
+        // Das unlesbare Root-Dokument wird übersprungen (kein Abbruch der
+        // gesamten Discovery); das Dokument aus `mid` lädt trotzdem.
+        assert_eq!(ctx.docs.len(), 1);
+        assert_eq!(ctx.docs[0].content, "readable mid doc");
+
+        // Aufräumen, damit TempDir sich beim Drop löschen lässt.
+        fs::set_permissions(root.join("HARW.md"), fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    #[test]
+    fn test_discover_skips_invalid_utf8_doc_and_loads_rest() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        mkdir(&root, ".git");
+        let mid = mkdir(&root, "mid");
+
+        // Ungültige UTF-8-Bytes, NICHT am Ende abgeschnitten (kein
+        // Truncation-Sonderfall) — muss trotzdem übersprungen statt die
+        // Discovery abbrechen zu lassen.
+        fs::write(root.join("HARW.md"), [0x48, 0x41, 0xff, 0xfe, 0x21]).unwrap();
+        write(&mid, "HARW.md", "readable mid doc");
+
+        let ctx = discover_project(&mid, &default_cfg()).unwrap();
+
+        assert_eq!(ctx.docs.len(), 1);
+        assert_eq!(ctx.docs[0].content, "readable mid doc");
+    }
+
+    // ── with_home_dir builder ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_with_home_dir_builder_setter() {
+        let cfg = DiscoveryConfig::new().with_home_dir(Some(PathBuf::from("/home/test")));
+        assert_eq!(cfg.home_dir, Some(PathBuf::from("/home/test")));
+
+        let cfg = cfg.with_home_dir(None);
+        assert_eq!(cfg.home_dir, None);
     }
 }

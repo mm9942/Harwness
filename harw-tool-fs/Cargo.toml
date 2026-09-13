@@ -10,6 +10,7 @@ harw-macros = { path = "../harw-macros" }
 harw-tools = { path = "../harw-tools" }
 harw-types = { path = "../harw-types" }
 harw-sandbox = { path = "../harw-sandbox" }
+harw-fsutil = { path = "../harw-fsutil" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
@@ -17,6 +18,8 @@ tracing = "0.1"
 regex = "1.13.0"
 globset = "0.4.19"
 ignore = "0.4.32"
+# `spawn_blocking` für Walks und Datei-IO (Version aus `Cargo.lock`, W1-02).
+tokio = { version = "1.53.0", features = ["rt"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "macros"] }

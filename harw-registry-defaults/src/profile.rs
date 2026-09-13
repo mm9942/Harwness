@@ -264,13 +264,13 @@ const BROWSER_TOOLS: &[&str] = &[
     "browser.close",
 ];
 
-/// Plan-/Goal-Operationen des Profils [`RegistryProfile::Planning`].
-///
-/// Diese Werkzeuge registriert **nicht** dieses Crate, sondern die
-/// Composition-Root (`harw-cli`/`harw-tui`). Sie erscheinen deshalb in
-/// [`RegistryProfile::tool_names`] (dem beworbenen Prompt-Inventar der
-/// Session), aber nicht in [`RegistryProfile::registered_tool_names`].
-const PLANNING_OPERATION_TOOLS: &[&str] = &["plan", "goal"];
+// Früher stand hier `PLANNING_OPERATION_TOOLS = ["plan", "goal"]`, das
+// `RegistryProfile::Planning::tool_names` zusätzlich bewarb. Entfernt in W1-05
+// (Register F-014, G-003): Kind-Registries tragen keinen `ModelToolProvider`,
+// der Planner sah `plan`/`goal` also nur als Phantom ohne Executor — und der
+// Deckungstest in `lib.rs` zwang beide über `tool_names()` in
+// `AUTO_APPROVED_TOOLS`, obwohl sie `model_tool(approval = "always")`
+// deklarieren. Das war der Approval-Bypass im Root.
 
 // ---------------------------------------------------------------------------
 // RegistryProfile
@@ -288,8 +288,8 @@ const PLANNING_OPERATION_TOOLS: &[&str] = &["plan", "goal"];
 /// - `Full` — voller Coding-Satz (heutiges Verhalten).
 /// - `ReadOnlyExplore` — ausschließlich lesend.
 /// - `Research` — `ReadOnlyExplore` plus Netzzugang über die Sandbox-Allowlist.
-/// - `Planning` — `ReadOnlyExplore` plus die Plan-/Goal-Operationen der
-///   Composition-Root.
+/// - `Planning` — `ReadOnlyExplore` plus `lens.ask` (Plan-/Goal-Operationen
+///   bewirbt es nicht: das Kind besitzt dafür keinen Executor).
 /// - `NoTools` — registriert und bewirbt gar nichts.
 ///
 /// # Warum `NoTools` und nicht `ReadOnlyExplore` für die Triage-Rollen
@@ -327,8 +327,8 @@ pub enum RegistryProfile {
     ReadOnlyExplore,
     /// ReadOnlyExplore + web.* (Netz nur über die Host-Allowlist der Sandbox).
     Research,
-    /// ReadOnlyExplore + Plan-/Goal-Werkzeuge (die Operationen selbst registriert
-    /// die Composition-Root, hier nur die Tool-Provider).
+    /// ReadOnlyExplore + `lens.ask`. Die Plan-/Goal-Operationen der
+    /// Composition-Root gehören **nicht** dazu (siehe W1-05).
     Planning,
     /// Registriert und bewirbt keine Werkzeuge — für Rollen, die bereits
     /// ausgewertete Befund-Batches als Parameter bekommen (`[tools].admitted
@@ -457,11 +457,12 @@ impl RegistryProfile {
     /// Die vollständige Werkzeugoberfläche, die der System-Prompt bewirbt.
     ///
     /// # Beschreibung
-    /// Für alle Profile außer [`RegistryProfile::Planning`] identisch zu
-    /// [`RegistryProfile::registered_tool_names`]. `Planning` hängt zusätzlich
-    /// `plan` und `goal` an: diese Operationen registriert die
-    /// Composition-Root, nicht dieses Crate — die Session besitzt sie also,
-    /// dieses Crate liefert sie nur nicht selbst.
+    /// Für **alle** Profile identisch zu
+    /// [`RegistryProfile::registered_tool_names`]: beworben wird nur, wofür die
+    /// Registry des Profils auch einen Executor trägt. Früher hängte `Planning`
+    /// zusätzlich `plan` und `goal` an — Operationen der Composition-Root, die
+    /// eine Kind-Registry nie besitzt; über die Deckungstests erzwang das ihre
+    /// Auto-Freigabe (W1-05, Register F-014/G-003).
     ///
     /// # Rückgabe
     /// Die beworbenen Tool-Namen in Prompt-Reihenfolge.
@@ -471,17 +472,14 @@ impl RegistryProfile {
     /// use harw_registry_defaults::profile::RegistryProfile;
     ///
     /// let planning = RegistryProfile::Planning.tool_names();
-    /// assert!(planning.contains(&"plan"));
-    /// assert!(planning.contains(&"goal"));
+    /// assert!(planning.contains(&"lens.ask"));
+    /// assert!(!planning.contains(&"plan"));
+    /// assert!(!planning.contains(&"goal"));
     /// assert!(!planning.contains(&"fs.write"));
     /// ```
     #[must_use]
     pub fn tool_names(self) -> Vec<&'static str> {
-        let mut names = self.registered_tool_names();
-        if matches!(self, RegistryProfile::Planning) {
-            names.extend(PLANNING_OPERATION_TOOLS.iter().copied());
-        }
-        names
+        self.registered_tool_names()
     }
 }
 
@@ -900,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn test_planning_profile_registers_read_only_tools_and_advertises_plan_and_goal() {
+    fn test_planning_profile_registers_read_only_tools_and_does_not_advertise_plan_or_goal() {
         let assembled = assemble(RegistryProfile::Planning);
         // Registriert werden die read-only Provider von `ReadOnlyExplore`
         // plus `lens.ask` — der einzige Grund, warum `Planning` sich
@@ -912,9 +910,11 @@ mod tests {
             .collect();
         expected.push("lens.ask".to_owned());
         assert_eq!(registered_names(&assembled), expected);
-        // … beworben werden zusätzlich die Operationen der Composition-Root.
-        assert!(assembled.identity.tools_available.contains(&"plan".to_owned()));
-        assert!(assembled.identity.tools_available.contains(&"goal".to_owned()));
+        // … und beworben wird genau das Registrierte: `plan`/`goal` sind
+        // Composition-Root-Operationen ohne Executor im Kind (W1-05).
+        assert_eq!(assembled.identity.tools_available, expected);
+        assert!(!assembled.identity.tools_available.contains(&"plan".to_owned()));
+        assert!(!assembled.identity.tools_available.contains(&"goal".to_owned()));
     }
 
     #[test]

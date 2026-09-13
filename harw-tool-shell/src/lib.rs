@@ -12,9 +12,15 @@
 //!
 //! # Modules
 //! - [`exec`] — [`ShellToolProvider`], [`ShellExecutor`], [`ShellExecError`]
+//! - [`limits`] — [`ShellLimits`], [`ShellLimitsError`]: rlimits über festgepinntes `prlimit`
+//!   und tmpfs-Größe (W1-03)
+//! - `capture` (intern) — streamende, gekappte Erfassung von stdout/stderr (W1-03)
 
 #![forbid(unsafe_code)]
 
+mod capture;
 pub mod exec;
+pub mod limits;
 
 pub use exec::{ShellExecError, ShellExecutor, ShellToolProvider};
+pub use limits::{ShellLimits, ShellLimitsError};

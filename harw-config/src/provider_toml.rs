@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::auth_toml::SecretRef;
+use crate::error::{ConfigError, ConfigResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +39,44 @@ impl ProviderToml {
     #[must_use]
     pub fn has_plaintext_secret(&self) -> bool {
         self.api_key.as_ref().is_some_and(|k| !k.is_empty())
+    }
+
+    /// `true`, wenn ein Header dieses Namens Credentials trägt und daher nur
+    /// als [`SecretRef`] konfiguriert werden darf.
+    ///
+    /// Regel (ASCII-case-insensitiv): der Name enthält `authorization` (deckt
+    /// `authorization`, `proxy-authorization`, `cf-aig-authorization` ab),
+    /// endet auf `-key` (`x-api-key`, `api-key`) oder enthält `token`.
+    /// `harw-provider-http` nutzt dieselbe Regel, um solche Header aufzulösen
+    /// und als sensitiv zu markieren.
+    #[must_use]
+    pub fn is_sensitive_header_name(name: &str) -> bool {
+        let name = name.trim().to_ascii_lowercase();
+        name.contains("authorization") || name.ends_with("-key") || name.contains("token")
+    }
+
+    /// Prüft Invarianten, die die TOML-Deserialisierung nicht ausdrücken kann.
+    ///
+    /// Derzeit: Header mit Credential-Namen (siehe
+    /// [`Self::is_sensitive_header_name`]) müssen eine gültige [`SecretRef`]
+    /// (`env:`/`file:`/`file-json:`/`keyring:`/`secrets:`) sein, nie Klartext.
+    ///
+    /// # Errors
+    /// [`ConfigError::PlaintextSecret`] mit Header-Namen als Feld; der Wert
+    /// erscheint nie im Fehler. Bei mehreren Verstößen wird der lexikographisch
+    /// kleinste Header-Name gemeldet (deterministisch trotz `HashMap`).
+    pub fn validate(&self) -> ConfigResult<()> {
+        let mut headers: Vec<(&String, &String)> = self.headers.iter().collect();
+        headers.sort_by(|left, right| left.0.cmp(right.0));
+        for (name, value) in headers {
+            if Self::is_sensitive_header_name(name) && value.parse::<SecretRef>().is_err() {
+                return Err(ConfigError::PlaintextSecret {
+                    file: format!("providers/{}.toml", self.name),
+                    field: format!("headers.{name}"),
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -95,6 +134,68 @@ mod tests {
 
         let error = toml::from_str::<ProviderToml>(src).unwrap_err();
         assert!(error.to_string().contains("unknown field `auht`"));
+    }
+
+    fn provider_with_headers(headers: &[(&str, &str)]) -> ProviderToml {
+        let src = r#"
+            name = "gateway"
+            api = "openai-chat"
+            base_url = "https://gateway.example/v1"
+            auth = "env:GATEWAY_KEY"
+        "#;
+        let mut provider: ProviderToml = toml::from_str(src).unwrap();
+        provider.headers = headers
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        provider
+    }
+
+    #[test]
+    fn test_validate_rejects_plaintext_credential_headers() {
+        for name in [
+            "authorization",
+            "Authorization",
+            "cf-aig-authorization",
+            "x-api-key",
+            "API-KEY",
+            "x-auth-token",
+            "X-Session-Token-Id",
+        ] {
+            let provider = provider_with_headers(&[(name, "Bearer plaintext-header-secret")]);
+            let error = provider.validate().expect_err(name);
+            assert!(
+                matches!(&error, ConfigError::PlaintextSecret { field, .. }
+                    if *field == format!("headers.{name}")),
+                "{name}: {error}"
+            );
+            assert!(!error.to_string().contains("plaintext-header-secret"));
+        }
+    }
+
+    #[test]
+    fn test_validate_accepts_secret_ref_credential_headers_and_plain_other_headers() {
+        let provider = provider_with_headers(&[
+            ("authorization", "env:GATEWAY_BEARER"),
+            ("x-api-key", "secrets:gateway/api-key"),
+            ("cf-aig-token", "file:/home/mia/.harw/secrets/cf.token"),
+            ("x-provider-marker", "plain-value"),
+            ("keyboard", "not-a-credential"),
+        ]);
+        provider.validate().expect("secret refs and ordinary headers are valid");
+    }
+
+    #[test]
+    fn test_validate_rejects_malformed_secret_ref_and_reports_smallest_name() {
+        let provider = provider_with_headers(&[
+            ("x-api-key", "env:"),
+            ("authorization", "unknown:value"),
+        ]);
+        let error = provider.validate().unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::PlaintextSecret { ref field, .. } if field == "headers.authorization"
+        ));
     }
 
     #[test]

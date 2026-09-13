@@ -3572,6 +3572,16 @@ async fn drive_turn_animated(
         .ok_or_else(|| TuiError::Core("Modell lieferte keine Assistant-Antwort".to_owned()))
 }
 
+/// Totzeit, bevor eine frisch angezeigte Freigabefrage `y`/`n` annimmt.
+///
+/// # Beschreibung
+/// W1-08 (Register G-008, w4-tui-control §1.4 K1): Ohne Totzeit beantwortet
+/// jedes `y` oder `n`, das im Moment des Erscheinens ohnehin getippt wurde
+/// („sync", „you", „nein"), die Frage — eine Tipp-Falle mit Ausführungsfolge.
+/// 700 ms liegen über der Reaktionszeit eines Tippstroms und deutlich unter
+/// der eines Menschen, der die Frage erst liest.
+const APPROVAL_ARMING_DELAY: Duration = Duration::from_millis(700);
+
 /// Was ein Tastendruck mit einer offenen Freigabefrage macht.
 ///
 /// # Beschreibung
@@ -3584,6 +3594,11 @@ enum ApprovalKeyAction {
     Approve,
     /// Ablehnung mit fester Begründung (`n` / `N`, `Esc`, `Ctrl+C`).
     Reject(&'static str),
+    /// Klappt die Argumente der Frage auf bzw. wieder ein (`v` / `V`).
+    ToggleDetails,
+    /// Eine Antworttaste, die (noch) nicht zählt: Totzeit läuft, die Frage ist
+    /// nicht sichtbar, oder die Taste kam aus einer Auto-Wiederholung.
+    NotArmed,
     /// Taste ohne Bedeutung — die Frage bleibt offen.
     Ignore,
 }
@@ -3595,7 +3610,8 @@ enum ApprovalKeyAction {
 ///
 /// # Rückgabe
 /// [`ApprovalKeyAction::Approve`] **nur** für `y`/`Y`;
-/// [`ApprovalKeyAction::Reject`] für `n`/`N`, `Esc` und `Ctrl+C`; sonst
+/// [`ApprovalKeyAction::Reject`] für `n`/`N`, `Esc` und `Ctrl+C`;
+/// [`ApprovalKeyAction::ToggleDetails`] für `v`/`V`; sonst
 /// [`ApprovalKeyAction::Ignore`].
 fn classify_approval_key(key: KeyEvent) -> ApprovalKeyAction {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -3607,9 +3623,53 @@ fn classify_approval_key(key: KeyEvent) -> ApprovalKeyAction {
     match key.code {
         KeyCode::Char('y' | 'Y') => ApprovalKeyAction::Approve,
         KeyCode::Char('n' | 'N') => ApprovalKeyAction::Reject(REASON_OPERATOR_REJECTED),
+        KeyCode::Char('v' | 'V') => ApprovalKeyAction::ToggleDetails,
         KeyCode::Esc => ApprovalKeyAction::Reject(REASON_OPERATOR_CANCELLED),
         _ => ApprovalKeyAction::Ignore,
     }
+}
+
+/// Prüft, ob `key` eine Antworttaste (`y`/`n`) ohne Modifier ist.
+fn is_approval_answer_key(key: KeyEvent) -> bool {
+    !key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('y' | 'Y' | 'n' | 'N'))
+}
+
+/// Klassifiziert einen Tastendruck gegen eine offene Freigabefrage **mit**
+/// Scharfschaltung — reine Funktion, ohne Uhr und ohne Terminal.
+///
+/// # Beschreibung
+/// W1-08 (Register G-008). `y`/`n` zählen nur, wenn
+/// 1. seit dem Anzeigen der Frage mindestens [`APPROVAL_ARMING_DELAY`]
+///    vergangen ist (Tipp-Falle, w4-tui-control K1),
+/// 2. die Frage sichtbar ist (`question_visible`; hochgescrollt beantwortet
+///    niemand, was er nicht liest, w4-tui-control K2),
+/// 3. der Tastendruck keine Auto-Wiederholung ist (eine gedrückt gehaltene
+///    Taste ist keine Entscheidung).
+///
+/// `Esc` und `Ctrl+C` bleiben immer wirksam: sie **lehnen ab**, sind also
+/// fail-safe und dürfen nie blockiert werden. `v` klappt jederzeit auf.
+///
+/// # Argumente
+/// - `key` ([`KeyEvent`]): der bereits auf Press/Repeat gefilterte Tastendruck.
+/// - `since_shown` (`Duration`): Zeit seit dem Anzeigen der Frage.
+/// - `question_visible` (`bool`): ob die Frage im Sichtbereich steht.
+///
+/// # Rückgabe
+/// [`ApprovalKeyAction::NotArmed`] statt `Approve`/`Reject`, solange eine der
+/// drei Bedingungen verletzt ist.
+fn classify_armed_approval_key(
+    key: KeyEvent,
+    since_shown: Duration,
+    question_visible: bool,
+) -> ApprovalKeyAction {
+    let armed = since_shown >= APPROVAL_ARMING_DELAY
+        && question_visible
+        && key.kind != crossterm::event::KeyEventKind::Repeat;
+    if is_approval_answer_key(key) && !armed {
+        return ApprovalKeyAction::NotArmed;
+    }
+    classify_approval_key(key)
 }
 
 /// Eine im Verlauf sichtbare, noch unbeantwortete Freigabefrage.
@@ -3622,6 +3682,31 @@ struct PendingApprovalPrompt {
     prompt: ApprovalPrompt,
     /// Die zugehörige, geteilte Verlaufszelle.
     cell: Arc<Mutex<ApprovalPromptCell>>,
+}
+
+/// Anzeigezustand der einen offenen Freigabefrage.
+///
+/// # Beschreibung
+/// Getrennt von [`PendingApprovalPrompt`], weil dort Frage und Zelle liegen
+/// (Antwortweg), hier dagegen Darstellung und Scharfschaltung: die
+/// aufklappbare Ansicht im Verlauf und der Zeitpunkt, ab dem `y`/`n` zählen.
+struct ApprovalPresentation {
+    /// Die im Verlauf hängende, aufklappbare Ansicht derselben Zelle.
+    view: Arc<Mutex<crate::history_cell::ApprovalPromptView>>,
+    /// Zeitpunkt, zu dem die Frage sichtbar gezeichnet wurde.
+    shown_at: Instant,
+}
+
+impl ApprovalPresentation {
+    /// Setzt die Totzeit neu (Frage wurde gerade erst sichtbar bzw. verändert).
+    fn rearm(&mut self) {
+        self.shown_at = Instant::now();
+    }
+
+    /// Zeit seit dem Anzeigen der Frage.
+    fn since_shown(&self) -> Duration {
+        self.shown_at.elapsed()
+    }
 }
 
 impl PendingApprovalPrompt {
@@ -3711,6 +3796,7 @@ async fn drive_pauses_to_completion(
     };
 
     let mut pending: Option<PendingApprovalPrompt> = None;
+    let mut presentation: Option<ApprovalPresentation> = None;
     let mut approvals_open = true;
     let mut input_open = true;
 
@@ -3730,6 +3816,7 @@ async fn drive_pauses_to_completion(
                 // Default, und die Zelle darf nicht als Frage stehenbleiben.
                 if let Some(open) = pending.take() {
                     open.reject(REASON_OPERATOR_CANCELLED);
+                    presentation = None;
                     draw_viewport(guard, app, spinner, None)?;
                 }
                 return Ok(());
@@ -3742,16 +3829,36 @@ async fn drive_pauses_to_completion(
                             request = %prompt.request(),
                             "tui.approval.prompt_shown"
                         );
+                        // Eine noch offene ältere Frage wird nicht still
+                        // überschrieben (w4-tui-control K3): nach einem
+                        // Zeitablauf im Treiber stünden sonst zwei offene
+                        // Fragen im Verlauf, und `y` beantwortete die falsche.
+                        if let Some(stale) = pending.take() {
+                            tracing::warn!("tui.approval.stale_prompt_closed");
+                            stale.reject(REASON_OPERATOR_CANCELLED);
+                        }
                         let cell = Arc::new(Mutex::new(ApprovalPromptCell {
                             tool_name: prompt.tool_name().to_owned(),
                             arguments_raw: prompt.arguments_json(),
                             decision: None,
                         }));
-                        app.push_shared_cell(Arc::clone(&cell));
-                        // Eine zuvor offene Frage kann es nicht geben: der
-                        // Treiber stellt sie streng nacheinander.
+                        let view = Arc::new(Mutex::new(
+                            crate::history_cell::ApprovalPromptView::new(
+                                Arc::clone(&cell),
+                                prompt.call(),
+                            ),
+                        ));
+                        app.push_shared_cell(Arc::clone(&view));
+                        // Die Frage muss sichtbar sein, sonst beantwortet der
+                        // Nutzer etwas, das außerhalb des Sichtbereichs steht
+                        // (w4-tui-control K2).
+                        app.scroll.force_follow();
                         pending = Some(PendingApprovalPrompt { prompt, cell });
                         draw_viewport(guard, app, spinner, None)?;
+                        presentation = Some(ApprovalPresentation {
+                            view,
+                            shown_at: Instant::now(),
+                        });
                     }
                     None => {
                         tracing::warn!("tui.approval.prompt_channel_ended");
@@ -3772,18 +3879,64 @@ async fn drive_pauses_to_completion(
                             draw_viewport(guard, app, spinner, None)?;
                             continue;
                         }
-                        match classify_approval_key(key) {
+                        let since_shown = presentation
+                            .as_ref()
+                            .map_or(Duration::ZERO, ApprovalPresentation::since_shown);
+                        // Sichtbar heißt hier: die Ansicht folgt dem Ende der
+                        // Historie, in dem die Frage als jüngste Zelle steht.
+                        let question_visible = app.scroll.is_at_tail();
+                        match classify_armed_approval_key(key, since_shown, question_visible) {
                             ApprovalKeyAction::Ignore => {}
+                            ApprovalKeyAction::NotArmed => {
+                                tracing::debug!(
+                                    since_shown_ms = u64::try_from(since_shown.as_millis())
+                                        .unwrap_or(u64::MAX),
+                                    question_visible,
+                                    "tui.approval.key_not_armed"
+                                );
+                                if !question_visible {
+                                    // Erst zeigen, dann fragen: die Frage wird
+                                    // eingeblendet und die Totzeit läuft neu.
+                                    app.scroll.force_follow();
+                                    draw_viewport(guard, app, spinner, None)?;
+                                    if let Some(open) = presentation.as_mut() {
+                                        open.rearm();
+                                    }
+                                }
+                            }
+                            ApprovalKeyAction::ToggleDetails => {
+                                if let Some(open) = presentation.as_mut() {
+                                    match open.view.lock() {
+                                        Ok(mut view) => {
+                                            let expanded = view.toggle_expanded();
+                                            tracing::debug!(
+                                                expanded,
+                                                "tui.approval.details_toggled"
+                                            );
+                                        }
+                                        Err(_) => {
+                                            tracing::error!("tui.approval.view_lock_poisoned");
+                                        }
+                                    }
+                                }
+                                app.scroll.force_follow();
+                                draw_viewport(guard, app, spinner, None)?;
+                                if let Some(open) = presentation.as_mut() {
+                                    open.rearm();
+                                }
+                            }
                             ApprovalKeyAction::Approve => {
                                 if let Some(open) = pending.take() {
                                     open.approve();
                                 }
+                                presentation = None;
                                 draw_viewport(guard, app, spinner, None)?;
                             }
                             ApprovalKeyAction::Reject(reason) => {
                                 if let Some(open) = pending.take() {
                                     open.reject(reason);
                                 }
+                                presentation = None;
                                 draw_viewport(guard, app, spinner, None)?;
                             }
                         }
@@ -3804,6 +3957,7 @@ async fn drive_pauses_to_completion(
                         input_open = false;
                         if let Some(open) = pending.take() {
                             open.reject(REASON_OPERATOR_CANCELLED);
+                            presentation = None;
                         }
                     }
                 }
@@ -6063,5 +6217,158 @@ forbidden = [{forbidden}]
                 panic!("root mismatch is not a provider-namespace error")
             }
         }
+    }
+}
+
+// ── Tests zur Scharfschaltung der Freigabefrage (W1-08) ──────────────────────
+
+#[cfg(test)]
+mod approval_arming_tests {
+    use super::*;
+    use crossterm::event::KeyEventKind;
+
+    /// Tastendruck ohne Modifier.
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Sichtbare Frage, Totzeit abgelaufen.
+    const ARMED: Duration = Duration::from_millis(900);
+
+    /// Pflichtfall G-008: ein `y` innerhalb der Totzeit gibt **nichts** frei.
+    #[test]
+    fn an_early_y_is_ignored_and_a_late_one_approves() {
+        assert_eq!(
+            classify_armed_approval_key(key(KeyCode::Char('y')), Duration::ZERO, true),
+            ApprovalKeyAction::NotArmed
+        );
+        assert_eq!(
+            classify_armed_approval_key(
+                key(KeyCode::Char('y')),
+                APPROVAL_ARMING_DELAY - Duration::from_millis(1),
+                true
+            ),
+            ApprovalKeyAction::NotArmed
+        );
+        assert_eq!(
+            classify_armed_approval_key(key(KeyCode::Char('y')), APPROVAL_ARMING_DELAY, true),
+            ApprovalKeyAction::Approve
+        );
+        assert_eq!(
+            classify_armed_approval_key(key(KeyCode::Char('Y')), ARMED, true),
+            ApprovalKeyAction::Approve
+        );
+    }
+
+    /// Auch die Ablehnung per `n` ist der Tipp-Falle entzogen — sonst
+    /// beantwortete ein getipptes „nein" die Frage, bevor sie gelesen ist.
+    #[test]
+    fn an_early_n_is_ignored_and_a_late_one_rejects() {
+        assert_eq!(
+            classify_armed_approval_key(key(KeyCode::Char('n')), Duration::from_millis(10), true),
+            ApprovalKeyAction::NotArmed
+        );
+        assert_eq!(
+            classify_armed_approval_key(key(KeyCode::Char('n')), ARMED, true),
+            ApprovalKeyAction::Reject(REASON_OPERATOR_REJECTED)
+        );
+    }
+
+    /// Eine nicht sichtbare Frage (hochgescrollt) wird nie beantwortet.
+    #[test]
+    fn an_invisible_question_accepts_no_answer() {
+        assert_eq!(
+            classify_armed_approval_key(key(KeyCode::Char('y')), ARMED, false),
+            ApprovalKeyAction::NotArmed
+        );
+        assert_eq!(
+            classify_armed_approval_key(key(KeyCode::Char('n')), ARMED, false),
+            ApprovalKeyAction::NotArmed
+        );
+    }
+
+    /// Eine gedrückt gehaltene Taste ist keine Entscheidung.
+    #[test]
+    fn a_repeated_key_never_answers() {
+        let repeat = KeyEvent::new_with_kind(
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        );
+        assert_eq!(
+            classify_armed_approval_key(repeat, ARMED, true),
+            ApprovalKeyAction::NotArmed
+        );
+    }
+
+    /// Abbruchtasten bleiben immer wirksam: sie lehnen ab (fail-safe).
+    #[test]
+    fn cancel_keys_stay_armed_because_they_reject() {
+        assert_eq!(
+            classify_armed_approval_key(key(KeyCode::Esc), Duration::ZERO, false),
+            ApprovalKeyAction::Reject(REASON_OPERATOR_CANCELLED)
+        );
+        assert_eq!(
+            classify_armed_approval_key(
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+                Duration::ZERO,
+                false
+            ),
+            ApprovalKeyAction::Reject(REASON_OPERATOR_CANCELLED)
+        );
+    }
+
+    /// `v` klappt jederzeit auf, andere Tasten bleiben bedeutungslos.
+    #[test]
+    fn v_toggles_details_and_other_keys_are_ignored() {
+        assert_eq!(
+            classify_armed_approval_key(key(KeyCode::Char('v')), Duration::ZERO, true),
+            ApprovalKeyAction::ToggleDetails
+        );
+        assert_eq!(
+            classify_armed_approval_key(key(KeyCode::Char('V')), ARMED, false),
+            ApprovalKeyAction::ToggleDetails
+        );
+        assert_eq!(
+            classify_armed_approval_key(key(KeyCode::Char('x')), ARMED, true),
+            ApprovalKeyAction::Ignore
+        );
+        assert_eq!(
+            classify_armed_approval_key(
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+                ARMED,
+                true
+            ),
+            ApprovalKeyAction::Ignore
+        );
+    }
+
+    /// Der Anzeigezustand schaltet nach `rearm` wieder scharf.
+    #[test]
+    fn rearm_restarts_the_arming_delay() {
+        // `checked_sub` statt `-`: auf einer gerade erst gestarteten Maschine
+        // reicht die monotone Uhr womöglich keine fünf Sekunden zurück, und
+        // `Instant::sub` würde dann paniken.
+        let Some(past) = Instant::now().checked_sub(Duration::from_secs(5)) else {
+            return;
+        };
+        let mut presentation = ApprovalPresentation {
+            view: Arc::new(Mutex::new(crate::history_cell::ApprovalPromptView::new(
+                Arc::new(Mutex::new(ApprovalPromptCell {
+                    tool_name: "fs.write".to_owned(),
+                    arguments_raw: "{}".to_owned(),
+                    decision: None,
+                })),
+                &harw_extension_api::ToolCall {
+                    id: harw_types::ToolCallId::new(),
+                    name: harw_extension_api::ToolName::new("fs.write"),
+                    arguments: harw_tools::serde_json::json!({ "path": "a.txt" }),
+                },
+            ))),
+            shown_at: past,
+        };
+        assert!(presentation.since_shown() >= APPROVAL_ARMING_DELAY);
+        presentation.rearm();
+        assert!(presentation.since_shown() < APPROVAL_ARMING_DELAY);
     }
 }

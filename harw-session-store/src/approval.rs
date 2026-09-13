@@ -15,6 +15,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use fs4::FileExt;
+#[cfg(unix)]
+use harw_fsutil::OpenMode;
 use harw_types::{ApprovalActor, ItemId, ReviewDecision, SessionId, ToolCallId};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -221,12 +223,10 @@ impl ApprovalStore {
 
     fn lock_session(&self, session: &SessionId) -> SessionStoreResult<File> {
         let path = self.session_dir(session)?.join(".lock");
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)?;
+        // F-006: `lock_session` folgte zuvor Symlinks vollständig (kein
+        // `O_NOFOLLOW`, keine Vorab-Prüfung). Jetzt symlinkfest über
+        // `harw_fsutil::open_nofollow`.
+        let file = open_lock_file_without_following_symlinks(&path)?;
         FileExt::try_lock(&file).map_err(|error| match error {
             fs4::TryLockError::WouldBlock => SessionStoreError::LockContended {
                 session: session.clone(),
@@ -276,18 +276,51 @@ fn path_is_symlink(path: &Path) -> SessionStoreResult<bool> {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn read_pending(path: &Path) -> std::io::Result<Vec<u8>> {
-    use std::os::unix::fs::OpenOptionsExt;
+/// Öffnet den Session-Lock ohne dem letzten Pfadglied als Symlink zu folgen.
+///
+/// F-006: `lock_session` folgte zuvor Symlinks vollständig — es gab weder
+/// eine Vorab-Prüfung noch `O_NOFOLLOW`. Auf Unix läuft das Öffnen jetzt über
+/// `harw_fsutil::open_nofollow` (plattformkorrektes `O_NOFOLLOW` über
+/// `rustix::fs::OFlags::NOFOLLOW`).
+fn open_lock_file_without_following_symlinks(path: &Path) -> std::io::Result<File> {
+    #[cfg(unix)]
+    {
+        harw_fsutil::open_nofollow(
+            path,
+            OpenMode {
+                read: true,
+                write: true,
+                create: true,
+                create_new: false,
+                truncate: false,
+                append: false,
+                mode: 0o666,
+            },
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+    }
+}
 
-    // O_NOFOLLOW prevents a pending record from being redirected between the
-    // metadata check and the read. Other Unix targets use the metadata check
-    // in the fallback below.
-    const O_NOFOLLOW: i32 = 0o400_000;
-    let mut options = OpenOptions::new();
-    options.read(true).custom_flags(O_NOFOLLOW);
-    let file = options.open(path).map_err(|error| {
-        if error.raw_os_error() == Some(40) {
+/// Liest eine ausstehende Genehmigung, ohne dem letzten Pfadglied als
+/// Symlink zu folgen.
+///
+/// F-006: das vormals architekturabhängig falsche `O_NOFOLLOW` (nur auf
+/// Linux/Android verwendet, andere Unix-Zielsysteme verließen sich allein
+/// auf die TOCTOU-anfällige `symlink_metadata`-Prüfung) wurde durch
+/// `harw_fsutil::open_nofollow` ersetzt, das auf jedem Unix-Zielsystem die
+/// korrekte Konstante verwendet.
+#[cfg(unix)]
+fn read_pending(path: &Path) -> std::io::Result<Vec<u8>> {
+    let file = harw_fsutil::open_nofollow(path, OpenMode::read_only()).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::FilesystemLoop {
             std::io::Error::from(std::io::ErrorKind::NotFound)
         } else {
             error
@@ -302,7 +335,7 @@ fn read_pending(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(not(unix))]
 fn read_pending(path: &Path) -> std::io::Result<Vec<u8>> {
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() {
@@ -481,5 +514,48 @@ mod tests {
             Err(SessionStoreError::ApprovalNotFound { .. })
         ));
         assert_eq!(std::fs::read(&external).unwrap(), b"sentinel");
+    }
+
+    /// F-006 regression: `lock_session` used to open its `.lock` sidecar with
+    /// no symlink protection at all (`OpenOptions` without `O_NOFOLLOW`), so a
+    /// planted symlink there was opened, created and locked through to
+    /// whatever it pointed at. `open_lock_file_without_following_symlinks`
+    /// now goes through `harw_fsutil::open_nofollow`, which must refuse the
+    /// last path component being a symlink before `resolve` ever gets a lock.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_session_lock_is_rejected_without_opening_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = ApprovalStore::new(temp.path());
+        let request = record();
+        store.issue(&request).unwrap();
+        let session_dir = store.session_dir(&request.session).unwrap();
+        let lock_path = session_dir.join(".lock");
+        let external = temp.path().join("external.lock");
+        std::fs::write(&external, b"outside lock target").unwrap();
+        symlink(&external, &lock_path).unwrap();
+
+        let error = store
+            .resolve(
+                &request.session,
+                &request.request,
+                &request.actor,
+                ReviewDecision::Approved,
+                None,
+                Timestamp::now(),
+            )
+            .unwrap_err();
+
+        assert!(
+            matches!(error, SessionStoreError::Io(_)),
+            "expected a symlink rejection, got {error:?}"
+        );
+        assert_eq!(
+            std::fs::read(&external).unwrap(),
+            b"outside lock target",
+            "the external lock target must not have been opened, let alone written"
+        );
     }
 }

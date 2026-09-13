@@ -15,7 +15,7 @@ use harw_job_runtime::{
 };
 use harw_session_store::{CancelRequest, JobStore, SessionStoreError};
 use harw_types::{ApprovalActor, TenantId, WorkId, WorkspaceId};
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -46,6 +46,179 @@ impl McpSubmittedJobKind {
             Self::Dream => JobKind::Dream,
             Self::Worker => JobKind::Worker,
         }
+    }
+}
+
+/// Harte Server-Obergrenze für Modell-Tokens eines per MCP eingereichten Jobs.
+///
+/// Gilt auch dann, wenn der Client kein Budget angibt: ein MCP-Job ist nie
+/// unbegrenzt (Register F-123 / P0.12). `SubmitOwn` darf damit höchstens
+/// diese Menge Modellzugang auf Serverkosten verbrauchen.
+pub const MCP_JOB_MAX_TOKENS: u64 = 200_000;
+
+/// Harte Server-Obergrenze für die Wanduhr eines per MCP eingereichten Jobs,
+/// in Sekunden.
+///
+/// Der Job-Worker (`harw serve`) begrenzt die tatsächliche Laufzeit zusätzlich
+/// auf die verbleibende Gültigkeit seiner Lease, solange es keine
+/// Lease-Erneuerung gibt (Folgearbeit W4a).
+pub const MCP_JOB_MAX_WALL_SECONDS: i64 = 600;
+
+/// Harte Server-Obergrenze für Tool-Aufrufe eines per MCP eingereichten Jobs.
+pub const MCP_JOB_MAX_TOOL_CALLS: u32 = 64;
+
+/// Serverseitige Obergrenzen, gegen die ein vom Client angefordertes
+/// [`Budget`] aufgelöst wird.
+///
+/// # Description
+/// Die Grenzen stammen nie aus einer Anfrage. [`Self::server_default`] liefert
+/// die harten Konstanten [`MCP_JOB_MAX_TOKENS`], [`MCP_JOB_MAX_WALL_SECONDS`]
+/// und [`MCP_JOB_MAX_TOOL_CALLS`]; eine Komposition darf über [`Self::new`]
+/// nur *strengere* Grenzen setzen. So bleibt die Deckelung im Job-Worker, der
+/// die harten Konstanten kennt, immer mindestens so weit wie die hier
+/// zugelassenen Budgets.
+///
+/// # Concurrency
+/// Unveränderliche Daten; frei teilbar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpJobBudgetLimits {
+    max_tokens: u64,
+    max_wall: SignedDuration,
+    max_tool_calls: u32,
+}
+
+impl McpJobBudgetLimits {
+    /// Die harten Server-Obergrenzen.
+    ///
+    /// # Returns
+    /// Grenzen gleich [`MCP_JOB_MAX_TOKENS`], [`MCP_JOB_MAX_WALL_SECONDS`] und
+    /// [`MCP_JOB_MAX_TOOL_CALLS`].
+    #[must_use]
+    pub const fn server_default() -> Self {
+        Self {
+            max_tokens: MCP_JOB_MAX_TOKENS,
+            max_wall: SignedDuration::from_secs(MCP_JOB_MAX_WALL_SECONDS),
+            max_tool_calls: MCP_JOB_MAX_TOOL_CALLS,
+        }
+    }
+
+    /// Erzeugt strengere Grenzen als [`Self::server_default`].
+    ///
+    /// # Arguments
+    /// - `max_tokens` (`u64`): Token-Obergrenze, `1..=MCP_JOB_MAX_TOKENS`.
+    /// - `max_wall` (`SignedDuration`): Wanduhr-Obergrenze, positiv und
+    ///   höchstens [`MCP_JOB_MAX_WALL_SECONDS`].
+    /// - `max_tool_calls` (`u32`): Tool-Obergrenze, `1..=MCP_JOB_MAX_TOOL_CALLS`.
+    ///
+    /// # Returns
+    /// `None`, wenn eine Grenze null/negativ ist oder die harte Obergrenze
+    /// überschreitet (fail closed: eine Konfiguration kann den Deckel nie
+    /// anheben).
+    #[must_use]
+    pub fn new(max_tokens: u64, max_wall: SignedDuration, max_tool_calls: u32) -> Option<Self> {
+        let ceiling = Self::server_default();
+        let valid = (1..=ceiling.max_tokens).contains(&max_tokens)
+            && max_wall > SignedDuration::ZERO
+            && max_wall <= ceiling.max_wall
+            && (1..=ceiling.max_tool_calls).contains(&max_tool_calls);
+        valid.then_some(Self {
+            max_tokens,
+            max_wall,
+            max_tool_calls,
+        })
+    }
+
+    /// Token-Obergrenze.
+    #[must_use]
+    pub const fn max_tokens(&self) -> u64 {
+        self.max_tokens
+    }
+
+    /// Wanduhr-Obergrenze.
+    #[must_use]
+    pub const fn max_wall(&self) -> SignedDuration {
+        self.max_wall
+    }
+
+    /// Tool-Aufruf-Obergrenze.
+    #[must_use]
+    pub const fn max_tool_calls(&self) -> u32 {
+        self.max_tool_calls
+    }
+
+    /// Löst ein vom Client angefordertes Budget gegen diese Grenzen auf.
+    ///
+    /// # Description
+    /// Fehlt das Budget oder eine einzelne Grenze, gilt die Server-Obergrenze:
+    /// ein MCP-Job ist nie unbegrenzt. Eine angeforderte Grenze *über* der
+    /// Obergrenze wird **abgelehnt**, nicht gekappt: der Client hat ausdrücklich
+    /// mehr verlangt, und ein stilles Kappen würde seine eigene Kostenrechnung
+    /// verfälschen. Die Fehlermeldung nennt die Obergrenze, damit der Client
+    /// korrigiert neu einreichen kann. Null-/Negativwerte prüft
+    /// `validate_submission` bereits vorher.
+    ///
+    /// # Arguments
+    /// - `requested` (`Option<&Budget>`): das untrusted Budget der Anfrage.
+    ///
+    /// # Returns
+    /// Das vollständig begrenzte [`Budget`] (alle Felder `Some`).
+    ///
+    /// # Errors
+    /// [`McpSupervisorError::InvalidSubmission`], wenn eine angeforderte Grenze
+    /// die Obergrenze überschreitet.
+    pub fn resolve(&self, requested: Option<&Budget>) -> Result<Budget, McpSupervisorError> {
+        let Some(requested) = requested else {
+            return Ok(self.as_budget());
+        };
+        let max_tokens = bounded("max_tokens", requested.max_tokens, self.max_tokens)?;
+        let max_tool_calls =
+            bounded("max_tool_calls", requested.max_tool_calls, self.max_tool_calls)?;
+        let max_wall = match requested.max_wall {
+            None => self.max_wall,
+            Some(wall) if wall <= self.max_wall => wall,
+            Some(_) => {
+                return Err(McpSupervisorError::InvalidSubmission(format!(
+                    "budget max_wall_seconds exceeds the server maximum of {} seconds",
+                    self.max_wall.as_secs()
+                )));
+            }
+        };
+        Ok(Budget {
+            max_tokens: Some(max_tokens),
+            max_wall: Some(max_wall),
+            max_tool_calls: Some(max_tool_calls),
+        })
+    }
+
+    /// Die Grenzen selbst als vollständig begrenztes [`Budget`].
+    #[must_use]
+    pub fn as_budget(&self) -> Budget {
+        Budget {
+            max_tokens: Some(self.max_tokens),
+            max_wall: Some(self.max_wall),
+            max_tool_calls: Some(self.max_tool_calls),
+        }
+    }
+}
+
+impl Default for McpJobBudgetLimits {
+    fn default() -> Self {
+        Self::server_default()
+    }
+}
+
+// Eine angeforderte ganzzahlige Grenze: fehlt sie, gilt die Obergrenze; liegt
+// sie darüber, wird die Einreichung abgelehnt (siehe `resolve`).
+fn bounded<T>(name: &str, requested: Option<T>, ceiling: T) -> Result<T, McpSupervisorError>
+where
+    T: PartialOrd + Copy + fmt::Display,
+{
+    match requested {
+        None => Ok(ceiling),
+        Some(value) if value <= ceiling => Ok(value),
+        Some(_) => Err(McpSupervisorError::InvalidSubmission(format!(
+            "budget {name} exceeds the server maximum of {ceiling}"
+        ))),
     }
 }
 
@@ -230,6 +403,8 @@ pub trait McpSupervisor: Send + Sync {
 pub struct DurableMcpSupervisor {
     store: Arc<JobStore>,
     worker_cancellation_sink: Arc<dyn WorkerCancellationSink>,
+    /// Serverseitige Budget-Obergrenzen; nie aus einer Anfrage.
+    budget_limits: McpJobBudgetLimits,
 }
 
 impl DurableMcpSupervisor {
@@ -249,7 +424,29 @@ impl DurableMcpSupervisor {
         Self {
             store,
             worker_cancellation_sink,
+            budget_limits: McpJobBudgetLimits::server_default(),
         }
+    }
+
+    /// Setzt strengere Budget-Obergrenzen als die Server-Vorgabe.
+    ///
+    /// # Arguments
+    /// - `budget_limits` (`McpJobBudgetLimits`): über
+    ///   [`McpJobBudgetLimits::new`] erzeugt und damit nie weiter als
+    ///   [`McpJobBudgetLimits::server_default`].
+    ///
+    /// # Returns
+    /// Den Supervisor mit den neuen Grenzen.
+    #[must_use]
+    pub fn with_budget_limits(mut self, budget_limits: McpJobBudgetLimits) -> Self {
+        self.budget_limits = budget_limits;
+        self
+    }
+
+    /// Die aktiven Budget-Obergrenzen.
+    #[must_use]
+    pub fn budget_limits(&self) -> McpJobBudgetLimits {
+        self.budget_limits
     }
 }
 
@@ -268,12 +465,15 @@ impl McpSupervisor for DurableMcpSupervisor {
                 return Err(McpSupervisorError::NotAuthorized);
             }
             validate_submission(&submission)?;
+            // P0.12: das Client-Budget wird gegen die Server-Obergrenzen
+            // aufgelöst; ohne Angabe gilt die Obergrenze, nie `unbounded`.
+            let budget = self.budget_limits.resolve(submission.budget.as_ref())?;
 
             let now = Timestamp::now();
             let mut job = Job::new(
                 WorkId::new(),
                 submission.kind.into_runtime_kind(),
-                submission.budget.unwrap_or_else(Budget::unbounded),
+                budget,
                 default_retry_policy(),
                 now,
             );
@@ -791,8 +991,196 @@ mod tests {
             stored.input,
             serde_json::json!({"task": "durable MCP work"})
         );
-        assert_eq!(stored.job.budget, Budget::unbounded());
+        // P0.12: ohne Client-Budget gilt die Server-Obergrenze, nie `unbounded`.
+        assert_eq!(
+            stored.job.budget,
+            McpJobBudgetLimits::server_default().as_budget()
+        );
+        assert_ne!(stored.job.budget, Budget::unbounded());
         assert_eq!(stored.job.retry, default_retry_policy());
+    }
+
+    #[tokio::test]
+    async fn submit_rejects_a_budget_above_the_server_maximum_without_admitting() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(JobStore::new(temp.path()));
+        let supervisor = DurableMcpSupervisor::new(Arc::clone(&store));
+
+        let too_many_tokens = supervisor
+            .submit_job(
+                &submit_context(),
+                McpJobSubmission {
+                    kind: McpSubmittedJobKind::Worker,
+                    input: serde_json::json!({"task": "expensive"}),
+                    budget: Some(Budget {
+                        max_tokens: Some(MCP_JOB_MAX_TOKENS + 1),
+                        max_wall: None,
+                        max_tool_calls: None,
+                    }),
+                },
+            )
+            .await;
+        let Err(McpSupervisorError::InvalidSubmission(detail)) = too_many_tokens else {
+            panic!("a token budget above the server maximum must be rejected");
+        };
+        assert!(detail.contains("max_tokens"), "{detail}");
+        assert!(detail.contains(&MCP_JOB_MAX_TOKENS.to_string()), "{detail}");
+
+        let too_long = supervisor
+            .submit_job(
+                &submit_context(),
+                McpJobSubmission {
+                    kind: McpSubmittedJobKind::Dream,
+                    input: serde_json::json!({"task": "slow"}),
+                    budget: Some(Budget {
+                        max_tokens: None,
+                        max_wall: Some(SignedDuration::from_secs(MCP_JOB_MAX_WALL_SECONDS + 1)),
+                        max_tool_calls: None,
+                    }),
+                },
+            )
+            .await;
+        assert!(matches!(
+            too_long,
+            Err(McpSupervisorError::InvalidSubmission(ref detail)) if detail.contains("max_wall_seconds")
+        ));
+
+        let too_many_tools = supervisor
+            .submit_job(
+                &submit_context(),
+                McpJobSubmission {
+                    kind: McpSubmittedJobKind::Worker,
+                    input: serde_json::json!({"task": "busy"}),
+                    budget: Some(Budget {
+                        max_tokens: None,
+                        max_wall: None,
+                        max_tool_calls: Some(MCP_JOB_MAX_TOOL_CALLS + 1),
+                    }),
+                },
+            )
+            .await;
+        assert!(matches!(
+            too_many_tools,
+            Err(McpSupervisorError::InvalidSubmission(ref detail)) if detail.contains("max_tool_calls")
+        ));
+
+        // Nichts davon wurde zugelassen.
+        let page = store
+            .list(&harw_session_store::JobListQuery::default())
+            .unwrap();
+        assert!(page.jobs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn submit_keeps_budgets_within_the_maximum_and_fills_missing_limits() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(JobStore::new(temp.path()));
+        let supervisor = DurableMcpSupervisor::new(Arc::clone(&store));
+
+        let submitted = supervisor
+            .submit_job(
+                &submit_context(),
+                McpJobSubmission {
+                    kind: McpSubmittedJobKind::Worker,
+                    input: serde_json::json!({"task": "bounded"}),
+                    budget: Some(Budget {
+                        max_tokens: Some(MCP_JOB_MAX_TOKENS),
+                        max_wall: None,
+                        max_tool_calls: Some(3),
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+
+        let stored = store.get(&submitted.work_id).unwrap();
+        assert_eq!(stored.job.budget.max_tokens, Some(MCP_JOB_MAX_TOKENS));
+        assert_eq!(
+            stored.job.budget.max_wall,
+            Some(SignedDuration::from_secs(MCP_JOB_MAX_WALL_SECONDS))
+        );
+        assert_eq!(stored.job.budget.max_tool_calls, Some(3));
+    }
+
+    #[tokio::test]
+    async fn stricter_composition_limits_apply_to_submissions() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(JobStore::new(temp.path()));
+        let limits = McpJobBudgetLimits::new(1_000, SignedDuration::from_secs(30), 2).unwrap();
+        let supervisor = DurableMcpSupervisor::new(Arc::clone(&store)).with_budget_limits(limits);
+        assert_eq!(supervisor.budget_limits(), limits);
+
+        let rejected = supervisor
+            .submit_job(
+                &submit_context(),
+                McpJobSubmission {
+                    kind: McpSubmittedJobKind::Worker,
+                    input: serde_json::json!({"task": "over the composed limit"}),
+                    budget: Some(Budget {
+                        max_tokens: Some(1_001),
+                        max_wall: None,
+                        max_tool_calls: None,
+                    }),
+                },
+            )
+            .await;
+        assert!(matches!(
+            rejected,
+            Err(McpSupervisorError::InvalidSubmission(_))
+        ));
+
+        let defaulted = supervisor
+            .submit_job(
+                &submit_context(),
+                McpJobSubmission {
+                    kind: McpSubmittedJobKind::Worker,
+                    input: serde_json::json!({"task": "no budget"}),
+                    budget: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get(&defaulted.work_id).unwrap().job.budget,
+            limits.as_budget()
+        );
+    }
+
+    #[test]
+    fn budget_limits_can_only_be_tightened() {
+        let ceiling = McpJobBudgetLimits::server_default();
+        assert_eq!(McpJobBudgetLimits::default(), ceiling);
+        assert_eq!(ceiling.max_tokens(), MCP_JOB_MAX_TOKENS);
+        assert_eq!(
+            ceiling.max_wall(),
+            SignedDuration::from_secs(MCP_JOB_MAX_WALL_SECONDS)
+        );
+        assert_eq!(ceiling.max_tool_calls(), MCP_JOB_MAX_TOOL_CALLS);
+        assert_eq!(
+            McpJobBudgetLimits::new(
+                MCP_JOB_MAX_TOKENS,
+                ceiling.max_wall(),
+                MCP_JOB_MAX_TOOL_CALLS
+            ),
+            Some(ceiling)
+        );
+        assert!(
+            McpJobBudgetLimits::new(MCP_JOB_MAX_TOKENS + 1, ceiling.max_wall(), 1).is_none()
+        );
+        assert!(
+            McpJobBudgetLimits::new(
+                1,
+                SignedDuration::from_secs(MCP_JOB_MAX_WALL_SECONDS + 1),
+                1
+            )
+            .is_none()
+        );
+        assert!(
+            McpJobBudgetLimits::new(1, ceiling.max_wall(), MCP_JOB_MAX_TOOL_CALLS + 1).is_none()
+        );
+        assert!(McpJobBudgetLimits::new(0, ceiling.max_wall(), 1).is_none());
+        assert!(McpJobBudgetLimits::new(1, SignedDuration::ZERO, 1).is_none());
+        assert!(McpJobBudgetLimits::new(1, ceiling.max_wall(), 0).is_none());
     }
 
     #[tokio::test]

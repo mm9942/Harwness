@@ -570,7 +570,8 @@ mod tests {
             persist_outcome(home.path(), &outcome).unwrap();
             let layers = harw_home::config_layers(home.path()).unwrap();
             let config = harw_config::discover_config(&layers).unwrap();
-            let provider = harw_provider_http::build_provider(&config).unwrap();
+            let provider =
+                harw_provider_http::build_provider_with_home(&config, home.path(), None).unwrap();
             let result = provider
                 .respond(harw_core::ModelRequest {
                     system_prompt: String::new(),

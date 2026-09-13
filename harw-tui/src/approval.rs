@@ -39,15 +39,31 @@
 //! die das entscheiden, sind [`TuiApprovalHandler::await_resolution`] und
 //! [`TuiApprovalHandler::open_prompt`]; beide tragen den Hinweis erneut.
 //!
+//! # Vertrag: `review` ist seiteneffektfrei (CONTRACTS.md §extension, W0B-07)
+//! [`ApprovalHandler::review`] **stellt keine Frage**. Es meldet nur, ob der
+//! Aufruf eine Nutzerentscheidung braucht ([`ApprovalDecision::AskUser`]),
+//! ob er ohne Entscheidung vorbeikommt (`Allow`) oder ob gar niemand mehr
+//! fragen könnte (`Deny`, toter Fragekanal). Angezeigt wird ausschließlich
+//! aus dem Pausenzustand heraus: [`ApprovalDriver::drive_to_completion`] liest
+//! den vom Kern festgehaltenen [`PendingApproval`] und ruft
+//! [`TuiApprovalHandler::open_prompt`] nach (W1-08, Register G-007).
+//!
+//! Warum das nötig ist: `harw_core::turn_loop::check_approval` befragt **jeden**
+//! Handler und aggregiert (`Deny` > `AskUser` > `Allow`). Ein `review`, das
+//! selbst einen Prompt öffnet, zeigte dem Nutzer deshalb auch dann eine Frage,
+//! wenn ein späterer Handler den Aufruf verbietet, und vergab bei verworfener
+//! `AskUser`-ID eine zweite, nie beantwortete Frage. Zusätzlich prüft
+//! `preflight_approvals` mehrere Calls im Voraus — jede dort geöffnete Frage
+//! wäre verfrüht.
+//!
 //! # Nebenläufigkeit
 //! [`TuiApprovalHandler`] ist `Send + Sync` (innerer `std::sync::Mutex`) und
 //! wird als `Arc` in die [`ExtensionRegistry`][harw_extension_api::ExtensionRegistry]
-//! gelegt. Der Renderer-Thread wird **nie** blockiert: [`ApprovalHandler::review`]
-//! sendet die Frage über einen ungepufferten `mpsc`-Kanal und kehrt sofort
-//! zurück; gewartet wird ausschließlich `await`-basiert auf einem
-//! `tokio::sync::oneshot`. Die Futures dieses Moduls werden auf dem
-//! `current_thread`-Runtime der TUI im selben Task gepollt wie das
-//! Turn-Future.
+//! gelegt. Der Renderer-Thread wird **nie** blockiert: die Frage geht über
+//! einen ungepufferten `mpsc`-Kanal; gewartet wird ausschließlich
+//! `await`-basiert auf einem `tokio::sync::oneshot`. Die Futures dieses Moduls
+//! werden auf dem `current_thread`-Runtime der TUI im selben Task gepollt wie
+//! das Turn-Future.
 //!
 //! # Fehlertypen
 //! [`ApprovalDriverError`] — Wiederaufnahme-Fehler des Kerns, fehlender
@@ -134,9 +150,9 @@ const REASON_REGISTRY_POISONED: &str = "the approval prompt registry is unusable
 /// Empfängerseite des Fragekanals — der Renderer pollt sie.
 ///
 /// # Beschreibung
-/// Ungepuffert (`unbounded`), damit [`ApprovalHandler::review`] eine Frage
-/// stellen kann, ohne je zu blockieren. Der Renderer nimmt jede Frage genau
-/// einmal entgegen und beantwortet sie über die Methoden von
+/// Ungepuffert (`unbounded`), damit [`TuiApprovalHandler::open_prompt`] eine
+/// Frage stellen kann, ohne je zu blockieren. Der Renderer nimmt jede Frage
+/// genau einmal entgegen und beantwortet sie über die Methoden von
 /// [`ApprovalPrompt`].
 pub type ApprovalPromptReceiver = mpsc::UnboundedReceiver<ApprovalPrompt>;
 
@@ -392,10 +408,10 @@ impl ApprovalScope {
 ///   Empfängerseite bis zum Abholen in einer nach Anfrage-ID indizierten
 ///   Tabelle liegt.
 ///
-/// [`ApprovalHandler::review`] wartet nie: es legt den Rückkanal ab, schickt
-/// die Frage los und meldet dem Kern [`ApprovalDecision::AskUser`]. Gewartet
-/// wird erst in [`Self::await_resolution`], das der [`ApprovalDriver`] ruft,
-/// nachdem der Kern den Turn sauber pausiert hat.
+/// [`ApprovalHandler::review`] wartet nie und **öffnet keine Frage**: es meldet
+/// dem Kern nur [`ApprovalDecision::AskUser`]. Gefragt wird erst, wenn der Kern
+/// den Turn sauber pausiert hat — [`ApprovalDriver`] ruft dann
+/// [`Self::open_prompt`] und [`Self::await_resolution`].
 ///
 /// # Concurrency
 /// `Send + Sync`. Interne Veränderlichkeit über `std::sync::Mutex`; der Lock
@@ -688,30 +704,31 @@ impl fmt::Debug for TuiApprovalHandler {
 }
 
 impl ApprovalHandler for TuiApprovalHandler {
-    /// Prüft einen Werkzeugaufruf, ohne je zu warten.
+    /// Prüft einen Werkzeugaufruf **seiteneffektfrei** (CONTRACTS.md §extension).
     ///
     /// # Description
     /// Liegt der Aufruf außerhalb von [`Self::scope`], lautet die Antwort
     /// [`ApprovalDecision::Allow`] — andere registrierte Handler entscheiden
-    /// dann weiter. Andernfalls wird eine Anfrage-ID vergeben, die Frage
-    /// abgeschickt und [`ApprovalDecision::AskUser`] gemeldet, was den Turn im
-    /// Kern sauber pausiert.
+    /// dann weiter. Andernfalls wird eine Anfrage-ID vergeben und
+    /// [`ApprovalDecision::AskUser`] gemeldet, was den Turn im Kern sauber
+    /// pausiert. **Es wird keine Frage geöffnet, nichts gesendet und nichts
+    /// in der Rückkanal-Tabelle abgelegt**; das erledigt der
+    /// [`ApprovalDriver`] aus dem Pausenzustand heraus (siehe Modul-Doku).
     ///
-    /// Schlägt das Absenden fehl, ist die Antwort [`ApprovalDecision::Deny`]:
-    /// eine Frage, die niemand sehen kann, ist keine Freigabe.
+    /// Ist der Fragekanal bereits geschlossen — der Renderer ist weg —, lautet
+    /// die Antwort [`ApprovalDecision::Deny`]: eine Frage, die niemand sehen
+    /// kann, ist keine Freigabe. Die Prüfung liest nur den Kanalzustand
+    /// (`UnboundedSender::is_closed`) und verändert ihn nicht.
     ///
     /// # Concurrency
-    /// Das zurückgegebene Future ist sofort fertig; es hält keinen Lock.
+    /// Das zurückgegebene Future ist sofort fertig; es nimmt keinen Lock.
     fn review<'a>(&'a self, call: &'a ToolCall) -> ExtFuture<'a, ApprovalDecision> {
-        let decision = if self.scope.requires_approval(call.name.as_str()) {
-            let request = ItemId::new();
-            if self.open_prompt(&request, call) {
-                ApprovalDecision::AskUser(request)
-            } else {
-                ApprovalDecision::Deny(REASON_PROMPT_UNDELIVERABLE.to_owned())
-            }
-        } else {
+        let decision = if !self.scope.requires_approval(call.name.as_str()) {
             ApprovalDecision::Allow
+        } else if self.prompt_tx.is_closed() {
+            ApprovalDecision::Deny(REASON_PROMPT_UNDELIVERABLE.to_owned())
+        } else {
+            ApprovalDecision::AskUser(ItemId::new())
         };
         Box::pin(async move { decision })
     }
@@ -1492,8 +1509,10 @@ mod tests {
         assert_eq!(handler.pending_len(), 0);
     }
 
+    /// W1-08: `review` fragt nach einer Entscheidung, hat dabei aber **keinen**
+    /// Seiteneffekt — kein Prompt, kein Eintrag in der Rückkanal-Tabelle.
     #[tokio::test]
-    async fn test_review_in_scope_call_asks_user_and_emits_prompt() {
+    async fn test_review_in_scope_call_asks_user_without_side_effects() {
         let (handler, mut prompts) = TuiApprovalHandler::with_scope(ApprovalScope::AllTools);
         let call = ToolCall {
             id: ToolCallId::new(),
@@ -1506,13 +1525,68 @@ mod tests {
         let ApprovalDecision::AskUser(request) = decision else {
             panic!("an in-scope call must ask the user");
         };
-        let Ok(prompt) = prompts.try_recv() else {
-            panic!("the prompt must reach the renderer");
+        assert!(
+            prompts.try_recv().is_err(),
+            "review darf keine Frage senden — das tut erst der Treiber"
+        );
+        assert!(!handler.has_pending(&request));
+        assert_eq!(handler.pending_len(), 0);
+    }
+
+    /// Mehrfaches `review` (Handler-Aggregation im Kern, Vorprüfung mehrerer
+    /// Calls) hinterlässt weiterhin nichts.
+    #[tokio::test]
+    async fn test_repeated_review_never_accumulates_prompts() {
+        let (handler, mut prompts) = TuiApprovalHandler::with_scope(ApprovalScope::AllTools);
+        for index in 0..5 {
+            let call = ToolCall {
+                id: ToolCallId::new(),
+                name: ToolName::new(WRITE_TOOL),
+                arguments: write_call(&format!("{index}.txt")),
+            };
+            let decision = handler.review(&call).await;
+            assert!(matches!(decision, ApprovalDecision::AskUser(_)));
+        }
+
+        assert!(prompts.try_recv().is_err(), "kein Prompt darf entstehen");
+        assert_eq!(handler.pending_len(), 0);
+    }
+
+    /// Der Treiber stellt die Frage aus dem Pausenzustand nach — genau einmal,
+    /// auch wenn `review` sie nicht geöffnet hat.
+    #[tokio::test]
+    async fn test_driver_opens_the_prompt_that_review_no_longer_opens() {
+        let (handler, mut prompts) = TuiApprovalHandler::with_scope(ApprovalScope::AllTools);
+        let driver = ApprovalDriver::new(Arc::clone(&handler));
+        let pending = PendingApproval {
+            call: ToolCall {
+                id: ToolCallId::new(),
+                name: ToolName::new(WRITE_TOOL),
+                arguments: write_call("a.txt"),
+            },
+            request: ItemId::new(),
+            actor: ApprovalActor::Operator {
+                id: "tui-approval-test".to_owned(),
+            },
         };
-        assert_eq!(prompt.request(), &request);
+
+        // Der erste Poll öffnet die Frage; danach wartet der Treiber auf die
+        // Antwort (der Zeitablauf hier ist nur das Poll-Signal, nicht der
+        // Freigabe-Timeout des Handlers).
+        let mut resolve = Box::pin(driver.resolve(&pending));
+        let polled = tokio::time::timeout(Duration::from_millis(50), &mut resolve).await;
+        assert!(polled.is_err(), "ohne Antwort darf der Treiber nicht fertig werden");
+
+        let Ok(prompt) = prompts.try_recv() else {
+            panic!("der Treiber muss die Frage nachstellen");
+        };
         assert_eq!(prompt.tool_name(), WRITE_TOOL);
         assert!(prompt.arguments_json().contains("a.txt"));
-        assert!(handler.has_pending(&request));
+        assert!(prompt.approve());
+
+        let resolution = resolve.await;
+        assert!(matches!(resolution, ApprovalResolution::Approve));
+        assert!(prompts.try_recv().is_err(), "genau eine Frage, nicht zwei");
     }
 
     #[tokio::test]

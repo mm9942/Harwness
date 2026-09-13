@@ -44,11 +44,13 @@ use harw_core::{
     ModelError, ModelFuture, ModelProvider, ModelRequest, ModelResponse, ToolCallResult,
 };
 use harw_provider::openai::{ContentPart, InputItem, ReasoningConfig, ResponsesRequest, ToolDef};
+use harw_sandbox::{EgressHost, EgressUrl};
 use harw_tools::{FunctionToolSpec, JsonSchema, ToolCall, ToolName, ToolSpec};
 use harw_types::{TokenUsage, ToolCallId};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 pub use anthropic::{
@@ -75,6 +77,42 @@ const SECRET_RESOLVER_FAILURE_REASON: &str = "secret resolver failed";
 const EMPTY_CREDENTIAL_REASON: &str = "credential is empty";
 const INVALID_KEYRING_REFERENCE_REASON: &str = "invalid keyring reference";
 const KEYRING_FAILURE_REASON: &str = "keyring credential unavailable";
+// Gründe für `file:`/`file-json:`-Fehler: bewusst ohne Pfad und ohne Inhalt,
+// damit Fehlertexte (UI, Telegram, Logs) kein Datei-Orakel werden.
+const FILE_CREDENTIAL_NO_HOME_REASON: &str =
+    "file credentials require the harw home directory (see build_provider_with_home)";
+const FILE_CREDENTIAL_OUTSIDE_SECRETS_REASON: &str =
+    "file credential must be an absolute path below <home>/secrets";
+const FILE_CREDENTIAL_OPEN_REASON: &str =
+    "file credential could not be opened without following symlinks";
+const FILE_CREDENTIAL_NOT_PRIVATE_REASON: &str =
+    "file credential must be a regular file owned by the current user without group or other permissions";
+const FILE_CREDENTIAL_READ_REASON: &str =
+    "file credential is unreadable, larger than 64 KiB or not UTF-8";
+const FILE_CREDENTIAL_JSON_REASON: &str = "file credential is not valid JSON";
+const FILE_CREDENTIAL_POINTER_REASON: &str = "JSON pointer missing or not a string";
+/// Obergrenze für eine Credential-Datei; Tokens und `credentials.json` sind klein.
+const MAX_FILE_CREDENTIAL_BYTES: u64 = 64 * 1024;
+/// Höchstzahl gefolgter Redirects innerhalb desselben Ursprungs (wie reqwests
+/// Default `Policy::limited(10)`).
+const MAX_REDIRECTS: usize = 10;
+const REDIRECT_CROSS_ORIGIN_REASON: &str =
+    "provider redirect to a different scheme, host or port was blocked";
+const REDIRECT_LIMIT_REASON: &str = "provider redirect limit exceeded";
+const INVALID_CREDENTIAL_HEADER_REASON: &str =
+    "provider credential is not a valid HTTP header value";
+
+/// Quellen, aus denen Credential-Referenzen aufgelöst werden.
+#[derive(Clone, Copy)]
+struct SecretSources<'a> {
+    /// Env-Layer aus den `.env`-Dateien der Konfigurations-Layer.
+    env_layer: &'a BTreeMap<String, String>,
+    /// Injizierter Resolver für `secrets:`.
+    resolver: Option<&'a dyn SecretResolver>,
+    /// harw-Home (`~/.harw` bzw. `HARW_HOME`). `file:`/`file-json:` werden nur
+    /// unterhalb von `<home>/secrets/` gelesen; ohne Home schlagen sie fehl.
+    home: Option<&'a Path>,
+}
 
 /// Baut den passenden [`ModelProvider`] aus der aufgelösten Konfiguration.
 ///
@@ -101,26 +139,57 @@ const KEYRING_FAILURE_REASON: &str = "keyring credential unavailable";
 /// - [`HttpProviderError::UnsupportedCredentialReference`]: `secrets:` wird
 ///   ohne injizierten Resolver nicht aufgelöst.
 ///
+/// Ohne Home-Verzeichnis schlagen `file:`/`file-json:`-Referenzen fail-closed
+/// fehl; dafür [`build_provider_with_home`] verwenden.
+///
 /// # Concurrency
 /// Reiner Aufbau; das Ergebnis ist `Send + Sync`.
 pub fn build_provider(
     config: &harw_config::ResolvedConfig,
 ) -> HttpProviderResult<Box<dyn ModelProvider>> {
-    build_provider_with_optional_resolver(config, None)
+    build_provider_with_optional_resolver(config, None, None)
 }
 
 /// Builds configured providers with an injected synchronous `secrets:` resolver.
+///
+/// Wie [`build_provider`] ohne Home: `file:`/`file-json:` schlagen fehl.
 pub fn build_provider_with_resolver(
     config: &harw_config::ResolvedConfig,
     resolver: &dyn SecretResolver,
 ) -> HttpProviderResult<Box<dyn ModelProvider>> {
-    build_provider_with_optional_resolver(config, Some(resolver))
+    build_provider_with_optional_resolver(config, Some(resolver), None)
+}
+
+/// Baut die konfigurierten Provider mit bekanntem harw-Home.
+///
+/// # Arguments
+/// - `config`: aufgelöste Konfiguration.
+/// - `home` (`&Path`): Root-Space (`~/.harw` bzw. `HARW_HOME`). `file:`- und
+///   `file-json:`-Referenzen werden nur unterhalb von `<home>/secrets/`
+///   gelesen: symlinkfrei (`open_dir_nofollow` + `open_beneath`), nur
+///   reguläre Dateien des effektiven Nutzers ohne Gruppen-/Fremdrechte.
+/// - `resolver`: optionaler `secrets:`-Resolver.
+///
+/// # Errors
+/// Wie [`build_provider`].
+pub fn build_provider_with_home(
+    config: &harw_config::ResolvedConfig,
+    home: &Path,
+    resolver: Option<&dyn SecretResolver>,
+) -> HttpProviderResult<Box<dyn ModelProvider>> {
+    build_provider_with_optional_resolver(config, resolver, Some(home))
 }
 
 fn build_provider_with_optional_resolver(
     config: &harw_config::ResolvedConfig,
     resolver: Option<&dyn SecretResolver>,
+    home: Option<&Path>,
 ) -> HttpProviderResult<Box<dyn ModelProvider>> {
+    let sources = SecretSources {
+        env_layer: &config.env_layer,
+        resolver,
+        home,
+    };
     let provider_name = config.harness.default_provider.as_deref().ok_or_else(|| {
         HttpProviderError::MissingDefault {
             what: "default_provider".to_owned(),
@@ -139,7 +208,7 @@ fn build_provider_with_optional_resolver(
         .filter(|(_, provider)| provider.enabled)
         .collect::<BTreeMap<_, _>>()
     {
-        let backend = match build_named_provider(name, provider, config, model, resolver) {
+        let backend = match build_named_provider(name, provider, config, model, sources) {
             Ok(backend) => backend,
             Err(error) if name != provider_name => Box::new(UnavailableProvider(error.to_string())),
             Err(error) => return Err(error),
@@ -173,7 +242,7 @@ fn build_named_provider(
     provider: &harw_config::ProviderToml,
     config: &harw_config::ResolvedConfig,
     default_model: &str,
-    resolver: Option<&dyn SecretResolver>,
+    sources: SecretSources<'_>,
 ) -> HttpProviderResult<Box<dyn ModelProvider>> {
     validate_endpoint(&provider.base_url)?;
     if !matches!(
@@ -204,12 +273,12 @@ fn build_named_provider(
 
     if provider.api == "anthropic-messages" {
         let (base_url, credential) =
-            resolve_anthropic(provider_name, provider, &config.env_layer, resolver)?;
+            resolve_anthropic(provider_name, provider, sources, &env_nonempty)?;
         let mut backend =
             AnthropicMessagesProvider::from_base(&base_url, model.to_owned(), credential);
         backend.configure(
             provider_name,
-            configured_headers(provider_name, &provider.headers)?,
+            configured_headers(provider_name, &provider.headers, sources)?,
         );
         return Ok(Box::new(backend));
     }
@@ -218,18 +287,30 @@ fn build_named_provider(
         provider_name,
         provider,
         model,
-        &config.env_layer,
-        resolver,
+        sources,
     )?))
 }
 
-/// Löst Base-URL + Credential für den nativen Anthropic-Weg env-first auf.
+/// Löst Base-URL + Credential für den nativen Anthropic-Weg auf.
+///
+/// Reihenfolge: explizite `auth`-Referenz; sonst implizite Umgebungs-
+/// Credentials, aber **nur** an gebundene Hosts (W1-06b):
+/// - Anthropic-direkt: `CLAUDE_CODE_OAUTH_TOKEN`, dann `ANTHROPIC_API_KEY`,
+///   nur wenn der Endpoint exakt `https://api.anthropic.com` (Port 443) ist.
+/// - Foundry: `ANTHROPIC_FOUNDRY_API_KEY` nur, wenn der Endpoint dasselbe
+///   Schema, denselben Host und Port wie `ANTHROPIC_FOUNDRY_BASE_URL` aus der
+///   **Prozess**-Umgebung hat (nie aus dem Env-Layer, den ein Repo liefern kann).
+///
+/// `process_env` liest die Prozess-Umgebung (Produktion: [`env_nonempty`]);
+/// als Parameter, damit Tests ohne `std::env::set_var` (in Edition 2024
+/// `unsafe`) auskommen.
 fn resolve_anthropic(
     provider_name: &str,
     provider: &harw_config::ProviderToml,
-    env_layer: &std::collections::BTreeMap<String, String>,
-    resolver: Option<&dyn SecretResolver>,
+    sources: SecretSources<'_>,
+    process_env: &dyn Fn(&str) -> Option<String>,
 ) -> HttpProviderResult<(String, AnthropicCredential)> {
+    let env_layer = sources.env_layer;
     // Persisted setup is authoritative. Legacy environment values are only
     // fallbacks for old Foundry profiles that never stored an endpoint/key.
     if provider_name == "foundry" || provider_name.starts_with("foundry-") {
@@ -242,8 +323,19 @@ fn resolve_anthropic(
             provider.base_url.clone()
         };
         let secret = if let Some(reference) = &provider.auth {
-            resolve_secret(reference, env_layer, resolver)?
+            resolve_secret(reference, sources)?
         } else {
+            let env_endpoint = process_env("ANTHROPIC_FOUNDRY_BASE_URL");
+            if !env_endpoint
+                .as_deref()
+                .is_some_and(|env_endpoint| same_origin(&base_url, env_endpoint))
+            {
+                return Err(HttpProviderError::MissingDefault {
+                    what: format!(
+                        "auth for provider '{provider_name}' (ANTHROPIC_FOUNDRY_API_KEY is only used when base_url matches ANTHROPIC_FOUNDRY_BASE_URL)"
+                    ),
+                });
+            }
             let key = harw_config::dotenv::resolve_env_ref("ANTHROPIC_FOUNDRY_API_KEY", env_layer)
                 .ok_or_else(|| HttpProviderError::MissingEnv {
                     var: "ANTHROPIC_FOUNDRY_API_KEY".into(),
@@ -271,7 +363,7 @@ fn resolve_anthropic(
     //     Credentials), auch wenn `ANTHROPIC_API_KEY` in der Umgebung mit einem
     //     Cloudflare-Gateway-Key belegt ist.
     if let Some(secret_ref) = &provider.auth {
-        let secret = resolve_secret(secret_ref, env_layer, resolver)?;
+        let secret = resolve_secret(secret_ref, sources)?;
         return Ok((
             base_url,
             if provider.auth_header.as_deref() == Some("bearer") {
@@ -281,13 +373,24 @@ fn resolve_anthropic(
             },
         ));
     }
-    // 2b. Setup-Token / OAuth env-first (Kompatibilität mit Claude Code).
-    if let Some(token) = env_nonempty("CLAUDE_CODE_OAUTH_TOKEN") {
+    // Implizite Umgebungs-Credentials gehen nur an den offiziellen API-Host —
+    // sonst könnte ein repo-lokales `providers/anthropic.toml` mit fremder
+    // `base_url` (und ohne `auth`) den Token des Nutzers abgreifen.
+    if !endpoint_is_official_host(&base_url, anthropic::ANTHROPIC_API_HOST) {
+        return Err(HttpProviderError::MissingDefault {
+            what: format!(
+                "auth for provider '{provider_name}' (CLAUDE_CODE_OAUTH_TOKEN/ANTHROPIC_API_KEY are only used for https://{})",
+                anthropic::ANTHROPIC_API_HOST
+            ),
+        });
+    }
+    // 2b. Setup-Token / OAuth (Kompatibilität mit Claude Code).
+    if let Some(token) = process_env("CLAUDE_CODE_OAUTH_TOKEN") {
         return Ok((base_url, classify_anthropic_secret(token)));
     }
     // 2c. Klassischer API-Key aus der Umgebung — mit Prefix-Detection:
     //    `sk-ant-oat…` = OAuth-Token (Bearer), sonst normaler API-Key (x-api-key).
-    if let Some(key) = env_nonempty("ANTHROPIC_API_KEY") {
+    if let Some(key) = process_env("ANTHROPIC_API_KEY") {
         return Ok((base_url, classify_anthropic_secret(key)));
     }
 
@@ -317,6 +420,114 @@ fn env_nonempty(var: &str) -> Option<String> {
     std::env::var(var)
         .ok()
         .filter(|value| !value.trim().is_empty())
+}
+
+/// `true`, wenn `endpoint` exakt `https://<official_host>` auf Port 443 ist.
+///
+/// Der Host wird über [`EgressUrl`] normalisiert (Kleinschreibung, IDNA,
+/// abschließender Punkt entfernt); Subdomains, Suffixe und andere Ports
+/// zählen nicht.
+fn endpoint_is_official_host(endpoint: &str, official_host: &str) -> bool {
+    EgressUrl::parse(endpoint).is_ok_and(|url| {
+        url.is_https()
+            && url.port() == 443
+            && matches!(url.host(), EgressHost::Domain(host) if host == official_host)
+    })
+}
+
+/// `true`, wenn beide URLs gültige [`EgressUrl`]s mit gleichem Schema, Host
+/// und Port sind.
+fn same_origin(left: &str, right: &str) -> bool {
+    match (EgressUrl::parse(left), EgressUrl::parse(right)) {
+        (Ok(left), Ok(right)) => {
+            left.is_https() == right.is_https()
+                && left.host() == right.host()
+                && left.port() == right.port()
+        }
+        _ => false,
+    }
+}
+
+/// Entscheidung der Redirect-Policy für einen einzelnen Redirect-Schritt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedirectDecision {
+    /// Gleicher Ursprung, Limit nicht erreicht.
+    Follow,
+    /// Schema, Host oder Port weicht vom Ursprung der Anfrage ab.
+    RejectCrossOrigin,
+    /// Mehr als [`MAX_REDIRECTS`] Redirects.
+    RejectLimit,
+}
+
+/// Entscheidet, ob reqwest einem Redirect folgen darf.
+///
+/// # Description
+/// reqwest entfernt bei Host-/Port-Wechsel nur `Authorization`, `Cookie`,
+/// `Proxy-Authorization` und `WWW-Authenticate` (`reqwest 0.12.28
+/// src/redirect.rs`, `remove_sensitive_headers`), **nicht** `x-api-key`/
+/// `api-key`. Deshalb wird jeder Redirect abgelehnt, dessen Schema, Host oder
+/// Port von einer der bisherigen URLs abweicht; Redirects auf demselben
+/// Ursprung (z. B. Pfad-Normalisierung eines Gateways) bleiben erlaubt.
+///
+/// # Arguments
+/// - `next`: Ziel des Redirects.
+/// - `previous`: bisherige URLs der Kette; das erste Element ist die
+///   ursprüngliche Anfrage (reqwest `Policy::redirect`, Kommentar zu
+///   `PolicyKind::Limit`). Leer → fail closed.
+fn redirect_decision(next: &reqwest::Url, previous: &[reqwest::Url]) -> RedirectDecision {
+    let Some(origin) = previous.first() else {
+        return RedirectDecision::RejectCrossOrigin;
+    };
+    let same_as_origin = |url: &reqwest::Url| {
+        url.scheme() == origin.scheme()
+            && url.host_str() == origin.host_str()
+            && url.port_or_known_default() == origin.port_or_known_default()
+    };
+    if !same_as_origin(next) || !previous.iter().all(same_as_origin) {
+        return RedirectDecision::RejectCrossOrigin;
+    }
+    if previous.len() > MAX_REDIRECTS {
+        return RedirectDecision::RejectLimit;
+    }
+    RedirectDecision::Follow
+}
+
+/// Redirect-Policy aller Provider-Clients (siehe [`redirect_decision`]).
+fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let decision = redirect_decision(attempt.url(), attempt.previous());
+        match decision {
+            RedirectDecision::Follow => attempt.follow(),
+            RedirectDecision::RejectCrossOrigin => attempt.error(REDIRECT_CROSS_ORIGIN_REASON),
+            RedirectDecision::RejectLimit => attempt.error(REDIRECT_LIMIT_REASON),
+        }
+    })
+}
+
+/// Baut den HTTP-Client eines Providers mit [`redirect_policy`].
+///
+/// # Panics
+/// Wie `reqwest::Client::new()` (das intern `ClientBuilder::new().build()
+/// .expect(..)` aufruft), wenn das TLS-Backend nicht initialisiert werden kann.
+/// Die zusätzliche Redirect-Policy fügt keinen Fehlerpfad hinzu.
+pub(crate) fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .redirect(redirect_policy())
+        .build()
+        .expect("reqwest client with TLS backend and redirect policy")
+}
+
+/// Baut einen als sensitiv markierten Header-Wert für ein Credential.
+///
+/// Sensitive Werte rendert `HeaderValue`s `Debug` als `Sensitive`; HTTP/2-
+/// HPACK indiziert sie nicht. Der Fehler enthält den Wert nie.
+pub(crate) fn sensitive_header_value(
+    secret: &str,
+) -> Result<reqwest::header::HeaderValue, ModelError> {
+    let mut value = reqwest::header::HeaderValue::from_str(secret)
+        .map_err(|_| ModelError::RequestFailed(INVALID_CREDENTIAL_HEADER_REASON.to_owned()))?;
+    value.set_sensitive(true);
+    Ok(value)
 }
 
 /// Wahl des Wire-Transports für einen OpenAI-kompatiblen Provider.
@@ -394,7 +605,7 @@ impl OpenAiResponsesProvider {
         transport: Transport,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: http_client(),
             base_url: base_url.into(),
             provider_id: "openai".to_owned(),
             model: model.into(),
@@ -453,7 +664,12 @@ impl OpenAiResponsesProvider {
                 what: format!("provider entry '{provider_name}'"),
             }
         })?;
-        Self::from_named_config(provider_name, provider, model, &config.env_layer, resolver)
+        let sources = SecretSources {
+            env_layer: &config.env_layer,
+            resolver,
+            home: None,
+        };
+        Self::from_named_config(provider_name, provider, model, sources)
     }
 
     /// Builds one OpenAI-compatible provider from its named configuration.
@@ -461,14 +677,15 @@ impl OpenAiResponsesProvider {
         provider_name: &str,
         provider: &harw_config::ProviderToml,
         model: &str,
-        env_layer: &BTreeMap<String, String>,
-        resolver: Option<&dyn SecretResolver>,
+        sources: SecretSources<'_>,
     ) -> HttpProviderResult<Self> {
         if provider.base_url.trim().is_empty() {
             return Err(HttpProviderError::Decode(format!(
                 "provider '{provider_name}' has an empty base_url"
             )));
         }
+        // Auch der öffentliche `from_config`-Pfad erzwingt https (http nur Loopback).
+        validate_endpoint(&provider.base_url)?;
         let auth_header = provider.auth_header.as_deref().unwrap_or_else(|| {
             if provider_name == "foundry" || provider_name.starts_with("foundry-") {
                 "api-key"
@@ -479,7 +696,7 @@ impl OpenAiResponsesProvider {
             }
         });
         let api_key = if let Some(reference) = &provider.auth {
-            resolve_secret(reference, env_layer, resolver)?
+            resolve_secret(reference, sources)?
         } else if auth_header == "none" {
             SecretString::new(String::new().into())
         } else {
@@ -514,7 +731,7 @@ impl OpenAiResponsesProvider {
             http_provider.transport = Transport::Chat;
         }
         http_provider.provider_id = provider_name.to_owned();
-        http_provider.headers = configured_headers(provider_name, &provider.headers)?;
+        http_provider.headers = configured_headers(provider_name, &provider.headers, sources)?;
         Ok(http_provider)
     }
 
@@ -544,39 +761,70 @@ impl OpenAiResponsesProvider {
 }
 
 /// Reject placeholder/project/request URLs before credentials are used.
+///
+/// # Description
+/// Geprüft über [`EgressUrl::parse`] (WHATWG-Parser wie reqwest; nur
+/// `http`/`https`, keine Userinfo, Host Pflicht). Zusätzlich:
+/// - `https` ist Pflicht; `http` nur für Loopback-Hosts
+///   ([`EgressHost::is_loopback`]: `localhost`, `*.localhost`, 127/8, `::1`),
+///   z. B. lokales Ollama oder Test-Mocks;
+/// - keine `<`/`>`-Platzhalter, keine Query, kein Fragment.
+///
+/// # Errors
+/// [`HttpProviderError::Decode`] ohne Echo der Eingabe.
 pub fn validate_endpoint(value: &str) -> HttpProviderResult<()> {
-    let url = reqwest::Url::parse(value)
+    let endpoint = EgressUrl::parse(value)
         .map_err(|_| HttpProviderError::Decode("invalid provider endpoint".into()))?;
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host_str().is_none()
-        || value.contains(['<', '>'])
-        || !url.username().is_empty()
-        || url.password().is_some()
+    let url = endpoint.as_url();
+    if value.contains(['<', '>'])
         || url.query().is_some()
         || url.fragment().is_some()
+        || !(endpoint.is_https() || endpoint.host().is_loopback())
     {
-        return Err(HttpProviderError::Decode("provider endpoint must be an HTTP(S) base URL without placeholders, credentials or query parameters".into()));
+        return Err(HttpProviderError::Decode("provider endpoint must be an HTTPS base URL (HTTP only for loopback hosts) without placeholders, credentials or query parameters".into()));
     }
     Ok(())
 }
 
 /// Resolves deterministic provider headers before any request can be sent.
+///
+/// Header mit Credential-Namen ([`harw_config::ProviderToml::is_sensitive_header_name`])
+/// müssen eine `SecretRef` sein; sie wird wie `auth` aufgelöst und der Wert als
+/// sensitiv markiert. Klartext wird abgelehnt (fail closed, auch wenn
+/// `ProviderToml::validate` nicht aufgerufen wurde). Übrige Header bleiben
+/// literal.
 fn configured_headers(
     provider_name: &str,
     headers: &std::collections::HashMap<String, String>,
+    sources: SecretSources<'_>,
 ) -> HttpProviderResult<reqwest::header::HeaderMap> {
     let mut resolved = reqwest::header::HeaderMap::new();
-    for (name, value) in headers.iter().collect::<BTreeMap<_, _>>() {
-        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
-            HttpProviderError::Decode(format!(
-                "provider '{provider_name}' has an invalid header name: {error}"
-            ))
-        })?;
-        let value = reqwest::header::HeaderValue::from_str(value).map_err(|error| {
-            HttpProviderError::Decode(format!(
-                "provider '{provider_name}' has an invalid header value: {error}"
-            ))
-        })?;
+    for (raw_name, value) in headers.iter().collect::<BTreeMap<_, _>>() {
+        let name =
+            reqwest::header::HeaderName::from_bytes(raw_name.as_bytes()).map_err(|error| {
+                HttpProviderError::Decode(format!(
+                    "provider '{provider_name}' has an invalid header name: {error}"
+                ))
+            })?;
+        let value = if harw_config::ProviderToml::is_sensitive_header_name(raw_name) {
+            let reference = value.parse::<harw_config::SecretRef>().map_err(|_| {
+                HttpProviderError::Decode(format!(
+                    "provider '{provider_name}' header '{name}' carries credentials and must be a secret reference (env:/file:/file-json:/keyring:/secrets:)"
+                ))
+            })?;
+            let secret = resolve_secret(&reference, sources)?;
+            sensitive_header_value(secret.expose_secret()).map_err(|_| {
+                HttpProviderError::Decode(format!(
+                    "provider '{provider_name}' header '{name}' resolved to an invalid header value"
+                ))
+            })?
+        } else {
+            reqwest::header::HeaderValue::from_str(value).map_err(|error| {
+                HttpProviderError::Decode(format!(
+                    "provider '{provider_name}' has an invalid header value: {error}"
+                ))
+            })?
+        };
         resolved.insert(name, value);
     }
     Ok(resolved)
@@ -667,18 +915,20 @@ fn transport_from_api(api: &str) -> Transport {
 /// Prozess-Umgebung gewinnt, wenn die Variable dort gesetzt und nicht leer
 /// ist; andernfalls wird der Env-Layer konsultiert. `keyring:` erwartet exakt
 /// `service/account`; `secrets:` wird an den injizierten Resolver delegiert.
+/// `file:`/`file-json:` lesen nur unterhalb von `<home>/secrets/` (siehe
+/// [`read_private_secret_file`]); ihre Fehler nennen weder Pfad noch Inhalt.
 ///
 /// # Arguments
 /// - `secret_ref` (`&harw_config::SecretRef`): Zu lösende Referenz.
-/// - `env_layer` (`&BTreeMap<String, String>`): Geladener Env-Layer aus
-///   `~/.harw/.env` (aus [`harw_config::ResolvedConfig::env_layer`]).
+/// - `sources` ([`SecretSources`]): Env-Layer, optionaler Resolver, optionales Home.
 fn resolve_secret(
     secret_ref: &harw_config::SecretRef,
-    env_layer: &std::collections::BTreeMap<String, String>,
-    resolver: Option<&dyn SecretResolver>,
+    sources: SecretSources<'_>,
 ) -> HttpProviderResult<SecretString> {
     use harw_config::SecretRef;
-    let reference = secret_ref.as_ref_string();
+    let env_layer = sources.env_layer;
+    let resolver = sources.resolver;
+    let reference = diagnostic_reference(secret_ref);
     match secret_ref {
         SecretRef::Env(name) => {
             let value = harw_config::resolve_env_ref(name, env_layer).ok_or_else(|| {
@@ -692,33 +942,37 @@ fn resolve_secret(
             validate_resolved_secret(reference, SecretString::new(value.into()))
         }
         SecretRef::File(path) => {
-            let raw = std::fs::read_to_string(path).map_err(|error| {
+            let raw = read_private_secret_file(sources.home, path).map_err(|reason| {
                 HttpProviderError::UnresolvedCredential {
                     reference: reference.clone(),
-                    reason: format!("file unreadable: {error}"),
+                    reason: reason.to_owned(),
                 }
             })?;
-            validate_resolved_secret(reference, SecretString::new(raw.trim().to_owned().into()))
+            validate_resolved_secret(
+                reference,
+                SecretString::new(raw.expose_secret().trim().to_owned().into()),
+            )
         }
         SecretRef::FileJson { path, pointer } => {
-            let raw = std::fs::read_to_string(path).map_err(|error| {
+            let raw = read_private_secret_file(sources.home, path).map_err(|reason| {
                 HttpProviderError::UnresolvedCredential {
                     reference: reference.clone(),
-                    reason: format!("file unreadable: {error}"),
+                    reason: reason.to_owned(),
                 }
             })?;
-            let doc: serde_json::Value = serde_json::from_str(&raw).map_err(|error| {
-                HttpProviderError::UnresolvedCredential {
-                    reference: reference.clone(),
-                    reason: format!("invalid JSON: {error}"),
-                }
-            })?;
+            let doc: serde_json::Value =
+                serde_json::from_str(raw.expose_secret()).map_err(|_| {
+                    HttpProviderError::UnresolvedCredential {
+                        reference: reference.clone(),
+                        reason: FILE_CREDENTIAL_JSON_REASON.to_owned(),
+                    }
+                })?;
             let value = doc
                 .pointer(pointer)
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| HttpProviderError::UnresolvedCredential {
                     reference: reference.clone(),
-                    reason: format!("JSON pointer '{pointer}' missing or not a string"),
+                    reason: FILE_CREDENTIAL_POINTER_REASON.to_owned(),
                 })?;
             validate_resolved_secret(reference, SecretString::new(value.trim().to_owned().into()))
         }
@@ -755,6 +1009,81 @@ fn resolve_secret(
             validate_resolved_secret(reference, SecretString::new(password.into()))
         }
     }
+}
+
+/// Referenz-Form für Fehlertexte: Dateireferenzen ohne Pfad (kein Orakel für
+/// Dateinamen/Home-Layout), alle anderen in kanonischer Form.
+fn diagnostic_reference(secret_ref: &harw_config::SecretRef) -> String {
+    match secret_ref {
+        harw_config::SecretRef::File(_) => "file:<redacted>".to_owned(),
+        harw_config::SecretRef::FileJson { .. } => "file-json:<redacted>".to_owned(),
+        other => other.as_ref_string(),
+    }
+}
+
+/// Liest eine Credential-Datei ausschließlich unterhalb von `<home>/secrets/`.
+///
+/// # Description
+/// 1. Ohne Home → Fehler (fail closed).
+/// 2. `raw_path` muss absolut sein und lexikalisch unter `<home>/secrets`
+///    oder `<kanonisches home>/secrets` liegen (Onboarding und `harw auth`
+///    schreiben kanonische Pfade); der Rest darf nur normale Komponenten
+///    haben (kein `..`, nicht leer).
+/// 3. `open_dir_nofollow(<secrets>)` (das Verzeichnis selbst darf kein Symlink
+///    sein) und `open_beneath(.., rest)` (`RESOLVE_BENEATH |
+///    RESOLVE_NO_SYMLINKS`: **kein** Glied darf ein Symlink sein — strenger als
+///    `open_nofollow`, das Zwischenverzeichnisse auflösen würde).
+/// 4. `ensure_private_regular`: reguläre Datei, Eigentümer = effektive UID,
+///    `mode & 0o077 == 0`.
+/// 5. Höchstens [`MAX_FILE_CREDENTIAL_BYTES`], UTF-8.
+///
+/// # Errors
+/// Einer der statischen `FILE_CREDENTIAL_*`-Gründe, nie mit Pfad oder Inhalt.
+fn read_private_secret_file(
+    home: Option<&Path>,
+    raw_path: &str,
+) -> Result<SecretString, &'static str> {
+    use std::io::Read as _;
+    use std::os::fd::AsFd as _;
+
+    let home = home.ok_or(FILE_CREDENTIAL_NO_HOME_REASON)?;
+    let (secrets_dir, relative) = secret_file_location(home, Path::new(raw_path))
+        .ok_or(FILE_CREDENTIAL_OUTSIDE_SECRETS_REASON)?;
+    let root =
+        harw_fsutil::open_dir_nofollow(&secrets_dir).map_err(|_| FILE_CREDENTIAL_OPEN_REASON)?;
+    let file =
+        harw_fsutil::open_beneath(root.as_fd(), &relative, harw_fsutil::OpenMode::read_only())
+            .map_err(|_| FILE_CREDENTIAL_OPEN_REASON)?;
+    harw_fsutil::ensure_private_regular(&file).map_err(|_| FILE_CREDENTIAL_NOT_PRIVATE_REASON)?;
+    let mut contents = String::new();
+    file.take(MAX_FILE_CREDENTIAL_BYTES + 1)
+        .read_to_string(&mut contents)
+        .map_err(|_| FILE_CREDENTIAL_READ_REASON)?;
+    let secret = SecretString::new(contents.into());
+    let read_bytes = u64::try_from(secret.expose_secret().len()).unwrap_or(u64::MAX);
+    if read_bytes > MAX_FILE_CREDENTIAL_BYTES {
+        return Err(FILE_CREDENTIAL_READ_REASON);
+    }
+    Ok(secret)
+}
+
+/// Zerlegt `path` in (`<home>/secrets`-Verzeichnis, relativer Rest), falls der
+/// Pfad lexikalisch darunter liegt; siehe [`read_private_secret_file`].
+fn secret_file_location(home: &Path, path: &Path) -> Option<(PathBuf, PathBuf)> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut candidates = vec![home.join("secrets")];
+    if let Ok(canonical_home) = home.canonicalize() {
+        candidates.push(canonical_home.join("secrets"));
+    }
+    candidates.into_iter().find_map(|secrets_dir| {
+        let relative = path.strip_prefix(&secrets_dir).ok()?.to_path_buf();
+        let only_normal = relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)));
+        (only_normal && !relative.as_os_str().is_empty()).then_some((secrets_dir, relative))
+    })
 }
 
 /// Parses a `keyring:` payload in the required `service/account` form.
@@ -1338,6 +1667,25 @@ fn extract_openai_usage(body: &Value, transport: Transport) -> TokenUsage {
     }
 }
 
+impl OpenAiResponsesProvider {
+    /// Baut den POST-Request mit konfigurierten Headern und Credential.
+    ///
+    /// Alle Credential-Header sind sensitiv markiert: `bearer_auth` tut das in
+    /// reqwest selbst (`header_sensitive(.., true)`), `api-key`/`x-api-key`
+    /// über [`sensitive_header_value`].
+    fn authorized_request(&self, url: &str) -> Result<reqwest::RequestBuilder, ModelError> {
+        let builder = self.client.post(url).headers(self.headers.clone());
+        Ok(match self.auth_header.as_str() {
+            "none" => builder,
+            "api-key" | "x-api-key" => builder.header(
+                self.auth_header.as_str(),
+                sensitive_header_value(self.api_key.expose_secret())?,
+            ),
+            _ => builder.bearer_auth(self.api_key.expose_secret()),
+        })
+    }
+}
+
 impl ModelProvider for OpenAiResponsesProvider {
     fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
         Box::pin(async move {
@@ -1359,14 +1707,7 @@ impl ModelProvider for OpenAiResponsesProvider {
                 }
             };
 
-            let builder = self.client.post(&url).headers(self.headers.clone());
-            let builder = match self.auth_header.as_str() {
-                "none" => builder,
-                "api-key" | "x-api-key" => {
-                    builder.header(self.auth_header.as_str(), self.api_key.expose_secret())
-                }
-                _ => builder.bearer_auth(self.api_key.expose_secret()),
-            };
+            let builder = self.authorized_request(&url)?;
             let response = builder
                 .json(&wire)
                 .timeout(self.request_timeout)
@@ -1562,6 +1903,22 @@ mod tests {
         }
     }
 
+    fn test_sources<'a>(
+        env_layer: &'a BTreeMap<String, String>,
+        resolver: Option<&'a dyn SecretResolver>,
+        home: Option<&'a Path>,
+    ) -> SecretSources<'a> {
+        SecretSources {
+            env_layer,
+            resolver,
+            home,
+        }
+    }
+
+    fn no_process_env(_name: &str) -> Option<String> {
+        None
+    }
+
     struct FakeSecretResolver {
         result: Result<SecretString, String>,
     }
@@ -1611,11 +1968,12 @@ mod tests {
         assert_eq!(provider.api_key.expose_secret(), "resolved-secret");
 
         let anthropic = secrets_provider_config("anthropic-messages");
+        let env_layer = BTreeMap::new();
         let (_, credential) = resolve_anthropic(
             "anthropic",
             &anthropic,
-            &std::collections::BTreeMap::new(),
-            Some(&resolver),
+            test_sources(&env_layer, Some(&resolver), None),
+            &no_process_env,
         )
         .expect("injected resolver constructs Anthropic credential");
         let AnthropicCredential::ApiKey(secret) = credential else {
@@ -1666,11 +2024,12 @@ mod tests {
             result: Err(format!("resolver unavailable: {secret}")),
         };
         let provider = secrets_provider_config("anthropic-messages");
+        let env_layer = BTreeMap::new();
         let error = match resolve_anthropic(
             "anthropic",
             &provider,
-            &std::collections::BTreeMap::new(),
-            Some(&resolver),
+            test_sources(&env_layer, Some(&resolver), None),
+            &no_process_env,
         ) {
             Ok(_) => panic!("resolver failure must fail Anthropic construction"),
             Err(error) => error,
@@ -1703,11 +2062,12 @@ mod tests {
             ));
 
             let provider = secrets_provider_config("anthropic-messages");
+            let env_layer = BTreeMap::new();
             let anthropic_error = match resolve_anthropic(
                 "anthropic",
                 &provider,
-                &std::collections::BTreeMap::new(),
-                Some(&resolver),
+                test_sources(&env_layer, Some(&resolver), None),
+                &no_process_env,
             ) {
                 Ok(_) => panic!("empty Anthropic resolver credential must fail construction"),
                 Err(error) => error,
@@ -1953,10 +2313,10 @@ mod tests {
     #[test]
     fn test_resolve_secret_rejects_secrets_reference_without_disclosing_it() {
         let reference = "tenant/provider-token-with-secret-metadata";
+        let env_layer = BTreeMap::new();
         let error = resolve_secret(
             &harw_config::SecretRef::Secrets(reference.to_owned()),
-            &std::collections::BTreeMap::new(),
-            None,
+            test_sources(&env_layer, None, None),
         )
         .expect_err("secrets references are unsupported by the HTTP provider");
 
@@ -3137,6 +3497,563 @@ mod tests {
             "provider returned a tool call with missing or invalid function",
         )
         .await;
+    }
+
+    // ── W1-06b: Endpoint, Env-Fallback, file:-Secrets, Header, Redirects ─────
+
+    #[test]
+    fn validate_endpoint_rejects_http_for_non_loopback_hosts() {
+        for endpoint in [
+            "http://api.openai.com/v1",
+            "http://gateway.example/v1",
+            "http://192.168.1.10:11434",
+            "http://10.0.0.1/v1",
+            "http://localhost.evil.example/v1",
+        ] {
+            let error = validate_endpoint(endpoint).expect_err(endpoint);
+            assert!(matches!(error, HttpProviderError::Decode(_)), "{endpoint}");
+            assert!(!error.to_string().contains(endpoint), "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn validate_endpoint_allows_https_and_http_loopback() {
+        for endpoint in [
+            "https://api.openai.com/v1",
+            "https://gateway.example:8443/anthropic/",
+            "http://127.0.0.1:11434",
+            "http://localhost:11434/v1",
+            "http://LOCALHOST./v1",
+            "http://ollama.localhost:11434",
+            "http://[::1]:8080/v1",
+        ] {
+            validate_endpoint(endpoint).unwrap_or_else(|error| panic!("{endpoint}: {error}"));
+        }
+    }
+
+    #[test]
+    fn validate_endpoint_rejects_userinfo_query_fragment_and_placeholders() {
+        for endpoint in [
+            "https://user:pw@api.openai.com/v1",
+            "https://user@api.openai.com/v1",
+            "https://api.openai.com/v1?key=abc",
+            "https://api.openai.com/v1#frag",
+            "https://<resource>.services.ai.azure.com/anthropic",
+            "https://example.test/<deployment>",
+            "ftp://api.openai.com/v1",
+            "api.openai.com/v1",
+            "",
+        ] {
+            assert!(validate_endpoint(endpoint).is_err(), "{endpoint:?}");
+        }
+    }
+
+    #[test]
+    fn build_provider_rejects_plain_http_gateway_before_resolving_credentials() {
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.default_provider = Some("gateway".to_owned());
+        config.harness.default_model = Some("model".to_owned());
+        config.providers.insert(
+            "gateway".to_owned(),
+            configured_provider(
+                "gateway",
+                "http://gateway.example/v1".to_owned(),
+                vec!["model"],
+                "GATEWAY_KEY",
+            ),
+        );
+        let error = match build_provider(&config) {
+            Ok(_) => panic!("plain-http non-loopback endpoint must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, HttpProviderError::Decode(_)));
+    }
+
+    fn anthropic_provider_without_auth(base_url: &str) -> harw_config::ProviderToml {
+        harw_config::ProviderToml {
+            name: "anthropic".to_owned(),
+            api: "anthropic-messages".to_owned(),
+            base_url: base_url.to_owned(),
+            auth: None,
+            auth_header: None,
+            api_key: None,
+            headers: HashMap::new(),
+            models: vec!["claude-test".to_owned()],
+            enabled: true,
+            origin_allowlist: harw_config::OriginAllowlistToml::default(),
+        }
+    }
+
+    #[test]
+    fn default_anthropic_base_url_is_the_official_host() {
+        assert!(endpoint_is_official_host(
+            DEFAULT_ANTHROPIC_BASE_URL,
+            anthropic::ANTHROPIC_API_HOST
+        ));
+    }
+
+    #[test]
+    fn implicit_anthropic_env_credentials_are_not_sent_to_foreign_hosts() {
+        let env_layer = BTreeMap::new();
+        let lookups = std::cell::RefCell::new(Vec::<String>::new());
+        let process_env = |name: &str| {
+            lookups.borrow_mut().push(name.to_owned());
+            (name == "CLAUDE_CODE_OAUTH_TOKEN").then(|| "sk-ant-oat-env-token".to_owned())
+        };
+
+        for foreign in [
+            "https://evil.example",
+            "https://api.anthropic.com.evil.example/v1",
+            "https://evil.example/api.anthropic.com/v1",
+            "https://api.anthropic.com:8443/v1",
+            "https://eu.api.anthropic.com/v1",
+            "http://127.0.0.1:9/v1",
+        ] {
+            let error = match resolve_anthropic(
+                "anthropic",
+                &anthropic_provider_without_auth(foreign),
+                test_sources(&env_layer, None, None),
+                &process_env,
+            ) {
+                Ok(_) => panic!("{foreign}: implicit env credential must not be used"),
+                Err(error) => error,
+            };
+            assert!(
+                matches!(error, HttpProviderError::MissingDefault { .. }),
+                "{foreign}"
+            );
+            assert!(!error.to_string().contains("sk-ant-oat-env-token"));
+        }
+        assert!(
+            lookups.borrow().is_empty(),
+            "foreign hosts must not even read the process environment"
+        );
+
+        for official in [
+            "https://api.anthropic.com",
+            "https://api.anthropic.com/v1",
+            "https://API.Anthropic.COM./v1",
+            "https://api.anthropic.com:443",
+        ] {
+            let (_, credential) = match resolve_anthropic(
+                "anthropic",
+                &anthropic_provider_without_auth(official),
+                test_sources(&env_layer, None, None),
+                &process_env,
+            ) {
+                Ok(resolved) => resolved,
+                Err(error) => panic!("{official}: {error}"),
+            };
+            assert!(
+                matches!(credential, AnthropicCredential::OAuth(_)),
+                "{official}"
+            );
+        }
+    }
+
+    #[test]
+    fn implicit_foundry_env_key_requires_matching_process_env_endpoint() {
+        let mut env_layer = BTreeMap::new();
+        env_layer.insert(
+            "ANTHROPIC_FOUNDRY_API_KEY".to_owned(),
+            "foundry-layer-key".to_owned(),
+        );
+        let bound_env = |name: &str| {
+            (name == "ANTHROPIC_FOUNDRY_BASE_URL")
+                .then(|| "https://RES.services.ai.azure.com/anthropic".to_owned())
+        };
+        let matching =
+            anthropic_provider_without_auth("https://res.services.ai.azure.com/anthropic/");
+        let foreign = anthropic_provider_without_auth("https://evil.example/anthropic/");
+
+        let resolved = resolve_anthropic(
+            "foundry",
+            &matching,
+            test_sources(&env_layer, None, None),
+            &bound_env,
+        );
+        assert!(matches!(resolved, Ok((_, AnthropicCredential::ApiKey(_)))));
+
+        let bound: &dyn Fn(&str) -> Option<String> = &bound_env;
+        let unbound: &dyn Fn(&str) -> Option<String> = &no_process_env;
+        for (provider, process_env) in [(&foreign, bound), (&matching, unbound)] {
+            let error = match resolve_anthropic(
+                "foundry-prod",
+                provider,
+                test_sources(&env_layer, None, None),
+                process_env,
+            ) {
+                Ok(_) => panic!("unbound Foundry endpoint must not receive the env key"),
+                Err(error) => error,
+            };
+            assert!(matches!(error, HttpProviderError::MissingDefault { .. }));
+            assert!(!error.to_string().contains("foundry-layer-key"));
+        }
+    }
+
+    fn write_file_with_mode(path: &Path, contents: &str, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, contents).expect("write credential fixture");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .expect("chmod credential fixture");
+    }
+
+    fn home_with_secrets() -> (tempfile::TempDir, PathBuf) {
+        let home = tempfile::tempdir().expect("temporary home");
+        let secrets = home.path().join("secrets");
+        std::fs::create_dir(&secrets).expect("create secrets directory");
+        (home, secrets)
+    }
+
+    fn file_ref(path: &Path) -> harw_config::SecretRef {
+        harw_config::SecretRef::File(path.to_str().expect("UTF-8 fixture path").to_owned())
+    }
+
+    /// Löst `reference` auf und liefert (Grund, gerenderter Fehler).
+    fn file_credential_error(
+        reference: &harw_config::SecretRef,
+        home: Option<&Path>,
+    ) -> (String, String) {
+        let env_layer = BTreeMap::new();
+        let error = match resolve_secret(reference, test_sources(&env_layer, None, home)) {
+            Ok(_) => panic!("file credential must be rejected"),
+            Err(error) => error,
+        };
+        let rendered = error.to_string();
+        let HttpProviderError::UnresolvedCredential { reason, .. } = error else {
+            panic!("unexpected error kind: {rendered}");
+        };
+        (reason, rendered)
+    }
+
+    #[test]
+    fn file_credentials_below_home_secrets_are_resolved() {
+        let (home, secrets) = home_with_secrets();
+        let token = secrets.join("provider.token");
+        write_file_with_mode(&token, "  file-token-value\n", 0o600);
+        let nested_dir = secrets.join("nested");
+        std::fs::create_dir(&nested_dir).expect("create nested directory");
+        let json = nested_dir.join("credentials.json");
+        write_file_with_mode(&json, r#"{"oauth":{"access":" json-token "}}"#, 0o400);
+
+        let env_layer = BTreeMap::new();
+        let sources = test_sources(&env_layer, None, Some(home.path()));
+        let secret = resolve_secret(&file_ref(&token), sources).expect("private token file");
+        assert_eq!(secret.expose_secret(), "file-token-value");
+
+        let json_ref = harw_config::SecretRef::FileJson {
+            path: json.to_str().expect("UTF-8 fixture path").to_owned(),
+            pointer: "/oauth/access".to_owned(),
+        };
+        let secret = resolve_secret(&json_ref, sources).expect("private JSON credential");
+        assert_eq!(secret.expose_secret(), "json-token");
+    }
+
+    #[test]
+    fn file_credentials_outside_home_secrets_are_rejected_without_path_or_content() {
+        let (home, secrets) = home_with_secrets();
+        let outside = home.path().join("outside.token");
+        write_file_with_mode(&outside, "outside-secret-value", 0o600);
+        let sibling_dir = home.path().join("secrets-evil");
+        std::fs::create_dir(&sibling_dir).expect("create sibling directory");
+        let sibling = sibling_dir.join("x.token");
+        write_file_with_mode(&sibling, "outside-secret-value", 0o600);
+
+        let traversal = format!("{}/../outside.token", secrets.display());
+        let references = [
+            file_ref(&outside),
+            file_ref(&sibling),
+            file_ref(&secrets),
+            harw_config::SecretRef::File(traversal),
+            harw_config::SecretRef::File("secrets/provider.token".to_owned()),
+            harw_config::SecretRef::FileJson {
+                path: outside.to_str().expect("UTF-8 fixture path").to_owned(),
+                pointer: "/token".to_owned(),
+            },
+        ];
+        for reference in &references {
+            let (reason, rendered) = file_credential_error(reference, Some(home.path()));
+            assert_eq!(reason, FILE_CREDENTIAL_OUTSIDE_SECRETS_REASON, "{rendered}");
+            assert!(!rendered.contains(home.path().to_str().expect("UTF-8")));
+            assert!(!rendered.contains("outside-secret-value"));
+        }
+
+        let (reason, rendered) = file_credential_error(&file_ref(&outside), None);
+        assert_eq!(reason, FILE_CREDENTIAL_NO_HOME_REASON);
+        assert!(!rendered.contains("outside.token"));
+    }
+
+    #[test]
+    fn file_credentials_through_symlinks_are_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let (home, secrets) = home_with_secrets();
+        let outside = home.path().join("outside.token");
+        write_file_with_mode(&outside, "symlinked-secret-value", 0o600);
+        let outside_dir = home.path().join("outside-dir");
+        std::fs::create_dir(&outside_dir).expect("create outside directory");
+        write_file_with_mode(&outside_dir.join("t.token"), "symlinked-secret-value", 0o600);
+
+        let final_link = secrets.join("link.token");
+        symlink(&outside, &final_link).expect("create final-component symlink");
+        let dir_link = secrets.join("linked-dir");
+        symlink(&outside_dir, &dir_link).expect("create intermediate symlink");
+
+        for path in [final_link, dir_link.join("t.token")] {
+            let (reason, rendered) = file_credential_error(&file_ref(&path), Some(home.path()));
+            assert_eq!(reason, FILE_CREDENTIAL_OPEN_REASON, "{rendered}");
+            assert!(!rendered.contains("symlinked-secret-value"));
+            assert!(!rendered.contains("link.token"));
+            assert!(!rendered.contains("linked-dir"));
+        }
+
+        // `<home>/secrets` selbst als Symlink.
+        let other_home = tempfile::tempdir().expect("second temporary home");
+        symlink(&outside_dir, other_home.path().join("secrets")).expect("secrets symlink");
+        let via_link = other_home.path().join("secrets").join("t.token");
+        let (reason, _) = file_credential_error(&file_ref(&via_link), Some(other_home.path()));
+        assert_eq!(reason, FILE_CREDENTIAL_OPEN_REASON);
+    }
+
+    #[test]
+    fn file_credentials_with_group_or_other_permissions_are_rejected() {
+        let (home, secrets) = home_with_secrets();
+        for (name, mode) in [("world.token", 0o644), ("group.token", 0o640)] {
+            let path = secrets.join(name);
+            write_file_with_mode(&path, "shared-secret-value", mode);
+            let (reason, rendered) = file_credential_error(&file_ref(&path), Some(home.path()));
+            assert_eq!(reason, FILE_CREDENTIAL_NOT_PRIVATE_REASON, "{name}");
+            assert!(!rendered.contains("shared-secret-value"));
+            assert!(!rendered.contains(name));
+        }
+    }
+
+    #[test]
+    fn file_json_credential_errors_do_not_echo_content() {
+        let (home, secrets) = home_with_secrets();
+        let path = secrets.join("broken.json");
+        write_file_with_mode(&path, "{not json broken-secret-value", 0o600);
+        let reference = harw_config::SecretRef::FileJson {
+            path: path.to_str().expect("UTF-8 fixture path").to_owned(),
+            pointer: "/token".to_owned(),
+        };
+        let (reason, rendered) = file_credential_error(&reference, Some(home.path()));
+        assert_eq!(reason, FILE_CREDENTIAL_JSON_REASON);
+        assert!(!rendered.contains("broken-secret-value"));
+        assert!(!rendered.contains("broken.json"));
+    }
+
+    #[test]
+    fn oversized_file_credentials_are_rejected() {
+        let (home, secrets) = home_with_secrets();
+        let path = secrets.join("huge.token");
+        let limit = usize::try_from(MAX_FILE_CREDENTIAL_BYTES).expect("limit fits usize");
+        write_file_with_mode(&path, &"x".repeat(limit + 1), 0o600);
+        let (reason, _) = file_credential_error(&file_ref(&path), Some(home.path()));
+        assert_eq!(reason, FILE_CREDENTIAL_READ_REASON);
+    }
+
+    #[test]
+    fn build_provider_with_home_enables_file_credentials_that_build_provider_rejects() {
+        let (home, secrets) = home_with_secrets();
+        let token = secrets.join("gateway.key");
+        write_file_with_mode(&token, "gateway-file-key", 0o600);
+        let mut provider = configured_provider(
+            "gateway",
+            "https://gateway.example/v1".to_owned(),
+            vec!["model"],
+            "unused",
+        );
+        provider.auth = Some(file_ref(&token));
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.default_provider = Some("gateway".to_owned());
+        config.harness.default_model = Some("model".to_owned());
+        config.providers.insert("gateway".to_owned(), provider);
+
+        build_provider_with_home(&config, home.path(), None)
+            .expect("file credential below <home>/secrets");
+        let error = match build_provider(&config) {
+            Ok(_) => panic!("file credentials require a home"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            &error,
+            HttpProviderError::UnresolvedCredential { reason, .. }
+                if reason == FILE_CREDENTIAL_NO_HOME_REASON
+        ));
+        assert!(!error.to_string().contains("gateway.key"));
+    }
+
+    #[test]
+    fn configured_credential_headers_reject_plaintext_and_resolve_secret_refs() {
+        let mut env_layer = BTreeMap::new();
+        env_layer.insert(
+            "HARW_TEST_GATEWAY_HEADER_TOKEN_W106B".to_owned(),
+            "Bearer resolved-gateway-token".to_owned(),
+        );
+        let sources = test_sources(&env_layer, None, None);
+
+        let plaintext = HashMap::from([(
+            "cf-aig-authorization".to_owned(),
+            "Bearer plaintext-gateway-token".to_owned(),
+        )]);
+        let error = configured_headers("gateway", &plaintext, sources)
+            .expect_err("plaintext credential header must be rejected");
+        assert!(!error.to_string().contains("plaintext-gateway-token"));
+
+        let referenced = HashMap::from([
+            (
+                "cf-aig-authorization".to_owned(),
+                "env:HARW_TEST_GATEWAY_HEADER_TOKEN_W106B".to_owned(),
+            ),
+            ("x-provider-marker".to_owned(), "gateway".to_owned()),
+        ]);
+        let headers =
+            configured_headers("gateway", &referenced, sources).expect("secret ref header");
+        let credential = headers.get("cf-aig-authorization").expect("credential header");
+        assert_eq!(credential.as_bytes(), b"Bearer resolved-gateway-token");
+        assert!(credential.is_sensitive());
+        assert!(!headers.get("x-provider-marker").expect("marker").is_sensitive());
+        assert!(!format!("{headers:?}").contains("resolved-gateway-token"));
+    }
+
+    #[test]
+    fn openai_credential_headers_are_marked_sensitive() {
+        for (auth_header, header_name) in [
+            ("api-key", "api-key"),
+            ("x-api-key", "x-api-key"),
+            ("bearer", "authorization"),
+        ] {
+            let mut provider = OpenAiResponsesProvider::new(
+                "https://example.test/v1",
+                "model",
+                SecretString::new("sk-sensitive-header-value".into()),
+            );
+            provider.auth_header = auth_header.to_owned();
+            let request = provider
+                .authorized_request("https://example.test/v1/chat/completions")
+                .expect("credential header")
+                .build()
+                .expect("request builds");
+            let value = request.headers().get(header_name).expect(header_name);
+            assert!(value.is_sensitive(), "{auth_header}");
+            assert!(!format!("{:?}", request.headers()).contains("sk-sensitive-header-value"));
+        }
+    }
+
+    #[test]
+    fn invalid_credential_header_value_is_rejected_without_echo() {
+        let error = sensitive_header_value("line\nbreak-secret").expect_err("CR/LF rejected");
+        let ModelError::RequestFailed(message) = error else {
+            panic!("invalid header value must be a request failure");
+        };
+        assert!(!message.contains("break-secret"));
+    }
+
+    #[test]
+    fn redirect_decision_follows_only_same_origin_within_limit() {
+        let url = |value: &str| reqwest::Url::parse(value).expect("test URL");
+        let origin = vec![url("https://api.example.test/v1/messages")];
+
+        let same = [
+            "https://api.example.test/v1/messages/",
+            "https://API.example.test:443/other",
+        ];
+        for next in same {
+            assert_eq!(
+                redirect_decision(&url(next), &origin),
+                RedirectDecision::Follow,
+                "{next}"
+            );
+        }
+
+        let cross = [
+            "https://evil.example/v1/messages",
+            "https://sub.api.example.test/v1/messages",
+            "https://api.example.test:8443/v1/messages",
+            "http://api.example.test/v1/messages",
+            "http://api.example.test:443/v1/messages",
+        ];
+        for next in cross {
+            assert_eq!(
+                redirect_decision(&url(next), &origin),
+                RedirectDecision::RejectCrossOrigin,
+                "{next}"
+            );
+        }
+
+        assert_eq!(
+            redirect_decision(&url("https://api.example.test/x"), &[]),
+            RedirectDecision::RejectCrossOrigin
+        );
+        let tainted_chain = vec![
+            url("https://api.example.test/a"),
+            url("https://evil.example/b"),
+        ];
+        assert_eq!(
+            redirect_decision(&url("https://api.example.test/c"), &tainted_chain),
+            RedirectDecision::RejectCrossOrigin
+        );
+
+        let chain = |len: usize| vec![url("https://api.example.test/hop"); len];
+        assert_eq!(
+            redirect_decision(&url("https://api.example.test/next"), &chain(MAX_REDIRECTS)),
+            RedirectDecision::Follow
+        );
+        assert_eq!(
+            redirect_decision(
+                &url("https://api.example.test/next"),
+                &chain(MAX_REDIRECTS + 1)
+            ),
+            RedirectDecision::RejectLimit
+        );
+    }
+
+    #[tokio::test]
+    async fn cross_port_redirect_is_not_followed_with_api_key() {
+        let target = TcpListener::bind("127.0.0.1:0").expect("bind redirect target");
+        target
+            .set_nonblocking(true)
+            .expect("non-blocking redirect target");
+        let target_url = format!(
+            "http://{}/v1/chat/completions",
+            target.local_addr().expect("target address")
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind redirecting server");
+        let base_url = format!("http://{}/v1", listener.local_addr().expect("server address"));
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept provider request");
+            let mut request = [0_u8; 4096];
+            let _read = stream.read(&mut request).expect("read provider request");
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nlocation: {target_url}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write redirect response");
+        });
+
+        let mut provider = OpenAiResponsesProvider::with_transport(
+            base_url,
+            "model",
+            SecretString::new("sk-redirect-secret".into()),
+            Transport::Chat,
+        );
+        provider.auth_header = "x-api-key".to_owned();
+        let error = provider
+            .respond(request_with_ids(None, None))
+            .await
+            .expect_err("cross-origin redirect must fail");
+        let ModelError::RequestFailed(message) = error else {
+            panic!("redirect rejection must be a request failure");
+        };
+        assert!(!message.contains("sk-redirect-secret"));
+        server.join().expect("redirecting server completes");
+        assert!(
+            matches!(target.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "redirect target must never be contacted"
+        );
     }
 
     // Echter Netzwerk-Test: braucht einen gültigen OPENAI_API_KEY und

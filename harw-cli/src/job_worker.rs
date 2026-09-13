@@ -346,6 +346,18 @@ async fn execute_claim(
 }
 
 // The historical path: a trusted prompt string, no tools, no sandbox.
+//
+// P0.12 (Register F-123): Ohne diese Prüfungen hätte jeder `SubmitOwn`-Principal
+// unbegrenzten Modellzugang auf Serverkosten. Deshalb gilt, in dieser
+// Reihenfolge und jeweils fail closed:
+// 1. Scope: Claim, Lease und `JobScope` müssen zum Worker- und
+//    Principal-Kontext passen (`check_prompt_claim_scope`), sonst
+//    `Failed{scope: …}` **ohne** Modellaufruf.
+// 2. Budget: das Job-Budget wird auf die harten MCP-Obergrenzen gedeckelt
+//    (`effective_prompt_budget`). Tokens werden nach jeder Modell-Runde aus der
+//    gemeldeten Usage verbucht (`BudgetedModelProvider`); die Wanduhr läuft als
+//    `tokio::time::timeout` um den ganzen Turn. Überschreitung ⇒
+//    `Failed{budget: …}`, danach kein weiterer Modellaufruf.
 async fn execute_prompt_claim(
     claim: JobClaim,
     input: serde_json::Value,
@@ -353,23 +365,372 @@ async fn execute_prompt_claim(
     transcript_root: PathBuf,
     control: Arc<WorkerExecutionControl>,
 ) -> JobOutcome {
-    match prompt_from_input(&input) {
-        Ok(prompt) => {
-            execute_turn(
-                claim,
-                prompt,
-                provider,
-                transcript_root,
-                control,
-                TurnSetup {
-                    registry: empty_extension_registry(),
-                    spawn_context: None,
-                    pause: PauseDisposition::Blocked,
-                },
-            )
-            .await
+    let work_id = claim.job.id.as_str().to_owned();
+
+    if let Err(reason) = check_prompt_claim_scope(&claim, &input) {
+        tracing::warn!(work_id = %work_id, reason = %reason, "prompt job rejected before any model call");
+        return JobOutcome::Failed { reason };
+    }
+
+    let prompt = match prompt_from_input(&input) {
+        Ok(prompt) => prompt,
+        Err(reason) => return JobOutcome::Blocked { reason },
+    };
+
+    let budget = effective_prompt_budget(&claim.job.budget);
+    let wall = match prompt_wall_allowance(&budget, &claim.job.usage, &claim.lease, Timestamp::now())
+    {
+        Ok(wall) => wall,
+        Err(reason) => {
+            tracing::warn!(work_id = %work_id, reason = %reason, "prompt job has no wall-clock budget left");
+            return JobOutcome::Failed { reason };
         }
-        Err(reason) => JobOutcome::Blocked { reason },
+    };
+    let ledger = PromptTokenLedger::new(budget, claim.job.usage.clone());
+    let budgeted: Arc<dyn ModelProvider> = Arc::new(BudgetedModelProvider {
+        inner: provider,
+        ledger: Arc::clone(&ledger),
+    });
+
+    let turn = execute_turn(
+        claim,
+        prompt,
+        budgeted,
+        transcript_root,
+        Arc::clone(&control),
+        TurnSetup {
+            registry: empty_extension_registry(),
+            spawn_context: None,
+            pause: PauseDisposition::Blocked,
+        },
+    );
+    match tokio::time::timeout(wall.duration, turn).await {
+        // Ein Abbruch durch den Supervisor bleibt ein Abbruch; jeder andere
+        // Ausgang eines Turns, der das Token-Budget gerissen hat, ist ein
+        // Budget-Fehlschlag — auch wenn das Modell noch geantwortet hat.
+        Ok(outcome @ JobOutcome::Cancelled { .. }) => outcome,
+        Ok(outcome) => match ledger.exceeded() {
+            Some(reason) => {
+                tracing::warn!(work_id = %work_id, reason = %reason, "prompt job exceeded its token budget");
+                JobOutcome::Failed { reason }
+            }
+            None => outcome,
+        },
+        Err(_elapsed) => {
+            // Der Turn läuft in einem eigenen Task (`execute_turn`). Das
+            // Verwerfen des Futures allein beendet ihn nicht: erst den Ledger
+            // schließen (jede weitere Runde wird abgewiesen), dann den Task
+            // hart abbrechen.
+            ledger.close(wall.reason.clone());
+            control.force_abort();
+            control.clear_abort_handle();
+            tracing::warn!(work_id = %work_id, reason = %wall.reason, "prompt job exceeded its wall-clock window");
+            JobOutcome::Failed { reason: wall.reason }
+        }
+    }
+}
+
+/// Sicherheitsabstand zwischen dem Ende des Wanduhr-Fensters eines Prompt-Jobs
+/// und dem Ablauf seiner Lease, damit `JobStore::complete` den Ausgang noch
+/// unter gültiger Lease festschreiben kann (ohne Lease-Erneuerung, W4a).
+const PROMPT_LEASE_COMMIT_MARGIN_SECONDS: i64 = 5;
+
+// Scope-Durchsetzung für Prompt-Jobs (P0.12). Liefert `Err(reason)` mit dem
+// Präfix `scope:`; Werte aus Scope oder Eingabe erscheinen bewusst nicht im
+// Grund, weil der Grund über MCP an den Client zurückgeht.
+//
+// Worker-Kontext: `JobStore::claim` setzt `lease.holder` auf die `worker_id`
+// der `ClaimRequest` und `token`/`lease` auf die geclaimte Work-ID. Ein Claim,
+// der nicht genau diesem Worker und genau diesem Job gehört, wird nie
+// ausgeführt.
+//
+// Principal-Kontext: Prompt-Jobs (`Worker`/`Dream`) werden in Produktion nur
+// von `DurableMcpSupervisor::submit_job` zugelassen, das Tenant/Workspace aus
+// dem authentifizierten `McpPrincipal` und als Einreicher dessen
+// `ApprovalActor::Operator` setzt. Alles andere passt nicht zu diesem Pfad.
+// Eine Eingabe, die selbst einen Tenant/Workspace adressiert, muss exakt dem
+// serverseitig aufgelösten Scope entsprechen.
+fn check_prompt_claim_scope(claim: &JobClaim, input: &serde_json::Value) -> Result<(), String> {
+    if claim.lease.holder != WORKER_ID {
+        return Err("scope: the job lease is held by another worker".to_owned());
+    }
+    if claim.lease.work_id != claim.job.id || claim.token.work_id != claim.job.id {
+        return Err("scope: the job lease names another job".to_owned());
+    }
+    if !is_scope_identifier(claim.scope.tenant().as_str()) {
+        return Err("scope: the job tenant is not a valid identifier".to_owned());
+    }
+    if !is_scope_identifier(claim.scope.workspace().as_str()) {
+        return Err("scope: the job workspace is not a valid identifier".to_owned());
+    }
+    match claim.scope.submitter() {
+        harw_types::ApprovalActor::Operator { id } if is_scope_identifier(id) => {}
+        harw_types::ApprovalActor::Operator { .. } => {
+            return Err("scope: the job submitter has no valid operator id".to_owned());
+        }
+        harw_types::ApprovalActor::ChannelPeer { .. } => {
+            return Err(
+                "scope: prompt jobs run only for authenticated MCP operators, not channel peers"
+                    .to_owned(),
+            );
+        }
+    }
+    check_input_declared_scope(&claim.scope, input)
+}
+
+// Eine Eingabe darf den Scope nicht umlenken: `tenant`, `workspace` oder ein
+// `scope`-Objekt müssen, falls vorhanden, exakt dem Scope des Jobs entsprechen.
+// Eine Nicht-Objekt-Eingabe ist hier kein Scope-Fall; `prompt_from_input`
+// blockiert sie danach.
+fn check_input_declared_scope(
+    scope: &harw_job_runtime::JobScope,
+    input: &serde_json::Value,
+) -> Result<(), String> {
+    let Some(object) = input.as_object() else {
+        return Ok(());
+    };
+    check_declared_scope_fields(scope, object, "job input")?;
+    let Some(declared) = object.get("scope") else {
+        return Ok(());
+    };
+    let Some(declared) = declared.as_object() else {
+        return Err("scope: the job input declares a malformed scope".to_owned());
+    };
+    if declared
+        .keys()
+        .any(|key| !matches!(key.as_str(), "tenant" | "workspace"))
+    {
+        return Err("scope: the job input scope names an unknown field".to_owned());
+    }
+    check_declared_scope_fields(scope, declared, "job input scope")
+}
+
+fn check_declared_scope_fields(
+    scope: &harw_job_runtime::JobScope,
+    object: &serde_json::Map<String, serde_json::Value>,
+    origin: &str,
+) -> Result<(), String> {
+    for (key, expected) in [
+        ("tenant", scope.tenant().as_str()),
+        ("workspace", scope.workspace().as_str()),
+    ] {
+        if let Some(declared) = object.get(key) {
+            if declared.as_str() != Some(expected) {
+                return Err(format!(
+                    "scope: the {origin} declares a {key} other than the job's server-resolved {key}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+// Nicht leer, keine Rand-Leerzeichen, keine Steuerzeichen.
+fn is_scope_identifier(value: &str) -> bool {
+    !value.is_empty() && value.trim() == value && !value.chars().any(char::is_control)
+}
+
+// Deckelt das gespeicherte Budget eines Prompt-Jobs auf die harten
+// MCP-Obergrenzen (`harw_mcp_server::supervisor::McpJobBudgetLimits`). Der
+// Supervisor lehnt größere Budgets bereits ab; diese Deckelung schützt zusätzlich
+// vor Altbeständen (`Budget::unbounded()` vor P0.12) und anderen Einreichern.
+// Das Ergebnis hat nie ein `None`-Feld.
+fn effective_prompt_budget(stored: &harw_job_runtime::Budget) -> harw_job_runtime::Budget {
+    let ceiling = harw_mcp_server::supervisor::McpJobBudgetLimits::server_default();
+    harw_job_runtime::Budget {
+        max_tokens: Some(
+            stored
+                .max_tokens
+                .map_or(ceiling.max_tokens(), |limit| limit.min(ceiling.max_tokens())),
+        ),
+        max_wall: Some(
+            stored
+                .max_wall
+                .map_or(ceiling.max_wall(), |limit| limit.min(ceiling.max_wall())),
+        ),
+        max_tool_calls: Some(
+            stored
+                .max_tool_calls
+                .map_or(ceiling.max_tool_calls(), |limit| {
+                    limit.min(ceiling.max_tool_calls())
+                }),
+        ),
+    }
+}
+
+/// Das Wanduhr-Fenster eines Prompt-Turns samt dem Grund, der bei Ablauf
+/// gemeldet wird.
+struct PromptWallAllowance {
+    /// Maximale Laufzeit des Turns.
+    duration: std::time::Duration,
+    /// `Failed`-Grund bei Ablauf (`budget:` oder `lease:`).
+    reason: String,
+}
+
+// Verbleibendes Wanduhr-Budget, zusätzlich begrenzt durch die verbleibende
+// Lease-Gültigkeit abzüglich `PROMPT_LEASE_COMMIT_MARGIN_SECONDS`: ohne
+// Lease-Erneuerung (W4a) könnte ein längerer Turn seinen Ausgang ohnehin nicht
+// mehr festschreiben und bliebe als `Running` liegen.
+fn prompt_wall_allowance(
+    budget: &harw_job_runtime::Budget,
+    usage: &harw_job_runtime::BudgetUsage,
+    lease: &harw_job_runtime::Lease,
+    now: Timestamp,
+) -> Result<PromptWallAllowance, String> {
+    let Some(max_wall) = budget.max_wall else {
+        return Err("budget: the job has no wall-clock limit".to_owned());
+    };
+    let budget_left = max_wall.saturating_sub(usage.wall);
+    if budget_left <= SignedDuration::ZERO {
+        return Err("budget: the wall-clock budget is already exhausted".to_owned());
+    }
+    let lease_left = now
+        .duration_until(lease.expires_at)
+        .saturating_sub(SignedDuration::from_secs(PROMPT_LEASE_COMMIT_MARGIN_SECONDS));
+    if lease_left <= SignedDuration::ZERO {
+        return Err("lease: too little lease time is left to run the job".to_owned());
+    }
+    let (window, reason) = if lease_left < budget_left {
+        (
+            lease_left,
+            format!(
+                "lease: the turn exceeded the {} ms left on the job lease",
+                lease_left.as_millis()
+            ),
+        )
+    } else {
+        (
+            budget_left,
+            format!(
+                "budget: wall-clock limit of {} ms exceeded",
+                budget_left.as_millis()
+            ),
+        )
+    };
+    let duration = std::time::Duration::try_from(window)
+        .map_err(|_| "budget: the wall-clock window is not representable".to_owned())?;
+    Ok(PromptWallAllowance { duration, reason })
+}
+
+/// Token-Buchhaltung eines Prompt-Jobs über alle Modell-Runden seines Turns.
+///
+/// # Description
+/// Quelle ist die `ModelResponse::usage` jeder Runde — dieselbe Größe, die
+/// `harw_core::turn_loop::drive_turn` in `total_usage` und damit in
+/// `AgentSession::total_usage` aufsummiert. Gebucht wird mit
+/// [`harw_job_runtime::Budget::charge_tokens`] über `TokenUsage::total()`
+/// (Input + Output). Nach dem ersten Überschreiten ist der Ledger dauerhaft
+/// geschlossen.
+///
+/// # Concurrency
+/// Geteilt als `Arc`; der `Mutex` wird nie über ein `await` gehalten.
+struct PromptTokenLedger {
+    budget: harw_job_runtime::Budget,
+    state: Mutex<PromptTokenState>,
+}
+
+struct PromptTokenState {
+    usage: harw_job_runtime::BudgetUsage,
+    exceeded: Option<String>,
+}
+
+impl PromptTokenLedger {
+    fn new(budget: harw_job_runtime::Budget, usage: harw_job_runtime::BudgetUsage) -> Arc<Self> {
+        Arc::new(Self {
+            budget,
+            state: Mutex::new(PromptTokenState {
+                usage,
+                exceeded: None,
+            }),
+        })
+    }
+
+    // Ein vergifteter Mutex hält nur Zählerstände; sie bleiben lesbar.
+    fn state(&self) -> std::sync::MutexGuard<'_, PromptTokenState> {
+        match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    // Vor jeder Modell-Runde: ein geschlossener oder bereits voll ausgeschöpfter
+    // Ledger lässt keinen weiteren Aufruf zu.
+    fn admit_round(&self) -> Result<(), String> {
+        let mut state = self.state();
+        if let Some(reason) = &state.exceeded {
+            return Err(reason.clone());
+        }
+        if let Some(limit) = self.budget.max_tokens {
+            if state.usage.tokens >= limit {
+                let reason = format!(
+                    "budget: token limit of {limit} is exhausted; no further model round"
+                );
+                state.exceeded = Some(reason.clone());
+                return Err(reason);
+            }
+        }
+        Ok(())
+    }
+
+    // Nach jeder Modell-Runde: verbucht die gemeldete Usage.
+    fn charge_round(&self, usage: &harw_types::TokenUsage) -> Result<(), String> {
+        let mut state = self.state();
+        if let Some(reason) = &state.exceeded {
+            return Err(reason.clone());
+        }
+        match self.budget.charge_tokens(&mut state.usage, usage.total()) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let reason = format!("budget: {error}");
+                state.exceeded = Some(reason.clone());
+                Err(reason)
+            }
+        }
+    }
+
+    // Schließt den Ledger (z. B. nach Ablauf der Wanduhr); ein bereits
+    // gesetzter Grund bleibt erhalten.
+    fn close(&self, reason: String) {
+        let mut state = self.state();
+        if state.exceeded.is_none() {
+            state.exceeded = Some(reason);
+        }
+    }
+
+    fn exceeded(&self) -> Option<String> {
+        self.state().exceeded.clone()
+    }
+}
+
+/// Ein [`ModelProvider`], der jede Runde gegen einen [`PromptTokenLedger`]
+/// prüft und verbucht.
+///
+/// # Description
+/// Vor der Runde wird zugelassen oder abgewiesen, ohne den inneren Provider zu
+/// berühren; nach der Runde wird die Usage verbucht. Überschreitet sie das
+/// Budget, endet der Turn mit einem Modellfehler, damit weder Tool-Runden noch
+/// weitere Modellaufrufe folgen. `execute_prompt_claim` ersetzt diesen Fehler
+/// durch den `budget:`-Grund des Ledgers.
+///
+/// # Concurrency
+/// `Send + Sync`: nur `Arc`s.
+struct BudgetedModelProvider {
+    inner: Arc<dyn ModelProvider>,
+    ledger: Arc<PromptTokenLedger>,
+}
+
+impl ModelProvider for BudgetedModelProvider {
+    fn respond<'a>(&'a self, request: harw_core::ModelRequest) -> harw_core::ModelFuture<'a> {
+        Box::pin(async move {
+            self.ledger
+                .admit_round()
+                .map_err(harw_core::ModelError::RequestFailed)?;
+            let response = self.inner.respond(request).await?;
+            self.ledger
+                .charge_round(&response.usage)
+                .map_err(harw_core::ModelError::RequestFailed)?;
+            Ok::<harw_core::ModelResponse, harw_core::ModelError>(response)
+        })
     }
 }
 
@@ -1884,5 +2245,526 @@ mod tests {
             prompt.contains("do not ask for approval"),
             "prompt: {prompt}"
         );
+    }
+}
+
+#[cfg(test)]
+mod prompt_claim_guard_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use harw_core::{EchoModelProvider, RecordingModelProvider};
+    use harw_job_runtime::{Budget, BudgetUsage, Job, JobScope, Lease, RetryPolicy, StoredJob};
+    use harw_mcp_server::supervisor::McpJobBudgetLimits;
+    use harw_types::{ApprovalActor, ChannelId, PeerId, TenantId, TokenUsage, WorkId, WorkspaceId};
+
+    // ── Fixtures ──────────────────────────────────────────────────────────
+
+    fn temp_dir() -> tempfile::TempDir {
+        match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(error) => panic!("temp directory: {error}"),
+        }
+    }
+
+    fn operator_scope() -> JobScope {
+        JobScope::new(
+            TenantId::from_str("tenant"),
+            WorkspaceId::from_str("workspace"),
+            ApprovalActor::Operator {
+                id: "operator".to_owned(),
+            },
+        )
+    }
+
+    fn record(id: &str, input: serde_json::Value, budget: Budget, scope: JobScope) -> StoredJob {
+        let now = Timestamp::now();
+        let mut job = Job::new(
+            WorkId::from_str(id),
+            JobKind::Worker,
+            budget,
+            RetryPolicy {
+                max_attempts: 1,
+                base_delay: SignedDuration::from_secs(1),
+                factor: 1.0,
+                max_delay: SignedDuration::from_secs(1),
+            },
+            now,
+        );
+        if let Err(error) = job.mark_ready(now) {
+            panic!("mark_ready: {error}");
+        }
+        StoredJob {
+            job,
+            scope,
+            input,
+            submitted_at: now,
+            not_before: now,
+            lease: None,
+            lease_epoch: 0,
+            completion: None,
+            cancellation: None,
+            revision: 0,
+            trace: None,
+        }
+    }
+
+    fn admit(store: &JobStore, record: &StoredJob) {
+        if let Err(error) = store.admit(record) {
+            panic!("admit: {error}");
+        }
+    }
+
+    fn failure_reason(store: &JobStore, id: &str) -> String {
+        let stored = match store.get(&WorkId::from_str(id)) {
+            Ok(stored) => stored,
+            Err(error) => panic!("get '{id}': {error}"),
+        };
+        match stored.completion.map(|completion| completion.outcome) {
+            Some(JobOutcome::Failed { reason }) => reason,
+            other => panic!("job '{id}' must have failed, got {other:?}"),
+        }
+    }
+
+    async fn run_once(store: &Arc<JobStore>, root: &Path, provider: Arc<dyn ModelProvider>) {
+        run_job_worker_once(
+            Arc::clone(store),
+            Arc::new(JobExecutionRegistry::new()),
+            provider,
+            root,
+            None,
+        )
+        .await;
+    }
+
+    fn empty_request() -> harw_core::ModelRequest {
+        harw_core::ModelRequest::new(
+            harw_extension_api::LoadedInstructions {
+                system_prompt: String::new(),
+                fragments: Vec::new(),
+            },
+            Vec::new(),
+            harw_core::ConversationHistory::new(),
+            Vec::new(),
+        )
+    }
+
+    /// Antwortet sofort mit fester Usage und zählt die Aufrufe.
+    struct FixedUsageProvider {
+        calls: AtomicUsize,
+        tokens_per_call: u64,
+    }
+
+    impl ModelProvider for FixedUsageProvider {
+        fn respond<'a>(&'a self, _request: harw_core::ModelRequest) -> harw_core::ModelFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut response = harw_core::ModelResponse::text("fixed");
+            response.usage = TokenUsage {
+                input_tokens: self.tokens_per_call,
+                output_tokens: 0,
+                reasoning_tokens: None,
+                cached_tokens: None,
+            };
+            Box::pin(async move { Ok(response) })
+        }
+    }
+
+    /// Antwortet nie und zählt die Aufrufe.
+    struct NeverRespondingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ModelProvider for NeverRespondingProvider {
+        fn respond<'a>(&'a self, _request: harw_core::ModelRequest) -> harw_core::ModelFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending::<
+                Result<harw_core::ModelResponse, harw_core::ModelError>,
+            >())
+        }
+    }
+
+    // ── Scope ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_prompt_job_with_input_addressing_another_workspace_fails_without_model_call() {
+        let temp = temp_dir();
+        let store = Arc::new(JobStore::new(temp.path()));
+        admit(
+            &store,
+            &record(
+                "foreign-workspace",
+                serde_json::json!({"task": "summarize", "workspace": "other-workspace"}),
+                Budget::unbounded(),
+                operator_scope(),
+            ),
+        );
+        admit(
+            &store,
+            &record(
+                "foreign-scope",
+                serde_json::json!({"task": "summarize", "scope": {"tenant": "other-tenant"}}),
+                Budget::unbounded(),
+                operator_scope(),
+            ),
+        );
+        let provider = Arc::new(RecordingModelProvider::new());
+
+        run_once(&store, temp.path(), Arc::clone(&provider) as Arc<dyn ModelProvider>).await;
+
+        assert!(
+            provider.recorded().is_empty(),
+            "a scope mismatch must never reach the model"
+        );
+        for id in ["foreign-workspace", "foreign-scope"] {
+            let reason = failure_reason(&store, id);
+            assert!(reason.starts_with("scope:"), "{id}: {reason}");
+            assert!(!reason.contains("other-"), "reason must not echo input: {reason}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prompt_job_with_matching_declared_scope_still_runs() {
+        let temp = temp_dir();
+        let store = Arc::new(JobStore::new(temp.path()));
+        admit(
+            &store,
+            &record(
+                "matching-scope",
+                serde_json::json!({
+                    "task": "summarize",
+                    "workspace": "workspace",
+                    "scope": {"tenant": "tenant", "workspace": "workspace"}
+                }),
+                Budget::unbounded(),
+                operator_scope(),
+            ),
+        );
+        let provider = Arc::new(RecordingModelProvider::new());
+
+        run_once(&store, temp.path(), Arc::clone(&provider) as Arc<dyn ModelProvider>).await;
+
+        assert_eq!(provider.recorded().len(), 1);
+        let stored = match store.get(&WorkId::from_str("matching-scope")) {
+            Ok(stored) => stored,
+            Err(error) => panic!("get: {error}"),
+        };
+        assert!(matches!(
+            stored.completion.map(|completion| completion.outcome),
+            Some(JobOutcome::Succeeded { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_prompt_job_from_a_channel_peer_or_malformed_scope_fails_without_model_call() {
+        let temp = temp_dir();
+        let store = Arc::new(JobStore::new(temp.path()));
+        admit(
+            &store,
+            &record(
+                "channel-peer",
+                serde_json::json!({"task": "summarize"}),
+                Budget::unbounded(),
+                JobScope::new(
+                    TenantId::from_str("tenant"),
+                    WorkspaceId::from_str("workspace"),
+                    ApprovalActor::ChannelPeer {
+                        channel: ChannelId::from_str("telegram"),
+                        peer: PeerId::from_str("peer"),
+                    },
+                ),
+            ),
+        );
+        admit(
+            &store,
+            &record(
+                "padded-workspace",
+                serde_json::json!({"task": "summarize"}),
+                Budget::unbounded(),
+                JobScope::new(
+                    TenantId::from_str("tenant"),
+                    // Leere IDs weist schon die Deserialisierung ab; ein
+                    // Rand-Leerzeichen erreicht den Worker und passt nicht.
+                    WorkspaceId::from_str(" workspace"),
+                    ApprovalActor::Operator {
+                        id: "operator".to_owned(),
+                    },
+                ),
+            ),
+        );
+        let provider = Arc::new(RecordingModelProvider::new());
+
+        run_once(&store, temp.path(), Arc::clone(&provider) as Arc<dyn ModelProvider>).await;
+
+        assert!(provider.recorded().is_empty());
+        for id in ["channel-peer", "padded-workspace"] {
+            let reason = failure_reason(&store, id);
+            assert!(reason.starts_with("scope:"), "{id}: {reason}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prompt_claim_held_by_another_worker_fails_without_model_call() {
+        let temp = temp_dir();
+        let store = JobStore::new(temp.path());
+        admit(
+            &store,
+            &record(
+                "foreign-lease",
+                serde_json::json!({"task": "summarize"}),
+                Budget::unbounded(),
+                operator_scope(),
+            ),
+        );
+        let claim = match store.claim(
+            &WorkId::from_str("foreign-lease"),
+            &ClaimRequest {
+                worker_id: "some-other-worker".to_owned(),
+                lease_ttl: SignedDuration::from_secs(LEASE_TTL_SECONDS),
+                now: Timestamp::now(),
+            },
+        ) {
+            Ok(claim) => claim,
+            Err(error) => panic!("claim: {error}"),
+        };
+        let provider = Arc::new(RecordingModelProvider::new());
+
+        let outcome = execute_prompt_claim(
+            claim,
+            serde_json::json!({"task": "summarize"}),
+            Arc::clone(&provider) as Arc<dyn ModelProvider>,
+            temp.path().to_path_buf(),
+            WorkerExecutionControl::new(),
+        )
+        .await;
+
+        assert!(provider.recorded().is_empty());
+        match outcome {
+            JobOutcome::Failed { reason } => assert!(reason.starts_with("scope:"), "{reason}"),
+            other => panic!("a foreign claim must fail, got {other:?}"),
+        }
+    }
+
+    // ── Budget ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_prompt_job_over_its_token_budget_fails_with_a_budget_reason() {
+        let temp = temp_dir();
+        let store = Arc::new(JobStore::new(temp.path()));
+        admit(
+            &store,
+            &record(
+                "token-overrun",
+                serde_json::json!({"prompt": "hello"}),
+                Budget {
+                    max_tokens: Some(1),
+                    max_wall: None,
+                    max_tool_calls: None,
+                },
+                operator_scope(),
+            ),
+        );
+
+        // `EchoModelProvider` meldet je Aufruf mindestens 1 Input- und 1
+        // Output-Token (`approx(..).max(1)`), also mehr als das Limit 1.
+        run_once(&store, temp.path(), Arc::new(EchoModelProvider::new("done"))).await;
+
+        let reason = failure_reason(&store, "token-overrun");
+        assert!(reason.starts_with("budget:"), "{reason}");
+        assert!(reason.contains("tokens"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn test_token_ledger_refuses_every_model_round_after_an_overrun() {
+        let inner = Arc::new(FixedUsageProvider {
+            calls: AtomicUsize::new(0),
+            tokens_per_call: 10,
+        });
+        let ledger = PromptTokenLedger::new(
+            Budget {
+                max_tokens: Some(15),
+                max_wall: None,
+                max_tool_calls: None,
+            },
+            BudgetUsage::default(),
+        );
+        let budgeted = BudgetedModelProvider {
+            inner: Arc::clone(&inner) as Arc<dyn ModelProvider>,
+            ledger: Arc::clone(&ledger),
+        };
+
+        assert!(budgeted.respond(empty_request()).await.is_ok());
+        assert!(ledger.exceeded().is_none());
+        assert!(
+            budgeted.respond(empty_request()).await.is_err(),
+            "20 tokens exceed the limit of 15"
+        );
+        let Some(reason) = ledger.exceeded() else {
+            panic!("the overrun must close the ledger");
+        };
+        assert!(reason.starts_with("budget:"), "{reason}");
+        assert!(budgeted.respond(empty_request()).await.is_err());
+        assert_eq!(
+            inner.calls.load(Ordering::SeqCst),
+            2,
+            "a closed ledger must never reach the inner provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_token_ledger_refuses_a_round_once_the_limit_is_reached_exactly() {
+        let inner = Arc::new(FixedUsageProvider {
+            calls: AtomicUsize::new(0),
+            tokens_per_call: 10,
+        });
+        let ledger = PromptTokenLedger::new(
+            Budget {
+                max_tokens: Some(10),
+                max_wall: None,
+                max_tool_calls: None,
+            },
+            BudgetUsage::default(),
+        );
+        let budgeted = BudgetedModelProvider {
+            inner: Arc::clone(&inner) as Arc<dyn ModelProvider>,
+            ledger: Arc::clone(&ledger),
+        };
+
+        assert!(budgeted.respond(empty_request()).await.is_ok());
+        assert!(budgeted.respond(empty_request()).await.is_err());
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+        assert!(ledger.exceeded().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_prompt_job_over_its_wall_clock_budget_fails_and_stops_the_turn() {
+        let temp = temp_dir();
+        let store = Arc::new(JobStore::new(temp.path()));
+        admit(
+            &store,
+            &record(
+                "wall-overrun",
+                serde_json::json!({"prompt": "hang"}),
+                Budget {
+                    max_tokens: None,
+                    max_wall: Some(SignedDuration::from_millis(50)),
+                    max_tool_calls: None,
+                },
+                operator_scope(),
+            ),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = Arc::new(NeverRespondingProvider {
+            calls: Arc::clone(&calls),
+        });
+
+        let finished = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_once(&store, temp.path(), provider),
+        )
+        .await;
+        assert!(finished.is_ok(), "the wall-clock budget must end the job");
+
+        let reason = failure_reason(&store, "wall-overrun");
+        assert!(reason.starts_with("budget:"), "{reason}");
+        assert!(reason.contains("wall-clock"), "{reason}");
+        let calls_at_failure = calls.load(Ordering::SeqCst);
+        assert!(calls_at_failure <= 1, "{calls_at_failure}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            calls_at_failure,
+            "the aborted turn must not call the model again"
+        );
+    }
+
+    #[test]
+    fn test_effective_prompt_budget_never_exceeds_the_mcp_ceiling() {
+        let ceiling = McpJobBudgetLimits::server_default();
+
+        assert_eq!(
+            effective_prompt_budget(&Budget::unbounded()),
+            ceiling.as_budget()
+        );
+        assert_eq!(
+            effective_prompt_budget(&Budget {
+                max_tokens: Some(u64::MAX),
+                max_wall: Some(SignedDuration::from_hours(24)),
+                max_tool_calls: Some(u32::MAX),
+            }),
+            ceiling.as_budget()
+        );
+        let small = Budget {
+            max_tokens: Some(7),
+            max_wall: Some(SignedDuration::from_secs(3)),
+            max_tool_calls: Some(1),
+        };
+        assert_eq!(effective_prompt_budget(&small), small);
+    }
+
+    #[test]
+    fn test_prompt_wall_allowance_is_bounded_by_budget_and_lease() {
+        let now = Timestamp::now();
+        let lease = match Lease::acquire(
+            WorkId::from_str("wall"),
+            WORKER_ID,
+            now,
+            SignedDuration::from_secs(120),
+        ) {
+            Ok(lease) => lease,
+            Err(error) => panic!("lease: {error}"),
+        };
+        let budget = |wall: SignedDuration| Budget {
+            max_tokens: Some(1),
+            max_wall: Some(wall),
+            max_tool_calls: Some(1),
+        };
+
+        let short = match prompt_wall_allowance(
+            &budget(SignedDuration::from_secs(10)),
+            &BudgetUsage::default(),
+            &lease,
+            now,
+        ) {
+            Ok(allowance) => allowance,
+            Err(reason) => panic!("{reason}"),
+        };
+        assert_eq!(short.duration, std::time::Duration::from_secs(10));
+        assert!(short.reason.starts_with("budget:"), "{}", short.reason);
+
+        let long = match prompt_wall_allowance(
+            &budget(SignedDuration::from_secs(600)),
+            &BudgetUsage::default(),
+            &lease,
+            now,
+        ) {
+            Ok(allowance) => allowance,
+            Err(reason) => panic!("{reason}"),
+        };
+        assert_eq!(
+            long.duration,
+            std::time::Duration::from_secs((120 - PROMPT_LEASE_COMMIT_MARGIN_SECONDS) as u64)
+        );
+        assert!(long.reason.starts_with("lease:"), "{}", long.reason);
+
+        let spent = BudgetUsage {
+            tokens: 0,
+            wall: SignedDuration::from_secs(10),
+            tool_calls: 0,
+        };
+        let exhausted = prompt_wall_allowance(
+            &budget(SignedDuration::from_secs(10)),
+            &spent,
+            &lease,
+            now,
+        );
+        assert!(matches!(exhausted, Err(ref reason) if reason.starts_with("budget:")));
+
+        let expired = prompt_wall_allowance(
+            &budget(SignedDuration::from_secs(10)),
+            &BudgetUsage::default(),
+            &lease,
+            lease.expires_at,
+        );
+        assert!(matches!(expired, Err(ref reason) if reason.starts_with("lease:")));
     }
 }

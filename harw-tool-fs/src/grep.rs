@@ -1,6 +1,7 @@
 //! `fs.grep` — Tool-Executor für Regex-basierte Dateisuche mit Kontextzeilen.
 //!
-//! Spec-Referenz: AP W2-01..03, Abschnitt "2. `grep.rs` — `fs.grep`".
+//! Spec-Referenz: AP W2-01..03, Abschnitt "2. `grep.rs` — `fs.grep`";
+//! Sicherheits- und Grenzenüberarbeitung: W1-02 (F-059, F-118).
 //!
 //! # Verantwortung
 //! Dieses Modul besitzt den `fs.grep`-Executor:
@@ -8,12 +9,19 @@
 //!   auch Quelle der JSON-Schema-Spezifikation.
 //! - `fs_grep` (per `#[harw_macros::tool]` zu [`FsGrepTool`] erweitert): durchsucht
 //!   Dateien unterhalb eines Start-Verzeichnisses zeilenweise mit einem
-//!   `regex`-Muster. Traversierung über die `ignore`-Crate (respektiert
-//!   `.gitignore`; `target/` und `.git/` werden zusätzlich hart
-//!   ausgeschlossen). Optionale Dateiauswahl über ein `globset`-Muster.
-//!   Binärdateien (NUL-Byte in den ersten 8 KiB) und Dateien über dem
-//!   Größenlimit werden übersprungen. Ausgabe im GNU-grep-Stil
-//!   (`pfad:zeile: inhalt` für Treffer, `pfad-zeile- inhalt` für Kontext).
+//!   `regex`-Muster. Ausgabe im GNU-grep-Stil (`pfad:zeile: inhalt` für
+//!   Treffer, `pfad-zeile- inhalt` für Kontext).
+//!
+//! # Traversierung und Grenzen (W1-02)
+//! Gewalkt wird über [`crate::tree::walk_tree`] (Basis
+//! `harw_fsutil::walk_beneath`): Symlinks werden nie gefolgt, Dateien nur über
+//! `open_beneath` relativ zum Eltern-Deskriptor geöffnet. `.gitignore`/
+//! `.ignore` gelten weiterhin (nur innerhalb des Workspace), `target/` und
+//! `.git/` sind harte Ausschlüsse. Das optionale `glob` wird gegen den Pfad
+//! **relativ zur Workspace-Wurzel** geprüft. Grenzen: höchstens 1000 Treffer,
+//! Tiefe 32, 50 000 Einträge, 10 s, Dateien über [`MAX_FILE_SIZE_BYTES`]
+//! werden übersprungen, Zeilen auf 1024 Bytes und die Gesamtausgabe auf
+//! 64 KiB gekürzt. Der Abbruchgrund erscheint als `# stopped: <grund>`.
 //!
 //! # Schlüsseltypen
 //! - [`GrepArgs`]
@@ -21,19 +29,26 @@
 //!
 //! # Nebenläufigkeit
 //! [`FsGrepTool`] ist `Send + Sync` (Unit-Struct). `fs.grep` ist `parallel_safe`.
+//! Der Walk läuft über `spawn_blocking`.
 //!
 //! # Fehler
 //! Permission-Fehler (erzwungen durch den Makro-Prolog vor der
 //! Deserialisierung), ungültige Regex- oder Glob-Muster und
 //! Pfadauflösungsfehler münden alle in `Ok(ToolOutput::error(...))`. Kein Panic.
 
-use globset::GlobBuilder;
+use crate::blocking::run_blocking;
+use crate::tree::{
+    HARD_MAX_RESULTS, MAX_OUTPUT_BYTES, MAX_SCAN_FILE_BYTES, StopReason, WalkOptions, Workspace,
+    normalize_relative, open_file_in, read_bounded, truncate_line, walk_tree,
+};
+use globset::{GlobBuilder, GlobMatcher};
+use harw_fsutil::EntryType;
 use harw_macros::Tool;
 use harw_tools::{ToolExecutionContext, ToolOutput, ToolsError};
-use ignore::WalkBuilder;
-use regex::RegexBuilder;
+use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use std::ffi::OsStr;
+use std::ops::ControlFlow;
 use std::path::Path;
 
 /// Standard-Obergrenze für `fs.grep`-Treffer.
@@ -49,11 +64,14 @@ pub const MAX_CONTEXT_LINES: usize = 10;
 /// Maximale Dateigröße, die noch durchsucht wird. Größere Dateien werden
 /// übersprungen, um den Speicherbedarf einer einzelnen Suche zu begrenzen
 /// (z. B. Log-Dumps oder Binär-Artefakte, die versehentlich im Workspace liegen).
-pub const MAX_FILE_SIZE_BYTES: u64 = 2 * 1024 * 1024;
+pub const MAX_FILE_SIZE_BYTES: u64 = MAX_SCAN_FILE_BYTES;
 
 /// Anzahl der Bytes am Dateianfang, die auf ein NUL-Byte geprüft werden, um
 /// Binärdateien heuristisch zu erkennen.
 const BINARY_SNIFF_BYTES: usize = 8192;
+
+/// Geschätzter Overhead je Ausgabezeile (Pfad-Trenner, Zeilennummer).
+const LINE_OVERHEAD_BYTES: usize = 16;
 
 /// Verzeichnis- bzw. Dateinamen, die unabhängig von `.gitignore` immer
 /// übersprungen werden.
@@ -70,13 +88,14 @@ pub struct GrepArgs {
     pub pattern: String,
     /// Optionales Unterverzeichnis.
     pub path: Option<String>,
-    /// Optionales Glob-Muster zur Dateiauswahl (Default: alle Textdateien).
+    /// Optionales Glob-Muster zur Dateiauswahl, relativ zur Workspace-Wurzel
+    /// (Default: alle Textdateien).
     pub glob: Option<String>,
     /// Kontextzeilen vor und nach dem Treffer (Default 0, Maximum 10).
     #[tool(default = 0)]
     #[serde(default)]
     pub context_lines: Option<usize>,
-    /// Obergrenze der Treffer (Default 100).
+    /// Obergrenze der Treffer (Default 100, Maximum 1000).
     #[tool(default = 100)]
     #[serde(default)]
     pub max_matches: Option<usize>,
@@ -100,11 +119,24 @@ struct GrepHit {
     after: Vec<(usize, String)>,
 }
 
+impl GrepHit {
+    /// Geschätzte Ausgabelänge dieses Treffers in Bytes.
+    fn output_cost(&self) -> usize {
+        let context: usize = self
+            .before
+            .iter()
+            .chain(self.after.iter())
+            .map(|(_, text)| text.len() + self.path.len() + LINE_OVERHEAD_BYTES)
+            .sum();
+        context + self.text.len() + self.path.len() + LINE_OVERHEAD_BYTES
+    }
+}
+
 /// Prüft, ob ein Datei- oder Verzeichnisname unabhängig von `.gitignore`
 /// hart ausgeschlossen werden soll (`target`, `.git`).
-fn is_hard_excluded(name: &OsStr) -> bool {
+fn is_hard_excluded(name: &OsStr, _is_dir: bool) -> bool {
     name.to_str()
-        .is_some_and(|s| HARD_EXCLUDED_NAMES.contains(&s))
+        .is_some_and(|name| HARD_EXCLUDED_NAMES.contains(&name))
 }
 
 /// Formatiert die gesammelten Treffer im GNU-grep-Stil: `pfad:zeile: inhalt`
@@ -139,12 +171,81 @@ fn format_hits(hits: &[GrepHit]) -> Vec<String> {
     out_lines
 }
 
+/// Zustand eines laufenden `fs.grep`-Durchlaufs.
+struct GrepRun<'a> {
+    regex: &'a Regex,
+    file_matcher: Option<&'a GlobMatcher>,
+    context_lines: usize,
+    cap: usize,
+    hits: Vec<GrepHit>,
+    output_bytes: usize,
+    skipped: usize,
+}
+
+impl GrepRun<'_> {
+    /// Durchsucht eine bereits symlinkfrei geöffnete Datei.
+    fn scan(&mut self, file: &std::fs::File, rel: &Path) -> ControlFlow<StopReason> {
+        let bytes = match read_bounded(file, MAX_FILE_SIZE_BYTES) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                self.skipped += 1;
+                return ControlFlow::Continue(());
+            }
+            Err(_) => return ControlFlow::Continue(()),
+        };
+        let sniff_len = bytes.len().min(BINARY_SNIFF_BYTES);
+        if bytes[..sniff_len].contains(&0u8) {
+            self.skipped += 1;
+            return ControlFlow::Continue(());
+        }
+
+        // UTF-8-sicher: verlustbehaftet dekodieren statt nach Byte-Index zu schneiden.
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<&str> = text.lines().collect();
+        let output_path = rel.display().to_string();
+
+        for (idx, line) in lines.iter().enumerate() {
+            if !self.regex.is_match(line) {
+                continue;
+            }
+            if self.hits.len() >= self.cap {
+                return ControlFlow::Break(StopReason::ResultLimit);
+            }
+
+            let before_start = idx.saturating_sub(self.context_lines);
+            let before = (before_start..idx)
+                .map(|i| (i + 1, truncate_line(lines[i])))
+                .collect::<Vec<_>>();
+
+            let after_end = (idx + 1 + self.context_lines).min(lines.len());
+            let after = ((idx + 1)..after_end)
+                .map(|i| (i + 1, truncate_line(lines[i])))
+                .collect::<Vec<_>>();
+
+            let hit = GrepHit {
+                path: output_path.clone(),
+                line: idx + 1,
+                before,
+                text: truncate_line(line),
+                after,
+            };
+            if self.output_bytes + hit.output_cost() > MAX_OUTPUT_BYTES {
+                return ControlFlow::Break(StopReason::OutputLimit);
+            }
+            self.output_bytes += hit.output_cost();
+            self.hits.push(hit);
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 /// Führt die `fs.grep`-Suche aus: durchsucht Dateien unterhalb eines
 /// (optionalen) Start-Verzeichnisses zeilenweise mit `args.pattern`.
 ///
 /// Berechtigungsprüfung (`ReadWorkspace`) und JSON-Deserialisierung laufen im
 /// von `#[harw_macros::tool]` generierten Prolog von [`FsGrepTool`], bevor
-/// diese Funktion aufgerufen wird.
+/// diese Funktion aufgerufen wird. Die eigentliche Arbeit läuft blockierend
+/// in `spawn_blocking`.
 ///
 /// # Errors
 /// Liefert nie `Err`; Pfad-, Muster- oder I/O-Fehler werden als
@@ -156,18 +257,17 @@ fn format_hits(hits: &[GrepHit]) -> Vec<String> {
     parallel_safe
 )]
 async fn fs_grep(context: &ToolExecutionContext, args: GrepArgs) -> Result<ToolOutput, ToolsError> {
-    let workspace = context.sandbox().workspace();
+    let root = context.sandbox().workspace().canonical_root().to_path_buf();
+    run_blocking("fs.grep", move || Ok(grep_blocking(&root, &args))).await
+}
 
-    let start_relative = args.path.as_deref().unwrap_or(".");
-    let start_resolved = match workspace.resolve_existing(Path::new(start_relative)) {
-        Ok(path) => path,
-        Err(err) => return Ok(ToolOutput::error(err.to_string())),
+/// Synchroner Kern von [`fs_grep`].
+fn grep_blocking(root: &Path, args: &GrepArgs) -> ToolOutput {
+    let start_input = args.path.as_deref().unwrap_or(".");
+    let start_rel = match normalize_relative(start_input) {
+        Ok(rel) => rel,
+        Err(reason) => return ToolOutput::error(format!("fs.grep: {reason}")),
     };
-    if !start_resolved.is_dir() {
-        return Ok(ToolOutput::error(format!(
-            "fs.grep: '{start_relative}' ist kein Verzeichnis"
-        )));
-    }
 
     let regex = match RegexBuilder::new(&args.pattern)
         .case_insensitive(args.case_insensitive.unwrap_or(false))
@@ -175,10 +275,10 @@ async fn fs_grep(context: &ToolExecutionContext, args: GrepArgs) -> Result<ToolO
     {
         Ok(re) => re,
         Err(err) => {
-            return Ok(ToolOutput::error(format!(
+            return ToolOutput::error(format!(
                 "fs.grep: ungültiges Muster '{}': {err}",
                 args.pattern
-            )));
+            ));
         }
     };
 
@@ -186,131 +286,95 @@ async fn fs_grep(context: &ToolExecutionContext, args: GrepArgs) -> Result<ToolO
         Some(pattern) => match GlobBuilder::new(pattern).literal_separator(true).build() {
             Ok(glob) => Some(glob.compile_matcher()),
             Err(err) => {
-                return Ok(ToolOutput::error(format!(
+                return ToolOutput::error(format!(
                     "fs.grep: ungültiges Glob-Muster '{pattern}': {err}"
-                )));
+                ));
             }
         },
         None => None,
     };
 
-    let workspace_root = workspace.canonical_root().to_path_buf();
+    let workspace = match Workspace::open(root) {
+        Ok(workspace) => workspace,
+        Err(err) => return ToolOutput::error(format!("fs.grep: Workspace nicht lesbar: {err}")),
+    };
     let context_lines = args
         .context_lines
         .unwrap_or(DEFAULT_CONTEXT_LINES)
         .min(MAX_CONTEXT_LINES);
-    let cap = args.max_matches.unwrap_or(DEFAULT_MAX_MATCHES).max(1);
+    let cap = args
+        .max_matches
+        .unwrap_or(DEFAULT_MAX_MATCHES)
+        .min(HARD_MAX_RESULTS)
+        .max(1);
 
-    let mut walk_builder = WalkBuilder::new(&start_resolved);
-    walk_builder
-        .hidden(false)
-        .parents(true)
-        .git_ignore(true)
-        .require_git(false)
-        .filter_entry(|entry| entry.depth() == 0 || !is_hard_excluded(entry.file_name()));
-
-    let mut hits: Vec<GrepHit> = Vec::new();
-    let mut skipped = 0usize;
-    let mut truncated = false;
-
-    'walk: for entry in walk_builder.build() {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-            continue;
-        }
-
-        if let Some(matcher) = &file_matcher {
-            let relative = entry
-                .path()
-                .strip_prefix(&start_resolved)
-                .unwrap_or_else(|_| entry.path());
-            if !matcher.is_match(relative) {
-                continue;
+    let mut run = GrepRun {
+        regex: &regex,
+        file_matcher: file_matcher.as_ref(),
+        context_lines,
+        cap,
+        hits: Vec::new(),
+        output_bytes: 0,
+        skipped: 0,
+    };
+    let walked = walk_tree(
+        &workspace,
+        &start_rel,
+        WalkOptions::standard(true, is_hard_excluded),
+        |entry| {
+            if entry.entry_type != EntryType::File {
+                return ControlFlow::Continue(());
             }
-        }
-
-        let metadata = match std::fs::metadata(entry.path()) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if metadata.len() > MAX_FILE_SIZE_BYTES {
-            skipped += 1;
-            continue;
-        }
-
-        let raw = match std::fs::read(entry.path()) {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let sniff_len = raw.len().min(BINARY_SNIFF_BYTES);
-        if raw[..sniff_len].contains(&0u8) {
-            skipped += 1;
-            continue;
-        }
-
-        // UTF-8-sicher: verlustbehaftet dekodieren statt nach Byte-Index zu schneiden.
-        let text = String::from_utf8_lossy(&raw);
-        let lines: Vec<&str> = text.lines().collect();
-        let output_path = entry
-            .path()
-            .strip_prefix(&workspace_root)
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| entry.path().display().to_string());
-
-        for (idx, line) in lines.iter().enumerate() {
-            if !regex.is_match(line) {
-                continue;
+            if let Some(matcher) = run.file_matcher {
+                if !matcher.is_match(entry.rel) {
+                    return ControlFlow::Continue(());
+                }
             }
-
-            let before_start = idx.saturating_sub(context_lines);
-            let before = (before_start..idx)
-                .map(|i| (i + 1, lines[i].to_owned()))
-                .collect::<Vec<_>>();
-
-            let after_end = (idx + 1 + context_lines).min(lines.len());
-            let after = ((idx + 1)..after_end)
-                .map(|i| (i + 1, lines[i].to_owned()))
-                .collect::<Vec<_>>();
-
-            hits.push(GrepHit {
-                path: output_path.clone(),
-                line: idx + 1,
-                before,
-                text: (*line).to_owned(),
-                after,
-            });
-
-            if hits.len() >= cap {
-                truncated = true;
-                break 'walk;
+            if entry.len > MAX_FILE_SIZE_BYTES {
+                run.skipped += 1;
+                return ControlFlow::Continue(());
             }
-        }
-    }
-
-    let mut out_lines = format_hits(&hits);
-
-    if truncated || skipped > 0 {
-        let mut note_parts = Vec::new();
-        if truncated {
-            note_parts.push(format!("Ergebnis auf {cap} Treffer begrenzt"));
-        }
-        if skipped > 0 {
-            note_parts.push(format!(
-                "{skipped} Datei(en) übersprungen (Binärdatei oder Größenlimit überschritten)"
+            match open_file_in(entry.dir, entry.name) {
+                Ok(file) => run.scan(&file, entry.rel),
+                Err(_) => ControlFlow::Continue(()),
+            }
+        },
+    );
+    let stop = match walked {
+        Ok(stop) => stop,
+        Err(err) => {
+            return ToolOutput::error(format!(
+                "fs.grep: '{start_input}' ist kein lesbares Verzeichnis \
+                 (Symlinks werden nicht verfolgt): {err}"
             ));
         }
+    };
+
+    let mut out_lines = format_hits(&run.hits);
+    let mut note_parts = Vec::new();
+    if stop == Some(StopReason::ResultLimit) {
+        note_parts.push(format!("Ergebnis auf {cap} Treffer begrenzt"));
+    }
+    if run.skipped > 0 {
+        note_parts.push(format!(
+            "{} Datei(en) übersprungen (Binärdatei oder Größenlimit überschritten)",
+            run.skipped
+        ));
+    }
+    if !note_parts.is_empty() {
         out_lines.push(format!("# Hinweis: {}.", note_parts.join("; ")));
     }
+    if let Some(reason) = stop {
+        out_lines.push(format!("# stopped: {}", reason.as_str()));
+    }
 
-    Ok(ToolOutput::text(out_lines.join("\n")))
+    ToolOutput::text(out_lines.join("\n"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{Fixture, SECRET, render};
     use harw_sandbox::{
         Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
     };
@@ -515,5 +579,66 @@ mod tests {
             }
             other => panic!("expected error output, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_does_not_follow_symlinks() {
+        let fixture = Fixture::new();
+        fixture.plant_escapes();
+        fs::write(fixture.ws.join("nested/own.txt"), "TOPSECRET-lookalike\n").unwrap();
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace]);
+
+        let output = fs_grep(&ctx, grep_args(SECRET)).await.unwrap();
+        let text = text_of(output);
+        assert_eq!(text.lines().count(), 1, "nur die eigene Datei darf treffen: {text}");
+        assert!(text.starts_with("nested/own.txt:1:"), "{text}");
+
+        for path in ["link_dir", "loop", "nested/up", "../outside"] {
+            let mut args = grep_args(SECRET);
+            args.path = Some(path.to_owned());
+            let output = fs_grep(&ctx, args).await.unwrap();
+            assert!(matches!(output, ToolOutput::Error { .. }), "{path}: {output:?}");
+            assert!(!render(&output).contains("secret.txt"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_skips_oversized_files_and_caps_output() {
+        let fixture = Fixture::new();
+        let mut big = fs::File::create(fixture.ws.join("big.log")).unwrap();
+        std::io::Write::write_all(&mut big, b"MATCHME\n").unwrap();
+        big.set_len(MAX_FILE_SIZE_BYTES + 1).unwrap();
+        let wide = format!("MATCHME {}\n", "x".repeat(5_000));
+        fs::write(fixture.ws.join("wide.txt"), wide.repeat(300)).unwrap();
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace]);
+
+        let mut args = grep_args("MATCHME");
+        args.max_matches = Some(usize::MAX);
+        let text = text_of(fs_grep(&ctx, args).await.unwrap());
+        assert!(text.contains("# stopped: output_limit"), "{}", &text[..text.len().min(400)]);
+        assert!(text.contains("übersprungen"), "Größenlimit muss gemeldet werden");
+        assert!(!text.contains("big.log:"), "übergroße Datei darf nicht durchsucht werden");
+        for line in text.lines().filter(|line| !line.starts_with('#')) {
+            let max_line = crate::tree::MAX_LINE_BYTES + 32;
+            assert!(line.len() <= max_line, "Zeile zu lang: {}", line.len());
+        }
+        assert!(text.len() <= MAX_OUTPUT_BYTES + 4096, "Ausgabe zu groß: {}", text.len());
+    }
+
+    #[tokio::test]
+    async fn test_fs_grep_caps_matches_at_hard_limit() {
+        let fixture = Fixture::new();
+        let lines: String = (0..(HARD_MAX_RESULTS + 20)).map(|i| format!("m{i}\n")).collect();
+        fs::write(fixture.ws.join("many.txt"), lines).unwrap();
+        let ctx = fixture.ctx(vec![Permission::ReadWorkspace]);
+        let mut args = grep_args("^m");
+        args.max_matches = Some(usize::MAX);
+        let text = text_of(fs_grep(&ctx, args).await.unwrap());
+        let hits = text
+            .lines()
+            .filter(|line| !line.starts_with('#') && line.contains(':'))
+            .count();
+        assert_eq!(hits, HARD_MAX_RESULTS);
+        assert!(text.contains("# stopped: result_limit"));
     }
 }

@@ -22,7 +22,19 @@
 //! # Error types
 //! [`ShellExecError`] — converted to [`harw_tools::ToolOutput::error`] before crossing the
 //! public `ToolExecutor` boundary. Callers only ever see `Result<ToolOutput, ToolsError>`.
+//!
+//! # Ressourcen-Härtung (W1-03)
+//! - `bwrap` und `prlimit` werden nur an festen Pfaden gesucht, nie über `PATH` (F-021).
+//! - Start: `/usr/bin/prlimit --as --cpu --fsize --nofile --nproc -- /usr/bin/bwrap …`,
+//!   tmpfs `/tmp` mit `--size` ([`ShellLimits`], F-061). Fehlt `prlimit` und ist
+//!   [`ShellLimits::require_rlimits`] gesetzt, wird nicht gestartet.
+//! - stdin ist `/dev/null` statt des geerbten TUI-Terminals (F-119).
+//! - stdout/stderr werden streamend mit gemeinsamem Budget gelesen; bei Überschreitung wird
+//!   `bwrap` per SIGKILL beendet (`--die-with-parent` + PID-Namespace räumen den Baum ab),
+//!   Teilausgabe bleibt bei Kappung und Timeout erhalten (F-060).
 
+use crate::capture::{BoundedCapture, DrainEnd};
+use crate::limits::{ShellLimits, ShellLimitsError, launch_command};
 use harw_extension_api::contributors::ToolProvider;
 use harw_sandbox::{BwrapLauncher, Permission, SandboxSpec};
 use harw_tools::{
@@ -32,7 +44,17 @@ use harw_tools::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use std::{collections::BTreeMap, ffi::OsString, fmt, io, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    fmt, io,
+    num::NonZeroU64,
+    path::PathBuf,
+    process::{ExitStatus, Stdio},
+    sync::Arc,
+    time::Duration,
+};
+use tokio::process::{Child, Command as TokioCommand};
 use tracing::{debug, info, warn};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -41,6 +63,9 @@ const TOOL_NAME: &str = "shell.exec";
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const TRUNCATION_MARKER: &str = "\n[...truncated...]";
+/// Obergrenze für das Einsammeln des Exit-Status nach SIGKILL. `kill_on_drop` bleibt
+/// als Rückfallebene, falls der Kernel den Prozess nicht rechtzeitig freigibt.
+const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ── ShellExecError ────────────────────────────────────────────────────────────
 
@@ -79,6 +104,8 @@ pub enum ShellExecError {
     },
     /// The combined output exceeded `max_output_bytes` and was truncated.
     TruncatedOutput,
+    /// Ressourcengrenzen sind ungültig oder nicht durchsetzbar (z. B. `prlimit` fehlt).
+    ResourceLimits(ShellLimitsError),
 }
 
 impl fmt::Display for ShellExecError {
@@ -91,6 +118,7 @@ impl fmt::Display for ShellExecError {
                 write!(f, "shell.exec: process exited with code {code}")
             }
             Self::TruncatedOutput => write!(f, "shell.exec: output truncated"),
+            Self::ResourceLimits(err) => write!(f, "shell.exec: resource limits: {err}"),
         }
     }
 }
@@ -99,6 +127,7 @@ impl std::error::Error for ShellExecError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Spawn(err) => Some(err),
+            Self::ResourceLimits(err) => Some(err),
             _ => None,
         }
     }
@@ -163,6 +192,7 @@ struct ShellExecArgs {
 pub struct ShellExecutor {
     timeout_secs: u64,
     max_output_bytes: usize,
+    limits: ShellLimits,
 }
 
 impl ShellExecutor {
@@ -246,17 +276,18 @@ impl ShellExecutor {
     /// Executes the shell command described by `args` in the given sandbox.
     ///
     /// # Description
-    /// Core async logic extracted for readability. Spawns the subprocess, applies the
-    /// timeout, collects output, and builds the final [`ToolOutput`].
+    /// Core async logic extracted for readability. Resolves the pinned `bwrap`/`prlimit`
+    /// binaries, spawns the subprocess with stdin `/dev/null`, streams stdout/stderr under
+    /// one byte budget and applies the timeout to reading and waiting together.
     ///
     /// # Errors
-    /// Returns `Ok(ToolOutput::error(...))` for denied-permission, timeout, or spawn
-    /// failure — callers are not expected to match on `Err` for these cases.
+    /// Returns `Ok(ToolOutput::error(...))` for denied-permission, missing sandbox binaries,
+    /// timeout, or spawn failure — callers are not expected to match on `Err` for these cases.
     /// Returns `Err(ToolsError)` only for argument parsing failures.
     ///
     /// # Concurrency
-    /// Safe to call from any async context. Uses `kill_on_drop(true)` so the child
-    /// process is reaped if the future is dropped before completion.
+    /// Safe to call from any async context. Timeout and output overflow kill and reap the
+    /// child explicitly; `kill_on_drop(true)` still covers a dropped future.
     ///
     /// # Panics
     /// None in production paths.
@@ -274,10 +305,27 @@ impl ShellExecutor {
             "shell.exec preparing isolated process"
         );
 
-        use std::process::Stdio;
-        use tokio::process::Command as TokioCommand;
+        let (tmpfs_size, prlimit) = match self.resolve_limits() {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let err = ShellExecError::ResourceLimits(err);
+                warn!(error = %err, "shell.exec resource limits unavailable");
+                return Ok(ToolOutput::error(err.to_string()));
+            }
+        };
+        if prlimit.is_none() {
+            warn!("shell.exec runs WITHOUT rlimits: prlimit missing and require_rlimits=false");
+        }
 
-        let launcher = BwrapLauncher::default();
+        let launcher = match BwrapLauncher::discover() {
+            Ok(launcher) => launcher.with_tmpfs_size(tmpfs_size),
+            Err(err) => {
+                warn!(error = %err, "shell.exec bubblewrap unavailable");
+                return Ok(ToolOutput::error(format!(
+                    "shell.exec: sandbox setup failed: {err}"
+                )));
+            }
+        };
         let shell_command = [
             OsString::from("/bin/sh"),
             OsString::from("-c"),
@@ -293,62 +341,172 @@ impl ShellExecutor {
             }
         };
 
-        // `BwrapLauncher` deliberately exposes an inspectable plan but its synchronous
-        // spawn API cannot pipe output. Execute that validated plan with Tokio so this
-        // boundary can retain timeout, kill-on-drop, and output-capture guarantees.
-        let child = match TokioCommand::new("bwrap")
-            .args(plan.args())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-        {
-            Ok(c) => c,
+        // `BwrapLauncher::spawn` ist synchron und kann nicht pipen. Der validierte Plan wird
+        // daher hier mit Tokio gestartet — mit dem festgepinnten `launcher.executable()`,
+        // nie mit einem über `PATH` gesuchten `bwrap`.
+        let launch = launch_command(
+            prlimit.as_deref(),
+            &self.limits,
+            launcher.executable(),
+            &plan,
+        );
+        let mut command = TokioCommand::new(&launch.program);
+        command.args(&launch.args);
+        let mut child = match configure_stdio(&mut command).spawn() {
+            Ok(child) => child,
             Err(err) => {
-                warn!(error = %err, "shell.exec spawn failed");
+                warn!(
+                    error = %err,
+                    program = %launch.program.display(),
+                    "shell.exec spawn failed"
+                );
                 return Ok(ToolOutput::error(format!(
                     "shell.exec: failed to spawn Bubblewrap: {err}"
                 )));
             }
         };
 
-        let timeout_result = tokio::time::timeout(
-            Duration::from_secs(effective_timeout),
-            child.wait_with_output(),
-        )
-        .await;
+        let (Some(mut stdout), Some(mut stderr)) = (child.stdout.take(), child.stderr.take())
+        else {
+            terminate(&mut child).await;
+            return Ok(ToolOutput::error(
+                "shell.exec: process I/O error: stdout/stderr pipes missing",
+            ));
+        };
 
-        match timeout_result {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(effective_timeout);
+        let mut capture = BoundedCapture::new(self.max_output_bytes);
+        let drained =
+            tokio::time::timeout_at(deadline, capture.drain(&mut stdout, &mut stderr)).await;
+
+        let status = match drained {
             Err(_elapsed) => {
+                terminate(&mut child).await;
                 warn!(timeout_secs = effective_timeout, "shell.exec timed out");
-                Ok(ToolOutput::error(format!(
-                    "shell.exec timed out after {effective_timeout}s"
-                )))
+                return Ok(self.timeout_output(effective_timeout, &capture));
             }
             Ok(Err(err)) => {
-                warn!(error = %err, "shell.exec wait_with_output failed");
-                Ok(ToolOutput::error(format!(
+                terminate(&mut child).await;
+                warn!(error = %err, "shell.exec output read failed");
+                return Ok(ToolOutput::error(format!(
                     "shell.exec: process I/O error: {err}"
-                )))
+                )));
             }
-            Ok(Ok(output)) => {
-                let exit_code = output.status.code().unwrap_or(-1);
-
-                let (stdout_str, stderr_str, truncated) = Self::truncate_combined_output(
-                    &output.stdout,
-                    &output.stderr,
-                    self.max_output_bytes,
+            Ok(Ok(DrainEnd::LimitExceeded)) => {
+                // Niemand liest mehr: Prozessbaum sofort beenden statt bis zum Timeout
+                // weiterlaufen zu lassen (Pipe voll → Kind blockiert, CPU/Disk-Last bleibt).
+                let status = terminate(&mut child).await;
+                warn!(
+                    max_output_bytes = self.max_output_bytes,
+                    "shell.exec output limit exceeded; process tree killed"
                 );
-
-                info!(exit_code, truncated, "shell.exec completed");
-
-                Ok(ToolOutput::json(json!({
-                    "exit_code": exit_code,
-                    "stdout": stdout_str,
-                    "stderr": stderr_str,
-                    "truncated": truncated,
-                })))
+                return Ok(self.completed_output(status, &capture, true));
             }
+            Ok(Ok(DrainEnd::Eof)) => {
+                match tokio::time::timeout_at(deadline, child.wait()).await {
+                    Ok(Ok(status)) => status,
+                    Ok(Err(err)) => {
+                        terminate(&mut child).await;
+                        warn!(error = %err, "shell.exec wait failed");
+                        return Ok(ToolOutput::error(format!(
+                            "shell.exec: process I/O error: {err}"
+                        )));
+                    }
+                    Err(_elapsed) => {
+                        terminate(&mut child).await;
+                        warn!(timeout_secs = effective_timeout, "shell.exec timed out");
+                        return Ok(self.timeout_output(effective_timeout, &capture));
+                    }
+                }
+            }
+        };
+
+        Ok(self.completed_output(Some(status), &capture, false))
+    }
+
+    /// Prüft die Limits und löst `prlimit` an den festen Pfaden auf.
+    ///
+    /// # Returns
+    /// tmpfs-Größe für bwrap `--size` und den `prlimit`-Pfad (`None` nur, wenn
+    /// `require_rlimits == false` und `prlimit` fehlt).
+    fn resolve_limits(&self) -> Result<(NonZeroU64, Option<PathBuf>), ShellLimitsError> {
+        self.limits.validate()?;
+        let tmpfs_size = self.limits.tmpfs_size()?;
+        let prlimit = self.limits.resolve_prlimit()?;
+        Ok((tmpfs_size, prlimit))
+    }
+
+    /// JSON-Ergebnis eines beendeten (oder wegen Ausgabeüberlauf getöteten) Prozesses.
+    ///
+    /// `killed_by_output_limit` ist der Kürzungshinweis für den Aufrufer: Die Ausgabe ist
+    /// gekappt **und** das Kommando lief nicht zu Ende; `exit_code` ist dann `-1` (Signal).
+    fn completed_output(
+        &self,
+        status: Option<ExitStatus>,
+        capture: &BoundedCapture,
+        killed_by_output_limit: bool,
+    ) -> ToolOutput {
+        let exit_code = status.and_then(|status| status.code()).unwrap_or(-1);
+        let (stdout_str, stderr_str, truncated) = Self::truncate_combined_output(
+            capture.stdout(),
+            capture.stderr(),
+            self.max_output_bytes,
+        );
+        let truncated = truncated || killed_by_output_limit;
+
+        info!(exit_code, truncated, killed_by_output_limit, "shell.exec completed");
+
+        ToolOutput::json(json!({
+            "exit_code": exit_code,
+            "stdout": stdout_str,
+            "stderr": stderr_str,
+            "truncated": truncated,
+            "killed_by_output_limit": killed_by_output_limit,
+        }))
+    }
+
+    /// Fehlerergebnis bei Timeout, das die bis dahin gelesene Teilausgabe (im selben
+    /// Byte-Budget gekürzt) mitliefert.
+    fn timeout_output(&self, timeout_secs: u64, capture: &BoundedCapture) -> ToolOutput {
+        let (stdout, stderr, truncated) = Self::truncate_combined_output(
+            capture.stdout(),
+            capture.stderr(),
+            self.max_output_bytes,
+        );
+        ToolOutput::error(format!(
+            "shell.exec timed out after {timeout_secs}s; process tree killed. \
+             Partial output (truncated: {truncated}):\n[stdout]\n{stdout}\n[stderr]\n{stderr}"
+        ))
+    }
+}
+
+/// Setzt die Standard-Streams für den Sandbox-Start: stdin `/dev/null` (nie das geerbte
+/// Terminal), stdout/stderr als Pipes, SIGKILL beim Drop des `Child`.
+fn configure_stdio(command: &mut TokioCommand) -> &mut TokioCommand {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+}
+
+/// Beendet den direkten Kindprozess (`prlimit` hat sich per `exec` durch `bwrap` ersetzt)
+/// per SIGKILL und sammelt den Exit-Status ein. `bwrap --die-with-parent` und der
+/// PID-Namespace beenden daraufhin den gesamten Sandbox-Prozessbaum, auch per
+/// `setsid`/`nohup` abgekoppelte Nachfahren.
+async fn terminate(child: &mut Child) -> Option<ExitStatus> {
+    if let Err(err) = child.start_kill() {
+        warn!(error = %err, "shell.exec kill failed");
+    }
+    match tokio::time::timeout(KILL_REAP_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => Some(status),
+        Ok(Err(err)) => {
+            warn!(error = %err, "shell.exec reap after kill failed");
+            None
+        }
+        Err(_elapsed) => {
+            warn!("shell.exec reap after kill timed out; relying on kill_on_drop");
+            None
         }
     }
 }
@@ -434,7 +592,8 @@ impl ToolExecutor for ShellExecutor {
 /// Holds the shared configuration (timeout, max output size) and manufactures
 /// [`ShellExecutor`] instances on demand via [`ToolProvider::executor`].
 ///
-/// Defaults: `timeout_secs = 30`, `max_output_bytes = 65536` (64 KiB).
+/// Defaults: `timeout_secs = 30`, `max_output_bytes = 65536` (64 KiB),
+/// `limits = ShellLimits::default()` (rlimits über `/usr/bin/prlimit`, tmpfs 256 MiB).
 ///
 /// # Concurrency
 /// `Send + Sync`. Multiple threads may call [`tools`][ShellToolProvider::tools] and
@@ -456,6 +615,8 @@ pub struct ShellToolProvider {
     pub timeout_secs: u64,
     /// Maximum number of raw stdout and stderr bytes returned together.
     pub max_output_bytes: usize,
+    /// rlimits und tmpfs-Größe für jeden Aufruf (siehe [`ShellLimits`]).
+    pub limits: ShellLimits,
 }
 
 impl ShellToolProvider {
@@ -543,6 +704,7 @@ impl Default for ShellToolProvider {
         Self {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            limits: ShellLimits::default(),
         }
     }
 }
@@ -611,6 +773,7 @@ impl ToolProvider for ShellToolProvider {
             Some(Arc::new(ShellExecutor {
                 timeout_secs: self.timeout_secs,
                 max_output_bytes: self.max_output_bytes,
+                limits: self.limits,
             }))
         } else {
             None
@@ -652,7 +815,10 @@ mod tests {
     use harw_tools::{ToolCall, ToolExecutionContext};
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::fs;
+    use std::path::Path;
+    use std::sync::OnceLock;
     use tempfile::TempDir;
+    use tokio::io::AsyncWriteExt;
 
     // ── Test helpers ───────────────────────────────────────────────────────────
 
@@ -730,6 +896,7 @@ mod tests {
         let executor = ShellExecutor {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            limits: ShellLimits::default(),
         };
 
         for command in ["", " ", "\t\n"] {
@@ -751,6 +918,7 @@ mod tests {
         let executor = ShellExecutor {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            limits: ShellLimits::default(),
         };
         let args = ShellExecArgs {
             command: "echo valid".to_owned(),
@@ -770,6 +938,7 @@ mod tests {
         let executor = ShellExecutor {
             timeout_secs: 5,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            limits: ShellLimits::default(),
         };
         let args = ShellExecArgs {
             command: "echo valid".to_owned(),
@@ -861,37 +1030,108 @@ mod tests {
         );
     }
 
+    // ── Pure Tests ohne Sandbox (W1-03) ────────────────────────────────────────
+
     #[tokio::test]
-    async fn test_exec_echo_returns_stdout() {
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
-        let ctx = make_ctx(sandbox);
-        let call = make_call("echo hello_from_shell");
-
-        let provider = ShellToolProvider::new();
-        let executor = provider
-            .executor(&ToolName::new(TOOL_NAME))
-            .expect("executor must be returned for shell.exec");
-
-        let output = executor
-            .execute(&ctx, &call)
+    async fn test_configure_stdio_sets_stdin_to_dev_null() {
+        if !Path::new("/proc/self/fd/0").exists() || !Path::new("/bin/sh").exists() {
+            eprintln!("übersprungen: /proc oder /bin/sh fehlt, stdin-Ziel nicht beobachtbar");
+            return;
+        }
+        // Absichtlich ohne bwrap: prüft genau die Stream-Konfiguration, die der
+        // Sandbox-Start verwendet.
+        let mut command = TokioCommand::new("/bin/sh");
+        command.args(["-c", "readlink /proc/self/fd/0"]);
+        let mut child = configure_stdio(&mut command)
+            .spawn()
+            .expect("spawn /bin/sh");
+        let mut stdout = child.stdout.take().expect("stdout piped");
+        let mut stderr = child.stderr.take().expect("stderr piped");
+        let mut capture = BoundedCapture::new(4096);
+        let end = capture
+            .drain(&mut stdout, &mut stderr)
             .await
-            .expect("execute must not return Err");
+            .expect("read child output");
+        let status = child.wait().await.expect("wait child");
 
-        match output {
+        assert_eq!(end, DrainEnd::Eof);
+        assert!(status.success(), "readlink must succeed: {status:?}");
+        assert_eq!(String::from_utf8_lossy(capture.stdout()).trim(), "/dev/null");
+    }
+
+    #[test]
+    fn test_completed_output_marks_output_limit_kill_as_truncated() {
+        let executor = ShellExecutor {
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+            max_output_bytes: 16,
+            limits: ShellLimits::default(),
+        };
+        let capture = BoundedCapture::new(16);
+
+        match executor.completed_output(None, &capture, true) {
             ToolOutput::Json { content } => {
-                assert_eq!(content["exit_code"], 0, "echo must exit with 0");
-                let stdout = content["stdout"].as_str().unwrap_or("");
-                assert!(
-                    stdout.contains("hello_from_shell"),
-                    "stdout must contain echoed string, got: {stdout:?}"
-                );
-                assert_eq!(
-                    content["truncated"], false,
-                    "echo output must not be truncated"
-                );
+                assert_eq!(content["exit_code"], -1);
+                assert_eq!(content["truncated"], true);
+                assert_eq!(content["killed_by_output_limit"], true);
             }
             other => panic!("expected Json output, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_timeout_output_keeps_partial_output_within_budget() {
+        let executor = ShellExecutor {
+            timeout_secs: 1,
+            max_output_bytes: 8 + TRUNCATION_MARKER.len(),
+            limits: ShellLimits::default(),
+        };
+        let (mut writer, mut stdout) = tokio::io::duplex(1024);
+        let (_stderr_writer, mut stderr) = tokio::io::duplex(1024);
+        writer
+            .write_all(b"partial-output-longer-than-budget")
+            .await
+            .expect("write");
+        let mut capture = BoundedCapture::new(executor.max_output_bytes);
+        let _ = tokio::time::timeout(
+            Duration::from_millis(50),
+            capture.drain(&mut stdout, &mut stderr),
+        )
+        .await;
+
+        match executor.timeout_output(1, &capture) {
+            ToolOutput::Error { message } => {
+                assert!(message.contains("timed out after 1s"), "{message}");
+                assert!(message.contains("partial-"), "{message}");
+                assert!(message.contains("truncated: true"), "{message}");
+                assert!(!message.contains("longer-than-budget"), "{message}");
+            }
+            other => panic!("expected Error output, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_exec_invalid_limits_fail_closed_before_spawn() {
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let executor = ShellExecutor {
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            limits: ShellLimits {
+                nofile: 0,
+                ..ShellLimits::default()
+            },
+        };
+        let args = ShellExecArgs {
+            command: "echo must_not_run".to_owned(),
+            timeout_secs: None,
+        };
+
+        match executor.run_command(&args, &sandbox).await.expect("run") {
+            ToolOutput::Error { message } => {
+                assert!(message.contains("resource limits"), "{message}");
+                assert!(message.contains("nofile"), "{message}");
+            }
+            other => panic!("invalid limits must not spawn, got: {other:?}"),
         }
     }
 
@@ -924,55 +1164,154 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_exec_timeout() {
+    // ── Sandbox-Integrationstests (brauchen bwrap + prlimit + userns) ─────────
+    //
+    // Jeder Test existiert zweimal: Die normale Variante prüft zur Laufzeit, ob die
+    // Sandbox startbar ist, und kehrt sonst mit Begründung früh zurück. Die
+    // `#[ignore]`-Variante (`cargo test -- --ignored`) verlangt die Umgebung und
+    // schlägt ohne sie fehl.
+
+    /// Startet einmalig `prlimit <Default-Limits> -- bwrap --unshare-all … /bin/true` an den
+    /// festen Pfaden. Scheitert das (kein bwrap/prlimit, userns gesperrt, NPROC zu knapp),
+    /// sind die Integrationstests nicht aussagekräftig.
+    fn sandbox_runtime_available() -> bool {
+        static AVAILABLE: OnceLock<bool> = OnceLock::new();
+        *AVAILABLE.get_or_init(|| {
+            let Ok(launcher) = BwrapLauncher::discover() else {
+                return false;
+            };
+            let Ok(Some(prlimit)) = ShellLimits::default().resolve_prlimit() else {
+                return false;
+            };
+            let mut args = ShellLimits::default().prlimit_args();
+            args.push(launcher.executable().as_os_str().to_owned());
+            args.extend(
+                [
+                    "--die-with-parent",
+                    "--unshare-all",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--",
+                    "/bin/true",
+                ]
+                .map(OsString::from),
+            );
+            std::process::Command::new(prlimit)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        })
+    }
+
+    macro_rules! sandbox_test {
+        ($name:ident, $required:ident, $body:ident) => {
+            #[tokio::test]
+            async fn $name() {
+                if !sandbox_runtime_available() {
+                    eprintln!(
+                        "übersprungen: {}: bwrap/prlimit/userns nicht startbar \
+                         (Pflichtvariante: {} mit --ignored)",
+                        stringify!($name),
+                        stringify!($required)
+                    );
+                    return;
+                }
+                $body().await;
+            }
+
+            #[tokio::test]
+            #[ignore = "requires bwrap+userns"]
+            async fn $required() {
+                assert!(
+                    sandbox_runtime_available(),
+                    "bwrap+prlimit+userns müssen für diesen Test startbar sein"
+                );
+                $body().await;
+            }
+        };
+    }
+
+    async fn run_with(provider: &ShellToolProvider, call: &ToolCall) -> ToolOutput {
         let tmp = make_temp_workspace();
         let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
         let ctx = make_ctx(sandbox);
+        let executor = provider
+            .executor(&ToolName::new(TOOL_NAME))
+            .expect("executor must be returned for shell.exec");
+        executor
+            .execute(&ctx, call)
+            .await
+            .expect("execute must not return Err")
+    }
 
+    async fn echo_returns_stdout() {
+        let output = run_with(&ShellToolProvider::new(), &make_call("echo hello_from_shell")).await;
+
+        match output {
+            ToolOutput::Json { content } => {
+                assert_eq!(content["exit_code"], 0, "echo must exit with 0");
+                let stdout = content["stdout"].as_str().unwrap_or("");
+                assert!(
+                    stdout.contains("hello_from_shell"),
+                    "stdout must contain echoed string, got: {stdout:?}"
+                );
+                assert_eq!(
+                    content["truncated"], false,
+                    "echo output must not be truncated"
+                );
+                assert_eq!(content["killed_by_output_limit"], false);
+            }
+            other => panic!("expected Json output, got: {other:?}"),
+        }
+    }
+    sandbox_test!(
+        test_exec_echo_returns_stdout,
+        test_exec_echo_returns_stdout_required,
+        echo_returns_stdout
+    );
+
+    async fn timeout_reports_error_with_partial_output() {
         // Provider with 1-second timeout; per-call override also 1s
         let provider = ShellToolProvider {
             timeout_secs: 1,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            limits: ShellLimits::default(),
         };
-        let call = make_call_with_timeout("sleep 5", 1);
+        let call = make_call_with_timeout("echo partial_before_timeout; sleep 5", 1);
+        let started = std::time::Instant::now();
 
-        let executor = provider
-            .executor(&ToolName::new(TOOL_NAME))
-            .expect("executor must be returned");
+        let output = run_with(&provider, &call).await;
 
-        let output = executor
-            .execute(&ctx, &call)
-            .await
-            .expect("execute must not return Err on timeout");
-
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "timeout must kill the process tree instead of waiting for sleep"
+        );
         match output {
             ToolOutput::Error { message } => {
                 assert!(
                     message.contains("timed out"),
                     "timeout message must contain 'timed out', got: {message:?}"
                 );
+                assert!(
+                    message.contains("partial_before_timeout"),
+                    "partial output must survive the timeout, got: {message:?}"
+                );
             }
             other => panic!("expected Error output for timeout, got: {other:?}"),
         }
     }
+    sandbox_test!(
+        test_exec_timeout,
+        test_exec_timeout_required,
+        timeout_reports_error_with_partial_output
+    );
 
-    #[tokio::test]
-    async fn test_exec_nonzero_exit() {
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
-        let ctx = make_ctx(sandbox);
-        let call = make_call("false");
-
-        let provider = ShellToolProvider::new();
-        let executor = provider
-            .executor(&ToolName::new(TOOL_NAME))
-            .expect("executor must be returned");
-
-        let output = executor
-            .execute(&ctx, &call)
-            .await
-            .expect("execute must not return Err on nonzero exit");
+    async fn nonzero_exit_is_reported() {
+        let output = run_with(&ShellToolProvider::new(), &make_call("false")).await;
 
         match output {
             ToolOutput::Json { content } => {
@@ -982,23 +1321,14 @@ mod tests {
             other => panic!("expected Json output even for nonzero exit, got: {other:?}"),
         }
     }
+    sandbox_test!(
+        test_exec_nonzero_exit,
+        test_exec_nonzero_exit_required,
+        nonzero_exit_is_reported
+    );
 
-    #[tokio::test]
-    async fn test_exec_stderr_captured() {
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
-        let ctx = make_ctx(sandbox);
-        let call = make_call("echo error_output >&2");
-
-        let provider = ShellToolProvider::new();
-        let executor = provider
-            .executor(&ToolName::new(TOOL_NAME))
-            .expect("executor must be returned");
-
-        let output = executor
-            .execute(&ctx, &call)
-            .await
-            .expect("execute must not return Err");
+    async fn stderr_is_captured() {
+        let output = run_with(&ShellToolProvider::new(), &make_call("echo error_output >&2")).await;
 
         match output {
             ToolOutput::Json { content } => {
@@ -1011,30 +1341,23 @@ mod tests {
             other => panic!("expected Json output, got: {other:?}"),
         }
     }
+    sandbox_test!(
+        test_exec_stderr_captured,
+        test_exec_stderr_captured_required,
+        stderr_is_captured
+    );
 
-    #[tokio::test]
-    async fn test_exec_output_truncation() {
-        let tmp = make_temp_workspace();
-        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
-        let ctx = make_ctx(sandbox);
-
+    async fn small_output_over_cap_is_truncated() {
         // The cap leaves room for a marker plus a truncated stdout prefix.
         let provider = ShellToolProvider {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             max_output_bytes: TRUNCATION_MARKER.len() + 10,
+            limits: ShellLimits::default(),
         };
         // Generate more than the configured output cap.
         let call = make_call("echo 'this_is_a_longer_string_than_ten_bytes'");
-        let executor = provider
-            .executor(&ToolName::new(TOOL_NAME))
-            .expect("executor must be returned");
 
-        let output = executor
-            .execute(&ctx, &call)
-            .await
-            .expect("execute must not return Err");
-
-        match output {
+        match run_with(&provider, &call).await {
             ToolOutput::Json { content } => {
                 assert_eq!(
                     content["truncated"], true,
@@ -1049,4 +1372,105 @@ mod tests {
             other => panic!("expected Json output, got: {other:?}"),
         }
     }
+    sandbox_test!(
+        test_exec_output_truncation,
+        test_exec_output_truncation_required,
+        small_output_over_cap_is_truncated
+    );
+
+    async fn endless_output_is_capped_and_killed() {
+        let provider = ShellToolProvider {
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+            max_output_bytes: 1024,
+            limits: ShellLimits::default(),
+        };
+        let started = std::time::Instant::now();
+
+        let output = run_with(&provider, &make_call("yes")).await;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(DEFAULT_TIMEOUT_SECS / 2),
+            "output overflow must kill the process instead of running into the timeout"
+        );
+        match output {
+            ToolOutput::Json { content } => {
+                assert_eq!(content["truncated"], true);
+                assert_eq!(content["killed_by_output_limit"], true);
+                let stdout = content["stdout"].as_str().unwrap_or("");
+                let stderr = content["stderr"].as_str().unwrap_or("");
+                assert!(stdout.len() + stderr.len() <= 1024, "budget must hold");
+                assert!(stdout.starts_with("y\ny\n"), "got: {stdout:?}");
+            }
+            other => panic!("expected Json output, got: {other:?}"),
+        }
+    }
+    sandbox_test!(
+        test_exec_endless_output_is_capped_and_killed,
+        test_exec_endless_output_is_capped_and_killed_required,
+        endless_output_is_capped_and_killed
+    );
+
+    async fn stdin_is_closed_inside_sandbox() {
+        let provider = ShellToolProvider {
+            timeout_secs: 10,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            limits: ShellLimits::default(),
+        };
+        // Mit geerbtem Terminal-stdin würde `cat` bis zum Timeout blockieren.
+        let call = make_call("cat; echo stdin_reached_eof");
+
+        match run_with(&provider, &call).await {
+            ToolOutput::Json { content } => {
+                assert_eq!(content["exit_code"], 0);
+                let stdout = content["stdout"].as_str().unwrap_or("");
+                assert_eq!(stdout.trim(), "stdin_reached_eof");
+            }
+            other => panic!("expected Json output, got: {other:?}"),
+        }
+    }
+    sandbox_test!(
+        test_exec_stdin_is_closed,
+        test_exec_stdin_is_closed_required,
+        stdin_is_closed_inside_sandbox
+    );
+
+    async fn rlimits_and_tmpfs_size_apply_inside_sandbox() {
+        let call = make_call("cat /proc/self/limits; df -B1 /tmp");
+
+        match run_with(&ShellToolProvider::new(), &call).await {
+            ToolOutput::Json { content } => {
+                assert_eq!(content["exit_code"], 0, "{content}");
+                let stdout = content["stdout"].as_str().unwrap_or("");
+                let expected = [
+                    ("Max cpu time", "60"),
+                    ("Max file size", "268435456"),
+                    ("Max processes", "4096"),
+                    ("Max open files", "256"),
+                    ("Max address space", "2147483648"),
+                ];
+                for (label, value) in expected {
+                    let line = stdout
+                        .lines()
+                        .find(|line| line.starts_with(label))
+                        .unwrap_or_else(|| panic!("missing limit line {label}: {stdout}"));
+                    let fields: Vec<&str> = line[label.len()..].split_whitespace().collect();
+                    assert_eq!(fields[..2], [value, value], "soft=hard for {label}: {line}");
+                }
+                let tmpfs = stdout
+                    .lines()
+                    .find(|line| line.trim_end().ends_with("/tmp"))
+                    .unwrap_or_else(|| panic!("missing df line for /tmp: {stdout}"));
+                assert!(
+                    tmpfs.split_whitespace().nth(1) == Some("268435456"),
+                    "tmpfs /tmp must be limited to 256 MiB: {tmpfs}"
+                );
+            }
+            other => panic!("expected Json output, got: {other:?}"),
+        }
+    }
+    sandbox_test!(
+        test_exec_rlimits_and_tmpfs_size_apply,
+        test_exec_rlimits_and_tmpfs_size_apply_required,
+        rlimits_and_tmpfs_size_apply_inside_sandbox
+    );
 }

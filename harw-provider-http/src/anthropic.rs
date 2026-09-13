@@ -40,6 +40,10 @@ pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 pub const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
 /// Standard-Basis eines direkten Anthropic-Providers.
 pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+/// Offizieller Host der Anthropic-API (Host von [`DEFAULT_ANTHROPIC_BASE_URL`]).
+/// Nur an diesen Host gehen implizite Umgebungs-Credentials
+/// (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`).
+pub(crate) const ANTHROPIC_API_HOST: &str = "api.anthropic.com";
 /// Default-Ausgabe-Token-Obergrenze, falls die Anfrage keine vorgibt.
 pub const DEFAULT_MAX_TOKENS: u32 = 4096;
 
@@ -100,7 +104,7 @@ impl AnthropicMessagesProvider {
         credential: AnthropicCredential,
     ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: super::http_client(),
             messages_url: messages_url.into(),
             provider_id: "anthropic".to_owned(),
             model: model.into(),
@@ -588,6 +592,28 @@ pub fn extract_anthropic_usage(body: &Value) -> TokenUsage {
     }
 }
 
+/// Setzt die Auth-Header des Credentials; alle Credential-Werte sind als
+/// sensitiv markiert (`x-api-key` und OAuth-`authorization` über
+/// [`super::sensitive_header_value`], `bearer_auth` in reqwest selbst).
+fn apply_anthropic_credential(
+    builder: reqwest::RequestBuilder,
+    credential: &AnthropicCredential,
+) -> Result<reqwest::RequestBuilder, ModelError> {
+    Ok(match credential {
+        AnthropicCredential::ApiKey(secret) => builder.header(
+            "x-api-key",
+            super::sensitive_header_value(secret.expose_secret())?,
+        ),
+        AnthropicCredential::Bearer(secret) => builder.bearer_auth(secret.expose_secret()),
+        AnthropicCredential::OAuth(secret) => builder
+            .header(
+                "authorization",
+                super::sensitive_header_value(&format!("Bearer {}", secret.expose_secret()))?,
+            )
+            .header("anthropic-beta", ANTHROPIC_OAUTH_BETA),
+    })
+}
+
 impl ModelProvider for AnthropicMessagesProvider {
     fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
         Box::pin(async move {
@@ -611,18 +637,7 @@ impl ModelProvider for AnthropicMessagesProvider {
                 anthropic_custom_headers()?
             };
 
-            builder = match &self.credential {
-                AnthropicCredential::ApiKey(secret) => {
-                    builder.header("x-api-key", secret.expose_secret())
-                }
-                AnthropicCredential::Bearer(secret) => builder.bearer_auth(secret.expose_secret()),
-                AnthropicCredential::OAuth(secret) => builder
-                    .header(
-                        "authorization",
-                        format!("Bearer {}", secret.expose_secret()),
-                    )
-                    .header("anthropic-beta", ANTHROPIC_OAUTH_BETA),
-            };
+            builder = apply_anthropic_credential(builder, &self.credential)?;
             if let Some(custom_headers) = custom_headers {
                 for (name, value) in custom_headers {
                     builder = builder.header(name, value);
@@ -1570,6 +1585,45 @@ mod tests {
                 .arguments
                 .as_object()
                 .is_some_and(|object| object.is_empty())
+        );
+    }
+
+    #[test]
+    fn anthropic_credential_headers_are_marked_sensitive() {
+        let secret = "sk-ant-sensitive-header-value";
+        for (credential, header_name) in [
+            (
+                AnthropicCredential::ApiKey(SecretString::new(secret.into())),
+                "x-api-key",
+            ),
+            (
+                AnthropicCredential::OAuth(SecretString::new(secret.into())),
+                "authorization",
+            ),
+            (
+                AnthropicCredential::Bearer(SecretString::new(secret.into())),
+                "authorization",
+            ),
+        ] {
+            let builder =
+                super::super::http_client().post("https://api.anthropic.com/v1/messages");
+            let request = apply_anthropic_credential(builder, &credential)
+                .expect("credential header")
+                .build()
+                .expect("request builds");
+            let value = request.headers().get(header_name).expect(header_name);
+            assert!(value.is_sensitive(), "{header_name}");
+            assert!(!format!("{:?}", request.headers()).contains(secret));
+        }
+    }
+
+    #[test]
+    fn official_anthropic_host_matches_default_base_url() {
+        assert_eq!(
+            reqwest::Url::parse(DEFAULT_ANTHROPIC_BASE_URL)
+                .expect("default base URL")
+                .host_str(),
+            Some(ANTHROPIC_API_HOST)
         );
     }
 }
