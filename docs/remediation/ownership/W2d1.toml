@@ -1,0 +1,13 @@
+# W2d-1 neu geschnitten: Welle A = neue Adapter-Dateien (je 1 Agent), Welle B = Konsumenten (je 1 Datei), Welle C = job_worker Scope
+[A1]
+files = ["harw-cli/src/runtime_entry.rs"]
+[A2]
+files = ["harw-cli/src/runtime_web.rs"]
+[A3]
+files = ["harw-cli/src/runtime_jobs.rs"]
+[A4]
+files = ["harw-cli/src/runtime_gateway.rs"]
+[A5]
+files = ["harw-tui/src/runtime_commands.rs"]
+[ORCH]
+files = ["harw-cli/src/main.rs#mod-lines", "harw-tui/src/lib.rs#mod-line", "docs/remediation/AGENT-BRIEF.md", "docs/remediation/CONTRACTS-W2d1.md"]

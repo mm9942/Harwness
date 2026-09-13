@@ -24,6 +24,7 @@ mod input;
 pub(crate) mod input_editor;
 pub(crate) mod input_reader;
 mod registry;
+pub(crate) mod runtime_commands;
 pub(crate) mod sanitize;
 pub mod session_controller;
 pub mod setup;
