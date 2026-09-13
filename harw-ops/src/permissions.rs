@@ -8,10 +8,34 @@
 //! Rückfrage tun darf. `set` schaltet zwischen den drei Stufen aus
 //! [`harw_extension_api::ApprovalMode`] um. Der Modus verschiebt nur, wer
 //! entscheidet — er verschiebt nie die Sandbox-Grenze selbst.
+//!
+//! # Woher der Modus kommt
+//! Die Operation besitzt keinen eigenen Zustand. Sie liest und schreibt
+//! ausschließlich die [`ApprovalModeCell`], die eine Kompositionswurzel unter
+//! ihrem Typ in die [`ServiceMap`](harw_operations::context::ServiceMap) des
+//! [`OpContext`] gelegt hat. Diese Zelle gehört zur Sitzung (und ihren
+//! Kind-Sitzungen, die denselben Klon teilen) — **nicht** dem Prozess: `set
+//! full` wirkt deshalb nur für diese Session, nie für andere Sitzungen oder
+//! Job-Worker im selben Prozess. Fehlt die Zelle in der `ServiceMap` (eine
+//! Laufzeit hat sie nicht registriert), liefert die Operation
+//! [`OpError::NotAvailable`] — nie einen stillen Ersatzwert.
 
 use harw_extension_api::ApprovalMode;
+use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_macros::operation;
 use harw_operations::{OpContext, OpError, OpOutput};
+
+// ── Konstanten ───────────────────────────────────────────────────────────────
+
+/// Meldung für den Fall, dass keine [`ApprovalModeCell`] registriert ist.
+///
+/// Das ist kein Fehler der Operation, sondern eine unvollständige
+/// Zusammenstellung der Laufzeit: ohne Zelle gibt es keinen Freigabemodus zu
+/// lesen oder zu setzen. Die Antwort sagt das, statt einen Modus zu behaupten.
+pub(crate) const NO_APPROVAL_MODE_CELL: &str =
+    "In dieser Laufzeit ist keine ApprovalModeCell registriert — der Freigabemodus \
+     kann weder gelesen noch gewechselt werden. Die Oberfläche muss eine \
+     `ApprovalModeCell` in die ServiceMap legen.";
 
 /// Argumente für `/permissions`.
 ///
@@ -52,7 +76,7 @@ async fn permissions(ctx: &OpContext, args: PermissionsArgs) -> Result<OpOutput,
     let sub = args.cmd.as_deref().unwrap_or("show");
     match sub {
         "show" => {}
-        "set" => return set_mode(args.mode.as_deref()),
+        "set" => return set_mode(ctx, args.mode.as_deref()),
         other => {
             return Err(OpError::NotAvailable(format!(
                 "/permissions {other}: nur `show` und `set <{}>` sind verfügbar; die Sandbox-Rechte selbst sind unveränderlich",
@@ -74,7 +98,10 @@ async fn permissions(ctx: &OpContext, args: PermissionsArgs) -> Result<OpOutput,
         permissions.join("\n")
     };
 
-    let active = harw_extension_api::approval_mode::current();
+    let Some(cell) = ctx.service::<ApprovalModeCell>() else {
+        return Err(OpError::NotAvailable(NO_APPROVAL_MODE_CELL.to_owned()));
+    };
+    let active = cell.get();
     let modes = ApprovalMode::ALL
         .iter()
         .map(|mode| {
@@ -100,14 +127,18 @@ async fn permissions(ctx: &OpContext, args: PermissionsArgs) -> Result<OpOutput,
 /// # Description
 /// Der Modus gilt ab dem nächsten Werkzeugaufruf, auch mitten in einem
 /// laufenden Turn. Er verschiebt ausschließlich, wer über einen Aufruf
-/// entscheidet; die Sandbox-Rechte bleiben, wie sie sind.
+/// entscheidet; die Sandbox-Rechte bleiben, wie sie sind. Geschrieben wird
+/// ausschließlich die [`ApprovalModeCell`] dieser Sitzung — `set full` wirkt
+/// damit nur für diese Session, nie prozessweit.
 ///
 /// # Arguments
+/// - `ctx` (`&OpContext`): liefert die `ServiceMap` mit der `ApprovalModeCell`.
 /// - `requested` (`Option<&str>`): der gewünschte Modusname.
 ///
 /// # Errors
 /// - [`OpError::InvalidArguments`]: kein oder ein unbekannter Name.
-fn set_mode(requested: Option<&str>) -> Result<OpOutput, OpError> {
+/// - [`OpError::NotAvailable`]: keine `ApprovalModeCell` registriert.
+fn set_mode(ctx: &OpContext, requested: Option<&str>) -> Result<OpOutput, OpError> {
     let Some(requested) = requested.map(str::trim).filter(|name| !name.is_empty()) else {
         return Err(OpError::InvalidArguments(format!(
             "/permissions set braucht einen Modus: {}",
@@ -120,10 +151,13 @@ fn set_mode(requested: Option<&str>) -> Result<OpOutput, OpError> {
             mode_names()
         )));
     };
-    harw_extension_api::approval_mode::set(mode);
+    let Some(cell) = ctx.service::<ApprovalModeCell>() else {
+        return Err(OpError::NotAvailable(NO_APPROVAL_MODE_CELL.to_owned()));
+    };
+    cell.set(mode);
     Ok(OpOutput {
         text: format!(
-            "Freigabemodus: {} — {}. Gilt ab dem nächsten Werkzeugaufruf.",
+            "Freigabemodus: {} — {}. Gilt ab dem nächsten Werkzeugaufruf (nur für diese Sitzung).",
             mode.as_str(),
             mode.description()
         ),
@@ -141,7 +175,7 @@ fn mode_names() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{PermissionsArgs, permissions};
+    use super::{ApprovalModeCell, PermissionsArgs, permissions};
     use crate::testutil::toks;
     use harw_extension_api::ApprovalMode;
     use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
@@ -150,13 +184,17 @@ mod tests {
     };
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    // Every test that reads or changes the process-wide mode shares this lock.
-    // Restoring the default alone does not prevent concurrent assertions racing.
-    static MODE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
+    /// Baut einen [`OpContext`] mit leerer [`ServiceMap`] — keine
+    /// `ApprovalModeCell` registriert. Jeder Test bekommt eine eigene
+    /// Workspace-Wurzel (statt eines globalen Zustands), damit Tests parallel
+    /// laufen können, ohne sich gegenseitig zu stören.
     fn test_context() -> OpContext {
-        let root = std::env::temp_dir().join("harw-permissions-test");
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("harw-permissions-test-{}-{id}", std::process::id()));
         std::fs::create_dir_all(root.join("workspace")).expect("create test workspace");
         let registry = WorkspaceRegistry::build(
             &root,
@@ -184,6 +222,49 @@ mod tests {
         )
     }
 
+    /// Wie [`test_context`], aber mit einer eigenen [`ApprovalModeCell`]
+    /// (Startwert `mode`) in der `ServiceMap`. Jeder Test, der eine Cell
+    /// braucht, bekommt seine eigene — kein geteilter, globaler Zustand.
+    fn test_context_with_mode(mode: ApprovalMode) -> (OpContext, ApprovalModeCell) {
+        let root = {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!(
+                "harw-permissions-test-cell-{}-{id}",
+                std::process::id()
+            ))
+        };
+        std::fs::create_dir_all(root.join("workspace")).expect("create test workspace");
+        let registry = WorkspaceRegistry::build(
+            &root,
+            [WorkspaceRegistration {
+                tenant: TenantId::from_str("test-tenant"),
+                workspace: WorkspaceId::from_str("workspace"),
+                root: PathBuf::from("workspace"),
+            }],
+        )
+        .expect("build workspace registry");
+        let binding = registry
+            .resolve(
+                &TenantId::from_str("test-tenant"),
+                &WorkspaceId::from_str("workspace"),
+            )
+            .expect("resolve workspace binding");
+        let cell = ApprovalModeCell::new(mode);
+        let mut services = ServiceMap::new();
+        services.insert(cell.clone());
+        let ctx = OpContext::new(
+            SessionId::new(),
+            TurnId::new(),
+            SandboxSpec::from_resolved(
+                binding,
+                PermissionSet::from_policy([Permission::WriteWorkspace, Permission::ReadWorkspace]),
+            ),
+            services,
+        );
+        (ctx, cell)
+    }
+
     #[test]
     fn test_permissions_args_from_raw_args_sets_cmd() {
         let args = PermissionsArgs::from_raw_args(&toks(&["show"]));
@@ -204,11 +285,7 @@ mod tests {
 
     #[tokio::test]
     async fn permissions_show_and_default_render_deterministically() {
-        let _guard = MODE_TEST_LOCK.lock().await;
-        let ctx = test_context();
-        // Der Freigabemodus ist prozessweit; dieser Test setzt ihn nicht und
-        // erwartet deshalb die Voreinstellung als aktive Stufe.
-        harw_extension_api::approval_mode::set(ApprovalMode::Delegated);
+        let (ctx, _cell) = test_context_with_mode(ApprovalMode::Delegated);
         let expected = format!(
             "Workspace: workspace\nTenant: test-tenant\nRoot: {}\nGranted permissions:\n- ReadWorkspace\n- WriteWorkspace\n\nFreigabemodus (* = aktiv):\n  ask — {}\n* auto — {}\n  full — {}\n\nUmschalten mit `/permissions set <ask|auto|full>`.",
             ctx.sandbox().workspace().canonical_root().display(),
@@ -235,6 +312,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn permissions_show_without_a_cell_is_not_available() {
+        let ctx = test_context();
+
+        let result = permissions(&ctx, PermissionsArgs::default()).await;
+
+        match result {
+            Err(OpError::NotAvailable(message)) => {
+                assert!(message.contains("ApprovalModeCell"));
+            }
+            other => panic!("expected NotAvailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn permissions_rejects_capability_mutation() {
         let ctx = test_context();
         let result = permissions(
@@ -255,14 +346,10 @@ mod tests {
         }
     }
 
-    // Der Freigabemodus ist ein prozessweiter Schalter
-    // (`harw_extension_api::approval_mode`). Dieser eine Test stellt am Ende
-    // ausdrücklich `Delegated` wieder her, damit andere Tests im selben
-    // Binary den Startwert vorfinden.
     #[tokio::test]
-    async fn permissions_set_full_switches_the_mode_and_reports_it() {
-        let _guard = MODE_TEST_LOCK.lock().await;
-        let ctx = test_context();
+    async fn permissions_set_full_switches_only_this_cell_and_reports_it() {
+        let (ctx, cell) = test_context_with_mode(ApprovalMode::Delegated);
+        let other_cell = ApprovalModeCell::new(ApprovalMode::Delegated);
 
         let result = permissions(
             &ctx,
@@ -276,15 +363,34 @@ mod tests {
         match result {
             Ok(output) => {
                 assert!(output.text.contains("full"));
-                assert_eq!(
-                    harw_extension_api::approval_mode::current(),
-                    ApprovalMode::FullAccess
-                );
+                assert_eq!(cell.get(), ApprovalMode::FullAccess);
+                // Eine unabhängige Zelle bleibt unberührt — `set` wirkt nur
+                // auf die Cell dieser Session, nicht prozessweit.
+                assert_eq!(other_cell.get(), ApprovalMode::Delegated);
             }
             Err(e) => panic!("Unexpected error: {e}"),
         }
+    }
 
-        harw_extension_api::approval_mode::set(ApprovalMode::Delegated);
+    #[tokio::test]
+    async fn permissions_set_without_a_cell_is_not_available() {
+        let ctx = test_context();
+
+        let result = permissions(
+            &ctx,
+            PermissionsArgs {
+                cmd: Some("set".to_owned()),
+                mode: Some("full".to_owned()),
+            },
+        )
+        .await;
+
+        match result {
+            Err(OpError::NotAvailable(message)) => {
+                assert!(message.contains("ApprovalModeCell"));
+            }
+            other => panic!("expected NotAvailable, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -331,10 +437,8 @@ mod tests {
 
     #[tokio::test]
     async fn permissions_show_lists_all_modes_and_marks_the_active_one() {
-        let _guard = MODE_TEST_LOCK.lock().await;
-        let ctx = test_context();
+        let (ctx, _cell) = test_context_with_mode(ApprovalMode::AlwaysAsk);
 
-        harw_extension_api::approval_mode::set(ApprovalMode::AlwaysAsk);
         let output = permissions(&ctx, PermissionsArgs::default())
             .await
             .expect("show");
@@ -346,7 +450,5 @@ mod tests {
             );
         }
         assert!(output.text.contains("* ask"));
-
-        harw_extension_api::approval_mode::set(ApprovalMode::Delegated);
     }
 }

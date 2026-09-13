@@ -11,12 +11,14 @@
 //! - [`InteractionMode`] — `Chat` | `Plan` | `Explore` | `Work`
 //!
 //! # Autoritätsmodell
-//! Die Permission-Obergrenze eines Modus ist **monoton**: sie wird mit der
-//! bereits bestehenden Sandbox geschnitten
-//! ([`harw_sandbox::SandboxSpec::restrict`]) und kann deshalb nie etwas
-//! hinzufügen, das die Session vorher nicht hatte. Ein Wechsel von `Explore`
-//! zurück nach `Work` stellt entzogene Permissions daher **nicht** wieder her —
-//! das ist beabsichtigt und der Grund, warum der Modus als Grenze taugt.
+//! Die Permission-Obergrenze eines Modus ist **monoton**: sie wird stets mit
+//! der Basis-Sandbox der Session geschnitten
+//! ([`harw_sandbox::SandboxSpec::restrict`],
+//! [`crate::session::AgentSession::set_mode`]), nie mit dem gerade aktuellen,
+//! bereits verengten Wert — der Schnitt ist deshalb nie kumulativ. Ein Wechsel
+//! von `Explore` zurück nach `Work` stellt entzogene Permissions daher bis zur
+//! Basis **wieder her**; er kann nie mehr freigeben, als die Basis je hatte.
+//! Das ist beabsichtigt und der Grund, warum der Modus als Grenze taugt.
 //!
 //! # Nebenläufigkeit
 //! [`InteractionMode`] ist ein `Copy`-Enum ohne innere Veränderlichkeit:

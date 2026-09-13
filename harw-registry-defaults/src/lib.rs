@@ -22,7 +22,10 @@
 //! # Key types
 //! - [`AssembledRegistry`]: registry + discovered project context + identity.
 //! - [`assemble_default_registry`]: builds the `Full` profile from a given `cwd`.
-//! - [`profile::assemble_registry`]: builds any profile.
+//! - [`profile::assemble_registry`]: builds any profile (runs discovery once).
+//! - [`profile::assemble_registry_for_project`]: builds any profile über einem
+//!   **bereits** erkannten Projektkontext — der Weg, auf dem eine Sitzung ihre
+//!   Kind-Registries montiert, ohne die Projekterkennung je Kind zu wiederholen.
 //! - [`embedded_agents`]: die eingebauten Agentendefinitionen als TOML und IR.
 //!
 //! # Feature `browser`
@@ -47,6 +50,7 @@ pub mod profile;
 
 use std::path::PathBuf;
 
+use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_extension_api::{
     ApprovalDecision, ApprovalHandler, ApprovalMode, ExtFuture, ExtensionRegistry, ToolCall,
 };
@@ -56,7 +60,7 @@ use harw_project_discovery::ProjectContext;
 pub use error::{RegistryDefaultsError, RegistryDefaultsResult};
 pub use profile::{
     IdentityOverrides, RegistryProfile, RestrictedToolProvider, assemble_registry,
-    profile_for_role, role_names,
+    assemble_registry_for_project, profile_for_role, role_names,
 };
 
 /// Die Werkzeuge, die ohne Nutzerrückfrage ausgeführt werden dürfen.
@@ -146,10 +150,53 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
 /// `shell.exec`, and any future tool registered by default, requires an
 /// explicit approval decision. This default is deliberately fail-closed so
 /// adding a tool cannot silently widen agent authority.
-#[derive(Debug, Default)]
-pub struct DefaultApprovalPolicy;
+///
+/// # Woher der Freigabemodus kommt
+/// Die Politik trägt ihre [`ApprovalModeCell`] selbst (G-009): Es gibt keinen
+/// prozessweiten Modus mehr, den Root, Kinder und Job-Worker gemeinsam sähen.
+/// Wer eine Sitzung zusammenbaut, entscheidet mit der übergebenen Zelle, wer
+/// den Modus mit wem teilt — ein Klon teilt ihn, [`ApprovalModeCell::detached`]
+/// löst ihn. Die Zelle wird bei **jedem** [`ApprovalHandler::review`] frisch
+/// gelesen, damit eine Umschaltung sofort und nicht erst im nächsten Turn wirkt.
+#[derive(Debug)]
+pub struct DefaultApprovalPolicy {
+    /// Der Freigabemodus dieser Politik; geteilt mit jedem Klon der Zelle.
+    mode: ApprovalModeCell,
+}
+
+impl Default for DefaultApprovalPolicy {
+    /// Erzeugt eine Politik mit einer **eigenen**, nicht geteilten Zelle auf
+    /// [`ApprovalMode::Delegated`].
+    ///
+    /// # Beschreibung
+    /// Das ist kein stiller Rückfall auf mehr Rechte: `Delegated` ist die
+    /// engste Stufe, die harw ohne jede Einstellung fährt (`AlwaysAsk` fragt
+    /// mehr, `FullAccess` fragt nichts). Wer den Modus zur Laufzeit umschalten
+    /// können muss, darf diesen Konstruktor **nicht** benutzen, sondern
+    /// [`DefaultApprovalPolicy::new`] mit der Zelle der Sitzung — eine hier
+    /// erzeugte Zelle hat außerhalb dieser Politik keinen Besitzer mehr.
+    fn default() -> Self {
+        Self::new(ApprovalModeCell::default())
+    }
+}
 
 impl DefaultApprovalPolicy {
+    /// Erzeugt die Politik über der Freigabemodus-Zelle `mode`.
+    ///
+    /// # Arguments
+    /// - `mode` ([`ApprovalModeCell`]): die Zelle, aus der jeder
+    ///   [`ApprovalHandler::review`] den aktuellen Modus liest. Ein Klon
+    ///   derselben Zelle beim Aufrufer bleibt der Schalter, mit dem sich der
+    ///   Modus der Sitzung umstellen lässt.
+    ///
+    /// # Returns
+    /// Die Politik; sie hält nur einen Zeiger auf die Zelle, keine Kopie des
+    /// Modus.
+    #[must_use]
+    pub fn new(mode: ApprovalModeCell) -> Self {
+        Self { mode }
+    }
+
     /// Returns whether `call` must be explicitly approved before dispatch.
     ///
     /// # Arguments
@@ -164,8 +211,8 @@ impl DefaultApprovalPolicy {
 }
 
 impl ApprovalHandler for DefaultApprovalPolicy {
-    /// Entscheidet anhand des aktiven Freigabemodus
-    /// ([`harw_extension_api::approval_mode`]).
+    /// Entscheidet anhand des Freigabemodus in der eigenen
+    /// [`ApprovalModeCell`].
     ///
     /// # Description
     /// - [`ApprovalMode::AlwaysAsk`]: jeder Aufruf wird bestätigt, auch ein
@@ -177,7 +224,7 @@ impl ApprovalHandler for DefaultApprovalPolicy {
     /// Der Modus wird bei **jedem** Aufruf frisch gelesen, damit eine
     /// Umschaltung sofort greift und nicht erst im nächsten Turn.
     fn review<'a>(&'a self, call: &'a ToolCall) -> ExtFuture<'a, ApprovalDecision> {
-        let requires_approval = match harw_extension_api::approval_mode::current() {
+        let requires_approval = match self.mode.get() {
             ApprovalMode::AlwaysAsk => true,
             ApprovalMode::Delegated => Self::requires_explicit_approval(call),
             ApprovalMode::FullAccess => false,
@@ -441,49 +488,144 @@ mod tests {
         }
     }
 
-    // Der Freigabemodus ist ein prozessweiter Schalter
-    // (`harw_extension_api::approval_mode`). Dieser eine Test bündelt alle
-    // drei Stufen und stellt am Ende ausdrücklich `Delegated` wieder her,
-    // damit andere Tests im selben Binary den Startwert vorfinden.
-    #[test]
-    fn review_reads_the_active_approval_mode_on_every_call() {
-        use harw_extension_api::approval_mode;
+    // Der Freigabemodus lebt seit G-009 in einer `ApprovalModeCell` statt in
+    // einem prozessweiten Static. Jeder der folgenden Tests baut sich deshalb
+    // seine eigene Zelle: Sie teilen keinen Zustand, brauchen keine
+    // Wiederherstellung am Ende und können in beliebiger Reihenfolge parallel
+    // laufen.
 
-        let policy = DefaultApprovalPolicy;
-        let read_only = call("fs.read");
+    #[test]
+    fn review_in_always_ask_mode_asks_even_for_read_only_tools() {
+        let policy = DefaultApprovalPolicy::new(ApprovalModeCell::new(ApprovalMode::AlwaysAsk));
+
+        assert!(matches!(
+            block_on(policy.review(&call("fs.read"))),
+            ApprovalDecision::AskUser(_)
+        ));
+        assert!(matches!(
+            block_on(policy.review(&call("shell.exec"))),
+            ApprovalDecision::AskUser(_)
+        ));
+    }
+
+    #[test]
+    fn review_in_delegated_mode_allows_only_the_allowlist() {
+        let policy = DefaultApprovalPolicy::new(ApprovalModeCell::new(ApprovalMode::Delegated));
+
+        assert!(matches!(
+            block_on(policy.review(&call("fs.read"))),
+            ApprovalDecision::Allow
+        ));
+        assert!(matches!(
+            block_on(policy.review(&call("shell.exec"))),
+            ApprovalDecision::AskUser(_)
+        ));
+    }
+
+    #[test]
+    fn review_in_full_access_mode_allows_everything() {
+        let policy = DefaultApprovalPolicy::new(ApprovalModeCell::new(ApprovalMode::FullAccess));
+
+        assert!(matches!(
+            block_on(policy.review(&call("fs.read"))),
+            ApprovalDecision::Allow
+        ));
+        assert!(matches!(
+            block_on(policy.review(&call("shell.exec"))),
+            ApprovalDecision::Allow
+        ));
+    }
+
+    /// Die Zusage „der Modus wird bei jedem Aufruf frisch gelesen“: Ein
+    /// `set` auf einem Klon der Zelle wirkt auf die bereits gebaute Politik,
+    /// ohne dass sie neu montiert werden müsste.
+    #[test]
+    fn review_reads_the_mode_cell_on_every_call() {
+        let cell = ApprovalModeCell::new(ApprovalMode::Delegated);
+        let policy = DefaultApprovalPolicy::new(cell.clone());
         let mutating = call("shell.exec");
 
-        approval_mode::set(ApprovalMode::AlwaysAsk);
-        assert!(matches!(
-            block_on(policy.review(&read_only)),
-            ApprovalDecision::AskUser(_)
-        ));
         assert!(matches!(
             block_on(policy.review(&mutating)),
             ApprovalDecision::AskUser(_)
         ));
 
-        approval_mode::set(ApprovalMode::Delegated);
+        cell.set(ApprovalMode::FullAccess);
+        assert!(
+            matches!(block_on(policy.review(&mutating)), ApprovalDecision::Allow),
+            "die Umschaltung muss sofort wirken, nicht erst im nächsten Turn"
+        );
+
+        cell.set(ApprovalMode::AlwaysAsk);
         assert!(matches!(
-            block_on(policy.review(&read_only)),
-            ApprovalDecision::Allow
-        ));
-        assert!(matches!(
-            block_on(policy.review(&mutating)),
+            block_on(policy.review(&call("fs.read"))),
             ApprovalDecision::AskUser(_)
         ));
+    }
 
-        approval_mode::set(ApprovalMode::FullAccess);
+    /// Eine Politik mit eigener Zelle darf von der Zelle einer anderen nichts
+    /// mitbekommen — der eigentliche Grund, warum der prozessweite Schalter
+    /// weg musste (G-009): Ein Kind im Modus `FullAccess` hätte sonst den
+    /// Root-Modus mitverändert und umgekehrt.
+    #[test]
+    fn two_policies_with_separate_cells_do_not_influence_each_other() {
+        let root_cell = ApprovalModeCell::new(ApprovalMode::Delegated);
+        let child_cell = ApprovalModeCell::new(ApprovalMode::Delegated);
+        let root = DefaultApprovalPolicy::new(root_cell.clone());
+        let child = DefaultApprovalPolicy::new(child_cell);
+
+        root_cell.set(ApprovalMode::FullAccess);
+
         assert!(matches!(
-            block_on(policy.review(&read_only)),
+            block_on(root.review(&call("shell.exec"))),
             ApprovalDecision::Allow
         ));
         assert!(matches!(
-            block_on(policy.review(&mutating)),
-            ApprovalDecision::Allow
+            block_on(child.review(&call("shell.exec"))),
+            ApprovalDecision::AskUser(_)
         ));
+    }
 
-        approval_mode::set(ApprovalMode::Delegated);
+    /// Die zusammengebaute Registry muss genau die übergebene Zelle tragen —
+    /// sonst wäre das Durchreichen durch [`assemble_registry_for_project`]
+    /// wirkungslos.
+    #[test]
+    fn assembled_registry_uses_the_approval_mode_cell_it_was_given() {
+        use harw_project_discovery::{DiscoveryConfig, discover_project};
+
+        let cwd = std::env::current_dir().expect("cwd");
+        let project =
+            discover_project(&cwd, &DiscoveryConfig::default()).expect("Discovery im Workspace");
+
+        let cell = ApprovalModeCell::new(ApprovalMode::AlwaysAsk);
+        let assembled = assemble_registry_for_project(
+            RegistryProfile::ReadOnlyExplore,
+            &project,
+            IdentityOverrides::default(),
+            cell.clone(),
+        )
+        .expect("assemble");
+
+        let handlers = assembled.registry.approval_handlers();
+        assert_eq!(handlers.len(), 1);
+        let handler = &handlers[0];
+
+        assert!(
+            matches!(
+                block_on(handler.review(&call("fs.read"))),
+                ApprovalDecision::AskUser(_)
+            ),
+            "die Registry muss den Modus der übergebenen Zelle sehen"
+        );
+
+        cell.set(ApprovalMode::FullAccess);
+        assert!(
+            matches!(
+                block_on(handler.review(&call("fs.read"))),
+                ApprovalDecision::Allow
+            ),
+            "ein `set` auf der übergebenen Zelle muss die montierte Registry erreichen"
+        );
     }
 
     #[test]

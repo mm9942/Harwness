@@ -19,6 +19,7 @@
 //!   Pause-Sperre (`allow_pause`) stammen dann aus der Definition.
 
 use crate::ModelProvider;
+use crate::activation::SessionActivation;
 use crate::session::SpawnContext;
 use crate::session_manager::SessionManager;
 use crate::state_store::StateStore;
@@ -47,6 +48,25 @@ use uuid::Uuid;
 /// Meldungstext für ein Geschwisterkind, das von [`JoinSemantics::AnyTerminal`]
 /// abgebrochen wurde, weil ein anderes Kind zuerst fertig war.
 const CANCELLED_BY_SIBLING: &str = "cancelled: sibling completed first";
+
+/// Das Effort-Level, auf das ein Kind geklammert wird, wenn der Elternteil
+/// selbst keines gesetzt hat.
+///
+/// # Beschreibung
+/// F-017/E3b. Ein fehlendes Eltern-Level (`None`) heißt **nicht** „unbegrenzt":
+/// ohne diesen Deckel hob ein `None` beim Elternteil auch den `effort_cap` der
+/// Agent-IR auf, und das Kind lief mit dem Provider-Default — genau der
+/// Befund E3(b) aus `w3-core-child-jobs-mcp.md`. Statt eines Provider-Defaults
+/// klammert [`ManagedAgentSpawner::clamp_child_reasoning_effort`] dann auf
+/// diesen Wert.
+///
+/// Belegt: `harw_types::ReasoningEffort` hat **kein** `Default`-Impl
+/// (`harw-types/src/reasoning.rs:17-26`), und der Modellkatalog führt keinen
+/// Effort-Default (`harw-model-catalog` kennt nur `ReasoningMode::Effort` als
+/// Fähigkeitsmerkmal, `harw-model-catalog/src/descriptor.rs:137-147`). Der
+/// Wert ist deshalb hier festgelegt: `Medium`, die Mitte der monotonen
+/// Ordnung `Minimal < Low < Medium < High < Xhigh < Max`.
+const DEFAULT_CHILD_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Medium;
 
 /// Ein bereits geboxtes Kind-Future im Fan-out-Scheduler.
 ///
@@ -456,6 +476,11 @@ struct ExternalRootParent {
     session_id: SessionId,
     spawn_context: SpawnContext,
     reasoning_effort: Option<ReasoningEffort>,
+    /// Die Tool-/Instruktions-/Kontext-Aktivierung der Wurzelsitzung. F-017/E3b:
+    /// Kinder dieser Wurzel werden damit geschnitten, weil eine extern
+    /// gefahrene Wurzel keine Spiegelsitzung im [`SessionManager`] hat, aus
+    /// der sich die Aktivierung sonst lesen ließe.
+    activation: SessionActivation,
 }
 
 /// The production-shaped [`AgentSpawner`] implementation. It is shared by
@@ -535,6 +560,19 @@ impl ManagedAgentSpawner {
     /// admission, so this registration is used only while the manager lacks
     /// `session_id`.
     ///
+    /// # Arguments
+    /// - `session_id` (`SessionId`): die extern gefahrene Wurzelsitzung.
+    /// - `spawn_context` (`SpawnContext`): deren vertrauenswürdige
+    ///   Sandbox-/Rollen-/Decken-Metadaten.
+    /// - `reasoning_effort` (`Option<ReasoningEffort>`): das Effort-Level der
+    ///   Wurzel, von dem Kinder monoton erben.
+    /// - `parent_activation` (`SessionActivation`): die Aktivierung der Wurzel.
+    ///   F-017/E3b: jedes Kind dieser Wurzel wird bei der Admission damit
+    ///   geschnitten ([`SessionActivation::intersect`]), damit eine Rolle
+    ///   niemals ein Werkzeug öffnen kann, das die Wurzel selbst nicht hat.
+    ///   Aufrufer, die den Schnitt nicht wollen, übergeben
+    ///   `SessionActivation::default()` (Profil `Full` — schneidet nichts weg).
+    ///
     /// # Errors
     /// Returns [`AgentSpawnError`] when a root is already registered, the
     /// session manager lock is poisoned, or `session_id` is manager-owned at
@@ -544,6 +582,7 @@ impl ManagedAgentSpawner {
         session_id: SessionId,
         spawn_context: SpawnContext,
         reasoning_effort: Option<ReasoningEffort>,
+        parent_activation: SessionActivation,
     ) -> Result<Self, AgentSpawnError> {
         if self.external_root_parent.is_some() {
             return Err(Self::reject(
@@ -564,6 +603,7 @@ impl ManagedAgentSpawner {
             session_id,
             spawn_context,
             reasoning_effort,
+            activation: parent_activation,
         });
         Ok(self)
     }
@@ -1181,10 +1221,11 @@ impl ManagedAgentSpawner {
     /// effektiv gesetzte Level zurück.
     ///
     /// # Beschreibung
-    /// Wave 8. Die Basis ist der in [`Self::admit`] monoton geerbte Parent-Wert.
-    /// - `cap` senkt den Wert weiter (`min(base, cap)`), hebt ihn nie an, und
-    ///   führt ohne geerbte Basis kein Level ein (eine Obergrenze bleibt eine
-    ///   Obergrenze).
+    /// Wave 8, korrigiert in F-017/E3b. Die Basis ist der in [`Self::admit`]
+    /// monoton geerbte Parent-Wert; fehlt er (`None`), gilt
+    /// [`DEFAULT_CHILD_REASONING_EFFORT`] als Basis — ein fehlender Eltern-Wert
+    /// ist kein Freibrief.
+    /// - `cap` senkt den Wert weiter (`min(base, cap)`) und hebt ihn nie an.
     /// - `owner_override` durchbricht die Monotonie gezielt (Owner-Authority) und
     ///   setzt das Level explizit — auch nach oben. `None` behält die Klammerung.
     ///
@@ -1195,6 +1236,8 @@ impl ManagedAgentSpawner {
     ///
     /// # Returns
     /// `Ok(Option<ReasoningEffort>)` — das nach der Klammerung gesetzte Level.
+    /// Seit F-017/E3b immer `Some(..)`: der `Option`-Typ bleibt nur erhalten,
+    /// weil [`crate::session::AgentSession::set_reasoning_effort`] ihn führt.
     ///
     /// # Errors
     /// - [`AgentSpawnError`]: das Kind ist nicht (mehr) im Manager registriert
@@ -1216,14 +1259,20 @@ impl ManagedAgentSpawner {
         let session = manager
             .get_mut(child)
             .map_err(|error| Self::reject(format!("unknown child for effort clamp: {error}")))?;
-        let base = session.reasoning_effort();
-        let capped = match (base, cap) {
-            (Some(b), Some(c)) => Some(b.min(c)),
-            (Some(b), None) => Some(b),
-            // Ein `cap` ist eine Obergrenze: ohne geerbte Basis kein neues Level.
-            (None, _) => None,
+        // F-017/E3b: Eine fehlende geerbte Basis heißt nicht „unbegrenzt".
+        // Vorher hob `(None, _) => None` auch einen vorhandenen `cap` der
+        // Agent-IR auf, und weil beide Produktionswurzeln mit
+        // `reasoning_effort = None` registrieren, griff der Deckel nie (Befund
+        // E3(b)). Ohne Basis gilt deshalb `DEFAULT_CHILD_REASONING_EFFORT`,
+        // und der `cap` klammert wie immer nach unten.
+        let base = session
+            .reasoning_effort()
+            .unwrap_or(DEFAULT_CHILD_REASONING_EFFORT);
+        let capped = match cap {
+            Some(c) => base.min(c),
+            None => base,
         };
-        let effective = owner_override.or(capped);
+        let effective = Some(owner_override.unwrap_or(capped));
         session.set_reasoning_effort(effective);
         Ok(effective)
     }
@@ -1630,32 +1679,42 @@ impl ManagedAgentSpawner {
             .manager
             .lock()
             .map_err(|_| Self::reject("session manager lock is poisoned"))?;
-        let (parent_context, parent_reasoning_effort, parent_depth) = match manager
-            .get(&input.parent_session_id)
-        {
-            Ok(parent) => (
-                parent
-                    .spawn_context()
-                    .cloned()
-                    .ok_or_else(|| Self::reject("child parent has no trusted sandbox context"))?,
-                parent.reasoning_effort(),
-                Self::parent_depth(&manager, &input.parent_session_id)?,
-            ),
-            Err(_) => {
-                let external_root = self
-                    .external_root_parent
-                    .as_ref()
-                    .filter(|root| root.session_id == input.parent_session_id)
-                    .ok_or_else(|| {
-                        Self::reject(format!("unknown child parent: {}", input.parent_session_id))
-                    })?;
-                (
-                    external_root.spawn_context.clone(),
-                    external_root.reasoning_effort,
-                    0,
-                )
-            }
-        };
+        // F-017/E3b: Die Aktivierung des Elternteils wird hier mitgelesen, aus
+        // derselben vertrauenswürdigen Quelle wie Sandbox, Effort und Tiefe.
+        // Für ein Kind eines Kindes (jede Ebene ab 2) ist das die Aktivierung
+        // der Elternsitzung im Manager — dieselbe Sitzung, die `manager.get`
+        // hier liefert und die bei ihrer eigenen Admission bereits gegen ihren
+        // Elternteil geschnitten wurde. Der Schnitt ist damit über die ganze
+        // Kette transitiv: Enkel ⊆ Kind ⊆ Wurzel.
+        let (parent_context, parent_reasoning_effort, parent_activation, parent_depth) =
+            match manager.get(&input.parent_session_id) {
+                Ok(parent) => (
+                    parent.spawn_context().cloned().ok_or_else(|| {
+                        Self::reject("child parent has no trusted sandbox context")
+                    })?,
+                    parent.reasoning_effort(),
+                    parent.activation().clone(),
+                    Self::parent_depth(&manager, &input.parent_session_id)?,
+                ),
+                Err(_) => {
+                    let external_root = self
+                        .external_root_parent
+                        .as_ref()
+                        .filter(|root| root.session_id == input.parent_session_id)
+                        .ok_or_else(|| {
+                            Self::reject(format!(
+                                "unknown child parent: {}",
+                                input.parent_session_id
+                            ))
+                        })?;
+                    (
+                        external_root.spawn_context.clone(),
+                        external_root.reasoning_effort,
+                        external_root.activation.clone(),
+                        0,
+                    )
+                }
+            };
         if !harw_agent_dsl::roles::can_spawn(
             parent_context.organizational_role,
             definition.organizational_role,
@@ -1811,6 +1870,31 @@ impl ManagedAgentSpawner {
                 ))
             })?;
         }
+        // F-017/E3b: Die Kind-Aktivierung wird mit der des Elternteils
+        // geschnitten — derselbe Schritt und derselbe Manager-Lock wie der
+        // Deckenschnitt (`cut_ceiling`) und die Sandbox-Prüfung oben, damit
+        // kein zweiter, vergessbarer Prüfschritt entsteht.
+        //
+        // Der Schnitt sitzt **nach** der IR-Aktivierung, denn genau die baut
+        // die Kind-Aktivierung rollenbasiert neu auf (`with_executable_agent_ir`,
+        // `session.rs`) und ohne IR bleibt `SessionActivation::default()` mit
+        // Profil `Full` stehen. Beides darf nach dem Schnitt nicht mehr
+        // erlauben als der Elternteil (Befund E1). `intersect` ist monoton:
+        // das Ergebnis lässt nie mehr zu als eine der beiden Seiten allein.
+        {
+            let child_session = manager.get_mut(&child).map_err(|error| {
+                Self::reject(format!(
+                    "child session {child} disappeared before the activation cut: {error}"
+                ))
+            })?;
+            // Der Schnitt geht in die **Basis** (`narrow_base_activation`),
+            // nicht in den abgeleiteten aktuellen Wert: `set_mode`/`with_mode`
+            // leiten `activation()` bei jedem Wechsel frisch aus der Basis ab
+            // (`session.rs`, `apply_mode`), ein über `activation_mut()`
+            // gesetztes Verbot fiele dabei weg. Eine Autoritätsgrenze darf
+            // keinen Moduswechsel überleben müssen — sie muss ihn überleben.
+            child_session.narrow_base_activation(&parent_activation);
+        }
         // Monotone Vererbung: das Kind startet mit dem Effort-Level des Parents.
         if parent_reasoning_effort.is_some() {
             if let Ok(child_session) = manager.get_mut(&child) {
@@ -1872,6 +1956,7 @@ impl AgentSpawner for ManagedAgentSpawner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::activation::ToolProfile;
     use crate::model::{EchoModelProvider, ModelFuture, ModelRequest, ModelResponse};
     use crate::session::AgentSession;
     use crate::state_store::InMemoryStateStore;
@@ -2333,6 +2418,7 @@ specialization = "child-controller-test"
                     harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
                 ),
                 Some(ReasoningEffort::Medium),
+                SessionActivation::default(),
             )
             .expect("trusted external root registers during construction");
 
@@ -2374,6 +2460,7 @@ specialization = "child-controller-test"
                     harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
                 ),
                 None,
+                SessionActivation::default(),
             )
             .expect("trusted external root registers during construction");
 
@@ -2398,6 +2485,7 @@ specialization = "child-controller-test"
                     harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
                 ),
                 None,
+                SessionActivation::default(),
             )
             .expect("trusted external root registers during construction");
 
@@ -2427,6 +2515,7 @@ specialization = "child-controller-test"
                 parent.clone(),
                 external_root_context(sandbox.clone(), harw_agent_dsl::roles::AgentRoleId::Worker),
                 None,
+                SessionActivation::default(),
             )
             .expect("trusted external root registers during construction");
 
@@ -2924,6 +3013,7 @@ specialization = "child-controller-test"
                     harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
                 ),
                 None,
+                SessionActivation::default(),
             )
             .expect("trusted external root registers during construction");
         (spawner, parent, sandbox)
@@ -2992,6 +3082,7 @@ admitted = ["fs.read"]
                     harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
                 ),
                 None,
+                SessionActivation::default(),
             )
             .expect("trusted external root registers during construction");
 
@@ -3218,7 +3309,12 @@ effort_cap = "ludicrous"
         );
         parent_context.trace = Some(parent_trace.clone());
         let spawner = worker_spawner(manager)
-            .with_external_root_parent(parent.clone(), parent_context, None)
+            .with_external_root_parent(
+                parent.clone(),
+                parent_context,
+                None,
+                SessionActivation::default(),
+            )
             .expect("trusted external root registers during construction");
 
         let child = spawner
@@ -3264,6 +3360,7 @@ effort_cap = "ludicrous"
                     harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
                 ),
                 None,
+                SessionActivation::default(),
             )
             .expect("trusted external root registers during construction");
 
@@ -3378,7 +3475,12 @@ effort_cap = "ludicrous"
         );
         parent_context.ceiling = Some(parent_ceiling.clone());
         let spawner = worker_spawner(manager)
-            .with_external_root_parent(parent.clone(), parent_context, None)
+            .with_external_root_parent(
+                parent.clone(),
+                parent_context,
+                None,
+                SessionActivation::default(),
+            )
             .expect("trusted external root registers during construction");
 
         let child = spawner
@@ -3415,7 +3517,12 @@ effort_cap = "ludicrous"
         );
         parent_context.ceiling = Some(test_ceiling(&["history.tail"], TrustClass::Evidence, 500));
         let spawner = worker_spawner(manager)
-            .with_external_root_parent(parent.clone(), parent_context, None)
+            .with_external_root_parent(
+                parent.clone(),
+                parent_context,
+                None,
+                SessionActivation::default(),
+            )
             .expect("trusted external root registers during construction");
 
         let requested = test_ceiling(
@@ -3477,7 +3584,12 @@ must_include = ["history.tail"]
                 harw_agent_dsl::roles::AgentRoleId::Worker,
                 Arc::new(IrChildRegistry { ir: ir.clone() }),
             )
-            .with_external_root_parent(parent.clone(), parent_context, None)
+            .with_external_root_parent(
+                parent.clone(),
+                parent_context,
+                None,
+                SessionActivation::default(),
+            )
             .expect("trusted external root registers during construction");
 
         let child = spawner
@@ -3546,7 +3658,12 @@ must_include = ["secrets.vault"]
                 harw_agent_dsl::roles::AgentRoleId::Worker,
                 Arc::new(IrChildRegistry { ir }),
             )
-            .with_external_root_parent(parent.clone(), parent_context, None)
+            .with_external_root_parent(
+                parent.clone(),
+                parent_context,
+                None,
+                SessionActivation::default(),
+            )
             .expect("trusted external root registers during construction");
 
         let active_before = spawner.active.lock().expect("active lock").len();
@@ -3721,7 +3838,12 @@ must_include = ["secrets.vault"]
         ));
         let requested_ceiling = test_ceiling(&["history.tail"], TrustClass::Evidence, 200);
         let spawner = worker_spawner(manager)
-            .with_external_root_parent(parent.clone(), parent_context, None)
+            .with_external_root_parent(
+                parent.clone(),
+                parent_context,
+                None,
+                SessionActivation::default(),
+            )
             .expect("trusted external root registers during construction");
 
         let child = spawner
@@ -3766,7 +3888,12 @@ must_include = ["secrets.vault"]
         );
         parent_context.ceiling = Some(test_ceiling(&["history.tail"], TrustClass::Data, 100));
         let spawner = worker_spawner(manager)
-            .with_external_root_parent(parent.clone(), parent_context, None)
+            .with_external_root_parent(
+                parent.clone(),
+                parent_context,
+                None,
+                SessionActivation::default(),
+            )
             .expect("trusted external root registers during construction");
 
         let active_before = spawner.active.lock().expect("active lock").len();
@@ -3836,7 +3963,12 @@ max_trust = "instruction"
         );
         parent_context.ceiling = Some(test_ceiling(&["history.tail"], TrustClass::Evidence, 500));
         let spawner = worker_spawner(manager)
-            .with_external_root_parent(parent.clone(), parent_context, None)
+            .with_external_root_parent(
+                parent.clone(),
+                parent_context,
+                None,
+                SessionActivation::default(),
+            )
             .expect("trusted external root registers during construction");
 
         // Die von der Fixture beschriebene Forderung, in Rust nachgebaut
@@ -3906,7 +4038,12 @@ max_trust = "instruction"
         parent_context.trace = Some(parent_trace.clone());
         let spawner = worker_spawner(manager)
             .with_lease_store(lease_store.clone())
-            .with_external_root_parent(parent.clone(), parent_context, None)
+            .with_external_root_parent(
+                parent.clone(),
+                parent_context,
+                None,
+                SessionActivation::default(),
+            )
             .expect("trusted external root registers during construction");
 
         spawner
@@ -3924,5 +4061,302 @@ max_trust = "instruction"
             persisted_trace.parent_span_id.as_deref(),
             Some(parent_trace.span_id.as_str())
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // F-017/E3b: Schnitt der Kind-Aktivierung mit der Eltern-Aktivierung
+    // (Befund E1) und Effort-Clamp ohne geerbte Basis (Befund E3b)
+    // -----------------------------------------------------------------------
+
+    /// Wie [`ir_spawner`], aber mit einer frei wählbaren Aktivierung der
+    /// extern registrierten Wurzel.
+    fn ir_spawner_with_parent_activation(
+        ir: ExecutableAgentIr,
+        parent_activation: SessionActivation,
+    ) -> (ManagedAgentSpawner, SessionId, SandboxSpec) {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let parent = SessionId::new();
+        let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative())
+            .with_role(
+                "worker",
+                AgentRole::Agent {
+                    name: "worker".to_owned(),
+                },
+                harw_agent_dsl::roles::AgentRoleId::Worker,
+                Arc::new(IrChildRegistry { ir }),
+            )
+            .with_external_root_parent(
+                parent.clone(),
+                external_root_context(
+                    sandbox.clone(),
+                    harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+                ),
+                None,
+                parent_activation,
+            )
+            .expect("trusted external root registers during construction");
+        (spawner, parent, sandbox)
+    }
+
+    /// Die Tool-Oberfläche einer Rolle, die `fs.read` **und** `shell.exec`
+    /// zulässt — genug, um einen fehlenden Schnitt sichtbar zu machen.
+    fn read_and_exec_ir() -> ExecutableAgentIr {
+        test_agent_ir(
+            r#"
+[tools]
+admitted = ["fs.read", "shell.exec"]
+"#,
+        )
+    }
+
+    #[test]
+    fn child_activation_is_cut_with_the_parent_activation() {
+        let mut parent_activation = SessionActivation::new(ToolProfile::Full);
+        parent_activation.disable_tool(ToolName::new("shell.exec"));
+        let (spawner, parent, sandbox) =
+            ir_spawner_with_parent_activation(read_and_exec_ir(), parent_activation);
+
+        let child = spawner
+            .admit("worker", spawn_input(parent), sandbox, None)
+            .expect("the child is admitted");
+
+        let manager = spawner.manager.lock().expect("test session manager lock");
+        let activation = manager
+            .get(&child)
+            .expect("child is manager-owned")
+            .activation();
+        assert!(
+            activation.is_tool_enabled(&ToolName::new("fs.read")),
+            "ein vom Elternteil erlaubtes und von der Rolle zugelassenes Werkzeug bleibt offen"
+        );
+        assert!(
+            !activation.is_tool_enabled(&ToolName::new("shell.exec")),
+            "die Rolle lässt shell.exec zu, der Elternteil nicht — der Schnitt entscheidet"
+        );
+    }
+
+    #[test]
+    fn parent_activation_cut_survives_a_later_mode_switch() {
+        // Der Schnitt ist eine Autoritätsgrenze, kein Laufzeit-Override: er
+        // liegt in der Basis und muss deshalb jeden `set_mode` überleben.
+        // `Work` ist der schärfste Fall — `ToolProfile::Full` ohne
+        // Allowlist, also die weiteste Modus-Decke überhaupt.
+        let mut parent_activation = SessionActivation::new(ToolProfile::Full);
+        parent_activation.disable_tool(ToolName::new("shell.exec"));
+        let (spawner, parent, sandbox) =
+            ir_spawner_with_parent_activation(read_and_exec_ir(), parent_activation);
+
+        let child = spawner
+            .admit("worker", spawn_input(parent), sandbox, None)
+            .expect("the child is admitted");
+
+        let mut manager = spawner.manager.lock().expect("test session manager lock");
+        let child_session = manager.get_mut(&child).expect("child is manager-owned");
+        child_session.set_mode(crate::mode::InteractionMode::Work);
+        assert!(
+            !child_session
+                .activation()
+                .is_tool_enabled(&ToolName::new("shell.exec")),
+            "das Verbot des Elternteils überlebt den Moduswechsel"
+        );
+        assert!(
+            !child_session
+                .base_activation()
+                .is_tool_enabled(&ToolName::new("shell.exec")),
+            "der Schnitt sitzt in der Basis, nicht nur im abgeleiteten Wert"
+        );
+        assert!(
+            child_session
+                .activation()
+                .is_tool_enabled(&ToolName::new("fs.read")),
+            "was Elternteil und Rolle erlauben, bleibt auch in Work offen"
+        );
+    }
+
+    #[test]
+    fn grandchild_activation_inherits_the_whole_intersection_chain() {
+        // Die Wurzel ist hier bewusst **manager-eigen**: nur so ist sie für
+        // `parent_depth` auflösbar, und nur so belegt der Test die zweite
+        // Bezugsquelle des Schnitts — bei einem Kind eines Kindes ist der
+        // Elternteil die Sitzung im Manager, deren Aktivierung `admit` über
+        // `AgentSession::activation()` liest.
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events.clone())));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+
+        let mut root_activation = SessionActivation::new(ToolProfile::Full);
+        root_activation.disable_tool(ToolName::new("shell.exec"));
+        let root_session = AgentSession::new(
+            AgentRole::Agent {
+                name: "root".to_owned(),
+            },
+            None,
+            ExtensionRegistryBuilder::default().build(),
+            events,
+        )
+        .with_spawn_context(external_root_context(
+            sandbox.clone(),
+            harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+        ))
+        .with_activation(root_activation);
+        let root = root_session.id().clone();
+        manager
+            .lock()
+            .expect("test session manager lock")
+            .restore(root_session)
+            .expect("test root session restores");
+
+        let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative())
+            .with_role(
+                "middle",
+                AgentRole::Agent {
+                    name: "middle".to_owned(),
+                },
+                harw_agent_dsl::roles::AgentRoleId::ChildOrchestrator,
+                Arc::new(IrChildRegistry {
+                    ir: read_and_exec_ir(),
+                }),
+            )
+            .with_role(
+                "worker",
+                AgentRole::Agent {
+                    name: "worker".to_owned(),
+                },
+                harw_agent_dsl::roles::AgentRoleId::Worker,
+                Arc::new(IrChildRegistry {
+                    ir: read_and_exec_ir(),
+                }),
+            );
+
+        let middle = spawner
+            .admit("middle", spawn_input(root), sandbox.clone(), None)
+            .expect("the child orchestrator is admitted");
+        let grandchild = spawner
+            .admit("worker", spawn_input(middle.clone()), sandbox, None)
+            .expect("the grandchild is admitted below the child orchestrator");
+
+        let manager = spawner.manager.lock().expect("test session manager lock");
+        for (label, session_id) in [("Kind", &middle), ("Enkel", &grandchild)] {
+            let activation = manager
+                .get(session_id)
+                .expect("session is manager-owned")
+                .activation();
+            assert!(
+                activation.is_tool_enabled(&ToolName::new("fs.read")),
+                "{label}: fs.read ist auf jeder Ebene erlaubt"
+            );
+            assert!(
+                !activation.is_tool_enabled(&ToolName::new("shell.exec")),
+                "{label}: das Verbot der Wurzel wirkt transitiv nach unten"
+            );
+        }
+    }
+
+    #[test]
+    fn parent_activation_cut_also_applies_without_an_agent_ir() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let parent = SessionId::new();
+        // Ohne IR bleibt die Kind-Aktivierung sonst auf `ToolProfile::Full`
+        // stehen (Befund E1) — auch dieser Pfad muss geschnitten werden.
+        let mut parent_activation = SessionActivation::new(ToolProfile::Full);
+        parent_activation.disable_tool(ToolName::new("shell.exec"));
+        parent_activation.disable_context("workspace_files");
+        let spawner = worker_spawner(manager)
+            .with_external_root_parent(
+                parent.clone(),
+                external_root_context(
+                    sandbox.clone(),
+                    harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+                ),
+                None,
+                parent_activation,
+            )
+            .expect("trusted external root registers during construction");
+
+        let child = spawner
+            .admit("worker", spawn_input(parent), sandbox, None)
+            .expect("the child is admitted");
+
+        let manager = spawner.manager.lock().expect("test session manager lock");
+        let activation = manager
+            .get(&child)
+            .expect("child is manager-owned")
+            .activation();
+        assert!(!activation.is_tool_enabled(&ToolName::new("shell.exec")));
+        assert!(!activation.is_context_enabled("workspace_files"));
+        assert!(activation.is_tool_enabled(&ToolName::new("fs.read")));
+    }
+
+    #[test]
+    fn effort_clamp_without_an_inherited_base_falls_back_to_the_default() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let parent = SessionId::new();
+        let spawner = worker_spawner(manager)
+            .with_external_root_parent(
+                parent.clone(),
+                external_root_context(
+                    sandbox.clone(),
+                    harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+                ),
+                // Genau die Produktionslage aus Befund E3(b): die Wurzel führt
+                // kein Effort-Level.
+                None,
+                SessionActivation::default(),
+            )
+            .expect("trusted external root registers during construction");
+
+        let capped = spawner
+            .admit("worker", spawn_input(parent.clone()), sandbox.clone(), None)
+            .expect("first child is admitted");
+        assert_eq!(
+            spawner
+                .manager
+                .lock()
+                .expect("test session manager lock")
+                .get(&capped)
+                .expect("child is manager-owned")
+                .reasoning_effort(),
+            None,
+            "ohne Eltern-Level erbt das Kind bei der Admission nichts"
+        );
+        assert_eq!(
+            spawner
+                .clamp_child_reasoning_effort(&capped, Some(ReasoningEffort::Low), None)
+                .expect("known child clamps cleanly"),
+            Some(ReasoningEffort::Low),
+            "der Deckel der Agent-IR greift jetzt auch ohne geerbte Basis"
+        );
+
+        let uncapped = spawner
+            .admit("worker", spawn_input(parent), sandbox, None)
+            .expect("second child is admitted");
+        assert_eq!(
+            spawner
+                .clamp_child_reasoning_effort(&uncapped, None, None)
+                .expect("known child clamps cleanly"),
+            Some(DEFAULT_CHILD_REASONING_EFFORT),
+            "ohne Deckel und ohne Basis gilt der Default, nicht der Provider-Default"
+        );
+    }
+
+    #[test]
+    fn effort_clamp_owner_override_still_beats_the_default_base() {
+        let (spawner, child) = spawner_with_admitted_child();
+
+        let effective = spawner
+            .clamp_child_reasoning_effort(
+                &child,
+                Some(ReasoningEffort::Minimal),
+                Some(ReasoningEffort::High),
+            )
+            .expect("known child clamps cleanly");
+
+        assert_eq!(effective, Some(ReasoningEffort::High));
     }
 }

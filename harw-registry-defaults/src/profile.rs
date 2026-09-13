@@ -14,7 +14,9 @@
 //! - [`RegistryProfile`] — der geschlossene Satz eingebauter Profile.
 //! - [`IdentityOverrides`] — Überschreibungen für den System-Prompt.
 //! - [`RestrictedToolProvider`] — Sichtbarkeitsfilter über einem Provider.
-//! - [`assemble_registry`] — baut eine Registry für ein Profil.
+//! - [`assemble_registry`] — erkennt das Projekt einmal und baut eine Registry.
+//! - [`assemble_registry_for_project`] — baut eine Registry über einem bereits
+//!   erkannten Projektkontext, ohne erneute Projekterkennung.
 //! - [`role_names`] — die Namen der eingebauten Rollen als Single Source of Truth.
 //!
 //! # Warum ein Filter statt eines zweiten Providers
@@ -37,11 +39,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_extension_api::{
     ExtensionRegistryBuilder, ToolExecutor, ToolName, ToolProvider, ToolSpec,
 };
 use harw_instructions::{AgentIdentity, BaselineInstructionsProvider};
-use harw_project_discovery::{DiscoveryConfig, ProjectContextProvider, discover_project};
+use harw_project_discovery::{
+    DiscoveryConfig, ProjectContext, ProjectContextProvider, discover_project,
+};
 use harw_tool_deps::DepsToolProvider;
 use harw_tool_fs::FsToolProvider;
 use harw_tool_lens::LensToolProvider;
@@ -309,19 +314,28 @@ const BROWSER_TOOLS: &[&str] = &[
 /// `NoTools` registriert nichts und bewirbt nichts — Inventar und
 /// Aufrufrecht bleiben deckungsgleich leer.
 ///
+/// # Warum es kein `Default` gibt (R4, G-071)
+/// `RegistryProfile` hatte `#[derive(Default)]` mit `#[default] Full`. Damit
+/// war `profile_for_role(role).unwrap_or_default()` in beiden Kind-Factories
+/// (`harw-tui/src/app.rs`, `harw-cli/src/chat.rs`) eine stille Ausweitung: die
+/// **unbekannte** Rolle bekam den vollen Coding-Satz inklusive `fs.write` und
+/// `shell.exec` — genau das Gegenteil der fail-closed-Zusage von
+/// [`profile_for_role`], das bewusst `None` statt `Full` liefert. Ein
+/// „Standardprofil“ kann es nicht geben: welcher Werkzeugsatz richtig ist,
+/// hängt am Aufrufkontext, nie am Typ. Wer kein Profil ermitteln kann, muss
+/// scheitern, nicht raten.
+///
 /// # Beispiele
 /// ```rust
 /// use harw_registry_defaults::profile::RegistryProfile;
 ///
-/// assert_eq!(RegistryProfile::default(), RegistryProfile::Full);
 /// assert!(RegistryProfile::ReadOnlyExplore.is_read_only());
 /// assert!(!RegistryProfile::ReadOnlyExplore.tool_names().contains(&"fs.write"));
 /// assert!(RegistryProfile::NoTools.tool_names().is_empty());
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistryProfile {
     /// Voller Coding-Satz (heutiges Verhalten): fs.*, shell.exec, Browser (Feature).
-    #[default]
     Full,
     /// Ausschließlich lesend: fs.read/list/search/glob/grep + deps.*.
     ReadOnlyExplore,
@@ -742,9 +756,27 @@ fn profile_tool_providers(
 /// Profils ([`RegistryProfile::tool_names`]) und trägt dessen
 /// Rollenbeschreibung, sofern `overrides` sie nicht ersetzt.
 ///
+/// Die Projekterkennung läuft **genau einmal**; der Rest der Montage liegt in
+/// [`assemble_registry_for_project`], an das diese Funktion delegiert. Wer
+/// mehrere Registries über demselben Projekt baut (Sitzung plus Kinder), ruft
+/// diese Funktion einmal und danach nur noch
+/// [`assemble_registry_for_project`] mit dem erhaltenen
+/// [`AssembledRegistry::project`].
+///
 /// Die Freigabegrenze ist für alle Profile dieselbe
 /// [`crate::DefaultApprovalPolicy`]: sie lässt ausschließlich read-only
 /// Werkzeuge ohne Rückfrage durch.
+///
+/// # Freigabemodus
+/// Diese Signatur nimmt keine [`ApprovalModeCell`] entgegen und baut deshalb
+/// eine **eigene** Zelle auf [`harw_extension_api::ApprovalMode::Delegated`]
+/// ([`ApprovalModeCell::default`]) — die engste Stufe ohne Einstellung, aber
+/// eben auch eine Zelle, die niemand außerhalb der erzeugten Registry umlegen
+/// kann. Eine Sitzung, deren Modus zur Laufzeit umschaltbar sein muss
+/// (`/permissions set`), montiert über [`assemble_registry_for_project`] und
+/// gibt einen Klon ihrer eigenen Zelle mit. Das Durchreichen der
+/// Sitzungs-Zelle aus den Composition-Roots (`harw-tui`, `harw-cli`) ist
+/// W2c-Folgearbeit.
 ///
 /// # Argumente
 /// - `profile` ([`RegistryProfile`]): das gewünschte Werkzeug-/Identitätsprofil.
@@ -783,6 +815,86 @@ pub fn assemble_registry(
     let discovery_config = DiscoveryConfig::default();
     let project = discover_project(&cwd, &discovery_config).map_err(RegistryDefaultsError::from)?;
 
+    assemble_registry_for_project(profile, &project, overrides, ApprovalModeCell::default())
+}
+
+/// Baut eine Registry für das gewünschte Profil über einem **bereits
+/// erkannten** Projektkontext.
+///
+/// # Beschreibung
+/// Identisch zu [`assemble_registry`], nur ohne dessen ersten Schritt: Diese
+/// Funktion nimmt keinen Pfad entgegen, sie kann also gar keine
+/// Projekterkennung auslösen. Wer eine Sitzung und ihre Kind-Registries
+/// montiert, entdeckt einmal und übergibt denselben [`ProjectContext`] an jeden
+/// Aufruf.
+///
+/// # Warum das die eigentliche Änderung ist (R5, G-071)
+/// Jede Kind-Registry und jede Registry-Kopie lief bisher durch
+/// [`assemble_registry`] und damit durch eine eigene
+/// [`harw_project_discovery::discover_project`]-Runde: Start der TUI dreimal,
+/// jeder Fan-out einmal je Kind. Das ist nicht nur Arbeit, es ist eine
+/// Fehlerquelle — ein `AGENTS.md`, das zwischen zwei Runden unlesbar wird,
+/// ließe Elternteil und Kind auf verschiedene Projektwurzeln blicken, und ein
+/// einziges nicht-UTF-8-Dokument verhinderte jeden Kind-Spawn. Ein einmal
+/// erkannter Kontext kann beides nicht.
+///
+/// # Argumente
+/// - `profile` ([`RegistryProfile`]): das gewünschte Werkzeug-/Identitätsprofil.
+/// - `project` (`&ProjectContext`): der bereits erkannte Projektkontext; wird
+///   für die Registry und das Ergebnis geklont, nie neu ermittelt.
+/// - `overrides` ([`IdentityOverrides`]): Überschreibungen für den System-Prompt.
+/// - `approval_mode` ([`ApprovalModeCell`]): die Zelle, aus der die
+///   [`crate::DefaultApprovalPolicy`] dieser Registry ihren Freigabemodus
+///   liest. Ein Klon der Sitzungs-Zelle lässt Kind und Elternteil denselben
+///   Modus sehen, [`ApprovalModeCell::detached`] trennt sie.
+///
+/// # Rückgabe
+/// `Ok(AssembledRegistry)` mit Registry, dem **übergebenen** Projektkontext und
+/// der Identität.
+///
+/// # Fehler
+/// - [`RegistryDefaultsError::ContextProviderRegistration`]: der Namensraum des
+///   [`ProjectContextProvider`] ist bereits belegt.
+/// - [`RegistryDefaultsError::BrowserHost`]: nur unter dem Feature `browser` und
+///   nur für [`RegistryProfile::Full`], wenn die Host-Konfiguration ungültig ist.
+///
+/// Ein Discovery-Fehler ist hier **nicht** möglich: Die Funktion bekommt keinen
+/// Pfad.
+///
+/// # Nebenläufigkeit
+/// Synchron; alle erzeugten Provider sind `Send + Sync`.
+///
+/// # Beispiele
+/// ```rust,no_run
+/// use std::path::Path;
+/// use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
+/// use harw_project_discovery::{DiscoveryConfig, discover_project};
+/// use harw_registry_defaults::profile::{
+///     IdentityOverrides, RegistryProfile, assemble_registry_for_project,
+/// };
+///
+/// // Einmal entdecken …
+/// let project = discover_project(Path::new("/workspace"), &DiscoveryConfig::default())?;
+/// let mode = ApprovalModeCell::new(ApprovalMode::Delegated);
+///
+/// // … und beliebig oft montieren, ohne erneute Projekterkennung.
+/// for _ in 0..2 {
+///     let assembled = assemble_registry_for_project(
+///         RegistryProfile::ReadOnlyExplore,
+///         &project,
+///         IdentityOverrides::default(),
+///         mode.clone(),
+///     )?;
+///     assert_eq!(assembled.identity.role_description, "read-only exploration agent");
+/// }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn assemble_registry_for_project(
+    profile: RegistryProfile,
+    project: &ProjectContext,
+    overrides: IdentityOverrides,
+    approval_mode: ApprovalModeCell,
+) -> RegistryDefaultsResult<AssembledRegistry> {
     let providers = profile_tool_providers(profile)?;
 
     let advertised_tools: Vec<String> = profile
@@ -807,7 +919,7 @@ pub fn assemble_registry(
     .with_extra_context(extra_context);
 
     let mut builder = ExtensionRegistryBuilder::default()
-        .approval_handler(Arc::new(DefaultApprovalPolicy))
+        .approval_handler(Arc::new(DefaultApprovalPolicy::new(approval_mode)))
         .instructions_provider(Arc::new(BaselineInstructionsProvider::new(
             identity.clone(),
         )))
@@ -822,7 +934,7 @@ pub fn assemble_registry(
 
     Ok(AssembledRegistry {
         registry: builder.build(),
-        project,
+        project: project.clone(),
         identity,
     })
 }
@@ -1013,6 +1125,78 @@ mod tests {
         assert_eq!(assembled.identity.extra_context, vec!["Antworte nur mit JSON."]);
     }
 
+    /// Legt ein leeres Projektverzeichnis unter `std::env::temp_dir()` an und
+    /// setzt einen `Cargo.toml`-Marker hinein, damit `discover_project` genau
+    /// dieses Verzeichnis als Projektwurzel erkennt.
+    ///
+    /// Der Name ist über Prozess-ID und Nanosekunden eindeutig — kein
+    /// gemeinsamer Zähler, kein anderer geteilter Zustand, damit parallel
+    /// laufende Tests einander nicht sehen.
+    fn make_temp_project(tag: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("Systemzeit liegt vor der Unix-Epoche")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "harw-registry-defaults-{tag}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("Projektverzeichnis anlegen");
+        std::fs::write(root.join("Cargo.toml"), b"[package]\nname = \"tmp\"\n")
+            .expect("Projektmarker schreiben");
+        root
+    }
+
+    /// Der Kern von G-071: Zwei Montagen über demselben [`ProjectContext`]
+    /// lösen keine zweite Projekterkennung aus.
+    ///
+    /// Bewiesen wird das nicht über einen Zähler, sondern über die
+    /// Unmöglichkeit: Nach der einen Discovery wird das Projektverzeichnis
+    /// gelöscht. Ab da scheitert `discover_project` (der Test prüft das
+    /// ausdrücklich) — beide Montagen gelingen trotzdem und liefern denselben
+    /// Kontext. Eine verborgene Re-Discovery könnte das nicht.
+    #[test]
+    fn test_assemble_registry_for_project_never_runs_discovery_again() {
+        let root = make_temp_project("no-rediscovery");
+
+        let project =
+            discover_project(&root, &DiscoveryConfig::default()).expect("Discovery im Tempdir");
+        assert_eq!(
+            project.project_root, project.cwd,
+            "der Marker liegt im Wurzelverzeichnis selbst"
+        );
+
+        std::fs::remove_dir_all(&root).expect("Projektverzeichnis entfernen");
+        assert!(
+            discover_project(&root, &DiscoveryConfig::default()).is_err(),
+            "nach dem Löschen muss jede erneute Discovery scheitern — sonst \
+             beweist dieser Test nichts"
+        );
+
+        let mode = ApprovalModeCell::new(harw_extension_api::ApprovalMode::AlwaysAsk);
+        let first = assemble_registry_for_project(
+            RegistryProfile::ReadOnlyExplore,
+            &project,
+            IdentityOverrides::default(),
+            mode.clone(),
+        )
+        .expect("erste Montage kommt ohne Discovery aus");
+        let second = assemble_registry_for_project(
+            RegistryProfile::ReadOnlyExplore,
+            &project,
+            IdentityOverrides::default(),
+            mode.clone(),
+        )
+        .expect("zweite Montage kommt ohne Discovery aus");
+
+        assert_eq!(first.project.project_root, project.project_root);
+        assert_eq!(second.project.project_root, project.project_root);
+        assert_eq!(first.identity.cwd, second.identity.cwd);
+        assert_eq!(registered_names(&first), registered_names(&second));
+        assert_eq!(first.registry.approval_handlers().len(), 1);
+        assert_eq!(second.registry.approval_handlers().len(), 1);
+    }
+
     #[test]
     fn test_restricted_provider_hides_filtered_executor() {
         let provider = RestrictedToolProvider::new(
@@ -1075,10 +1259,32 @@ mod tests {
         assert_eq!(profile_for_role(""), None);
     }
 
+    /// Nachfolger von `test_default_profile_is_full`: `RegistryProfile`
+    /// implementiert `Default` nicht mehr (R4/G-071), es gibt also kein
+    /// Profil, auf das ein unbekannter Name zurückfallen könnte. Geprüft wird
+    /// die verbliebene Zusage — `Full` ist das einzige nicht-read-only Profil
+    /// und muss ausdrücklich gewählt werden.
     #[test]
-    fn test_default_profile_is_full() {
-        assert_eq!(RegistryProfile::default(), RegistryProfile::Full);
+    fn test_full_is_the_only_writable_profile_and_never_a_fallback() {
         assert!(!RegistryProfile::Full.is_read_only());
+        for profile in RegistryProfile::ALL
+            .iter()
+            .filter(|p| **p != RegistryProfile::Full)
+        {
+            assert!(
+                profile.is_read_only(),
+                "{profile:?} ist weder Full noch read-only"
+            );
+        }
+        // Keine eingebaute Rolle bekommt `Full`: der einzige Weg dorthin ist
+        // eine ausdrückliche Wahl in der Composition-Root, nie ein Fallback.
+        for role in role_names::ALL {
+            assert_ne!(
+                profile_for_role(role),
+                Some(RegistryProfile::Full),
+                "Rolle {role} darf nicht den vollen Coding-Satz bekommen"
+            );
+        }
     }
 
     #[test]

@@ -7,8 +7,9 @@
 //! [`crate::activation::SessionActivation`]. See that module for details.
 //!
 //! Der Interaktionsmodus ([`crate::mode::InteractionMode`]) sitzt eine Ebene
-//! darüber: er setzt Tool-Aktivierung *und* Sandbox-Obergrenze gemeinsam und
-//! ausschließlich reduzierend — siehe [`AgentSession::set_mode`].
+//! darüber: er schneidet Tool-Aktivierung *und* Sandbox-Obergrenze gemeinsam
+//! aus der Basis der Session (Agent-IR bzw. Spawn-Kontext) — nie über sie
+//! hinaus, aber auch ohne Ratsche zurück — siehe [`AgentSession::set_mode`].
 //!
 //! # Folgeknoten zu AW2-01/AW2-02: `ContextProgram` je Sitzung — erbt oder bringt mit?
 //!
@@ -170,6 +171,31 @@ pub struct AgentSession {
     /// [`SessionActivation::default()`] (Full profile, no overrides), which
     /// exposes every registered tool.
     activation: SessionActivation,
+    /// Basis-Aktivierung: die Tool-Freigabe, die diese Session bei ihrem
+    /// Aufbau bekommen hat — aus der Agent-IR
+    /// ([`AgentSession::with_executable_agent_ir`]) bzw. aus
+    /// [`AgentSession::with_activation`] —, bevor ein Interaktionsmodus sie
+    /// verengt hat.
+    ///
+    /// `apply_mode` schneidet **immer** von hier aus, nie vom aktuellen Wert.
+    /// Damit gilt beides zugleich: ein Modus ist reversibel (Explore → Work
+    /// stellt genau die Basis wieder her, keine Ratsche) und er kann nie mehr
+    /// freigeben, als die Basis trug (ein `forbidden` aus der Agent-Definition
+    /// bleibt in jedem Modus verboten).
+    base_activation: SessionActivation,
+    /// Basis-Sandbox: die Autorität, mit der der Spawn-Kontext angehängt
+    /// wurde, vor jedem Modus-Schnitt. Dieselbe Rolle wie `base_activation`,
+    /// eine Achse tiefer.
+    ///
+    /// `Option`, weil [`harw_sandbox::SandboxSpec`] bewusst kein `Default`
+    /// hat: eine Sandbox entsteht ausschließlich aus einer aufgelösten
+    /// [`harw_sandbox::WorkspaceBinding`] plus Policy-Entscheidung
+    /// ([`harw_sandbox::SandboxSpec::from_resolved`]), es gibt also keinen
+    /// neutralen Wert, den [`AgentSession::new_with_id`] erfinden dürfte.
+    /// `None` heißt „diese Session hat keine Sandbox", nicht „unbegrenzt":
+    /// ohne Spawn-Kontext gibt es nichts zu schneiden, und die
+    /// Tool-Ausführung lehnt eine solche Session ohnehin ab.
+    base_sandbox: Option<SandboxSpec>,
     /// Aufsummierte Token-Nutzung **aller** Turns dieser Session.
     ///
     /// Ohne diesen Akkumulator wäre eine Token-Obergrenze für Kind-Agenten
@@ -336,6 +362,8 @@ impl AgentSession {
             event_tx,
             turn_event_tx: None,
             activation: SessionActivation::default(),
+            base_activation: SessionActivation::default(),
+            base_sandbox: None,
             total_usage: TokenUsage::default(),
             mode: InteractionMode::default(),
             executable_snapshot_id: None,
@@ -349,6 +377,14 @@ impl AgentSession {
     /// minimal profile, admits only the IR's admitted names, then applies its
     /// forbidden names as final denials. The IR snapshot ID is retained for
     /// audit and correlation.
+    ///
+    /// Diese Fläche wird als **Basis** hinterlegt (`base_activation`), nicht
+    /// nur als aktueller Wert: jeder spätere Modus-Wechsel schneidet gegen
+    /// sie, statt sie zu ersetzen. Ein `forbidden`-Name der Agent-Definition
+    /// überlebt deshalb jedes `/mode` — siehe [`Self::set_mode`]. Der
+    /// anschließende `apply_mode`-Aufruf hält die Reihenfolge der
+    /// Builder-Aufrufe egal; im Default-Modus [`InteractionMode::Chat`] ist
+    /// der Schnitt die Identität.
     #[must_use]
     pub fn with_executable_agent_ir(mut self, executable: &ExecutableAgentIr) -> Self {
         let mut activation = SessionActivation::new(ToolProfile::Minimal);
@@ -360,8 +396,9 @@ impl AgentSession {
             activation.disable_tool(ToolName::new(name.clone()));
         }
 
-        self.activation = activation;
+        self.base_activation = activation;
         self.executable_snapshot_id = Some(executable.snapshot_id());
+        self.apply_mode();
         self
     }
 
@@ -375,18 +412,24 @@ impl AgentSession {
     /// Attaches the immutable, trusted context established before the session
     /// started. It is intentionally unavailable to model/tool JSON.
     ///
-    /// Die Sandbox wird beim Anhängen sofort mit der Obergrenze des aktuellen
-    /// [`InteractionMode`] geschnitten. Damit hängt die Autorität nicht von der
-    /// Reihenfolge der Builder-Aufrufe ab: `with_mode(...).with_spawn_context(...)`
-    /// und `with_spawn_context(...).with_mode(...)` ergeben dieselbe Sandbox.
-    /// Für den Default-Modus [`InteractionMode::Chat`] ist der Schnitt die
+    /// Die übergebene Sandbox wird als **Basis-Autorität** dieser Session
+    /// festgehalten (`base_sandbox`) und sofort mit der Obergrenze des
+    /// aktuellen [`InteractionMode`] geschnitten. Damit hängt die Autorität
+    /// nicht von der Reihenfolge der Builder-Aufrufe ab:
+    /// `with_mode(...).with_spawn_context(...)` und
+    /// `with_spawn_context(...).with_mode(...)` ergeben dieselbe Sandbox. Für
+    /// den Default-Modus [`InteractionMode::Chat`] ist der Schnitt die
     /// Identität, bestehende Aufrufer sehen also keine Änderung.
+    ///
+    /// Die Basis ist die Obergrenze, nicht ein zweiter Speicher neben der
+    /// Wahrheit: sie wird ausschließlich hier gesetzt — von der Stelle also,
+    /// die die vertrauenswürdige Autorität überhaupt erst anliefert — und von
+    /// da an nur noch geschnitten.
     #[must_use]
-    pub fn with_spawn_context(mut self, mut spawn_context: SpawnContext) -> Self {
-        spawn_context.sandbox = spawn_context
-            .sandbox
-            .restrict(&self.mode.permission_ceiling());
+    pub fn with_spawn_context(mut self, spawn_context: SpawnContext) -> Self {
+        self.base_sandbox = Some(spawn_context.sandbox.clone());
         self.spawn_context = Some(spawn_context);
+        self.apply_mode();
         self
     }
 
@@ -428,40 +471,50 @@ impl AgentSession {
         self
     }
 
-    /// Wechselt den Modus und wendet ihn sofort an: Tool-Aktivierung aus
-    /// `allowed_tools`, Sandbox aus `permission_ceiling` (nur Reduktion).
+    /// Wechselt den Modus und wendet ihn sofort an: Tool-Aktivierung und
+    /// Sandbox werden **von der Basis aus** mit dem Modus geschnitten.
     /// Der Spawn-Kontext behält seinen Workspace; nur die Permissions schrumpfen.
     ///
     /// # Beschreibung
     /// Der Modus ist eine durchgesetzte Grenze, kein Hinweis an das Modell.
-    /// Konkret geschieht dreierlei:
-    /// 1. Eine frische [`SessionActivation`] aus
-    ///    [`InteractionMode::tool_profile`] ersetzt die bisherige. Frühere
-    ///    Einzel-Overrides (`enable_tool`/`disable_tool`) fallen dabei weg —
-    ///    andernfalls könnte ein alter `enable_tool`-Override ein Werkzeug in
-    ///    einen engeren Modus hineinretten.
-    /// 2. Jeder Name aus [`InteractionMode::allowed_tools`] wird freigeschaltet.
-    ///    `None` bedeutet „keine namensbasierte Einschränkung".
-    /// 3. Die Sandbox des Spawn-Kontexts wird mit
-    ///    [`InteractionMode::permission_ceiling`] **geschnitten**
-    ///    ([`harw_sandbox::SandboxSpec::restrict`]). Der Schnitt ist monoton:
-    ///    ein Wechsel nach [`InteractionMode::Work`] gibt nichts zurück, was die
-    ///    Sandbox vorher nicht hatte. Der [`harw_sandbox::NetworkScope`] bleibt
-    ///    unangetastet — eine Permission-Obergrenze sagt nichts über einzelne
-    ///    Ziele aus, weder über Hostnamen
-    ///    ([`harw_sandbox::EgressTarget::Host`],
+    /// Konkret geschieht zweierlei:
+    /// 1. Aus [`InteractionMode::tool_profile`] und
+    ///    [`InteractionMode::allowed_tools`] entsteht eine frische
+    ///    [`SessionActivation`] — die „Modus-Decke". Die Aktivierung der
+    ///    Session ist deren Schnitt mit der Basis-Aktivierung
+    ///    ([`SessionActivation::intersect`], monoton: das Ergebnis erlaubt nie
+    ///    mehr als jede Seite für sich). Basis ist, was
+    ///    [`Self::with_executable_agent_ir`] bzw. [`Self::with_activation`]
+    ///    hinterlegt hat — ein `forbidden`-Name der Agent-Definition bleibt
+    ///    deshalb in **jedem** Modus verboten, auch in
+    ///    [`InteractionMode::Work`]. `allowed_tools() == None` bedeutet „keine
+    ///    namensbasierte Einschränkung durch den Modus", nicht „alles erlaubt":
+    ///    die Basis gilt weiter.
+    /// 2. Die Sandbox des Spawn-Kontexts wird als Schnitt der **Basis-Sandbox**
+    ///    mit [`InteractionMode::permission_ceiling`] neu gesetzt
+    ///    ([`harw_sandbox::SandboxSpec::restrict`]). Der
+    ///    [`harw_sandbox::NetworkScope`] bleibt unangetastet — eine
+    ///    Permission-Obergrenze sagt nichts über einzelne Ziele aus, weder über
+    ///    Hostnamen ([`harw_sandbox::EgressTarget::Host`],
     ///    [`harw_sandbox::EgressTarget::DnsSuffix`]) noch über Adressbereiche
     ///    ([`harw_sandbox::EgressTarget::Cidr`]).
     ///
-    /// Ohne Spawn-Kontext entfällt Schritt 3 ersatzlos: es gibt dann keine
+    /// Ohne Spawn-Kontext entfällt Schritt 2 ersatzlos: es gibt dann keine
     /// Autorität, die zu schneiden wäre, und die Tool-Ausführung lehnt eine
     /// solche Session ohnehin ab.
     ///
-    /// Nur die Sandbox ist monoton, die Tool-Aktivierung ist es nicht: ein
-    /// Wechsel zurück nach [`InteractionMode::Work`] macht Werkzeuge wieder
-    /// sichtbar. Das ist ungefährlich, weil die endgültige Autorität die
-    /// Sandbox trägt — ein wieder sichtbares `fs.write` scheitert weiterhin an
-    /// fehlendem [`harw_sandbox::Permission::WriteWorkspace`].
+    /// # Warum von der Basis, nicht vom aktuellen Wert
+    /// Beide Achsen sind dadurch **reversibel und trotzdem gedeckelt**:
+    /// `Explore` → `Work` stellt exakt die Basis wieder her (keine Ratsche,
+    /// die eine Session nach einem einzigen `/mode explore` dauerhaft
+    /// entrechtet), und kein Modus kommt je über die Basis hinaus. Kumulativ
+    /// auf den aktuellen Wert zu schneiden hätte nur die erste Hälfte; die
+    /// Basis zu ersetzen — der frühere Zustand — nur die zweite.
+    ///
+    /// Einzel-Overrides, die zur Laufzeit über [`Self::activation_mut`]
+    /// gesetzt wurden, gehören nicht zur Basis und fallen bei jedem
+    /// Modus-Wechsel weg: andernfalls könnte ein alter `enable_tool`-Override
+    /// ein Werkzeug in einen engeren Modus hineinretten.
     ///
     /// # Arguments
     /// - `mode` (`InteractionMode`): der neue Modus (`Copy`, kein Ownership-Transfer).
@@ -483,20 +536,28 @@ impl AgentSession {
         }
     }
 
-    // Setzt den bereits in `self.mode` hinterlegten Modus durch: Activation neu
-    // aufbauen und die Sandbox schneiden. Bewusst ohne Event — der Aufrufer
-    // entscheidet, ob ein Wechsel stattgefunden hat.
+    // Setzt den bereits in `self.mode` hinterlegten Modus durch: Activation und
+    // Sandbox jeweils als Schnitt der Basis mit der Modus-Decke. Bewusst ohne
+    // Event — der Aufrufer entscheidet, ob ein Wechsel stattgefunden hat.
+    //
+    // Idempotent und reihenfolgeunabhängig: die Funktion liest nur `mode`,
+    // `base_activation` und `base_sandbox` und schreibt nur die abgeleiteten
+    // Werte. Deshalb darf jeder Builder-Schritt, der eine Basis setzt, sie
+    // anschließend aufrufen.
     fn apply_mode(&mut self) {
-        let mut activation = SessionActivation::new(self.mode.tool_profile());
+        let mut mode_activation = SessionActivation::new(self.mode.tool_profile());
         if let Some(names) = self.mode.allowed_tools() {
             for name in names {
-                activation.enable_tool(ToolName::new(*name));
+                mode_activation.enable_tool(ToolName::new(*name));
             }
         }
-        self.activation = activation;
+        self.activation = self.base_activation.intersect(&mode_activation);
 
-        if let Some(context) = self.spawn_context.as_mut() {
-            context.sandbox = context.sandbox.restrict(&self.mode.permission_ceiling());
+        let ceiling = self.mode.permission_ceiling();
+        if let (Some(context), Some(base)) =
+            (self.spawn_context.as_mut(), self.base_sandbox.as_ref())
+        {
+            context.sandbox = base.restrict(&ceiling);
         }
     }
 
@@ -655,6 +716,60 @@ impl AgentSession {
         &self.activation
     }
 
+    /// Liefert die Basis-Aktivierung: die Tool-Freigabe, die diese Session bei
+    /// ihrem Aufbau bekommen hat, unabhängig vom aktuellen
+    /// [`InteractionMode`].
+    ///
+    /// # Beschreibung
+    /// [`Self::activation`] ist stets der Schnitt dieser Basis mit der Decke
+    /// des aktuellen Modus und damit eine Teilmenge von ihr. Wer wissen will,
+    /// *warum* ein Werkzeug unsichtbar ist — vom Modus verengt oder von der
+    /// Agent-Definition verboten —, vergleicht beide.
+    ///
+    /// # Returns
+    /// Unveränderliche Referenz auf die Basis-[`SessionActivation`]. Für eine
+    /// Session, die weder [`Self::with_executable_agent_ir`] noch
+    /// [`Self::with_activation`] gesehen hat, ist das
+    /// [`SessionActivation::default()`] (Profil `Full`, keine Overrides).
+    ///
+    /// # Nebenläufigkeit
+    /// Nur lesend; sicher aus jedem Thread, solange die Session geliehen ist.
+    #[must_use]
+    pub fn base_activation(&self) -> &SessionActivation {
+        &self.base_activation
+    }
+
+    /// Verengt die Basis dauerhaft auf den Schnitt mit `ceiling`.
+    ///
+    /// # Beschreibung
+    /// Für Autoritätsgrenzen, die *jeden* späteren Modus-Wechsel überleben
+    /// müssen — etwa den Schnitt einer Kind-Sitzung mit der Aktivierung ihres
+    /// Elternteils (`ManagedAgentSpawner::admit`, Befund F-017/E1). Ein
+    /// Schreibzugriff über [`Self::activation_mut`] taugt dafür **nicht**: der
+    /// aktuelle Wert wird bei jedem [`Self::set_mode`] aus der Basis neu
+    /// abgeleitet und ein dort gesetztes Verbot damit stillschweigend
+    /// verworfen.
+    ///
+    /// Monoton: [`SessionActivation::intersect`] lässt nie mehr zu als jede
+    /// Seite allein, die Basis wird also nie weiter, nur enger. Mehrfaches
+    /// Anwenden derselben Decke ist idempotent. Anschließend wird der aktuelle
+    /// Modus über die neue Basis neu angewandt, damit
+    /// [`Self::activation`] sofort zur verengten Basis passt.
+    ///
+    /// # Arguments
+    /// - `ceiling` (`&SessionActivation`): die Decke, auf die verengt wird.
+    ///
+    /// # Panics
+    /// Keine.
+    ///
+    /// # Nebenläufigkeit
+    /// Verlangt exklusiven Zugriff (`&mut self`), hält keine Sperre und sendet
+    /// kein Event — der Aufrufer entscheidet, ob ein Wechsel sichtbar wird.
+    pub fn narrow_base_activation(&mut self, ceiling: &SessionActivation) {
+        self.base_activation = self.base_activation.intersect(ceiling);
+        self.apply_mode();
+    }
+
     /// Returns a mutable reference to the session's activation filter.
     ///
     /// # Description
@@ -670,6 +785,14 @@ impl AgentSession {
     /// Builder-style setter for the activation filter (consumes and returns
     /// `self` for chaining with other `with_*` methods).
     ///
+    /// Die übergebene Aktivierung wird zugleich zur **Basis** dieser Session
+    /// ([`Self::base_activation`]): ein späterer [`Self::set_mode`]-Aufruf
+    /// schneidet gegen sie, statt sie zu verlieren. Der anschließende
+    /// `apply_mode`-Aufruf hält die Reihenfolge der Builder-Aufrufe egal —
+    /// `with_mode(m).with_activation(a)` und `with_activation(a).with_mode(m)`
+    /// liefern dieselbe Sitzung; im Default-Modus
+    /// [`InteractionMode::Chat`] ist der Schnitt die Identität.
+    ///
     /// # Arguments
     /// - `activation` (`SessionActivation`): the new filter to install.
     ///
@@ -683,7 +806,8 @@ impl AgentSession {
     /// ```
     #[must_use]
     pub fn with_activation(mut self, activation: SessionActivation) -> Self {
-        self.activation = activation;
+        self.base_activation = activation;
+        self.apply_mode();
         self
     }
 
@@ -1326,8 +1450,9 @@ forbidden = [{forbidden}]
     }
 
     #[test]
-    fn test_set_mode_work_restores_no_permission_the_sandbox_lacked() {
-        // Monotonie: der Schnitt ist die einzige Operation auf der Sandbox.
+    fn test_set_mode_work_restores_the_base_and_invents_nothing() {
+        // Der Schnitt läuft immer von der Basis-Sandbox aus: reversibel nach
+        // oben bis zur Basis, nie darüber hinaus.
         let mut session =
             session_with_permissions(&[Permission::ReadWorkspace, Permission::WriteWorkspace]);
 
@@ -1338,12 +1463,12 @@ forbidden = [{forbidden}]
 
         let permissions = permissions_of(&session);
         assert!(
-            !permissions.contains(Permission::WriteWorkspace),
-            "Work darf eine entzogene Permission nicht zurückgeben"
+            permissions.contains(Permission::WriteWorkspace),
+            "Work muss die Basis-Permission zurückgeben — sonst wäre /mode eine Ratsche"
         );
         assert!(
             !permissions.contains(Permission::ExecuteProcess),
-            "Work darf keine Permission erfinden, die die Session nie hatte"
+            "Work darf keine Permission erfinden, die die Basis nie hatte"
         );
         assert!(permissions.contains(Permission::ReadWorkspace));
     }

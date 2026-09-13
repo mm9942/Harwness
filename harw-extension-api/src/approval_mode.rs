@@ -1,4 +1,4 @@
-//! Prozessweiter Freigabemodus.
+//! Freigabemodus.
 //!
 //! # Verantwortlichkeit
 //! Dieses Modul besitzt genau eine Sache: die Antwort auf die Frage „wie viel
@@ -8,20 +8,18 @@
 //!
 //! # Schlüsseltypen
 //! - [`ApprovalMode`] — die drei Stufen
-//! - [`current`] / [`set`] — Lesen und Setzen des aktiven Modus
+//! - [`ApprovalModeCell`] — die Instanz, in der ein Modus lebt
 //!
-//! # Warum prozessweit
-//! Ein harw-Prozess führt genau eine interaktive Sitzung, und der Modus ist
-//! eine Aussage dieser einen Person über diese eine Sitzung. Ihn stattdessen
-//! durch Registry, Session und Politik zu fädeln, würde jede dieser Schichten
-//! um einen Parameter erweitern, den nur eine einzige Stelle liest. Die
-//! Umschaltung wirkt sofort, nicht erst an der nächsten Turn-Grenze: eine
-//! Person, die gerade „alles fragen" wählt, meint den nächsten Aufruf, nicht
-//! den übernächsten Turn.
+//! # Warum pro Sitzung
+//! Der Modus lebt pro Session in einer [`ApprovalModeCell`], nicht
+//! prozessweit: eine Sitzung und ihre Kind-Sitzungen teilen sich einen Klon
+//! derselben Zelle, ohne dass Registry, Session und Politik dafür einen
+//! globalen Zustand fädeln müssten. Die Umschaltung wirkt sofort, nicht erst
+//! an der nächsten Turn-Grenze: eine Person, die gerade „alles fragen"
+//! wählt, meint den nächsten Aufruf, nicht den übernächsten Turn.
 //!
 //! # Nebenläufigkeit
-//! Der Zustand liegt in einem [`AtomicU8`] und ist von jedem Thread aus les-
-//! und schreibbar, ohne Sperre.
+//! Siehe [`ApprovalModeCell`] für die Details zu Sperre und Vergiftung.
 //!
 //! # Fehler
 //! Das Modul erzeugt keine Fehler. Ein unbekannter Name führt in
@@ -29,15 +27,16 @@
 //!
 //! # Beispiele
 //! ```rust
-//! use harw_extension_api::approval_mode::{self, ApprovalMode};
+//! use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
 //!
 //! assert_eq!(ApprovalMode::parse("full"), Some(ApprovalMode::FullAccess));
-//! approval_mode::set(ApprovalMode::AlwaysAsk);
-//! assert_eq!(approval_mode::current(), ApprovalMode::AlwaysAsk);
-//! approval_mode::set(ApprovalMode::Delegated);
+//!
+//! let cell = ApprovalModeCell::new(ApprovalMode::AlwaysAsk);
+//! assert_eq!(cell.get(), ApprovalMode::AlwaysAsk);
+//! cell.set(ApprovalMode::Delegated);
+//! assert_eq!(cell.get(), ApprovalMode::Delegated);
 //! ```
 
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Wie viel ein Werkzeugaufruf ohne Rückfrage tun darf.
@@ -111,25 +110,6 @@ impl ApprovalMode {
 
     /// Alle Stufen in der Reihenfolge zunehmender Autorität.
     pub const ALL: [Self; 3] = [Self::AlwaysAsk, Self::Delegated, Self::FullAccess];
-
-    // Numerische Darstellung für den atomaren Zustand.
-    fn to_repr(self) -> u8 {
-        match self {
-            Self::AlwaysAsk => 0,
-            Self::Delegated => 1,
-            Self::FullAccess => 2,
-        }
-    }
-
-    // Umkehrung von `to_repr`. Ein unerwarteter Wert fällt auf die
-    // Voreinstellung zurück, statt weiter zu öffnen.
-    fn from_repr(repr: u8) -> Self {
-        match repr {
-            0 => Self::AlwaysAsk,
-            2 => Self::FullAccess,
-            _ => Self::Delegated,
-        }
-    }
 }
 
 impl Default for ApprovalMode {
@@ -146,16 +126,14 @@ impl std::fmt::Display for ApprovalMode {
     }
 }
 
-/// Geteilte, klonbare Zelle für einen [`ApprovalMode`] — die Instanz-Variante
-/// zum prozessweiten [`current`]/[`set`].
+/// Geteilte, klonbare Zelle für einen [`ApprovalMode`].
 ///
 /// # Verantwortlichkeit
-/// Wo [`current`]/[`set`] einen einzigen, globalen Zustand für den gesamten
-/// Prozess führen, trägt `ApprovalModeCell` ihren Zustand selbst: mehrere
-/// Klone teilen sich denselben Modus (nützlich, wenn z. B. eine Sitzung und
-/// ihre Kind-Sitzungen denselben Modus sehen sollen, ohne den globalen
-/// Prozesszustand zu berühren), während [`Self::detached`] eine unabhängige
-/// Kopie erzeugt, die ab diesem Zeitpunkt keinen Zustand mehr teilt.
+/// `ApprovalModeCell` trägt ihren Zustand selbst: mehrere Klone teilen sich
+/// denselben Modus (nützlich, wenn z. B. eine Sitzung und ihre
+/// Kind-Sitzungen denselben Modus sehen sollen), während [`Self::detached`]
+/// eine unabhängige Kopie erzeugt, die ab diesem Zeitpunkt keinen Zustand
+/// mehr teilt.
 ///
 /// # Nebenläufigkeit
 /// Innen ein `Arc<RwLock<ApprovalMode>>`: viele gleichzeitige Leser, ein
@@ -246,46 +224,15 @@ impl std::fmt::Debug for ApprovalModeCell {
 }
 
 impl Default for ApprovalModeCell {
-    /// Startet mit [`ApprovalMode::default`] (`Delegated`) — derselbe
-    /// Startwert wie das prozessweite [`current`]/[`set`].
+    /// Startet mit [`ApprovalMode::default`] (`Delegated`).
     fn default() -> Self {
         Self::new(ApprovalMode::default())
     }
 }
 
-// Der aktive Modus. Startwert 1 ist `Delegated`.
-static ACTIVE: AtomicU8 = AtomicU8::new(1);
-
-/// Liest den aktiven Freigabemodus.
-///
-/// # Rückgabe
-/// Den zuletzt über [`set`] gewählten Modus, sonst [`ApprovalMode::default`].
-///
-/// # Nebenläufigkeit
-/// Sperrenfrei, von jedem Thread aus aufrufbar.
-#[must_use]
-pub fn current() -> ApprovalMode {
-    ApprovalMode::from_repr(ACTIVE.load(Ordering::Relaxed))
-}
-
-/// Setzt den aktiven Freigabemodus.
-///
-/// # Beschreibung
-/// Die Änderung gilt ab dem nächsten Werkzeugaufruf, auch innerhalb eines
-/// bereits laufenden Turns.
-///
-/// # Arguments
-/// - `mode` (`ApprovalMode`): die neue Stufe.
-///
-/// # Nebenläufigkeit
-/// Sperrenfrei, von jedem Thread aus aufrufbar.
-pub fn set(mode: ApprovalMode) {
-    ACTIVE.store(mode.to_repr(), Ordering::Relaxed);
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{ApprovalMode, ApprovalModeCell, current, set};
+    use super::{ApprovalMode, ApprovalModeCell};
 
     #[test]
     fn test_parse_recognizes_all_short_names() {
@@ -333,20 +280,18 @@ mod tests {
         assert_eq!(ApprovalMode::default(), ApprovalMode::Delegated);
     }
 
-    // `set`/`current` teilen sich einen prozessweiten `AtomicU8`. Tests laufen
-    // parallel im selben Prozess, darum bündelt dieser eine Test jeden
-    // Übergang und stellt am Ende ausdrücklich `Delegated` wieder her, damit
-    // andere Tests im selben Binary den Startwert vorfinden.
     #[test]
-    fn test_set_then_current_returns_the_set_mode() {
-        set(ApprovalMode::AlwaysAsk);
-        assert_eq!(current(), ApprovalMode::AlwaysAsk);
+    fn test_cell_set_then_get_returns_the_set_mode() {
+        let cell = ApprovalModeCell::default();
 
-        set(ApprovalMode::FullAccess);
-        assert_eq!(current(), ApprovalMode::FullAccess);
+        cell.set(ApprovalMode::AlwaysAsk);
+        assert_eq!(cell.get(), ApprovalMode::AlwaysAsk);
 
-        set(ApprovalMode::Delegated);
-        assert_eq!(current(), ApprovalMode::Delegated);
+        cell.set(ApprovalMode::FullAccess);
+        assert_eq!(cell.get(), ApprovalMode::FullAccess);
+
+        cell.set(ApprovalMode::Delegated);
+        assert_eq!(cell.get(), ApprovalMode::Delegated);
     }
 
     #[test]

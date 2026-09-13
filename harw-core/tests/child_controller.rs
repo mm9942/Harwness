@@ -781,7 +781,7 @@ async fn test_clamp_child_reasoning_effort_no_cap_keeps_base_unchanged() {
 }
 
 #[tokio::test]
-async fn test_clamp_child_reasoning_effort_no_base_with_cap_stays_none() {
+async fn test_clamp_child_reasoning_effort_no_base_with_cap_falls_back_to_the_default() {
     // `managed_parent` builds a parent with no reasoning-effort level set, so
     // `admit()` never inherits a base into the child.
     let (manager, parent, sandbox) = managed_parent();
@@ -804,9 +804,11 @@ async fn test_clamp_child_reasoning_effort_no_base_with_cap_stays_none() {
         .clamp_child_reasoning_effort(&child, Some(ReasoningEffort::High), None)
         .expect("known child clamps cleanly");
 
-    // A cap is a pure upper bound: without an inherited base it introduces no
-    // level of its own.
-    assert_eq!(effective, None);
+    // F-017/E3b: a missing inherited base is not a free pass. Without a base,
+    // `DEFAULT_CHILD_REASONING_EFFORT` (`Medium`) stands in for it, and the
+    // cap still clamps downward from there — here `min(Medium, High)` keeps
+    // `Medium`, so the cap has no further effect but the default is not lost.
+    assert_eq!(effective, Some(ReasoningEffort::Medium));
 }
 
 #[tokio::test]
