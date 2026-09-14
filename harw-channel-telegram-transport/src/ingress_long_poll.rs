@@ -126,6 +126,9 @@ pub fn spawn_long_poll_thread(
 
 fn run_thread(config: LongPollConfig) -> TransportResult<()> {
     tokio::runtime::Builder::new_current_thread()
+        // `TelegramClient` uses Reqwest/Hyper TCP sockets. `enable_time` alone
+        // lets retries sleep but panics on the first socket operation.
+        .enable_io()
         .enable_time()
         .build()
         .map_err(TelegramTransportError::from)?
