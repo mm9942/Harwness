@@ -583,7 +583,10 @@ impl FilePlanStore {
         // maßgebliche Fortsetzung und werden ohne neue History-Einträge erneut
         // auf den geladenen Zustand angewendet.
         let mut plan = plan;
-        for event in history.iter().filter(|event| event.revision > plan.revision) {
+        for event in &history {
+            if event.revision <= plan.revision {
+                continue;
+            }
             apply_mutation(&mut plan, &event.action, &event.actor, event.applied_at);
             plan.updated_at = event.applied_at;
             plan.revision = event.revision;

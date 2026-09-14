@@ -14,8 +14,8 @@
 //! kennt). [`PlanSection::validate`] prüft trotzdem, dass nur bekannte
 //! Knotenart-Namen auftauchen, damit Tippfehler früh auffallen.
 //!
-//! `enabled = false` (Default) muss laut Design-Doku die Registrierung des
-//! Tools **vollständig** entfernen — dieses Modul liefert nur die
+//! Der Planmodus ist standardmäßig aktiv. `enabled = false` entfernt die
+//! Registrierung weiterhin vollständig; dieses Modul liefert nur die
 //! deklarative Konfiguration, das Entfernen selbst obliegt dem Consumer.
 
 use serde::{Deserialize, Serialize};
@@ -33,17 +33,17 @@ pub struct ToolsSection {
 /// `[tools.plan]` — Sichtbarkeit, Persistenz und Validierungs-Policy des
 /// Planning-Tools. Alle Felder haben hart-codierte Defaults, sodass eine
 /// `config.toml` ohne `[tools.plan]` weiterhin gültig ist und das Tool
-/// standardmäßig deaktiviert bleibt.
+/// standardmäßig aktiv bleibt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanSection {
-    /// Schaltet das Plan-Tool frei. `false` (Default) muss die Registrierung
-    /// beim Consumer vollständig entfernen, nicht nur "leer" lassen.
-    #[serde(default)]
+    /// Schaltet das Plan-Tool frei. Der Default ist `true`; `false` entfernt
+    /// die Registrierung beim Consumer vollständig, nicht nur "leer".
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Persistiert Pläne über Prozessgrenzen hinweg (`FilePlanStore` statt
     /// `InMemoryPlanStore`).
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub persist: bool,
     /// Erzwingt die Nutzung des Plan-Tools, sobald die Runtime eine Aufgabe
     /// als "komplex" einstuft.
@@ -78,8 +78,8 @@ pub struct PlanSection {
 impl Default for PlanSection {
     fn default() -> Self {
         Self {
-            enabled: false,
-            persist: false,
+            enabled: default_true(),
+            persist: default_true(),
             require_for_complex_work: false,
             validate_dependency_cycles: default_true(),
             validate_write_conflicts: default_true(),
@@ -156,8 +156,8 @@ mod tests {
     #[test]
     fn test_plan_section_defaults_from_empty_toml() {
         let section: PlanSection = toml::from_str("").unwrap();
-        assert!(!section.enabled);
-        assert!(!section.persist);
+        assert!(section.enabled);
+        assert!(section.persist);
         assert!(!section.require_for_complex_work);
         assert!(section.validate_dependency_cycles);
         assert!(section.validate_write_conflicts);

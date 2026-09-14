@@ -8,6 +8,58 @@ pub fn load_system_prompt(agent_dir: &Path, system_file: Option<&str>) -> Config
     read_optional_file(&path)
 }
 
+/// Lädt die beiden benutzerpflegbaren UIA-Kontextdateien aus deren Agentenordner.
+///
+/// `Personality.md` prägt ausschließlich Ton, Persönlichkeit und
+/// Antwortverhalten. `USER.md` enthält persönlichen Kontext über den Nutzer.
+/// Beide Dateien bleiben optional und werden als getrennte, gekennzeichnete
+/// Modellkontext-Fragmente zurückgegeben; technische Autorisierung kommt
+/// weiterhin ausschließlich aus `definition.toml`, Runtime und Sandbox.
+pub fn load_uia_personalization(agent_dir: &Path) -> ConfigResult<Vec<String>> {
+    let personality = read_optional_file(&configured_file_path(
+        agent_dir,
+        "Personality.md",
+        "Personality.md",
+    )?)?;
+    let user = read_optional_file(&configured_file_path(agent_dir, "USER.md", "USER.md")?)?;
+
+    let mut fragments = Vec::new();
+    if !personality.trim().is_empty() {
+        fragments.push(format!(
+            "# UIA-Persönlichkeit und Antwortverhalten\n{personality}"
+        ));
+    }
+    if !user.trim().is_empty() {
+        fragments.push(format!("# Nutzerkontext (USER.md)\n{user}"));
+    }
+    Ok(fragments)
+}
+
+/// Liest den freiwillig hinterlegten Anzeigenamen aus der `USER.md` einer UIA.
+///
+/// Nur eine eigene Zeile im Format `Name: Ada` (Groß-/Kleinschreibung des
+/// Feldnamens ist unerheblich) gilt als Anzeigename. Sonstiger persönlicher
+/// Kontext wird bewusst nicht geraten oder als Name ausgegeben.
+pub fn load_uia_user_name(agent_dir: &Path) -> ConfigResult<Option<String>> {
+    let user = read_optional_file(&configured_file_path(agent_dir, "USER.md", "USER.md")?)?;
+    Ok(user.lines().find_map(user_name_from_line))
+}
+
+fn user_name_from_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    let line = line.strip_prefix('-').map_or(line, str::trim_start);
+    let (label, value) = line.split_once(':')?;
+    // USER.md ist Markdown: neben `Name: Mia` ist daher auch der übliche
+    // Listenpunkt `- **Name:** Mia` ein explizites Namensfeld.
+    let label = label.trim().trim_matches('*').trim();
+    if !label.eq_ignore_ascii_case("name") {
+        return None;
+    }
+
+    let value = value.trim().trim_matches(['"', '\'']).trim();
+    (!value.is_empty() && !value.chars().any(char::is_control)).then(|| value.to_owned())
+}
+
 /// Lädt Skill-Instructions.
 pub fn load_skill_instructions(
     skill_dir: &Path,
@@ -214,6 +266,55 @@ mod tests {
         );
         fs::remove_dir_all(&skill_directory).unwrap();
         fs::remove_dir_all(&outside_directory).unwrap();
+    }
+
+    #[test]
+    fn uia_personalization_keeps_personality_and_user_context_separate() {
+        let directory = test_directory();
+        fs::write(directory.join("Personality.md"), "warm and concise").unwrap();
+        fs::write(directory.join("USER.md"), "prefers German").unwrap();
+
+        let fragments = load_uia_personalization(&directory).expect("load UIA files");
+        assert_eq!(fragments.len(), 2);
+        assert!(fragments[0].contains("UIA-Persönlichkeit"));
+        assert!(fragments[0].contains("warm and concise"));
+        assert!(fragments[1].contains("Nutzerkontext"));
+        assert!(fragments[1].contains("prefers German"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn uia_user_name_reads_only_an_explicit_name_field() {
+        let directory = test_directory();
+        fs::write(directory.join("USER.md"), "# Nutzerkontext\n- Name: Mia\nprefers German").unwrap();
+
+        assert_eq!(load_uia_user_name(&directory).unwrap().as_deref(), Some("Mia"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn uia_user_name_reads_a_markdown_emphasized_name_field() {
+        let directory = test_directory();
+        fs::write(directory.join("USER.md"), "# Nutzerprofil: Mia\n\n- **Name:** Mia").unwrap();
+
+        assert_eq!(load_uia_user_name(&directory).unwrap().as_deref(), Some("Mia"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn uia_user_name_ignores_unstructured_context() {
+        let directory = test_directory();
+        fs::write(directory.join("USER.md"), "Mia prefers German").unwrap();
+
+        assert_eq!(load_uia_user_name(&directory).unwrap(), None);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn uia_personalization_allows_missing_files() {
+        let directory = test_directory();
+        assert!(load_uia_personalization(&directory).unwrap().is_empty());
+        fs::remove_dir(directory).unwrap();
     }
 
     #[test]

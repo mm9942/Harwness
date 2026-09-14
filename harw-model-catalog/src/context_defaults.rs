@@ -63,7 +63,10 @@ use crate::runtime::ContextPolicy;
 /// der [`program_defaults_for`] alle anderen Stufen abwärts verengt — er
 /// selbst wird gegen nichts verengt, weil er per Definition die weiteste
 /// Vorgabe ist, die dieser Katalog jemals ausgibt.
-const BROAD_CONTEXT_RAW_TOTAL: u32 = 128_000;
+/// 512k lässt große Repositories, Architektur-Notizen und mehrere relevante
+/// Dateien im selben Arbeitskontext zu. Die effektive Obergrenze bleibt durch
+/// das deklarierte Kontextfenster des gewählten Modells begrenzt.
+const BROAD_CONTEXT_RAW_TOTAL: u32 = 512_000;
 
 /// Rohvorgabe für `ContextPolicy::Balanced` — ausgewogenes Fenster.
 ///
@@ -71,14 +74,14 @@ const BROAD_CONTEXT_RAW_TOTAL: u32 = 128_000;
 /// `BroadContext`-Obergrenze auf diesen Wert per `tighten`, sodass
 /// `Balanced` strukturell nie größer als `BroadContext` sein kann, selbst
 /// wenn dieser Wert versehentlich zu groß gewählt würde.
-const BALANCED_RAW_TOTAL: u32 = 32_000;
+const BALANCED_RAW_TOTAL: u32 = 128_000;
 
 /// Rohvorgabe für `ContextPolicy::TightSelect` — enges, fokussiertes Fenster.
 ///
 /// Wird nie direkt zurückgegeben; [`program_defaults_for`] verengt zuerst auf
 /// [`BALANCED_RAW_TOTAL`] und dann auf diesen Wert, sodass `TightSelect`
 /// strukturell nie größer als `Balanced` oder `BroadContext` sein kann.
-const TIGHT_SELECT_RAW_TOTAL: u32 = 8_000;
+const TIGHT_SELECT_RAW_TOTAL: u32 = 32_000;
 
 /// Baut eine [`ContextBudgetSpec`] mit gegebenem Gesamtbudget und ohne
 /// Sektions-Feinabstufung — der Katalog kennt keine konkreten Sektionsnamen,
@@ -160,15 +163,15 @@ mod tests {
     fn test_program_defaults_for_known_policies() {
         assert_eq!(
             program_defaults_for(&ContextPolicy::TightSelect).total.total,
-            8_000
-        );
-        assert_eq!(
-            program_defaults_for(&ContextPolicy::Balanced).total.total,
             32_000
         );
         assert_eq!(
-            program_defaults_for(&ContextPolicy::BroadContext).total.total,
+            program_defaults_for(&ContextPolicy::Balanced).total.total,
             128_000
+        );
+        assert_eq!(
+            program_defaults_for(&ContextPolicy::BroadContext).total.total,
+            512_000
         );
     }
 
@@ -194,7 +197,7 @@ mod tests {
             ContextPolicy::Balanced,
             ContextPolicy::BroadContext,
         ];
-        let requested_totals = [0, 1, 8_000, 32_000, 128_000, 500_000, u32::MAX];
+        let requested_totals = [0, 1, 32_000, 128_000, 512_000, 1_000_000, u32::MAX];
 
         for policy in policies {
             let catalog_default = program_defaults_for(&policy);

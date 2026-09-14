@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 /// # Varianten
 /// - `UserInterface` — sichtbare Benutzeroberfläche; darf nur Root-Orchestratoren spawnen.
 /// - `RootOrchestrator` — Wurzel eines Agenten-Baums; darf Child-Orchestratoren und Worker spawnen.
-/// - `ChildOrchestrator` — Untergeordneter Orchestrator; darf weitere Child-Orchestratoren (innerhalb der Tiefe) und Worker spawnen.
+/// - `ChildOrchestrator` — Untergeordneter Orchestrator; darf Worker spawnen. Weitere Child-Orchestratoren benötigen zusätzlich eine exakte Freigabe aus der Agentendefinition.
 /// - `Worker` — Ausführungsworker; darf keine dauerhaften Agenten spawnen.
 ///
 /// # Beispiele
@@ -84,7 +84,8 @@ pub fn can_spawn(caller: AgentRoleId, target: AgentRoleId) -> bool {
         (AgentRoleId::RootOrchestrator, AgentRoleId::Worker) => true,
         (AgentRoleId::RootOrchestrator, _) => false,
 
-        // ChildOrchestrator → ChildOrchestrator (innerhalb der Tiefe) und Worker
+        // ChildOrchestrator → ChildOrchestrator is only the sealed role upper bound;
+        // the runtime additionally requires an exact definition-level grant.
         (AgentRoleId::ChildOrchestrator, AgentRoleId::ChildOrchestrator) => true,
         (AgentRoleId::ChildOrchestrator, AgentRoleId::Worker) => true,
         (AgentRoleId::ChildOrchestrator, _) => false,

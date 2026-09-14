@@ -1,5 +1,10 @@
 #![forbid(unsafe_code)]
 
+//! Konfigurationsdateien und ihre typisierten Repräsentationen.
+//!
+//! Das Laden und Mergen mehrerer Konfigurationsebenen geschieht über
+//! [`discovery::discover_config`].
+
 pub mod agent_toml;
 pub mod auth_toml;
 pub mod browser_toml;
@@ -41,7 +46,9 @@ pub use harness_config::{
     HarnessConfig, LoggingSection, McpJobCapabilityToml, McpListenerSection, McpPrincipalToml,
     PolicySection, SessionSection, TuiSection,
 };
-pub use loader::{load_skill_instructions, load_system_prompt};
+pub use loader::{
+    load_skill_instructions, load_system_prompt, load_uia_personalization, load_uia_user_name,
+};
 pub use mcp_toml::{McpServerToml, McpTransportToml};
 pub use mode_toml::ModeSection;
 pub use model_toml::{ModelCapabilitiesToml, ModelToml};

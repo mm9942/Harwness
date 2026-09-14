@@ -38,6 +38,8 @@ tokio = { version = "1.52.3", features = ["macros", "rt", "sync", "time"] }
 tracing = "0.1.44"
 harw-home = { version = "0.2.0", path = "../harw-home" }
 harw-runtime = { path = "../harw-runtime" }
+# Uhrzeit und Datum für die einmalige, kontextbezogene TUI-Begrüßung.
+time = { version = "0.3.53", features = ["formatting"] }
 
 [dev-dependencies]
 harw-tools = { path = "../harw-tools" }

@@ -72,6 +72,7 @@ use std::time::SystemTime;
 
 use ratatui::text::Line;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use time::OffsetDateTime;
 
 use harw_core::{AgentSession, ModelProvider, StateStore};
 use harw_extension_api::ApprovalHandler;
@@ -84,7 +85,7 @@ use harw_types::{Clock, SessionId, SystemClock};
 
 use crate::app::{
     ChatApp, ResumeSessionSelector, TerminalGuard, TuiError, TuiPlanServices, TuiRunOutcome,
-    WELCOME, frame_scheduler, install_loaded_history, run_loop,
+    frame_scheduler, install_loaded_history, run_loop,
 };
 use crate::approval::{ApprovalDriver, ApprovalPromptReceiver, TuiApprovalHandler};
 use crate::events::harw_event_channel;
@@ -93,6 +94,76 @@ use crate::input_reader::spawn_input_reader;
 use crate::session_controller::TuiSessionController;
 use crate::session_picker::SessionEntry;
 use crate::tui_event::TuiEvent;
+
+/// Erzeugt die einmalige Begrüßung einer TUI-Sitzung aus lokalem Kontext.
+///
+/// Sie ist reine Anzeige und wird nie als Nutzereingabe oder persistierte
+/// Conversation-History behandelt. Die Uhrzeit wird explizit als UTC markiert,
+/// damit die Ausgabe auch ohne verfügbare lokale Zeitzonendaten eindeutig bleibt.
+fn tui_greeting(
+    project_root: &str,
+    uia_definition: Option<&str>,
+    uia_user_name: Option<&str>,
+) -> String {
+    // Der in USER.md freiwillig hinterlegte Name gehört zum UIA-Kontext und
+    // gewinnt deshalb vor dem technischen Login-Namen. Fehlt er, bleibt die
+    // Begrüßung auch für ältere oder unpersonalisierte UIAs funktionsfähig.
+    let user = uia_user_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            std::env::var("USER")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_else(|| "da".to_owned());
+    tui_greeting_at(project_root, uia_definition, &user, OffsetDateTime::now_utc())
+}
+
+/// Liest den optionalen Anzeigenamen der aktiven UIA aus ihrer `USER.md`.
+///
+/// Die Runtime hat dieselbe Datei bereits als UIA-Personalisierung validiert.
+/// Ein fehlender Name ist kein Fehler: Dann verwendet [`tui_greeting`] den
+/// Login-Namen als Rückfall. Ein Leseproblem wird ebenfalls nicht in der
+/// Anzeige eskaliert, weil eine Begrüßung die gestartete Sitzung nicht
+/// unbenutzbar machen darf.
+fn active_uia_user_name(assembly: &RuntimeAssembly) -> Option<String> {
+    let config = assembly.config();
+    let definition = config.harness.active_uia_definition.as_deref()?;
+    let agent_dir = config.agent_definition_dirs.get(definition)?;
+    harw_config::load_uia_user_name(agent_dir).ok().flatten()
+}
+
+/// Deterministischer Kern der TUI-Begrüßung; getrennt für die Tests.
+fn tui_greeting_at(
+    project_root: &str,
+    uia_definition: Option<&str>,
+    user: &str,
+    now: OffsetDateTime,
+) -> String {
+    let salutation = match now.hour() {
+        5..=11 => "Guten Morgen",
+        12..=17 => "Guten Tag",
+        18..=22 => "Guten Abend",
+        _ => "Gute Nacht",
+    };
+    let workspace = Path::new(project_root)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("dieser Workspace");
+    let uia = uia_definition
+        .and_then(|definition| definition.rsplit('.').next())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Harw");
+    format!(
+        "{uia}: {salutation}, {user}! Bereit für »{workspace}« — {} {:02}:{:02} UTC. Womit beginnen wir?",
+        now.date(),
+        now.hour(),
+        now.minute(),
+    )
+}
 
 /// Hinweis, wenn `/resume` ohne konfigurierte [`TuiResume`] eintrifft.
 const RESUME_NOT_CONFIGURED: &str = "Session resume is not configured.";
@@ -434,7 +505,12 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
         }
     };
     install_loaded_history(&mut session, &mut app, history);
-    app.push_lines(vec![Line::from(WELCOME)]);
+    let uia_user_name = active_uia_user_name(&assembly);
+    app.push_lines(vec![Line::from(tui_greeting(
+        app.project_root(),
+        assembly.config().harness.active_uia_definition.as_deref(),
+        uia_user_name.as_deref(),
+    ))]);
     let mut gateway = ResumableGateway::new(
         session,
         Arc::clone(assembly.state_store()),
@@ -759,7 +835,12 @@ async fn resume_session(
         }
     };
     install_loaded_history(&mut runtime.session, &mut runtime.app, history);
-    runtime.app.push_lines(vec![Line::from(WELCOME)]);
+    let uia_user_name = active_uia_user_name(&assembly);
+    runtime.app.push_lines(vec![Line::from(tui_greeting(
+        runtime.app.project_root(),
+        assembly.config().harness.active_uia_definition.as_deref(),
+        uia_user_name.as_deref(),
+    ))]);
     Ok(ResumedRuntime { assembly, runtime })
 }
 
@@ -1152,5 +1233,42 @@ mod tests {
         let entries = session_entries(temp.path(), vec![SessionId::from_str("../escape")]);
 
         assert!(entries.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod greeting_tests {
+    use super::tui_greeting_at;
+    use time::{Date, Month, PrimitiveDateTime, Time};
+
+    #[test]
+    fn greeting_uses_workspace_user_date_and_time() {
+        let now = PrimitiveDateTime::new(
+            Date::from_calendar_date(2026, Month::September, 14).unwrap(),
+            Time::from_hms(19, 5, 0).unwrap(),
+        )
+        .assume_utc();
+        let greeting = tui_greeting_at("/work/Harwness", Some("harwness.agent.emily-ui"), "Mia", now);
+        assert!(greeting.starts_with("emily-ui: Guten Abend, Mia!"));
+        assert!(greeting.contains("»Harwness«"));
+        assert!(greeting.contains("2026-09-14 19:05 UTC"));
+    }
+
+    #[test]
+    fn greeting_prefers_the_explicit_user_profile_name() {
+        let now = PrimitiveDateTime::new(
+            Date::from_calendar_date(2026, Month::September, 14).unwrap(),
+            Time::from_hms(11, 4, 0).unwrap(),
+        )
+        .assume_utc();
+
+        let greeting = tui_greeting_at(
+            "/work/Harwness",
+            Some("harwness.agent.terminal-ui@1"),
+            "Mia",
+            now,
+        );
+
+        assert!(greeting.starts_with("terminal-ui@1: Guten Morgen, Mia!"));
     }
 }

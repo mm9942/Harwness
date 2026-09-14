@@ -202,6 +202,14 @@ pub fn run_chat(
     let spec = runtime_spec(entry, &home, &cwd, local_principal(surface));
     let mut config = load_chat_config(&spec)?;
 
+    // Ein lokaler Chat braucht immer eine UIA. Fehlt die Auswahl, verwenden
+    // wir eine vorhandene UIA oder erzeugen eine minimale lokale Definition;
+    // danach wird die Konfiguration neu geladen, damit die Runtime exakt den
+    // persistenten Profilwert validiert und montiert.
+    if crate::uia_bootstrap::ensure_active_uia(&home, &config)?.is_some() {
+        config = load_chat_config(&spec)?;
+    }
+
     // Erststart-Fluss: nur wenn der Home-Workspace noch nicht einsatzbereit ist,
     // führt der Wizard durch die Einrichtung. „Einsatzbereit" heißt: die
     // `onboarding.seen`-Flags sind vollständig ODER es sind bereits ein

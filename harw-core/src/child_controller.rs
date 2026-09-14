@@ -2577,6 +2577,21 @@ impl ManagedAgentSpawner {
                 parent_context.organizational_role, definition.organizational_role
             )));
         }
+        // The sealed role matrix is only a coarse upper bound. Delegating a
+        // child orchestrator additionally needs an exact, frozen grant from
+        // the parent's own agent definition. Worker delegation remains
+        // available to eligible orchestrators without this list.
+        if definition.organizational_role
+            == harw_agent_dsl::roles::AgentRoleId::ChildOrchestrator
+            && !parent_context
+                .allowed_child_orchestrators
+                .iter()
+                .any(|allowed| allowed == role_name)
+        {
+            return Err(Self::reject(format!(
+                "parent definition does not explicitly permit spawning child orchestrator '{role_name}'"
+            )));
+        }
 
         let mut active = self
             .active
@@ -2687,6 +2702,12 @@ impl ManagedAgentSpawner {
                 capability_snapshot,
                 approval_actor,
                 organizational_role: definition.organizational_role,
+                // This grant belongs to the child definition, not its parent.
+                // An absent IR/list is default-deny for its future
+                // child-orchestrator delegation.
+                allowed_child_orchestrators: executable_ir
+                    .map(|ir| ir.spawn_contract().child_orchestrators().to_vec())
+                    .unwrap_or_default(),
                 trace: child_trace.clone(),
                 // AW2-02: dieselbe Decke, die soeben neben der Sandbox
                 // geschnitten wurde — kein zweiter, separater Zustand.
@@ -4001,10 +4022,14 @@ admitted = ["fs.read"]
             ExtensionRegistryBuilder::default().build(),
             events,
         )
-        .with_spawn_context(external_root_context(
-            sandbox.clone(),
-            harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
-        ));
+        .with_spawn_context({
+            let mut context = external_root_context(
+                sandbox.clone(),
+                harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+            );
+            context.allowed_child_orchestrators.push("manager".to_owned());
+            context
+        });
         let root = root_session.id().clone();
         manager
             .lock()
@@ -4030,6 +4055,36 @@ admitted = ["fs.read"]
                 Arc::new(EmptyChildRegistry),
             );
         (spawner, root, sandbox)
+    }
+
+    #[test]
+    fn child_orchestrator_spawn_requires_an_exact_parent_grant() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let root = SessionId::new();
+        let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative())
+            .with_role(
+                "specialist",
+                AgentRole::Agent { name: "specialist".to_owned() },
+                harw_agent_dsl::roles::AgentRoleId::ChildOrchestrator,
+                Arc::new(EmptyChildRegistry),
+            )
+            .with_external_root_parent(
+                root.clone(),
+                external_root_context(
+                    sandbox.clone(),
+                    harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+                ),
+                None,
+                SessionActivation::default(),
+            )
+            .expect("external root registers");
+
+        let error = spawner
+            .admit("specialist", spawn_input(root), sandbox, None)
+            .expect_err("a missing exact grant must deny child orchestration");
+        assert!(error.message.contains("does not explicitly permit"));
     }
 
     #[test]
@@ -4281,6 +4336,7 @@ effort_cap = "ludicrous"
             capability_snapshot: None,
             approval_actor: None,
             organizational_role: harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+            allowed_child_orchestrators: vec!["manager".to_owned()],
             trace: Some(root_trace.clone()),
             ceiling: None,
         };
@@ -4606,6 +4662,7 @@ must_include = ["secrets.vault"]
             capability_snapshot: None,
             approval_actor: None,
             organizational_role: harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+            allowed_child_orchestrators: vec!["manager".to_owned()],
             trace: None,
             ceiling: Some(root_ceiling.clone()),
         };
@@ -5077,10 +5134,14 @@ admitted = ["fs.read", "shell.exec"]
             ExtensionRegistryBuilder::default().build(),
             events,
         )
-        .with_spawn_context(external_root_context(
-            sandbox.clone(),
-            harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
-        ))
+        .with_spawn_context({
+            let mut context = external_root_context(
+                sandbox.clone(),
+                harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+            );
+            context.allowed_child_orchestrators.push("middle".to_owned());
+            context
+        })
         .with_activation(root_activation);
         let root = root_session.id().clone();
         manager

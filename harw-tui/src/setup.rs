@@ -199,7 +199,7 @@ pub struct SetupApp {
     /// Aktuell markierter Index in der **gefilterten** Liste (Provider) bzw. in
     /// der Auth-/Modell-Optionsliste, je nach Phase.
     selected: usize,
-    /// Vertikaler Scroll-Offset (Provider-Liste).
+    /// Vertikaler Scroll-Offset des Listenbereichs; folgt der Markierung.
     scroll: u16,
     /// Gewählter Provider (gesetzt beim Verlassen der Provider-Phase).
     chosen_provider: Option<ProviderSpec>,
@@ -947,7 +947,7 @@ fn setup_loop(
 ///
 /// Auswahl-Stile und Hinweiszeilen werden theme-abhängig über [`crate::style`]
 /// aufgelöst (SLICE 8).
-fn draw(guard: &mut TerminalGuard, app: &SetupApp) -> Result<(), TuiError> {
+fn draw(guard: &mut TerminalGuard, app: &mut SetupApp) -> Result<(), TuiError> {
     guard
         .terminal()
         .draw(|frame| {
@@ -961,14 +961,47 @@ fn draw(guard: &mut TerminalGuard, app: &SetupApp) -> Result<(), TuiError> {
             frame.render_widget(header, chunks[0]);
 
             let lines = body_lines(app);
-            let body = Paragraph::new(lines)
-                .block(Block::default().borders(Borders::ALL))
-                .wrap(Wrap { trim: false })
-                .scroll((app.scroll, 0));
-            frame.render_widget(body, chunks[1]);
+            let mut body = Paragraph::new(lines).block(Block::default().borders(Borders::ALL));
+            // Listen-Phasen: eine Zeile je Eintrag (kein Umbruch), damit der
+            // Zeilenindex der Markierung stimmt und der Offset ihr folgen kann.
+            if let Some(line) = selected_line_index(app) {
+                // Rahmen oben/unten abziehen.
+                let viewport = usize::from(chunks[1].height.saturating_sub(2)).max(1);
+                app.scroll = follow_scroll(usize::from(app.scroll), line, viewport);
+            } else {
+                app.scroll = 0;
+                body = body.wrap(Wrap { trim: false });
+            }
+            frame.render_widget(body.scroll((app.scroll, 0)), chunks[1]);
         })
         .map_err(TuiError::from)?;
     Ok(())
+}
+
+/// Zeilenindex der markierten Zeile in [`body_lines`], falls die Phase eine Liste ist.
+fn selected_line_index(app: &SetupApp) -> Option<usize> {
+    match app.stage {
+        // Kopfzeile „Filter: …“.
+        SetupStage::Provider => Some(1 + app.selected),
+        SetupStage::Api => Some(app.selected),
+        // Kopfzeile „[1-9] Direktwahl“.
+        SetupStage::Auth => Some(1 + app.selected),
+        // Hinweis, eigene Auswahl, Validierungsfehler.
+        SetupStage::Model => Some(3 + app.selected),
+        SetupStage::Endpoint | SetupStage::Done => None,
+    }
+}
+
+/// Minimal verschobener Scroll-Offset, der `line` im Sichtfenster hält.
+fn follow_scroll(current: usize, line: usize, viewport: usize) -> u16 {
+    let offset = if line < current {
+        line
+    } else if line >= current + viewport {
+        line + 1 - viewport
+    } else {
+        current
+    };
+    u16::try_from(offset).unwrap_or(u16::MAX)
 }
 
 /// Baut die phasenspezifischen Anzeigezeilen des Frames.
@@ -1500,5 +1533,82 @@ mod tests {
             !style::is_light(app.theme),
             "Standard-Theme ohne COLORFGBG muss Dark sein"
         );
+    }
+
+    // --- follow_scroll ---
+
+    #[test]
+    fn test_follow_scroll_line_inside_viewport_keeps_current_offset() {
+        // line 5 liegt im Fenster [current=2, current+viewport=12) -> Offset bleibt.
+        assert_eq!(follow_scroll(2, 5, 10), 2);
+    }
+
+    #[test]
+    fn test_follow_scroll_line_below_viewport_scrolls_minimally() {
+        // Reproduziert den ursprünglichen Bug: viele Modelle (z. B. OpenRouter)
+        // schieben die Markierung unter das Sichtfenster.
+        assert_eq!(follow_scroll(0, 30, 10), 21);
+    }
+
+    #[test]
+    fn test_follow_scroll_line_above_offset_scrolls_up_to_line() {
+        assert_eq!(follow_scroll(10, 3, 5), 3);
+    }
+
+    #[test]
+    fn test_follow_scroll_saturates_on_huge_values() {
+        // offset = 1_000_000 + 1 - 1 = 1_000_000, was u16 weit übersteigt ->
+        // Sättigung auf u16::MAX statt Panic/Wraparound. `usize::MAX` selbst
+        // würde bereits bei `line + 1` überlaufen und ist daher ungeeignet.
+        assert_eq!(follow_scroll(0, 1_000_000, 1), u16::MAX);
+    }
+
+    // --- selected_line_index ---
+
+    #[test]
+    fn test_selected_line_index_provider_stage_offsets_by_one() {
+        let mut app = SetupApp::new(vec![groq_provider(), ollama_provider()]);
+        app.selected = 1;
+        assert_eq!(selected_line_index(&app), Some(2));
+    }
+
+    #[test]
+    fn test_selected_line_index_api_stage_no_offset() {
+        let mut app = SetupApp::new(vec![groq_provider()]);
+        app.stage = SetupStage::Api;
+        app.selected = 4;
+        assert_eq!(selected_line_index(&app), Some(4));
+    }
+
+    #[test]
+    fn test_selected_line_index_auth_stage_offsets_by_one() {
+        let mut app = SetupApp::new(vec![groq_provider()]);
+        app.stage = SetupStage::Auth;
+        app.auth_options = vec![AuthOption::ApiKey, AuthOption::Custom];
+        app.selected = 1;
+        assert_eq!(selected_line_index(&app), Some(2));
+    }
+
+    #[test]
+    fn test_selected_line_index_model_stage_offsets_by_three() {
+        let mut app = SetupApp::new(vec![groq_provider()]);
+        app.stage = SetupStage::Model;
+        app.model_options = vec!["a".to_owned(), "b".to_owned()];
+        app.selected = 1;
+        assert_eq!(selected_line_index(&app), Some(4));
+    }
+
+    #[test]
+    fn test_selected_line_index_endpoint_stage_is_none() {
+        let mut app = SetupApp::new(vec![groq_provider()]);
+        app.stage = SetupStage::Endpoint;
+        assert_eq!(selected_line_index(&app), None);
+    }
+
+    #[test]
+    fn test_selected_line_index_done_stage_is_none() {
+        let mut app = SetupApp::new(vec![groq_provider()]);
+        app.stage = SetupStage::Done;
+        assert_eq!(selected_line_index(&app), None);
     }
 }

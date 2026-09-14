@@ -42,3 +42,5 @@ docs/remediation/AGENT-BRIEF.md
 
 # Lokales Auslieferungsarchiv (zu gross fuer GitHub)
 harw.zip
+.harw/
+harw-export-*

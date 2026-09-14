@@ -38,6 +38,9 @@ use harw_types::{TenantId, WorkspaceId};
 use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+mod cargo;
+pub use cargo::{CargoExecutionMode, CargoProfileError, CargoSandboxProfile};
+
 mod bwrap;
 pub use bwrap::{
     BwrapCommandPlan, BwrapLauncher, SANDBOX_PROXY_SOCKET_PATH, SANDBOX_RELAY_PATH, SandboxChild,
@@ -1220,6 +1223,8 @@ pub enum SandboxError {
     /// [`NetworkMode::ProxyOnly`] angefordert, aber die Sandbox trägt
     /// [`Permission::NetworkAccess`] nicht (fail-closed).
     NetworkModeNotGranted,
+    /// Ein Cargo-Fetch benötigt den expliziten Proxy-Netzpfad und mindestens ein erlaubtes Ziel.
+    CargoFetchNetworkDenied,
     /// [`RelaySpec`] verletzt eine Invariante; `field` benennt das Feld.
     InvalidRelaySpec {
         field: &'static str,
@@ -1275,6 +1280,10 @@ impl fmt::Display for SandboxError {
             Self::NetworkModeNotGranted => write!(
                 f,
                 "proxy-only network mode requires the network access permission"
+            ),
+            Self::CargoFetchNetworkDenied => write!(
+                f,
+                "Cargo fetch requires proxy-only network access and a non-empty network scope"
             ),
             Self::InvalidRelaySpec { field, reason } => {
                 write!(f, "invalid egress relay configuration ({field}): {reason}")

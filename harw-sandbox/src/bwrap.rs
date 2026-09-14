@@ -35,7 +35,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 
-use crate::{NetworkMode, Permission, RelaySpec, SandboxError, SandboxResult, SandboxSpec};
+use crate::{CargoExecutionMode, CargoSandboxProfile, NetworkMode, Permission, RelaySpec, SandboxError, SandboxResult, SandboxSpec};
 
 /// Feste Suchpfade für Bubblewrap in Prioritätsreihenfolge. `PATH` wird nie
 /// ausgewertet.
@@ -49,6 +49,10 @@ pub const SANDBOX_PROXY_SOCKET_PATH: &str = "/run/harw/egress.sock";
 
 // Elternverzeichnis beider fester Pfade; liegt auf dem tmpfs-Root der Sandbox.
 const SANDBOX_RUN_DIR: &str = "/run/harw";
+/// Fester Cargo-Programmname und Toolchain-Wurzel im Sandkasten.
+pub const SANDBOX_CARGO_PATH: &str = "/opt/harw/toolchain/bin/cargo";
+pub const SANDBOX_RUSTUP_HOME: &str = "/opt/harw/rustup";
+pub const SANDBOX_CARGO_HOME: &str = "/var/cache/harw/cargo";
 
 /// A fully determined Bubblewrap invocation. Keeping it inspectable makes
 /// policy tests possible without launching a process on the host.
@@ -73,6 +77,7 @@ pub struct BwrapLauncher {
     tmpfs_size: Option<NonZeroU64>,
     /// Netzmodus; Default [`NetworkMode::None`]. Nie Host-netns.
     network_mode: NetworkMode,
+    cargo_profile: Option<CargoSandboxProfile>,
 }
 
 impl Default for BwrapLauncher {
@@ -94,6 +99,7 @@ impl BwrapLauncher {
             executable,
             tmpfs_size: None,
             network_mode: NetworkMode::None,
+            cargo_profile: None,
         }
     }
 
@@ -185,6 +191,21 @@ impl BwrapLauncher {
         &self.network_mode
     }
 
+    /// Bindet eine zuvor validierte Rust-Toolchain an diesen Launcher. Das Profil
+    /// kann nur beim Aufbau des Launchers gesetzt werden; Tool-Aufrufe können es
+    /// nicht liefern oder auf einen beliebigen Host-Pfad umbiegen.
+    #[must_use]
+    pub fn with_cargo_profile(mut self, profile: CargoSandboxProfile) -> Self {
+        self.cargo_profile = Some(profile);
+        self
+    }
+
+    /// Das konfigurierte Cargo-Profil, falls die Sandbox Rust-Builds anbietet.
+    #[must_use]
+    pub fn cargo_profile(&self) -> Option<&CargoSandboxProfile> {
+        self.cargo_profile.as_ref()
+    }
+
     /// Produces a hermetic command plan. `command` must include the program as
     /// its first item and is only allowed when the sandbox granted process
     /// execution. The host network namespace is never shared: every plan
@@ -256,6 +277,21 @@ impl BwrapLauncher {
                 OsString::from(format!("socks5h://127.0.0.1:{}", spec.listen_port)),
             ]);
         }
+        if let Some(profile) = &self.cargo_profile {
+            if matches!(profile.mode(), CargoExecutionMode::Fetch)
+                && (relay.is_none() || sandbox.network_scope().is_empty())
+            {
+                return Err(SandboxError::CargoFetchNetworkDenied);
+            }
+            args.extend([
+                OsString::from("--setenv"), OsString::from("RUSTUP_HOME"), OsString::from(SANDBOX_RUSTUP_HOME),
+                OsString::from("--setenv"), OsString::from("CARGO_HOME"), OsString::from(SANDBOX_CARGO_HOME),
+                OsString::from("--setenv"), OsString::from("PATH"), OsString::from("/opt/harw/toolchain/bin:/usr/local/bin:/usr/bin:/bin"),
+            ]);
+            if profile.mode().offline() {
+                args.extend([OsString::from("--setenv"), OsString::from("CARGO_NET_OFFLINE"), OsString::from("true")]);
+            }
+        }
 
         for directory in ["/usr", "/bin", "/lib", "/lib64"] {
             let path = Path::new(directory);
@@ -266,6 +302,16 @@ impl BwrapLauncher {
                     path.as_os_str().to_owned(),
                 ]);
             }
+        }
+        if let Some(profile) = &self.cargo_profile {
+            let cargo_dir = profile.cargo_bin().parent().expect("canonical executable has a parent");
+            append_destination_dirs(&mut args, Path::new("/opt/harw/toolchain/bin"))?;
+            args.extend([OsString::from("--ro-bind"), cargo_dir.as_os_str().to_owned(), OsString::from("/opt/harw/toolchain/bin")]);
+            append_destination_dirs(&mut args, Path::new(SANDBOX_RUSTUP_HOME))?;
+            args.extend([OsString::from("--ro-bind"), profile.rustup_home().as_os_str().to_owned(), OsString::from(SANDBOX_RUSTUP_HOME)]);
+            append_destination_dirs(&mut args, Path::new(SANDBOX_CARGO_HOME))?;
+            args.push(if profile.mode().cache_writable() { OsString::from("--bind") } else { OsString::from("--ro-bind") });
+            args.extend([profile.cargo_home().as_os_str().to_owned(), OsString::from(SANDBOX_CARGO_HOME)]);
         }
         append_destination_dirs(&mut args, workspace)?;
         let write_allowed = sandbox.permissions().contains(Permission::WriteWorkspace);

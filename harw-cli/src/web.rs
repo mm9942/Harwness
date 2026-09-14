@@ -207,8 +207,11 @@ pub(crate) fn serve_web(
     );
 
     let plan_config = crate::plan_tool_config_from_section(&config.harness.tools.plan)?;
+    let project = harw_home::project::discover_project(&cwd, &[])
+        .map_err(|error| error.to_string())?;
+    let project_home = harw_home::project::ProjectHome::at(&project);
     let plan = crate::build_plan_services(
-        &home,
+        &project_home,
         &plan_config,
         crate::DEFAULT_PLAN_SPACE,
         crate::DEFAULT_GOAL_SPACE,

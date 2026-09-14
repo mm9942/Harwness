@@ -41,9 +41,11 @@ mod secret_store;
 mod settings;
 mod web;
 mod worker_cancellation;
+mod uia_bootstrap;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -164,7 +166,7 @@ pub fn log_sensitive_enabled() -> bool {
 ///
 /// Panics if a global subscriber has already been installed (only possible if
 /// this function is called twice, which is a programming error).
-fn init_tracing(level: &str, log_sensitive: bool) {
+fn init_tracing(level: &str, log_sensitive: bool, tui_active: bool) {
     use tracing_subscriber::EnvFilter;
     // Standardmäßig auf `warn` reduzieren, damit die interaktive TUI (Alternate
     // Screen) nicht durch Info-Spans überschrieben wird. `--log info` bleibt
@@ -175,13 +177,21 @@ fn init_tracing(level: &str, log_sensitive: bool) {
         level
     };
     let filter = EnvFilter::try_new(effective).unwrap_or_else(|_| EnvFilter::new("warn"));
-    // Auf STDERR schreiben, sodass die TUI (die stdout via Alternate Screen
-    // beansprucht) nicht mit Log-Zeilen überschrieben wird.
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .with_writer(std::io::stderr)
-        .init();
+    // Im Alternate-Screen ist auch STDERR sichtbar. Ein `fmt`-Layer darf in
+    // der TUI daher gar nicht installiert werden: Ein Sink-Writer schützt nur
+    // diesen einen Layer, nicht spätere Writer/Layers. Die reine Registry
+    // behält den Filter und die Trace-Metadaten für Instrumentierung, formatiert
+    // aber *keine* Ereignisse in das Terminal.
+    if tui_active {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry().with(filter).init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(false)
+            .with_writer(std::io::stderr)
+            .init();
+    }
     if log_sensitive {
         LOG_SENSITIVE.store(true, Ordering::Relaxed);
         tracing::warn!(
@@ -193,7 +203,8 @@ fn init_tracing(level: &str, log_sensitive: bool) {
 
 fn main() {
     let cli = Cli::parse();
-    init_tracing(&cli.chat.log, cli.chat.log_sensitive);
+    let tui_active = cli.command.is_none() && cli.chat.prompt.is_none();
+    init_tracing(&cli.chat.log, cli.chat.log_sensitive, tui_active);
     let code = match dispatch(cli) {
         Ok(()) => 0,
         Err(error) => {
@@ -415,6 +426,24 @@ fn cmd_init(home_override: Option<PathBuf>) -> Result<(), String> {
     }
     println!("aktives Profil: {}", report.profile_dir.display());
     println!("neu geschriebene Dateien: {}", report.written_files.len());
+
+    let cwd = std::env::current_dir().map_err(|error| format!("cwd: {error}"))?;
+    let project = harw_home::project::discover_project(&cwd, &[])
+        .map_err(|error| error.to_string())?;
+    if !project.root.join(".git").exists() {
+        let status = ProcessCommand::new("git")
+            .arg("init")
+            .current_dir(&project.root)
+            .status()
+            .map_err(|error| format!("could not run git init in {}: {error}", project.root.display()))?;
+        if !status.success() {
+            return Err(format!("git init failed in {} with status {status}", project.root.display()));
+        }
+        println!("Git-Repository angelegt: {}", project.root.display());
+    }
+    let project_home = harw_home::project::ProjectHome::at(&project);
+    project_home.ensure().map_err(|error| error.to_string())?;
+    println!("Harw-Projektzustand angelegt: {}", project_home.dir.display());
     Ok(())
 }
 
@@ -1323,7 +1352,7 @@ impl PlanServices {
 ///
 /// Rein synchron; benötigt keinen exklusiven Zugriff auf gemeinsame Daten.
 pub(crate) fn build_plan_services(
-    home: &Path,
+    project_home: &harw_home::project::ProjectHome,
     config: &PlanToolConfig,
     plan_space: &str,
     goal_space: &str,
@@ -1341,8 +1370,9 @@ pub(crate) fn build_plan_services(
         });
     }
 
-    let plan_root = harw_home::paths::plans_dir(home).join(plan_space);
-    let goal_root = harw_home::paths::goals_dir(home).join(goal_space);
+    project_home.ensure().map_err(|error| error.to_string())?;
+    let plan_root = project_home.plans_dir().join(plan_space);
+    let goal_root = project_home.goals_dir().join(goal_space);
 
     let (plan, goal): (Arc<dyn PlanStore>, Arc<dyn GoalStore>) = if config.persist {
         let plan_store =
@@ -1366,7 +1396,7 @@ pub(crate) fn build_plan_services(
         )
     };
 
-    let findings = Arc::new(FindingStore::from_home(home));
+    let findings = Arc::new(FindingStore::new(project_home.plans_dir()));
 
     tracing::info!(
         persist = config.persist,
@@ -1592,7 +1622,10 @@ fn build_plan_node_services(
     config: &PlanToolConfig,
     project_root: &Path,
 ) -> Result<Option<Arc<job_worker::PlanNodeServices>>, String> {
-    let services = build_plan_services(home, config, DEFAULT_PLAN_SPACE, DEFAULT_GOAL_SPACE)?;
+    let project = harw_home::project::discover_project(project_root, &[])
+        .map_err(|error| error.to_string())?;
+    let project_home = harw_home::project::ProjectHome::at(&project);
+    let services = build_plan_services(&project_home, config, DEFAULT_PLAN_SPACE, DEFAULT_GOAL_SPACE)?;
     let Some(plan) = services.plan else {
         return Ok(None);
     };
@@ -1689,8 +1722,11 @@ fn prepare_planning_startup(
     );
 
     let plan_config = plan_tool_config_from_section(&config.harness.tools.plan)?;
+    let project = harw_home::project::discover_project(&spec.cwd, &[])
+        .map_err(|error| error.to_string())?;
+    let project_home = harw_home::project::ProjectHome::at(&project);
     let services = build_plan_services(
-        &spec.home,
+        &project_home,
         &plan_config,
         DEFAULT_PLAN_SPACE,
         DEFAULT_GOAL_SPACE,
@@ -2322,9 +2358,19 @@ mod tests {
         config: &PlanToolConfig,
     ) -> (tempfile::TempDir, super::PlanServices) {
         let home = tempfile::tempdir().expect("create temporary home");
-        let services =
-            build_plan_services(home.path(), config, DEFAULT_PLAN_SPACE, DEFAULT_GOAL_SPACE)
-                .expect("plan services build");
+        let root = harw_home::project::ProjectRoot {
+            root: home.path().to_path_buf(),
+            trust_key: home.path().to_path_buf(),
+            kind: harw_home::project::ProjectKind::Directory,
+        };
+        let project_home = harw_home::project::ProjectHome::at(&root);
+        let services = build_plan_services(
+            &project_home,
+            config,
+            DEFAULT_PLAN_SPACE,
+            DEFAULT_GOAL_SPACE,
+        )
+        .expect("plan services build");
         (home, services)
     }
 
@@ -2334,10 +2380,11 @@ mod tests {
         // der Platte entstehen — sonst sähe ein abgeschaltetes Werkzeug beim
         // nächsten Blick ins Dateisystem benutzt aus.
         let config = PlanToolConfig {
+            enabled: false,
             persist: true,
             ..PlanToolConfig::default()
         };
-        assert!(!config.is_enabled(), "Default muss deaktiviert sein");
+        assert!(!config.is_enabled(), "explizit deaktivierte Konfiguration bleibt aus");
 
         let (home, services) = plan_services_over_temp_home(&config);
 
@@ -2411,8 +2458,8 @@ mod tests {
         assert!(services.plan.is_some());
         assert!(services.goal.is_some());
 
-        let plans = harw_home::paths::plans_dir(home.path()).join(DEFAULT_PLAN_SPACE);
-        let goals = harw_home::paths::goals_dir(home.path()).join(DEFAULT_GOAL_SPACE);
+        let plans = home.path().join(".harw/plans").join(DEFAULT_PLAN_SPACE);
+        let goals = home.path().join(".harw/goals").join(DEFAULT_GOAL_SPACE);
         assert!(plans.is_dir(), "{} fehlt", plans.display());
         assert!(goals.is_dir(), "{} fehlt", goals.display());
         assert_ne!(

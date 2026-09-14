@@ -30,6 +30,10 @@ pub struct ResolvedConfig {
     pub agents: HashMap<String, AgentToml>,
     /// Compiled agent definitions, keyed by their canonical `DefinitionId`.
     pub executable_agents: HashMap<String, ExecutableAgentIr>,
+    /// Agentenordner der final aufgelösten DSL-Definitionen. Der Runtime-Pfad
+    /// verwendet ihn ausschließlich für die optionalen, benutzerpflegbaren
+    /// UIA-Dateien `Personality.md` und `USER.md`.
+    pub agent_definition_dirs: HashMap<String, PathBuf>,
     pub providers: HashMap<String, ProviderToml>,
     pub models: HashMap<String, ModelToml>,
     pub skills: HashMap<String, SkillToml>,
@@ -81,6 +85,15 @@ impl ResolvedConfig {
         }
         if let Some(definition) = &self.harness.active_agent_definition {
             require_reference(&self.executable_agents, "agent definition", definition)?;
+        }
+        if let Some(definition) = &self.harness.active_uia_definition {
+            require_reference(&self.executable_agents, "UIA definition", definition)?;
+            let role = self.executable_agents[definition].role();
+            if role != harw_agent_dsl::roles::AgentRoleId::UserInterface {
+                return Err(ConfigError::Invalid(format!(
+                    "UIA definition '{definition}' must have role 'user-interface', found '{role:?}'"
+                )));
+            }
         }
 
         for provider_name in sorted_keys(&self.providers) {
@@ -509,6 +522,9 @@ pub fn discover_config_with_restricted(
             if cfg.default_model.is_none() {
                 cfg.default_model = resolved.harness.default_model.clone();
             }
+            if cfg.active_uia_definition.is_none() {
+                cfg.active_uia_definition = resolved.harness.active_uia_definition.clone();
+            }
             if fields.get("onboarding").is_none() {
                 cfg.onboarding = resolved.harness.onboarding.clone();
             }
@@ -581,6 +597,14 @@ pub fn discover_config_with_restricted(
                 "failed to lower agent definition '{id}' from {paths}: {error}"
             ))
         })?;
+        let definition_dir = definitions
+            .last()
+            .expect("resolved definition has at least one source")
+            .2
+            .parent()
+            .expect("definition.toml has an agent directory")
+            .to_path_buf();
+        resolved.agent_definition_dirs.insert(id.clone(), definition_dir);
         resolved.executable_agents.insert(id, executable);
     }
 

@@ -20,6 +20,11 @@ pub struct HarnessConfig {
     pub default_model: Option<String>,
     #[serde(default)]
     pub active_agent_definition: Option<String>,
+    /// Pflichtauswahl des Benutzeroberflächen-Agenten. Der Name verweist auf
+    /// eine gesenkte Agent-Definition mit der Rolle `user-interface`.
+    /// Ohne gültige Auswahl wird keine interaktive Runtime gestartet.
+    #[serde(default)]
+    pub active_uia_definition: Option<String>,
     #[serde(default)]
     pub policy_profile: Option<String>,
     #[serde(default)]
@@ -318,6 +323,26 @@ mod tests {
     }
 
     #[test]
+    fn test_active_uia_definition_defaults_to_none() {
+        let cfg: HarnessConfig = toml::from_str("default_provider = \"anthropic\"").unwrap();
+        assert_eq!(cfg.active_uia_definition, None);
+    }
+
+    #[test]
+    fn test_active_uia_definition_reads_exact_definition_id() {
+        let cfg: HarnessConfig = toml::from_str(
+            r#"
+                active_uia_definition = "harwness.agent.terminal-ui@1"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.active_uia_definition.as_deref(),
+            Some("harwness.agent.terminal-ui@1")
+        );
+    }
+
+    #[test]
     fn test_active_agent_definition_reads_exact_definition_id() {
         let cfg: HarnessConfig = toml::from_str(
             r#"
@@ -430,8 +455,9 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!cfg.tools.plan.enabled);
-        assert_eq!(cfg.mode.default, "chat");
+        assert!(cfg.tools.plan.enabled);
+        assert!(cfg.tools.plan.persist);
+        assert_eq!(cfg.mode.default, "plan");
         assert_eq!(cfg.research.max_fetch_bytes, 1_048_576);
         assert_eq!(cfg.permissions, crate::permissions_toml::PermissionsSection::default());
         assert!(cfg.project_root_markers.is_none());

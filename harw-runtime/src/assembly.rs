@@ -1323,6 +1323,29 @@ impl RuntimeAssemblyBuilder {
         );
         let sandbox = sandbox.with_extra_roots(extra_roots.clone());
 
+        // Agent-Definitionen werden einmal gesenkt. Ein interaktiver Einstieg
+        // besitzt zwingend eine konfigurierte UIA; fehlende oder falsch gerollte
+        // Auswahl ist ein Startfehler, nie ein stiller Full-Tool-Fallback.
+        let needs_definitions = spec.active_agent.is_some()
+            || config.harness.active_uia_definition.is_some()
+            || matches!(profile.spawner, SpawnerPolicy::BuiltinRoles);
+        let agent_definitions = if needs_definitions {
+            lower_agent_definitions(&config)?
+        } else {
+            HashMap::new()
+        };
+        let uia_ir = resolve_active_uia(spec.entry, &config, &agent_definitions)?;
+        // Ein UI-Einstieg hat genau einen Root: die UIA. Die frühere
+        // `active_agent`-Auswahl bleibt für nicht-interaktive Einstiege
+        // erhalten, darf aber die UIA weder ersetzen noch ihre Tool-Decke
+        // überlagern.
+        let agent_ir = if uia_ir.is_some() {
+            None
+        } else {
+            resolve_active_agent(spec.active_agent.as_deref(), &config, &agent_definitions)?
+        };
+        let activation = root_activation(uia_ir.as_ref().or(agent_ir.as_ref()));
+
         // 5. Ein Trace, ein Spawn-Kontext.
         let trace = new_root_trace(spec.entry);
         let spawn_context = SpawnContext {
@@ -1330,7 +1353,16 @@ impl RuntimeAssemblyBuilder {
             suggestions: None,
             capability_snapshot: None,
             approval_actor: spec.principal.approval_actor(),
-            organizational_role: root_organizational_role(profile.spawner),
+            organizational_role: uia_ir
+                .as_ref()
+                .map_or_else(|| root_organizational_role(profile.spawner), ExecutableAgentIr::role),
+            // The root can delegate a child orchestrator only when its frozen
+            // active definition lists that exact role. No active definition
+            // means no such delegation grant.
+            allowed_child_orchestrators: uia_ir
+                .as_ref()
+                .map(|ir| ir.spawn_contract().child_orchestrators().to_vec())
+                .unwrap_or_default(),
             trace: Some(trace),
             ceiling: Some(ceiling.clone()),
         };
@@ -1362,25 +1394,23 @@ impl RuntimeAssemblyBuilder {
             allow_rules.clone(),
         );
 
-        // Die eingebauten Rollen werden **einmal** gesenkt und danach sowohl
-        // für `--agent` als auch für die Kind-Fabrik benutzt (Befund Z2c-07).
-        // Ohne beides bleibt die Arbeit ganz aus.
-        let needs_definitions =
-            spec.active_agent.is_some() || matches!(profile.spawner, SpawnerPolicy::BuiltinRoles);
-        let agent_definitions = if needs_definitions {
-            lower_agent_definitions(&config)?
-        } else {
-            HashMap::new()
-        };
-
-        // Agent-IR des Wurzel-Agenten (falls einer benannt ist).
-        let agent_ir =
-            resolve_active_agent(spec.active_agent.as_deref(), &config, &agent_definitions)?;
-        let activation = root_activation(agent_ir.as_ref());
-
         // 7. Registry: ein Projektkontext, eine Kette. Der Modellkontext folgt
         //    `profile.project_context` und einem gebundenen `workspace_root`.
-        let overrides = root_identity(&spec, narrowing.as_ref());
+        let mut overrides = root_identity(&spec, narrowing.as_ref());
+        if let Some(uia) = uia_ir.as_ref() {
+            let definition_id = uia.id().to_string();
+            if let Some(agent_dir) = config.agent_definition_dirs.get(&definition_id) {
+                let fragments = harw_config::load_uia_personalization(agent_dir).map_err(|error| {
+                    RuntimeError::Registry {
+                        detail: format!(
+                            "could not load UIA personalization from {}: {error}",
+                            agent_dir.display()
+                        ),
+                    }
+                })?;
+                overrides.extra_context.extend(fragments);
+            }
+        }
         let narrowed_root = narrowing
             .as_ref()
             .and_then(|narrowing| narrowing.workspace_root.as_ref())
@@ -1560,6 +1590,33 @@ fn lower_agent_definitions(
     builtin_agent_definitions(&config.executable_agents).map_err(|error| RuntimeError::Registry {
         detail: format!("could not lower builtin agent definitions: {error}"),
     })
+}
+
+/// Löst die obligatorische UIA eines interaktiven Einstiegs auf.
+///
+/// TUI und One-shot sind Nutzeroberflächen. Sie starten ausschließlich mit
+/// `harness.active_uia_definition`, deren gesenkte DSL-Rolle
+/// `user-interface` sein muss. Andere Einstiege haben keine UIA-Pflicht.
+fn resolve_active_uia(
+    entry: EntryKind,
+    config: &ResolvedConfig,
+    builtin: &HashMap<String, ExecutableAgentIr>,
+) -> RuntimeResult<Option<ExecutableAgentIr>> {
+    if !matches!(entry, EntryKind::Tui | EntryKind::OneShot) {
+        return Ok(None);
+    }
+    let name = config.harness.active_uia_definition.as_deref().ok_or_else(|| RuntimeError::Registry {
+        detail: "no active UIA is configured; set harness.active_uia_definition to a user-interface agent definition".to_owned(),
+    })?;
+    let ir = resolve_active_agent(Some(name), config, builtin)?.ok_or_else(|| RuntimeError::Registry {
+        detail: format!("UIA '{name}' did not resolve"),
+    })?;
+    if ir.role() != AgentRoleId::UserInterface {
+        return Err(RuntimeError::Registry {
+            detail: format!("configured UIA '{name}' has role {:?}, expected user-interface", ir.role()),
+        });
+    }
+    Ok(Some(ir))
 }
 
 /// Löst den benannten Wurzel-Agenten zu seiner gesenkten IR auf.
@@ -1814,7 +1871,12 @@ fn build_spawner(
             AgentRole::Agent {
                 name: (*role).to_owned(),
             },
-            AgentRoleId::Worker,
+            // The registered target's sealed role comes from its frozen
+            // definition. Unknown/missing definitions fail closed as workers,
+            // which cannot spawn further agents.
+            definitions
+                .get(*role)
+                .map_or(AgentRoleId::Worker, ExecutableAgentIr::role),
             Arc::clone(&factory),
         );
         roles.push((*role).to_owned());
@@ -2420,6 +2482,28 @@ mod tests {
         let config = ResolvedConfig::default();
         let definitions = lower_agent_definitions(&config).expect("Rollen senken");
         (config, definitions)
+    }
+
+    #[test]
+    fn interactive_entries_require_a_configured_user_interface_agent() {
+        let (config, definitions) = builtin();
+        let error = resolve_active_uia(EntryKind::Tui, &config, &definitions).unwrap_err();
+        assert!(matches!(error, RuntimeError::Registry { .. }));
+
+        let explorer = definitions.get(role_names::EXPLORER).expect("explorer").clone();
+        let mut config = config;
+        config.harness.active_uia_definition = Some("not-a-uia".to_owned());
+        config.executable_agents.insert("not-a-uia".to_owned(), explorer);
+        let error = resolve_active_uia(EntryKind::Tui, &config, &definitions).unwrap_err();
+        assert!(matches!(error, RuntimeError::Registry { .. }));
+    }
+
+    #[test]
+    fn non_interactive_entries_do_not_require_a_uia() {
+        let (config, definitions) = builtin();
+        assert!(resolve_active_uia(EntryKind::Doctor, &config, &definitions)
+            .expect("doctor has no UIA requirement")
+            .is_none());
     }
 
     #[test]
@@ -3416,7 +3500,7 @@ mod tests {
         let project_home = ProjectHome::at(&home_project_root);
 
         let mut section = PlanSection::default();
-        section.persist = true;
+        section.enabled = false;
         assert!(!plan_section_is_untouched(&section));
 
         assert!(

@@ -3153,6 +3153,7 @@ mod tests {
                 id: "test-operator".to_owned(),
             }),
             organizational_role: harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+            allowed_child_orchestrators: Vec::new(),
             trace: None,
             // `None` reads fail-closed (most restrictive ceiling), not
             // "unbounded" — see `SpawnContext::ceiling`'s own doc. Existing

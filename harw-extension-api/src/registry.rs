@@ -496,6 +496,18 @@ impl ExtensionRegistryBuilder {
         self.approval_handlers.push(h);
         self
     }
+
+    /// Entfernt alle bisher registrierten Freigabe-Handler.
+    ///
+    /// Das ist für einen bekannten Montagepunkt gedacht, an dem eine
+    /// mitgebrachte Standardpolitik durch eine vollständig konfigurierte
+    /// Freigabekette ersetzt werden muss. Andere Registry-Bestandteile
+    /// bleiben unverändert erhalten.
+    #[must_use]
+    pub fn clear_approval_handlers(mut self) -> Self {
+        self.approval_handlers.clear();
+        self
+    }
     pub fn turn_observer(mut self, o: Arc<dyn TurnObserver>) -> Self {
         self.turn_observers.push(o);
         self

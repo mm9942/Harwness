@@ -263,6 +263,10 @@ pub struct SpawnContext {
     /// which target roles it may ever spawn, independent of sandbox/depth
     /// limits.
     pub organizational_role: AgentRoleId,
+    /// Exact child-orchestrator role names that this already admitted agent
+    /// may create. Derived exclusively from its frozen agent definition;
+    /// absent means deny all child-orchestrator spawns.
+    pub allowed_child_orchestrators: Vec<String>,
     /// Der Trace-Kontext, unter dem dieser Agent läuft.
     ///
     /// Wird beim Handoff an ein Kind **vererbt**, nicht neu erzeugt: ein Kind
@@ -1650,6 +1654,7 @@ forbidden = [{forbidden}]
             capability_snapshot: None,
             approval_actor: None,
             organizational_role: AgentRoleId::RootOrchestrator,
+            allowed_child_orchestrators: Vec::new(),
             trace: None,
             ceiling: None,
         }
@@ -1882,6 +1887,7 @@ forbidden = [{forbidden}]
             capability_snapshot: None,
             approval_actor: None,
             organizational_role: AgentRoleId::RootOrchestrator,
+            allowed_child_orchestrators: Vec::new(),
             trace: None,
             ceiling: None,
         });

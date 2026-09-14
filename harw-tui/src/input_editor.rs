@@ -302,6 +302,16 @@ impl InputEditor {
         debug_assert!(self.buffer.is_char_boundary(self.cursor));
     }
 
+    /// Löscht auf der aktuellen Zeile alles rechts vom Cursor (Ctrl+K-Semantik).
+    ///
+    /// Ein folgender Zeilenumbruch und alle nachfolgenden Eingabezeilen bleiben
+    /// erhalten, damit Ctrl+K keinen mehrzeiligen Entwurf unerwartet verkürzt.
+    pub fn delete_to_end(&mut self) {
+        let end = self.current_line_end();
+        self.buffer.drain(self.cursor..end);
+        debug_assert!(self.buffer.is_char_boundary(self.cursor));
+    }
+
     /// Löscht das Zeichen rechts vom Cursor (Vorwärts-Delete).
     ///
     /// Ist der Cursor am Ende, ist die Operation ein No-Op.
@@ -767,6 +777,10 @@ impl InputEditor {
             }
             KeyCode::Char('j') if ctrl => {
                 self.insert_newline();
+                InputAction::Redraw
+            }
+            KeyCode::Char('k' | 'K') if ctrl => {
+                self.delete_to_end();
                 InputAction::Redraw
             }
             KeyCode::Enter => {
@@ -1249,7 +1263,32 @@ mod tests {
         assert!(ed.cursor() <= 1);
     }
 
-    // 21. utf8_boundary_safety
+    // 21. ctrl_k_deletes_only_to_end_of_current_line
+    #[test]
+    fn test_ctrl_k_deletes_to_end_of_current_line_without_moving_cursor() {
+        let mut ed = InputEditor::new();
+        ed.insert_str("before\nafter");
+        for _ in 0..5 {
+            ed.move_left();
+        }
+        let cursor = ed.cursor();
+        assert_eq!(
+            ed.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)),
+            InputAction::Redraw
+        );
+        assert_eq!(ed.text(), "before\n");
+        assert_eq!(ed.cursor(), cursor);
+
+        ed.move_home();
+        assert_eq!(
+            ed.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)),
+            InputAction::Redraw
+        );
+        assert_eq!(ed.text(), "\n");
+        assert_eq!(ed.cursor(), 0);
+    }
+
+    // 22. utf8_boundary_safety
     #[test]
     fn test_utf8_boundary_safety() {
         let mut ed = InputEditor::new();

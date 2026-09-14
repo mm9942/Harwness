@@ -32,7 +32,7 @@
 //! assert!(matches!(from_crossterm(ct_event), Some(TuiEvent::Key(_))));
 //! ```
 
-use crossterm::event::{Event, KeyEventKind};
+use crossterm::event::{Event, KeyEventKind, MouseEventKind};
 
 /// Alle Terminaleingabe-Ereignisse, die der async Event-Loop von harw-tui verarbeitet.
 ///
@@ -98,8 +98,9 @@ pub(crate) enum TuiEvent {
 ///   → `Some(TuiEvent::Key(...))`
 /// - `Event::Key` mit `KeyEventKind::Release` → `None` (ignoriert)
 /// - `Event::Paste(text)` → `Some(TuiEvent::Paste(text))`
+/// - Rad-Ereignisse (`MouseEventKind::ScrollUp`/`ScrollDown`) → `Some(TuiEvent::Mouse(..))`
 /// - `Event::Resize(w, h)` → `Some(TuiEvent::Resize(w, h))`
-/// - Alle anderen Ereignisse (z. B. `FocusGained`, `FocusLost`, `Mouse`) → `None`
+/// - Alle anderen Ereignisse (z. B. `FocusGained`, `FocusLost`, Klicks und Bewegungen) → `None`
 ///
 /// `TuiEvent::Draw` kann über diese Funktion **nicht** erzeugt werden; es entsteht
 /// ausschließlich im `FrameRequester`-Pfad (Spec-Abschnitt 2.3 und 2.5).
@@ -143,7 +144,15 @@ pub(crate) fn from_crossterm(event: Event) -> Option<TuiEvent> {
             KeyEventKind::Press | KeyEventKind::Repeat => Some(TuiEvent::Key(key_event)),
             KeyEventKind::Release => None,
         },
-        Event::Mouse(mouse_event) => Some(TuiEvent::Mouse(mouse_event)),
+        Event::Mouse(mouse_event)
+            if matches!(
+                mouse_event.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            ) =>
+        {
+            Some(TuiEvent::Mouse(mouse_event))
+        }
+        Event::Mouse(_) => None,
         Event::Paste(text) => Some(TuiEvent::Paste(text)),
         Event::Resize(w, h) => Some(TuiEvent::Resize(w, h)),
         _ => None,
@@ -152,7 +161,10 @@ pub(crate) fn from_crossterm(event: Event) -> Option<TuiEvent> {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseEvent,
+        MouseEventKind,
+    };
 
     use super::*;
 
@@ -193,6 +205,28 @@ mod tests {
         let event = make_key_event(KeyEventKind::Release);
         let result = from_crossterm(event);
         assert_eq!(result, None, "Key-Release muss None zurückgeben");
+    }
+
+    #[test]
+    fn test_mouse_wheel_maps_to_mouse_event() {
+        let event = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(from_crossterm(event), Some(TuiEvent::Mouse(_))));
+    }
+
+    #[test]
+    fn test_non_wheel_mouse_events_are_ignored() {
+        let event = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(from_crossterm(event), None);
     }
 
     /// Resize-Ereignis wird als `TuiEvent::Resize` mit korrekten Abmessungen zurückgegeben.

@@ -58,8 +58,8 @@ use crate::paths;
 /// wird.
 const DEFAULT_MARKER: &str = ".git";
 
-/// Inhalt von `.harw/.gitignore`, wie von [`ProjectHome::ensure`] geschrieben.
-const PROJECT_GITIGNORE_CONTENTS: &str = "state/\n";
+/// Regel für die Gitignore im Projektroot: der gesamte Harw-Zustand bleibt lokal.
+const ROOT_GITIGNORE_RULE: &str = ".harw/";
 
 /// Obergrenze für die `.git`-Datei eines Worktrees und ihre `commondir`.
 ///
@@ -380,20 +380,19 @@ impl ProjectHome {
         self.dir.join("state")
     }
 
-    /// Legt die Projekt-Home-Verzeichnisse (`0700`) und `.harw/.gitignore`
-    /// idempotent an.
+    /// Legt die Projekt-Home-Verzeichnisse (`0700`) an und stellt sicher, dass
+    /// der gesamte Harw-Zustand in der Gitignore des Projektroots steht.
     ///
     /// # Description
     /// Lehnt Roots ab, für die kein Projekt-Home entstehen darf: das
     /// Dateisystem-Root (`/`) und das Home-Verzeichnis des Benutzers selbst
-    /// (`$HOME`, kanonisiert). `.harw/.gitignore` wird nur geschrieben, wenn
-    /// es noch nicht existiert, und trägt ausschließlich `state/\n` — der
-    /// lokale Zustand soll nie versehentlich committet werden, auch wenn der
-    /// Rest von `.harw` versioniert wird.
+    /// (`$HOME`, kanonisiert). Die Root-`.gitignore` wird idempotent um
+    /// `.harw/` ergänzt. Damit sind Plans, Goals, Memories und der
+    /// Sessionindex zusammen als lokaler Harw-Projektzustand ausgeschlossen.
     ///
     /// # Returns
     /// `Ok(())`, wenn alle Verzeichnisse existieren und `.gitignore`
-    /// geschrieben ist (oder bereits war).
+    /// ergänzt ist (oder die Regel bereits enthielt).
     ///
     /// # Errors
     /// - [`HomeError::UnsupportedProjectHomeRoot`]: `root` ist `/` oder
@@ -417,17 +416,33 @@ impl ProjectHome {
             create_private_dir(&dir)?;
         }
 
-        let gitignore = self.dir.join(".gitignore");
-        if !gitignore.exists() {
-            write_atomic(
-                &gitignore,
-                PROJECT_GITIGNORE_CONTENTS.as_bytes(),
-                AtomicWriteOptions::with_mode(0o644),
-            )
-            .map_err(|error| HomeError::io(&gitignore, error))?;
-        }
+        ensure_root_gitignore(root)?;
         Ok(())
     }
+}
+
+/// Ergänzt die Root-`.gitignore` um die kanonische Regel für lokalen Harw-Zustand.
+///
+/// Bestehende Regeln bleiben bytegenau erhalten. Die Erkennung akzeptiert auch
+/// die äquivalente Regel `/.harw/`, damit wiederholte Starts keinen Diff erzeugen.
+fn ensure_root_gitignore(root: &Path) -> HomeResult<()> {
+    let gitignore = root.join(".gitignore");
+    let existing = match std::fs::read_to_string(&gitignore) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(HomeError::io(&gitignore, error)),
+    };
+    if existing.lines().any(|line| matches!(line.trim(), ".harw/" | "/.harw/")) {
+        return Ok(());
+    }
+    let separator = if existing.is_empty() || existing.ends_with('\n') { "" } else { "\n" };
+    let updated = format!("{existing}{separator}{ROOT_GITIGNORE_RULE}\n");
+    write_atomic(
+        &gitignore,
+        updated.as_bytes(),
+        AtomicWriteOptions::with_mode(0o644),
+    )
+    .map_err(|error| HomeError::io(&gitignore, error))
 }
 
 /// Baut den `std::io::Error`, der [`HomeError::io`] beschreibt, wenn
@@ -689,16 +704,16 @@ mod tests {
             assert_eq!(mode, 0o700, "{dir:?} must be 0700");
         }
 
-        let gitignore = home.dir.join(".gitignore");
-        assert_eq!(
-            std::fs::read_to_string(&gitignore).unwrap(),
-            "state/\n"
-        );
+        let gitignore = repo.path().join(".gitignore");
+        assert_eq!(std::fs::read_to_string(&gitignore).unwrap(), ".harw/\n");
 
-        // Re-run is idempotent and never overwrites a customized gitignore.
+        // Re-run is idempotent and preserves existing rules while adding the
+        // one required rule exactly once.
         std::fs::write(&gitignore, "custom\n").unwrap();
         home.ensure().unwrap();
-        assert_eq!(std::fs::read_to_string(&gitignore).unwrap(), "custom\n");
+        assert_eq!(std::fs::read_to_string(&gitignore).unwrap(), "custom\n.harw/\n");
+        home.ensure().unwrap();
+        assert_eq!(std::fs::read_to_string(&gitignore).unwrap(), "custom\n.harw/\n");
     }
 
     #[test]

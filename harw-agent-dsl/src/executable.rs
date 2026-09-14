@@ -398,6 +398,9 @@ pub struct SpawnContract {
     budget: Option<BudgetSpec>,
     /// Maximale Spawn-Tiefe unterhalb dieses Agenten.
     max_depth: Option<u32>,
+    /// Exact registered role names of child orchestrators this definition may
+    /// create. An empty list denies child-orchestrator delegation by default.
+    child_orchestrators: Vec<String>,
 }
 
 /// Job template — the shape of the work unit this agent runs.
@@ -582,7 +585,7 @@ pub struct ReturnPipeline {
 /// mit einem `v3`-Digest; beide Räume sind durch den Domain-String getrennt).
 /// Golden-Snapshots aus `v2` sind ab diesem Knoten bewusst ungültig — kein
 /// stillschweigend verschobener Hash, siehe Abschlussbericht des Knotens.
-const SNAPSHOT_HASH_DOMAIN: &str = "harwness.executable-ir.snapshot/v3";
+const SNAPSHOT_HASH_DOMAIN: &str = "harwness.executable-ir.snapshot/v4";
 
 /// Berechnet einen stabilen BLAKE3-Digest über die Inhaltsfelder einer [`ExecutableAgentIr`].
 ///
@@ -740,6 +743,7 @@ fn compute_snapshot_id(ir: &ExecutableAgentIr) -> SnapshotId {
         }
     }
     hash_opt_u32(&mut hasher, ir.spawn_contract.max_depth);
+    hash_str_vec(&mut hasher, &ir.spawn_contract.child_orchestrators);
 
     // --- job_template ---
     hash_opt_str(&mut hasher, ir.job_template.goal_kind.as_deref());
@@ -886,6 +890,20 @@ impl SpawnContract {
     /// Reiner Lesezugriff; von jedem Thread aus sicher.
     pub fn max_depth(&self) -> Option<u32> {
         self.max_depth
+    }
+
+    /// Returns the exact child-orchestrator role names this agent may spawn.
+    /// An absent or empty TOML list is an explicit default-deny policy.
+    #[must_use]
+    pub fn child_orchestrators(&self) -> &[String] {
+        &self.child_orchestrators
+    }
+
+    /// Tests whether this definition explicitly grants spawning `role_name` as
+    /// a child orchestrator.
+    #[must_use]
+    pub fn permits_child_orchestrator(&self, role_name: &str) -> bool {
+        self.child_orchestrators.iter().any(|allowed| allowed == role_name)
     }
 }
 
@@ -1157,7 +1175,7 @@ impl ReturnPipeline {
 /// Jede Sektion ist unter ihrem Kurznamen und unter dem Namen der Zielstruktur
 /// ansprechbar (`[spawn]` oder `[spawn_contract]` usw.):
 ///
-/// - `[spawn]`: `workspace_hint` (String), `max_depth` (u32)
+/// - `[spawn]`: `workspace_hint` (String), `max_depth` (u32), `child_orchestrators` (exact role-name list)
 /// - `[spawn.budget]`: `max_tokens` (u64), `max_tool_calls` (u32),
 ///   `max_wall_secs` (u64), `effort_cap` (String)
 /// - `[job]`: `goal_kind` (String)
@@ -1239,6 +1257,11 @@ pub fn lower(resolved: &ResolvedAgentDefinition) -> Result<ExecutableAgentIr, Ds
         ),
         budget,
         max_depth: config_u32(&resolved.config, &["spawn", "spawn_contract"], "max_depth"),
+        child_orchestrators: config_strings(
+            &resolved.config,
+            &["spawn", "spawn_contract"],
+            "child_orchestrators",
+        ),
     };
     let job_template = JobTemplate {
         goal_kind: config_string(&resolved.config, &["job", "job_template"], "goal_kind"),
@@ -1536,6 +1559,20 @@ mod tests {
             ir.return_pipeline.validators,
             ["schema.v1", "redact.secrets"]
         );
+    }
+
+    #[test]
+    fn lower_carries_exact_child_orchestrator_grants() {
+        let mut resolved = base_resolved("manager");
+        resolved.config = toml::toml! {
+            [spawn]
+            child_orchestrators = ["specialist", "reviewer"]
+        };
+
+        let ir = lower(&resolved).expect("spawn grant lowers");
+        assert!(ir.spawn_contract().permits_child_orchestrator("specialist"));
+        assert!(ir.spawn_contract().permits_child_orchestrator("reviewer"));
+        assert!(!ir.spawn_contract().permits_child_orchestrator("other"));
     }
 
     #[test]

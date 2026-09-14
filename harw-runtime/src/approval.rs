@@ -512,19 +512,20 @@ impl ApprovalChain {
         builder
     }
 
-    /// Wie [`Self::install`], aber **ohne** die eigene Standardpolitik: die
-    /// übergebene Registry trägt sie bereits.
+    /// Wie [`Self::install`], für eine Registry, die bereits ihre regellose
+    /// Standardpolitik trägt.
     ///
     /// # Warum es diese zweite Form gibt
     /// `assemble_registry_for_project` registriert **genau einen**
-    /// `ApprovalHandler`, eine [`DefaultApprovalPolicy`] über der
+    /// `ApprovalHandler`, eine regellose [`DefaultApprovalPolicy`] über der
     /// [`ApprovalModeCell`], die ihr der Aufrufer übergeben hat
     /// (`harw-registry-defaults/src/profile.rs:921-922`; der dortige Test hält
     /// `approval_handlers().len() == 1` fest, `:1196-1197`). Hängte die Kette
     /// ihre eigene daneben, stünden zwei davon in jeder Wurzel- und
-    /// Kindregistry (Befund Z2c-06, Ledger §4.9): wirkungsgleich, weil beide
-    /// dieselbe Zelle lesen und die Aggregation `Deny` > `AskUser` > `Allow`
-    /// ist — aber der Snapshot bildete die Registry dann nicht mehr ab.
+    /// Kindregistry. Das ist zudem nicht wirkungsgleich: die mitgebrachte
+    /// Politik kennt keine Regeln und kann daher eine konfigurierte
+    /// `AllowRuleSet` noch zu `AskUser` eskalieren. Bei genau diesem bekannten
+    /// Montagepunkt wird sie deshalb ersetzt.
     ///
     /// # Warum die Provenienz ein Parameter ist und keine Erkennung
     /// Ablesen lässt sich die Art **nicht**: weder [`DefaultApprovalPolicy`]
@@ -547,7 +548,7 @@ impl ApprovalChain {
     ///
     /// # Rückgabe
     /// Den Bauer der Registry, erweitert um die Handler aus
-    /// [`Self::handlers`] ohne die Standardpolitik. Die Reihenfolge ist
+    /// [`Self::handlers`]. Die Reihenfolge ist
     /// Dokumentation, keine Priorität: `check_approval` befragt jeden Handler
     /// und aggregiert `Deny` > `AskUser` > `Allow`.
     #[must_use]
@@ -560,7 +561,10 @@ impl ApprovalChain {
             );
         }
         let mut builder = assembled.into_builder();
-        for handler in self.handlers_with_default(!carries_default) {
+        if carries_default {
+            builder = builder.clear_approval_handlers();
+        }
+        for handler in self.handlers_with_default(true) {
             builder = builder.approval_handler(handler);
         }
         builder
@@ -687,9 +691,10 @@ mod tests {
     /// **ausgeschaltetem** `[tools.plan]` — die Lage aus G-010/F-154.
     fn config_with(tools: &[&str]) -> ResolvedConfig {
         let mut config = ResolvedConfig::default();
+        config.harness.tools.plan.enabled = false;
         assert!(
             !config.harness.tools.plan.enabled,
-            "der Test lebt davon, dass [tools.plan] aus ist"
+            "der Test lebt von einer explizit deaktivierten Planungsfläche"
         );
         config.harness.policy.require_approval_for =
             tools.iter().map(|t| (*t).to_owned()).collect();
@@ -1083,8 +1088,8 @@ mod tests {
         ));
     }
 
-    /// Z2c-06: Eine Registry, die ihre Standardpolitik schon trägt, bekommt
-    /// keine zweite.
+    /// Eine Registry aus den Defaults erhält die regelbewusste
+    /// Standardpolitik der Kette statt ihrer regellosen mitgebrachten.
     #[test]
     fn install_over_default_does_not_add_a_second_default_policy() {
         let cell = ApprovalModeCell::new(ApprovalMode::Delegated);
@@ -1103,9 +1108,44 @@ mod tests {
 
         let registry = chain.install_over_default(assembled).build();
 
-        // Standardpolitik (mitgebracht) + Config + Ask — keine vierte.
+        // Standardpolitik (aus der Kette) + Config + Ask — keine vierte.
         assert_eq!(registry.approval_handlers().len(), 3);
         assert_eq!(registry.approval_handlers().len(), chain.snapshot().len());
+    }
+
+    #[test]
+    fn install_over_default_replaces_the_default_with_the_rules_aware_policy() {
+        let cell = ApprovalModeCell::new(ApprovalMode::Delegated);
+        let rules = AllowRuleSet::new();
+        rules.add(ApprovalRule {
+            tool: "shell.exec".to_owned(),
+            pattern: Some("git status".to_owned()),
+            decision: RuleDecision::Allow,
+            scope: RuleScope::Project,
+        });
+        let chain = ApprovalChain::for_root(
+            &config_with(&[]),
+            AskResolution::Fail,
+            cell.clone(),
+            None,
+            rules,
+        );
+        let assembled = ExtensionRegistryBuilder::default()
+            .approval_handler(Arc::new(DefaultApprovalPolicy::new(cell)))
+            .build();
+
+        let registry = chain.install_over_default(assembled).build();
+
+        // Default und Ask-Auflösung müssen beide die gleiche Regelmenge sehen;
+        // eine regellose Default-Policy würde hier stattdessen AskUser liefern.
+        assert!(matches!(
+            block_on(registry.approval_handlers()[0].review(&shell_call("git status --short"))),
+            ApprovalDecision::Allow
+        ));
+        assert!(matches!(
+            block_on(registry.approval_handlers()[1].review(&shell_call("git status --short"))),
+            ApprovalDecision::Allow
+        ));
     }
 
     /// Eine Registry anderer Gestalt bekommt die Grundlinie trotzdem.

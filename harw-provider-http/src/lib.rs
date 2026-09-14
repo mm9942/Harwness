@@ -61,6 +61,7 @@ mod anthropic_caps;
 mod error;
 pub mod retry;
 pub mod routing;
+mod tool_names;
 
 use error::{model_error_for_status, model_error_for_transport, retry_after_hint};
 use harw_core::envelope::render_tool_result;
@@ -154,8 +155,32 @@ struct SecretSources<'a> {
     resolver: Option<&'a dyn SecretResolver>,
     /// harw-Home (`~/.harw` bzw. `HARW_HOME`). `file:`/`file-json:` werden nur
     /// unterhalb von `<home>/secrets/` gelesen; ohne Home schlagen sie fehl.
+    /// Ausnahme: bekannte CLI-Credential-Dateien, siehe [`EXTERNAL_CLI_CREDENTIALS`].
     home: Option<&'a Path>,
+    /// Endpoint des Providers, für den gerade aufgelöst wird. Bindet externe
+    /// CLI-Credentials an ihren offiziellen Host; `None` erlaubt keine.
+    endpoint: Option<&'a str>,
 }
+
+/// Bekannte Credential-Dateien anderer CLIs, die `harw onboard`/`harw auth
+/// import` erkennt (`harw_model_catalog::detect_local_sources`).
+///
+/// Sie liegen außerhalb von `<home>/secrets` und werden nur gelesen, wenn Pfad
+/// (relativ zu `$HOME`) **und** JSON-Pointer exakt passen und der Provider-
+/// Endpoint `https://<host>` eines der offiziellen Hosts ist. Eine repo-lokale
+/// Provider-TOML kann den Token damit nicht an einen fremden Host lenken.
+const EXTERNAL_CLI_CREDENTIALS: &[(&str, &[&str], &[&str])] = &[
+    (
+        ".codex/auth.json",
+        &["/OPENAI_API_KEY", "/tokens/access_token"],
+        &["api.openai.com", "chatgpt.com"],
+    ),
+    (
+        ".claude/.credentials.json",
+        &["/claudeAiOauth/accessToken"],
+        &[anthropic::ANTHROPIC_API_HOST],
+    ),
+];
 
 /// Baut den passenden [`ModelProvider`] aus der aufgelösten Konfiguration.
 ///
@@ -211,6 +236,11 @@ pub fn build_provider_with_resolver(
 ///   `file-json:`-Referenzen werden nur unterhalb von `<home>/secrets/`
 ///   gelesen: symlinkfrei (`open_dir_nofollow` + `open_beneath`), nur
 ///   reguläre Dateien des effektiven Nutzers ohne Gruppen-/Fremdrechte.
+///   Ausnahme: allowlistete CLI-Credential-Dateien (`~/.codex/auth.json`,
+///   `~/.claude/.credentials.json`, siehe `EXTERNAL_CLI_CREDENTIALS`) werden
+///   auch außerhalb von `<home>/secrets` gelesen — aber nur, wenn Pfad **und**
+///   JSON-Pointer exakt zur Allowlist passen und der aufrufende Provider den
+///   offiziellen Host des jeweiligen CLI-Anbieters anspricht.
 /// - `resolver`: optionaler `secrets:`-Resolver.
 ///
 /// # Errors
@@ -232,6 +262,7 @@ fn build_provider_with_optional_resolver(
         env_layer: &config.env_layer,
         resolver,
         home,
+        endpoint: None,
     };
     let provider_name = config.harness.default_provider.as_deref().ok_or_else(|| {
         HttpProviderError::MissingDefault {
@@ -288,6 +319,10 @@ fn build_named_provider(
     sources: SecretSources<'_>,
 ) -> HttpProviderResult<Box<dyn ModelProvider>> {
     validate_endpoint(&provider.base_url)?;
+    let sources = SecretSources {
+        endpoint: Some(&provider.base_url),
+        ..sources
+    };
     if !matches!(
         provider.auth_header.as_deref(),
         None | Some("bearer" | "api-key" | "x-api-key" | "none")
@@ -782,6 +817,7 @@ impl OpenAiResponsesProvider {
             env_layer: &config.env_layer,
             resolver,
             home: None,
+            endpoint: Some(&provider.base_url),
         };
         Self::from_named_config(provider_name, provider, model, sources)
     }
@@ -1031,6 +1067,11 @@ fn transport_from_api(api: &str) -> Transport {
 /// `service/account`; `secrets:` wird an den injizierten Resolver delegiert.
 /// `file:`/`file-json:` lesen nur unterhalb von `<home>/secrets/` (siehe
 /// [`read_private_secret_file`]); ihre Fehler nennen weder Pfad noch Inhalt.
+/// Ausnahme für `file-json:`: liegt der Pfad außerhalb von `<home>/secrets`,
+/// wird zusätzlich [`read_external_cli_credential`] versucht — sie akzeptiert
+/// ausschließlich die in [`EXTERNAL_CLI_CREDENTIALS`] allowlisteten Pfad/
+/// Pointer-Paare (`~/.codex/auth.json`, `~/.claude/.credentials.json`) und nur,
+/// wenn `sources.endpoint` auf den jeweils offiziellen Host zeigt.
 ///
 /// # Arguments
 /// - `secret_ref` (`&harw_config::SecretRef`): Zu lösende Referenz.
@@ -1068,7 +1109,16 @@ fn resolve_secret(
             )
         }
         SecretRef::FileJson { path, pointer } => {
-            let raw = read_private_secret_file(sources.home, path).map_err(|reason| {
+            let raw = read_private_secret_file(sources.home, path)
+                .or_else(|reason| {
+                    if reason == FILE_CREDENTIAL_OUTSIDE_SECRETS_REASON {
+                        read_external_cli_credential(sources.endpoint, path, pointer)
+                            .unwrap_or(Err(reason))
+                    } else {
+                        Err(reason)
+                    }
+                })
+                .map_err(|reason| {
                 HttpProviderError::UnresolvedCredential {
                     reference: reference.clone(),
                     reason: reason.to_owned(),
@@ -1181,6 +1231,80 @@ fn read_private_secret_file(
     Ok(secret)
 }
 
+/// Liest eine allowlistete CLI-Credential-Datei (siehe
+/// [`EXTERNAL_CLI_CREDENTIALS`]).
+///
+/// # Description
+/// Nur [`resolve_secret`] ruft diese Funktion auf, und zwar ausschließlich als
+/// Fallback für `file-json:`-Referenzen außerhalb von `<home>/secrets`. Die
+/// Datei wird gelesen wie unter `<home>/secrets`: Elternverzeichnis ohne
+/// Symlink (`open_dir_nofollow`), Datei ohne Symlink (`open_beneath` mit
+/// `RESOLVE_NO_SYMLINKS`), reguläre Datei des effektiven Nutzers ohne
+/// Gruppen-/Fremdrechte (`ensure_private_regular`), höchstens
+/// [`MAX_FILE_CREDENTIAL_BYTES`].
+///
+/// # Arguments
+/// - `endpoint` (`Option<&str>`): Base-URL des Providers, für den gerade
+///   aufgelöst wird; `None` lehnt jede externe CLI-Credential-Datei ab.
+/// - `raw_path` (`&str`): absoluter Pfad aus der `file-json:`-Referenz; muss
+///   exakt `$HOME/<relative>` eines [`EXTERNAL_CLI_CREDENTIALS`]-Eintrags sein.
+/// - `pointer` (`&str`): JSON-Pointer aus der Referenz; muss exakt in der
+///   Pointer-Liste des passenden Allowlist-Eintrags enthalten sein.
+///
+/// # Returns
+/// `None`, wenn `raw_path`/`pointer`/`endpoint` nicht zur Allowlist passen —
+/// der Aufrufer behält dann seinen ursprünglichen `Err(reason)`. `Some(Ok(_))`
+/// mit dem Dateiinhalt als [`SecretString`], falls die Datei gelesen werden
+/// konnte; `Some(Err(reason))`, falls sie zur Allowlist passt, aber nicht
+/// sicher lesbar ist (kein Symlink-freier Zugriff, falsche Rechte, zu groß).
+///
+/// # Concurrency
+/// Rein lesend und zustandslos; sicher aus mehreren Threads parallel aufrufbar.
+fn read_external_cli_credential(
+    endpoint: Option<&str>,
+    raw_path: &str,
+    pointer: &str,
+) -> Option<Result<SecretString, &'static str>> {
+    use std::io::Read as _;
+    use std::os::fd::AsFd as _;
+
+    let endpoint = endpoint?;
+    let user_home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
+    let user_home = PathBuf::from(user_home);
+    let path = Path::new(raw_path);
+    let (relative, _, _) = EXTERNAL_CLI_CREDENTIALS.iter().find(|(relative, pointers, hosts)| {
+        path == user_home.join(relative)
+            && pointers.contains(&pointer)
+            && hosts
+                .iter()
+                .any(|host| endpoint_is_official_host(endpoint, host))
+    })?;
+    let full = user_home.join(relative);
+    let (Some(parent), Some(file_name)) = (full.parent(), full.file_name()) else {
+        return Some(Err(FILE_CREDENTIAL_OPEN_REASON));
+    };
+    Some((|| {
+        let root =
+            harw_fsutil::open_dir_nofollow(parent).map_err(|_| FILE_CREDENTIAL_OPEN_REASON)?;
+        let file = harw_fsutil::open_beneath(
+            root.as_fd(),
+            Path::new(file_name),
+            harw_fsutil::OpenMode::read_only(),
+        )
+        .map_err(|_| FILE_CREDENTIAL_OPEN_REASON)?;
+        harw_fsutil::ensure_private_regular(&file)
+            .map_err(|_| FILE_CREDENTIAL_NOT_PRIVATE_REASON)?;
+        let mut contents = String::new();
+        file.take(MAX_FILE_CREDENTIAL_BYTES + 1)
+            .read_to_string(&mut contents)
+            .map_err(|_| FILE_CREDENTIAL_READ_REASON)?;
+        if contents.len() as u64 > MAX_FILE_CREDENTIAL_BYTES {
+            return Err(FILE_CREDENTIAL_READ_REASON);
+        }
+        Ok(SecretString::new(contents.into()))
+    })())
+}
+
 /// Zerlegt `path` in (`<home>/secrets`-Verzeichnis, relativer Rest), falls der
 /// Pfad lexikalisch darunter liegt; siehe [`read_private_secret_file`].
 fn secret_file_location(home: &Path, path: &Path) -> Option<(PathBuf, PathBuf)> {
@@ -1255,6 +1379,7 @@ fn strict_parameters(spec: &FunctionToolSpec) -> JsonSchema {
 /// [`ToolDef::function`] hart auf `true` gesetzt), damit nicht-strikte
 /// Tool-Definitionen korrekt auf den Wire kommen.
 fn build_responses_tools(tools: &[ToolSpec]) -> Vec<ToolDef> {
+    let names = tool_names::ToolNameCodec::for_tools(tools);
     tools
         .iter()
         .map(|spec| match spec {
@@ -1263,7 +1388,7 @@ fn build_responses_tools(tools: &[ToolSpec]) -> Vec<ToolDef> {
                     .unwrap_or_else(|_| serde_json::json!({}));
                 ToolDef {
                     kind: "function".to_owned(),
-                    name: f.name.as_str().to_owned(),
+                    name: names.encode(f.name.as_str()),
                     description: Some(f.description.clone()),
                     parameters,
                     strict: f.strict,
@@ -1300,6 +1425,8 @@ fn build_responses_tools(tools: &[ToolSpec]) -> Vec<ToolDef> {
 /// Eine vollständig befüllte [`ResponsesRequest`], bereit zur Serialisierung.
 fn build_request(model: &str, request: &ModelRequest) -> ResponsesRequest {
     let renderer = ToolResultRenderer::new(request);
+    // Interne Namen wie `fs.read` verletzen `^[a-zA-Z0-9_-]+$` der API.
+    let names = tool_names::ToolNameCodec::for_request(request);
     let mut input = Vec::new();
     for message in request.history.to_model_messages() {
         match message {
@@ -1322,7 +1449,7 @@ fn build_request(model: &str, request: &ModelRequest) -> ResponsesRequest {
             } => {
                 input.push(InputItem::FunctionCall {
                     call_id: call_id.to_string(),
-                    name,
+                    name: names.encode(&name),
                     arguments: arguments.to_string(),
                 });
             }
@@ -1729,13 +1856,14 @@ fn extract_assistant_text(body: &Value) -> Option<String> {
 /// Chat-Completions-Wire-Format des `tools`-Arrays:
 /// `{type:"function", function:{name, description, parameters, strict}}`.
 fn build_chat_tools(tools: &[ToolSpec]) -> Vec<Value> {
+    let names = tool_names::ToolNameCodec::for_tools(tools);
     tools
         .iter()
         .map(|spec| match spec {
             ToolSpec::Function(f) => serde_json::json!({
                 "type": "function",
                 "function": {
-                    "name": f.name.as_str(),
+                    "name": names.encode(f.name.as_str()),
                     "description": f.description,
                     "parameters": strict_parameters(f),
                     "strict": f.strict,
@@ -1771,6 +1899,7 @@ fn build_chat_tools(tools: &[ToolSpec]) -> Vec<Value> {
 /// Ein [`serde_json::Value`]-Objekt, direkt als Request-Body serialisierbar.
 fn build_chat_body(request: &ModelRequest, model: &str) -> Value {
     let renderer = ToolResultRenderer::new(request);
+    let names = tool_names::ToolNameCodec::for_request(request);
     let mut messages: Vec<Value> = Vec::new();
 
     let mut system = request.system_prompt.clone();
@@ -1801,7 +1930,7 @@ fn build_chat_body(request: &ModelRequest, model: &str) -> Value {
                         "id": call_id.as_str(),
                         "type": "function",
                         "function": {
-                            "name": name,
+                            "name": names.encode(&name),
                             "arguments": arguments.to_string(),
                         },
                     }),
@@ -2177,16 +2306,21 @@ impl ModelProvider for OpenAiResponsesProvider {
             }
 
             let value: Value = serde_json::from_str(&body)?;
-            match self.transport {
+            let mut response = match self.transport {
                 Transport::Responses => {
                     let (response, replay) = interpret_responses(&value, &self.provider_id, model)?;
                     if let Some(entry) = replay {
                         self.reasoning_replay.remember(entry);
                     }
-                    Ok(response)
+                    response
                 }
-                Transport::Chat => interpret_chat(&value),
+                Transport::Chat => interpret_chat(&value)?,
+            };
+            let names = tool_names::ToolNameCodec::for_request(&request);
+            for call in &mut response.tool_calls {
+                call.name = ToolName::new(names.decode(call.name.as_str()));
             }
+            Ok(response)
         })
     }
 }
@@ -2335,6 +2469,7 @@ mod tests {
             env_layer,
             resolver,
             home,
+            endpoint: None,
         }
     }
 
@@ -2734,6 +2869,67 @@ mod tests {
         ] {
             assert_eq!(parse_keyring_reference(payload), None, "{payload:?}");
         }
+    }
+
+    #[test]
+    fn test_read_external_cli_credential_none_endpoint_returns_none() {
+        // Ohne Endpoint darf niemals eine externe CLI-Credential-Datei
+        // gelesen werden, unabhängig von Pfad/Pointer.
+        assert!(read_external_cli_credential(None, "/anything", "/anything").is_none());
+    }
+
+    #[test]
+    fn test_read_external_cli_credential_non_official_host_returns_none() {
+        let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+            // Ohne HOME kann der Allowlist-Pfad nicht gebildet werden; das ist
+            // hier irrelevant, weil der Host schon vorher ablehnt, aber die
+            // Funktion selbst liest HOME zuerst.
+            return;
+        };
+        let path = PathBuf::from(home).join(".codex/auth.json");
+        let raw_path = path.to_str().expect("utf8 test path");
+
+        let result = read_external_cli_credential(
+            Some("https://evil.example/v1"),
+            raw_path,
+            "/tokens/access_token",
+        );
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_read_external_cli_credential_wrong_pointer_returns_none() {
+        let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+            return;
+        };
+        let path = PathBuf::from(home).join(".codex/auth.json");
+        let raw_path = path.to_str().expect("utf8 test path");
+
+        let result = read_external_cli_credential(
+            Some("https://api.openai.com/v1"),
+            raw_path,
+            "/not/an/allowlisted/pointer",
+        );
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_read_external_cli_credential_wrong_path_returns_none() {
+        let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+            return;
+        };
+        let path = PathBuf::from(home).join("not-an-allowlisted-file.json");
+        let raw_path = path.to_str().expect("utf8 test path");
+
+        let result = read_external_cli_credential(
+            Some("https://api.openai.com/v1"),
+            raw_path,
+            "/tokens/access_token",
+        );
+
+        assert!(result.is_none());
     }
 
     #[test]

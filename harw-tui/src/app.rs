@@ -99,7 +99,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyModifiers,
+    DisableBracketedPaste, EnableBracketedPaste, EnableMouseCapture, KeyCode, KeyEvent,
+    KeyModifiers,
 };
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::Terminal;
@@ -109,9 +110,11 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
+use harw_core::cancel::{CancelReason, CancelToken};
+use harw_core::turn_loop::TurnControl;
 use harw_core::{
-    AgentSession, ConversationHistory, CoreError, InteractionMode, ManagedAgentSpawner,
-    ModelError, ModelMessage, TurnInput, TurnOutcome, run_turn,
+    AgentSession, ConversationHistory, CoreError, InteractionMode, ManagedAgentSpawner, ModelError,
+    ModelMessage, TurnInput, TurnOutcome, run_turn,
 };
 use harw_extension_api::allow_rules::{ApprovalRule, RuleDecision, RuleScope, derive_shell_rule};
 use harw_extension_api::approval_mode::ApprovalMode;
@@ -652,8 +655,20 @@ pub struct ChatApp {
     cells: Vec<Box<dyn HistoryCell>>,
     /// Editor-Zustand für die aktuelle Eingabezeile (Puffer, Cursor, History).
     input: InputEditor,
-    /// Typing received during a turn is replayed after the turn finishes.
+    /// Eingabeereignisse, die während eines Turns ankamen und nach ihm erneut
+    /// durch den normalen Editorpfad laufen. Dadurch bleibt der Composer auch
+    /// bei Modellarbeit und Freigabefragen vollständig bedienbar.
     deferred_input: std::collections::VecDeque<TuiEvent>,
+    /// Bereits abgeschickte Benutzertexte. Ein laufender Turn darf nie
+    /// abgebrochen oder vermischt werden; diese FIFO wird ausschließlich an
+    /// Turn-Grenzen abgearbeitet.
+    pending_turns: std::collections::VecDeque<String>,
+    /// Kooperativer Abbruchgriff für den gerade laufenden Turn. `Ctrl+C`
+    /// löst ihn auch dann aus, wenn kein Freigabe-Dialog sichtbar ist.
+    active_cancel: Option<CancelToken>,
+    /// Ein erstes Escape schließt nur Popup/History-Navigation; ein zweites
+    /// Escape leert den Composer.
+    escape_armed: bool,
     /// Scroll-Zustand der Chat-Ansicht (Offset, Auto-Follow).
     scroll: ChatScroll,
     /// Persistente Eingabe-Historie; überdauert die Sitzung als Datei.
@@ -771,6 +786,7 @@ impl std::fmt::Debug for ChatApp {
             .debug_struct("ChatApp")
             .field("cells_len", &self.cells.len())
             .field("input", &self.input.text())
+            .field("turn_running", &self.active_cancel.is_some())
             .field("scroll_offset", &self.scroll.offset())
             .field("command_popup_open", &self.command_popup.is_some())
             .field("theme", &self.theme)
@@ -858,9 +874,12 @@ impl ChatApp {
             cells: Vec::new(),
             input,
             deferred_input: std::collections::VecDeque::new(),
+            pending_turns: std::collections::VecDeque::new(),
+            active_cancel: None,
+            escape_armed: false,
             scroll: ChatScroll::new(),
             input_history,
-            command_registry: CommandRegistry::built_in(),
+            command_registry: CommandRegistry::from_command_adapters(&adapters),
             command_popup: None,
             theme: style::detect_theme(),
             total_usage: TokenUsage::default(),
@@ -1151,6 +1170,7 @@ impl ChatApp {
                     self.mode_before_plan = Some(self.active_mode);
                 }
                 self.set_approval_mode(ApprovalMode::AlwaysAsk);
+                self.active_mode = InteractionMode::Plan;
                 if let Err(error) =
                     self.session_controller.request_mode(InteractionMode::Plan.as_str())
                 {
@@ -1169,6 +1189,7 @@ impl ChatApp {
                 };
                 self.set_approval_mode(approval);
                 if let Some(previous) = self.mode_before_plan.take() {
+                    self.active_mode = previous;
                     if let Err(error) = self.session_controller.request_mode(previous.as_str()) {
                         tracing::warn!(
                             error = %error,
@@ -1192,12 +1213,12 @@ impl ChatApp {
             .pending_permission_stage
             .unwrap_or_else(|| self.current_permission_stage());
         let next = current.next();
-        if turn_running {
-            self.pending_permission_stage = Some(next);
-        } else {
-            self.pending_permission_stage = None;
-            self.apply_permission_stage(next);
-        }
+        // Freigabestufen gelten sofort, auch während ein Turn läuft. Der
+        // Interaktionsmodus wird vom Kern weiter an der Turn-Grenze übernommen,
+        // aber der sichtbare Zielzustand aktualisiert sich unverzüglich.
+        let _ = turn_running;
+        self.pending_permission_stage = None;
+        self.apply_permission_stage(next);
     }
 
     /// Schließt die aktuell offene Lese-Gruppe (Plan Schritt 2 „Gruppierung").
@@ -1595,9 +1616,10 @@ impl ChatApp {
 /// RAII-Guard, der Raw-Mode, Bracketed-Paste und Alternate-Screen bei Drop zurückstellt.
 ///
 /// # Beschreibung
-/// Aktiviert Raw-Mode, `EnterAlternateScreen` und `EnableBracketedPaste` und baut ein
-/// ratatui-Fullscreen-Terminal. Der Alternate-Screen claimt die gesamte Terminalfläche
-/// und stellt sie beim Drop sauber wieder her, sodass der normale Scrollback erhalten bleibt.
+/// Aktiviert Raw-Mode, `EnterAlternateScreen`, Bracketed-Paste und Maus-Capture und baut
+/// ein ratatui-Fullscreen-Terminal. Das Mausrad wird als `MouseEvent` an den vorhandenen
+/// Chat-Scrollpfad geliefert, statt vom Terminal in `Up`/`Down` für die Input-History
+/// übersetzt zu werden. Shift+Mauszug bleibt terminalseitig für die Textauswahl verfügbar.
 ///
 /// # Nebenläufigkeit
 /// Nicht thread-sicher; ausschließlich vom Renderer-Thread verwendet.
@@ -1606,12 +1628,12 @@ pub(crate) struct TerminalGuard {
 }
 
 impl TerminalGuard {
-    /// Aktiviert Raw-Mode, Alternate-Screen und Bracketed-Paste und baut das Fullscreen-Terminal.
+    /// Aktiviert Raw-Mode, Alternate-Screen, Bracketed-Paste und Maus-Capture.
     ///
     /// # Beschreibung
     /// Reihenfolge beim Aufbau:
     /// 1. Raw-Mode aktivieren.
-    /// 2. `EnterAlternateScreen` + `EnableBracketedPaste` senden.
+    /// 2. `EnterAlternateScreen`, `EnableBracketedPaste` und `EnableMouseCapture` senden.
     /// 3. Backend + Fullscreen-`Terminal` bauen.
     ///
     /// Bei jedem Fehler nach Schritt 1 wird bereits aktivierter Zustand best-effort zurückgestellt.
@@ -1625,7 +1647,7 @@ impl TerminalGuard {
             stdout,
             crossterm::terminal::EnterAlternateScreen,
             EnableBracketedPaste,
-            crossterm::event::EnableMouseCapture,
+            EnableMouseCapture,
         ) {
             let _ = crossterm::execute!(
                 stdout,
@@ -1851,12 +1873,11 @@ pub(crate) async fn run_loop(
     let mut spinner = Spinner::new();
 
     loop {
-        // Wird im `harw_rx`-Zweig gesetzt und **nach** dem `select!`
-        // verarbeitet, damit der Turn-Pfad `tui_rx`/`turn_event_rx` erneut
-        // veränderlich leihen darf (siehe Funktionsdoku).
-        let mut submitted: Option<String> = None;
+        // Eine während des vorherigen Turns abgeschickte Eingabe hat Vorrang.
+        // Sie passiert denselben Pfad wie eine frische `HarwEvent::Submit`.
+        let mut submitted: Option<String> = app.pending_turns.pop_front();
 
-        tokio::select! {
+        if submitted.is_none() { tokio::select! {
             maybe_tev = async { match app.deferred_input.pop_front() { Some(event) => Some(event), None => tui_rx.recv().await } } => {
                 let Some(tev) = maybe_tev else { return Ok(TuiRunOutcome::Quit) };
 
@@ -1913,8 +1934,14 @@ pub(crate) async fn run_loop(
                         frame_req.schedule_frame();
                     }
                     HarwEvent::Submit(text) => {
-                        // Nur merken — verarbeitet wird nach dem `select!`.
-                        submitted = Some(text);
+                        // Ein Turn läuft nie parallel zum nächsten. Falls bereits
+                        // etwas zur Verarbeitung bereitsteht, bleibt diese Eingabe
+                        // FIFO erhalten.
+                        if submitted.is_some() {
+                            app.pending_turns.push_back(text);
+                        } else {
+                            submitted = Some(text);
+                        }
                     }
                     HarwEvent::Command(raw) => {
                         if let Some(request) = resume_request(&raw) {
@@ -2092,7 +2119,7 @@ pub(crate) async fn run_loop(
                     }
                 }
             }
-        }
+        } }
 
         // ── Turn-Pfad, außerhalb des `select!` ───────────────────────────────
         let Some(text) = submitted else {
@@ -2704,7 +2731,7 @@ fn handle_overlay_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -
 /// - **Enter** — Zeile absenden (leer/whitespace: ignoriert).
 /// - **Ctrl+J** (auch Shift/Alt+Enter) — neue Zeile im Eingabepuffer.
 /// - **Ctrl+C** — 1×: „again to quit"-Hinweis; 2× innerhalb 2 s: [`HarwEvent::Quit`].
-/// - **Ctrl+D** — nur bei **leerer** Eingabe; 1×: Hinweis, 2×: Quit.
+/// - **Ctrl+D** — 1×: Hinweis, 2× innerhalb 2 s: Quit, unabhängig von Composer, Popup oder Overlay.
 /// - **Esc** — aktuelle Eingabe leeren.
 /// - **Backspace** — letztes Zeichen löschen.
 /// - **PageUp** — History nach oben scrollen (via [`ChatScroll::page_up`]).
@@ -2748,36 +2775,46 @@ fn handle_key(
         return true;
     }
 
-    // Ctrl+D — nur bei leerer Eingabe; Doppeldruck beendet.
+    // Ctrl+D — Doppeldruck beendet unabhängig vom aktuellen UI-Zustand.
+    // Der Check liegt vor Overlay, Popup und Composer, damit ein verlässlicher
+    // Notausstieg auch bei offenem Dialog oder nicht leerer Eingabe funktioniert.
     if ctrl && matches!(key.code, KeyCode::Char('d' | 'D')) {
-        if app.input.is_empty() {
-            if matches!(
-                *pending_quit,
-                Some(QuitArm {
-                    label: "Ctrl+D",
-                    ..
-                })
-            ) {
-                bus.send(HarwEvent::Quit);
-                return false;
-            }
-            *pending_quit = Some(QuitArm {
+        if matches!(
+            *pending_quit,
+            Some(QuitArm {
                 label: "Ctrl+D",
-                at: Instant::now(),
-            });
-            return true;
+                ..
+            })
+        ) {
+            bus.send(HarwEvent::Quit);
+            return false;
         }
-        return false;
+        *pending_quit = Some(QuitArm {
+            label: "Ctrl+D",
+            at: Instant::now(),
+        });
+        return true;
     }
 
     // Jede andere Taste macht eine Scharfstellung rückgängig.
     *pending_quit = None;
+    if !matches!(key.code, KeyCode::Esc) {
+        app.escape_armed = false;
+    }
 
     // ── Vollflächige Overlays (Session-Picker, `/export`-Auswahl) ────────
     // Exklusiv: solange eines offen ist, geht keine Taste an Popup, Editor
     // oder ChatScroll (Plan Schritt 6/7).
     if app.has_overlay() {
         return handle_overlay_key(app, key, bus);
+    }
+
+    // Das erste Escape schließt ausschließlich die Autovervollständigung.
+    // Ein direkt folgendes Escape erreicht danach den Composer und leert ihn.
+    if matches!(key.code, KeyCode::Esc) && app.has_popup() {
+        app.command_popup = None;
+        app.escape_armed = true;
+        return true;
     }
 
     // Shift+Tab — Zyklus ask → auto → full → plan (Plan Schritt 5). Nur
@@ -2788,6 +2825,14 @@ fn handle_key(
         // (während eines Turns übernimmt `handle_busy_event`) — der Wechsel
         // wirkt hier also sofort, nicht vorgemerkt.
         app.cycle_permission_stage(false);
+        return true;
+    }
+
+    // Ctrl+K löscht nur bis zum Ende der aktuellen Zeile, auch bei offenem
+    // Command-Popup. Mehrzeilige Entwürfe unterhalb des Cursors bleiben stehen.
+    if ctrl && matches!(key.code, KeyCode::Char('k' | 'K')) {
+        app.input.delete_to_end();
+        app.sync_popup();
         return true;
     }
 
@@ -2897,11 +2942,18 @@ fn handle_key(
         }
     } else {
         // ── Normaler Eingabe-Pfad (kein Popup aktiv) — InputEditor konsultieren ──
-        // Esc während History-Browsing wird vom InputEditor selbst behandelt
-        // (cancel_history + Redraw); Esc ohne History-Browsing leert den Puffer.
+        // Zwei Escape-Tasten leeren den Composer. Das erste Escape ist ein
+        // harmloser Rücksprung (und kann damit auch die History-Navigation
+        // beenden); erst der zweite unmittelbare Druck verwirft den Text.
         if matches!(key.code, KeyCode::Esc) && !app.input.is_empty() {
-            app.input.clear();
-            app.command_popup = None;
+            if app.escape_armed {
+                app.input.clear();
+                app.command_popup = None;
+                app.escape_armed = false;
+            } else {
+                app.escape_armed = true;
+                let _ = app.input.handle_key(key);
+            }
             return true;
         }
 
@@ -2960,22 +3012,28 @@ async fn run_turn_streaming(
     // See harw-tui Design §session_controller — apply_to_session, AP W5-05.
     app.apply_pending_controller_state(gateway.session_mut());
 
+    // Keep a clone in the UI so Ctrl+C can cancel the core turn at its
+    // cooperative checkpoints instead of merely queuing a character.
+    let cancel = CancelToken::new();
+    app.active_cancel = Some(cancel.clone());
     spinner.start();
     let reply = drive_turn_animated(
         guard,
         app,
         spinner,
         gateway,
-        text,
+        TurnInput::user(text).with_control(TurnControl::new().with_cancel(cancel)),
         approval_driver,
         approvals,
         tui_rx,
         turn_event_rx,
         turn_state,
     )
-    .await?;
+    .await;
     spinner.stop();
+    app.active_cancel = None;
 
+    let reply = reply?;
     reveal_reply(guard, app, &reply).await?;
     Ok(())
 }
@@ -3042,7 +3100,7 @@ async fn drive_turn_animated(
     app: &mut ChatApp,
     spinner: &mut Spinner,
     gateway: &mut dyn crate::gateway::ChatGateway,
-    text: &str,
+    input: TurnInput,
     approval_driver: &ApprovalDriver,
     approvals: &mut ApprovalPromptReceiver,
     tui_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TuiEvent>,
@@ -3057,7 +3115,7 @@ async fn drive_turn_animated(
     let mut input_open = true;
     let first_result = {
         let (session, store, model) = gateway.borrow_turn_ctx();
-        let turn = run_turn(session, model, store, TurnInput::user(text));
+        let turn = run_turn(session, model, store, input);
         tokio::pin!(turn);
         loop {
             tokio::select! {
@@ -3681,7 +3739,11 @@ async fn drive_pauses_to_completion(
                             continue;
                         };
                         match dialog.handle_key(key, armed) {
-                            DialogAction::Stay => {}
+                            DialogAction::Stay => {
+                                if queue_busy_key(app, key) {
+                                    draw_viewport(guard, app, spinner, None)?;
+                                }
+                            }
                             DialogAction::ToggleDetails => {
                                 draw_viewport(guard, app, spinner, None)?;
                             }
@@ -3737,32 +3799,62 @@ async fn drive_pauses_to_completion(
     }
 }
 
+/// Bearbeitet den Composer während eines laufenden Turns. Chat-Zeilen gehen
+/// direkt in die FIFO. Slash-Kommandos bleiben nach Enter im Composer, damit
+/// sie weder verloren gehen noch die laufende Ausführung beeinflussen.
+fn queue_busy_key(app: &mut ChatApp, key: KeyEvent) -> bool {
+    match app.input.handle_key(key) {
+        InputAction::Submit(text) => {
+            app.remember_input(&text);
+            match classify_line(&text) {
+                LineAction::Chat(text) => app.pending_turns.push_back(text),
+                // Commands require the runtime command channel. Preserve the
+                // original line in the composer rather than silently losing it.
+                LineAction::Command(raw) => app.input.insert_str(&raw),
+                LineAction::Quit | LineAction::Ignore | LineAction::System(_) => {}
+            }
+            true
+        }
+        InputAction::Redraw => { app.sync_popup(); true }
+        InputAction::Passthrough => false,
+    }
+}
+
 /// Processes navigation immediately while preserving typing for the next prompt.
 fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> bool {
     let total = app.last_history_total_lines() as usize;
     let rows = app.last_history_visible_rows() as usize;
     match event {
+        TuiEvent::Key(key)
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(key.code, KeyCode::Char('c' | 'C')) =>
+        {
+            if let Some(cancel) = &app.active_cancel {
+                cancel.cancel(CancelReason::User);
+                app.push_line(Role::System, "Abbruch angefordert …");
+                return true;
+            }
+            false
+        }
         TuiEvent::Mouse(mouse) => {
             app.scroll.handle_mouse(mouse, total, rows) == ScrollAction::Redraw
         }
         TuiEvent::Key(key) if app.scroll.handle_key(key, total, rows) == ScrollAction::Redraw => {
             true
         }
-        // Shift+Tab wirkt während eines laufenden Turns nicht sofort, sondern
-        // wird vorgemerkt (AP W5-05, Plan Schritt 5): die Statuszeile zeigt
-        // ab diesem Tastendruck „(ab nächstem Turn)", bis die nächste
-        // Turn-Grenze den Wechsel über `apply_pending_controller_state`
-        // einlöst. Nicht in `deferred_input` einreihen — sonst würde
-        // derselbe Zyklus-Schritt nach Turn-Ende ein zweites Mal ausgelöst.
+        // Shift+Tab gilt sofort und wird nicht in `deferred_input` eingereiht,
+        // damit der Zyklus nach Turn-Ende nicht ein zweites Mal läuft.
         TuiEvent::Key(key) if matches!(key.code, KeyCode::BackTab) => {
-            app.cycle_permission_stage(true);
+            app.cycle_permission_stage(false);
             true
         }
         TuiEvent::Draw | TuiEvent::Resize(_, _) => true,
-        event => {
-            app.deferred_input.push_back(event);
-            false
+        TuiEvent::Paste(text) => {
+            app.input.insert_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+            app.sync_popup();
+            true
         }
+        TuiEvent::Key(key) => queue_busy_key(app, key),
     }
 }
 
@@ -3797,26 +3889,12 @@ async fn reveal_reply(
     Ok(())
 }
 
-/// Zeichnet die Fullscreen-Viewport: History (scrollbar) oben, Status mitte, Eingabebox unten.
+/// Zeichnet die Fullscreen-Viewport: scrollbare History oben und Eingabebox unten.
 ///
 /// # Beschreibung
-/// Dreiteiliges Layout (Direction::Vertical):
-/// - **History** (`Constraint::Min(3)`): alle `cells` als scrollbarer `Paragraph`.
-///   `app.scroll_offset` bestimmt den Abstand vom Ende (0 = unten). PageUp/PageDown
-///   steuern diesen Offset via [`handle_key`].
-/// - **Status** (`Constraint::Length(1)`): animierter Spinner, Beenden-Hinweis oder
-///   Standard-Tastenlegende.
-/// - **Eingabe** (`Constraint::Length(3–6)`): Mehrzeilige Eingabe mit `› `-Präfix und
-///   Rahmen. Höhe passt sich der Zeilenanzahl an (Clamp 3–6).
-///
-/// Ein offenes, nicht leeres `/command`-Popup überlagert den unteren Teil des History-
-/// Bereichs, direkt oberhalb der Statuszeile.
-///
-/// # Argumente
-/// - `guard` (`&mut TerminalGuard`): Terminal-Guard.
-/// - `app` (`&ChatApp`): aktueller Zustand (Eingabe, History, Theme, Popup, Scroll-Offset).
-/// - `spinner` (`&Spinner`): Spinner-Zustand für die Statuszeile.
-/// - `quit_hint` (`Option<&str>`): Label der scharfgestellten Beenden-Taste.
+/// Dreiteiliges Layout: History oben, eine dauerhafte Statuszeile und der
+/// mehrzeilige Composer unten. Ein offenes `/command`-Popup überlagert den
+/// unteren Teil der History.
 ///
 /// # Fehler
 /// [`TuiError::Io`] beim Zeichnen.
@@ -3878,21 +3956,27 @@ fn render_viewport(
         }
     };
 
-    // Dreiteiliges vertikales Layout: History | Eingabe | Status.
-    // Status kommt bewusst UNTER die Eingabebox — dort erwartet das Auge
-    // Fußzeilen-Hinweise, ohne den Sichtabstand zwischen Chat und
-    // Eingabefeld zu vergrößern.
+    // History | permanente Statuszeile | Eingabe. Der Sicherheitsmodus muss
+    // sichtbar bleiben und darf nicht vom Verlauf verdrängt werden.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(3),
-            Constraint::Length(input_height),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Min(3), Constraint::Length(1), Constraint::Length(input_height)])
         .split(area);
     let history_area = chunks[0];
-    let input_area = chunks[1];
-    let status_area = chunks[2];
+    let status_area = chunks[1];
+    let input_area = chunks[2];
+    let permission = match app.current_permission_stage() {
+        PermissionCycleStage::Ask => "Ask",
+        PermissionCycleStage::Auto => "Auto",
+        PermissionCycleStage::Full => "Full Access",
+        PermissionCycleStage::Plan => "Plan",
+    };
+    let status = format!(
+        " Shift+Tab: {permission} | Modus: {} | Tokens: {} (in {}, out {})",
+        app.active_mode.as_str(), app.total_usage.total(),
+        app.total_usage.input_tokens, app.total_usage.output_tokens,
+    );
+    frame.render_widget(Paragraph::new(status).style(Style::default().fg(style::border_color(theme))), status_area);
 
     // ── History ──────────────────────────────────────────────────────
     // Alle Zellen zu einem flachen Zeilen-Vec zusammenführen.
@@ -3928,7 +4012,6 @@ fn render_viewport(
 
     frame.render_widget(history_widget.scroll((scroll_from_top, 0)), history_area);
 
-    // ── Status ───────────────────────────────────────────────────────
     // Popup überlagert den unteren Teil des History-Bereichs (falls offen).
     let popup_open = app
         .command_popup
@@ -3953,18 +4036,6 @@ fn render_viewport(
             }
         }
     }
-    let sl = status_line(
-        theme,
-        spinner,
-        quit_hint,
-        &app.total_usage,
-        app.active_mode(),
-        app.current_permission_stage(),
-        app.pending_permission_stage().is_some(),
-        app.session_title(),
-        app.has_collapsed_tool_cells(),
-    );
-    frame.render_widget(Paragraph::new(sl), status_area);
 
     // ── Eingabe / Freigabe-Panel ─────────────────────────────────────
     // Solange eine Freigabefrage offen ist, ersetzt das `ApprovalDialog` den
@@ -4009,176 +4080,6 @@ fn render_viewport(
         .saturating_add(u16::try_from(cursor_row.saturating_sub(input_top)).unwrap_or(u16::MAX))
         .min(max_y);
     frame.set_cursor_position((cursor_x, cursor_y));
-}
-
-/// Formatiert eine Token-Zahl kompakt (`999` → `"999"`, `1234` → `"1.2k"`).
-///
-/// # Beschreibung
-/// Werte unter 1000 werden unverändert als Dezimalzahl ausgegeben; ab 1000
-/// wird auf eine Nachkommastelle in Tausendern gerundet (z.B. `1234` → `1.2k`).
-/// Genutzt von [`status_line`] für den kompakten Token-Nutzungs-Suffix.
-///
-/// # Argumente
-/// - `n` (`u64`): die zu formatierende Token-Anzahl.
-///
-/// # Rückgabe
-/// Kompakte, menschenlesbare Darstellung als `String`.
-fn format_tokens_compact(n: u64) -> String {
-    if n < 1000 {
-        n.to_string()
-    } else {
-        format!("{:.1}k", n as f64 / 1000.0)
-    }
-}
-
-/// Baut das Statuszeilen-Segment für den Freigabemodus-Zyklus (Plan Schritt 5).
-///
-/// # Beschreibung
-/// `Ask` ohne Vormerkung zeigt **nichts** (der Standardmodus braucht keine
-/// Hervorhebung); jede andere Stufe — und `Ask` selbst, sobald ein Wechsel
-/// vorgemerkt ist — bekommt ein farbiges Segment mit dem Shift+Tab-Hinweis.
-/// `Full` erscheint in Warnfarbe (rot): voller Zugriff ohne Rückfrage ist das
-/// riskanteste der vier Stufen. Ist `pending` gesetzt (Shift+Tab während eines
-/// laufenden Turns, AP W5-05), wird `" (ab nächstem Turn)"` angehängt.
-///
-/// # Argumente
-/// - `theme` ([`style::Theme`]): aktives Farbschema.
-/// - `stage` ([`PermissionCycleStage`]): die anzuzeigende (aktuelle oder
-///   vorgemerkte) Stufe.
-/// - `pending` (`bool`): `true`, wenn die Stufe noch nicht angewendet wurde.
-fn permission_stage_segment(
-    theme: style::Theme,
-    stage: PermissionCycleStage,
-    pending: bool,
-) -> Option<Span<'static>> {
-    let suffix = if pending { " (ab nächstem Turn)" } else { "" };
-    let (text, style) = match stage {
-        PermissionCycleStage::Ask if !pending => return None,
-        PermissionCycleStage::Ask => (
-            format!("· ask mode{suffix} "),
-            style::dim_style(theme),
-        ),
-        PermissionCycleStage::Auto => (
-            format!("· ⏵⏵ auto mode on (shift+tab){suffix} "),
-            style::selected_style(theme),
-        ),
-        PermissionCycleStage::Full => (
-            format!("· ⏺ full access on (shift+tab){suffix} "),
-            style::error_style(theme),
-        ),
-        PermissionCycleStage::Plan => (
-            format!("· ⏸ plan mode on (shift+tab){suffix} "),
-            style::dim_style(theme),
-        ),
-    };
-    Some(Span::styled(text, style))
-}
-
-/// Baut die Statuszeile für die Fullscreen-Viewport.
-///
-/// # Beschreibung
-/// Priorität der Inhalte (höchste zuerst):
-/// 1. Laufender Turn → animierter Spinner-Glyph + „denkt…" + Modus-Anzeige.
-/// 2. Scharfgestelltes Beenden → gelber Hinweis mit dem Taste-Label.
-/// 3. Standard-Tastenlegende (Enter, Ctrl+J, Ctrl+C/D) — gefolgt vom aktiven
-///    Interaktionsmodus (AP W5-05), dem Freigabemodus-Segment (Plan Schritt 5,
-///    [`permission_stage_segment`]), dem Session-Titel (falls bekannt, Plan
-///    Schritt 7), einem Ctrl+O-Hinweis (sofern Werkzeugzellen eingeklappt
-///    sind, Plan Schritt 2) und, bei `total_usage.total() > 0`, einem
-///    kompakten Token-Nutzungs-Suffix (z. B.
-///    `" · 1.2k Tokens (0.9k in + 0.3k out)"`), formatiert über
-///    [`format_tokens_compact`].
-///
-/// # Argumente
-/// - `theme` ([`style::Theme`]): aktives Farbschema für Spinner und Legende.
-/// - `spinner` (`&Spinner`): Spinner-Zustand; `is_active()` und `glyph()` werden
-///   abgefragt.
-/// - `quit_hint` (`Option<&str>`): wenn `Some(label)`, wird der Beenden-Hinweis
-///   mit dem Label angezeigt (z. B. `"Ctrl+C"`).
-/// - `total_usage` (`&TokenUsage`): über die Session-Laufzeit aufsummierte
-///   Token-Nutzung; nur im Standard-Legenden-Zweig als Suffix sichtbar.
-/// - `mode` ([`InteractionMode`]): der zuletzt an einer Turn-Grenze angewendete
-///   Interaktionsmodus.
-/// - `permission_stage` ([`PermissionCycleStage`]): aktuelle bzw. vorgemerkte
-///   Shift+Tab-Stufe.
-/// - `permission_pending` (`bool`): `true`, solange der Wechsel noch nicht
-///   angewendet wurde.
-/// - `session_title` (`Option<&str>`): Anzeigetitel der Sitzung, falls bekannt.
-/// - `tool_cells_collapsed` (`bool`): `true`, wenn mindestens eine
-///   Werkzeugzelle eingeklappt ist (Ctrl+O-Hinweis).
-///
-/// # Rückgabe
-/// Eine fertig gestaltete [`ratatui::text::Line`] mit Lebensdauer `'static`.
-#[allow(clippy::too_many_arguments)]
-fn status_line(
-    theme: style::Theme,
-    spinner: &Spinner,
-    quit_hint: Option<&str>,
-    total_usage: &TokenUsage,
-    mode: InteractionMode,
-    permission_stage: PermissionCycleStage,
-    permission_pending: bool,
-    session_title: Option<&str>,
-    tool_cells_collapsed: bool,
-) -> Line<'static> {
-    if spinner.is_active() {
-        let mut spans = vec![
-            Span::styled(
-                format!("{} ", spinner.glyph()),
-                style::selected_style(theme),
-            ),
-            Span::styled("denkt…", style::dim_style(theme)),
-            Span::styled(
-                format!(" · Modus: {} ", mode.as_str()),
-                style::dim_style(theme),
-            ),
-        ];
-        if let Some(segment) = permission_stage_segment(theme, permission_stage, permission_pending) {
-            spans.push(segment);
-        }
-        Line::from(spans)
-    } else if let Some(label) = quit_hint {
-        Line::from(Span::styled(
-            format!(" {label} erneut drücken zum Beenden "),
-            style::warning_style(theme),
-        ))
-    } else {
-        let mut spans = vec![Span::styled(
-            " Enter: senden · Ctrl+J: neue Zeile · Ctrl+C 2× / Ctrl+D: beenden ".to_owned(),
-            style::dim_style(theme),
-        )];
-        spans.push(Span::styled(
-            format!("· Modus: {} ", mode.as_str()),
-            style::dim_style(theme),
-        ));
-        if let Some(segment) = permission_stage_segment(theme, permission_stage, permission_pending) {
-            spans.push(segment);
-        }
-        if let Some(title) = session_title {
-            spans.push(Span::styled(
-                format!("· {title} "),
-                style::dim_style(theme),
-            ));
-        }
-        if tool_cells_collapsed {
-            spans.push(Span::styled(
-                "· ctrl+o: Werkzeuge ausklappen ".to_owned(),
-                style::dim_style(theme),
-            ));
-        }
-        if total_usage.total() > 0 {
-            spans.push(Span::styled(
-                format!(
-                    "· {} Tokens ({} in + {} out) ",
-                    format_tokens_compact(total_usage.total()),
-                    format_tokens_compact(total_usage.input_tokens),
-                    format_tokens_compact(total_usage.output_tokens),
-                ),
-                style::dim_style(theme),
-            ));
-        }
-        Line::from(spans)
-    }
 }
 
 /// Fehler des TUI-Chat-Renderers.
@@ -4679,6 +4580,32 @@ forbidden = [{forbidden}]
     // behandelt.
     // ────────────────────────────────────────────────────────────────────
 
+    /// Zwei Ctrl+D beenden auch bei nicht leerem Composer und offenem Popup.
+    #[test]
+    fn double_ctrl_d_quits_regardless_of_composer_or_popup_state() {
+        let mut app = test_chat_app();
+        app.input.insert_str("/status mit Entwurf");
+        app.sync_popup();
+        assert!(app.command_popup.is_some(), "Vorbedingung: Popup ist offen");
+
+        let (bus, mut receiver) = harw_event_channel();
+        let mut pending_quit = None;
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+
+        assert!(handle_key(&mut app, ctrl_d, &mut pending_quit, &bus));
+        assert!(matches!(
+            pending_quit,
+            Some(QuitArm { label: "Ctrl+D", .. })
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        assert!(!handle_key(&mut app, ctrl_d, &mut pending_quit, &bus));
+        assert!(matches!(receiver.try_recv(), Ok(HarwEvent::Quit)));
+    }
+
     /// Plain Enter bei offenem Popup (Eingabe `/status`, kein Leerzeichen)
     /// sendet die Zeile ab: das erwartete `HarwEvent::Command` erscheint auf
     /// dem Bus und `app.input` wird geleert.
@@ -4718,6 +4645,44 @@ forbidden = [{forbidden}]
             }
             other => panic!("erwartete HarwEvent::Command(\"/status\"), war: {other:?}"),
         }
+    }
+
+    #[test]
+    fn busy_submit_is_queued_in_fifo_order() {
+        let mut app = test_chat_app();
+        app.input.insert_str("erste Nachricht");
+        assert!(queue_busy_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ));
+        app.input.insert_str("zweite Nachricht");
+        assert!(queue_busy_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ));
+
+        assert_eq!(app.pending_turns.pop_front().as_deref(), Some("erste Nachricht"));
+        assert_eq!(app.pending_turns.pop_front().as_deref(), Some("zweite Nachricht"));
+        assert!(app.pending_turns.is_empty());
+    }
+
+    /// Der Composer bleibt beim ersten Escape erhalten und wird beim zweiten
+    /// unmittelbaren Escape geleert.
+    #[test]
+    fn two_escapes_clear_the_input_box() {
+        let mut app = test_chat_app();
+        app.input.insert_str("nicht verlieren beim ersten Escape");
+        let (bus, _receiver) = harw_event_channel();
+        let mut pending_quit = None;
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(handle_key(&mut app, escape, &mut pending_quit, &bus));
+        assert_eq!(app.input(), "nicht verlieren beim ersten Escape");
+        assert!(app.escape_armed);
+
+        assert!(handle_key(&mut app, escape, &mut pending_quit, &bus));
+        assert!(app.input().is_empty());
+        assert!(!app.escape_armed);
     }
 
     /// `KeyCode::Tab` bei offenem Popup akzeptiert die markierte Auswahl,
@@ -5375,25 +5340,7 @@ forbidden = [{forbidden}]
 
         assert_eq!(session.mode(), InteractionMode::Explore);
         assert_eq!(app.active_mode(), InteractionMode::Explore);
-        let rendered: String = status_line(
-            style::Theme::Dark,
-            &Spinner::new(),
-            None,
-            &TokenUsage::default(),
-            app.active_mode(),
-            app.current_permission_stage(),
-            app.pending_permission_stage().is_some(),
-            app.session_title(),
-            app.has_collapsed_tool_cells(),
-        )
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect();
-        assert!(
-            rendered.contains("Modus: explore"),
-            "die Statuszeile muss den aktiven Modus zeigen, war: {rendered:?}"
-        );
+
     }
 
     /// Ein unbekannter Modusname wird abgewiesen statt still auf den Default zu
@@ -5536,9 +5483,9 @@ forbidden = [{forbidden}]
         assert!(rendered.contains("Knoten ergänzt"));
     }
 
-    /// `ModeChanged` zieht den Anzeigemodus nach; ein unbekannter Name nicht.
+    /// `ModeChanged` zieht den internen Modus nach; ein unbekannter Name nicht.
     #[test]
-    fn mode_changed_events_update_the_status_bar_mode() {
+    fn mode_changed_events_update_the_active_mode() {
         let mut app = test_chat_app();
         let mut state = TurnEventState::default();
 

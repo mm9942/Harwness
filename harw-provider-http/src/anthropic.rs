@@ -30,6 +30,7 @@ use harw_protocol::OpaqueReasoning;
 use harw_tools::{ToolCall, ToolName, ToolSpec};
 use harw_types::{TokenUsage, ToolCallId};
 use secrecy::{ExposeSecret, SecretString};
+use crate::tool_names::ToolNameCodec;
 use serde_json::Value;
 use std::fmt;
 use std::time::Duration;
@@ -244,7 +245,7 @@ fn anthropic_custom_headers()
 /// ausgeschlossen (reine Daten-Struktur ohne fehlbare Typen) — im
 /// unwahrscheinlichen Fehlerfall wird ein leeres Objekt-Schema verwendet,
 /// statt zu paniken.
-fn build_anthropic_tools(tools: &[ToolSpec]) -> Vec<Value> {
+fn build_anthropic_tools(tools: &[ToolSpec], names: &ToolNameCodec) -> Vec<Value> {
     tools
         .iter()
         .map(|spec| match spec {
@@ -252,7 +253,7 @@ fn build_anthropic_tools(tools: &[ToolSpec]) -> Vec<Value> {
                 let input_schema =
                     serde_json::to_value(&f.parameters).unwrap_or_else(|_| serde_json::json!({}));
                 serde_json::json!({
-                    "name": f.name.as_str(),
+                    "name": names.encode(f.name.as_str()),
                     "description": f.description,
                     "input_schema": input_schema,
                 })
@@ -346,6 +347,8 @@ pub fn build_messages_body(model: &str, max_tokens: u32, request: &ModelRequest)
         system.push_str(fragment);
     }
 
+    // Interne Namen wie `fs.read` verletzen Anthropics Namensmuster.
+    let names = ToolNameCodec::for_request(request);
     let mut messages: Vec<Value> = Vec::new();
     for message in request.history.to_model_messages() {
         match message {
@@ -366,7 +369,7 @@ pub fn build_messages_body(model: &str, max_tokens: u32, request: &ModelRequest)
                     serde_json::json!({
                         "type": "tool_use",
                         "id": call_id.as_str(),
-                        "name": name,
+                        "name": names.encode(&name),
                         "input": arguments,
                     }),
                 );
@@ -399,7 +402,7 @@ pub fn build_messages_body(model: &str, max_tokens: u32, request: &ModelRequest)
         body["system"] = Value::String(system);
     }
     if !request.tools.is_empty() {
-        body["tools"] = Value::Array(build_anthropic_tools(&request.tools));
+        body["tools"] = Value::Array(build_anthropic_tools(&request.tools, &names));
     }
     if let Some(effort) = request.reasoning_effort
         && let Some(caps) = crate::anthropic_caps::lookup(model)
@@ -725,11 +728,20 @@ impl ModelProvider for AnthropicMessagesProvider {
 
             let value: Value = serde_json::from_str(&body)?;
             let text = extract_anthropic_text(&value);
-            let tool_calls = extract_anthropic_tool_calls(&value).map_err(|_| {
-                ModelError::RequestFailed(
-                    "Anthropic response contained a tool-use block with invalid input".to_owned(),
-                )
-            })?;
+            let names = ToolNameCodec::for_request(&request);
+            let tool_calls = extract_anthropic_tool_calls(&value)
+                .map_err(|_| {
+                    ModelError::RequestFailed(
+                        "Anthropic response contained a tool-use block with invalid input"
+                            .to_owned(),
+                    )
+                })?
+                .into_iter()
+                .map(|call| ToolCall {
+                    name: ToolName::new(names.decode(call.name.as_str())),
+                    ..call
+                })
+                .collect::<Vec<_>>();
             if text.is_none() && tool_calls.is_empty() {
                 return Err(ModelError::EmptyResponse);
             }
@@ -1196,6 +1208,62 @@ mod tests {
                 .and_then(|s| s.get("type"))
                 .and_then(Value::as_str),
             Some("object")
+        );
+    }
+
+    #[test]
+    fn test_build_messages_body_sanitizes_dotted_tool_name_in_tools_and_history() {
+        let mut history = harw_core::ConversationHistory::new();
+        let call_id = harw_types::ToolCallId::try_from_str("call-1").expect("valid call id");
+        history.push_tool_call(call_id, "fs.read", serde_json::json!({"path": "/tmp"}));
+        let dotted_tool = ToolSpec::Function(harw_tools::FunctionToolSpec {
+            name: ToolName::new("fs.read"),
+            description: "Reads a file".to_owned(),
+            parameters: harw_tools::JsonSchema {
+                schema_type: Some(harw_tools::JsonSchemaType::Object),
+                ..Default::default()
+            },
+            strict: false,
+        });
+        let request = ModelRequest {
+            system_prompt: String::new(),
+            instruction_fragments: Vec::new(),
+            context: Vec::new(),
+            history,
+            tools: vec![dotted_tool],
+            context_assembly: Default::default(),
+            reasoning_effort: None,
+            model_id: None,
+            provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
+        };
+
+        let body = build_messages_body("claude-sonnet-5", 256, &request);
+
+        let tools = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .expect("tools array");
+        assert_eq!(tools[0].get("name").and_then(Value::as_str), Some("fs_read"));
+
+        let messages = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("messages array");
+        let tool_use_block = messages[0]
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|content| content.first())
+            .expect("tool_use content block");
+        assert_eq!(
+            tool_use_block.get("type").and_then(Value::as_str),
+            Some("tool_use")
+        );
+        assert_eq!(
+            tool_use_block.get("name").and_then(Value::as_str),
+            Some("fs_read")
         );
     }
 
