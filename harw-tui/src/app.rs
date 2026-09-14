@@ -2007,13 +2007,37 @@ pub(crate) async fn run_loop(
                             app.push_lines(lines);
                             frame_req.schedule_frame();
                         } else {
+                            // `/compact` mutiert die aktive TUI-Sitzung direkt. Die
+                            // Operation-Adapter besitzen absichtlich keinen Zugriff auf
+                            // den lebenden `AgentSession`; über sie wäre deshalb nur der
+                            // frühere Not-available-Stub erreichbar. Der gekürzte Verlauf
+                            // wird sofort persistiert, damit ein anschließendes `/resume`
+                            // denselben Kontext erhält.
+                            let output = if raw.trim() == "/compact" {
+                                const COMPACT_HISTORY_BYTES: usize = 128 * 1024;
+                                let (session, store, _) = gateway.borrow_turn_ctx();
+                                let before = session.history().len();
+                                let (compacted, _used_bytes, dropped) = session
+                                    .history()
+                                    .tail_within_estimated_bytes(COMPACT_HISTORY_BYTES);
+                                *session.history_mut() = compacted;
+                                let after = session.history().len();
+                                match store.save_history(session.id(), session.history()).await {
+                                    Ok(()) => format!(
+                                        "Session-Kontext komprimiert: {dropped} ältere Einträge entfernt ({before} → {after})."
+                                    ),
+                                    Err(error) => format!(
+                                        "Session-Kontext wurde nur im Speicher komprimiert; Persistenz fehlgeschlagen: {error}"
+                                    ),
+                                }
+                            } else {
                             // `/command`-Zeile asynchron über die Operation-Adapter-
                             // Pipeline ausführen; identischer Render-/Redraw-Pfad wie
                             // bei `SystemMessage` (mehrzeilige Ausgaben an `\n`
                             // aufteilen). Berechtigungsstufe und Slash-Dienste
                             // stammen aus der Runtime-Montage; die Dienste werden
                             // erst nach erfolgreicher Admission gebaut.
-                            let output = match app.runtime() {
+                            match app.runtime() {
                                 Some(rt) => {
                                     execute_command_as(
                                         app.adapters(),
@@ -2029,6 +2053,7 @@ pub(crate) async fn run_loop(
                                     tracing::error!("tui.command.no_runtime_assembly");
                                     "Fehler: keine Runtime-Montage".to_owned()
                                 }
+                            }
                             };
                             let lines: Vec<Line<'static>> = output
                                 .split('\n')
@@ -2861,11 +2886,11 @@ fn handle_key(
         return true;
     }
 
-    // Enter wird IMMER vor dem Popup behandelt — das Popup ist nur ein
-    // Autocomplete-Hinweis und darf das Absenden nicht blockieren. Frühere
-    // Version leitete Enter ins Popup, das arg-behaftete Commands (`/model list`)
-    // verschluckte (Query matchte keinen Command-Namen → `Stay`) oder die
-    // Argumente beim Autocomplete verwarf. Tab akzeptiert jetzt die Auswahl.
+    // Enter übernimmt bei sichtbaren Command-Vorschlägen zuerst die markierte
+    // Auswahl. Dadurch wird `/co` nie als unbekannter Command abgesendet,
+    // obwohl `/compact` sichtbar gewählt werden kann. Argumentbehaftete
+    // Commands sind davon nicht betroffen: `sync_popup` schließt das Popup,
+    // sobald nach dem Namen Whitespace steht.
     if matches!(key.code, KeyCode::Enter) {
         // Shift/Alt+Enter fügt (wie in vielen TUIs) eine neue Zeile ein.
         if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT)
@@ -2874,7 +2899,17 @@ fn handle_key(
             app.sync_popup();
             return true;
         }
-        // Plain Enter: getippte Zeile absenden, offenes Popup schließen.
+        if let Some(name) = app
+            .command_popup
+            .as_ref()
+            .and_then(CommandPopup::selected_name)
+        {
+            app.input.clear();
+            app.input.insert_str(&format!("/{name} "));
+            app.command_popup = None;
+            return true;
+        }
+        // Plain Enter ohne Auswahl: getippte Zeile absenden.
         let line = app.input.text().to_owned();
         app.input.clear();
         app.command_popup = None;
@@ -4606,45 +4641,38 @@ forbidden = [{forbidden}]
         assert!(matches!(receiver.try_recv(), Ok(HarwEvent::Quit)));
     }
 
-    /// Plain Enter bei offenem Popup (Eingabe `/status`, kein Leerzeichen)
-    /// sendet die Zeile ab: das erwartete `HarwEvent::Command` erscheint auf
-    /// dem Bus und `app.input` wird geleert.
+    /// Enter bei einem offenen Popup übernimmt den markierten Befehl und
+    /// sendet den unvollständigen Präfix nicht als unbekannten Command ab.
     #[test]
-    fn test_handle_key_enter_submits_line_and_closes_popup() {
+    fn test_handle_key_enter_accepts_popup_selection_without_submit() {
         let mut app = test_chat_app();
         app.input.clear();
-        app.input.insert_str("/status");
+        app.input.insert_str("/co");
         app.sync_popup();
-        assert!(
-            app.command_popup.is_some(),
-            "Popup muss vor dem Enter-Druck offen sein"
+        assert_eq!(
+            app.command_popup
+                .as_ref()
+                .and_then(CommandPopup::selected_name),
+            Some("compact"),
+            "`/co` muss `/compact` vorauswählen"
         );
 
         let (bus, mut receiver) = harw_event_channel();
         let mut pending_quit: Option<QuitArm> = None;
-        let key = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-
-        let redraw = handle_key(&mut app, key, &mut pending_quit, &bus);
+        let redraw = handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut pending_quit,
+            &bus,
+        );
 
         assert!(redraw, "Enter muss einen Redraw anfordern");
+        assert_eq!(app.input(), "/compact ");
+        assert!(app.command_popup.is_none(), "Auswahl muss das Popup schließen");
         assert!(
-            app.command_popup.is_none(),
-            "plain Enter muss ein offenes Popup schließen"
+            receiver.try_recv().is_err(),
+            "Autocomplete darf noch keinen Command absenden"
         );
-        assert!(
-            app.input().is_empty(),
-            "plain Enter muss die Eingabe leeren"
-        );
-
-        match receiver.try_recv() {
-            Ok(HarwEvent::Command(raw)) => {
-                assert_eq!(
-                    raw, "/status",
-                    "Rohzeile muss unverändert weitergereicht werden"
-                );
-            }
-            other => panic!("erwartete HarwEvent::Command(\"/status\"), war: {other:?}"),
-        }
     }
 
     #[test]
