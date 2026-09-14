@@ -191,10 +191,10 @@ const SERVICE_RESTART_SEC: u32 = 5;
 /// (`harw gateway`). Vorher installierte `service install` nur den Gateway,
 /// womit ein Dienstbetrieb nie Jobs ausführte (G-065).
 ///
-/// Unter systemd schreibt `install` nur die User-Unit-Dateien und gibt den
-/// `systemctl --user daemon-reload`/`enable`-Hinweis aus — es startet nichts.
-/// Andere Backends (launchd, schtasks) installieren wie bisher über
-/// [`ServiceManager::install`]. `status`/`uninstall` wirken auf beide Dienste.
+/// Unter systemd schreibt `install` die User-Unit-Dateien, lädt den Manager neu
+/// und aktiviert/startet beide Units. Andere Backends (launchd, schtasks)
+/// installieren wie bisher über [`ServiceManager::install`]. `status`/`uninstall`
+/// wirken auf beide Dienste.
 ///
 /// # Errors
 /// Home-/Executable-Auflösung, Unit-Verzeichnis, Schreib- und Backend-Fehler.
@@ -221,7 +221,12 @@ pub fn service(home_override: Option<PathBuf>, action: ServiceAction) -> Result<
                 for path in &written {
                     println!("Unit geschrieben: {}", path.display());
                 }
-                println!("{}", systemd_activation_hint(&specs));
+                activate_systemd_units(&specs)?;
+                println!("Dienste aktiviert und gestartet: {}", specs
+                    .iter()
+                    .map(|spec| format!("{}.service", spec.name))
+                    .collect::<Vec<_>>()
+                    .join(" "));
             } else {
                 for spec in &specs {
                     manager.install(spec).map_err(|error| error.to_string())?;
@@ -341,16 +346,37 @@ fn write_systemd_units(
         .collect()
 }
 
-/// Returns the operator hint printed after writing systemd units.
-fn systemd_activation_hint(specs: &[ServiceSpec]) -> String {
+/// Lädt die soeben geschriebenen User-Units neu und aktiviert sie dauerhaft.
+///
+/// Fehler werden nicht verschluckt: Ohne laufenden User-Manager (oder ohne
+/// DBus-Session) wäre eine geschriebene Unit kein funktionierender Dienst.
+fn activate_systemd_units(specs: &[ServiceSpec]) -> Result<(), String> {
+    let reload = std::process::Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .output()
+        .map_err(|error| format!("systemctl --user daemon-reload nicht ausführbar: {error}"))?;
+    if !reload.status.success() {
+        return Err(format!(
+            "systemctl --user daemon-reload fehlgeschlagen: {}",
+            String::from_utf8_lossy(&reload.stderr).trim()
+        ));
+    }
     let units = specs
         .iter()
         .map(|spec| format!("{}.service", spec.name))
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!(
-        "Aktivieren mit:\n  systemctl --user daemon-reload\n  systemctl --user enable --now {units}"
-    )
+        .collect::<Vec<_>>();
+    let start = std::process::Command::new("systemctl")
+        .args(["--user", "enable", "--now"])
+        .args(&units)
+        .output()
+        .map_err(|error| format!("systemctl --user enable --now nicht ausführbar: {error}"))?;
+    if !start.status.success() {
+        return Err(format!(
+            "systemctl --user enable --now fehlgeschlagen: {}",
+            String::from_utf8_lossy(&start.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 /// Which process signal requested the shutdown.
@@ -816,16 +842,6 @@ mod tests {
         assert!(error.contains("HOME"), "{error}");
     }
 
-    #[test]
-    fn test_systemd_activation_hint_names_daemon_reload_and_both_units() {
-        let specs = service_specs(Path::new("/usr/bin/harw"), Path::new("/srv/harw"));
-        let hint = systemd_activation_hint(&specs);
-        assert!(hint.contains("systemctl --user daemon-reload"), "{hint}");
-        assert!(
-            hint.contains("systemctl --user enable --now harw-serve.service harw-gateway.service"),
-            "{hint}"
-        );
-    }
 
     #[test]
     fn test_shutdown_reason_signal_name_matches_signal() {
