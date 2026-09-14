@@ -115,6 +115,15 @@ pub enum Command {
     Init,
     /// Onboarding-Wizard: Provider, Modell und optional Channel einrichten.
     Onboard,
+    /// Richtet einen Channel ein oder schließt ein ausstehendes Pairing ab.
+    Connect {
+        /// Channel-Art (derzeit nur `telegram`).
+        #[arg(long)]
+        channel: String,
+        /// Einmaligen Code nach einer `/pair CODE`-Nachricht an den Bot einlösen.
+        #[arg(long, value_name = "CODE")]
+        pair: Option<String>,
+    },
     /// Layered-Konfiguration und Katalog-Referenzen validieren.
     Doctor {
         /// Statt der Home-Layer genau dieses Verzeichnis prüfen.
@@ -508,6 +517,17 @@ pub enum SettingsPermissionsAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connect_telegram_pairing_parses() {
+        let cli = Cli::try_parse_from(["harw", "connect", "--channel", "telegram", "--pair", "ABCD-EFGH"])
+            .expect("Telegram connect must parse");
+        let Some(Command::Connect { channel, pair }) = cli.command else {
+            panic!("expected connect command");
+        };
+        assert_eq!(channel, "telegram");
+        assert_eq!(pair.as_deref(), Some("ABCD-EFGH"));
+    }
 
     #[test]
     fn resume_is_absent_without_the_flag() {

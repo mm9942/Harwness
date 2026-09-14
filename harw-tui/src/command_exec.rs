@@ -60,6 +60,7 @@ use std::collections::HashSet;
 #[cfg(test)]
 use std::sync::Arc;
 
+use harw_extension_api::contributors::ToolProvider;
 use harw_operations::adapter::CommandAdapter;
 #[cfg(test)]
 use harw_operations::registry::OperationRegistry;
@@ -67,7 +68,10 @@ use harw_operations::{OpContext, PermissionTier, ServiceMap};
 #[cfg(test)]
 use harw_operations::SharedSessionController;
 use harw_sandbox::SandboxSpec;
-use harw_types::{SessionId, TurnId};
+use harw_tool_shell::ShellToolProvider;
+use harw_tools::{ToolCall, ToolExecutionContext, ToolExecutor, ToolOutput};
+use harw_tools::spec::ToolName;
+use harw_types::{SessionId, ToolCallId, TurnId};
 
 #[cfg(test)]
 use crate::session_controller::TuiSessionController;
@@ -122,9 +126,10 @@ pub(crate) struct CommandServices<'a> {
 ///   geklont, Services siehe unten) und [`CommandAdapter::dispatch`] awaiten.
 ///   `Ok(output)` liefert `output.text`; `Err(error)` wird als
 ///   `"Fehler: {error}"` gerendert. Nicht gefunden: `"Unbekannter Command: {path}"`.
-/// - [`Invocation::Shell`] / [`Invocation::ShellRepeat`]: Ablehnung über die
-///   Capability `commands.shell` („Shell-Ausführung abgelehnt: Capability
-///   'commands.shell' ist nicht aktiviert"); der TUI-Kontext aktiviert sie nicht.
+/// - [`Invocation::Shell`]: wird im lokalen TUI-Kontext standardmäßig durch den
+///   Bubblewrap-gebundenen `shell.exec`-Ausführer ausgeführt. `HARW_DISABLE_SHELL=1`
+///   schaltet die Capability für den Prozess aus.
+/// - [`Invocation::ShellRepeat`]: ist noch nicht implementiert.
 /// - [`Invocation::Note`]: `"Notiz: {text}"`.
 /// - [`Invocation::Mention`]: `"@{target}: {body}"`.
 /// - [`Invocation::Chat`]: unverändert durchgereicht.
@@ -225,16 +230,22 @@ where
 /// Baut den [`DispatchContext`] der lokalen TUI.
 ///
 /// # Beschreibung
-/// Surface ist [`InvocationSurface::Tui`]. Capabilities sind
-/// [`CapabilitySet::default()`]: Kein Produktionspfad erteilt heute
-/// `commands.shell` (es gibt weder einen Config-Schlüssel noch einen Erzeuger
-/// von `CapabilitySet` außerhalb von Tests), und dieser Build führt keine
-/// Shell-Befehle aus.
+/// Surface ist [`InvocationSurface::Tui`]. Lokale Shell-Befehle sind für die
+/// Owner-Konsole standardmäßig verfügbar. `HARW_DISABLE_SHELL=1` deaktiviert sie
+/// explizit für den gestarteten Prozess; Channel-Eingänge bleiben davon getrennt
+/// und benötigen weiterhin ihre eigene `channel.allow_shell`-Freigabe.
 fn tui_dispatch_context(caller_permission: PermissionTier) -> DispatchContext {
+    let disabled = std::env::var("HARW_DISABLE_SHELL")
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
     DispatchContext {
         caller_tier: caller_permission,
         surface: InvocationSurface::Tui,
-        capabilities: CapabilitySet::default(),
+        capabilities: if disabled {
+            CapabilitySet::default()
+        } else {
+            CapabilitySet::with(crate::ShellCapability::CommandsShell)
+        },
     }
 }
 
@@ -298,13 +309,58 @@ where
                 Err(error) => format!("Fehler: {error}"),
             }
         }
-        CommandAction::Shell(command) => {
-            format!("Shell-Ausführung ist noch nicht verfügbar: {command}")
-        }
+        CommandAction::Shell(command) => execute_shell(sandbox, session_id, command).await,
         CommandAction::ShellRepeat => "Shell-Wiederholung ist noch nicht verfügbar.".to_owned(),
         CommandAction::Note(note) => format!("Notiz: {note}"),
         CommandAction::Mention { target, body } => format!("@{target}: {body}"),
         CommandAction::Chat(text) => text,
+    }
+}
+
+/// Führt einen lokalen `!`-Befehl ausschließlich über den normalen,
+/// Bubblewrap-gebundenen `shell.exec`-Ausführer aus. Die übergebene TUI-Sandbox
+/// ist die gesamte Autoritätsquelle; weder Arbeitsverzeichnis noch Rechte kommen
+/// aus dem vom Benutzer getippten Text.
+async fn execute_shell(
+    sandbox: &SandboxSpec,
+    session_id: &SessionId,
+    command: String,
+) -> String {
+    let provider = ShellToolProvider::new();
+    let tool_name = ToolName::new("shell.exec");
+    let Some(executor) = provider.executor(&tool_name) else {
+        return "Shell-Ausführung fehlgeschlagen: shell.exec ist nicht verfügbar.".to_owned();
+    };
+    let context = ToolExecutionContext::new(session_id.clone(), TurnId::new(), sandbox.clone());
+    let call = ToolCall {
+        id: ToolCallId::new(),
+        name: tool_name,
+        arguments: serde_json::json!({ "command": command }),
+    };
+    match executor.execute(&context, &call).await {
+        Ok(ToolOutput::Json { content }) => {
+            let stdout = content
+                .get("stdout")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let stderr = content
+                .get("stderr")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let exit_code = content
+                .get("exit_code")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(-1);
+            match (stdout.is_empty(), stderr.is_empty()) {
+                (true, true) => format!("Shell beendet (Exit-Code {exit_code})."),
+                (false, true) => stdout.to_owned(),
+                (true, false) => format!("stderr:\n{stderr}"),
+                (false, false) => format!("{stdout}\nstderr:\n{stderr}"),
+            }
+        }
+        Ok(ToolOutput::Text { content }) => content,
+        Ok(ToolOutput::Error { message }) => format!("Shell-Ausführung abgelehnt: {message}"),
+        Err(error) => format!("Shell-Ausführung fehlgeschlagen: {error}"),
     }
 }
 
@@ -654,16 +710,14 @@ mod tests {
         .await;
         std::fs::remove_dir_all(tmp).ok();
 
-        // Die TUI erteilt `commands.shell` nicht (`tui_dispatch_context`); die
-        // Admission über `CommandRegistry::dispatch` lehnt deshalb ab.
-        assert_eq!(
-            output, "Shell-Ausführung abgelehnt: Capability 'commands.shell' ist nicht aktiviert",
-            "unexpected shell output; got: {output}"
+        assert!(
+            !output.contains("Capability 'commands.shell' ist nicht aktiviert"),
+            "die lokale TUI aktiviert commands.shell standardmäßig: {output}"
         );
     }
 
     #[tokio::test]
-    async fn test_shell_repeat_not_available() {
+    async fn test_shell_repeat_is_not_implemented() {
         let adapters = adapters();
         let (sandbox, tmp) = test_sandbox();
         let session_id = SessionId::new();
@@ -683,10 +737,7 @@ mod tests {
         .await;
         std::fs::remove_dir_all(tmp).ok();
 
-        assert_eq!(
-            output, "Shell-Ausführung abgelehnt: Capability 'commands.shell' ist nicht aktiviert",
-            "unexpected shell-repeat output; got: {output}"
-        );
+        assert_eq!(output, "Shell-Wiederholung ist noch nicht verfügbar.");
     }
 
     #[tokio::test]

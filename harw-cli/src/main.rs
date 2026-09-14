@@ -24,6 +24,7 @@ mod auth;
 mod chat;
 mod cli;
 mod completion;
+mod connect;
 mod gateway;
 mod home;
 mod job_worker;
@@ -269,6 +270,10 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             harw_home::ensure_home(&home).map_err(|error| error.to_string())?;
             onboarding::run_wizard(&home)
         }
+        Some(Command::Connect { channel, pair }) => {
+            let home = home::resolve_home(home_override)?;
+            connect::run(&home, &channel, pair.as_deref())
+        }
         Some(Command::Doctor { config_dir }) => {
             let layers = resolve_layers(home_override.clone(), config_dir.clone())?;
             doctor(layers, home_override.clone(), config_dir)?;
@@ -334,6 +339,7 @@ fn run_startup_migrations(
         // damit zu den Pfaden, die vor dem Lesen migrieren müssen.
         None
         | Some(Command::Onboard)
+        | Some(Command::Connect { .. })
         | Some(Command::Gateway { .. })
         | Some(Command::Settings { .. })
         | Some(Command::Analyze(_)) => {
@@ -542,7 +548,7 @@ fn serve_mcp(
             let plan_config = plan_tool_config_from_section(&config.harness.tools.plan)?;
             let project_root =
                 std::env::current_dir().map_err(|error| error.to_string())?;
-            build_plan_node_services(home_path, &plan_config, &project_root)?
+            build_plan_node_services(&plan_config, &project_root)?
         }
         // Ohne HARW-Home gibt es kein `plans/`-Verzeichnis. `plan-node`-Jobs
         // enden dann sichtbar als blockiert, statt still übersprungen zu werden.
@@ -1618,7 +1624,6 @@ fn seed_startup_goal(
 ///   `project_root` ließ sich nicht als Workspace binden
 ///   ([`harw_runtime::RuntimeError::Sandbox`]).
 fn build_plan_node_services(
-    home: &Path,
     config: &PlanToolConfig,
     project_root: &Path,
 ) -> Result<Option<Arc<job_worker::PlanNodeServices>>, String> {

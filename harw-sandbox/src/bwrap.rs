@@ -278,6 +278,9 @@ impl BwrapLauncher {
             ]);
         }
         if let Some(profile) = &self.cargo_profile {
+            let sandbox_cargo_dir = Path::new(SANDBOX_CARGO_PATH)
+                .parent()
+                .expect("fixed sandbox cargo path has a parent");
             if matches!(profile.mode(), CargoExecutionMode::Fetch)
                 && (relay.is_none() || sandbox.network_scope().is_empty())
             {
@@ -286,7 +289,7 @@ impl BwrapLauncher {
             args.extend([
                 OsString::from("--setenv"), OsString::from("RUSTUP_HOME"), OsString::from(SANDBOX_RUSTUP_HOME),
                 OsString::from("--setenv"), OsString::from("CARGO_HOME"), OsString::from(SANDBOX_CARGO_HOME),
-                OsString::from("--setenv"), OsString::from("PATH"), OsString::from("/opt/harw/toolchain/bin:/usr/local/bin:/usr/bin:/bin"),
+                OsString::from("--setenv"), OsString::from("PATH"), OsString::from(format!("{}:/usr/local/bin:/usr/bin:/bin", sandbox_cargo_dir.display())),
             ]);
             if profile.mode().offline() {
                 args.extend([OsString::from("--setenv"), OsString::from("CARGO_NET_OFFLINE"), OsString::from("true")]);
@@ -305,8 +308,15 @@ impl BwrapLauncher {
         }
         if let Some(profile) = &self.cargo_profile {
             let cargo_dir = profile.cargo_bin().parent().expect("canonical executable has a parent");
-            append_destination_dirs(&mut args, Path::new("/opt/harw/toolchain/bin"))?;
-            args.extend([OsString::from("--ro-bind"), cargo_dir.as_os_str().to_owned(), OsString::from("/opt/harw/toolchain/bin")]);
+            let sandbox_cargo_dir = Path::new(SANDBOX_CARGO_PATH)
+                .parent()
+                .expect("fixed sandbox cargo path has a parent");
+            append_destination_dirs(&mut args, sandbox_cargo_dir)?;
+            args.extend([
+                OsString::from("--ro-bind"),
+                cargo_dir.as_os_str().to_owned(),
+                sandbox_cargo_dir.as_os_str().to_owned(),
+            ]);
             append_destination_dirs(&mut args, Path::new(SANDBOX_RUSTUP_HOME))?;
             args.extend([OsString::from("--ro-bind"), profile.rustup_home().as_os_str().to_owned(), OsString::from(SANDBOX_RUSTUP_HOME)]);
             append_destination_dirs(&mut args, Path::new(SANDBOX_CARGO_HOME))?;

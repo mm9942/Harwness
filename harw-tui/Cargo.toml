@@ -24,6 +24,8 @@ harw-ops = { path = "../harw-ops" }
 harw-plan = { path = "../harw-plan" }
 harw-protocol = { path = "../harw-protocol" }
 harw-sandbox = { path = "../harw-sandbox" }
+harw-tool-shell = { path = "../harw-tool-shell" }
+harw-tools = { path = "../harw-tools" }
 harw-session-store = { path = "../harw-session-store" }
 harw-types = { path = "../harw-types" }
 # `unstable-rendered-line-info` schaltet `Paragraph::line_count` frei. Ohne sie
@@ -36,7 +38,8 @@ tokio = { version = "1.52.3", features = ["macros", "rt", "sync", "time"] }
 # Strukturierte Diagnose im Approval-/Child-Resume-Treiber (`src/approval.rs`).
 # Version bewusst identisch zu harw-cli/Cargo.toml.
 tracing = "0.1.44"
-harw-home = { version = "0.2.0", path = "../harw-home" }
+serde_json = "1"
+harw-home = { version = "0.3.0", path = "../harw-home" }
 harw-runtime = { path = "../harw-runtime" }
 # Uhrzeit und Datum für die einmalige, kontextbezogene TUI-Begrüßung.
 time = { version = "0.3.53", features = ["formatting"] }
