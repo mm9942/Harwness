@@ -222,6 +222,18 @@ enum TelegramIngressMode {
     Disabled(String),
 }
 
+/// `/pair <code>` belongs to the local `harw connect` workflow, never to the
+/// conversational model. Once a peer is paired, old/replayed pairing commands
+/// are still admitted by the channel; discard them here so they cannot trigger
+/// an arbitrary model answer.
+fn is_telegram_pairing_command(text: &str) -> bool {
+    let command = text.trim().split_ascii_whitespace().next().unwrap_or_default();
+    command.eq_ignore_ascii_case("/pair")
+        || command
+            .strip_prefix("/pair@")
+            .is_some_and(|bot| !bot.is_empty())
+}
+
 /// Runtime consumer registered by this gateway composition. It deliberately
 /// accepts only events already admitted by `TelegramChannel`.
 struct GatewayTelegramConsumer {
@@ -236,6 +248,10 @@ impl AdmittedEventConsumer for GatewayTelegramConsumer {
             tracing::warn!(channel = %key.channel, peer = %key.peer, "Telegram event has no text runtime handoff");
             return;
         };
+        if is_telegram_pairing_command(&text) {
+            tracing::debug!(channel = %key.channel, peer = %key.peer, "Telegram pairing command consumed outside model runtime");
+            return;
+        }
         if !event.attachments.is_empty() {
             tracing::warn!(channel = %key.channel, peer = %key.peer, "Telegram attachments have no governed runtime intake handoff");
             return;
@@ -2062,6 +2078,14 @@ pinned_identities = [123456789]
         assert!(diagnostic.contains("fail closed"));
         assert!(diagnostic.contains("credential"));
         assert!(!diagnostic.contains("TELEGRAM_TEST_TOKEN"));
+    }
+
+    #[test]
+    fn telegram_pairing_commands_never_reach_the_model() {
+        assert!(is_telegram_pairing_command("/pair Y2GQ-DEYE"));
+        assert!(is_telegram_pairing_command(" /PAIR@LinLinBot Y2GQ-DEYE "));
+        assert!(!is_telegram_pairing_command("/pairing Y2GQ-DEYE"));
+        assert!(!is_telegram_pairing_command("hey /pair Y2GQ-DEYE"));
     }
 
     #[test]
