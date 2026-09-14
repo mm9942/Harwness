@@ -20,8 +20,9 @@ const GENERATED_UIA_DIR: &str = "default-terminal-ui";
 /// Eine explizite Auswahl bleibt unverändert und wird weiterhin von Config und
 /// Runtime fail-closed validiert. Eine einzige entdeckte UIA wird als Standard
 /// persistiert. Bei mehreren Definitionen trifft der Mensch die Wahl. Gibt es
-/// keine, zeigt der Bootstrap einen lokalen, minimalen Entwurf und schreibt ihn
-/// ausschließlich nach `ja`.
+/// keine, legt der Bootstrap eine lokale, minimale UIA an und aktiviert sie.
+/// Persönlichkeit und Nutzerkontext bleiben bewusst als lokale Dateien im
+/// Profil, damit sie nicht in ein Projekt-Repository geraten.
 pub(crate) fn ensure_active_uia(home: &Path, config: &ResolvedConfig) -> Result<Option<String>, String> {
     if config.harness.active_uia_definition.is_some() {
         return Ok(None);
@@ -38,7 +39,7 @@ pub(crate) fn ensure_active_uia(home: &Path, config: &ResolvedConfig) -> Result<
     let selected = match candidates.len() {
         1 => candidates.remove(0),
         count if count > 1 => select_uia(&candidates)?,
-        _ => confirm_generated_uia()?,
+        _ => GENERATED_UIA_ID.to_owned(),
     };
     if selected == GENERATED_UIA_ID {
         write_generated_uia(home)?;
@@ -59,24 +60,6 @@ fn select_uia(candidates: &[String]) -> Result<String, String> {
     io::stdin().read_line(&mut answer).map_err(|error| format!("UIA-Auswahl lesen: {error}"))?;
     let index: usize = answer.trim().parse().map_err(|_| "ungültige UIA-Auswahl; es wurde nichts gespeichert".to_owned())?;
     candidates.get(index.saturating_sub(1)).cloned().ok_or_else(|| "ungültige UIA-Auswahl; es wurde nichts gespeichert".to_owned())
-}
-
-fn confirm_generated_uia() -> Result<String, String> {
-    require_terminal()?;
-    eprintln!("Keine UIA-Definition wurde gefunden. Vorgeschlagene lokale Definition:");
-    eprintln!("  id: {GENERATED_UIA_ID}");
-    eprintln!("  role: user-interface");
-    eprintln!("  specialization: terminal-ui");
-    eprintln!("  Beschreibung: Lokale, sichere Standardoberfläche für Harwness.");
-    eprint!("Diesen Entwurf speichern und aktivieren? [ja/Nein]: ");
-    io::stderr().flush().map_err(|error| format!("UIA-Bestätigung ausgeben: {error}"))?;
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer).map_err(|error| format!("UIA-Bestätigung lesen: {error}"))?;
-    if matches!(answer.trim().to_lowercase().as_str(), "ja" | "j" | "yes" | "y") {
-        Ok(GENERATED_UIA_ID.to_owned())
-    } else {
-        Err("UIA-Bootstrap abgebrochen; es wurde keine Definition gespeichert oder aktiviert".to_owned())
-    }
 }
 
 fn require_terminal() -> Result<(), String> {
