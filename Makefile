@@ -16,7 +16,11 @@
 # einzeln aufrufbar, denn ein Gate, das man extra aufrufen muss, wird nicht
 # aufgerufen — es muss auch im Normalbetrieb mitlaufen.
 
-CARGO ?= cargo
+# Nutze die benutzerspezifische Rust-Toolchain auch dann, wenn `cargo` nicht
+# im PATH liegt (z. B. in schlanken Shells/GUI-Starts). Auf Systemen ohne
+# rustup-Fallback bleibt der normale PATH-Aufruf erhalten; `make CARGO=…`
+# überschreibt beides ausdrücklich.
+CARGO ?= $(if $(wildcard $(HOME)/.cargo/bin/cargo),$(HOME)/.cargo/bin/cargo,cargo)
 BINDIR ?= $(HOME)/.local/bin
 
 .PHONY: clippy-tests clippy tests fmt check build install service gates

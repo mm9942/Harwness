@@ -33,7 +33,7 @@ pub fn run(home_override: Option<PathBuf>, action: AuthAction) -> Result<(), Str
 
 /// PKCE-Paste-Flow: URL zeigen, Code von `stdin` lesen, Token holen + speichern.
 fn login(home: &Path, provider: &str) -> Result<(), String> {
-    require_anthropic(provider)?;
+    require_anthropic_login(provider)?;
 
     let pkce = harw_oauth::generate_pkce();
     // `state` wird aus dem Verifier abgeleitet (deterministisch, ausreichend
@@ -72,12 +72,10 @@ fn login(home: &Path, provider: &str) -> Result<(), String> {
 
 /// Setzt einen bereits vorhandenen Setup-Token direkt (Eingabe über `stdin`).
 fn token(home: &Path, provider: &str) -> Result<(), String> {
-    require_anthropic(provider)?;
+    require_token_provider(provider)?;
 
     let raw = if std::io::stdin().is_terminal() {
-        eprintln!(
-            "Füge den Setup-Token ein (z. B. Ausgabe von `claude setup-token`) und drücke Enter:"
-        );
+        eprintln!("{}", token_prompt(provider));
         read_secret_input("token> ")?
     } else {
         read_all_stdin()?
@@ -104,8 +102,8 @@ fn persist_and_hint(home: &Path, provider: &str, token: &SecretString) -> Result
             nicht protokollierte Shell-Eingabe."
     );
     eprintln!(
-        "\nDanach nutzt der Anthropic-native Weg (`default_provider = \"anthropic\"`) \
-         den Token automatisch."
+        "\nTrage diese Referenz als `auth = \"…\"` in `providers/{provider}.toml` ein, \
+         damit Harw das Secret verwendet."
     );
     Ok(())
 }
@@ -115,7 +113,11 @@ fn import(source: &str) -> Result<(), String> {
     let provider = match source {
         "codex" | "codex-oauth" => "openai",
         "claude-cli" | "claude-setup-token" => "anthropic",
-        other => return Err(format!("unbekannte Quelle: {other} (codex | claude-cli)")),
+        "gemini-env" => "gemini",
+        "mistral-env" => "mistral",
+        other => return Err(format!(
+            "unbekannte Quelle: {other} (codex | claude-cli | gemini-env | mistral-env)"
+        )),
     };
 
     let detected = harw_model_catalog::detect_local_sources(provider);
@@ -156,6 +158,9 @@ fn status(home: &Path) -> Result<(), String> {
         "ANTHROPIC_FOUNDRY_API_KEY",
         "ANTHROPIC_FOUNDRY_BASE_URL",
         "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "MISTRAL_API_KEY",
     ];
     for var in env_vars {
         println!("  env  {:<28} {}", var, yes_no(env_present(var)));
@@ -171,6 +176,14 @@ fn status(home: &Path) -> Result<(), String> {
         (
             "<home>/secrets/anthropic-oauth.token",
             home.join("secrets").join("anthropic-oauth.token"),
+        ),
+        (
+            "<home>/secrets/gemini-oauth.token",
+            home.join("secrets").join("gemini-oauth.token"),
+        ),
+        (
+            "<home>/secrets/mistral-oauth.token",
+            home.join("secrets").join("mistral-oauth.token"),
         ),
     ];
     for (label, path) in files {
@@ -200,14 +213,39 @@ fn expand(path: &str) -> PathBuf {
     }
 }
 
-/// Stellt sicher, dass der Provider `anthropic` ist (einziger OAuth-Provider).
-fn require_anthropic(provider: &str) -> Result<(), String> {
+/// Beschränkt den eingebauten Browser-PKCE-Flow auf Anthropic.
+///
+/// Andere Provider werden ausschließlich über `harw auth token <provider>`
+/// eingerichtet, bis ein eigener, öffentlicher OAuth-Vertrag implementiert ist.
+fn require_anthropic_login(provider: &str) -> Result<(), String> {
     if provider == "anthropic" {
         Ok(())
     } else {
         Err(format!(
-            "OAuth/Setup-Token wird derzeit nur für 'anthropic' unterstützt (gegeben: {provider})"
+            "Browser-OAuth wird derzeit nur für 'anthropic' unterstützt; verwende für {provider} `harw auth token {provider}`"
         ))
+    }
+}
+
+/// Beschränkt direkte Secret-Eingabe auf Provider mit einem sicheren,
+/// dokumentierten API-Key- bzw. Setup-Token-Weg. Der Browser-OAuth-Login
+/// bleibt ausdrücklich Anthropic vorbehalten.
+fn require_token_provider(provider: &str) -> Result<(), String> {
+    match provider {
+        "anthropic" | "openai" | "gemini" | "mistral" => Ok(()),
+        other => Err(format!(
+            "direkte Secret-Eingabe wird nur für anthropic, openai, gemini oder mistral unterstützt (gegeben: {other})"
+        )),
+    }
+}
+
+fn token_prompt(provider: &str) -> &'static str {
+    match provider {
+        "anthropic" => "Füge den Setup-Token ein (z. B. Ausgabe von `claude setup-token`) und drücke Enter:",
+        "openai" => "Füge den OpenAI-API-Key oder einen bereits vorhandenen Codex-Token ein und drücke Enter:",
+        "gemini" => "Füge den Gemini-/Google-API-Key ein und drücke Enter:",
+        "mistral" => "Füge den Mistral-API-Key ein und drücke Enter:",
+        _ => "Füge das Secret ein und drücke Enter:",
     }
 }
 

@@ -50,7 +50,11 @@ use crate::config::PlanToolConfig;
 use crate::error::{PlanError, PlanResult};
 use crate::ids::{PlanId, RevisionId};
 use crate::store::{PlanRevision, PlanStore, check_batch_target, stage_actions};
-use crate::types::Plan;
+use crate::mutation::apply_mutation;
+use crate::types::{Plan, PlanNodeStatus};
+
+/// Höchstens neun History-Ereignisse müssen nach einem Checkpoint nachgespielt werden.
+const CHECKPOINT_INTERVAL: u64 = 10;
 
 /// Integritätssiegel für Snapshot-Dateien (crate-privat, geteilt mit
 /// `goal_store::FileGoalStore`).
@@ -575,6 +579,15 @@ impl FilePlanStore {
         } else {
             Vec::new()
         };
+        // Der Snapshot ist nur ein Checkpoint. Alle späteren Events sind die
+        // maßgebliche Fortsetzung und werden ohne neue History-Einträge erneut
+        // auf den geladenen Zustand angewendet.
+        let mut plan = plan;
+        for event in history.iter().filter(|event| event.revision > plan.revision) {
+            apply_mutation(&mut plan, &event.action, &event.actor, event.applied_at);
+            plan.updated_at = event.applied_at;
+            plan.revision = event.revision;
+        }
         let history_revision = history
             .iter()
             .map(|event| event.revision)
@@ -700,21 +713,61 @@ impl FilePlanStore {
         Ok(())
     }
 
-    /// Veröffentlicht Kandidat, Siegel und Events dauerhaft (Reihenfolge siehe
-    /// Modulkopf) und gibt das neue Kettenglied zurück.
-    ///
-    /// # Errors
-    /// - [`PlanError::Io`] / [`PlanError::Serde`] bei Persistenzfehlern.
-    /// - [`PlanError::InvalidId`] bei ungültiger Plan-ID.
+    /// Persistiert Events und schreibt nur bei einem Checkpoint Snapshot plus
+    /// Siegel. Der erste Zustand ist immer ein Checkpoint; danach gilt ein
+    /// Intervall von zehn Revisionen oder ein terminaler Übergang.
+    fn checkpoint_required(candidate: &Plan, events: &[PlanEvent]) -> bool {
+        candidate.revision.value() == 1
+            || candidate.revision.value() % CHECKPOINT_INTERVAL == 0
+            || events.iter().any(|event| matches!(
+                &event.action,
+                PlanAction::SetStatus {
+                    status: PlanNodeStatus::Completed
+                        | PlanNodeStatus::Superseded
+                        | PlanNodeStatus::Invalidated,
+                    ..
+                } | PlanAction::Invalidate { .. } | PlanAction::Supersede { .. }
+            ))
+    }
+
+    /// Entfernt nach einem erfolgreich veröffentlichten Checkpoint alle älteren
+    /// Snapshots und Siegel. `history.jsonl` bleibt unverändert die vollständige
+    /// Audit-Historie. Der Checkpoint beginnt bewusst eine neue Siegelkette;
+    /// dadurch ist seine Integrität ohne bereits gelöschte Vorgänger prüfbar.
+    fn compact_checkpoints(root: &Path, plan_id: &PlanId, keep: RevisionId) -> PlanResult<()> {
+        let dir = Self::plan_dir(root, plan_id)?;
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let revision = name.strip_prefix("rev-")
+                .and_then(|value| value.strip_suffix(".json").or_else(|| value.strip_suffix(".seal")))
+                .and_then(|value| value.parse::<u64>().ok());
+            if revision.is_some_and(|revision| revision != keep.value()) {
+                std::fs::remove_file(entry.path())?;
+            }
+        }
+        Self::sync_parent_directory(&dir.join("history.jsonl"))
+    }
+
     fn publish(
         root: &Path,
-        prev_seal: Option<&seal::SealLink>,
         candidate: &Plan,
         events: &[PlanEvent],
-    ) -> PlanResult<seal::SealLink> {
+    ) -> PlanResult<Option<seal::SealLink>> {
+        if !Self::checkpoint_required(candidate, events) {
+            Self::append_events(root, &candidate.id, events)?;
+            return Ok(None);
+        }
         let bytes = serde_json::to_vec_pretty(candidate)?;
         let plan_path = Self::plan_path(root, &candidate.id, candidate.revision)?;
-        let (seal_bytes, link) = seal::build(prev_seal, candidate.revision.value(), &bytes)?;
+        // Checkpoints are self-contained because compaction deletes their
+        // predecessor snapshots and seals.
+        let (seal_bytes, link) = seal::build(None, candidate.revision.value(), &bytes)?;
         let staged_snapshot = Self::stage_atomic_write(&plan_path, &bytes)?;
         let staged_seal = match seal::stage(&seal::seal_path(&plan_path), &seal_bytes) {
             Ok(staged) => staged,
@@ -728,15 +781,15 @@ impl FilePlanStore {
             staged_snapshot.discard();
             return Err(error);
         }
-        // Siegel vor dem Snapshot: ein Absturz dazwischen hinterlässt ein
-        // verwaistes Siegel, nie einen unversiegelten neuesten Snapshot.
         if let Err(error) = staged_seal.commit() {
             staged_snapshot.discard();
             return Err(error);
         }
         staged_snapshot.commit()?;
-        Ok(link)
+        Self::compact_checkpoints(root, &candidate.id, candidate.revision)?;
+        Ok(Some(link))
     }
+
 }
 
 impl PlanStore for FilePlanStore {
@@ -796,11 +849,11 @@ impl PlanStore for FilePlanStore {
                 actor: actor.to_owned(),
                 applied_at: now,
             };
-            let link = Self::publish(&inner.root, None, &plan, std::slice::from_ref(&event))?;
+            let link = Self::publish(&inner.root, &plan, std::slice::from_ref(&event))?;
             inner.next_revision = revision.next();
             inner.plan = Some(plan);
             inner.plan_id = Some(plan_id);
-            inner.seal = Some(link);
+            inner.seal = link;
             inner.history.push(event.clone());
             return Ok(event);
         }
@@ -813,14 +866,16 @@ impl PlanStore for FilePlanStore {
         let (candidate, events) =
             stage_actions(plan, vec![action], actor, &self.config, revision, now)
                 .map_err(|(_, error)| error)?;
-        let link = Self::publish(&inner.root, inner.seal.as_ref(), &candidate, &events)?;
+        let link = Self::publish(&inner.root, &candidate, &events)?;
         let Some(event) = events.into_iter().next() else {
             return Err(PlanError::PlanNotFound);
         };
         debug!(revision = %revision, actor = actor, "Persistente Aktion angewendet");
         inner.next_revision = revision.next();
         inner.plan = Some(candidate);
-        inner.seal = Some(link);
+        if let Some(link) = link {
+            inner.seal = Some(link);
+        }
         inner.history.push(event.clone());
         Ok(event)
     }
@@ -860,11 +915,13 @@ impl PlanStore for FilePlanStore {
             source: Box::new(source),
         })?;
 
-        let link = Self::publish(&inner.root, inner.seal.as_ref(), &candidate, &events)?;
+        let link = Self::publish(&inner.root, &candidate, &events)?;
         let revision = candidate.revision;
         inner.next_revision = revision.next();
         inner.plan = Some(candidate);
-        inner.seal = Some(link);
+        if let Some(link) = link {
+            inner.seal = Some(link);
+        }
         inner.history.extend(events.iter().cloned());
         info!(
             plan_id = %plan,
@@ -992,23 +1049,15 @@ mod tests {
         assert_eq!(plan.nodes.len(), 1);
         assert_eq!(plan.goal_statement, "Persistenz-Ziel");
 
-        // Plan-Datei muss existieren
-        let rev_path = dir
-            .path()
-            .join("plans")
-            .join("p-1")
-            .join(format!("rev-{}.json", plan.revision.value()));
-        assert!(
-            rev_path.exists(),
-            "rev-Datei existiert nicht: {:?}",
-            rev_path
-        );
-
-        // Reload via JSON
-        let bytes = std::fs::read(&rev_path).unwrap();
-        let reloaded: Plan = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(reloaded.id, plan.id);
-        assert_eq!(reloaded.nodes.len(), 1);
+        // Nur der initiale Stand ist ein Checkpoint; der zweite Zustand wird
+        // beim Neustart aus history.jsonl rekonstruiert.
+        let checkpoint = dir.path().join("plans").join("p-1").join("rev-1.json");
+        assert!(checkpoint.exists(), "initialer Checkpoint fehlt");
+        assert!(!dir.path().join("plans").join("p-1").join("rev-2.json").exists());
+        drop(store);
+        let reloaded = make_store(&dir);
+        assert_eq!(reloaded.current().unwrap().id, plan.id);
+        assert_eq!(reloaded.current().unwrap().nodes.len(), 1);
     }
 
     #[test]
@@ -1404,7 +1453,7 @@ mod tests {
         drop(seeded_store(&dir, "p-seal"));
         let plan_dir = dir.path().join("plans").join("p-seal");
         assert!(plan_dir.join("rev-1.seal").exists());
-        assert!(plan_dir.join("rev-2.seal").exists());
+        assert!(!plan_dir.join("rev-2.seal").exists());
 
         let reloaded = make_store(&dir);
         assert_eq!(reloaded.current().unwrap().nodes.len(), 1);
@@ -1414,11 +1463,9 @@ mod tests {
     fn test_manipulated_snapshot_is_rejected_on_load() {
         let dir = TempDir::new().unwrap();
         drop(seeded_store(&dir, "p-tamper"));
-        let snapshot = dir.path().join("plans").join("p-tamper").join("rev-2.json");
-        let tampered = std::fs::read_to_string(&snapshot)
-            .unwrap()
-            .replace("\"draft\"", "\"completed\"");
-        std::fs::write(&snapshot, tampered).unwrap();
+        let snapshot = dir.path().join("plans").join("p-tamper").join("rev-1.json");
+        // Die Bytes ändern, ohne das passende Siegel neu zu berechnen.
+        std::fs::write(&snapshot, b"{\"tampered\":true}").unwrap();
 
         let result = FilePlanStore::new(dir.path());
 
@@ -1429,33 +1476,32 @@ mod tests {
     }
 
     #[test]
-    fn test_manipulated_seal_chain_is_rejected_on_load() {
+    fn test_manipulated_checkpoint_seal_is_rejected_on_load() {
         let dir = TempDir::new().unwrap();
-        drop(seeded_store(&dir, "p-chain"));
-        let plan_dir = dir.path().join("plans").join("p-chain");
-        // Vorgängersiegel verfälschen: der Kettenwert von rev-2 passt nicht mehr.
-        let prev = plan_dir.join("rev-1.seal");
+        drop(seeded_store(&dir, "p-seal-tamper"));
+        let seal_path = dir.path().join("plans").join("p-seal-tamper").join("rev-1.seal");
         let mut value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&prev).unwrap()).unwrap();
+            serde_json::from_slice(&std::fs::read(&seal_path).unwrap()).unwrap();
         value["chain"] = serde_json::json!("00");
-        std::fs::write(&prev, serde_json::to_vec(&value).unwrap()).unwrap();
-
-        assert!(matches!(
-            FilePlanStore::new(dir.path()),
-            Err(PlanError::SealMismatch { .. })
-        ));
+        std::fs::write(&seal_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(matches!(FilePlanStore::new(dir.path()), Err(PlanError::SealMismatch { .. })));
     }
 
     #[test]
-    fn test_deleted_seal_in_sealed_directory_is_rejected() {
+    fn test_checkpoint_without_seal_loads_as_legacy() {
         let dir = TempDir::new().unwrap();
-        drop(seeded_store(&dir, "p-gone"));
-        std::fs::remove_file(dir.path().join("plans").join("p-gone").join("rev-2.seal")).unwrap();
-
-        assert!(matches!(
-            FilePlanStore::new(dir.path()),
-            Err(PlanError::SealMismatch { .. })
-        ));
+        drop(seeded_store(&dir, "p-legacy-seal"));
+        // A single retained checkpoint has no predecessor seal that could mark
+        // the directory as sealed. This intentionally remains compatible with
+        // pre-seal stores; the next checkpoint writes a fresh seal.
+        std::fs::remove_file(
+            dir.path()
+                .join("plans")
+                .join("p-legacy-seal")
+                .join("rev-1.seal"),
+        )
+        .unwrap();
+        assert!(FilePlanStore::new(dir.path()).is_ok());
     }
 
     #[test]
@@ -1463,9 +1509,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         drop(seeded_store(&dir, "p-legacy"));
         let plan_dir = dir.path().join("plans").join("p-legacy");
-        for name in ["rev-1.seal", "rev-2.seal"] {
-            std::fs::remove_file(plan_dir.join(name)).unwrap();
-        }
+        std::fs::remove_file(plan_dir.join("rev-1.seal")).unwrap();
 
         let legacy = make_store(&dir);
         assert_eq!(legacy.current().unwrap().nodes.len(), 1, "Legacy lädt");
@@ -1477,10 +1521,35 @@ mod tests {
                 "a",
             )
             .unwrap();
-        assert!(plan_dir.join("rev-3.seal").exists(), "nächster Write versiegelt");
+        // Checkpoints are periodic; the next checkpoint re-establishes sealing.
+        for index in 3..=10 {
+            legacy.apply(PlanAction::Inspect, "a").unwrap();
+            if index == 10 {
+                assert!(plan_dir.join("rev-10.seal").exists(), "Checkpoint versiegelt");
+            }
+        }
 
         let reloaded = make_store(&dir);
         assert_eq!(reloaded.current().unwrap().nodes.len(), 2);
+    }
+
+    #[test]
+    fn test_checkpoint_compacts_snapshots_and_replays_history() {
+        let dir = TempDir::new().unwrap();
+        let store = make_store(&dir);
+        store.apply(PlanAction::Create { plan_id: PlanId::new("compact"), goal: "checkpoint".to_owned() }, "o").unwrap();
+        for _ in 2..=10 {
+            store.apply(PlanAction::Inspect, "o").unwrap();
+        }
+        let plan_dir = dir.path().join("plans").join("compact");
+        assert!(plan_dir.join("rev-10.json").exists());
+        assert!(plan_dir.join("rev-10.seal").exists());
+        assert!(!plan_dir.join("rev-1.json").exists(), "alter Checkpoint wird kompakt entfernt");
+        store.apply(PlanAction::Inspect, "o").unwrap();
+        drop(store);
+        let reloaded = make_store(&dir);
+        assert_eq!(reloaded.revision(), RevisionId::new(11));
+        assert_eq!(reloaded.history(None).unwrap().len(), 11);
     }
 
     // ── apply_batch (persistent) ───────────────────────────────────────────
@@ -1518,9 +1587,8 @@ mod tests {
         assert_eq!(result.revision, RevisionId::new(4));
         assert_eq!(history_lines(&dir, "p-batch"), 4);
         let plan_dir = dir.path().join("plans").join("p-batch");
-        assert!(plan_dir.join("rev-4.json").exists());
-        assert!(plan_dir.join("rev-4.seal").exists());
-        assert!(!plan_dir.join("rev-3.json").exists(), "ein Snapshot je Batch");
+        assert!(!plan_dir.join("rev-4.json").exists());
+        assert!(plan_dir.join("rev-1.json").exists());
 
         let reloaded = make_store(&dir);
         let plan = reloaded.current().unwrap();

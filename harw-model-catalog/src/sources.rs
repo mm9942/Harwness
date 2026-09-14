@@ -181,6 +181,30 @@ pub fn embedded_sources() -> Vec<CredentialSource> {
             extract: ExtractRule::EnvVar("CLAUDE_CODE_OAUTH_TOKEN".to_owned()),
             kind: SourceKind::OAuthToken,
         },
+        // Gemini and Mistral publish API-key based developer interfaces. These
+        // entries deliberately describe only those public environment paths;
+        // no consumer-CLI credential files are inspected.
+        CredentialSource {
+            id: "gemini-env".to_owned(),
+            provider: "gemini".to_owned(),
+            path: String::new(),
+            extract: ExtractRule::EnvVar("GEMINI_API_KEY".to_owned()),
+            kind: SourceKind::ApiKey,
+        },
+        CredentialSource {
+            id: "google-api-env".to_owned(),
+            provider: "gemini".to_owned(),
+            path: String::new(),
+            extract: ExtractRule::EnvVar("GOOGLE_API_KEY".to_owned()),
+            kind: SourceKind::ApiKey,
+        },
+        CredentialSource {
+            id: "mistral-env".to_owned(),
+            provider: "mistral".to_owned(),
+            path: String::new(),
+            extract: ExtractRule::EnvVar("MISTRAL_API_KEY".to_owned()),
+            kind: SourceKind::ApiKey,
+        },
     ]
 }
 
@@ -353,6 +377,8 @@ mod tests {
         assert!(sources.iter().any(|s| s.id == "codex"));
         assert!(sources.iter().any(|s| s.id == "codex-oauth"));
         assert!(sources.iter().any(|s| s.id == "claude-cli"));
+        assert!(sources.iter().any(|s| s.id == "gemini-env"));
+        assert!(sources.iter().any(|s| s.id == "mistral-env"));
     }
 
     #[test]
