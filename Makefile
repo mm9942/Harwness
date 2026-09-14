@@ -1,4 +1,4 @@
-# Harwness — Entwicklungs-Targets.
+# HARW — Workspace-Targets
 #
 # `clippy-tests` ist das kanonische Verifikationskommando dieses Repos: es führt
 # Clippy über den gesamten Workspace inklusive Test-Targets mit
@@ -25,7 +25,7 @@ BINDIR ?= $(HOME)/.local/bin
 
 .PHONY: clippy-tests clippy tests fmt check build install service gates
 
-## Kanonische Verifikation: Clippy (inkl. Tests, warnings = Fehler) + Testsuite + Gates.
+## Kanonische Verifikation: Clippy (inkl. Test-Targets, warnings = Fehler) + Testsuite + Gates.
 clippy-tests:
 	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
 	$(CARGO) test --workspace --all-features
@@ -60,9 +60,7 @@ install: build
 	install -Dm755 target/release/harw $(BINDIR)/harw
 	@echo "harw installiert nach $(BINDIR)/harw"
 
-## Installiert die systemd-User-Unit (harw gateway als Hintergrund-Daemon).
+## Installiert und aktiviert die systemd-User-Dienste einschließlich Gateway.
 service: install
 	$(BINDIR)/harw service install
-	systemctl --user daemon-reload
-	systemctl --user enable --now harw.service
-	@echo "harw.service (gateway) aktiviert."
+	@echo "Harw-Dienste installiert und aktiviert."
