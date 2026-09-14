@@ -1594,30 +1594,20 @@ fn lower_agent_definitions(
 
 /// Löst die obligatorische UIA eines interaktiven Einstiegs auf.
 ///
-/// TUI und One-shot sind Nutzeroberflächen und benötigen zwingend eine UIA.
-/// Ein Telegram-Gateway verwendet dieselbe UIA, wenn sie konfiguriert ist, damit
-/// lokale und Telegram-Gespräche dieselbe Persönlichkeit und den zugehörigen
-/// Kontext verwenden. Unkonfigurierte Gateways bleiben aus Kompatibilitätsgründen
-/// bei ihrem bisherigen, agentlosen Root.
+/// TUI und One-shot sind Nutzeroberflächen. Sie starten ausschließlich mit
+/// `harness.active_uia_definition`, deren gesenkte DSL-Rolle
+/// `user-interface` sein muss. Andere Einstiege haben keine UIA-Pflicht.
 fn resolve_active_uia(
     entry: EntryKind,
     config: &ResolvedConfig,
     builtin: &HashMap<String, ExecutableAgentIr>,
 ) -> RuntimeResult<Option<ExecutableAgentIr>> {
-    let required = matches!(entry, EntryKind::Tui | EntryKind::OneShot);
-    let eligible = required || matches!(entry, EntryKind::GatewayTelegram);
-    if !eligible {
+    if !matches!(entry, EntryKind::Tui | EntryKind::OneShot) {
         return Ok(None);
     }
-    let Some(name) = config.harness.active_uia_definition.as_deref() else {
-        return if required {
-            Err(RuntimeError::Registry {
-                detail: "no active UIA is configured; set harness.active_uia_definition to a user-interface agent definition".to_owned(),
-            })
-        } else {
-            Ok(None)
-        };
-    };
+    let name = config.harness.active_uia_definition.as_deref().ok_or_else(|| RuntimeError::Registry {
+        detail: "no active UIA is configured; set harness.active_uia_definition to a user-interface agent definition".to_owned(),
+    })?;
     let ir = resolve_active_agent(Some(name), config, builtin)?.ok_or_else(|| RuntimeError::Registry {
         detail: format!("UIA '{name}' did not resolve"),
     })?;
@@ -2513,9 +2503,6 @@ mod tests {
         let (config, definitions) = builtin();
         assert!(resolve_active_uia(EntryKind::Doctor, &config, &definitions)
             .expect("doctor has no UIA requirement")
-            .is_none());
-        assert!(resolve_active_uia(EntryKind::GatewayTelegram, &config, &definitions)
-            .expect("unconfigured gateway remains compatible")
             .is_none());
     }
 
