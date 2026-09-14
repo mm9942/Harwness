@@ -279,7 +279,8 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             doctor(layers, home_override.clone(), config_dir)?;
             lifecycle::health(home_override)
         }
-        Some(Command::Gateway { telemetry }) => gateway::run(home_override, telemetry),
+        Some(Command::Gateway { action: Some(action), .. }) => lifecycle::gateway_service(home_override, action),
+        Some(Command::Gateway { action: None, telemetry }) => gateway::run(home_override, telemetry),
         Some(Command::Serve { config_dir }) => {
             let (layers, storage_root, home) = resolve_serve_paths(home_override, config_dir)?;
             serve_mcp(layers, storage_root, home)

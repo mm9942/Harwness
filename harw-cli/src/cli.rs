@@ -137,9 +137,12 @@ pub enum Command {
         config_dir: Option<PathBuf>,
     },
     /// Persistenter Hintergrund-Daemon: Gateway + Agenten + Channels
-    /// (Telegram) + Knowledge (Workbench/Dream/Diary). Bleibt dauerhaft am
-    /// Leben — der Weg, wie `harw.service` läuft.
+    /// (Telegram) + Knowledge (Workbench/Dream/Diary). Ohne Aktion läuft der
+    /// Daemon im Vordergrund; die Aktionen verwalten seine Service-Unit.
     Gateway {
+        /// Service-Aktion; ohne Subcommand wird der Gateway direkt gestartet.
+        #[command(subcommand)]
+        action: Option<GatewayAction>,
         /// Zusätzliche Telemetrie-Exportziele (Vorgabe: beide aus).
         #[command(flatten)]
         telemetry: TelemetryArgs,
@@ -291,6 +294,23 @@ pub enum AuthAction {
     },
     /// Vorhandene Credential-Quellen anzeigen (ohne Secrets).
     Status,
+}
+
+/// Aktionen für die dedizierte `harw-gateway.service`-Unit.
+#[derive(Debug, Subcommand)]
+pub enum GatewayAction {
+    /// Unit schreiben, aktivieren und starten.
+    Install,
+    /// Gateway-Dienst starten.
+    Start,
+    /// Gateway-Dienst geordnet stoppen.
+    Stop,
+    /// Gateway-Dienst neu starten.
+    Restart,
+    /// Gateway-Dienst beim Login aktivieren.
+    Enable,
+    /// Gateway-Dienst beim Login deaktivieren.
+    Disable,
 }
 
 /// Aktionen des `harw service`-Subcommands.

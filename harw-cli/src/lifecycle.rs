@@ -30,7 +30,7 @@ use harw_install::{
     detect_service_manager,
 };
 
-use crate::cli::ServiceAction;
+use crate::cli::{GatewayAction, ServiceAction};
 use crate::home::resolve_home;
 
 /// Rendert die `harw-install`-Health-Checks (System/Sandbox/Runtime/Service/Home).
@@ -252,6 +252,51 @@ pub fn service(home_override: Option<PathBuf>, action: ServiceAction) -> Result<
         }
     }
     Ok(())
+}
+
+/// Verwaltet ausschließlich die `harw-gateway.service` des aktiven Profils.
+///
+/// Die Kurzform unter `harw gateway` ist für den täglichen Betrieb gedacht;
+/// `harw service` bleibt die Verwaltung beider Hintergrunddienste.
+pub fn gateway_service(home_override: Option<PathBuf>, action: GatewayAction) -> Result<(), String> {
+    let home = resolve_home(home_override)?;
+    let platform = Platform::detect();
+    if detect_service_manager(&platform).kind() != ServiceKind::Systemd {
+        return Err("Gateway-Service-Steuerung wird auf dieser Plattform noch nicht unterstützt".to_owned());
+    }
+    let [_serve, gateway] = service_specs(
+        &std::env::current_exe().map_err(|error| error.to_string())?,
+        &home,
+    );
+    match action {
+        GatewayAction::Install => {
+            let manager = harw_install::service_systemd::SystemdServiceManager::new();
+            let unit_dir = systemd_user_unit_dir(std::env::var_os("XDG_CONFIG_HOME"), std::env::var_os("HOME"))?;
+            write_systemd_units(&unit_dir, &manager, std::slice::from_ref(&gateway))?;
+            systemctl_gateway(&["daemon-reload"])?;
+            systemctl_gateway(&["enable", "--now", "harw-gateway.service"])?;
+        }
+        GatewayAction::Start => systemctl_gateway(&["start", "harw-gateway.service"] )?,
+        GatewayAction::Stop => systemctl_gateway(&["stop", "harw-gateway.service"] )?,
+        GatewayAction::Restart => systemctl_gateway(&["restart", "harw-gateway.service"] )?,
+        GatewayAction::Enable => systemctl_gateway(&["enable", "harw-gateway.service"] )?,
+        GatewayAction::Disable => systemctl_gateway(&["disable", "harw-gateway.service"] )?,
+    }
+    Ok(())
+}
+
+/// Führt einen systemd-User-Befehl aus und gibt dessen Diagnose vollständig weiter.
+fn systemctl_gateway(args: &[&str]) -> Result<(), String> {
+    let output = std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .output()
+        .map_err(|error| format!("systemctl --user nicht ausführbar: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!("systemctl --user {} fehlgeschlagen: {}", args.join(" "), String::from_utf8_lossy(&output.stderr).trim()))
+    }
 }
 
 /// Builds the service descriptions `harw service` manages: `serve` first, then
