@@ -1,138 +1,91 @@
 //! `approval.pending` / `approval.resolve` — die Bestätigungsfläche (Knoten
-//! UI-06-Folgeknoten) über `harw-web` erreichbar machen.
+//! UI-06-Folgeknoten, A-APPR) über `harw-web` erreichbar machen.
 //!
 //! # Verantwortungsbereich
-//! `harw_web::security` (siehe dortige Moduldoku) definiert bereits die
-//! gesamte Logik, die einen [`harw_session_store::approval::ApprovalRecord`]
-//! anzeigt oder auflöst — [`harw_web::security::pending_approval`] und
-//! [`harw_web::security::resolve_approval`] — aber diese Logik war bislang
-//! über **keine** Fläche erreichbar: `#[operation(...)]` kannte kein
-//! `web(...)`-Unterattribut (das hat der vorherige Knoten geschlossen, siehe
-//! `harw-macros/src/operation.rs`). Diese Datei schließt genau diese Lücke,
-//! ohne die Logik selbst zu duplizieren: `run()` beider Operationen ruft
-//! ausschließlich [`harw_web::security::pending_approval`] bzw.
-//! [`harw_web::security::resolve_approval`] auf.
+//! `harw_web::security` (siehe dortige Moduldoku) definiert die gesamte
+//! Logik, die offene [`harw_session_store::approval::ApprovalRecord`]s
+//! auflistet oder eine davon auflöst —
+//! [`harw_web::security::list_pending_approvals`] und
+//! [`harw_web::security::resolve_approval`]. Diese Datei macht sie über
+//! `Surface::Web` erreichbar, ohne die Logik zu duplizieren, und formt das
+//! Ergebnis als [`OpOutput`] mit Text **und** strukturierter `data`-Nutzlast.
 //!
 //! # Warum `approval.resolve` selbst keine Bestätigung verlangt
 //! `approval.resolve` **ändert** einen Zustand (ein `ApprovalRecord` wird
 //! einmalig verbraucht) und trägt trotzdem `web(..., approval = "none")`.
-//! Das ist kein Versehen: eine Operation, die eine menschliche Bestätigung
-//! *entgegennimmt*, kann nicht selbst eine Bestätigung verlangen — sie
-//! müsste dann von sich selbst genehmigt werden, bevor sie eine Genehmigung
-//! entgegennehmen darf, eine Endlosschleife. `approval.resolve` autorisiert
-//! dabei **nichts**: sie reicht eine bereits getroffene menschliche
-//! Entscheidung unverändert an
-//! [`harw_session_store::approval::ApprovalStore::resolve`] weiter, und
-//! **dieser Speicher** entscheidet — über Aktualitäts-, Actor- und
-//! Einmaligkeitsprüfung —, ob die Entscheidung zulässig ist. Diese Datei
-//! ruft an keiner Stelle `harw-dod-escalate` oder `harw-dod-warden` auf (sie
-//! hängt nicht einmal von diesen Crates ab, siehe `harw-ops/Cargo.toml`) —
-//! Autorisierung entsteht in dieser Codebasis an genau einer Stelle
-//! (Invariante S1), und die ist nicht hier.
+//! Eine Operation, die eine menschliche Bestätigung *entgegennimmt*, kann
+//! nicht selbst eine Bestätigung verlangen. Sie autorisiert dabei **nichts**:
+//! [`harw_session_store::approval::ApprovalStore::resolve`] entscheidet über
+//! Einmaligkeit, Actor-Bindung und TTL. Diese Datei ruft an keiner Stelle
+//! `harw-dod-escalate` oder `harw-dod-warden` auf (Invariante S1).
 //!
-//! # Woher der `ApprovalActor` kommt
-//! Beide Operationen leiten den [`harw_types::ApprovalActor`] **ausschließlich**
-//! aus den über `SO_PEERCRED` gelesenen Peer-Credentials her — nie aus einem
-//! Feld des JSON-Anfragerumpfs. `run()` liest dafür genau zwei Services aus
-//! dem [`OpContext`]:
-//! - `harw_web::peer::PeerCredentials` — die Identität des Aufrufers.
-//! - `Arc<dyn harw_web::security::ApprovalActorResolver>` — die
-//!   serverseitig vertraute Richtlinie, die diese Identität auf einen
-//!   `ApprovalActor` abbildet.
+//! # Woher der `ApprovalActor` kommt (F-172, F-121)
+//! Ausschließlich aus dem vertrauenswürdigen [`Principal`] des Aufrufers
+//! (`Principal::actor_id`), den die Eingangsgrenze als Service in die
+//! `ServiceMap` legt — für Web `harw-cli/src/web.rs::web_op_context`
+//! (`services.insert(web_principal(peer.uid, tier))`). `OpContext` hat kein
+//! eigenes `principal()`-Feld; der Service ist der einzige Zugriffsweg.
+//! Für Web-Principals verlangt [`harw_web::security::ApprovalCaller::actor`]
+//! zusätzlich die `SO_PEERCRED`-Peer-Credentials und die serverseitige
+//! Genehmiger-Tabelle (`Arc<dyn ApprovalActorResolver>`), die denselben Actor
+//! bestätigen müssen. Fehlt der Principal oder hat er keinen Actor, wird
+//! fail-closed abgelehnt. [`ApprovalResolveArgs`] hat **kein** Actor- und
+//! **kein** Zeitfeld.
 //!
-//! Es gibt in [`ApprovalResolveArgs`] **kein** Feld, aus dem ein Aufrufer
-//! selbst einen Actor vorschlagen könnte — der Typ macht das strukturell
-//! unmöglich, nicht nur per Konvention.
+//! # Serveruhr (F-122)
+//! `resolved_at` und die TTL stammen aus der Serveruhr: ein registrierter
+//! `Arc<dyn Clock>`-Service (Tests: feste Uhr), sonst
+//! [`harw_types::SystemClock`]. Ein vom Client mitgeschicktes `resolved_at`
+//! wird nicht gelesen.
 //!
-//! **Offener Befund dieses Knotens:** [`OpContext`] (Session, Turn, Sandbox,
-//! `ServiceMap`) hat kein eigenes Feld für Peer-Credentials — sie müssen als
-//! `PeerCredentials`-Service in der `ServiceMap` registriert sein, damit
-//! `run()` sie lesen kann. Ob die kompositionsseitige
-//! `harw_web::server::WebContextFactory` (die pro Aufruf `(&PeerCredentials,
-//! PermissionTier) -> OpContext` baut) diesen Service tatsächlich einfügt,
-//! liegt außerhalb des Schreibbereichs dieses Knotens (`harw-cli`/die
-//! Composition Root, nicht `harw-ops`). Fehlt der Service, meldet
-//! `approval_resolve` das fail-closed als [`OpError::NotAvailable`] — es
-//! erfindet keinen Ersatz-Actor und nimmt keinen Actor aus `args` entgegen.
-//! Siehe Abschlussbericht dieses Knotens für die genaue Fundstelle.
+//! # Warum `approval.pending` alle offenen Anfragen listet
+//! `Surface::Web` trägt für `GET` weder Pfadparameter noch Rumpf.
+//! `approval.pending` listet deshalb alle offenen, nicht abgelaufenen Anfragen
+//! über [`harw_session_store::approval::ApprovalStore::pending_all`] (höchstens
+//! [`PENDING_LIMIT`]) — kein eigener Verzeichnis-Scan in dieser Datei.
 //!
-//! # Warum `approval.pending` alle offenen Anfragen listet, nicht eine
-//! `Surface::Web { path, readonly, approval }` trägt weder Pfadparameter
-//! noch Rumpf für `GET` — eine Route ist ein fest verdrahteter Pfad (siehe
-//! `harw_web`-Moduldoku). Eine Einzelabfrage nach `session`/`request` bräuchte
-//! eine Erweiterung von `Surface::Web`, die außerhalb dieses Knotens liegt.
-//! `approval.pending` listet deshalb bewusst **alle** für den Store
-//! sichtbaren offenen Anfragen: es sind wenige, und der Bediener soll sie
-//! ohnehin alle sehen, um zu entscheiden.
-//!
-//! [`harw_session_store::approval::ApprovalStore`] hat dafür **keine**
-//! eigene Auflistungsmethode — nur `issue`, `resolve` und `pending` (Einzel-
-//! abfrage nach `session`+`request`). Diese Datei erfindet keinen zweiten,
-//! ungeprüften Lesepfad: [`list_pending_records`] öffnet ausschließlich den
-//! über [`harw_session_store::approval::ApprovalStore::root`] bereits
-//! öffentlichen Wurzelpfad, um Kandidaten-Dateinamen (`<session>/<request>
-//! .pending.json`, gefiltert um jede Anfrage mit einer bereits vorhandenen
-//! `<request>.resolved.json`-Datei — `ApprovalStore::resolve` löscht die
-//! Pending-Datei nicht, sie legt nur zusätzlich die Resolved-Datei an) zu
-//! **entdecken** — die eigentliche, gegen Symlink-Angriffe
-//! gehärtete Leseoperation bleibt ausnahmslos
-//! [`harw_web::security::pending_approval`] (das intern
-//! `ApprovalStore::pending` aufruft) vorbehalten. Ein Kandidat, der zwischen
-//! Entdeckung und Abfrage bereits aufgelöst wurde oder sich als Symlink
-//! entpuppt, wird stillschweigend übersprungen (kein Fehler) — das ist keine
-//! Race Condition in dieser Datei, weil die einzige Autorität für den Inhalt
-//! immer `ApprovalStore::pending` bleibt. **Offener Befund:** eine
-//! `ApprovalStore::list_pending(...)`-Methode, die diese Entdeckung intern
-//! und mit derselben Härtung wie `pending`/`resolve` durchführt, gehört
-//! eigentlich nach `harw-session-store` — das liegt außerhalb des
-//! Schreibbereichs dieses Knotens.
-//!
-//! # Was hier fehlt (siehe `harw_web::security`-Moduldoku)
-//! `approval.pending` gibt ausschließlich die Felder von
-//! [`harw_session_store::approval::ApprovalRecord`] aus (`request`,
-//! `session`, `call_id`, `actor`, `issued_at`) — keinen Befundtext, keine
-//! `WardenAction`/`Reversibility`. `harw_web::security::PendingApprovalView`
-//! bräuchte dafür einen bereits aus `call_id` aufgelösten Anzeigeinhalt, den
-//! noch keine Operation liefert (siehe dortige Moduldoku). Diese Lücke wird
-//! hier nicht geschlossen, nur nicht verschwiegen.
+//! # Selbstgenehmigung — offen
+//! `ApprovalRecord::actor` ist der gebundene Beantworter, nicht der
+//! Anfragende; ohne persistierten Anfragenden ist „Anfragender ≠ Beantworter"
+//! nicht prüfbar (C-APPR-Folgearbeit, Ledger `W4a/A-APPR.md`). Wirksam ist
+//! heute nur: Modell-/Kind-/Operations-Principals haben keinen Actor und
+//! werden abgelehnt.
 //!
 //! # Nebenläufigkeit
 //! Beide Op-Structs sind zustandslose Unit-Structs (`#[operation]`-generiert).
-//! [`ApprovalStore::resolve`] serialisiert konkurrierende Auflösungen
-//! derselben Sitzung über einen Datei-Lock; diese Datei hält selbst keinen
-//! Zustand.
+//! `ApprovalStore::resolve` serialisiert konkurrierende Auflösungen derselben
+//! Sitzung über einen Datei-Lock; diese Datei hält selbst keinen Zustand.
 //!
 //! # Fehlertypen
-//! Beide Operationen übersetzen [`harw_web::security::SecurityError`] nach
-//! [`OpError`] (siehe [`map_security_error`]); zusätzlich melden sie fehlende
-//! Services als [`OpError::NotAvailable`].
+//! Beide Operationen übersetzen [`SecurityError`] nach [`OpError`] (siehe
+//! [`map_security_error`]); fehlende Services melden sie als
+//! [`OpError::NotAvailable`].
 
 use std::sync::Arc;
 
 use harw_macros::operation;
 use harw_operations::{OpContext, OpError, OpOutput};
-use harw_session_store::approval::{ApprovalRecord, ApprovalStore};
+use harw_session_store::approval::{ApprovalRecord, ApprovalResolutionRecord, ApprovalStore};
 use harw_session_store::error::SessionStoreError;
-use harw_types::{ItemId, ReviewDecision, SessionId};
+use harw_types::{Clock, ItemId, Principal, ReviewDecision, SessionId, SystemClock};
 use harw_web::peer::PeerCredentials;
-use harw_web::security::{ApprovalActorResolver, SecurityError, pending_approval, resolve_approval};
-use jiff::Timestamp;
+use harw_web::security::{
+    ApprovalActorResolver, ApprovalCaller, SecurityError, list_pending_approvals,
+    resolve_approval,
+};
+
+/// Höchstzahl der von `approval.pending` gelieferten Anfragen.
+pub const PENDING_LIMIT: usize = 200;
 
 /// Übersetzt [`SecurityError`] nach [`OpError`].
 ///
 /// # Description
-/// [`SecurityError::UnknownApprover`] ist eine Autorisierungsablehnung (der
-/// Peer darf keine Anfrage auflösen) und wird als [`OpError::NotAvailable`]
-/// gemeldet — dieselbe Behandlung wie eine fehlende Berechtigung an anderer
-/// Stelle in dieser Crate. Innerhalb von [`SecurityError::Store`] werden
-/// „der Aufrufer hat etwas Falsches benannt oder wiederholt"-Fälle
-/// ([`SessionStoreError::ApprovalNotFound`],
-/// [`SessionStoreError::ApprovalAlreadyResolved`]) als
-/// [`OpError::InvalidArguments`] gemeldet — eine zweite Bestätigung derselben
-/// Anfrage wird damit abgewiesen, nicht als interner Fehler getarnt. Ein
-/// Actor-Fehlanpassung ([`SessionStoreError::ApprovalActorMismatch`]) ist
-/// eine Autorisierungsablehnung wie `UnknownApprover`. Alles andere ist ein
-/// Laufzeitfehler des Speichers.
+/// Jede Identitätsablehnung (kein Actor, kein authentifizierter Web-Peer,
+/// unbekannter Genehmiger, abweichende Identität, Actor-Mismatch im
+/// Speicher) ist [`OpError::NotAvailable`]. „Falsch benannt, wiederholt oder
+/// abgelaufen" (`ApprovalNotFound`, `ApprovalAlreadyResolved`,
+/// `ApprovalExpired`) ist [`OpError::InvalidArguments`]. Alles andere ist
+/// ein Laufzeitfehler des Speichers.
 ///
 /// # Arguments
 /// - `error` (`SecurityError`): der zu übersetzende Fehler.
@@ -141,8 +94,19 @@ use jiff::Timestamp;
 /// Der äquivalente [`OpError`].
 fn map_security_error(error: SecurityError) -> OpError {
     match error {
+        SecurityError::NoApproverActor { kind, surface } => OpError::NotAvailable(format!(
+            "Aufrufer ({kind:?} über {surface:?}) darf keine Genehmigungsanfrage auflösen"
+        )),
+        SecurityError::UnauthenticatedWebPeer => OpError::NotAvailable(
+            "keine authentifizierten Peer-Credentials oder keine Genehmiger-Tabelle im \
+             Kontext — Web-Aufrufer kann nicht als Genehmiger bestätigt werden"
+                .to_owned(),
+        ),
         SecurityError::UnknownApprover { uid } => OpError::NotAvailable(format!(
             "Peer mit uid {uid} ist keinem Genehmiger zugeordnet"
+        )),
+        SecurityError::ApproverIdentityMismatch { uid } => OpError::NotAvailable(format!(
+            "Peer mit uid {uid} entspricht nicht dem Genehmiger des Aufrufers"
         )),
         SecurityError::Store(SessionStoreError::ApprovalNotFound { session, request }) => {
             OpError::InvalidArguments(format!(
@@ -154,10 +118,15 @@ fn map_security_error(error: SecurityError) -> OpError {
                 "Genehmigungsanfrage '{request}' wurde bereits aufgelöst"
             ))
         }
+        SecurityError::Store(SessionStoreError::ApprovalExpired {
+            request,
+            expires_at,
+            ..
+        }) => OpError::InvalidArguments(format!(
+            "Genehmigungsanfrage '{request}' ist seit {expires_at} abgelaufen"
+        )),
         SecurityError::Store(SessionStoreError::ApprovalActorMismatch { request }) => {
-            OpError::NotAvailable(format!(
-                "abweichender Genehmiger für Anfrage '{request}'"
-            ))
+            OpError::NotAvailable(format!("abweichender Genehmiger für Anfrage '{request}'"))
         }
         SecurityError::Store(other) => {
             OpError::Execution(format!("Genehmigungsspeicher-Fehler: {other}"))
@@ -171,119 +140,46 @@ fn map_security_error(error: SecurityError) -> OpError {
 /// [`OpError::NotAvailable`], wenn kein `Arc<ApprovalStore>` registriert ist.
 fn approval_store(ctx: &OpContext) -> Result<Arc<ApprovalStore>, OpError> {
     ctx.service::<Arc<ApprovalStore>>()
-        .cloned()
+        .map(Arc::clone)
         .ok_or_else(|| OpError::NotAvailable("kein Genehmigungsspeicher im Kontext".to_owned()))
 }
 
-/// Entdeckt Kandidaten-Anfragen (`session`, `request`) unterhalb von
-/// [`ApprovalStore::root`], ohne selbst eine Autoritätsentscheidung zu
-/// treffen.
+/// Liefert die Serveruhr: registrierter `Arc<dyn Clock>`-Service oder
+/// [`SystemClock`].
 ///
 /// # Description
-/// Liest genau zwei Verzeichnisebenen: `root()/<session>/` und darin jede
-/// Datei mit der Endung `.pending.json`. Der Dateiname ohne diese Endung ist
-/// die `request`-Id, der Ordnername die `session`-Id — dieselbe Kodierung,
-/// die `ApprovalStore::pending_path` intern verwendet
-/// (`harw-session-store/src/approval.rs`). Diese Funktion **liest keinen
-/// Dateiinhalt** und trifft keine Sichtbarkeits- oder Gültigkeitsentscheidung
-/// — sie liefert nur Namen, die anschließend ausnahmslos über
-/// [`pending_approval`] (und damit über den Symlink-gehärteten Lesepfad von
-/// `ApprovalStore::pending`) bestätigt werden müssen.
-///
-/// # Arguments
-/// - `store` (`&ApprovalStore`): der Genehmigungsspeicher, dessen `root()`
-///   gelesen wird.
+/// Beide Quellen sind serverseitig; ein Rückfall auf die Systemuhr ist daher
+/// keine Abschwächung. Der Service existiert, damit Tests eine feste Uhr
+/// injizieren können.
 ///
 /// # Returns
-/// Ein `Vec<(SessionId, ItemId)>` mit allen gefundenen Kandidaten, in keiner
-/// garantierten Reihenfolge.
-///
-/// # Errors
-/// [`std::io::Error`], wenn `root()` oder eines der Sitzungsverzeichnisse
-/// nicht gelesen werden kann. Ein fehlendes `root()`-Verzeichnis (noch nie
-/// eine Anfrage ausgestellt) liefert eine leere Liste, keinen Fehler.
-fn discover_pending_candidates(store: &ApprovalStore) -> std::io::Result<Vec<(SessionId, ItemId)>> {
-    let mut candidates = Vec::new();
-    let root_entries = match std::fs::read_dir(store.root()) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(candidates),
-        Err(error) => return Err(error),
-    };
-    for session_entry in root_entries {
-        let session_entry = session_entry?;
-        if !session_entry.file_type()?.is_dir() {
-            continue;
-        }
-        let Some(session_name) = session_entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-
-        // Beide Suffixe derselben Sitzung werden zuerst gesammelt, damit
-        // `<request>.resolved.json` bereits aufgelöste Anfragen ausfiltern
-        // kann, ohne eine zweite Verzeichnisleseoperation zu brauchen —
-        // `ApprovalStore::resolve` löscht die `.pending.json`-Datei nicht,
-        // sie legt nur zusätzlich die `.resolved.json`-Datei an (siehe
-        // `harw-session-store/src/approval.rs`).
-        let mut file_names = std::collections::BTreeSet::new();
-        for file_entry in std::fs::read_dir(session_entry.path())? {
-            let file_entry = file_entry?;
-            if let Some(name) = file_entry.file_name().to_str() {
-                file_names.insert(name.to_owned());
-            }
-        }
-        for file_name in &file_names {
-            let Some(request_name) = file_name.strip_suffix(".pending.json") else {
-                continue;
-            };
-            let resolved_name = format!("{request_name}.resolved.json");
-            if file_names.contains(&resolved_name) {
-                // Bereits aufgelöst — die Anfrage ist keine offene Anfrage
-                // mehr, auch wenn ihre `.pending.json`-Datei zu
-                // Auditzwecken liegen bleibt. Die Autorität für "aufgelöst"
-                // bleibt trotzdem `ApprovalStore::resolve`; dieser Filter
-                // ist nur eine Anzeige-Heuristik.
-                continue;
-            }
-            candidates.push((
-                SessionId::from_str(session_name.clone()),
-                ItemId::from_str(request_name.to_owned()),
-            ));
-        }
+/// Eine geteilte Uhr.
+fn server_clock(ctx: &OpContext) -> Arc<dyn Clock> {
+    match ctx.service::<Arc<dyn Clock>>() {
+        Some(clock) => Arc::clone(clock),
+        None => Arc::new(SystemClock),
     }
-    Ok(candidates)
 }
 
-/// Bestätigt jeden Kandidaten über [`pending_approval`] und verwirft, was
-/// zwischen Entdeckung und Bestätigung ungültig wurde.
+/// Baut die strukturierte Nutzlast einer Auflösung.
 ///
 /// # Description
-/// Ruft für jeden von [`discover_pending_candidates`] gefundenen Kandidaten
-/// [`pending_approval`] auf. [`SecurityError::Store`] mit
-/// [`SessionStoreError::ApprovalNotFound`] wird stillschweigend übersprungen
-/// (die Anfrage wurde inzwischen aufgelöst oder war ein Symlink, siehe
-/// Moduldoku) — jeder andere Fehler wird propagiert.
-///
-/// # Arguments
-/// - `store` (`&ApprovalStore`): der Genehmigungsspeicher.
-///
-/// # Returns
-/// Alle noch offenen, bestätigten [`ApprovalRecord`]s.
+/// Felder `id` (Anfrage), `session`, `decision`, `resolved_at` (Serveruhr),
+/// `actor` — jeweils in ihrer serde-Wire-Form (`snake_case`, RFC 3339).
 ///
 /// # Errors
-/// [`OpError::Execution`] bei einem I/O-Fehler beim Entdecken der Kandidaten
-/// oder einem nicht-transienten Speicherfehler.
-fn list_pending_records(store: &ApprovalStore) -> Result<Vec<ApprovalRecord>, OpError> {
-    let candidates = discover_pending_candidates(store)
-        .map_err(|error| OpError::Execution(format!("Genehmigungsverzeichnis unlesbar: {error}")))?;
-    let mut records = Vec::with_capacity(candidates.len());
-    for (session, request) in candidates {
-        match pending_approval(store, &session, &request) {
-            Ok(record) => records.push(record),
-            Err(SecurityError::Store(SessionStoreError::ApprovalNotFound { .. })) => continue,
-            Err(other) => return Err(map_security_error(other)),
-        }
-    }
-    Ok(records)
+/// [`OpError::Execution`], wenn ein Feld nicht serialisierbar ist.
+fn resolution_data(resolution: &ApprovalResolutionRecord) -> Result<serde_json::Value, OpError> {
+    let encode = |error: serde_json::Error| {
+        OpError::Execution(format!("Auflösung nicht serialisierbar: {error}"))
+    };
+    Ok(serde_json::json!({
+        "id": resolution.request.as_str(),
+        "session": resolution.session.as_str(),
+        "decision": serde_json::to_value(resolution.decision).map_err(encode)?,
+        "resolved_at": serde_json::to_value(resolution.resolved_at).map_err(encode)?,
+        "actor": serde_json::to_value(&resolution.actor).map_err(encode)?,
+    }))
 }
 
 /// Argument-Container für `approval.pending` — leer, weil die Fläche alle
@@ -291,67 +187,77 @@ fn list_pending_records(store: &ApprovalStore) -> Result<Vec<ApprovalRecord>, Op
 #[derive(Default, serde::Deserialize, harw_macros::FromRawArgs)]
 pub struct ApprovalPendingArgs {}
 
-/// Listet alle über den Genehmigungsspeicher sichtbaren offenen Anfragen.
+/// Listet alle offenen, nicht abgelaufenen Genehmigungsanfragen.
 ///
 /// # Description
-/// Reine Anzeige, keine Auflösung — ruft ausschließlich [`pending_approval`]
-/// auf (über [`list_pending_records`], das die Kandidaten dafür entdeckt,
-/// siehe Moduldoku „Warum `approval.pending` alle offenen Anfragen listet").
-/// Trifft keine eigene Sichtbarkeits- oder Autorisierungsentscheidung.
+/// Reine Anzeige, keine Auflösung — ruft ausschließlich
+/// [`list_pending_approvals`] (`ApprovalStore::pending_all`) mit
+/// [`PENDING_LIMIT`] und der Serveruhr auf.
 ///
 /// # Arguments
-/// - `ctx` (`&OpContext`): muss `Arc<ApprovalStore>` als Service anbieten.
+/// - `ctx` (`&OpContext`): muss `Arc<ApprovalStore>` als Service anbieten;
+///   optional `Arc<dyn Clock>`.
 /// - `_args` (`ApprovalPendingArgs`): leer.
 ///
 /// # Returns
-/// `Ok(OpOutput { text })` mit einer Zeile je offener Anfrage, oder einem
-/// Hinweistext, wenn keine offen ist.
+/// `OpOutput` mit einer Textzeile je Anfrage und
+/// `data = {"pending": [ApprovalRecord…], "limit": PENDING_LIMIT}`.
 ///
 /// # Errors
 /// - [`OpError::NotAvailable`]: kein Genehmigungsspeicher im Kontext.
-/// - [`OpError::Execution`]: das Genehmigungsverzeichnis konnte nicht
-///   gelesen werden.
+/// - [`OpError::Execution`]: das Genehmigungsverzeichnis ist nicht lesbar.
 ///
 /// # Examples
 /// ```rust,no_run
-/// // Aufruf erfolgt über Operation::run(); siehe Modultests für den
-/// // direkten Aufruf gegen einen temporären ApprovalStore.
+/// // Aufruf erfolgt über Operation::run(); siehe Modultests.
 /// ```
 #[operation(
     name = "approval.pending",
     summary = "Listet alle offenen Genehmigungsanfragen. Autorisiert nichts.",
     domain = "execution",
     permission = "observer",
-    web(path = "/api/approval-pending", readonly, approval = "none")
+    web(path = "/api/approval-pending", method = "get", approval = "none")
 )]
 async fn approval_pending(
     ctx: &OpContext,
     _args: ApprovalPendingArgs,
 ) -> Result<OpOutput, OpError> {
     let store = approval_store(ctx)?;
-    let records = list_pending_records(&store)?;
-    if records.is_empty() {
-        return Ok(OpOutput {
-            text: "Keine offenen Genehmigungsanfragen.".to_owned(),
-        });
-    }
-    let mut buf = format!("{} offene Genehmigungsanfrage(n):\n", records.len());
-    for record in &records {
-        buf.push_str(&format!(
-            "· {} (Sitzung {}, Aufruf {}, angefragt von {:?} um {})\n",
-            record.request, record.session, record.call_id, record.actor, record.issued_at
-        ));
-    }
-    Ok(OpOutput { text: buf })
+    let clock = server_clock(ctx);
+    let records: Vec<ApprovalRecord> =
+        list_pending_approvals(&store, PENDING_LIMIT, clock.as_ref())
+            .map_err(map_security_error)?;
+    let data = serde_json::json!({
+        "pending": serde_json::to_value(&records).map_err(|error| {
+            OpError::Execution(format!("Anfragen nicht serialisierbar: {error}"))
+        })?,
+        "limit": PENDING_LIMIT,
+    });
+    let text = if records.is_empty() {
+        "Keine offenen Genehmigungsanfragen.".to_owned()
+    } else {
+        let mut buf = format!("{} offene Genehmigungsanfrage(n):\n", records.len());
+        for record in &records {
+            buf.push_str(&format!(
+                "· {} (Sitzung {}, Aufruf {}, Genehmiger {:?}, ausgestellt {})\n",
+                record.request, record.session, record.call_id, record.actor, record.issued_at
+            ));
+        }
+        buf
+    };
+    Ok(OpOutput {
+        text,
+        data: Some(data),
+    })
 }
 
 /// Argument-Container für `approval.resolve`.
 ///
 /// # Beschreibung
-/// Trägt **keinen** `actor`-Parameter — der `ApprovalActor` kommt
-/// ausschließlich aus den Peer-Credentials des Aufrufers (siehe Moduldoku).
-/// `resolved_at` kommt vom Aufrufer, weil diese Operation keine Systemuhr
-/// liest.
+/// Trägt **keinen** `actor`- und **keinen** Zeitparameter — der Actor kommt
+/// aus dem Principal des Aufrufers, die Zeit aus der Serveruhr (siehe
+/// Moduldoku). Unbekannte Felder (etwa ein altes `resolved_at`) werden von
+/// serde ignoriert und nie gelesen.
 #[derive(Debug, serde::Deserialize)]
 pub struct ApprovalResolveArgs {
     /// Die betroffene Sitzung.
@@ -363,25 +269,18 @@ pub struct ApprovalResolveArgs {
     /// Optionaler Freitextkommentar des Bedieners.
     #[serde(default)]
     pub comment: Option<String>,
-    /// Vom Aufrufer bereitgestellter Zeitstempel der Entscheidung.
-    pub resolved_at: Timestamp,
 }
 
 impl Default for ApprovalResolveArgs {
-    /// Sentinel-Default, das das `#[operation]`-Makro für den (bei dieser
-    /// Fläche nie eintretenden) Fall `args.is_null()` benötigt — `harw-web`
-    /// liefert für eine POST-Route mit Rumpf keinen `null`-Wert. Die
-    /// Sentinel-Werte sind bewusst ungültig (leere IDs, `Rejected`,
-    /// Unix-Epoche): ein versehentlich durchgereichtes Default würde sofort
-    /// als `OpError::InvalidArguments`/`ApprovalNotFound` auffallen, nie
-    /// als stille Genehmigung.
+    /// Sentinel-Default, das das `#[operation]`-Makro für den Fall
+    /// `args.is_null()` benötigt. Leere IDs und `Rejected` fallen sofort als
+    /// `ApprovalNotFound`/`UnsafeApprovalPath` auf, nie als stille Genehmigung.
     fn default() -> Self {
         Self {
             session: SessionId::from_str(String::new()),
             request: ItemId::from_str(String::new()),
             decision: ReviewDecision::Rejected,
             comment: None,
-            resolved_at: Timestamp::UNIX_EPOCH,
         }
     }
 }
@@ -400,86 +299,77 @@ impl harw_operations::FromRawArgs for ApprovalResolveArgs {
 /// Entscheidung auf.
 ///
 /// # Description
-/// Leitet den `ApprovalActor` ausschließlich aus den über `SO_PEERCRED`
-/// gelesenen Peer-Credentials her (Service `PeerCredentials` im
-/// [`OpContext`]) und ruft dafür ausschließlich [`resolve_approval`] auf.
-/// Trägt `web(..., approval = "none")`, obwohl sie mutiert — siehe
-/// Moduldoku „Warum `approval.resolve` selbst keine Bestätigung verlangt":
-/// sie autorisiert selbst nichts, sondern reicht eine bereits getroffene
-/// menschliche Entscheidung an [`harw_session_store::approval::ApprovalStore::resolve`]
-/// weiter, das über Aktualität, Actor-Identität und Einmaligkeit entscheidet.
+/// Liest den [`Principal`] aus dem [`OpContext`] (Service), ergänzt für
+/// Web-Aufrufer `PeerCredentials` und `Arc<dyn ApprovalActorResolver>`, und
+/// ruft [`resolve_approval`] mit der Serveruhr auf. Der Actor entsteht nur in
+/// [`ApprovalCaller::actor`]; ohne Actor wird abgelehnt.
 ///
 /// # Arguments
-/// - `ctx` (`&OpContext`): muss `Arc<ApprovalStore>`,
-///   `Arc<dyn ApprovalActorResolver>` und `PeerCredentials` als Services
-///   anbieten.
+/// - `ctx` (`&OpContext`): muss `Arc<ApprovalStore>` und `Principal`
+///   anbieten; für Web-Principals zusätzlich `PeerCredentials` und
+///   `Arc<dyn ApprovalActorResolver>`; optional `Arc<dyn Clock>`.
 /// - `args` (`ApprovalResolveArgs`): Sitzung, Anfrage, Entscheidung,
-///   optionaler Kommentar, Zeitstempel — kein Actor-Feld.
+///   optionaler Kommentar.
 ///
 /// # Returns
-/// `Ok(OpOutput { text })` mit dem durabel geschriebenen Auflösungsergebnis.
+/// `OpOutput` mit Text und
+/// `data = {"id", "session", "decision", "resolved_at", "actor"}`.
 ///
 /// # Errors
-/// - [`OpError::NotAvailable`]: kein Genehmigungsspeicher, kein
-///   Actor-Resolver oder keine Peer-Credentials im Kontext registriert
-///   (letzteres ist der im Abschlussbericht gemeldete Befund: der
-///   `OpContext` muss `PeerCredentials` als Service tragen, sonst kann
-///   diese Operation den Aufrufer nicht identifizieren); ebenso, wenn der
-///   Peer keinem `ApprovalActor` zugeordnet ist oder der aufgelöste Actor
-///   nicht zum bei `issue()` hinterlegten passt.
-/// - [`OpError::InvalidArguments`]: die Anfrage existiert nicht (mehr) oder
-///   wurde bereits aufgelöst — eine zweite Bestätigung wird abgewiesen,
-///   nicht überschrieben.
+/// - [`OpError::NotAvailable`]: kein Speicher/Principal im Kontext; Principal
+///   ohne Actor; Web-Aufrufer ohne authentifizierten Peer, unbekannt oder mit
+///   abweichender Identität; Actor passt nicht zur Anfrage.
+/// - [`OpError::InvalidArguments`]: Anfrage unbekannt, bereits aufgelöst oder
+///   abgelaufen.
+/// - [`OpError::Execution`]: sonstiger Speicherfehler.
 ///
 /// # Concurrency
-/// Delegiert die Sperrung vollständig an
-/// [`harw_session_store::approval::ApprovalStore::resolve`] (Datei-Lock je
-/// Sitzung).
+/// Delegiert die Sperrung vollständig an `ApprovalStore::resolve`.
 ///
 /// # Examples
 /// ```rust,no_run
-/// // Aufruf erfolgt über Operation::run(); siehe Modultests für den
-/// // direkten Aufruf mit einem Test-Resolver und Test-Peer.
+/// // Aufruf erfolgt über Operation::run(); siehe Modultests.
 /// ```
 #[operation(
     name = "approval.resolve",
     summary = "Löst eine offene Genehmigungsanfrage anhand einer menschlichen Entscheidung auf. Autorisiert selbst nichts.",
     domain = "execution",
     permission = "operator",
-    web(path = "/api/approval-resolve", approval = "none")
+    web(path = "/api/approval-resolve", method = "post", approval = "none")
 )]
 async fn approval_resolve(
     ctx: &OpContext,
     args: ApprovalResolveArgs,
 ) -> Result<OpOutput, OpError> {
     let store = approval_store(ctx)?;
-    let resolver = ctx
-        .service::<Arc<dyn ApprovalActorResolver>>()
-        .cloned()
-        .ok_or_else(|| {
-            OpError::NotAvailable("kein Genehmiger-Resolver im Kontext registriert".to_owned())
-        })?;
-    let peer = ctx.service::<PeerCredentials>().copied().ok_or_else(|| {
+    let principal = ctx.service::<Principal>().ok_or_else(|| {
         OpError::NotAvailable(
-            "keine Peer-Credentials im Kontext registriert — der OpContext muss \
-             `PeerCredentials` als Service tragen, sonst kann diese Operation den \
-             Aufrufer nicht identifizieren"
+            "kein Principal im Kontext — Aufrufer nicht identifizierbar, Freigabe abgelehnt"
                 .to_owned(),
         )
     })?;
+    let resolver = ctx.service::<Arc<dyn ApprovalActorResolver>>();
+    let peer = ctx.service::<PeerCredentials>();
+    let caller = match (peer, resolver) {
+        (Some(peer), Some(resolver)) => {
+            ApprovalCaller::new(principal).with_web_peer(peer, resolver.as_ref())
+        }
+        _ => ApprovalCaller::new(principal),
+    };
+    let clock = server_clock(ctx);
 
     let resolution = resolve_approval(
         &store,
-        resolver.as_ref(),
-        &peer,
+        &caller,
         &args.session,
         &args.request,
         args.decision,
         args.comment,
-        args.resolved_at,
+        clock.as_ref(),
     )
     .map_err(map_security_error)?;
 
+    let data = resolution_data(&resolution)?;
     Ok(OpOutput {
         text: format!(
             "Anfrage {} (Sitzung {}) aufgelöst als {:?} durch {:?} um {}.",
@@ -489,14 +379,15 @@ async fn approval_resolve(
             resolution.actor,
             resolution.resolved_at
         ),
+        data: Some(data),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovalPendingArgs, ApprovalResolveArgs, approval_pending, approval_resolve,
-        discover_pending_candidates,
+        ApprovalPendingArgs, ApprovalResolveArgs, PENDING_LIMIT, approval_pending,
+        approval_resolve,
     };
     use crate::testutil::toks;
     use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
@@ -504,13 +395,36 @@ mod tests {
         Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
     };
     use harw_session_store::approval::{ApprovalRecord, ApprovalStore};
-    use harw_types::{ApprovalActor, ItemId, ReviewDecision, SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
+    use harw_types::{
+        ApprovalActor, Clock, IngressSurface, ItemId, PermissionTier, Principal, PrincipalKind,
+        ReviewDecision, SessionId, TenantId, ToolCallId, TurnId, WorkspaceId,
+    };
     use harw_web::peer::PeerCredentials;
     use harw_web::security::{ApprovalActorResolver, StaticUidApprovalActorMap};
-    use jiff::Timestamp;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use jiff::{SignedDuration, Timestamp};
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const ISSUED_SECS: i64 = 1_700_000_000;
+
+    // Feste Serveruhr, als `Arc<dyn Clock>`-Service injiziert.
+    struct FixedClock(Timestamp);
+
+    impl Clock for FixedClock {
+        fn now(&self) -> Timestamp {
+            self.0
+        }
+    }
+
+    fn issued_at() -> Timestamp {
+        Timestamp::constant(ISSUED_SECS, 0)
+    }
+
+    fn at_offset(offset: SignedDuration) -> Timestamp {
+        // Testhilfe: 1.7e9 s plus Minuten liegt sicher im Wertebereich.
+        issued_at().checked_add(offset).expect("timestamp in range")
+    }
 
     fn unique_root(prefix: &str) -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -518,14 +432,17 @@ mod tests {
         std::env::temp_dir().join(format!("{prefix}-{}-{id}", std::process::id()))
     }
 
-    /// Baut einen Test-`OpContext`. `store`, `resolver` und `peer` werden nur
-    /// eingefügt, wenn übergeben — genau das belegt den fehlenden
-    /// Verdrahtungspfad in `approval_resolve_without_peer_credentials_...`.
-    fn test_context(
+    /// Dienste eines Test-`OpContext`; nur gesetzte Felder werden eingefügt.
+    #[derive(Default)]
+    struct Services {
         store: Option<Arc<ApprovalStore>>,
+        principal: Option<Principal>,
         resolver: Option<Arc<dyn ApprovalActorResolver>>,
         peer: Option<PeerCredentials>,
-    ) -> (OpContext, PathBuf) {
+        clock: Option<Timestamp>,
+    }
+
+    fn test_context(services_in: Services) -> (OpContext, PathBuf) {
         let root = unique_root("harw-ops-approval-test");
         std::fs::create_dir_all(root.join("ws")).expect("create test workspace");
         let registry = WorkspaceRegistry::build(
@@ -548,14 +465,21 @@ mod tests {
             PermissionSet::from_policy([Permission::ReadWorkspace]),
         );
         let mut services = ServiceMap::new();
-        if let Some(store) = store {
+        if let Some(store) = services_in.store {
             services.insert(store);
         }
-        if let Some(resolver) = resolver {
+        if let Some(principal) = services_in.principal {
+            services.insert(principal);
+        }
+        if let Some(resolver) = services_in.resolver {
             services.insert(resolver);
         }
-        if let Some(peer) = peer {
+        if let Some(peer) = services_in.peer {
             services.insert(peer);
+        }
+        if let Some(now) = services_in.clock {
+            let clock: Arc<dyn Clock> = Arc::new(FixedClock(now));
+            services.insert(clock);
         }
         (
             OpContext::new(SessionId::new(), TurnId::new(), sandbox, services),
@@ -563,247 +487,349 @@ mod tests {
         )
     }
 
-    fn issue_pending(store: &ApprovalStore, session: &str, request: &str, actor_id: &str) {
+    fn web_principal() -> Principal {
+        Principal::trusted_ingress(
+            PrincipalKind::Human,
+            "uid:1000",
+            IngressSurface::Web,
+            PermissionTier::Owner,
+        )
+    }
+
+    fn owner() -> ApprovalActor {
+        ApprovalActor::Operator {
+            id: "owner".to_owned(),
+        }
+    }
+
+    fn issue_pending(store: &ApprovalStore, session: &str, request: &str, issued: Timestamp) {
         store
             .issue(&ApprovalRecord {
                 request: ItemId::from_str(request),
                 session: SessionId::from_str(session),
                 call_id: ToolCallId::from_str("call-1"),
-                actor: ApprovalActor::Operator {
-                    id: actor_id.to_owned(),
-                },
-                issued_at: Timestamp::constant(0, 0),
+                actor: owner(),
+                issued_at: issued,
             })
             .expect("issue pending approval");
     }
 
-    fn resolver_for(entries: Vec<(u32, String)>) -> Arc<dyn ApprovalActorResolver> {
-        Arc::new(StaticUidApprovalActorMap::new(entries))
+    fn resolver_owner() -> Arc<dyn ApprovalActorResolver> {
+        Arc::new(StaticUidApprovalActorMap::new(vec![(1000, "owner".to_owned())]))
+    }
+
+    fn approve_args(request: &str) -> ApprovalResolveArgs {
+        ApprovalResolveArgs {
+            session: SessionId::from_str("session-1"),
+            request: ItemId::from_str(request),
+            decision: ReviewDecision::Approved,
+            comment: None,
+        }
+    }
+
+    /// Voll verdrahteter Web-Kontext (Principal, Peer uid 1000, Resolver, Uhr).
+    fn web_services(store: &Arc<ApprovalStore>, now: Timestamp) -> Services {
+        Services {
+            store: Some(Arc::clone(store)),
+            principal: Some(web_principal()),
+            resolver: Some(resolver_owner()),
+            peer: Some(PeerCredentials::new(1, 1000, 1000)),
+            clock: Some(now),
+        }
+    }
+
+    fn cleanup(store_root: &Path, ws_root: PathBuf) {
+        std::fs::remove_dir_all(store_root).ok();
+        std::fs::remove_dir_all(ws_root).ok();
     }
 
     #[test]
-    fn approval_pending_args_from_raw_args_ignores_tokens() {
-        let args = ApprovalPendingArgs::from_raw_args(&toks(&["ignored"])).expect("parses");
-        let _ = args;
+    fn test_approval_pending_args_from_raw_args_ignores_tokens() {
+        assert!(ApprovalPendingArgs::from_raw_args(&toks(&["ignored"])).is_ok());
     }
 
     #[test]
-    fn approval_resolve_args_from_raw_args_is_rejected() {
+    fn test_approval_resolve_args_from_raw_args_is_rejected() {
         let error = ApprovalResolveArgs::from_raw_args(&toks(&[])).unwrap_err();
         assert!(matches!(error, OpError::InvalidArguments(_)));
     }
 
+    /// Ein vom Client mitgeschicktes `resolved_at`/`actor` hat kein Zielfeld.
     #[test]
-    fn approval_resolve_args_deserializes_without_an_actor_field() {
+    fn test_approval_resolve_args_ignore_client_time_and_actor() {
         let json = serde_json::json!({
             "session": "session-1",
             "request": "approval-1",
             "decision": "approved",
             "resolved_at": "1970-01-01T00:00:00Z",
+            "actor": {"kind": "operator", "id": "attacker"},
         });
-        let args: ApprovalResolveArgs =
-            serde_json::from_value(json).expect("deserializes without actor");
+        let args: ApprovalResolveArgs = serde_json::from_value(json).expect("deserializes");
         assert_eq!(args.session.as_str(), "session-1");
         assert_eq!(args.decision, ReviewDecision::Approved);
+        assert!(!format!("{args:?}").contains("1970"));
+        assert!(!format!("{args:?}").contains("attacker"));
     }
 
     #[tokio::test]
-    async fn approval_pending_without_store_returns_not_available() {
-        let (ctx, root) = test_context(None, None, None);
+    async fn test_approval_pending_without_store_returns_not_available() {
+        let (ctx, root) = test_context(Services::default());
         let result = approval_pending(&ctx, ApprovalPendingArgs::default()).await;
         std::fs::remove_dir_all(root).ok();
         assert!(matches!(result, Err(OpError::NotAvailable(_))));
     }
 
     #[tokio::test]
-    async fn approval_pending_with_empty_store_reports_none_open() {
+    async fn test_approval_pending_with_empty_store_reports_none_open() {
         let store_root = unique_root("harw-ops-approval-empty-store");
         let store = Arc::new(ApprovalStore::new(&store_root));
-        let (ctx, ws_root) = test_context(Some(store), None, None);
+        let (ctx, ws_root) = test_context(Services {
+            store: Some(store),
+            ..Services::default()
+        });
         let output = approval_pending(&ctx, ApprovalPendingArgs::default())
             .await
             .expect("list succeeds on empty store");
-        std::fs::remove_dir_all(&store_root).ok();
-        std::fs::remove_dir_all(ws_root).ok();
+        cleanup(&store_root, ws_root);
         assert_eq!(output.text, "Keine offenen Genehmigungsanfragen.");
+        let data = output.data.expect("structured payload");
+        assert_eq!(data["pending"], serde_json::json!([]));
+        assert_eq!(data["limit"], serde_json::json!(PENDING_LIMIT));
     }
 
+    /// `pending_all`-Ausgabe: sortiert nach `issued_at`, ohne abgelaufene und
+    /// aufgelöste Anfragen, als `data.pending`.
     #[tokio::test]
-    async fn approval_pending_lists_an_issued_request() {
+    async fn test_approval_pending_lists_open_requests_from_pending_all() {
         let store_root = unique_root("harw-ops-approval-list-store");
         let store = Arc::new(ApprovalStore::new(&store_root));
-        issue_pending(&store, "session-1", "approval-1", "alice");
-        let (ctx, ws_root) = test_context(Some(Arc::clone(&store)), None, None);
+        let now = at_offset(SignedDuration::from_mins(40));
+        issue_pending(&store, "session-1", "stale", issued_at());
+        issue_pending(&store, "session-1", "later", at_offset(SignedDuration::from_mins(20)));
+        issue_pending(&store, "session-2", "earlier", at_offset(SignedDuration::from_mins(15)));
+        issue_pending(&store, "session-1", "done", at_offset(SignedDuration::from_mins(25)));
 
+        let (resolve_ctx, ws_resolve) = test_context(web_services(&store, now));
+        approval_resolve(&resolve_ctx, approve_args("done"))
+            .await
+            .expect("resolve 'done'");
+
+        let (ctx, ws_root) = test_context(Services {
+            store: Some(Arc::clone(&store)),
+            clock: Some(now),
+            ..Services::default()
+        });
         let output = approval_pending(&ctx, ApprovalPendingArgs::default())
             .await
             .expect("list succeeds");
+        std::fs::remove_dir_all(ws_resolve).ok();
+        cleanup(&store_root, ws_root);
 
-        let candidates =
-            discover_pending_candidates(&store).expect("discovery reads the store root");
-        std::fs::remove_dir_all(&store_root).ok();
-        std::fs::remove_dir_all(ws_root).ok();
-
-        assert_eq!(candidates.len(), 1);
-        assert!(output.text.contains("approval-1"));
-        assert!(output.text.contains("session-1"));
-        assert!(output.text.contains("1 offene"));
+        assert!(output.text.contains("2 offene"));
+        assert!(!output.text.contains("stale"));
+        let data = output.data.expect("structured payload");
+        let pending = data["pending"].as_array().expect("pending array");
+        let requests: Vec<&str> = pending
+            .iter()
+            .filter_map(|record| record["request"].as_str())
+            .collect();
+        assert_eq!(requests, vec!["earlier", "later"]);
+        assert_eq!(pending[0]["session"], serde_json::json!("session-2"));
+        assert_eq!(
+            pending[0]["actor"],
+            serde_json::json!({"kind": "operator", "id": "owner"})
+        );
     }
 
     #[tokio::test]
-    async fn approval_resolve_without_approval_store_returns_not_available() {
-        let (ctx, root) = test_context(None, None, None);
-        let args = ApprovalResolveArgs {
-            session: SessionId::from_str("session-1"),
-            request: ItemId::from_str("approval-1"),
-            decision: ReviewDecision::Approved,
-            comment: None,
-            resolved_at: Timestamp::constant(1, 0),
-        };
-        let result = approval_resolve(&ctx, args).await;
+    async fn test_approval_resolve_without_approval_store_returns_not_available() {
+        let (ctx, root) = test_context(Services::default());
+        let result = approval_resolve(&ctx, approve_args("approval-1")).await;
         std::fs::remove_dir_all(root).ok();
         assert!(matches!(result, Err(OpError::NotAvailable(_))));
     }
 
-    /// Der gemeldete Befund dieses Knotens: ohne einen `PeerCredentials`-
-    /// Service im `OpContext` kann `approval_resolve` den Aufrufer nicht
-    /// identifizieren — sie erfindet keinen Ersatz-Actor, sondern meldet
-    /// `NotAvailable` mit einer Nachricht, die genau das benennt.
+    /// Ohne Principal-Service gibt es keinen Actor — abgelehnt, Speicher
+    /// unberührt, auch wenn Peer und Resolver vorhanden sind.
     #[tokio::test]
-    async fn approval_resolve_without_peer_credentials_reports_the_missing_wiring() {
-        let store_root = unique_root("harw-ops-approval-no-peer-store");
+    async fn test_approval_resolve_without_principal_is_rejected() {
+        let store_root = unique_root("harw-ops-approval-no-principal");
         let store = Arc::new(ApprovalStore::new(&store_root));
-        issue_pending(&store, "session-1", "approval-1", "alice");
-        let resolver = resolver_for(vec![(1000, "alice".to_owned())]);
-        let (ctx, ws_root) = test_context(Some(store), Some(resolver), None);
+        issue_pending(&store, "session-1", "approval-1", issued_at());
+        let mut services = web_services(&store, at_offset(SignedDuration::from_mins(1)));
+        services.principal = None;
+        let (ctx, ws_root) = test_context(services);
 
-        let args = ApprovalResolveArgs {
-            session: SessionId::from_str("session-1"),
-            request: ItemId::from_str("approval-1"),
-            decision: ReviewDecision::Approved,
-            comment: None,
-            resolved_at: Timestamp::constant(1, 0),
-        };
-        let result = approval_resolve(&ctx, args).await;
-        std::fs::remove_dir_all(&store_root).ok();
-        std::fs::remove_dir_all(ws_root).ok();
+        let result = approval_resolve(&ctx, approve_args("approval-1")).await;
+        let resolution = store
+            .resolution(&SessionId::from_str("session-1"), &ItemId::from_str("approval-1"))
+            .expect("readable");
+        cleanup(&store_root, ws_root);
+
+        match result {
+            Err(OpError::NotAvailable(message)) => assert!(message.contains("kein Principal")),
+            other => panic!("expected NotAvailable(kein Principal), got: {other:?}"),
+        }
+        assert_eq!(resolution, None);
+    }
+
+    /// Ein Principal ohne `actor_id()` (Kind-Agent) wird abgelehnt.
+    #[tokio::test]
+    async fn test_approval_resolve_principal_without_actor_is_rejected() {
+        let store_root = unique_root("harw-ops-approval-child-principal");
+        let store = Arc::new(ApprovalStore::new(&store_root));
+        issue_pending(&store, "session-1", "approval-1", issued_at());
+        let mut services = web_services(&store, at_offset(SignedDuration::from_mins(1)));
+        services.principal = Some(web_principal().child_of("explorer"));
+        let (ctx, ws_root) = test_context(services);
+
+        let result = approval_resolve(&ctx, approve_args("approval-1")).await;
+        let resolution = store
+            .resolution(&SessionId::from_str("session-1"), &ItemId::from_str("approval-1"))
+            .expect("readable");
+        cleanup(&store_root, ws_root);
 
         match result {
             Err(OpError::NotAvailable(message)) => {
-                assert!(message.contains("Peer-Credentials"));
+                assert!(message.contains("darf keine Genehmigungsanfrage auflösen"));
             }
+            other => panic!("expected NotAvailable(no actor), got: {other:?}"),
+        }
+        assert_eq!(resolution, None);
+    }
+
+    /// Web-Principal ohne `PeerCredentials` — kein authentifizierter Peer.
+    #[tokio::test]
+    async fn test_approval_resolve_web_principal_without_peer_credentials_is_rejected() {
+        let store_root = unique_root("harw-ops-approval-no-peer-store");
+        let store = Arc::new(ApprovalStore::new(&store_root));
+        issue_pending(&store, "session-1", "approval-1", issued_at());
+        let mut services = web_services(&store, at_offset(SignedDuration::from_mins(1)));
+        services.peer = None;
+        let (ctx, ws_root) = test_context(services);
+
+        let result = approval_resolve(&ctx, approve_args("approval-1")).await;
+        cleanup(&store_root, ws_root);
+
+        match result {
+            Err(OpError::NotAvailable(message)) => assert!(message.contains("Peer-Credentials")),
             other => panic!("expected NotAvailable mentioning Peer-Credentials, got: {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn approval_resolve_rejects_a_peer_unknown_to_the_resolver() {
+    async fn test_approval_resolve_rejects_a_peer_unknown_to_the_resolver() {
         let store_root = unique_root("harw-ops-approval-unknown-peer-store");
         let store = Arc::new(ApprovalStore::new(&store_root));
-        issue_pending(&store, "session-1", "approval-1", "alice");
-        let resolver = resolver_for(vec![(1000, "alice".to_owned())]);
-        let (ctx, ws_root) = test_context(
-            Some(store),
-            Some(resolver),
-            Some(PeerCredentials::new(1, 9999, 9999)),
-        );
+        issue_pending(&store, "session-1", "approval-1", issued_at());
+        let mut services = web_services(&store, at_offset(SignedDuration::from_mins(1)));
+        services.peer = Some(PeerCredentials::new(1, 9999, 9999));
+        let (ctx, ws_root) = test_context(services);
 
-        let args = ApprovalResolveArgs {
-            session: SessionId::from_str("session-1"),
-            request: ItemId::from_str("approval-1"),
-            decision: ReviewDecision::Approved,
-            comment: None,
-            resolved_at: Timestamp::constant(1, 0),
-        };
-        let result = approval_resolve(&ctx, args).await;
-        std::fs::remove_dir_all(&store_root).ok();
-        std::fs::remove_dir_all(ws_root).ok();
+        let result = approval_resolve(&ctx, approve_args("approval-1")).await;
+        cleanup(&store_root, ws_root);
 
-        assert!(matches!(result, Err(OpError::NotAvailable(_))));
+        match result {
+            Err(OpError::NotAvailable(message)) => {
+                assert!(message.contains("keinem Genehmiger zugeordnet"));
+            }
+            other => panic!("expected NotAvailable(unknown approver), got: {other:?}"),
+        }
     }
 
-    /// Belegt zusätzlich zur Typsignatur (kein `actor`-Feld in
-    /// `ApprovalResolveArgs`), dass der tatsächlich verwendete Actor exakt
-    /// der aus den Peer-Credentials abgeleitete ist — keine autorisierte
-    /// Aktion entsteht dabei: nur der bereits durabel gespeicherte Zustand
-    /// wechselt von "pending" zu "resolved".
+    /// `resolved_at` stammt aus der injizierten Serveruhr; `data` trägt
+    /// `id`, `session`, `decision`, `resolved_at`, `actor`.
     #[tokio::test]
-    async fn approval_resolve_derives_the_actor_from_peer_credentials_and_resolves_once() {
+    async fn test_approval_resolve_uses_server_clock_and_returns_json_data() {
         let store_root = unique_root("harw-ops-approval-resolve-store");
         let store = Arc::new(ApprovalStore::new(&store_root));
-        issue_pending(&store, "session-1", "approval-1", "alice");
-        let resolver = resolver_for(vec![(1000, "alice".to_owned())]);
-        let (ctx, ws_root) = test_context(
-            Some(Arc::clone(&store)),
-            Some(resolver),
-            Some(PeerCredentials::new(1, 1000, 1000)),
-        );
+        issue_pending(&store, "session-1", "approval-1", issued_at());
+        let now = at_offset(SignedDuration::from_mins(7));
+        let (ctx, ws_root) = test_context(web_services(&store, now));
 
         let args = ApprovalResolveArgs {
-            session: SessionId::from_str("session-1"),
-            request: ItemId::from_str("approval-1"),
             decision: ReviewDecision::ApprovedOnce,
             comment: Some("bounded exception".to_owned()),
-            resolved_at: Timestamp::constant(2, 0),
+            ..approve_args("approval-1")
         };
         let output = approval_resolve(&ctx, args)
             .await
-            .expect("resolution succeeds for the known peer");
+            .expect("resolution succeeds for the confirmed web approver");
+        let durable = store
+            .resolution(&SessionId::from_str("session-1"), &ItemId::from_str("approval-1"))
+            .expect("readable")
+            .expect("durable resolution");
+        cleanup(&store_root, ws_root);
+
         assert!(output.text.contains("approval-1"));
         assert!(output.text.contains("ApprovedOnce"));
-        assert!(output.text.contains("alice"));
+        assert!(output.text.contains("owner"));
+        assert_eq!(durable.resolved_at, now);
 
-        // Nach der Auflösung ist die Anfrage nicht mehr "pending" — der
-        // Endpunkt ändert nur den bereits vorhandenen Zustand des Speichers.
-        let remaining = discover_pending_candidates(&store).expect("discovery still works");
-        std::fs::remove_dir_all(&store_root).ok();
-        std::fs::remove_dir_all(ws_root).ok();
-        assert!(remaining.is_empty());
+        let data = output.data.expect("structured payload");
+        let expected = serde_json::json!({
+            "id": "approval-1",
+            "session": "session-1",
+            "decision": "approved_once",
+            "resolved_at": serde_json::to_value(now).expect("timestamp serializes"),
+            "actor": {"kind": "operator", "id": "owner"},
+        });
+        assert_eq!(data, expected);
+    }
+
+    /// Abgelaufene Anfrage (Serveruhr ≥ `issued_at` + 30 min) → Fehler.
+    #[tokio::test]
+    async fn test_approval_resolve_expired_request_is_rejected() {
+        let store_root = unique_root("harw-ops-approval-expired-store");
+        let store = Arc::new(ApprovalStore::new(&store_root));
+        issue_pending(&store, "session-1", "approval-1", issued_at());
+        let (ctx, ws_root) =
+            test_context(web_services(&store, at_offset(SignedDuration::from_mins(30))));
+
+        let result = approval_resolve(&ctx, approve_args("approval-1")).await;
+        let resolution = store
+            .resolution(&SessionId::from_str("session-1"), &ItemId::from_str("approval-1"))
+            .expect("readable");
+        cleanup(&store_root, ws_root);
+
+        match result {
+            Err(OpError::InvalidArguments(message)) => assert!(message.contains("abgelaufen")),
+            other => panic!("expected InvalidArguments(abgelaufen), got: {other:?}"),
+        }
+        assert_eq!(resolution, None);
     }
 
     /// Eine zweite Bestätigung derselben Anfrage wird abgewiesen, nicht
     /// überschrieben.
     #[tokio::test]
-    async fn approval_resolve_rejects_a_second_confirmation_of_the_same_request() {
+    async fn test_approval_resolve_rejects_a_second_confirmation_of_the_same_request() {
         let store_root = unique_root("harw-ops-approval-twice-store");
         let store = Arc::new(ApprovalStore::new(&store_root));
-        issue_pending(&store, "session-1", "approval-1", "alice");
-        let resolver = resolver_for(vec![(1000, "alice".to_owned())]);
-        let peer = PeerCredentials::new(1, 1000, 1000);
+        issue_pending(&store, "session-1", "approval-1", issued_at());
+        let now = at_offset(SignedDuration::from_mins(1));
 
-        let (ctx_first, ws_root_first) =
-            test_context(Some(Arc::clone(&store)), Some(Arc::clone(&resolver)), Some(peer));
-        approval_resolve(
-            &ctx_first,
-            ApprovalResolveArgs {
-                session: SessionId::from_str("session-1"),
-                request: ItemId::from_str("approval-1"),
-                decision: ReviewDecision::Approved,
-                comment: None,
-                resolved_at: Timestamp::constant(3, 0),
-            },
-        )
-        .await
-        .expect("first resolution succeeds");
+        let (ctx_first, ws_root_first) = test_context(web_services(&store, now));
+        approval_resolve(&ctx_first, approve_args("approval-1"))
+            .await
+            .expect("first resolution succeeds");
 
-        let (ctx_second, ws_root_second) = test_context(Some(Arc::clone(&store)), Some(resolver), Some(peer));
+        let (ctx_second, ws_root_second) = test_context(web_services(&store, now));
         let replay = approval_resolve(
             &ctx_second,
             ApprovalResolveArgs {
-                session: SessionId::from_str("session-1"),
-                request: ItemId::from_str("approval-1"),
                 decision: ReviewDecision::Rejected,
-                comment: None,
-                resolved_at: Timestamp::constant(4, 0),
+                ..approve_args("approval-1")
             },
         )
         .await
         .unwrap_err();
 
-        std::fs::remove_dir_all(&store_root).ok();
         std::fs::remove_dir_all(ws_root_first).ok();
-        std::fs::remove_dir_all(ws_root_second).ok();
+        cleanup(&store_root, ws_root_second);
 
-        assert!(matches!(replay, OpError::InvalidArguments(message) if message.contains("bereits aufgelöst")));
+        match replay {
+            OpError::InvalidArguments(message) => assert!(message.contains("bereits aufgelöst")),
+            other => panic!("expected InvalidArguments(bereits aufgelöst), got: {other:?}"),
+        }
     }
 }

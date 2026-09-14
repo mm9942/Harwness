@@ -22,9 +22,11 @@
 //! Das Credential liegt in `secrecy::SecretString` und wird ausschließlich beim
 //! Setzen des Auth-Headers via `ExposeSecret` offengelegt — niemals geloggt.
 
+use harw_core::model::StopReason;
 use harw_core::{
     ModelError, ModelFuture, ModelProvider, ModelRequest, ModelResponse, ToolCallResult,
 };
+use harw_protocol::OpaqueReasoning;
 use harw_tools::{ToolCall, ToolName, ToolSpec};
 use harw_types::{TokenUsage, ToolCallId};
 use secrecy::{ExposeSecret, SecretString};
@@ -232,58 +234,6 @@ fn anthropic_custom_headers()
     }
 }
 
-/// Übersetzt das interne Reasoning-Effort-Level in den Anthropic-
-/// `output_config.effort`-Wire-Wert.
-///
-/// # Description
-/// Gibt `None` zurück für `Minimal` — Anthropic kennt kein eigenes
-/// "minimal"-Level in `output_config.effort`. `None` bedeutet: das Feld
-/// `output_config.effort` wird im Wire-Request **weggelassen**; Extended
-/// Thinking bleibt aber aktiv (`thinking: {"type": "adaptive"}`), sodass das
-/// Modell den Denkaufwand selbst wählt.
-/// `Low`/`Medium`/`High` liefern `Some("low"/"medium"/"high")`.
-/// `Xhigh`/`Max` sind Backlog — aktuell nicht im Enum vertreten (TODO 0.2.0).
-///
-/// # Returns
-/// `Some(level)` → Feld setzen; `None` → Feld weglassen.
-#[must_use]
-fn map_effort_to_anthropic(effort: harw_types::ReasoningEffort) -> Option<&'static str> {
-    match effort {
-        harw_types::ReasoningEffort::Minimal => None,
-        harw_types::ReasoningEffort::Low => Some("low"),
-        harw_types::ReasoningEffort::Medium => Some("medium"),
-        harw_types::ReasoningEffort::High => Some("high"),
-        harw_types::ReasoningEffort::Xhigh | harw_types::ReasoningEffort::Max => Some("high"),
-    }
-}
-
-/// Returns whether the selected Anthropic model declares support for adaptive
-/// thinking and the `output_config.effort` parameter.
-///
-/// This transport deliberately fails closed: deployment aliases and model IDs
-/// unknown to the embedded Anthropic declaration do not receive reasoning
-/// fields. `harw-provider-http` does not depend on `harw-model-catalog`, so
-/// this compact allow-list mirrors the catalog's Anthropic models whose
-/// `ReasoningSupport` is `Effort` without widening this crate's dependency
-/// boundary.
-#[must_use]
-fn supports_anthropic_adaptive_thinking(model: &str) -> bool {
-    matches!(
-        model,
-        "claude-fable-5"
-            | "claude-mythos-5"
-            | "claude-opus-4-8"
-            | "claude-sonnet-5"
-            | "claude-haiku-4-5-20251001"
-            | "claude-opus-4-7"
-            | "claude-opus-4-6"
-            | "claude-sonnet-4-6"
-            | "claude-sonnet-4-5-20250929"
-            | "claude-opus-4-5-20251101"
-            | "claude-opus-4-1-20250805"
-    )
-}
-
 /// Übersetzt die dem Modell angebotenen [`ToolSpec`]s in das Anthropic-
 /// Wire-Format des `tools`-Arrays: `{name, description, input_schema}`.
 ///
@@ -358,19 +308,31 @@ fn push_content_block(messages: &mut Vec<Value>, role: &str, block: Value) {
 /// (bestehendes Verhalten für Requests ohne Tools). Rein und I/O-frei, daher
 /// direkt testbar.
 ///
-/// Ist `request.reasoning_effort` `Some(effort)` **und** `model` als
-/// reasoning-fähig deklariert, werden zusätzlich zwei Top-Level-Felder
-/// gesetzt: `thinking: {"type": "adaptive"}` (aktiviert Extended Thinking im
-/// aktuellen Anthropic-Wire-Schema — NICHT das veraltete
-/// `{"type": "enabled", "budget_tokens": N}`-Schema) und `output_config:
-/// {"effort": <gemapptes Level>}` (siehe [`map_effort_to_anthropic`]). Für
-/// unbekannte oder als nicht reasoning-fähig deklarierte Modelle werden diese
-/// Felder auch bei angefordertem Effort weggelassen. Ist
-/// `request.reasoning_effort` `None`, bleiben beide Felder ebenfalls unset.
+/// Ist `request.reasoning_effort` `Some(effort)`, schlägt die Funktion das
+/// Modell in der Capability-Tabelle [`crate::anthropic_caps`] nach
+/// ([`anthropic_caps::lookup`]):
+/// - Akzeptiert das Modell `thinking: {"type": "adaptive"}`
+///   ([`anthropic_caps::ThinkingSupport::Adaptive`]), wird dieses Top-Level-
+///   Feld gesetzt (aktuelles Anthropic-Wire-Schema — NICHT das veraltete
+///   `{"type": "enabled", "budget_tokens": N}`-Schema, das der Harness mangels
+///   ableitbarem Token-Budget nicht sendet).
+/// - Liefert [`anthropic_caps::effort_wire_value`] für dieses Modell einen
+///   Wert, wird zusätzlich `output_config: {"effort": <Wert>}` gesetzt — das
+///   ist unabhängig vom `thinking`-Feld möglich (manche Modelle akzeptieren
+///   `effort` ohne `adaptive`-Thinking).
+/// - Unbekannte Modelle (`lookup` liefert `None`) und Modelle ohne die
+///   jeweilige Fähigkeit bekommen das betreffende Feld gar nicht (fail
+///   closed — ein falsches `thinking`- oder `effort`-Feld erzeugt HTTP 400).
+///
+/// Ist `request.reasoning_effort` `None`, bleiben beide Felder unset.
+///
+/// `max_tokens` wird über [`anthropic_caps::clamp_max_tokens`] auf das
+/// Ausgabe-Limit des Modells geklemmt, bevor es auf `body["max_tokens"]`
+/// landet; für unbekannte Modelle bleibt der angeforderte Wert unverändert.
 ///
 /// # Arguments
 /// - `model` (`&str`): Modell-/Deployment-Name für das `model`-Feld.
-/// - `max_tokens` (`u32`): Ausgabe-Token-Obergrenze.
+/// - `max_tokens` (`u32`): gewünschte Ausgabe-Token-Obergrenze (vor Clamping).
 /// - `request` (`&ModelRequest`): Quelle für System-Prompt, Fragmente,
 ///   Verlauf, Tools und optionales `reasoning_effort`.
 ///
@@ -427,6 +389,7 @@ pub fn build_messages_body(model: &str, max_tokens: u32, request: &ModelRequest)
         }
     }
 
+    let max_tokens = crate::anthropic_caps::clamp_max_tokens(model, max_tokens);
     let mut body = serde_json::json!({
         "model": model,
         "max_tokens": max_tokens,
@@ -439,14 +402,19 @@ pub fn build_messages_body(model: &str, max_tokens: u32, request: &ModelRequest)
         body["tools"] = Value::Array(build_anthropic_tools(&request.tools));
     }
     if let Some(effort) = request.reasoning_effort
-        && supports_anthropic_adaptive_thinking(model)
+        && let Some(caps) = crate::anthropic_caps::lookup(model)
     {
-        body["thinking"] = serde_json::json!({"type": "adaptive"});
-        if let Some(level) = map_effort_to_anthropic(effort) {
+        if caps.thinking == crate::anthropic_caps::ThinkingSupport::Adaptive {
+            body["thinking"] = serde_json::json!({"type": "adaptive"});
+        }
+        // Minimal → thinking (falls gesetzt) bleibt aktiv, aber
+        // output_config.effort wird weggelassen; das Modell wählt den
+        // Denkaufwand selbst. effort_wire_value liefert dafür bereits `None`.
+        if let Some(level) = crate::anthropic_caps::effort_wire_value(caps, effort) {
             body["output_config"] = serde_json::json!({"effort": level});
         }
-        // Minimal → thinking stays active but output_config.effort is omitted;
-        // the model auto-selects thinking budget.
+        // Unbekannte Modelle (lookup == None) bekommen weder thinking noch
+        // output_config — fail closed, siehe Modul-Doku von anthropic_caps.
     }
     body
 }
@@ -592,6 +560,77 @@ pub fn extract_anthropic_usage(body: &Value) -> TokenUsage {
     }
 }
 
+/// Übersetzt Anthropics Top-Level-`stop_reason` in [`StopReason`].
+///
+/// # Description
+/// Liest `body.stop_reason` (String) einer nicht-gestreamten
+/// Messages-Antwort und mappt sie auf die provider-neutrale Variante.
+/// Ein fehlender oder unbekannter Wert wird nicht verworfen: bekannte
+/// Anthropic-Werte werden 1:1 gemappt, ein unbekannter String landet in
+/// [`StopReason::Other`], und ein komplett fehlendes Feld fällt auf
+/// [`StopReason::EndTurn`] zurück (Default-Verhalten bei regulärer Antwort).
+///
+/// # Arguments
+/// - `body` (`&Value`): der bereits geparste JSON-Response-Body.
+///
+/// # Returns
+/// Die gemappte [`StopReason`].
+#[must_use]
+pub fn extract_anthropic_stop_reason(body: &Value) -> StopReason {
+    match body.get("stop_reason").and_then(Value::as_str) {
+        Some("end_turn") => StopReason::EndTurn,
+        Some("tool_use") => StopReason::ToolUse,
+        Some("max_tokens") => StopReason::MaxTokens,
+        Some("stop_sequence") => StopReason::StopSequence,
+        Some("pause_turn") => StopReason::PauseTurn,
+        Some("refusal") => StopReason::Refusal { detail: None },
+        Some(other) => StopReason::Other(other.to_owned()),
+        None => StopReason::EndTurn,
+    }
+}
+
+/// Extrahiert opake Denkblöcke (`thinking`/`redacted_thinking`) aus einer
+/// nicht-gestreamten Messages-Antwort (G-015).
+///
+/// # Description
+/// Sammelt alle `content[]`-Blöcke vom Typ `thinking` oder
+/// `redacted_thinking` unverändert (als rohe `serde_json::Value`) in
+/// Aufrufreihenfolge, damit sie im nächsten Tool-Loop-Turn byte-identisch
+/// zurückgespielt werden können.
+///
+/// # Arguments
+/// - `body` (`&Value`): der bereits geparste JSON-Response-Body.
+/// - `model` (`&str`): die für den Request verwendete Modell-ID, zur
+///   Provenance-Markierung im zurückgegebenen [`OpaqueReasoning`].
+///
+/// # Returns
+/// `Some(OpaqueReasoning)` mit `provider: "anthropic"`, wenn mindestens ein
+/// Denkblock vorhanden ist; sonst `None` (kein Extended Thinking in der
+/// Antwort).
+#[must_use]
+pub fn extract_anthropic_reasoning(body: &Value, model: &str) -> Option<OpaqueReasoning> {
+    let content = body.get("content")?.as_array()?;
+    let blocks: Vec<Value> = content
+        .iter()
+        .filter(|block| {
+            matches!(
+                block.get("type").and_then(Value::as_str),
+                Some("thinking") | Some("redacted_thinking")
+            )
+        })
+        .cloned()
+        .collect();
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(OpaqueReasoning {
+            provider: "anthropic".to_owned(),
+            model: model.to_owned(),
+            blocks,
+        })
+    }
+}
+
 /// Setzt die Auth-Header des Credentials; alle Credential-Werte sind als
 /// sensitiv markiert (`x-api-key` und OAuth-`authorization` über
 /// [`super::sensitive_header_value`], `bearer_auth` in reqwest selbst).
@@ -699,6 +738,8 @@ impl ModelProvider for AnthropicMessagesProvider {
                 message: text,
                 tool_calls,
                 usage: extract_anthropic_usage(&value),
+                stop: extract_anthropic_stop_reason(&value),
+                reasoning: extract_anthropic_reasoning(&value, model),
             })
         })
     }
@@ -719,6 +760,9 @@ mod tests {
             reasoning_effort: None,
             model_id: model_id.map(Into::into),
             provider_id: provider_id.map(Into::into),
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         }
     }
 
@@ -861,6 +905,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
 
         let body = build_messages_body("claude-sonnet-5", 1024, &request);
@@ -902,6 +949,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
         let body = build_messages_body("m", 256, &request);
         assert!(body.get("system").is_none());
@@ -921,6 +971,9 @@ mod tests {
             reasoning_effort: Some(harw_types::ReasoningEffort::High),
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
 
         let body = build_messages_body("claude-opus-4-8", 1024, &request);
@@ -942,6 +995,9 @@ mod tests {
             reasoning_effort: Some(harw_types::ReasoningEffort::High),
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
 
         let body = build_messages_body("anthropic-deployment-alias", 1024, &request);
@@ -964,6 +1020,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
 
         let body = build_messages_body("claude-opus-4-8", 1024, &request);
@@ -971,25 +1030,75 @@ mod tests {
         assert!(body.get("output_config").is_none());
     }
 
+    /// Baut eine [`ModelRequest`] mit gegebenem `reasoning_effort`, sonst
+    /// minimalem Inhalt — Hilfsfunktion für die Capability-Wiring-Tests unten.
+    fn request_with_effort(effort: Option<harw_types::ReasoningEffort>) -> ModelRequest {
+        let mut history = harw_core::ConversationHistory::new();
+        history.push_user_text("hi");
+        ModelRequest {
+            system_prompt: String::new(),
+            instruction_fragments: Vec::new(),
+            context: Vec::new(),
+            history,
+            tools: Vec::new(),
+            context_assembly: Default::default(),
+            reasoning_effort: effort,
+            model_id: None,
+            provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
+        }
+    }
+
     #[test]
-    fn test_map_effort_to_anthropic_all_variants() {
-        // Minimal → None (omit output_config.effort on wire; model auto-selects)
-        assert_eq!(
-            map_effort_to_anthropic(harw_types::ReasoningEffort::Minimal),
-            None
-        );
-        assert_eq!(
-            map_effort_to_anthropic(harw_types::ReasoningEffort::Low),
-            Some("low")
-        );
-        assert_eq!(
-            map_effort_to_anthropic(harw_types::ReasoningEffort::Medium),
-            Some("medium")
-        );
-        assert_eq!(
-            map_effort_to_anthropic(harw_types::ReasoningEffort::High),
-            Some("high")
-        );
+    fn test_build_messages_body_known_model_with_thinking_gets_field_and_clamped_max_tokens() {
+        let request = request_with_effort(Some(harw_types::ReasoningEffort::High));
+
+        // claude-opus-5 unterstützt adaptive thinking + effort und erlaubt
+        // höchstens 128k Ausgabe-Tokens (siehe anthropic_caps::MODELS).
+        let body = build_messages_body("claude-opus-5", 500_000, &request);
+
+        assert_eq!(body["thinking"]["type"].as_str(), Some("adaptive"));
+        assert_eq!(body["output_config"]["effort"].as_str(), Some("high"));
+        assert_eq!(body.get("max_tokens").and_then(Value::as_u64), Some(128_000));
+    }
+
+    #[test]
+    fn test_build_messages_body_model_without_thinking_support_omits_thinking_field() {
+        let request = request_with_effort(Some(harw_types::ReasoningEffort::High));
+
+        // claude-sonnet-4-5-20250929 kennt nur den Legacy-Modus (ExtendedOnly)
+        // und akzeptiert `output_config.effort` gar nicht (caps.effort == false).
+        let body = build_messages_body("claude-sonnet-4-5-20250929", 1024, &request);
+
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn test_build_messages_body_extended_only_model_can_still_get_effort_without_thinking() {
+        let request = request_with_effort(Some(harw_types::ReasoningEffort::High));
+
+        // claude-opus-4-5-20251101 ist ExtendedOnly (kein adaptive-thinking),
+        // akzeptiert laut Tabelle aber `output_config.effort` unabhängig davon.
+        let body = build_messages_body("claude-opus-4-5-20251101", 1024, &request);
+
+        assert!(body.get("thinking").is_none());
+        assert_eq!(body["output_config"]["effort"].as_str(), Some("high"));
+    }
+
+    #[test]
+    fn test_build_messages_body_unknown_model_uses_conservative_fallback() {
+        let request = request_with_effort(Some(harw_types::ReasoningEffort::High));
+
+        let body = build_messages_body("totally-unknown-deployment", 900_000, &request);
+
+        // Fail closed: keine Reasoning-Felder für unbekannte Modelle.
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
+        // Kein Modell-Limit bekannt → max_tokens bleibt unangetastet.
+        assert_eq!(body.get("max_tokens").and_then(Value::as_u64), Some(900_000));
     }
 
     #[test]
@@ -1062,6 +1171,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
 
         let body = build_messages_body("claude-sonnet-5", 256, &request);
@@ -1101,6 +1213,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
         let body = build_messages_body("m", 256, &request);
         assert!(body.get("tools").is_none());
@@ -1124,6 +1239,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
         let body = build_messages_body("m", 256, &request);
         let messages = body
@@ -1175,6 +1293,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
         let body = build_messages_body("m", 256, &request);
         let messages = body
@@ -1218,6 +1339,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
         let body = build_messages_body("m", 256, &request);
         let messages = body
@@ -1271,6 +1395,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
         let body = build_messages_body("m", 256, &request);
         let messages = body
@@ -1359,6 +1486,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
         let body = build_messages_body("m", 256, &request);
         let messages = body
@@ -1395,6 +1525,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
         let body = build_messages_body("m", 256, &request);
         let messages = body

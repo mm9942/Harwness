@@ -10,7 +10,7 @@
 //!
 //! Die zusätzlichen, sensorspezifischen Prüfungen aus dem Arbeitsauftrag
 //! (Spaltenzuordnung aus der Zeilenmitte, Robustheit gegen siebzehn Felder,
-//! Geräte- und Partitionsfilterung, kein Zeileninhalt in der Fehlermeldung,
+//! Rauschgeräte-Filterung, kein Zeileninhalt in der Fehlermeldung,
 //! Determinismus) leben als `#[cfg(test)]`-Unit-Tests direkt bei der
 //! privaten Logik in `src/sensor.rs`, weil sie diese isoliert und teils ohne
 //! Dateisystem-Umweg prüfen; diese Datei bindet nur die Harness ein.

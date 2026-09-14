@@ -12,28 +12,31 @@
 //!
 //! # Design
 //! Backed by [`harw_core::activation::SessionActivation`] which the caller holds
-//! as `&mut`. The [`harw_extension_api::ExtensionRegistry`] is read-only — only
-//! the activation state is mutated. Spec source: harw-tui design, tools-command
-//! section.
+//! as `&mut`, never letting it exceed a session ceiling (base ∩ mode) passed in
+//! alongside it. Tool listings and toggle validation work off a pre-collected
+//! `(name, enabled)` snapshot rather than a live
+//! [`harw_extension_api::ExtensionRegistry`] borrow — the TUI run-loop cannot
+//! hold both a shared registry borrow and a mutable activation borrow at once.
+//! Spec source: harw-tui design, tools-command section.
 //!
 //! # Concurrency
 //! Pure synchronous function; no locking. The caller (TUI run-loop) owns both
-//! `registry` and `activation` exclusively while this runs.
+//! the tool snapshot and `activation` exclusively while this runs.
 //!
 //! # Examples
 //! ```rust,no_run
-//! use harw_tui::tools_command::{handle_tools_command, ToolsCommandOutcome};
+//! use harw_tui::tools_command::{dispatch_tools_command_bounded, ToolsCommandOutcome};
 //! use harw_core::activation::{SessionActivation, ToolProfile};
-//! use harw_extension_api::registry::empty_extension_registry;
 //!
-//! let registry = empty_extension_registry();
+//! let snapshot: Vec<(String, bool)> = Vec::new();
 //! let mut activation = SessionActivation::new(ToolProfile::Full);
-//! let outcome = handle_tools_command("", &registry, &mut activation);
+//! let ceiling = SessionActivation::new(ToolProfile::Full);
+//! let outcome = dispatch_tools_command_bounded("", &snapshot, &mut activation, &ceiling);
 //! assert!(matches!(outcome, ToolsCommandOutcome::Listing(_)));
 //! ```
 
 use harw_core::activation::{SessionActivation, ToolProfile};
-use harw_extension_api::{ExtensionRegistry, ToolName};
+use harw_extension_api::ToolName;
 
 // ---------------------------------------------------------------------------
 // Public outcome type
@@ -87,83 +90,6 @@ impl ToolsCommandOutcome {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Parses the arg-string of a `/tools` command and dispatches to the
-/// appropriate sub-handler, mutating `activation` in place for
-/// state-changing sub-commands.
-///
-/// # Description
-/// `args` is everything after `/tools` (i.e. the remainder of the input
-/// line, already stripped of the leading `/tools` token). The function
-/// trims whitespace and splits on ASCII whitespace to identify the
-/// sub-command and any trailing argument.
-///
-/// Evaluation table:
-///
-/// | `args` (trimmed)         | Sub-command      |
-/// |--------------------------|------------------|
-/// | `""`                     | list all tools   |
-/// | `"on <name>"`            | enable tool      |
-/// | `"off <name>"`           | disable tool     |
-/// | `"reset"`                | reset all        |
-/// | `"reset <name>"`         | reset one tool   |
-/// | `"profile <p>"`          | switch profile   |
-/// | anything else            | usage error      |
-///
-/// # Arguments
-/// - `args` (`&str`): the raw arg string after `/tools`, may be empty.
-/// - `registry` (`&ExtensionRegistry`): read-only view of all registered
-///   tool providers; used only for listing.
-/// - `activation` (`&mut SessionActivation`): current session activation
-///   state; mutated by `on`, `off`, `reset`, and `profile` sub-commands.
-///
-/// # Returns
-/// A [`ToolsCommandOutcome`] describing what happened.
-///
-/// # Examples
-/// ```rust,no_run
-/// use harw_tui::tools_command::{handle_tools_command, ToolsCommandOutcome};
-/// use harw_core::activation::{SessionActivation, ToolProfile};
-/// use harw_extension_api::registry::empty_extension_registry;
-///
-/// let registry = empty_extension_registry();
-/// let mut activation = SessionActivation::new(ToolProfile::Coding);
-///
-/// // List tools
-/// let out = handle_tools_command("", &registry, &mut activation);
-/// assert!(matches!(out, ToolsCommandOutcome::Listing(_)));
-///
-/// // Switch profile
-/// let out = handle_tools_command("profile minimal", &registry, &mut activation);
-/// assert_eq!(out, ToolsCommandOutcome::Confirmation("profile set to minimal".to_string()));
-/// assert_eq!(activation.profile(), ToolProfile::Minimal);
-/// ```
-pub fn handle_tools_command(
-    args: &str,
-    registry: &ExtensionRegistry,
-    activation: &mut SessionActivation,
-) -> ToolsCommandOutcome {
-    let trimmed = args.trim();
-    let parts: Vec<&str> = if trimmed.is_empty() {
-        Vec::new()
-    } else {
-        trimmed.split_whitespace().collect()
-    };
-
-    match parts.as_slice() {
-        [] => list_tools(registry, activation),
-        ["on", name] => set_tool(activation, name, true),
-        ["off", name] => set_tool(activation, name, false),
-        ["reset"] => reset_all(activation),
-        ["reset", name] => reset_one(activation, name),
-        ["profile", p] => set_profile(activation, p),
-        _ => ToolsCommandOutcome::Error(
-            "usage: /tools | /tools on <name> | /tools off <name> \
-             | /tools reset [<name>] | /tools profile <minimal|coding|full>"
-                .to_string(),
-        ),
-    }
-}
-
 /// Dispatches a `/tools` command using pre-collected tool state, avoiding
 /// split-borrow conflicts in the TUI run-loop.
 ///
@@ -183,10 +109,13 @@ pub fn handle_tools_command(
 ///
 /// Entfernt W2d-2/CE (E8): der frühere unbegrenzte `dispatch_tools_command`
 /// (ohne Deckenprüfung) hatte in `tools_command.rs` keine eigenen Tests und
-/// wurde ersatzlos gestrichen — jeder Aufrufer verwendet ab jetzt diese
-/// begrenzte Variante. Die Sub-Handler `list_from_snapshot`, `set_tool`,
-/// `reset_all`, `reset_one` und `set_profile` bleiben bestehen, da
-/// [`handle_tools_command`] und diese Funktion sie weiterhin nutzen.
+/// wurde ersatzlos gestrichen. Entfernt W2d-2/F-TOOLS (Befund R6): der
+/// ebenfalls unbegrenzte `handle_tools_command` (kein Prod-Aufrufer im
+/// Workspace) ist aus demselben Grund gestrichen — jeder Aufrufer verwendet
+/// ab jetzt diese begrenzte Variante. Von den früheren Sub-Handlern bleibt
+/// nur `set_tool` bestehen (gemeinsam mit `bounded_set_tool` genutzt);
+/// `list_tools`, `reset_all`, `reset_one` und `set_profile` sind mit
+/// `handle_tools_command` entfallen.
 ///
 /// # Description
 /// `ceiling` is the session's tool ceiling: base activation ∩ mode activation
@@ -263,41 +192,6 @@ pub fn dispatch_tools_command_bounded(
 // ---------------------------------------------------------------------------
 // Sub-handlers (private)
 // ---------------------------------------------------------------------------
-
-/// Lists all registered tools with their current on/off state.
-///
-/// # Description
-/// Iterates over every [`ToolProvider`] in `registry`, calls `.tools()` on
-/// each, extracts the tool name from the [`ToolSpec`], and checks
-/// `activation.is_tool_enabled` to format the status marker. A profile
-/// header line is always prepended.
-///
-/// # Returns
-/// [`ToolsCommandOutcome::Listing`] with one entry per tool (plus header).
-fn list_tools(registry: &ExtensionRegistry, activation: &SessionActivation) -> ToolsCommandOutcome {
-    let mut lines = Vec::new();
-    lines.push(format!("profile: {:?}", activation.profile()));
-
-    let mut any = false;
-    for provider in registry.tool_providers() {
-        for spec in provider.tools() {
-            any = true;
-            let name = spec.name();
-            let mark = if activation.is_tool_enabled(&ToolName::new(name)) {
-                "on "
-            } else {
-                "off"
-            };
-            lines.push(format!("  [{}] {}", mark, name));
-        }
-    }
-
-    if !any {
-        lines.push("  (no tools registered)".to_string());
-    }
-
-    ToolsCommandOutcome::Listing(lines)
-}
 
 /// Lists tools from a pre-collected `(name, enabled)` snapshot.
 ///
@@ -392,9 +286,10 @@ fn bounded_set_tool(
 /// Resets the whole activation to the session ceiling (Befund T2).
 ///
 /// # Description
-/// Replaces `activation` with a copy of `ceiling` (base ∩ mode). Unlike
-/// [`reset_all`], this never widens beyond the ceiling: a fresh activation of
-/// the current profile could re-enable tools the base or mode forbids.
+/// Replaces `activation` with a copy of `ceiling` (base ∩ mode). Unlike a
+/// plain reset to a fresh activation of the current profile, this never
+/// widens beyond the ceiling: a fresh activation of the current profile could
+/// re-enable tools the base or mode forbids.
 ///
 /// # Arguments
 /// - `activation` — session activation to replace in-place.
@@ -445,7 +340,7 @@ fn bounded_reset_one(
 /// to the session ceiling (Befunde T3/T7).
 ///
 /// # Description
-/// Parses `p` exactly like [`set_profile`]. On success, applies the profile
+/// Parses `p` case-insensitively into a [`ToolProfile`] variant. On success, applies the profile
 /// to a copy of `activation`, stores `requested.intersect(ceiling)`
 /// ([`SessionActivation::intersect`]) back into `activation`, and reports the
 /// effective result: when no registered tool (from `known_tools`) and no name
@@ -511,67 +406,6 @@ fn bounded_set_profile(
     }
 }
 
-/// Resets all per-tool overrides by replacing the activation with a fresh
-/// one that has the same profile.
-///
-/// # Description
-/// Constructs a new [`SessionActivation`] from the current profile, which
-/// clears all `tools_disabled` and `tools_enabled_extra` entries. Also
-/// clears instruction and context overrides (they were empty per-tool-only
-/// use). For a full reset the profile itself is preserved.
-///
-/// # Arguments
-/// - `activation` — session activation to replace in-place.
-fn reset_all(activation: &mut SessionActivation) -> ToolsCommandOutcome {
-    let profile = activation.profile();
-    *activation = SessionActivation::new(profile);
-    ToolsCommandOutcome::Confirmation("reset all tool overrides".to_string())
-}
-
-/// Resets overrides for a single named tool.
-///
-/// # Description
-/// Calls [`SessionActivation::reset_tool`] for the named tool. After the
-/// call the tool reverts to profile-only evaluation.
-///
-/// # Arguments
-/// - `activation` — session activation to mutate.
-/// - `name` — raw tool-name string from the command line.
-fn reset_one(activation: &mut SessionActivation, name: &str) -> ToolsCommandOutcome {
-    activation.reset_tool(&ToolName::new(name.to_string()));
-    ToolsCommandOutcome::Confirmation(format!("reset {name}"))
-}
-
-/// Switches the active tool profile.
-///
-/// # Description
-/// Parses `p` (case-insensitive) into a [`ToolProfile`] variant and calls
-/// [`SessionActivation::set_profile`]. Per-tool overrides that were set
-/// before the profile change are preserved — they are re-evaluated against
-/// the new profile on the next [`SessionActivation::is_tool_enabled`] call.
-///
-/// # Arguments
-/// - `activation` — session activation to mutate.
-/// - `p` — profile name: `"minimal"`, `"coding"`, or `"full"`.
-///
-/// # Errors
-/// Returns [`ToolsCommandOutcome::Error`] when `p` does not match any known
-/// profile name.
-fn set_profile(activation: &mut SessionActivation, p: &str) -> ToolsCommandOutcome {
-    let profile = match p.to_ascii_lowercase().as_str() {
-        "minimal" => ToolProfile::Minimal,
-        "coding" => ToolProfile::Coding,
-        "full" => ToolProfile::Full,
-        other => {
-            return ToolsCommandOutcome::Error(format!(
-                "unknown profile '{other}' — choose: minimal, coding, full"
-            ));
-        }
-    };
-    activation.set_profile(profile);
-    ToolsCommandOutcome::Confirmation(format!("profile set to {p}"))
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -579,54 +413,6 @@ fn set_profile(activation: &mut SessionActivation, p: &str) -> ToolsCommandOutco
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harw_extension_api::contributors::ToolProvider;
-    use harw_extension_api::registry::ExtensionRegistryBuilder;
-    use harw_extension_api::{ToolExecutor, ToolName, ToolSpec};
-    // `harw_tools` is a [dev-dependencies] entry added specifically for tests;
-    // it is not a production dependency of harw-tui.
-    use harw_tools::{FunctionToolSpec, JsonSchema};
-    use std::sync::Arc;
-
-    // ── Minimal in-test ToolProvider ─────────────────────────────────────────
-
-    /// Fake provider with two tools: `"test.alpha"` and `"test.beta"`.
-    ///
-    /// Used to exercise the listing and toggle sub-commands without depending
-    /// on any real filesystem or shell provider.
-    struct FakeToolProvider;
-
-    /// Constructs a `ToolSpec::Function` for the given tool name with an empty
-    /// parameter schema — sufficient for listing and activation tests.
-    fn make_tool_spec(name: &str) -> ToolSpec {
-        ToolSpec::Function(FunctionToolSpec {
-            name: ToolName::new(name),
-            description: format!("{name} description"),
-            parameters: JsonSchema::default(),
-            strict: false,
-        })
-    }
-
-    impl ToolProvider for FakeToolProvider {
-        fn tools(&self) -> Vec<ToolSpec> {
-            vec![make_tool_spec("test.alpha"), make_tool_spec("test.beta")]
-        }
-
-        fn executor(&self, _name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
-            None
-        }
-    }
-
-    /// Builds a registry containing the two fake tools.
-    fn registry_with_tools() -> ExtensionRegistry {
-        ExtensionRegistryBuilder::default()
-            .tool_provider(Arc::new(FakeToolProvider))
-            .build()
-    }
-
-    /// Builds an empty registry (no tool providers).
-    fn empty_registry() -> ExtensionRegistry {
-        ExtensionRegistryBuilder::default().build()
-    }
 
     fn full_activation() -> SessionActivation {
         SessionActivation::new(ToolProfile::Full)
@@ -659,12 +445,17 @@ mod tests {
     // ── Tests ─────────────────────────────────────────────────────────────────
 
     /// `/tools` with no registered tools yields the profile line + "(no tools registered)".
+    ///
+    /// Migrated from the removed `handle_tools_command` (W2d-2/F-TOOLS, R6):
+    /// same output contract, driven through `dispatch_tools_command_bounded`
+    /// with an empty snapshot instead of a registry.
     #[test]
-    fn list_returns_profile_line_when_no_tools() {
-        let registry = empty_registry();
+    fn test_dispatch_tools_command_bounded_list_returns_profile_line_when_no_tools() {
+        let known: Vec<(String, bool)> = Vec::new();
+        let ceiling = full_activation();
         let mut activation = full_activation();
 
-        let outcome = handle_tools_command("", &registry, &mut activation);
+        let outcome = dispatch_tools_command_bounded("", &known, &mut activation, &ceiling);
 
         let ToolsCommandOutcome::Listing(lines) = outcome else {
             panic!("expected Listing");
@@ -680,41 +471,46 @@ mod tests {
         );
     }
 
-    /// `/tools` with two registered tools lists both with on/off status markers.
+    /// `/tools` with two known tools lists both with on/off status markers
+    /// taken directly from the snapshot.
+    ///
+    /// Migrated from the removed `handle_tools_command` (W2d-2/F-TOOLS, R6).
     #[test]
-    fn list_shows_registered_tools_with_status() {
-        let registry = registry_with_tools();
+    fn test_dispatch_tools_command_bounded_list_shows_known_tools_with_snapshot_status() {
+        let known = both_known(); // test.alpha=true, test.beta=false
+        let ceiling = full_activation();
         let mut activation = full_activation();
 
-        let outcome = handle_tools_command("", &registry, &mut activation);
+        let outcome = dispatch_tools_command_bounded("", &known, &mut activation, &ceiling);
 
         let ToolsCommandOutcome::Listing(lines) = outcome else {
             panic!("expected Listing");
         };
         assert!(
-            lines.iter().any(|l| l.contains("test.alpha")),
-            "alpha should appear"
+            lines.iter().any(|l| l.contains("[on ]") && l.contains("test.alpha")),
+            "alpha is enabled in the snapshot, so it should show as on"
         );
         assert!(
-            lines.iter().any(|l| l.contains("test.beta")),
-            "beta should appear"
-        );
-        // Full profile → both tools enabled
-        assert!(
-            lines.iter().filter(|l| l.contains("[on ]")).count() == 2,
-            "both tools should be on under Full profile"
+            lines.iter().any(|l| l.contains("[off]") && l.contains("test.beta")),
+            "beta is disabled in the snapshot, so it should show as off"
         );
     }
 
-    /// `/tools on <name>` enables a tool that was disabled.
+    /// `/tools on <name>` enables a tool that was disabled, when the ceiling
+    /// allows it — the removed `handle_tools_command` had no ceiling, so this
+    /// case (unlike `off`, already covered by
+    /// `test_dispatch_tools_command_bounded_disable_known_tool_applies`) had
+    /// no bounded-path equivalent yet.
     #[test]
-    fn on_enables_disabled_tool() {
-        let registry = registry_with_tools();
+    fn test_dispatch_tools_command_bounded_on_enables_disabled_tool_within_ceiling() {
+        let known = both_known();
+        let ceiling = full_activation();
         let mut activation = full_activation();
         activation.disable_tool(ToolName::new("test.alpha"));
         assert!(!activation.is_tool_enabled(&ToolName::new("test.alpha")));
 
-        let outcome = handle_tools_command("on test.alpha", &registry, &mut activation);
+        let outcome =
+            dispatch_tools_command_bounded("on test.alpha", &known, &mut activation, &ceiling);
 
         assert_eq!(
             outcome,
@@ -723,103 +519,83 @@ mod tests {
         assert!(activation.is_tool_enabled(&ToolName::new("test.alpha")));
     }
 
-    /// `/tools off <name>` disables a tool that was enabled.
+    // `off_disables_tool` (removed `handle_tools_command` test) is a pure
+    // duplicate of `test_dispatch_tools_command_bounded_disable_known_tool_applies`
+    // below — deleted rather than migrated, per Ledger W2d2/F-TOOLS.md.
+
+    // `reset_all_reverts_overrides` (removed `handle_tools_command` test) is
+    // covered at the parsing level by
+    // `test_dispatch_tools_command_bounded_reset_restores_ceiling` — deleted,
+    // per Ledger W2d2/F-TOOLS.md.
+
+    // `reset_one_reverts_single_tool` (removed `handle_tools_command` test)
+    // is covered at the parsing level by
+    // `test_dispatch_tools_command_bounded_reset_one_keeps_ceiling_disabled_tool_off`
+    // and `..._reset_then_reset_one_stays_within_ceiling` — deleted, per
+    // Ledger W2d2/F-TOOLS.md.
+
+    /// `/tools profile coding` under an unrestricted (`Full`) ceiling reports
+    /// the plain confirmation and exposes exactly the `Coding` allowlist.
+    ///
+    /// Note: unlike the removed `handle_tools_command`, the bounded path
+    /// always intersects with `ceiling`
+    /// ([`harw_core::activation::SessionActivation::intersect`]), whose
+    /// result profile is `Minimal` unless *both* sides are `Full` — so
+    /// `activation.profile()` is not asserted here; tool visibility is.
     #[test]
-    fn off_disables_tool() {
-        let registry = registry_with_tools();
+    fn test_dispatch_tools_command_bounded_profile_switch_reports_plain_confirmation_when_unrestricted()
+    {
+        let known: Vec<(String, bool)> = Vec::new();
+        let ceiling = full_activation();
         let mut activation = full_activation();
-        assert!(activation.is_tool_enabled(&ToolName::new("test.beta")));
 
-        let outcome = handle_tools_command("off test.beta", &registry, &mut activation);
-
-        assert_eq!(
-            outcome,
-            ToolsCommandOutcome::Confirmation("disabled test.beta".to_string())
-        );
-        assert!(!activation.is_tool_enabled(&ToolName::new("test.beta")));
-    }
-
-    /// `/tools reset` clears all overrides for all tools.
-    #[test]
-    fn reset_all_reverts_overrides() {
-        let registry = registry_with_tools();
-        let mut activation = full_activation();
-        activation.disable_tool(ToolName::new("test.alpha"));
-        activation.disable_tool(ToolName::new("test.beta"));
-        assert!(!activation.is_tool_enabled(&ToolName::new("test.alpha")));
-
-        let outcome = handle_tools_command("reset", &registry, &mut activation);
-
-        assert_eq!(
-            outcome,
-            ToolsCommandOutcome::Confirmation("reset all tool overrides".to_string())
-        );
-        // Full profile restored → tools enabled again
-        assert!(activation.is_tool_enabled(&ToolName::new("test.alpha")));
-        assert!(activation.is_tool_enabled(&ToolName::new("test.beta")));
-        // Profile itself must be preserved
-        assert_eq!(activation.profile(), ToolProfile::Full);
-    }
-
-    /// `/tools reset <name>` reverts only the named tool's override.
-    #[test]
-    fn reset_one_reverts_single_tool() {
-        let registry = registry_with_tools();
-        let mut activation = full_activation();
-        activation.disable_tool(ToolName::new("test.alpha"));
-        activation.disable_tool(ToolName::new("test.beta"));
-
-        let outcome = handle_tools_command("reset test.alpha", &registry, &mut activation);
-
-        assert_eq!(
-            outcome,
-            ToolsCommandOutcome::Confirmation("reset test.alpha".to_string())
-        );
-        // alpha reverted to profile default (Full → enabled)
-        assert!(activation.is_tool_enabled(&ToolName::new("test.alpha")));
-        // beta still explicitly disabled
-        assert!(!activation.is_tool_enabled(&ToolName::new("test.beta")));
-    }
-
-    /// `/tools profile coding` changes the profile to Coding.
-    #[test]
-    fn profile_switch_changes_activation_profile() {
-        let registry = empty_registry();
-        let mut activation = full_activation();
-        assert_eq!(activation.profile(), ToolProfile::Full);
-
-        let outcome = handle_tools_command("profile coding", &registry, &mut activation);
+        let outcome =
+            dispatch_tools_command_bounded("profile coding", &known, &mut activation, &ceiling);
 
         assert_eq!(
             outcome,
             ToolsCommandOutcome::Confirmation("profile set to coding".to_string())
         );
-        assert_eq!(activation.profile(), ToolProfile::Coding);
+        assert!(
+            activation.is_tool_enabled(&ToolName::new("fs.read")),
+            "Coding allowlist tool must be enabled under an unrestricted ceiling"
+        );
+        assert!(
+            !activation.is_tool_enabled(&ToolName::new("custom.tool")),
+            "tool outside the Coding allowlist must stay hidden"
+        );
     }
 
-    /// `/tools profile <unknown>` returns an error variant.
+    /// `/tools profile <unknown>` returns an error variant and leaves
+    /// `activation` untouched.
+    ///
+    /// Migrated from the removed `handle_tools_command` (W2d-2/F-TOOLS, R6).
     #[test]
-    fn profile_switch_rejects_unknown_name() {
-        let registry = empty_registry();
+    fn test_dispatch_tools_command_bounded_profile_switch_rejects_unknown_name() {
+        let known: Vec<(String, bool)> = Vec::new();
+        let ceiling = full_activation();
         let mut activation = full_activation();
 
-        let outcome = handle_tools_command("profile turbo", &registry, &mut activation);
+        let outcome =
+            dispatch_tools_command_bounded("profile turbo", &known, &mut activation, &ceiling);
 
         assert!(
             matches!(outcome, ToolsCommandOutcome::Error(ref msg) if msg.contains("turbo")),
             "error should name the unknown profile"
         );
-        // Profile must not have changed
         assert_eq!(activation.profile(), ToolProfile::Full);
     }
 
     /// An unrecognised sub-command returns a usage error.
+    ///
+    /// Migrated from the removed `handle_tools_command` (W2d-2/F-TOOLS, R6).
     #[test]
-    fn unknown_subcommand_returns_usage_error() {
-        let registry = empty_registry();
+    fn test_dispatch_tools_command_bounded_unknown_subcommand_returns_usage_error() {
+        let known: Vec<(String, bool)> = Vec::new();
+        let ceiling = full_activation();
         let mut activation = full_activation();
 
-        let outcome = handle_tools_command("frobnicate", &registry, &mut activation);
+        let outcome = dispatch_tools_command_bounded("frobnicate", &known, &mut activation, &ceiling);
 
         assert!(matches!(outcome, ToolsCommandOutcome::Error(_)));
     }

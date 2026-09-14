@@ -288,7 +288,7 @@ fn render_shell_output(content: Value) -> Result<String, OpError> {
     model_tool(readonly, approval = "always"),
     // Web-Fläche übernimmt dieselbe Achse wie das ModelTool: `git diff` ist
     // ein reiner Lesevorgang auf dem Workspace, keine Mutation.
-    web(path = "/api/diff", readonly, approval = "none")
+    web(path = "/api/diff", method = "get", approval = "none")
 )]
 async fn diff(ctx: &OpContext, args: DiffArgs) -> Result<OpOutput, OpError> {
     let plan = build_git_diff_plan(&args)?;
@@ -324,7 +324,7 @@ async fn diff(ctx: &OpContext, args: DiffArgs) -> Result<OpOutput, OpError> {
         }
     };
 
-    Ok(OpOutput { text })
+    Ok(OpOutput::from(text))
 }
 
 #[cfg(test)]

@@ -130,15 +130,15 @@ async fn effort(ctx: &OpContext, args: EffortArgs) -> Result<OpOutput, OpError> 
                 Some(e) => format!("Reasoning-Effort: {e}"),
                 None => "Reasoning-Effort: (nicht gesetzt — Provider-Default)".to_string(),
             };
-            Ok(OpOutput { text })
+            Ok(OpOutput::from(text))
         }
         "clear" | "none" | "auto" => {
             controller
                 .set_reasoning_effort(None)
                 .map_err(|e| OpError::Execution(e.to_string()))?;
-            Ok(OpOutput {
-                text: "Reasoning-Effort zurückgesetzt (Provider-Default)".to_string(),
-            })
+            Ok(OpOutput::from(
+                "Reasoning-Effort zurückgesetzt (Provider-Default)".to_string(),
+            ))
         }
         other => {
             let effort: ReasoningEffort = other.parse().map_err(|_| {
@@ -150,9 +150,9 @@ async fn effort(ctx: &OpContext, args: EffortArgs) -> Result<OpOutput, OpError> 
             controller
                 .set_reasoning_effort(Some(effort))
                 .map_err(|e| OpError::Execution(e.to_string()))?;
-            Ok(OpOutput {
-                text: format!("Reasoning-Effort gesetzt: {other}"),
-            })
+            Ok(OpOutput::from(format!(
+                "Reasoning-Effort gesetzt: {other}"
+            )))
         }
     }
 }

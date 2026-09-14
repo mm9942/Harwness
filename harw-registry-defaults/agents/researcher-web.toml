@@ -2,7 +2,15 @@
 #
 # Die einzige eingebaute Rolle mit Netzzugang. Der Zugang bleibt doppelt
 # begrenzt: `web.*` ist nur die Tool-Oberflaeche, die tatsaechlich erreichbaren
-# Hosts bestimmt die Allowlist der Sandbox.
+# Hosts bestimmt die Egress-Policy aus `[network].researcher_web_hosts`
+# (`harw_registry_defaults::research_web::researcher_web_policy`; leer = kein
+# Netz, private Ziele nie).
+#
+# W5 RD / Annahme A5: Die Rolle liest KEINE Workspace-Daten — weder `fs.*` noch
+# `deps.*` (auch nicht `deps.graph`/`deps.locked`, die `Cargo.lock` und
+# Workspace-Metadaten lesen). Wer ins Netz schreiben kann, darf nichts Lokales
+# lesen, das er hinaustragen koennte. Crate-Namen und Versionen bekommt die
+# Rolle ueber ihren Auftrag vom Elternteil. Reducer: `reduce_to_read_network`.
 
 schema = "harwness.agent/v1"
 id = "harwness.agent.researcher-web@1"
@@ -22,21 +30,32 @@ output = "verified-research-records"
 
 [tools]
 admitted = [
+  "web.fetch",
+  "web.docs_rs",
+  "web.crates_io",
+]
+forbidden = [
   "fs.read",
+  "fs.write",
   "fs.list",
   "fs.search",
   "fs.glob",
   "fs.grep",
+  "shell.exec",
   "deps.graph",
   "deps.locked",
   "deps.source_read",
   "deps.source_search",
   "deps.source_list",
-  "web.fetch",
-  "web.docs_rs",
-  "web.crates_io",
+  "lens.ask",
+  "browser.open",
+  "browser.observe",
+  "browser.find",
+  "browser.act",
+  "browser.wait",
+  "browser.events",
+  "browser.close",
 ]
-forbidden = ["fs.write", "shell.exec"]
 
 [spawn]
 max_depth = 1

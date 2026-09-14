@@ -7,6 +7,7 @@ use crate::ids::{
 use crate::selector::Selector;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ObservationMode {
     PageSummary,
     InteractiveElements,
@@ -211,5 +212,19 @@ mod tests {
         let json = serde_json::to_string(&a).expect("bounding box serializes");
         let decoded: BoundingBox = serde_json::from_str(&json).expect("bounding box deserializes");
         assert_eq!(decoded, a);
+    }
+
+    #[test]
+    fn test_observation_mode_deserialize_rejects_unknown_field_in_dom_selection() {
+        let json = serde_json::json!({
+            "DomSelection": {
+                "selector": { "Css": "main > article" },
+                "extra": "nope"
+            }
+        });
+
+        let result: Result<ObservationMode, serde_json::Error> = serde_json::from_value(json);
+
+        assert!(result.is_err());
     }
 }

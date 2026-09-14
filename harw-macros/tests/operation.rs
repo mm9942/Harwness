@@ -31,9 +31,7 @@ impl FromRawArgs for EmptyArgs {
     command(path = "/test_noop", visibility = "tui_only")
 )]
 async fn test_noop(_ctx: &OpContext, _args: EmptyArgs) -> Result<OpOutput, OpError> {
-    Ok(OpOutput {
-        text: "ok".to_owned(),
-    })
+    Ok(OpOutput::from("ok".to_owned()))
 }
 
 #[test]
@@ -61,9 +59,7 @@ impl FromRawArgs for NoArgs {
     permission = "operator"
 )]
 async fn session_status(_ctx: &OpContext, _args: NoArgs) -> Result<OpOutput, OpError> {
-    Ok(OpOutput {
-        text: String::new(),
-    })
+    Ok(OpOutput::from(String::new()))
 }
 
 #[test]
@@ -100,9 +96,7 @@ impl FromRawArgs for ReadArgs {
     model_tool(readonly, approval = "none")
 )]
 async fn catalog_read(_ctx: &OpContext, _args: ReadArgs) -> Result<OpOutput, OpError> {
-    Ok(OpOutput {
-        text: String::new(),
-    })
+    Ok(OpOutput::from(String::new()))
 }
 
 #[test]
@@ -141,9 +135,7 @@ impl FromRawArgs for DualArgs {
     model_tool(approval = "always")
 )]
 async fn knowledge_search(_ctx: &OpContext, _args: DualArgs) -> Result<OpOutput, OpError> {
-    Ok(OpOutput {
-        text: String::new(),
-    })
+    Ok(OpOutput::from(String::new()))
 }
 
 #[test]
@@ -195,9 +187,7 @@ fn operation_struct_is_send_sync() {
     agent_tool(child = "researcher", authority = "reduce_to_read_only", budget = "8k")
 )]
 async fn test_agent(_ctx: &OpContext, _args: EmptyArgs) -> Result<OpOutput, OpError> {
-    Ok(OpOutput {
-        text: "ok".to_owned(),
-    })
+    Ok(OpOutput::from("ok".to_owned()))
 }
 
 #[test]
@@ -253,17 +243,15 @@ impl FromRawArgs for WebOnlyArgs {
     summary = "Nur eine Web-Fläche, kein Command, kein ModelTool.",
     domain = "misc",
     permission = "observer",
-    web(path = "/api/test-web-only", readonly, approval = "none")
+    web(path = "/api/test-web-only", method = "get", approval = "none")
 )]
 async fn test_web_only(_ctx: &OpContext, _args: WebOnlyArgs) -> Result<OpOutput, OpError> {
-    Ok(OpOutput {
-        text: "ok".to_owned(),
-    })
+    Ok(OpOutput::from("ok".to_owned()))
 }
 
 #[test]
-fn web_surface_defaults_and_fields_match() {
-    use harw_operations::{ApprovalPolicy, Surface};
+fn web_surface_method_and_fields_match() {
+    use harw_operations::{ApprovalPolicy, Surface, WebMethod};
 
     let op = TestWebOnlyOperation;
     let meta = op.meta();
@@ -272,7 +260,7 @@ fn web_surface_defaults_and_fields_match() {
         meta.surfaces[0],
         Surface::Web {
             path: "/api/test-web-only",
-            readonly: true,
+            method: WebMethod::Get,
             approval: ApprovalPolicy::None,
         },
     );
@@ -289,27 +277,28 @@ impl FromRawArgs for WebWriteArgs {
 
 #[operation(
     name = "test_web_write",
-    summary = "Web-Fläche ohne `readonly`, mit approval = always.",
+    summary = "Web-Fläche mit method = post, approval = always.",
     domain = "execution",
     permission = "operator",
-    web(path = "/api/test-web-write", approval = "always")
+    web(path = "/api/test-web-write", method = "post", approval = "always")
 )]
 async fn test_web_write(_ctx: &OpContext, _args: WebWriteArgs) -> Result<OpOutput, OpError> {
-    Ok(OpOutput {
-        text: "ok".to_owned(),
-    })
+    Ok(OpOutput::from("ok".to_owned()))
 }
 
 #[test]
-fn web_surface_without_readonly_key_defaults_to_false() {
-    use harw_operations::{ApprovalPolicy, Surface};
+fn web_surface_with_explicit_post_method() {
+    // F-031: `method` ist Pflicht und wird nicht mehr aus `readonly`
+    // abgeleitet — dieser Test belegt den expliziten `method = "post"`-Fall
+    // (vormals: kein `readonly`-Schlüssel → impliziter `false`-Default).
+    use harw_operations::{ApprovalPolicy, Surface, WebMethod};
 
     let op = TestWebWriteOperation;
     assert_eq!(
         op.meta().surfaces[0],
         Surface::Web {
             path: "/api/test-web-write",
-            readonly: false,
+            method: WebMethod::Post,
             approval: ApprovalPolicy::Always,
         },
     );
@@ -333,17 +322,15 @@ impl FromRawArgs for TripleArgs {
     permission = "observer",
     command(path = "/triple", visibility = "channel_parity"),
     model_tool(readonly, approval = "none"),
-    web(path = "/api/triple", readonly, approval = "none")
+    web(path = "/api/triple", method = "get", approval = "none")
 )]
 async fn test_triple_surface(_ctx: &OpContext, _args: TripleArgs) -> Result<OpOutput, OpError> {
-    Ok(OpOutput {
-        text: "ok".to_owned(),
-    })
+    Ok(OpOutput::from("ok".to_owned()))
 }
 
 #[test]
 fn command_model_tool_and_web_surfaces_all_coexist() {
-    use harw_operations::{ApprovalPolicy, CommandVisibility, Surface};
+    use harw_operations::{ApprovalPolicy, CommandVisibility, Surface, WebMethod};
 
     let op = TestTripleSurfaceOperation;
     let meta = op.meta();
@@ -358,7 +345,7 @@ fn command_model_tool_and_web_surfaces_all_coexist() {
     }));
     assert!(meta.surfaces.contains(&Surface::Web {
         path: "/api/triple",
-        readonly: true,
+        method: WebMethod::Get,
         approval: ApprovalPolicy::None,
     }));
 }

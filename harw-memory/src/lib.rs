@@ -53,6 +53,9 @@ pub mod contradiction_index;
 pub mod detect;
 pub mod epistemic;
 pub mod error;
+pub mod consolidation;
+pub mod extraction;
+pub mod facts;
 pub mod file_store;
 pub mod heartbeat;
 pub mod learning;
@@ -69,6 +72,11 @@ pub use context_provider::{
 };
 pub use detect::detect_correction;
 pub use error::{MemoryError, MemoryResult};
+pub use extraction::{
+    EntryRole, ExtractionCandidate, ExtractionError, ExtractionPolicy, IncomingStore,
+    TranscriptEntry, build_input, parse_response, select_sessions, system_prompt, user_prompt,
+};
+pub use facts::{Fact, FactScope, FactStore, FactType, redact, slugify};
 pub use file_store::FileMemoryStore;
 pub use store::Memory;
 pub use types::{Entry, MaintenanceReport, RecallQuery, Signal, Stats, Tier};

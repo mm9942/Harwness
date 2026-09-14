@@ -131,7 +131,7 @@ pub(crate) struct CommandServices<'a> {
 ///
 /// # Argumente
 /// - `adapters` (`&[CommandAdapter]`): alle `/`-Command-Adapter, gebaut aus der
-///   `OperationRegistry` in `run_chat_tui` (`CommandAdapter::from_operation`).
+///   `OperationRegistry` in `crate::runtime_root::run_tui` (`CommandAdapter::from_operation`).
 /// - `sandbox` (`&SandboxSpec`): Authority-Boundary; wird pro Dispatch geklont
 ///   in den `OpContext` übernommen.
 /// - `session_id` (`&SessionId`): Stabile Session-ID; wird pro Dispatch geklont.
@@ -367,8 +367,10 @@ fn render_admission_error(typed: &str, error: &CommandError) -> String {
 ///   über mehrere `execute_command`-Aufrufe hinweg erhalten bleibt.
 ///
 /// # Rückgabe
-/// Eine [`ServiceMap`] mit [`OperationRegistry`], [`SharedSessionController`]
-/// sowie optionalem `Arc<harw_config::ResolvedConfig>` und `Arc<dyn Memory>`.
+/// Eine [`ServiceMap`] mit [`OperationRegistry`], [`SharedSessionController`],
+/// je einer leeren `AllowRuleSet` und `ExtraRootsCell` (gleiche Fläche wie
+/// `RuntimeServices::service_map(ServiceSurface::Slash)`) sowie optionalem
+/// `Arc<harw_config::ResolvedConfig>` und `Arc<dyn Memory>`.
 ///
 /// # Spec
 /// harw-tui Design §session_controller — build_services long-lived controller.
@@ -410,6 +412,12 @@ pub(crate) fn build_services(
     // zu Arc<dyn SessionController> — Arc::clone würde den konkreten Typ beibehalten.
     let shared: SharedSessionController = Arc::clone(controller) as SharedSessionController;
     services.insert(shared);
+    // Gleiche Fläche wie `RuntimeServices::service_map(ServiceSurface::Slash)`
+    // (harw-runtime/src/services.rs, `assemble`): beide Zellen gehören zur
+    // Produktionsmontage dazu. Leere, frische Zellen genügen hier — Tests
+    // prüfen keinen Regelinhalt, nur dass der Diensttyp auffindbar ist.
+    services.insert(harw_extension_api::allow_rules::AllowRuleSet::new());
+    services.insert(harw_sandbox::ExtraRootsCell::new());
     services
 }
 
@@ -502,6 +510,9 @@ mod tests {
                     aliases: &["guard"],
                     category: OperationCategory::Misc,
                     args_schema: None,
+                    // Kein Ausgabeschema: Dieser Test-Helfer prüft nur Dispatch/Meta-Zugriffe,
+                    // keine strukturierte Ausgabe (siehe harw-ops/src/lib.rs, help.rs: gleiches Muster).
+                    output_schema: None,
                 },
                 meta_reads: AtomicUsize::new(0),
                 dispatches: AtomicUsize::new(0),
@@ -520,6 +531,7 @@ mod tests {
             Box::pin(async {
                 Ok(OpOutput {
                     text: "dispatched".to_owned(),
+                    data: None,
                 })
             })
         }

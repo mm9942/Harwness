@@ -125,9 +125,7 @@ async fn plugins(ctx: &OpContext, args: PluginsArgs) -> Result<OpOutput, OpError
     match args.action.as_deref().unwrap_or("list") {
         "list" => {
             if config.plugins.is_empty() {
-                return Ok(OpOutput {
-                    text: "Keine Plugins konfiguriert.".to_owned(),
-                });
+                return Ok(OpOutput::from("Keine Plugins konfiguriert.".to_owned()));
             }
             let mut names: Vec<&String> = config.plugins.keys().collect();
             names.sort();
@@ -140,9 +138,7 @@ async fn plugins(ctx: &OpContext, args: PluginsArgs) -> Result<OpOutput, OpError
                     plugin.version, plugin.description
                 ));
             }
-            Ok(OpOutput {
-                text: lines.join("\n"),
-            })
+            Ok(OpOutput::from(lines.join("\n")))
         }
         "install" | "activate" | "uninstall" => Err(OpError::NotAvailable(
             "plugin lifecycle mutation is not available".to_owned(),

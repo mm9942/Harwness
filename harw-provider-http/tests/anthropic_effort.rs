@@ -28,6 +28,9 @@ fn make_request(effort: Option<ReasoningEffort>) -> ModelRequest {
         reasoning_effort: effort,
         model_id: None,
         provider_id: None,
+        data_block: None,
+        max_output_tokens: None,
+        tool_result_max_bytes: None,
     }
 }
 

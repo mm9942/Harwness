@@ -59,9 +59,7 @@ pub struct QuitArgs {}
     command(path = "/quit", visibility = "tui_only")
 )]
 async fn quit(_ctx: &OpContext, _args: QuitArgs) -> Result<OpOutput, OpError> {
-    Ok(OpOutput {
-        text: "__QUIT__".to_owned(),
-    })
+    Ok(OpOutput::from("__QUIT__".to_owned()))
 }
 
 #[cfg(test)]

@@ -660,6 +660,11 @@ impl Memory for FileMemoryStore {
             demoted_to_cold: hb.demoted,
             warm_created: promoted,
             heartbeat: Some(hb),
+            // Der Fakten-Verfall (Memory v3, §5.4) läuft nicht in diesem
+            // Tier-Wartungslauf, sondern im Heartbeat über die Fakten-Wurzeln;
+            // hier bleibt der Faktenteil des Berichts deshalb leer.
+            facts_decayed: 0,
+            facts_below_threshold: Vec::new(),
         })
     }
 

@@ -1,0 +1,20 @@
+{
+  "kernel": "6.18.34+rpt-rpi-2712",
+  "captured_at": "2026-09-13T18:33:35Z",
+  "entries": [
+    {
+      "path": "/proc/loadavg",
+      "kind": {
+        "type": "file",
+        "content": "4.31 3.01 2.48 1/519 287984\n"
+      }
+    },
+    {
+      "path": "/proc/meminfo",
+      "kind": {
+        "type": "file",
+        "content": "MemTotal:        8251776 kB\nMemFree:         1956288 kB\nMemAvailable:    4685760 kB\nBuffers:          332032 kB\nCached:          2627248 kB\nSwapCached:            0 kB\nActive:          2869136 kB\nInactive:        2588112 kB\nActive(anon):    1999936 kB\nInactive(anon):   907984 kB\nActive(file):     869200 kB\nInactive(file):  1680128 kB\nUnevictable:      143792 kB\nMlocked:              16 kB\nSwapTotal:       2097136 kB\nSwapFree:        2096736 kB\nZswap:                 0 kB\nZswapped:              0 kB\nDirty:              1664 kB\nWriteback:             0 kB\n"
+      }
+    }
+  ]
+}

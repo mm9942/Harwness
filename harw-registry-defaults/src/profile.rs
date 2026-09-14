@@ -17,6 +17,8 @@
 //! - [`assemble_registry`] — erkennt das Projekt einmal und baut eine Registry.
 //! - [`assemble_registry_for_project`] — baut eine Registry über einem bereits
 //!   erkannten Projektkontext, ohne erneute Projekterkennung.
+//! - [`assemble_registry_for_sandbox`] — wie oben, registriert aber nur die
+//!   Werkzeuge, deren Recht der gewährte [`PermissionSet`] trägt (W5 RD).
 //! - [`role_names`] — die Namen der eingebauten Rollen als Single Source of Truth.
 //!
 //! # Warum ein Filter statt eines zweiten Providers
@@ -26,11 +28,17 @@
 //! aus `executor()`. Ein Kind kann das Werkzeug damit weder sehen noch durch
 //! Raten seines Namens aufrufen — die Beschränkung ist keine Prompt-Bitte.
 //!
+//! # Browser nur mit Grant (W5 RD, F-073)
+//! Kein Profil registriert `browser.*`. Die Werkzeuge entstehen ausschließlich
+//! über `browser_tool_provider` (Feature `browser`) mit einem ausdrücklichen
+//! `harw_tool_browser::BrowserOpenGrant`; vorher hängte `Full` sie unter dem
+//! Feature still und ohne Grant an.
+//!
 //! # Fehler
 //! [`assemble_registry`] gibt [`crate::RegistryDefaultsError`] zurück:
-//! `ProjectDiscovery`, wenn `cwd` kein auflösbares Projekt ist, und
-//! `BrowserHost` (nur unter dem Feature `browser`), wenn die Host-Konfiguration
-//! ungültig ist.
+//! `ProjectDiscovery`, wenn `cwd` kein auflösbares Projekt ist.
+//! `browser_tool_provider` (Feature `browser`) liefert `BrowserHost`, wenn die
+//! Host-Konfiguration ungültig ist.
 //!
 //! # Nebenläufigkeit
 //! Alle Typen sind `Send + Sync`. [`assemble_registry`] ist synchron und
@@ -47,6 +55,7 @@ use harw_instructions::{AgentIdentity, BaselineInstructionsProvider};
 use harw_project_discovery::{
     DiscoveryConfig, ProjectContext, ProjectContextProvider, discover_project,
 };
+use harw_sandbox::PermissionSet;
 use harw_tool_deps::DepsToolProvider;
 use harw_tool_fs::FsToolProvider;
 use harw_tool_lens::LensToolProvider;
@@ -56,8 +65,11 @@ use harw_tool_web::WebToolProvider;
 #[cfg(feature = "browser")]
 use harw_browser_thirtyfour::{config::FirefoxHostConfig, host::FirefoxHost};
 #[cfg(feature = "browser")]
-use harw_tool_browser::{BrowserToolSet, HarwnessBrowserToolProvider};
+use harw_tool_browser::{
+    BrowserOpenGrant, BrowserOpenPolicy, BrowserToolSet, HarwnessBrowserToolProvider,
+};
 
+use crate::authority::{permissions_of, tool_permission};
 use crate::error::{RegistryDefaultsError, RegistryDefaultsResult};
 use crate::{AssembledRegistry, DefaultApprovalPolicy};
 
@@ -162,6 +174,14 @@ pub mod role_names {
     /// eigene Werkzeugoberfläche.
     pub const SECURITY_ENDPOINT_TRIAGE: &str = "security-endpoint-triage";
 
+    /// Führt Befehls- und Dateioperationen im Auftrag des Haupt-Agenten aus
+    /// und liefert eine Zusammenfassung statt Rohausgaben (Slice B7). Die
+    /// TUI delegiert damit Befehlsfolgen an einen eigenen Worker, statt sie
+    /// als viele einzelne Tool-Aufrufe im Hauptfenster zu zeigen. Einzige
+    /// eingebaute Rolle mit [`RegistryProfile::Full`] — siehe
+    /// [`profile_for_role`] und die Begründung in `agents/executor.toml`.
+    pub const EXECUTOR: &str = "executor";
+
     /// Alle bekannten eingebauten Rollen.
     ///
     /// Siehe die Moduldokumentation oben: `context-steward` und
@@ -178,6 +198,7 @@ pub mod role_names {
         SECURITY_BASELINE_TRIAGE,
         SECURITY_STRUCTURE_TRIAGE,
         SECURITY_ENDPOINT_TRIAGE,
+        EXECUTOR,
     ];
 }
 
@@ -186,7 +207,8 @@ pub mod role_names {
 // ---------------------------------------------------------------------------
 
 /// Die lesenden Werkzeuge von `harw-tool-fs`.
-const FS_READ_ONLY_TOOLS: &[&str] = &["fs.read", "fs.list", "fs.search", "fs.glob", "fs.grep"];
+pub(crate) const FS_READ_ONLY_TOOLS: &[&str] =
+    &["fs.read", "fs.list", "fs.search", "fs.glob", "fs.grep"];
 
 /// Die vollständige Werkzeugliste von `harw-tool-fs`, in Provider-Reihenfolge.
 const FS_FULL_TOOLS: &[&str] = &[
@@ -207,11 +229,20 @@ const DEPS_TOOLS: &[&str] = &[
     "deps.source_list",
 ];
 
+/// Die Deps-Werkzeuge, die nur den Workspace (`Cargo.lock`/Metadaten) lesen
+/// (`ReadWorkspace`). Teilmenge von [`DEPS_TOOLS`].
+pub(crate) const DEPS_WORKSPACE_TOOLS: &[&str] = &["deps.graph", "deps.locked"];
+
+/// Die Deps-Werkzeuge über dem Registry-Quellcache (`ReadCargoRegistry`).
+/// Teilmenge von [`DEPS_TOOLS`].
+pub(crate) const DEPS_SOURCE_TOOLS: &[&str] =
+    &["deps.source_read", "deps.source_search", "deps.source_list"];
+
 /// Die Werkzeuge von `harw-tool-web`, in Provider-Reihenfolge.
-const WEB_TOOLS: &[&str] = &["web.fetch", "web.docs_rs", "web.crates_io"];
+pub(crate) const WEB_TOOLS: &[&str] = &["web.fetch", "web.docs_rs", "web.crates_io"];
 
 /// Die Werkzeuge von `harw-tool-shell`.
-const SHELL_TOOLS: &[&str] = &["shell.exec"];
+pub(crate) const SHELL_TOOLS: &[&str] = &["shell.exec"];
 
 /// Das eine Werkzeug von `harw-tool-lens` (AW6-10): semantische Abfrage über
 /// `docs.design` und `knowledge.palace`.
@@ -255,11 +286,15 @@ const SHELL_TOOLS: &[&str] = &["shell.exec"];
 ///   Lens-Zugriff bliebe ungenutzter Code. `intel-scout` korreliert
 ///   Advisories gegen `Cargo.lock` (`[tools].admitted = ["deps.locked"]`) —
 ///   keine Design-/Wissensfrage.
-const LENS_TOOLS: &[&str] = &["lens.ask"];
+pub(crate) const LENS_TOOLS: &[&str] = &["lens.ask"];
 
-/// Die Browser-Werkzeuge, in Provider-Reihenfolge (nur unter Feature `browser`).
-#[cfg(feature = "browser")]
-const BROWSER_TOOLS: &[&str] = &[
+/// Die Browser-Werkzeuge, in Provider-Reihenfolge.
+///
+/// Kein Profil registriert sie (W5 RD): sie entstehen nur über
+/// `browser_tool_provider` (Feature `browser`) mit ausdrücklichem Grant. Die
+/// Liste bleibt ohne Feature bestehen, damit
+/// [`crate::authority::tool_permission`] und die Rechte-Matrix sie kennen.
+pub(crate) const BROWSER_TOOLS: &[&str] = &[
     "browser.open",
     "browser.observe",
     "browser.find",
@@ -290,9 +325,12 @@ const BROWSER_TOOLS: &[&str] = &[
 /// Hand gepflegt und bewarb Werkzeuge, die das Kind gar nicht besaß.
 ///
 /// # Varianten
-/// - `Full` — voller Coding-Satz (heutiges Verhalten).
+/// - `Full` — voller Coding-Satz: `fs.*`, `shell.exec` (ohne Browser, W5 RD).
 /// - `ReadOnlyExplore` — ausschließlich lesend.
-/// - `Research` — `ReadOnlyExplore` plus Netzzugang über die Sandbox-Allowlist.
+/// - `Research` — **nur** `web.*` (W5 RD, Annahme A5): kein `fs.*`, kein
+///   `deps.*`, damit die einzige Rolle mit Netz keine Workspace-Daten lesen und
+///   hinaustragen kann. Netz-Scope aus `[network].researcher_web_hosts`
+///   ([`crate::research_web::researcher_web_policy`]).
 /// - `Planning` — `ReadOnlyExplore` plus `lens.ask` (Plan-/Goal-Operationen
 ///   bewirbt es nicht: das Kind besitzt dafür keinen Executor).
 /// - `NoTools` — registriert und bewirbt gar nichts.
@@ -335,11 +373,12 @@ const BROWSER_TOOLS: &[&str] = &[
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistryProfile {
-    /// Voller Coding-Satz (heutiges Verhalten): fs.*, shell.exec, Browser (Feature).
+    /// Voller Coding-Satz: fs.*, shell.exec. Browser nur über expliziten Grant.
     Full,
     /// Ausschließlich lesend: fs.read/list/search/glob/grep + deps.*.
     ReadOnlyExplore,
-    /// ReadOnlyExplore + web.* (Netz nur über die Host-Allowlist der Sandbox).
+    /// Nur web.* — kein Workspace-Lesen (A5); Netz nur über
+    /// `[network].researcher_web_hosts`.
     Research,
     /// ReadOnlyExplore + `lens.ask`. Die Plan-/Goal-Operationen der
     /// Composition-Root gehören **nicht** dazu (siehe W1-05).
@@ -410,8 +449,8 @@ impl RegistryProfile {
     /// Die Reihenfolge entspricht exakt der Reihenfolge, in der
     /// [`assemble_registry`] die Provider registriert, und damit der Reihenfolge
     /// von `ExtensionRegistry::tool_providers().flat_map(ToolProvider::tools)`.
-    /// Unter dem Feature `browser` hängt `Full` zusätzlich die sieben
-    /// `browser.*`-Werkzeuge an. `Planning` hängt zusätzlich `lens.ask` an —
+    /// `browser.*` gehört zu keinem Profil (W5 RD). `Research` registriert
+    /// ausschließlich `web.*`. `Planning` hängt zusätzlich `lens.ask` an —
     /// siehe die Begründung bei [`LENS_TOOLS`], warum ausschließlich
     /// `planner` dieses Werkzeug bekommt.
     ///
@@ -429,18 +468,11 @@ impl RegistryProfile {
     #[must_use]
     pub fn registered_tool_names(self) -> Vec<&'static str> {
         match self {
-            RegistryProfile::Full => {
-                // `mut` wird nur unter dem Feature `browser` gebraucht.
-                #[cfg_attr(not(feature = "browser"), allow(unused_mut))]
-                let mut names: Vec<&'static str> = FS_FULL_TOOLS
-                    .iter()
-                    .chain(SHELL_TOOLS.iter())
-                    .copied()
-                    .collect();
-                #[cfg(feature = "browser")]
-                names.extend(BROWSER_TOOLS.iter().copied());
-                names
-            }
+            RegistryProfile::Full => FS_FULL_TOOLS
+                .iter()
+                .chain(SHELL_TOOLS.iter())
+                .copied()
+                .collect(),
             RegistryProfile::ReadOnlyExplore => FS_READ_ONLY_TOOLS
                 .iter()
                 .chain(DEPS_TOOLS.iter())
@@ -456,12 +488,8 @@ impl RegistryProfile {
                 .chain(LENS_TOOLS.iter())
                 .copied()
                 .collect(),
-            RegistryProfile::Research => FS_READ_ONLY_TOOLS
-                .iter()
-                .chain(DEPS_TOOLS.iter())
-                .chain(WEB_TOOLS.iter())
-                .copied()
-                .collect(),
+            // Nur `web.*` (A5): die Rolle mit Netz liest keine Workspace-Daten.
+            RegistryProfile::Research => WEB_TOOLS.to_vec(),
             // Siehe die Begründung bei `RegistryProfile::NoTools`: keine
             // Werkzeuge registriert, keine beworben.
             RegistryProfile::NoTools => Vec::new(),
@@ -494,6 +522,65 @@ impl RegistryProfile {
     #[must_use]
     pub fn tool_names(self) -> Vec<&'static str> {
         self.registered_tool_names()
+    }
+
+    /// Die Rechte, die jedes Werkzeug dieses Profils zusammen verlangt.
+    ///
+    /// # Beschreibung
+    /// Vereinigung von [`crate::authority::tool_permission`] über
+    /// [`RegistryProfile::registered_tool_names`]. Unter genau diesem Satz
+    /// registriert [`assemble_registry_for_sandbox`] das volle Profil.
+    ///
+    /// # Rückgabe
+    /// Ein [`PermissionSet`]; leer für [`RegistryProfile::NoTools`].
+    ///
+    /// # Beispiele
+    /// ```rust
+    /// use harw_registry_defaults::profile::RegistryProfile;
+    /// use harw_sandbox::Permission;
+    ///
+    /// let research = RegistryProfile::Research.required_permissions();
+    /// assert!(research.contains(Permission::NetworkAccess));
+    /// assert!(!research.contains(Permission::ReadWorkspace));
+    /// ```
+    #[must_use]
+    pub fn required_permissions(self) -> PermissionSet {
+        permissions_of(&self.registered_tool_names())
+    }
+
+    /// Die Werkzeuge dieses Profils, deren Recht `granted` trägt.
+    ///
+    /// # Beschreibung
+    /// Registry-seitiger Reducer: ein Werkzeug ohne gewährtes Recht (oder ohne
+    /// bekanntes Recht) fällt heraus, statt beworben zu werden und am
+    /// Rechte-Prolog zu scheitern. Beispiel `ReadOnlyExplore` ohne
+    /// `ReadCargoRegistry`: `deps.source_*` fehlt (R0-Frage, F-084).
+    ///
+    /// # Argumente
+    /// - `granted` (`&PermissionSet`): die Rechte der Ziel-Sandbox.
+    ///
+    /// # Rückgabe
+    /// Teilmenge von [`RegistryProfile::registered_tool_names`] in
+    /// Registrierungsreihenfolge.
+    ///
+    /// # Beispiele
+    /// ```rust
+    /// use harw_registry_defaults::profile::RegistryProfile;
+    /// use harw_sandbox::{Permission, PermissionSet};
+    ///
+    /// let granted = PermissionSet::from_policy([Permission::ReadWorkspace]);
+    /// let tools = RegistryProfile::ReadOnlyExplore.tool_names_for(&granted);
+    /// assert!(tools.contains(&"deps.locked"));
+    /// assert!(!tools.contains(&"deps.source_read"));
+    /// ```
+    #[must_use]
+    pub fn tool_names_for(self, granted: &PermissionSet) -> Vec<&'static str> {
+        self.registered_tool_names()
+            .into_iter()
+            .filter(|tool| {
+                tool_permission(tool).is_some_and(|needed| granted.contains(needed))
+            })
+            .collect()
     }
 }
 
@@ -543,6 +630,14 @@ pub fn profile_for_role(role: &str) -> Option<RegistryProfile> {
         | role_names::SECURITY_BASELINE_TRIAGE
         | role_names::SECURITY_STRUCTURE_TRIAGE
         | role_names::SECURITY_ENDPOINT_TRIAGE => Some(RegistryProfile::NoTools),
+        // Einzige eingebaute Rolle mit dem vollen, schreibenden Coding-Satz
+        // (Slice B7): sie fuehrt Befehls-/Dateioperationen im Auftrag des
+        // Haupt-Agenten aus. Das ist eine ausdrueckliche, dokumentierte
+        // Ausnahme (siehe `agents/executor.toml` und den Test
+        // `test_only_executor_gets_the_full_writable_profile` in
+        // `embedded_agents.rs`), kein Fallback: jede andere unbekannte Rolle
+        // faellt weiterhin auf `None`, nie auf `Full`.
+        role_names::EXECUTOR => Some(RegistryProfile::Full),
         _ => None,
     }
 }
@@ -687,12 +782,8 @@ impl ToolProvider for RestrictedToolProvider {
 
 /// Erzeugt die Tool-Provider eines Profils in Registrierungsreihenfolge.
 ///
-/// # Fehler
-/// - [`RegistryDefaultsError::BrowserHost`]: nur unter dem Feature `browser`,
-///   wenn die Firefox-Host-Konfiguration ungültig ist.
-fn profile_tool_providers(
-    profile: RegistryProfile,
-) -> RegistryDefaultsResult<Vec<Arc<dyn ToolProvider>>> {
+/// Infallibel: seit W5 RD baut kein Profil mehr einen Browser-Host.
+fn profile_tool_providers(profile: RegistryProfile) -> Vec<Arc<dyn ToolProvider>> {
     // Der read-only Anteil ist für drei Profile identisch: der gefilterte
     // FS-Provider plus der vollständig lesende Deps-Provider.
     fn read_only_base() -> Vec<Arc<dyn ToolProvider>> {
@@ -708,25 +799,9 @@ fn profile_tool_providers(
         RegistryProfile::Full => {
             let filesystem: Arc<dyn ToolProvider> = Arc::new(FsToolProvider::default());
             let shell: Arc<dyn ToolProvider> = Arc::new(ShellToolProvider::default());
-            // `mut` wird nur unter dem Feature `browser` gebraucht.
-            #[cfg_attr(not(feature = "browser"), allow(unused_mut))]
-            let mut providers: Vec<Arc<dyn ToolProvider>> = vec![filesystem, shell];
-            #[cfg(feature = "browser")]
-            {
-                // `FirefoxHost::new` führt keine I/O aus und startet keinen
-                // Prozess; ein fehlender WebDriver fällt erst beim ersten
-                // `browser.open` auf und bricht den Start nicht.
-                let host: Arc<dyn harw_browser::host::BrowserHost> =
-                    Arc::new(FirefoxHost::new(FirefoxHostConfig::default()).map_err(|error| {
-                        RegistryDefaultsError::BrowserHost(error.to_string())
-                    })?);
-                providers.push(Arc::new(HarwnessBrowserToolProvider::new(
-                    BrowserToolSet::new(host),
-                )));
-            }
-            Ok(providers)
+            vec![filesystem, shell]
         }
-        RegistryProfile::ReadOnlyExplore => Ok(read_only_base()),
+        RegistryProfile::ReadOnlyExplore => read_only_base(),
         // `LensToolProvider::new()` ist zustandslos (keine Bau-, Home- oder
         // Indexpfad-Konfiguration nötig): `derive_read_scope` leitet den
         // `ReadScope` beim Aufruf aus dem `ToolExecutionContext` ab, nie aus
@@ -735,16 +810,78 @@ fn profile_tool_providers(
         RegistryProfile::Planning => {
             let mut providers = read_only_base();
             providers.push(Arc::new(LensToolProvider::new()));
-            Ok(providers)
+            providers
         }
+        // Kein `read_only_base` (A5): weder `fs.*` noch `deps.*`. Die Policy
+        // aus `[network].researcher_web_hosts` reicht W6 I-CONTRIB an die
+        // Web-Werkzeuge durch, sobald `harw-tool-web` (N-WEB) sie annimmt.
         RegistryProfile::Research => {
-            let mut providers = read_only_base();
-            providers.push(Arc::new(WebToolProvider::new()));
-            Ok(providers)
+            let web: Arc<dyn ToolProvider> = Arc::new(WebToolProvider::new());
+            vec![web]
         }
         // Keine Provider: siehe die Begründung bei `RegistryProfile::NoTools`.
-        RegistryProfile::NoTools => Ok(Vec::new()),
+        RegistryProfile::NoTools => Vec::new(),
     }
+}
+
+/// Filtert einen Provider auf die Werkzeuge in `allowed`.
+///
+/// Gibt den Provider unverändert zurück, wenn nichts herausfällt, und `None`,
+/// wenn nichts übrig bleibt (ein leerer Provider wird nicht registriert).
+fn restrict_provider(
+    provider: Arc<dyn ToolProvider>,
+    allowed: &[&'static str],
+) -> Option<Arc<dyn ToolProvider>> {
+    let offered: Vec<ToolSpec> = provider.tools();
+    let kept = offered
+        .iter()
+        .filter(|spec| allowed.iter().any(|name| *name == spec.name()))
+        .count();
+    if kept == 0 {
+        None
+    } else if kept == offered.len() {
+        Some(provider)
+    } else {
+        Some(Arc::new(RestrictedToolProvider::new(provider, allowed)))
+    }
+}
+
+/// Baut die Browser-Werkzeuge mit einem **ausdrücklichen** Öffnungs-Grant.
+///
+/// # Beschreibung
+/// Einziger Weg zu `browser.*` (W5 RD, F-073): kein Profil registriert sie
+/// mehr. Der Grant (`harw_tool_browser::BrowserOpenGrant`) legt Origins,
+/// Profilbindung und Limits host-seitig fest; das Modell kann ihn nicht
+/// erweitern. Ohne Grant gibt es keinen Provider. Der Aufrufer (W6 I-CONTRIB)
+/// baut den Grant aus `[browser]` und registriert den Provider nur, wenn
+/// `[browser].enabled = true`.
+///
+/// `FirefoxHost::new` führt keine I/O aus und startet keinen Prozess; ein
+/// fehlender WebDriver fällt erst beim ersten `browser.open` auf.
+///
+/// # Argumente
+/// - `grant` (`BrowserOpenGrant`): die host-eigene Öffnungs-Autorität; Eigentum
+///   geht über.
+///
+/// # Rückgabe
+/// `Ok(Arc<dyn ToolProvider>)` mit den sieben `browser.*`-Werkzeugen.
+///
+/// # Fehler
+/// - [`RegistryDefaultsError::BrowserHost`]: die Firefox-Host-Konfiguration ist
+///   ungültig.
+///
+/// # Nebenläufigkeit
+/// Synchron; der Provider ist `Send + Sync`.
+#[cfg(feature = "browser")]
+pub fn browser_tool_provider(
+    grant: BrowserOpenGrant,
+) -> RegistryDefaultsResult<Arc<dyn ToolProvider>> {
+    let host: Arc<dyn harw_browser::host::BrowserHost> = Arc::new(
+        FirefoxHost::new(FirefoxHostConfig::default())
+            .map_err(|error| RegistryDefaultsError::BrowserHost(error.to_string()))?,
+    );
+    let tool_set = BrowserToolSet::with_open_policy(host, BrowserOpenPolicy::grant(grant));
+    Ok(Arc::new(HarwnessBrowserToolProvider::new(tool_set)))
 }
 
 /// Baut eine Registry für das gewünschte Profil.
@@ -787,9 +924,9 @@ fn profile_tool_providers(
 /// `Ok(AssembledRegistry)` mit Registry, erkanntem Projektkontext und Identität.
 ///
 /// # Fehler
-/// - [`RegistryDefaultsError::ProjectDiscovery`]: `cwd` ist kein auflösbares Projekt.
-/// - [`RegistryDefaultsError::BrowserHost`]: nur unter dem Feature `browser` und
-///   nur für [`RegistryProfile::Full`], wenn die Host-Konfiguration ungültig ist.
+/// - [`RegistryDefaultsError::ProjectDiscovery`][]: `cwd` ist kein auflösbares Projekt.
+/// - [`RegistryDefaultsError::ContextProviderRegistration`][]: siehe
+///   [`assemble_registry_for_project`].
 ///
 /// # Nebenläufigkeit
 /// Synchron; alle erzeugten Provider sind `Send + Sync`.
@@ -855,8 +992,6 @@ pub fn assemble_registry(
 /// # Fehler
 /// - [`RegistryDefaultsError::ContextProviderRegistration`]: der Namensraum des
 ///   [`ProjectContextProvider`] ist bereits belegt.
-/// - [`RegistryDefaultsError::BrowserHost`]: nur unter dem Feature `browser` und
-///   nur für [`RegistryProfile::Full`], wenn die Host-Konfiguration ungültig ist.
 ///
 /// Ein Discovery-Fehler ist hier **nicht** möglich: Die Funktion bekommt keinen
 /// Pfad.
@@ -895,13 +1030,91 @@ pub fn assemble_registry_for_project(
     overrides: IdentityOverrides,
     approval_mode: ApprovalModeCell,
 ) -> RegistryDefaultsResult<AssembledRegistry> {
-    let providers = profile_tool_providers(profile)?;
+    assemble_registry_for_sandbox(
+        profile,
+        project,
+        overrides,
+        approval_mode,
+        &profile.required_permissions(),
+    )
+}
 
-    let advertised_tools: Vec<String> = profile
-        .tool_names()
-        .iter()
-        .map(|name| (*name).to_owned())
+/// Baut eine Registry über einem erkannten Projektkontext und registriert nur
+/// die Werkzeuge, deren Recht die Ziel-Sandbox trägt.
+///
+/// # Beschreibung
+/// Wie [`assemble_registry_for_project`], aber jede Provider-Liste wird auf
+/// [`RegistryProfile::tool_names_for`]`(granted)` gefiltert — Registrierung
+/// **und** Identität (beworbenes Inventar). Ein Werkzeug ohne gewährtes Recht
+/// ist damit weder sichtbar noch per Namensraten ausführbar
+/// ([`RestrictedToolProvider`]); ein Provider ohne verbleibendes Werkzeug wird
+/// gar nicht registriert.
+///
+/// Das beantwortet die R0-Frage „`deps.*` nur mit `ReadCargoRegistry`“ hart:
+/// `ReadOnlyExplore` unter `{ReadWorkspace}` registriert `deps.graph` und
+/// `deps.locked`, aber kein `deps.source_*`.
+///
+/// Composition-Roots geben den Rechtesatz der Sandbox, in der die Session läuft
+/// (Kind: `AuthorityReducer::reduce` über den Elternsatz, siehe
+/// [`crate::authority::authority_reducer_for_role`]). Der Aufruf mit
+/// [`RegistryProfile::required_permissions`] registriert das volle Profil —
+/// genau das tut [`assemble_registry_for_project`].
+///
+/// # Argumente
+/// - `profile` ([`RegistryProfile`]): Werkzeug-/Identitätsprofil.
+/// - `project` (`&ProjectContext`): bereits erkannter Projektkontext.
+/// - `overrides` ([`IdentityOverrides`]): Überschreibungen für den System-Prompt.
+/// - `approval_mode` ([`ApprovalModeCell`]): Freigabemodus-Zelle der Politik.
+/// - `granted` (`&PermissionSet`): Rechte der Ziel-Sandbox; nur geliehen.
+///
+/// # Rückgabe
+/// `Ok(AssembledRegistry)`; `identity.tools_available` ist exakt die Menge der
+/// registrierten Werkzeuge.
+///
+/// # Fehler
+/// - [`RegistryDefaultsError::ContextProviderRegistration`]: der Namensraum des
+///   [`ProjectContextProvider`] ist bereits belegt.
+///
+/// # Nebenläufigkeit
+/// Synchron; alle erzeugten Provider sind `Send + Sync`.
+///
+/// # Beispiele
+/// ```rust,no_run
+/// use std::path::Path;
+/// use harw_extension_api::approval_mode::ApprovalModeCell;
+/// use harw_project_discovery::{DiscoveryConfig, discover_project};
+/// use harw_registry_defaults::authority::reduce_to_read_registry;
+/// use harw_registry_defaults::profile::{
+///     IdentityOverrides, RegistryProfile, assemble_registry_for_sandbox,
+/// };
+/// use harw_sandbox::{Permission, PermissionSet};
+///
+/// let project = discover_project(Path::new("/workspace"), &DiscoveryConfig::default())?;
+/// let parent = PermissionSet::from_policy([Permission::ReadWorkspace]);
+/// let assembled = assemble_registry_for_sandbox(
+///     RegistryProfile::ReadOnlyExplore,
+///     &project,
+///     IdentityOverrides::default(),
+///     ApprovalModeCell::default(),
+///     &reduce_to_read_registry(&parent),
+/// )?;
+/// assert!(!assembled.identity.tools_available.contains(&"deps.source_read".to_owned()));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn assemble_registry_for_sandbox(
+    profile: RegistryProfile,
+    project: &ProjectContext,
+    overrides: IdentityOverrides,
+    approval_mode: ApprovalModeCell,
+    granted: &PermissionSet,
+) -> RegistryDefaultsResult<AssembledRegistry> {
+    let allowed = profile.tool_names_for(granted);
+    let providers: Vec<Arc<dyn ToolProvider>> = profile_tool_providers(profile)
+        .into_iter()
+        .filter_map(|provider| restrict_provider(provider, &allowed))
         .collect();
+
+    let advertised_tools: Vec<String> = allowed.iter().map(|name| (*name).to_owned()).collect();
 
     let IdentityOverrides {
         agent_name,
@@ -996,17 +1209,144 @@ mod tests {
         );
     }
 
+    /// A5: Die einzige Rolle mit Netz registriert **nur** `web.*` — kein
+    /// `fs.*`, kein `deps.*`, also nichts, womit sie Workspace-Daten lesen und
+    /// über `web.fetch` hinaustragen könnte.
     #[test]
-    fn test_research_profile_adds_exactly_the_web_tools() {
+    fn test_research_profile_registers_only_the_web_tools() {
         let assembled = assemble(RegistryProfile::Research);
         let names = registered_names(&assembled);
-        for web_tool in WEB_TOOLS {
-            assert!(names.contains(&(*web_tool).to_owned()), "fehlt: {web_tool}");
+        let expected: Vec<String> = WEB_TOOLS.iter().map(|tool| (*tool).to_owned()).collect();
+        assert_eq!(names, expected);
+        assert!(!names.iter().any(|name| name.starts_with("fs.")));
+        assert!(!names.iter().any(|name| name.starts_with("deps.")));
+        assert_eq!(assembled.identity.tools_available, expected);
+    }
+
+    #[test]
+    fn test_no_profile_registers_browser_tools_without_a_grant() {
+        for profile in RegistryProfile::ALL {
+            let names = profile.registered_tool_names();
+            for tool in BROWSER_TOOLS {
+                assert!(!names.contains(tool), "{profile:?} registriert {tool} ohne Grant");
+            }
         }
+    }
+
+    #[test]
+    fn test_deps_tool_lists_partition_the_provider_order() {
+        let joined: Vec<&str> = DEPS_WORKSPACE_TOOLS
+            .iter()
+            .chain(DEPS_SOURCE_TOOLS.iter())
+            .copied()
+            .collect();
+        assert_eq!(joined, DEPS_TOOLS);
+        assert_eq!(harw_tool_deps::DepsToolProvider::TOOL_NAMES, DEPS_TOOLS);
+    }
+
+    #[test]
+    fn test_required_permissions_per_profile() {
+        use harw_sandbox::Permission;
+
+        let set = |permissions: &[Permission]| PermissionSet::from_policy(permissions.to_vec());
         assert_eq!(
-            names.len(),
-            RegistryProfile::ReadOnlyExplore.registered_tool_names().len() + WEB_TOOLS.len()
+            RegistryProfile::Full.required_permissions(),
+            set(&[
+                Permission::ReadWorkspace,
+                Permission::WriteWorkspace,
+                Permission::ExecuteProcess
+            ])
         );
+        assert_eq!(
+            RegistryProfile::ReadOnlyExplore.required_permissions(),
+            set(&[Permission::ReadWorkspace, Permission::ReadCargoRegistry])
+        );
+        assert_eq!(
+            RegistryProfile::Planning.required_permissions(),
+            set(&[Permission::ReadWorkspace, Permission::ReadCargoRegistry])
+        );
+        assert_eq!(
+            RegistryProfile::Research.required_permissions(),
+            set(&[Permission::NetworkAccess])
+        );
+        assert_eq!(RegistryProfile::NoTools.required_permissions(), PermissionSet::empty());
+    }
+
+    #[test]
+    fn test_tool_names_for_hides_registry_tools_without_read_cargo_registry() {
+        use harw_sandbox::Permission;
+
+        let workspace_only = PermissionSet::from_policy([Permission::ReadWorkspace]);
+        let tools = RegistryProfile::ReadOnlyExplore.tool_names_for(&workspace_only);
+        assert_eq!(
+            tools,
+            vec![
+                "fs.read",
+                "fs.list",
+                "fs.search",
+                "fs.glob",
+                "fs.grep",
+                "deps.graph",
+                "deps.locked"
+            ]
+        );
+        for profile in RegistryProfile::ALL {
+            assert_eq!(
+                profile.tool_names_for(&profile.required_permissions()),
+                profile.registered_tool_names(),
+                "{profile:?}: unter den eigenen Rechten fällt nichts heraus"
+            );
+            assert!(
+                profile.tool_names_for(&PermissionSet::empty()).is_empty(),
+                "{profile:?}: ohne Rechte bleibt nichts"
+            );
+        }
+    }
+
+    #[test]
+    fn test_assemble_registry_for_sandbox_registers_and_advertises_only_granted_tools() {
+        use harw_sandbox::Permission;
+
+        let cwd = std::env::current_dir().expect("cwd");
+        let project =
+            discover_project(&cwd, &DiscoveryConfig::default()).expect("Discovery im Workspace");
+        let granted = PermissionSet::from_policy([Permission::ReadWorkspace]);
+        let assembled = assemble_registry_for_sandbox(
+            RegistryProfile::ReadOnlyExplore,
+            &project,
+            IdentityOverrides::default(),
+            ApprovalModeCell::default(),
+            &granted,
+        )
+        .expect("assemble");
+
+        let expected: Vec<String> = RegistryProfile::ReadOnlyExplore
+            .tool_names_for(&granted)
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        assert_eq!(registered_names(&assembled), expected);
+        assert_eq!(assembled.identity.tools_available, expected);
+
+        let deps_source = ToolName::new("deps.source_read");
+        for provider in assembled.registry.tool_providers() {
+            assert!(
+                provider.executor(&deps_source).is_none(),
+                "deps.source_read darf ohne ReadCargoRegistry nicht per Namensraten laufen"
+            );
+        }
+
+        // Research ohne NetworkAccess: kein einziger Provider bleibt übrig.
+        let research = assemble_registry_for_sandbox(
+            RegistryProfile::Research,
+            &project,
+            IdentityOverrides::default(),
+            ApprovalModeCell::default(),
+            &granted,
+        )
+        .expect("assemble");
+        assert!(research.registry.tool_providers().is_empty());
+        assert!(research.identity.tools_available.is_empty());
     }
 
     #[test]
@@ -1236,6 +1576,12 @@ mod tests {
             profile_for_role(role_names::ANALYST),
             Some(RegistryProfile::ReadOnlyExplore)
         );
+        assert_eq!(
+            profile_for_role(role_names::EXECUTOR),
+            Some(RegistryProfile::Full),
+            "executor ist die einzige eingebaute Rolle mit dem vollen, \
+             schreibenden Coding-Satz (Slice B7)"
+        );
         for role in [
             role_names::SECURITY_EGRESS_TRIAGE,
             role_names::SECURITY_BASELINE_TRIAGE,
@@ -1264,8 +1610,16 @@ mod tests {
     /// Profil, auf das ein unbekannter Name zurückfallen könnte. Geprüft wird
     /// die verbliebene Zusage — `Full` ist das einzige nicht-read-only Profil
     /// und muss ausdrücklich gewählt werden.
+    ///
+    /// Seit Slice B7 ist `executor` die eine ausdrückliche, dokumentierte
+    /// Ausnahme (siehe `agents/executor.toml` und
+    /// [`role_names::EXECUTOR`]) — jede **andere** eingebaute Rolle bleibt
+    /// weiterhin ausgeschlossen. Der Test benennt die Ausnahme explizit
+    /// (kein Wildcard-`filter`), damit eine künftige zweite schreibende
+    /// Rolle diesen Test bewusst anfassen muss statt stillschweigend
+    /// durchzurutschen.
     #[test]
-    fn test_full_is_the_only_writable_profile_and_never_a_fallback() {
+    fn test_full_is_the_only_writable_profile_and_never_an_unnamed_fallback() {
         assert!(!RegistryProfile::Full.is_read_only());
         for profile in RegistryProfile::ALL
             .iter()
@@ -1276,9 +1630,13 @@ mod tests {
                 "{profile:?} ist weder Full noch read-only"
             );
         }
-        // Keine eingebaute Rolle bekommt `Full`: der einzige Weg dorthin ist
-        // eine ausdrückliche Wahl in der Composition-Root, nie ein Fallback.
+        // Keine eingebaute Rolle außer der ausdrücklichen Ausnahme
+        // `executor` bekommt `Full`: der einzige Weg dorthin ist eine
+        // ausdrückliche Wahl in `profile_for_role`, nie ein Fallback.
         for role in role_names::ALL {
+            if role == &role_names::EXECUTOR {
+                continue;
+            }
             assert_ne!(
                 profile_for_role(role),
                 Some(RegistryProfile::Full),
@@ -1319,7 +1677,14 @@ mod tests {
         /// Rollendateien, die die Verzeichnis-Sammlung bereits findet, deren
         /// Aufnahme in `role_names::ALL` aber ein eigener, noch offener
         /// Befund ist (siehe Moduldokumentation von `role_names`).
-        const PENDING_EXCLUSIONS: &[&str] = &["context-steward", "intel-scout"];
+        /// `memory-steward` (Memory v3, §5.3) hat eine Rollendatei, aber noch
+        /// kein Profil: die Konsolidierung braucht genau `fs.*` **ohne**
+        /// `shell.exec`, und ein solches Profil gibt es bisher nicht.
+        /// `RegistryProfile::Full` wäre zu weit — die Deckungsprüfung in
+        /// `tests/tool_admission_coverage.rs` würde die Rolle dann zwingen,
+        /// auch `shell.exec` zuzulassen. Bis das schmale Profil existiert,
+        /// bleibt die Rolle eine dokumentierte Ausnahme statt still gesenkt.
+        const PENDING_EXCLUSIONS: &[&str] = &["context-steward", "intel-scout", "memory-steward"];
 
         let discovered: BTreeSet<&str> = crate::embedded_agents::builtin_agent_toml()
             .iter()

@@ -124,24 +124,20 @@
 //!    konfiguriertem Volume. Diese Zähler sagen nichts über physische
 //!    Datenträgerlast aus, die dieser Sensor beobachten soll — siehe
 //!    [`sensor::is_noise_device`].
-//! 2. **Partitionen ausgeschlossen — Begründung gegen Doppelzählung.**
-//!    `sda` und `sda1` erscheinen beide unter `/sys/block`, `nvme0n1` und
-//!    `nvme0n1p1` ebenso: das Elterngerät und jede seiner Partitionen. Beide
-//!    zu zählen zählte dieselbe physische I/O doppelt — eine Schreiboperation
-//!    auf `sda1` erscheint in der Praxis auch in `sda`s Zählern (die Summe
-//!    aller Partitionen liegt nahe an, aber nicht exakt bei, den
-//!    Ganzgerät-Zählern, je nach Kernel-Version). Dieser Sensor meldet
-//!    deshalb **nur Ganzgeräte**, keine Partitionen. Die Erkennung
-//!    ([`sensor::is_partition_of_any`]) verlässt sich nicht auf eine
-//!    Namensfamilie (SCSI-Schema `sda`→`sda1` vs. NVMe-Schema
-//!    `nvme0n1`→`nvme0n1p1` vs. MMC-Schema `mmcblk0`→`mmcblk0p1` unterscheiden
-//!    sich strukturell zu sehr für eine einzelne Regel), sondern auf
-//!    **Koexistenz innerhalb desselben Polls**: ein Gerätename ist eine
-//!    Partition, wenn ein *anderer*, tatsächlich sichtbarer Gerätename sein
-//!    exaktes Präfix ist und der Rest entweder rein numerisch ist (`sda` +
-//!    `1`) oder mit `p` beginnt, gefolgt von Ziffern (`nvme0n1` + `p1`,
-//!    `mmcblk0` + `p1`). Das behandelt alle drei Namensfamilien mit derselben
-//!    Regel, ohne eine davon eigens zu kennen.
+//! 2. **Keine Partitionen — strukturell, nicht per Heuristik (F-204).**
+//!    Eine frühere Fassung ging davon aus, `/sys/block` liste `sda` und
+//!    `sda1` (bzw. `nvme0n1` und `nvme0n1p1`) gleichermaßen als Geschwister
+//!    und filterte Partitionen deshalb über eine Namens-Koexistenz-Heuristik
+//!    heraus. Diese Annahme ist falsch: `/sys/block` listet ausschließlich
+//!    Ganzgeräte; eine Partition erscheint immer eine Ebene *unterhalb*
+//!    ihres Ganzgeräts (`/sys/block/sda/sda1`, nicht `/sys/block/sda1`). Die
+//!    Heuristik erzeugte deshalb nur Fehlklassifikationen, ohne je eine
+//!    echte Partition zu treffen — zum Beispiel wurde das eigenständige,
+//!    physische Gerät `nvme0n10` fälschlich als „Partition 0" von `nvme0n1`
+//!    ausgeschlossen. Das Glob-Muster für Geräteverzeichnisse (`*/stat`,
+//!    genau eine Ebene) trifft echte Partitionen aus demselben Grund nie — dieser
+//!    Sensor meldet also allein durch die Form seines Glob-Musters nur
+//!    Ganzgeräte, ohne eine gesonderte Partitionsfilterung zu brauchen.
 //! 3. **Anzahl hart begrenzt.** Die ersten beiden Filter schließen bekanntes
 //!    Rauschen aus, verhindern aber nicht, dass ein Host mit ungewöhnlich
 //!    vielen *physischen* Datenträgern (ein großes Storage-Array) die
@@ -206,13 +202,18 @@
 //!
 //! # Examples
 //! ```rust,no_run
+//! use harw_dod_cap::scope::AliasRoot;
 //! use harw_dod_cap::{Capability, ReadScope, SensorHandle};
 //! use harw_dod_blockio::BlockioSensor;
 //! use harw_dod_signals::Sensor;
 //! use harw_types::SensorId;
 //! use std::path::PathBuf;
 //!
-//! let scope = ReadScope::from_roots([PathBuf::from("/sys/block")]);
+//! // `/sys/block/*`-Einträge sind Symlinks nach `/sys/devices/...` (F-005);
+//! // `AliasRoot::sysfs_class` baut den Bereich, der das zulässt.
+//! let alias =
+//!     AliasRoot::sysfs_class(PathBuf::from("/sys/block")).expect("gültige sysfs-Klassenwurzel");
+//! let scope = ReadScope::from_roots_and_aliases(Vec::new(), [alias]);
 //! let handle = SensorHandle::new(SensorId::from_str("blockio-0"), Capability::ReadSysfsBlock)
 //!     .bind(scope);
 //! let sensor = BlockioSensor::from(handle);

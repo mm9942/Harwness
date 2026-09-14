@@ -15,7 +15,27 @@
 //!
 //! ## Fehler
 //! Konstruktions- und Auflösungsfehler laufen über [`HttpProviderError`];
-//! Laufzeitfehler in `respond` werden in [`harw_core::ModelError`] übersetzt.
+//! Laufzeitfehler in `respond` werden in [`harw_core::ModelError`] übersetzt
+//! (W4a / A-OAI: `Transient`/`Auth`/`QuotaExceeded`/`ContextLength`/`Timeout`,
+//! siehe `error::model_error_for_status`).
+//!
+//! ## Wire-Vertrag (W4a / A-OAI)
+//! - **Tool-Ergebnisse** gehen ausschließlich über
+//!   [`harw_core::envelope::render_tool_result`] auf den Wire (Trust-Hülle,
+//!   Byte-Deckel `ModelRequest::tool_result_max_bytes`).
+//! - **Datenblock** (`ModelRequest::data_block`): eigenes `user`-Item bzw.
+//!   `user`-Nachricht **am Ende** des Inputs, also nach allen
+//!   `function_call_output`-Items — der Verlaufspräfix bleibt cache-stabil.
+//! - **Responses-API:** Reasoning-Items (`type: "reasoning"`) werden unverändert
+//!   als `OpaqueReasoning{provider,..}` in `ModelResponse::reasoning` gemeldet;
+//!   Items mit `encrypted_content` werden je Tool-Call-Runde provider-lokal
+//!   gemerkt und vor den zugehörigen `function_call`-Items zurückgespielt
+//!   (`store: false`, `include: ["reasoning.encrypted_content"]`).
+//!   `status: "incomplete"` + `incomplete_details.reason` → `StopReason::MaxTokens`
+//!   bzw. `ContentFilter`; unvollständige Tool-Calls werden verworfen.
+//! - **Chat-Completions:** `reasoning_effort` (top-level), `max_completion_tokens`,
+//!   `finish_reason` `stop|length|tool_calls|content_filter` → `StopReason`.
+//! - Wiederholung vorübergehender Fehler: [`RetryingProvider`] (Modul [`retry`]).
 //!
 //! ## Sicherheit
 //! Der API-Key liegt in `secrecy::SecretString` und wird ausschließlich beim
@@ -37,20 +57,27 @@
 #![forbid(unsafe_code)]
 
 pub mod anthropic;
+mod anthropic_caps;
 mod error;
+pub mod retry;
 pub mod routing;
 
+use error::{model_error_for_status, model_error_for_transport, retry_after_hint};
+use harw_core::envelope::render_tool_result;
+use harw_core::model::StopReason;
 use harw_core::{
     ModelError, ModelFuture, ModelProvider, ModelRequest, ModelResponse, ToolCallResult,
 };
+use harw_protocol::{OpaqueReasoning, ResultTrust, TurnItem};
 use harw_provider::openai::{ContentPart, InputItem, ReasoningConfig, ResponsesRequest, ToolDef};
 use harw_sandbox::{EgressHost, EgressUrl};
 use harw_tools::{FunctionToolSpec, JsonSchema, ToolCall, ToolName, ToolSpec};
 use harw_types::{TokenUsage, ToolCallId};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 pub use anthropic::{
@@ -58,6 +85,10 @@ pub use anthropic::{
     anthropic_messages_url, build_messages_body, extract_anthropic_text,
 };
 pub use error::{HttpProviderError, HttpProviderResult};
+pub use retry::{
+    JitterSource, RetryDecision, RetryPolicy, RetrySleeper, RetryingProvider, SleepFuture,
+    StdJitter, ThreadSleeper, retry_decision,
+};
 pub use routing::RoutingModelProvider;
 
 /// Synchronously resolves a `secrets:` credential reference.
@@ -101,6 +132,18 @@ const REDIRECT_CROSS_ORIGIN_REASON: &str =
 const REDIRECT_LIMIT_REASON: &str = "provider redirect limit exceeded";
 const INVALID_CREDENTIAL_HEADER_REASON: &str =
     "provider credential is not a valid HTTP header value";
+/// Byte-Deckel je gerendertem Tool-Ergebnis, wenn der Request keinen setzt
+/// (`ModelRequest::tool_result_max_bytes == None`). Für den ganzen Verlauf
+/// gleich, damit bereits gesendete Ergebnisse bytegleich (cache-stabil) bleiben.
+const DEFAULT_TOOL_RESULT_MAX_BYTES: usize = 256 * 1024;
+/// Tool-Name im Envelope, wenn der Verlauf den zugehörigen Call nicht enthält.
+const UNKNOWN_TOOL_NAME: &str = "unknown";
+/// `include`-Wert der Responses-API für zustandslos wiederverwendbares Reasoning.
+const INCLUDE_ENCRYPTED_REASONING: &str = "reasoning.encrypted_content";
+/// Höchstzahl gemerkter Reasoning-Runden je Provider (FIFO).
+const MAX_REASONING_REPLAY_ENTRIES: usize = 64;
+/// Obergrenze für provider-gelieferte Grund-Strings in `StopReason::Other`.
+const MAX_STOP_REASON_CHARS: usize = 64;
 
 /// Quellen, aus denen Credential-Referenzen aufgelöst werden.
 #[derive(Clone, Copy)]
@@ -565,6 +608,76 @@ pub struct OpenAiResponsesProvider {
     headers: reqwest::header::HeaderMap,
     transport: Transport,
     request_timeout: Duration,
+    reasoning_replay: ReasoningReplay,
+}
+
+/// Eine gemerkte Reasoning-Runde der Responses-API (W4a / A-OAI).
+///
+/// `blocks` sind die unveränderten `reasoning`-Output-Items mit
+/// `encrypted_content`; `call_ids` die `function_call`s derselben Antwort.
+#[derive(Debug, Clone, PartialEq)]
+struct ReplayEntry {
+    call_ids: Vec<String>,
+    provider: String,
+    model: String,
+    blocks: Vec<Value>,
+}
+
+/// Provider-lokaler, begrenzter Speicher für zurückzuspielende Reasoning-Items.
+///
+/// # Description
+/// `ConversationHistory` hat (Stand W3) keinen Träger für opake
+/// Reasoning-Blöcke; bis A-LOOP `ModelResponse::reasoning` persistiert, merkt
+/// sich der Provider die Blöcke je Tool-Call-Runde und spielt sie zurück,
+/// sobald der Verlauf die zugehörigen `function_call`s enthält. Nur Einträge
+/// desselben Providers **und** Modells werden verwendet.
+///
+/// # Concurrency
+/// `Mutex` nur für kurze Kopier-/Einfügeoperationen, nie über `await` gehalten;
+/// Poisoning wird toleriert (reiner Cache).
+#[derive(Debug, Default)]
+struct ReasoningReplay {
+    entries: Mutex<VecDeque<ReplayEntry>>,
+}
+
+impl ReasoningReplay {
+    // Merkt eine Runde; älteste Einträge fallen bei Überlauf heraus.
+    fn remember(&self, entry: ReplayEntry) {
+        if entry.call_ids.is_empty() || entry.blocks.is_empty() {
+            return;
+        }
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        while entries.len() >= MAX_REASONING_REPLAY_ENTRIES {
+            entries.pop_front();
+        }
+        entries.push_back(entry);
+    }
+
+    // Liefert die Runden, deren Tool-Calls im Verlauf von `request` stehen.
+    fn for_request(&self, provider: &str, model: &str, request: &ModelRequest) -> Vec<ReplayEntry> {
+        let call_ids: BTreeSet<&str> = request
+            .history
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::ToolCall(call) => Some(call.call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        if call_ids.is_empty() {
+            return Vec::new();
+        }
+        let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries
+            .iter()
+            .filter(|entry| {
+                entry.provider == provider
+                    && entry.model == model
+                    && entry.call_ids.iter().any(|id| call_ids.contains(id.as_str()))
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 impl OpenAiResponsesProvider {
@@ -614,6 +727,7 @@ impl OpenAiResponsesProvider {
             headers: reqwest::header::HeaderMap::new(),
             transport,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            reasoning_replay: ReasoningReplay::default(),
         }
     }
 
@@ -1185,6 +1299,7 @@ fn build_responses_tools(tools: &[ToolSpec]) -> Vec<ToolDef> {
 /// # Returns
 /// Eine vollständig befüllte [`ResponsesRequest`], bereit zur Serialisierung.
 fn build_request(model: &str, request: &ModelRequest) -> ResponsesRequest {
+    let renderer = ToolResultRenderer::new(request);
     let mut input = Vec::new();
     for message in request.history.to_model_messages() {
         match message {
@@ -1212,16 +1327,21 @@ fn build_request(model: &str, request: &ModelRequest) -> ResponsesRequest {
                 });
             }
             harw_core::ModelMessage::ToolResult { call_id, result } => {
-                let output = match result {
-                    ToolCallResult::Success { value } => value.to_string(),
-                    ToolCallResult::Error { message } => message,
-                };
+                let output = renderer.render(&call_id, &result);
                 input.push(InputItem::FunctionCallOutput {
                     call_id: call_id.to_string(),
                     output,
                 });
             }
         }
+    }
+    if let Some(data_block) = non_empty_data_block(request) {
+        input.push(InputItem::Message {
+            role: "user".to_owned(),
+            content: vec![ContentPart::InputText {
+                text: data_block.to_owned(),
+            }],
+        });
     }
 
     let mut req = ResponsesRequest::new(model.to_owned(), input);
@@ -1245,6 +1365,316 @@ fn build_request(model: &str, request: &ModelRequest) -> ResponsesRequest {
         });
     }
     req
+}
+
+/// Liefert den nicht-leeren Datenblock eines Requests.
+fn non_empty_data_block(request: &ModelRequest) -> Option<&str> {
+    request
+        .data_block
+        .as_deref()
+        .filter(|data_block| !data_block.trim().is_empty())
+}
+
+/// Rendert Tool-Ergebnisse des Verlaufs über die Trust-Hülle (W3 C-PROTO).
+///
+/// # Description
+/// `ModelMessage::ToolResult` trägt weder Tool-Namen noch Trust-Klasse; beide
+/// werden einmal je Request aus `ConversationHistory::items` je `call_id`
+/// gesammelt. Fehlt der Call, heißt das Tool [`UNKNOWN_TOOL_NAME`]; fehlt das
+/// Ergebnis-Item, gilt der sichere Default `Untrusted`.
+struct ToolResultRenderer {
+    names: BTreeMap<String, String>,
+    trusts: BTreeMap<String, ResultTrust>,
+    max_bytes: usize,
+}
+
+impl ToolResultRenderer {
+    // Sammelt Namen/Trust aus dem Verlauf und den Byte-Deckel aus dem Request.
+    fn new(request: &ModelRequest) -> Self {
+        let mut names = BTreeMap::new();
+        let mut trusts = BTreeMap::new();
+        for item in request.history.items() {
+            match item {
+                TurnItem::ToolCall(call) => {
+                    names.insert(call.call_id.as_str().to_owned(), call.tool_name.clone());
+                }
+                TurnItem::ToolResult(result) => {
+                    trusts.insert(result.call_id.as_str().to_owned(), result.trust);
+                }
+                _ => {}
+            }
+        }
+        Self {
+            names,
+            trusts,
+            max_bytes: request
+                .tool_result_max_bytes
+                .unwrap_or(DEFAULT_TOOL_RESULT_MAX_BYTES),
+        }
+    }
+
+    // Wire-Text eines Tool-Ergebnisses (Envelope bei `Untrusted`).
+    fn render(&self, call_id: &ToolCallId, result: &ToolCallResult) -> String {
+        let tool = self
+            .names
+            .get(call_id.as_str())
+            .map_or(UNKNOWN_TOOL_NAME, String::as_str);
+        let trust = self
+            .trusts
+            .get(call_id.as_str())
+            .copied()
+            .unwrap_or_default();
+        render_tool_result(tool, trust, result, self.max_bytes).text
+    }
+}
+
+/// Baut den vollständigen `/responses`-Body inkl. Reasoning-Replay.
+///
+/// # Description
+/// Serialisiert [`build_request`] und ergänzt, was `ResponsesRequest` (in
+/// `harw-provider`) nicht modelliert:
+/// - gemerkte Reasoning-Items unmittelbar **vor** dem ersten `function_call`
+///   ihrer Runde (unverändert, in Originalreihenfolge);
+/// - `max_output_tokens` aus `ModelRequest::max_output_tokens`;
+/// - `include: ["reasoning.encrypted_content"]`, wenn Reasoning angefordert ist.
+///
+/// # Errors
+/// `serde_json::Error`, falls die Serialisierung scheitert.
+fn build_responses_body(
+    model: &str,
+    request: &ModelRequest,
+    replay: &[ReplayEntry],
+) -> Result<Value, serde_json::Error> {
+    let mut body = serde_json::to_value(build_request(model, request))?;
+    if !replay.is_empty() {
+        if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
+            let items = std::mem::take(input);
+            let mut emitted = vec![false; replay.len()];
+            for item in items {
+                let function_call_id = (item.get("type").and_then(Value::as_str)
+                    == Some("function_call"))
+                .then(|| item.get("call_id").and_then(Value::as_str))
+                .flatten();
+                if let Some(call_id) = function_call_id {
+                    for (entry, done) in replay.iter().zip(emitted.iter_mut()) {
+                        if !*done && entry.call_ids.iter().any(|id| id == call_id) {
+                            *done = true;
+                            input.extend(entry.blocks.iter().cloned());
+                        }
+                    }
+                }
+                input.push(item);
+            }
+        }
+    }
+    if let Some(max_output_tokens) = request.max_output_tokens {
+        body["max_output_tokens"] = Value::from(max_output_tokens);
+    }
+    if request.reasoning_effort.is_some() {
+        body["include"] = serde_json::json!([INCLUDE_ENCRYPTED_REASONING]);
+    }
+    Ok(body)
+}
+
+/// Kürzt einen provider-gelieferten Grund auf ein unkritisches Token.
+fn bounded_reason(reason: &str) -> String {
+    reason
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+        .take(MAX_STOP_REASON_CHARS)
+        .collect()
+}
+
+/// Sammelt `refusal`-Parts der `message`-Items einer Responses-Antwort.
+fn extract_responses_refusal(body: &Value) -> Option<String> {
+    let output = body.get("output")?.as_array()?;
+    let refusal: String = output
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+        .filter_map(|item| item.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("refusal"))
+        .filter_map(|part| part.get("refusal").and_then(Value::as_str))
+        .collect();
+    (!refusal.is_empty()).then_some(refusal)
+}
+
+/// Projiziert eine nicht-gestreamte Responses-Antwort auf den W3-Vertrag.
+///
+/// # Description
+/// - `status` fehlt → wie `completed`; `failed`/`cancelled` → `RequestFailed`.
+/// - `incomplete`: `incomplete_details.reason` `max_output_tokens` →
+///   [`StopReason::MaxTokens`], `content_filter` → [`StopReason::ContentFilter`],
+///   sonst `Other`. Teiltext bleibt erhalten; `function_call`-Items werden
+///   verworfen (Argumente können abgeschnitten sein — nie ausführen).
+/// - sonst: Tool-Calls → `ToolUse`; nur Refusal-Parts → `Refusal`; Text → `EndTurn`;
+///   gar nichts → `EmptyResponse`.
+/// - `reasoning`-Items → `OpaqueReasoning{provider, model, blocks}` (verbatim);
+///   Items mit `encrypted_content` einer Tool-Call-Runde → [`ReplayEntry`].
+///
+/// # Errors
+/// `RequestFailed` bei `failed`/`cancelled` oder defekten Tool-Calls;
+/// `EmptyResponse` bei leerer, vollständiger Antwort.
+fn interpret_responses(
+    body: &Value,
+    provider: &str,
+    model: &str,
+) -> Result<(ModelResponse, Option<ReplayEntry>), ModelError> {
+    let status = body
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("completed");
+    if matches!(status, "failed" | "cancelled") {
+        return Err(ModelError::RequestFailed(format!(
+            "provider reported response status '{status}'"
+        )));
+    }
+    let incomplete = (status == "incomplete").then(|| {
+        body.pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    });
+    let output = body
+        .get("output")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let text = extract_assistant_text(body);
+    let refusal = extract_responses_refusal(body);
+    let tool_calls = if incomplete.is_some() {
+        let dropped = output
+            .iter()
+            .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+            .count();
+        if dropped > 0 {
+            tracing::warn!(dropped, "dropping tool calls of an incomplete response");
+        }
+        Vec::new()
+    } else {
+        extract_openai_tool_calls(body, Transport::Responses)
+            .map_err(|error| ModelError::RequestFailed(error.to_string()))?
+    };
+    let stop = match incomplete {
+        Some("max_output_tokens") => StopReason::MaxTokens,
+        Some("content_filter") => StopReason::ContentFilter,
+        Some(other) => StopReason::Other(bounded_reason(other)),
+        None if !tool_calls.is_empty() => StopReason::ToolUse,
+        None if text.is_none() && refusal.is_some() => StopReason::Refusal {
+            detail: refusal.clone(),
+        },
+        None => StopReason::EndTurn,
+    };
+    if incomplete.is_none() && text.is_none() && tool_calls.is_empty() && refusal.is_none() {
+        return Err(ModelError::EmptyResponse);
+    }
+
+    let blocks: Vec<Value> = output
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+        .cloned()
+        .collect();
+    let replayable: Vec<Value> = blocks
+        .iter()
+        .filter(|block| {
+            block
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| !content.is_empty())
+        })
+        .cloned()
+        .collect();
+    let replay = (!tool_calls.is_empty() && !replayable.is_empty()).then(|| ReplayEntry {
+        call_ids: tool_calls
+            .iter()
+            .map(|call| call.id.as_str().to_owned())
+            .collect(),
+        provider: provider.to_owned(),
+        model: model.to_owned(),
+        blocks: replayable,
+    });
+    let reasoning = (!blocks.is_empty()).then(|| OpaqueReasoning {
+        provider: provider.to_owned(),
+        model: model.to_owned(),
+        blocks,
+    });
+
+    Ok((
+        ModelResponse {
+            message: text,
+            tool_calls,
+            usage: extract_openai_usage(body, Transport::Responses),
+            stop,
+            reasoning,
+        },
+        replay,
+    ))
+}
+
+/// Projiziert eine nicht-gestreamte Chat-Completions-Antwort auf den W3-Vertrag.
+///
+/// # Description
+/// `choices[0].finish_reason`: `length` → `MaxTokens`, `content_filter` →
+/// `ContentFilter` (beide: Tool-Calls verworfen, Teiltext bleibt);
+/// vorhandene Tool-Calls → `ToolUse` (auch bei `stop`, manche Gateways);
+/// nur `message.refusal` → `Refusal`; `stop`/`tool_calls`/fehlend → `EndTurn`;
+/// unbekannt → `Other`.
+///
+/// # Errors
+/// `RequestFailed` bei defekten Tool-Calls; `EmptyResponse`, wenn eine nicht
+/// abgeschnittene Antwort weder Text, Tool-Calls noch Refusal enthält.
+fn interpret_chat(body: &Value) -> Result<ModelResponse, ModelError> {
+    let choice = body.pointer("/choices/0");
+    let finish = choice
+        .and_then(|choice| choice.get("finish_reason"))
+        .and_then(Value::as_str);
+    let text = extract_chat_content(body);
+    let refusal = choice
+        .and_then(|choice| choice.pointer("/message/refusal"))
+        .and_then(Value::as_str)
+        .filter(|refusal| !refusal.is_empty())
+        .map(str::to_owned);
+    let truncated = matches!(finish, Some("length" | "content_filter"));
+    let tool_calls = if truncated {
+        let dropped = choice
+            .and_then(|choice| choice.pointer("/message/tool_calls"))
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        if dropped > 0 {
+            tracing::warn!(dropped, "dropping tool calls of a truncated chat completion");
+        }
+        Vec::new()
+    } else {
+        extract_openai_tool_calls(body, Transport::Chat)
+            .map_err(|error| ModelError::RequestFailed(error.to_string()))?
+    };
+    let stop = match finish {
+        Some("length") => StopReason::MaxTokens,
+        Some("content_filter") => StopReason::ContentFilter,
+        _ if !tool_calls.is_empty() => StopReason::ToolUse,
+        _ if text.is_none() && refusal.is_some() => StopReason::Refusal {
+            detail: refusal.clone(),
+        },
+        None | Some("stop" | "tool_calls" | "function_call") => StopReason::EndTurn,
+        Some(other) => StopReason::Other(bounded_reason(other)),
+    };
+    if !truncated && text.is_none() && tool_calls.is_empty() && refusal.is_none() {
+        return Err(ModelError::EmptyResponse);
+    }
+    Ok(ModelResponse {
+        message: text,
+        tool_calls,
+        usage: extract_openai_usage(body, Transport::Chat),
+        stop,
+        reasoning: None,
+    })
+}
+
+/// Liest einen Header als eigenen String (für Werte, die `response.text()` überleben).
+fn header_string(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 /// Übersetzt das interne Reasoning-Effort-Level in den OpenAI-Wire-Wert für
@@ -1340,6 +1770,7 @@ fn build_chat_tools(tools: &[ToolSpec]) -> Vec<Value> {
 /// # Returns
 /// Ein [`serde_json::Value`]-Objekt, direkt als Request-Body serialisierbar.
 fn build_chat_body(request: &ModelRequest, model: &str) -> Value {
+    let renderer = ToolResultRenderer::new(request);
     let mut messages: Vec<Value> = Vec::new();
 
     let mut system = request.system_prompt.clone();
@@ -1377,10 +1808,7 @@ fn build_chat_body(request: &ModelRequest, model: &str) -> Value {
                 );
             }
             harw_core::ModelMessage::ToolResult { call_id, result } => {
-                let content = match result {
-                    ToolCallResult::Success { value } => value.to_string(),
-                    ToolCallResult::Error { message } => message,
-                };
+                let content = renderer.render(&call_id, &result);
                 messages.push(serde_json::json!({
                     "role": "tool",
                     "tool_call_id": call_id.as_str(),
@@ -1389,10 +1817,19 @@ fn build_chat_body(request: &ModelRequest, model: &str) -> Value {
             }
         }
     }
+    if let Some(data_block) = non_empty_data_block(request) {
+        messages.push(serde_json::json!({ "role": "user", "content": data_block }));
+    }
 
     let mut body = serde_json::json!({ "model": model, "messages": messages });
     if !request.tools.is_empty() {
         body["tools"] = Value::Array(build_chat_tools(&request.tools));
+    }
+    if let Some(effort) = request.reasoning_effort {
+        body["reasoning_effort"] = Value::from(map_effort_to_openai(effort));
+    }
+    if let Some(max_output_tokens) = request.max_output_tokens {
+        body["max_completion_tokens"] = Value::from(max_output_tokens);
     }
     body
 }
@@ -1692,10 +2129,17 @@ impl ModelProvider for OpenAiResponsesProvider {
             let model = self.selected_model(&request)?;
             let (url, wire) = match self.transport {
                 Transport::Responses => {
-                    tracing::debug!(model, "sending responses request");
+                    let replay =
+                        self.reasoning_replay
+                            .for_request(&self.provider_id, model, &request);
+                    tracing::debug!(
+                        model,
+                        replayed_reasoning_rounds = replay.len(),
+                        "sending responses request"
+                    );
                     (
                         format!("{}/responses", self.base_url),
-                        serde_json::to_value(build_request(model, &request))?,
+                        build_responses_body(model, &request, &replay)?,
                     )
                 }
                 Transport::Chat => {
@@ -1713,57 +2157,36 @@ impl ModelProvider for OpenAiResponsesProvider {
                 .timeout(self.request_timeout)
                 .send()
                 .await
-                .map_err(|error| {
-                    ModelError::RequestFailed(HttpProviderError::from(error).to_string())
-                })?;
+                .map_err(|error| model_error_for_transport(error, false))?;
 
             let status = response.status();
-            let retry_after_header = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned);
+            let retry_after = header_string(response.headers(), "retry-after");
+            let retry_after_ms = header_string(response.headers(), "retry-after-ms");
             let request_id = provider_request_id(response.headers());
-            let body = response.text().await.map_err(|error| {
-                ModelError::RequestFailed(HttpProviderError::from(error).to_string())
-            })?;
-
-            if status.as_u16() == 429 {
-                let retry_after = parse_retry_after(retry_after_header.as_deref(), &body);
-                return Err(ModelError::RateLimited {
-                    retry_after_secs: retry_after.as_secs(),
-                    message: sanitized_provider_error(
-                        status.as_u16(),
-                        request_id.as_deref(),
-                        &body,
-                    ),
-                });
-            }
+            let body = response
+                .text()
+                .await
+                .map_err(|error| model_error_for_transport(error, true))?;
 
             if !status.is_success() {
-                return Err(ModelError::RequestFailed(sanitized_provider_error(
-                    status.as_u16(),
-                    request_id.as_deref(),
-                    &body,
-                )));
+                let hint = retry_after_hint(retry_after.as_deref(), retry_after_ms.as_deref(), &body);
+                let error =
+                    model_error_for_status(status.as_u16(), request_id.as_deref(), hint, &body);
+                tracing::debug!(status = status.as_u16(), retryable = error.is_retryable(), "provider returned an error status");
+                return Err(error);
             }
 
             let value: Value = serde_json::from_str(&body)?;
-            let text = match self.transport {
-                Transport::Responses => extract_assistant_text(&value),
-                Transport::Chat => extract_chat_content(&value),
-            };
-            let tool_calls = extract_openai_tool_calls(&value, self.transport)
-                .map_err(|error| ModelError::RequestFailed(error.to_string()))?;
-            if text.is_none() && tool_calls.is_empty() {
-                return Err(ModelError::EmptyResponse);
+            match self.transport {
+                Transport::Responses => {
+                    let (response, replay) = interpret_responses(&value, &self.provider_id, model)?;
+                    if let Some(entry) = replay {
+                        self.reasoning_replay.remember(entry);
+                    }
+                    Ok(response)
+                }
+                Transport::Chat => interpret_chat(&value),
             }
-
-            Ok(ModelResponse {
-                message: text,
-                tool_calls,
-                usage: extract_openai_usage(&value, self.transport),
-            })
         })
     }
 }
@@ -2209,6 +2632,9 @@ mod tests {
             reasoning_effort: None,
             model_id: model_id.map(Into::into),
             provider_id: provider_id.map(Into::into),
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         }
     }
 
@@ -2488,6 +2914,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
 
         let body = build_chat_body(&request, "gpt-4o-mini");
@@ -2532,6 +2961,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
 
         let body = build_chat_body(&request, "m");
@@ -2653,6 +3085,9 @@ mod tests {
             reasoning_effort: Some(harw_types::ReasoningEffort::Minimal),
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
 
         let req = build_request("gpt-test", &request);
@@ -2675,6 +3110,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
 
         let req = build_request("gpt-test", &request);
@@ -2808,6 +3246,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
         let req = build_request("gpt-test", &request);
         assert_eq!(req.tools.len(), 1);
@@ -2833,6 +3274,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
         let req = build_request("gpt-test", &request);
         assert_eq!(req.input.len(), 1);
@@ -2868,6 +3312,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
         let body = build_chat_body(&request, "gpt-4o-mini");
         let tools = body
@@ -2902,6 +3349,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
         let body = build_chat_body(&request, "gpt-4o-mini");
         assert!(body.get("tools").is_none());
@@ -2925,6 +3375,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
         let body = build_chat_body(&request, "gpt-4o-mini");
         let messages = body
@@ -2981,6 +3434,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
         let body = build_chat_body(&request, "gpt-4o-mini");
         let messages = body
@@ -3031,6 +3487,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
         let body = build_chat_body(&request, "gpt-4o-mini");
         let messages = body
@@ -3099,6 +3558,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
         let body = build_chat_body(&request, "gpt-4o-mini");
         let messages = body
@@ -3146,6 +3608,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
         let body = build_chat_body(&request, "gpt-4o-mini");
         let messages = body
@@ -4079,6 +4544,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         };
         let response = provider.respond(request).await.expect("live respond");
         assert!(response.message.is_some());

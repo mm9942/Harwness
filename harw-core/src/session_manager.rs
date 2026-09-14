@@ -51,6 +51,39 @@ impl SessionManager {
         id
     }
 
+    /// Liefert eine Kopie des Event-Senders, mit dem dieser Manager Sessions anlegt.
+    ///
+    /// # Description
+    /// A-CHILD (F-183). Der Kind-Controller baut eine neue Kind-Session samt
+    /// Registry **außerhalb** des Manager-Locks und legt sie danach über
+    /// [`Self::restore`] ein. Dafür braucht er denselben Sender, den
+    /// [`Self::create_governed_session`] intern verwendet — sonst liefen die
+    /// Events des Kindes in einen anderen Kanal.
+    ///
+    /// # Returns
+    /// Einen geklonten `mpsc::UnboundedSender<SessionEvent>` (billig, teilt den Kanal).
+    ///
+    /// # Concurrency
+    /// Braucht nur `&self`; der Aufrufer hält den Manager-Lock nur für diesen Aufruf.
+    #[must_use]
+    pub fn event_sender(&self) -> mpsc::UnboundedSender<SessionEvent> {
+        self.event_tx.clone()
+    }
+
+    /// Prüft, ob eine Session mit dieser ID gerade im Manager liegt.
+    ///
+    /// # Description
+    /// A-CHILD. Eine während eines Kind-Turns entnommene Session (`remove`)
+    /// ist hier bis zum `restore` **nicht** sichtbar; der Reaper nutzt genau
+    /// das, um laufende von ruhenden Kindern zu unterscheiden.
+    ///
+    /// # Returns
+    /// `true`, wenn `id` registriert ist.
+    #[must_use]
+    pub fn contains(&self, id: &SessionId) -> bool {
+        self.sessions.contains_key(id.as_str())
+    }
+
     pub fn get(&self, id: &SessionId) -> CoreResult<&AgentSession> {
         self.sessions
             .get(id.as_str())

@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth_toml::SecretRef;
 use crate::mode_toml::ModeSection;
+use crate::permissions_toml::PermissionsSection;
 use crate::plan_toml::ToolsSection;
 use crate::research_toml::ResearchSection;
 
@@ -44,6 +45,16 @@ pub struct HarnessConfig {
     /// Siehe `research_toml.rs`.
     #[serde(default)]
     pub research: ResearchSection,
+    /// `[permissions]` — persistenter Freigabemodus, Timeout sowie
+    /// Allow/Deny-Regeln und zusätzliche Arbeitswurzeln (Contract
+    /// `harw-scopes-contract.md` §2/§5 Zeile A2). Siehe `permissions_toml.rs`.
+    #[serde(default)]
+    pub permissions: PermissionsSection,
+    /// Marker-Dateinamen für die Projekt-Root-Erkennung (Contract §3),
+    /// Default `[".git"]` beim Consumer (`harw-home::project`), sofern hier
+    /// nicht gesetzt.
+    #[serde(default)]
+    pub project_root_markers: Option<Vec<String>>,
     #[serde(skip)]
     pub base_dir: Option<std::path::PathBuf>,
 }
@@ -133,6 +144,21 @@ pub struct SessionSection {
     pub journal_format: String,
     #[serde(default = "default_retention_days")]
     pub retention_days: u32,
+    /// Ob nach dem ersten abgeschlossenen Turn ein Session-Titel per Modell
+    /// erzeugt wird (Memory-/Session-Titel, Schritt 7). Default `true`; ohne
+    /// erreichbaren Provider fällt die Erzeugung auf den Anfang der ersten
+    /// Nutzernachricht zurück.
+    #[serde(default = "default_title_generation")]
+    pub title_generation: bool,
+    /// Modell für die Titelerzeugung (`provider/modell`). `None` bedeutet:
+    /// dasselbe Modell wie die Session, mit niedrigem Aufwand.
+    #[serde(default)]
+    pub title_model: Option<String>,
+}
+
+/// Default für [`SessionSection::title_generation`].
+fn default_title_generation() -> bool {
+    true
 }
 
 impl Default for SessionSection {
@@ -141,6 +167,8 @@ impl Default for SessionSection {
             store_dir: default_store_dir(),
             journal_format: default_journal_format(),
             retention_days: default_retention_days(),
+            title_generation: default_title_generation(),
+            title_model: None,
         }
     }
 }
@@ -405,9 +433,12 @@ mod tests {
         assert!(!cfg.tools.plan.enabled);
         assert_eq!(cfg.mode.default, "chat");
         assert_eq!(cfg.research.max_fetch_bytes, 1_048_576);
+        assert_eq!(cfg.permissions, crate::permissions_toml::PermissionsSection::default());
+        assert!(cfg.project_root_markers.is_none());
         assert!(cfg.tools.plan.validate().is_ok());
         assert!(cfg.mode.validate().is_ok());
         assert!(cfg.research.validate().is_ok());
+        assert!(cfg.permissions.validate().is_ok());
     }
 
     #[test]
@@ -443,6 +474,48 @@ mod tests {
         assert!(cfg.tools.plan.validate().is_ok());
         assert!(cfg.mode.validate().is_ok());
         assert!(cfg.research.validate().is_ok());
+        assert!(cfg.permissions.validate().is_ok());
+    }
+
+    #[test]
+    fn test_permissions_section_and_project_root_markers_parse_together() {
+        let src = r#"
+            default_provider = "anthropic"
+            project_root_markers = [".git", ".hg"]
+
+            [permissions]
+            default_mode = "auto"
+            approval_timeout_secs = 120
+
+            [[permissions.allow]]
+            tool = "shell.exec"
+            pattern = "cargo check"
+
+            [[permissions.deny]]
+            tool = "fs.write"
+        "#;
+        let cfg: HarnessConfig = toml::from_str(src).unwrap();
+
+        assert_eq!(
+            cfg.project_root_markers,
+            Some(vec![".git".to_owned(), ".hg".to_owned()])
+        );
+        assert_eq!(cfg.permissions.default_mode.as_deref(), Some("auto"));
+        assert_eq!(cfg.permissions.approval_timeout_secs, Some(120));
+        assert_eq!(cfg.permissions.allow.len(), 1);
+        assert_eq!(cfg.permissions.allow[0].tool, "shell.exec");
+        assert_eq!(cfg.permissions.deny.len(), 1);
+        assert_eq!(cfg.permissions.deny[0].tool, "fs.write");
+        assert!(cfg.permissions.validate().is_ok());
+    }
+
+    #[test]
+    fn test_permissions_section_rejects_unknown_nested_field() {
+        let src = r#"
+            [permissions]
+            defualt_mode = "auto"
+        "#;
+        assert!(toml::from_str::<HarnessConfig>(src).is_err());
     }
 
     #[test]

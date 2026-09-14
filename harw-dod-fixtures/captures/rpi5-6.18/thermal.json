@@ -1,0 +1,27 @@
+{
+  "kernel": "6.18.34+rpt-rpi-2712",
+  "captured_at": "2026-09-13T18:33:35Z",
+  "entries": [
+    {
+      "path": "/sys/class/thermal/thermal_zone0",
+      "kind": {
+        "type": "symlink",
+        "target": "../../devices/virtual/thermal/thermal_zone0"
+      }
+    },
+    {
+      "path": "/sys/class/thermal/thermal_zone0/type",
+      "kind": {
+        "type": "file",
+        "content": "cpu-thermal\n"
+      }
+    },
+    {
+      "path": "/sys/class/thermal/thermal_zone0/temp",
+      "kind": {
+        "type": "file",
+        "content": "69950\n"
+      }
+    }
+  ]
+}

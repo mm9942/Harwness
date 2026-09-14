@@ -5,12 +5,18 @@
 //! Onboarding-Wizard (`onboarding`) durchlaufen wurde. Die Subcommands
 //! (`init`, `onboard`, `doctor`, `serve`, `web`, `project`, `classify`, `run`)
 //! decken Einrichtung, Validierung, den MCP-Listener, die Web-Oberfläche,
-//! Projekt-Trust und Bootstrap-Pfade ab. Die
+//! Projekt-Trust und Bootstrap-Pfade ab. `harw serve` fährt bei SIGTERM/SIGINT
+//! geordnet herunter ([`serve_until`]); sein Job-Worker läuft auf einem eigenen
+//! Thread mit eigener Tokio-Runtime, damit blockierende Store-I/O den
+//! MCP-Listener nicht aushungert. Die
 //! Argument-Grammatik lebt in `cli` (clap); Hilfe erscheint nur bei
 //! `--help`/`-h`.
 
 #![forbid(unsafe_code)]
 
+// jemalloc nur mit Cargo-Feature `jemalloc` (Vorgabe aus, G-067): auf
+// 16K-Seiten-Kerneln (RPi 5) ist ein 4K-gebautes jemalloc absturzgefährdet.
+#[cfg(feature = "jemalloc")]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -32,11 +38,14 @@ mod runtime_gateway;
 mod runtime_jobs;
 mod runtime_web;
 mod secret_store;
+mod settings;
 mod web;
 mod worker_cancellation;
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::Parser;
 use harw_config::{
@@ -52,22 +61,22 @@ use harw_mcp_server::{
     BoundMcpListener, DurableMcpSupervisor, McpAuthenticator, McpEventBus, McpJobCapability,
     McpListenerConfig, McpPrincipal, McpSupervisor, PrincipalRegistry, StaticBearerAuthenticator,
 };
-use harw_operations::{OpInput, ServiceMap};
+use harw_operations::OpInput;
 use harw_plan::goal::{Goal, GoalAction, GoalId, GoalStatus, GoalStore};
 use harw_plan::types::{Criterion, VerificationStep};
 use harw_plan::{
     FileGoalStore, FilePlanStore, InMemoryGoalStore, InMemoryPlanStore, PlanAction, PlanId,
     PlanNodeKind, PlanStore, PlanToolConfig,
 };
-use harw_plan_bridge::{
-    FindingStore, GoalContextProvider, offset_from_timestamp, register_plan_services,
-};
+use harw_plan_bridge::{FindingStore, GoalContextProvider, offset_from_timestamp};
+use harw_protocol::SessionEvent;
 use harw_provider_http::SecretResolver;
 use harw_runtime::{EntryKind, ModelSource, RuntimeSpec, RuntimeStores, ServiceSurface};
 use harw_session_store::JobStore;
 use harw_tui::classify_input;
 use harw_types::{
-    ApprovalActor, IngressSurface, SessionId, TenantId, ThreadRef, TurnId, WorkspaceId,
+    ApprovalActor, IngressSurface, PermissionTier, SessionId, TenantId, ThreadRef, TurnId,
+    WorkspaceId,
 };
 use tokio::runtime::Builder;
 use worker_cancellation::RegistryWorkerCancellationSink;
@@ -236,6 +245,11 @@ fn dispatch(cli: Cli) -> Result<(), String> {
                 cli.chat.prompt,
                 cli.chat.resume,
                 chat_startup,
+                chat::ChatOptions {
+                    all_projects: cli.chat.all,
+                    verbose: cli.chat.verbose,
+                    add_dirs: cli.chat.add_dir,
+                },
             )
         }
         Some(Command::Init) => cmd_init(home_override),
@@ -245,10 +259,8 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             onboarding::run_wizard(&home)
         }
         Some(Command::Doctor { config_dir }) => {
-            let layers = resolve_layers(home_override.clone(), config_dir)?;
-            // Ohne auflösbares Home bleibt es bei der Config-Zusammenfassung.
-            let home = home::resolve_home(home_override.clone()).ok();
-            doctor(layers, home.as_deref())?;
+            let layers = resolve_layers(home_override.clone(), config_dir.clone())?;
+            doctor(layers, home_override.clone(), config_dir)?;
             lifecycle::health(home_override)
         }
         Some(Command::Gateway { telemetry }) => gateway::run(home_override, telemetry),
@@ -263,6 +275,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             web::serve_web(Some(home), socket)
         }
         Some(Command::Project { action }) => project_trust::run(home_override, action),
+        Some(Command::Settings { action }) => settings::run(home_override, action),
         Some(Command::Classify { input }) => {
             let text = input.join(" ");
             println!(
@@ -311,6 +324,7 @@ fn run_startup_migrations(
         None
         | Some(Command::Onboard)
         | Some(Command::Gateway { .. })
+        | Some(Command::Settings { .. })
         | Some(Command::Analyze(_)) => {
             let home = home::resolve_home(home_override)?;
             harw_home::ensure_home(&home).map_err(|error| error.to_string())?;
@@ -526,11 +540,23 @@ fn serve_mcp(
         runtime_root,
     });
 
+    // Zwei Runtimes (G-054): der Listener behält seine `current_thread`-Runtime
+    // auf dem Hauptthread; der Job-Worker bekommt eine eigene auf einem eigenen
+    // Thread. Beide werden vor dem Binden gebaut, damit ein Runtime-Fehler den
+    // Start abbricht, statt einen Listener ohne Worker laufen zu lassen.
     let runtime = Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| error.to_string())?;
-    runtime.block_on(async {
+    let worker_runtime = Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("could not build job worker runtime: {error}"))?;
+
+    let (listener, signals) = runtime.block_on(async {
+        // Signale vor dem Binden registrieren: ab dem ersten Accept beendet
+        // SIGTERM den Prozess nicht mehr hart (G-022).
+        let signals = lifecycle::ShutdownSignals::install()?;
         let event_bus = Arc::new(McpEventBus::with_default_capacity());
         let listener = BoundMcpListener::bind_with_supervisor_and_events(
             McpListenerConfig {
@@ -545,40 +571,212 @@ fn serve_mcp(
         )
         .await
         .map_err(|error| error.to_string())?;
-        eprintln!(
-            "harw MCP listening on http://{}{}",
-            listener.local_addr().map_err(|error| error.to_string())?,
-            config.harness.mcp_listener.path
-        );
-        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let worker_store = Arc::clone(&store);
-        let worker_executions = Arc::clone(&executions);
-        let worker_provider = Arc::clone(&provider);
-        let worker_plan_services = plan_node_services.clone();
-        let worker_context = Arc::clone(&worker_context);
-        let worker = tokio::spawn(async move {
-            job_worker::run_job_worker(
-                worker_store,
-                worker_executions,
-                worker_provider,
-                worker_plan_services,
-                shutdown_rx,
-                worker_context,
-            )
-            .await;
-        });
+        Ok::<_, String>((listener, signals))
+    })?;
+    eprintln!(
+        "harw MCP listening on http://{}{}",
+        listener.local_addr().map_err(|error| error.to_string())?,
+        config.harness.mcp_listener.path
+    );
 
-        let listener_result = listener.serve().await;
-        let _ = shutdown_tx.send(true);
-        let worker_result = worker.await;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let worker = spawn_job_worker_thread(worker_runtime, move || {
+        job_worker::run_job_worker(
+            store,
+            executions,
+            provider,
+            plan_node_services,
+            shutdown_rx,
+            worker_context,
+        )
+    })?;
 
-        match listener_result {
-            Err(error) => Err(error.to_string()),
-            Ok(()) => {
-                worker_result.map_err(|error| format!("job worker stopped unexpectedly: {error}"))
+    let ServeOutcome {
+        listener: listener_result,
+        worker: worker_stop,
+    } = runtime.block_on(serve_until(
+        |listener_shutdown| listener.serve_until(listener_shutdown),
+        async {
+            let reason = signals.wait().await;
+            tracing::info!(signal = reason.signal_name(), "serve.shutdown.requested");
+        },
+        &shutdown_tx,
+        worker.done,
+        WORKER_SHUTDOWN_GRACE,
+    ));
+
+    let worker_result = match worker_stop {
+        WorkerStop::Finished | WorkerStop::Vanished => worker
+            .handle
+            .join()
+            .map_err(|_| "job worker thread panicked".to_owned()),
+        WorkerStop::TimedOut => {
+            // Der Thread wird nicht gejoint: `main` beendet den Prozess gleich
+            // mit `std::process::exit`. Laufende Jobs bleiben `Running`, bis
+            // ihr Lease abläuft.
+            tracing::warn!(
+                grace_secs = WORKER_SHUTDOWN_GRACE.as_secs(),
+                "serve.shutdown.worker_timed_out"
+            );
+            Err(format!(
+                "job worker did not stop within {}s after shutdown",
+                WORKER_SHUTDOWN_GRACE.as_secs()
+            ))
+        }
+    };
+    tracing::info!(worker = ?worker_stop, "serve.shutdown.complete");
+
+    listener_result?;
+    worker_result
+}
+
+/// Upper bound for the job worker to observe the shutdown flag after the MCP
+/// listener has stopped (G-022). Below systemd's default `TimeoutStopSec=90s`.
+const WORKER_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// Job worker running on its own OS thread and Tokio runtime (G-054).
+struct JobWorkerThread {
+    /// Joined once `done` resolved; left detached on timeout.
+    handle: std::thread::JoinHandle<()>,
+    /// Fires when the worker future returned; dropped unsent on panic.
+    done: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// Spawns `make_worker()` on a dedicated thread driven by `runtime`.
+///
+/// # Description
+/// Blocking work inside the job worker (fs4 locks, fsync, store listing) then
+/// only stalls this thread, never the MCP listener's runtime (G-054). The
+/// runtime is built by the caller so its failure aborts startup instead of
+/// silently running a listener without a worker.
+///
+/// # Errors
+/// When the OS refuses to spawn the thread.
+///
+/// # Concurrency
+/// The closure and its captures move to the new thread (`Send + 'static`); the
+/// worker future itself is created and polled only there.
+fn spawn_job_worker_thread<F, Fut>(
+    runtime: tokio::runtime::Runtime,
+    make_worker: F,
+) -> Result<JobWorkerThread, String>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = ()>,
+{
+    let (done_tx, done) = tokio::sync::oneshot::channel();
+    let handle = std::thread::Builder::new()
+        .name("harw-job-worker".to_owned())
+        .spawn(move || {
+            runtime.block_on(make_worker());
+            // `Err` only means `serve_until` already gave up waiting (timeout);
+            // there is nobody left to notify.
+            if done_tx.send(()).is_err() {
+                tracing::debug!("serve.job_worker.finished_after_grace");
+            }
+        })
+        .map_err(|error| format!("could not spawn job worker thread: {error}"))?;
+    Ok(JobWorkerThread { handle, done })
+}
+
+/// How the job worker ended during [`serve_until`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerStop {
+    /// The worker future returned.
+    Finished,
+    /// The completion sender was dropped without sending (worker panicked).
+    Vanished,
+    /// The worker did not finish within the grace period.
+    TimedOut,
+}
+
+/// Result of [`serve_until`]: listener outcome plus how the worker stopped.
+#[derive(Debug)]
+struct ServeOutcome {
+    /// `Err` when the listener failed or the worker died while serving.
+    listener: Result<(), String>,
+    /// Worker termination observed after the listener stopped.
+    worker: WorkerStop,
+}
+
+/// Serves until `shutdown` resolves, then stops listener and worker in order.
+///
+/// # Description
+/// 1. Starts `listener` with a receiver of `shutdown_tx`.
+/// 2. Waits for the first of: the listener ending on its own (error), the
+///    external `shutdown` future (signal), or the worker ending unexpectedly.
+/// 3. Sets the shared watch flag to `true` — the listener stops accepting and
+///    aborts its connections, the worker leaves its poll loop — and awaits the
+///    listener.
+/// 4. Waits at most `grace` for `worker_done`.
+///
+/// # Arguments
+/// - `listener`: builds the serving future from a shutdown receiver
+///   (production: `BoundMcpListener::serve_until`).
+/// - `shutdown`: resolves when shutdown is requested (production: signals;
+///   tests: a oneshot).
+/// - `shutdown_tx` (`&watch::Sender<bool>`): the channel the worker already
+///   watches.
+/// - `worker_done`: completion notification of the worker thread.
+/// - `grace` (`Duration`): cap on waiting for the worker.
+///
+/// # Returns
+/// [`ServeOutcome`]; never waits unbounded for the worker.
+///
+/// # Concurrency
+/// Runs on the listener runtime; the worker runs elsewhere and is only
+/// observed through the watch/oneshot channels.
+async fn serve_until<L, LFut, S>(
+    listener: L,
+    shutdown: S,
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    mut worker_done: tokio::sync::oneshot::Receiver<()>,
+    grace: Duration,
+) -> ServeOutcome
+where
+    L: FnOnce(tokio::sync::watch::Receiver<bool>) -> LFut,
+    LFut: Future<Output = std::io::Result<()>>,
+    S: Future<Output = ()>,
+{
+    let serving = listener(shutdown_tx.subscribe());
+    tokio::pin!(serving);
+    tokio::pin!(shutdown);
+
+    let mut worker_early = None;
+    let listener_result = tokio::select! {
+        result = &mut serving => result.map_err(|error| error.to_string()),
+        () = &mut shutdown => {
+            shutdown_tx.send_replace(true);
+            serving.await.map_err(|error| error.to_string())
+        }
+        early = &mut worker_done => {
+            tracing::error!("serve.job_worker.stopped_while_serving");
+            worker_early = Some(match early {
+                Ok(()) => WorkerStop::Finished,
+                Err(_) => WorkerStop::Vanished,
+            });
+            shutdown_tx.send_replace(true);
+            match serving.await {
+                Ok(()) => Err("job worker stopped unexpectedly while serving".to_owned()),
+                Err(error) => Err(error.to_string()),
             }
         }
-    })
+    };
+    // Idempotent: covers the listener ending on its own.
+    shutdown_tx.send_replace(true);
+
+    let worker = match worker_early {
+        Some(stop) => stop,
+        None => match tokio::time::timeout(grace, worker_done).await {
+            Ok(Ok(())) => WorkerStop::Finished,
+            Ok(Err(_)) => WorkerStop::Vanished,
+            Err(_) => WorkerStop::TimedOut,
+        },
+    };
+    ServeOutcome {
+        listener: listener_result,
+        worker,
+    }
 }
 
 /// Baut den Provider für `harw serve`.
@@ -795,6 +993,20 @@ fn run_local_echo(input: &str, home: &Path) -> Result<String, String> {
             TurnOutcome::AwaitingChild { .. } | TurnOutcome::AwaitingApproval { .. } => {
                 return Err("local echo provider unexpectedly paused a turn".to_owned());
             }
+            // Terminale Ausgänge: beim Echo-Provider ebenso unerwartet wie eine
+            // Pause, aber mit eigenem Grund in der Meldung.
+            TurnOutcome::Cancelled { reason } => {
+                return Err(format!("local echo turn was cancelled: {reason:?}"));
+            }
+            TurnOutcome::Truncated => {
+                return Err("local echo turn was truncated".to_owned());
+            }
+            TurnOutcome::Refused { detail } => {
+                return Err(format!("local echo turn was refused: {detail:?}"));
+            }
+            TurnOutcome::Failed { reason } => {
+                return Err(format!("local echo turn failed: {reason}"));
+            }
         }
 
         session
@@ -823,8 +1035,8 @@ fn run_thread_for_session(session_id: &SessionId) -> ThreadRef {
 // Bis hierher existierten Plan-Store, Goal-Store, `FindingStore`,
 // `GoalContextProvider` und die sechs Planungs-Operationen unabhängig
 // voneinander. Dieser Abschnitt ist die einzige Stelle, die sie zusammensetzt:
-// eine `PlanToolConfig` speist **gleichzeitig** die `ServiceMap` (Stores) und
-// die `OperationRegistry` (Ops), sodass registrierte Operationen und
+// eine `PlanToolConfig` speist **gleichzeitig** die Plan-/Goal-/Finding-Stores
+// und die `OperationRegistry` (Ops), sodass registrierte Operationen und
 // vorhandene Dienste nicht auseinanderlaufen können.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -956,7 +1168,7 @@ fn parse_plan_node_kind(name: &str) -> Result<PlanNodeKind, String> {
 /// # Description
 ///
 /// Genau **eine** so gebaute Konfiguration geht anschließend sowohl in die
-/// [`ServiceMap`] (über [`register_plan_services`]) als auch in die
+/// Plan-, Goal- und Finding-Stores ([`build_plan_services`]) als auch in die
 /// `OperationRegistry` (über [`harw_ops::register_plan_tools`]). Beide aus
 /// derselben Quelle zu speisen ist der Kern dieses Moduls: eine registrierte
 /// Operation ohne passenden Store — oder ein Store ohne Operationen — wäre der
@@ -1003,26 +1215,25 @@ pub(crate) fn plan_tool_config_from_section(section: &PlanSection) -> Result<Pla
 ///
 /// # Description
 ///
-/// `services` ist bei abgeschalteter Planungsfläche leer, und `plan`/`goal` sind
-/// dann `None`. Beides gehört zusammen: ein Aufrufer, der `plan`/`goal` mit
-/// `None` sieht, weiß, dass auch die `ServiceMap` keine Plan-Dienste trägt.
+/// `plan`/`goal`/`findings` sind bei abgeschalteter Planungsfläche alle `None`
+/// — nie nur ein Teil. Ein Aufrufer, der `plan`/`goal` mit `None` sieht, weiß
+/// damit auch, dass [`PlanServices::to_runtime`] `None` liefert.
 ///
 /// # Concurrency
 ///
-/// Die Stores sind `Arc<dyn …>` über `Send + Sync`-Implementierungen; die
-/// [`ServiceMap`] wird beim Aufbau exklusiv gehalten und danach nur verschoben.
+/// Die Stores sind `Arc<dyn …>` über `Send + Sync`-Implementierungen und
+/// werden nur geklont bzw. verschoben.
 pub(crate) struct PlanServices {
-    /// Dienstkarte mit Plan-Store, Goal-Store, Finding-Store und Konfiguration.
-    services: ServiceMap,
-    /// Derselbe Plan-Store, den `services` trägt — für Startup-Mutationen.
+    /// Derselbe Plan-Store, den die Montage über [`PlanServices::to_runtime`]
+    /// bekommt — für Startup-Mutationen.
     ///
     /// `pub(crate)`, weil `crate::web` dieselben Stores braucht, um pro
-    /// Web-Aufruf eine frische [`ServiceMap`] zu bauen (die `ServiceMap`
-    /// selbst ist nicht `Clone`) — siehe `crate::web`-Moduldoku.
+    /// Web-Aufruf eine frische [`harw_runtime::PlanServices`] zu bauen — siehe
+    /// `crate::web`-Moduldoku.
     pub(crate) plan: Option<Arc<dyn PlanStore>>,
-    /// Derselbe Goal-Store, den `services` trägt — für Startup-Mutationen.
+    /// Derselbe Goal-Store — für Startup-Mutationen.
     pub(crate) goal: Option<Arc<dyn GoalStore>>,
-    /// Derselbe Finding-Store, den `services` trägt.
+    /// Derselbe Finding-Store.
     ///
     /// Wird gehalten, damit [`PlanServices::to_runtime`] der Montage
     /// **dieselben** Instanzen gibt, statt zweite Stores auf demselben
@@ -1043,8 +1254,8 @@ impl PlanServices {
     /// Alle drei Stores oder keiner: eine halb geöffnete Planungsfläche wird nie
     /// an [`harw_runtime::RuntimeAssemblyBuilder::plan_services`] gereicht. Es
     /// werden **keine** neuen Stores erzeugt — die `Arc`s zeigen auf dieselben
-    /// Instanzen wie die [`ServiceMap`]; zwei Schreiber auf einem
-    /// Plan-Verzeichnis wären stiller Datenverlust.
+    /// Instanzen wie `self.plan`/`self.goal`/`self.findings`; zwei Schreiber
+    /// auf einem Plan-Verzeichnis wären stiller Datenverlust.
     ///
     /// # Returns
     /// `Some(_)`, wenn Plan-, Goal- **und** Finding-Store vorliegen; sonst `None`.
@@ -1062,7 +1273,7 @@ impl PlanServices {
     }
 }
 
-/// Baut die Plan-Dienste einer Laufzeit und trägt sie in eine [`ServiceMap`] ein.
+/// Baut die Plan-Dienste einer Laufzeit.
 ///
 /// # Description
 ///
@@ -1084,9 +1295,9 @@ impl PlanServices {
 /// (`<root>/<plan_id>/research/<question_id>.md`) und legt das Verzeichnis erst
 /// beim ersten Schreiben an.
 ///
-/// Alle vier Dienste werden über [`register_plan_services`] unter einem einzigen
-/// exklusiven Borrow eingetragen — es gibt keinen beobachtbaren Zwischenzustand
-/// mit halber Ausstattung.
+/// Alle drei Stores gehen als `Some` oder alle drei als `None` in das
+/// zurückgegebene [`PlanServices`] — es gibt keinen beobachtbaren
+/// Zwischenzustand mit halber Ausstattung.
 ///
 /// # Arguments
 ///
@@ -1100,8 +1311,7 @@ impl PlanServices {
 ///
 /// # Returns
 ///
-/// [`PlanServices`] — bei abgeschalteter Fläche mit leerer [`ServiceMap`] und
-/// `None`-Stores.
+/// [`PlanServices`] — bei abgeschalteter Fläche mit `None`-Stores.
 ///
 /// # Errors
 ///
@@ -1118,15 +1328,12 @@ pub(crate) fn build_plan_services(
     plan_space: &str,
     goal_space: &str,
 ) -> Result<PlanServices, String> {
-    let mut services = ServiceMap::new();
-
     if !config.is_enabled() {
         tracing::info!(
             reason = "tools.plan.enabled = false",
             "plan.services.skipped"
         );
         return Ok(PlanServices {
-            services,
             plan: None,
             goal: None,
             findings: None,
@@ -1160,13 +1367,6 @@ pub(crate) fn build_plan_services(
     };
 
     let findings = Arc::new(FindingStore::from_home(home));
-    register_plan_services(
-        &mut services,
-        Arc::clone(&plan),
-        Arc::clone(&goal),
-        Arc::clone(&findings),
-        config.clone(),
-    );
 
     tracing::info!(
         persist = config.persist,
@@ -1177,7 +1377,6 @@ pub(crate) fn build_plan_services(
     );
 
     Ok(PlanServices {
-        services,
         plan: Some(plan),
         goal: Some(goal),
         findings: Some(findings),
@@ -1230,7 +1429,7 @@ struct PlanningStartup {
     plan_config: PlanToolConfig,
     /// Ziel-Kontext-Beitragender; `None`, wenn die Planungsfläche aus ist.
     goal_context: Option<Arc<dyn ContextProvider>>,
-    /// Plan-Dienste inklusive gefüllter [`ServiceMap`].
+    /// Plan-Dienste (Plan-, Goal- und Finding-Store, falls aktiv).
     services: PlanServices,
 }
 
@@ -1589,14 +1788,77 @@ fn analyze_plan_surface_disabled() -> String {
         .to_owned()
 }
 
+/// Montiert die Laufzeit für `harw analyze`.
+///
+/// # Description
+/// Baut eine [`harw_runtime::RuntimeAssembly`] für [`EntryKind::Analyze`]
+/// (`OperationSurface::CommandsOnly`, `SpawnerPolicy::BuiltinRoles`) aus einer
+/// bereits vorbereiteten [`RuntimeSpec`], den Plan-Diensten
+/// ([`PlanServices::to_runtime`]), der Modellquelle und einem optionalen
+/// Secret-Resolver. Herausgelöst aus [`cmd_analyze`], damit die Montage selbst
+/// — ohne CLI-Parsing, `println!` oder Operationsaufruf — isoliert testbar
+/// ist.
+///
+/// Der Sitzungs-Ereigniskanal ist Pflicht für `SpawnerPolicy::BuiltinRoles`;
+/// sein Empfänger geht an den Aufrufer zurück und muss bis zum Ende von dessen
+/// Nutzung der Montage gebunden bleiben, damit Sendungen nicht an einem
+/// geschlossenen Kanal enden. Eine Wurzelsitzung entsteht nicht: eine spätere
+/// Operation läuft direkt unter
+/// [`harw_runtime::RuntimeAssembly::root_session_id`], der beim Bau als
+/// Spawner-Wurzel registrierten Kennung.
+///
+/// # Arguments
+/// - `spec` (`RuntimeSpec`): vorbereitete Spec (inkl. `mode_override`),
+///   verbraucht (der Builder nimmt sie entgegen).
+/// - `plan` (`harw_runtime::PlanServices`): vollständige Plan-Dienste.
+/// - `model` (`ModelSource`): `Echo` für `--dry-run`, sonst `Configured`.
+/// - `resolver` (`Option<Arc<dyn SecretResolver + Send + Sync>>`): versiegelter
+///   Secret-Resolver; `None` im `--dry-run`-Pfad.
+///
+/// # Returns
+/// Die gebaute [`harw_runtime::RuntimeAssembly`] und den Empfänger des
+/// Sitzungs-Ereigniskanals.
+///
+/// # Errors
+/// Ein `String`, wenn der Montagebau scheitert.
+///
+/// # Concurrency
+/// Rein synchron; baut keine eigene Runtime.
+fn analyze_assembly(
+    spec: RuntimeSpec,
+    plan: harw_runtime::PlanServices,
+    model: ModelSource,
+    resolver: Option<Arc<dyn SecretResolver + Send + Sync>>,
+) -> Result<
+    (
+        harw_runtime::RuntimeAssembly,
+        tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
+    ),
+    String,
+> {
+    let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut builder = harw_runtime::RuntimeAssembly::builder(spec)
+        .model(model)
+        .stores(RuntimeStores {
+            state_store: Arc::new(harw_core::InMemoryStateStore::new()),
+            job_store: None,
+            approval_store: None,
+        })
+        .plan_services(plan)
+        .session_events(event_tx);
+    if let Some(resolver) = resolver {
+        builder = builder.secret_resolver(resolver);
+    }
+    let assembly = builder.build().map_err(|error| error.to_string())?;
+    Ok((assembly, event_rx))
+}
+
 /// Führt `harw analyze` gegen die `analyze`-Operation aus.
 ///
 /// # Description
 /// Baut denselben Planungs-Startup wie der Chat-Einstieg
-/// ([`prepare_planning_startup`]) und montiert dann eine
-/// [`harw_runtime::RuntimeAssembly`] für [`EntryKind::Analyze`]
-/// (`OperationSurface::CommandsOnly`, `SpawnerPolicy::BuiltinRoles`) mit den
-/// Plan-Diensten aus [`PlanServices::to_runtime`]. `/analyze` wird in
+/// ([`prepare_planning_startup`]) und montiert dann über [`analyze_assembly`]
+/// die Laufzeit. `/analyze` wird in
 /// [`harw_runtime::RuntimeAssembly::operations`] gesucht und über die
 /// Slash-Fläche ([`ServiceSurface::Slash`]) mit der Sandbox der Montage
 /// ausgeführt. Ist die Planungsfläche abgeschaltet, ist `/analyze` gar nicht
@@ -1607,11 +1869,18 @@ fn analyze_plan_surface_disabled() -> String {
 /// Secret-Resolver ([`runtime_entry::configured_secret_resolver`]), weil ein
 /// echter Fan-out Kind-Agenten über den Spawner der Montage startet.
 ///
-/// Der Sitzungs-Ereigniskanal ist Pflicht für `SpawnerPolicy::BuiltinRoles`;
-/// sein Empfänger bleibt bis zum Ende gebunden, damit Sendungen nicht an
-/// einem geschlossenen Kanal enden. Eine Wurzelsitzung entsteht nicht: die
-/// Operation läuft direkt unter [`harw_runtime::RuntimeAssembly::root_session_id`],
-/// der beim Bau als Spawner-Wurzel registrierten Kennung.
+/// Vor der Ausführung prüft diese Funktion die Mindest-Berechtigungsstufe der
+/// gefundenen Operation ([`harw_operations::operation::OperationMeta::permission`])
+/// gegen die Stufe des montierten Principals
+/// ([`harw_runtime::RuntimeAssembly::principal`]) — dieselbe Regel wie
+/// `harw-tui`s `CommandRegistry::dispatch` (`harw-tui/src/registry.rs`): eine
+/// zu niedrige Stufe bricht ab, statt die Operation trotzdem laufen zu lassen.
+///
+/// Der Sitzungs-Ereigniskanal aus [`analyze_assembly`] bleibt bis zum Ende
+/// dieser Funktion gebunden, damit Sendungen nicht an einem geschlossenen
+/// Kanal enden. Eine Wurzelsitzung entsteht nicht: die Operation läuft direkt
+/// unter [`harw_runtime::RuntimeAssembly::root_session_id`], der beim Bau als
+/// Spawner-Wurzel registrierten Kennung.
 ///
 /// # Arguments
 /// - `home_override` (`Option<PathBuf>`): expliziter Root-Space (`--home`).
@@ -1625,7 +1894,7 @@ fn analyze_plan_surface_disabled() -> String {
 /// # Errors
 /// Ein `String` bei widersprüchlichen Flags, abgeschalteter Planungsfläche,
 /// Config-/Trust-/Montagefehlern (inkl. fehlender Provider-Einrichtung ohne
-/// `--dry-run`) oder abgelehnter Operation.
+/// `--dry-run`), zu niedriger Berechtigungsstufe oder abgelehnter Operation.
 ///
 /// # Concurrency
 /// Baut eine eigene Single-Thread-Tokio-Runtime für den einen Operationsaufruf.
@@ -1659,29 +1928,31 @@ fn cmd_analyze(
         )
     };
 
-    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut builder = harw_runtime::RuntimeAssembly::builder(spec)
-        .model(model)
-        .stores(RuntimeStores {
-            state_store: Arc::new(harw_core::InMemoryStateStore::new()),
-            job_store: None,
-            approval_store: None,
-        })
-        .plan_services(plan)
-        .session_events(event_tx);
-    if let Some(resolver) = secret_resolver {
-        builder = builder.secret_resolver(resolver);
-    }
-    let assembly = builder.build().map_err(|error| error.to_string())?;
+    let (assembly, _event_rx) = analyze_assembly(spec, plan, model, secret_resolver)?;
 
     let operation = assembly
         .operations()
         .find_by_command("/analyze")
         .map(Arc::clone)
         .ok_or_else(analyze_plan_surface_disabled)?;
+
+    // C4: eine zu niedrige Berechtigungsstufe darf die Operation nicht
+    // erreichen — dieselbe Prüfung wie `harw-tui`s `CommandRegistry::dispatch`
+    // (`harw-tui/src/registry.rs`: `context.caller_tier < spec.permission`).
+    let required: PermissionTier = operation.meta().permission;
+    let actual: PermissionTier = assembly.principal().tier();
+    if actual < required {
+        return Err(format!(
+            "`analyze` erfordert mindestens Berechtigungsstufe {required:?}, \
+             der aufrufende Principal hat aber nur {actual:?}"
+        ));
+    }
+
+    // Goal-Kontext wirkt bei analyze nur über Store-Seeding (--goal legt das
+    // Ziel bereits in prepare_planning_startup an); Kind-Registry-Anbindung
+    // (GoalContextContributor für /analyze) folgt in W4a.
     tracing::info!(
         mode = startup.mode.as_str(),
-        goal_context = startup.goal_context.is_some(),
         operations = assembly.operations().len(),
         cwd = %assembly.spec().cwd.display(),
         "analyze.runtime.assembled"
@@ -1712,20 +1983,32 @@ fn cmd_analyze(
 /// Prüft die Konfiguration für `harw doctor` und gibt eine Zusammenfassung aus.
 ///
 /// # Description
-/// Validiert die Config-Layer wie bisher und druckt deren Kennzahlen. Ist ein
-/// HARW-Home auflösbar, montiert `doctor` zusätzlich die Runtime
-/// ([`runtime_entry::doctor_assembly`]) und druckt deren effektive Rechte
-/// ([`print_runtime_rights`]).
+/// Validiert die Config-Layer wie bisher und druckt deren Kennzahlen. Für die
+/// Laufzeit-Rechte gibt es drei Fälle ([`doctor_home_resolution`]):
+/// - `--config-dir` gesetzt: Runtime-Montage übersprungen, eine Zeile
+///   `runtime_warning=skipped: --config-dir` (C6 — ein externes `--config-dir`
+///   ist kein HARW-Home; ein Montageversuch dagegen wäre irreführend).
+/// - kein `--config-dir`, aber [`home::resolve_home`] scheitert: eine Zeile
+///   `runtime_warning=<text>` — der Fehler wird gemeldet, nicht still
+///   verworfen.
+/// - sonst: [`print_runtime_rights`] montiert [`EntryKind::Doctor`] und
+///   druckt die effektiven Rechte.
 ///
 /// # Arguments
 /// - `layers` (`Vec<PathBuf>`): die Config-Layer.
-/// - `home` (`Option<&Path>`): aufgelöster Root-Space, falls vorhanden.
+/// - `home_override` (`Option<PathBuf>`): expliziter `--home`-Wert.
+/// - `config_dir` (`Option<PathBuf>`): expliziter `--config-dir`-Wert.
 ///
 /// # Errors
 /// Ein `String`, wenn die Config nicht geladen oder validiert werden kann.
-/// Ein Montagefehler ist **kein** Fehler dieses Befehls: er erscheint als
-/// Warnzeile, der Exit-Code bleibt der der Config-Prüfung.
-fn doctor(layers: Vec<PathBuf>, home: Option<&Path>) -> Result<(), String> {
+/// Ein Montagefehler oder ein nicht auflösbares Home ist **kein** Fehler
+/// dieses Befehls: beides erscheint als Warnzeile, der Exit-Code bleibt der
+/// der Config-Prüfung.
+fn doctor(
+    layers: Vec<PathBuf>,
+    home_override: Option<PathBuf>,
+    config_dir: Option<PathBuf>,
+) -> Result<(), String> {
     let config = discover_config(&layers).map_err(|error| error.to_string())?;
     config.validate().map_err(|error| error.to_string())?;
     println!("Harwness configuration is valid.");
@@ -1751,10 +2034,41 @@ fn doctor(layers: Vec<PathBuf>, home: Option<&Path>) -> Result<(), String> {
         config.harness.mcp_listener.listen_addr
     );
     println!("mcp_listener_path={}", config.harness.mcp_listener.path);
-    if let Some(home) = home {
-        print_runtime_rights(home);
+    match doctor_home_resolution(config_dir.as_deref(), home_override) {
+        Ok(home) => print_runtime_rights(&home),
+        Err(reason) => println!("runtime_warning={reason}"),
     }
     Ok(())
+}
+
+/// Entscheidet, ob und wie `doctor` den Root-Space für die Laufzeit-Rechte auflöst.
+///
+/// # Description
+/// Reine Auflösungslogik ohne Seiteneffekt, herausgelöst aus [`doctor`], damit
+/// C6 (kein stilles Verwerfen eines Auflösungsfehlers, kein Montageversuch
+/// gegen ein externes `--config-dir`) ohne `println!`-Erfassung testbar ist.
+///
+/// # Arguments
+/// - `config_dir` (`Option<&Path>`): expliziter `--config-dir`-Wert, geliehen.
+/// - `home_override` (`Option<PathBuf>`): expliziter `--home`-Wert.
+///
+/// # Returns
+/// Den aufgelösten Root-Space.
+///
+/// # Errors
+/// - `"skipped: --config-dir"`, wenn `config_dir` gesetzt ist — ein externes
+///   `--config-dir` ist kein HARW-Home, also wird die Runtime-Montage
+///   übersprungen statt gegen den falschen Pfad zu scheitern.
+/// - der Fehlertext von [`home::resolve_home`], wenn kein `--config-dir`
+///   gesetzt ist, aber auch kein Root-Space auflösbar ist.
+fn doctor_home_resolution(
+    config_dir: Option<&Path>,
+    home_override: Option<PathBuf>,
+) -> Result<PathBuf, String> {
+    if config_dir.is_some() {
+        return Err("skipped: --config-dir".to_owned());
+    }
+    home::resolve_home(home_override)
 }
 
 /// Druckt die effektiven Rechte der Doctor-Montage oder eine Warnzeile.
@@ -1984,8 +2298,17 @@ mod tests {
 
         build_serve_provider(&config, Some(home.as_path()), None)
             .expect("file credential below <home>/secrets resolves for serve");
-        let error = build_serve_provider(&config, None, None)
-            .expect_err("file credential must stay fail-closed without a home");
+        // `Box<dyn ModelProvider>` implementiert kein `Debug` (Trait-Objekt
+        // ohne Debug-Bound) — `.expect_err(..)` würde das für den Ok-Zweig
+        // verlangen. Daher hier von Hand matchen und im unerwarteten
+        // Ok-Fall mit einer eigenen, sprechenden Meldung abbrechen statt
+        // den Provider selbst zu formatieren.
+        let error = match build_serve_provider(&config, None, None) {
+            Err(error) => error,
+            Ok(_) => panic!(
+                "file credential must stay fail-closed without a home, got a provider instead"
+            ),
+        };
         assert!(!error.contains("gateway-file-key"), "leaked secret: {error}");
         assert!(!error.contains("gateway.key"), "leaked path: {error}");
 
@@ -2020,10 +2343,9 @@ mod tests {
 
         assert!(services.plan.is_none());
         assert!(services.goal.is_none());
-        assert!(services.services.get::<Arc<dyn PlanStore>>().is_none());
-        assert!(services.services.get::<Arc<dyn GoalStore>>().is_none());
-        assert!(services.services.get::<Arc<FindingStore>>().is_none());
-        assert!(services.services.get::<PlanToolConfig>().is_none());
+        assert!(services.findings.is_none());
+        assert!(!services.config.is_enabled());
+        assert!(services.to_runtime().is_none());
 
         assert!(
             !harw_home::paths::plans_dir(home.path()).exists(),
@@ -2056,10 +2378,10 @@ mod tests {
         let config = PlanToolConfig::enabled_defaults();
         let (_home, services) = plan_services_over_temp_home(&config);
 
-        assert!(services.services.get::<Arc<dyn PlanStore>>().is_some());
-        assert!(services.services.get::<Arc<dyn GoalStore>>().is_some());
-        assert!(services.services.get::<Arc<FindingStore>>().is_some());
-        assert!(services.services.get::<PlanToolConfig>().is_some());
+        assert!(services.plan.is_some());
+        assert!(services.goal.is_some());
+        assert!(services.findings.is_some());
+        assert!(services.to_runtime().is_some());
 
         let (registry, plan_tools) = build_operation_registry(&config);
         assert_eq!(plan_tools, harw_ops::PLAN_TOOL_COUNT);
@@ -2139,7 +2461,6 @@ mod tests {
     #[test]
     fn test_plan_services_to_runtime_requires_all_three_stores() {
         let disabled = super::PlanServices {
-            services: ServiceMap::new(),
             plan: None,
             goal: None,
             findings: None,
@@ -2148,7 +2469,6 @@ mod tests {
         assert!(disabled.to_runtime().is_none());
 
         let partial = super::PlanServices {
-            services: ServiceMap::new(),
             plan: Some(Arc::new(InMemoryPlanStore::new())),
             goal: Some(Arc::new(InMemoryGoalStore::new())),
             findings: None,
@@ -2407,6 +2727,66 @@ mod tests {
             max_parallel: Some(0),
         };
         assert!(analyze_tokens(&zero_parallel).is_err());
+    }
+
+    /// C3: bei aktiver Planungsfläche montiert [`analyze_assembly`] eine
+    /// Laufzeit, in der `/analyze` über
+    /// `assembly.operations().find_by_command` auffindbar ist.
+    #[test]
+    fn test_analyze_assembly_registers_analyze_operation_when_plan_enabled() {
+        let home = tempfile::tempdir().expect("create temporary home");
+        harw_home::ensure_home(home.path()).expect("home scaffolds");
+        std::fs::write(
+            home.path().join("config.toml"),
+            "[tools.plan]\nenabled = true\n",
+        )
+        .expect("write plan-enabled config");
+        let cwd = tempfile::tempdir().expect("create temporary cwd");
+
+        let spec = runtime_entry::runtime_spec(
+            EntryKind::Analyze,
+            home.path(),
+            cwd.path(),
+            runtime_entry::local_principal(IngressSurface::Cli),
+        );
+        let startup = prepare_planning_startup(&spec, None, None)
+            .expect("planning startup resolves over an enabled plan surface");
+        assert!(
+            startup.plan_config.is_enabled(),
+            "config.toml muss [tools.plan] aktivieren"
+        );
+        let plan = startup
+            .services
+            .to_runtime()
+            .expect("bei aktiver Fläche liegen alle drei Plan-Stores vor");
+
+        let (assembly, _event_rx) =
+            analyze_assembly(spec, plan, ModelSource::Echo("test".to_owned()), None)
+                .expect("analyze assembly builds over an enabled plan surface");
+
+        assert!(
+            assembly.operations().find_by_command("/analyze").is_some(),
+            "/analyze muss bei aktiver Planungsfläche registriert sein"
+        );
+    }
+
+    /// C3: eine abgeschaltete Planungsfläche lässt `harw analyze` mit der
+    /// zentralen Fehlermeldung ([`analyze_plan_surface_disabled`]) scheitern.
+    #[test]
+    fn test_cmd_analyze_disabled_plan_surface_names_config_key() {
+        let home = tempfile::tempdir().expect("create temporary home");
+        let args = AnalyzeArgs {
+            crate_name: None,
+            workspace: false,
+            bottom_up: false,
+            top_down: false,
+            dry_run: true,
+            max_parallel: None,
+        };
+
+        let error = cmd_analyze(Some(home.path().to_path_buf()), None, None, &args)
+            .expect_err("harw analyze muss ohne `[tools.plan] enabled = true` scheitern");
+        assert_eq!(error, analyze_plan_surface_disabled());
     }
 
     #[test]
@@ -2696,6 +3076,35 @@ mod tests {
         assert_eq!(web_home(Ok(home.clone())), Ok(home));
     }
 
+    /// C6: ein externes `--config-dir` ist kein HARW-Home — `doctor` darf
+    /// keinen Montageversuch dagegen unternehmen, sondern überspringt die
+    /// Laufzeit-Rechte ausdrücklich.
+    #[test]
+    fn test_doctor_home_resolution_skips_runtime_rights_with_config_dir() {
+        let config_dir = PathBuf::from("/tmp/harw-doctor-config-dir");
+        let error = doctor_home_resolution(Some(config_dir.as_path()), None)
+            .expect_err("--config-dir must skip the runtime rights assembly");
+        assert_eq!(error, "skipped: --config-dir");
+
+        // Auch mit einem zusätzlich gesetzten `--home` bleibt es beim Skip:
+        // `--config-dir` gewinnt, das Home wird nicht stillschweigend benutzt.
+        let error = doctor_home_resolution(
+            Some(config_dir.as_path()),
+            Some(PathBuf::from("/tmp/harw-doctor-home")),
+        )
+        .expect_err("--config-dir must win over a coincidentally set --home");
+        assert_eq!(error, "skipped: --config-dir");
+    }
+
+    /// C6: ohne `--config-dir` löst `doctor` den Root-Space normal auf.
+    #[test]
+    fn test_doctor_home_resolution_resolves_explicit_home_without_config_dir() {
+        let home = PathBuf::from("/tmp/harw-doctor-explicit-home");
+        let resolved = doctor_home_resolution(None, Some(home.clone()))
+            .expect("an explicit --home resolves without --config-dir");
+        assert_eq!(resolved, home);
+    }
+
     #[test]
     fn test_run_startup_migrations_project_skips_home_resolution() {
         let parent = tempfile::tempdir().expect("create temporary parent");
@@ -2733,5 +3142,203 @@ mod tests {
             Ok(_) => panic!("missing environment credential must fail closed"),
             Err(error) => assert!(error.contains("mia-local"), "{error}"),
         }
+    }
+
+    /// Fake listener: serves until the shared watch flag turns `true`, like
+    /// `BoundMcpListener::serve_until`, and reports that it saw the flag.
+    async fn fake_listener(
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+        stopped: tokio::sync::oneshot::Sender<()>,
+    ) -> std::io::Result<()> {
+        while !*shutdown.borrow() {
+            if shutdown.changed().await.is_err() {
+                break;
+            }
+        }
+        stopped
+            .send(())
+            .expect("test observer outlives the fake listener");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_serve_until_shutdown_stops_listener_and_worker() {
+        let (shutdown_tx, worker_rx) = tokio::sync::watch::channel(false);
+        let (trigger_tx, trigger_rx) = tokio::sync::oneshot::channel::<()>();
+        let (listener_stopped_tx, mut listener_stopped_rx) = tokio::sync::oneshot::channel();
+        let (worker_done_tx, worker_done_rx) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(async move {
+            let mut worker_rx = worker_rx;
+            while !*worker_rx.borrow() {
+                if worker_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            worker_done_tx.send(()).expect("serve_until awaits the worker");
+        });
+
+        let serve = serve_until(
+            |rx| fake_listener(rx, listener_stopped_tx),
+            async {
+                trigger_rx.await.expect("trigger sender kept alive");
+            },
+            &shutdown_tx,
+            worker_done_rx,
+            Duration::from_secs(5),
+        );
+        tokio::pin!(serve);
+        // Without a shutdown request the future keeps serving.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut serve)
+                .await
+                .is_err(),
+            "serve_until must not finish before shutdown"
+        );
+        assert!(listener_stopped_rx.try_recv().is_err());
+
+        trigger_tx.send(()).expect("serve_until holds the trigger");
+        let outcome = tokio::time::timeout(Duration::from_secs(5), serve)
+            .await
+            .expect("shutdown must end serve_until");
+
+        assert_eq!(outcome.listener, Ok(()));
+        assert_eq!(outcome.worker, WorkerStop::Finished);
+        assert_eq!(listener_stopped_rx.try_recv(), Ok(()));
+        assert!(*shutdown_tx.borrow());
+        worker.await.expect("worker task joins");
+    }
+
+    #[tokio::test]
+    async fn test_serve_until_caps_wait_for_stuck_worker() {
+        let (shutdown_tx, _worker_rx) = tokio::sync::watch::channel(false);
+        let (listener_stopped_tx, _listener_stopped_rx) = tokio::sync::oneshot::channel();
+        // The sender is kept alive and never used: a worker that ignores shutdown.
+        let (_worker_done_tx, worker_done_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            serve_until(
+                |rx| fake_listener(rx, listener_stopped_tx),
+                std::future::ready(()),
+                &shutdown_tx,
+                worker_done_rx,
+                Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("grace period must bound serve_until");
+
+        assert_eq!(outcome.listener, Ok(()));
+        assert_eq!(outcome.worker, WorkerStop::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn test_serve_until_worker_panic_while_serving_is_error() {
+        let (shutdown_tx, _worker_rx) = tokio::sync::watch::channel(false);
+        let (listener_stopped_tx, mut listener_stopped_rx) = tokio::sync::oneshot::channel();
+        let (worker_done_tx, worker_done_rx) = tokio::sync::oneshot::channel::<()>();
+        drop(worker_done_tx);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            serve_until(
+                |rx| fake_listener(rx, listener_stopped_tx),
+                std::future::pending::<()>(),
+                &shutdown_tx,
+                worker_done_rx,
+                Duration::from_secs(5),
+            ),
+        )
+        .await
+        .expect("a vanished worker must end serve_until");
+
+        assert_eq!(outcome.worker, WorkerStop::Vanished);
+        let error = outcome.listener.expect_err("dead worker is reported");
+        assert!(error.contains("job worker stopped unexpectedly"), "{error}");
+        assert_eq!(listener_stopped_rx.try_recv(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn test_serve_until_listener_error_signals_worker_shutdown() {
+        let (shutdown_tx, worker_rx) = tokio::sync::watch::channel(false);
+        let (worker_done_tx, worker_done_rx) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(async move {
+            let mut worker_rx = worker_rx;
+            while !*worker_rx.borrow() {
+                if worker_rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            worker_done_tx.send(()).expect("serve_until awaits the worker");
+        });
+
+        let outcome = serve_until(
+            |_rx| async { Err(std::io::Error::other("accept failed")) },
+            std::future::pending::<()>(),
+            &shutdown_tx,
+            worker_done_rx,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(outcome.listener, Err("accept failed".to_owned()));
+        assert_eq!(outcome.worker, WorkerStop::Finished);
+        worker.await.expect("worker task joins");
+    }
+
+    #[test]
+    fn test_spawn_job_worker_thread_reports_completion() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build worker runtime for test");
+        let (ran_tx, ran_rx) = std::sync::mpsc::channel();
+        let worker = spawn_job_worker_thread(runtime, move || async move {
+            ran_tx
+                .send(std::thread::current().name().map(str::to_owned))
+                .expect("test receiver alive");
+        })
+        .expect("spawn worker thread");
+
+        worker.handle.join().expect("worker thread joins");
+        assert_eq!(
+            ran_rx.recv().expect("worker ran"),
+            Some("harw-job-worker".to_owned())
+        );
+        let mut done = worker.done;
+        assert_eq!(done.try_recv(), Ok(()));
+    }
+
+    #[test]
+    fn test_jemalloc_allocator_is_feature_gated() {
+        let source = include_str!("main.rs");
+        let allocator = source
+            .find("#[global_allocator]")
+            .expect("global allocator declaration present");
+        let gate = source
+            .find("#[cfg(feature = \"jemalloc\")]")
+            .expect("jemalloc cfg gate present");
+        // The gate must directly precede the allocator attribute.
+        assert!(gate < allocator);
+        assert_eq!(
+            source[gate..allocator].trim(),
+            "#[cfg(feature = \"jemalloc\")]"
+        );
+        assert_eq!(
+            source
+                .lines()
+                .filter(|line| line.trim() == "#[global_allocator]")
+                .count(),
+            1
+        );
+
+        let manifest = include_str!("../Cargo.toml");
+        assert!(
+            manifest.contains("tikv-jemallocator = { version = \"0.7.0\", optional = true }"),
+            "jemalloc dependency must be optional"
+        );
+        assert!(manifest.contains("jemalloc = [\"dep:tikv-jemallocator\"]"));
+        // Opt-in: the default feature set must not pull jemalloc in.
+        assert!(manifest.contains("default = []"));
     }
 }

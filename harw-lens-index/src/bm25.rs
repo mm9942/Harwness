@@ -4,23 +4,25 @@
 //! Besitzt [`Bm25Index`]: eine reine Textsuche über die `text`-Felder aller
 //! gespeicherten [`Chunk`]s, ohne Embedding.
 //!
-//! # Bewusste Doppelung mit `harw-knowledge`
-//! `harw-knowledge` (`harw-knowledge/src/memory/recall.rs`, `KeywordRanker`)
-//! implementiert bereits ein echtes BM25 mit denselben Parametern
-//! (`k1 = 1.2`, `b = 0.75`) für seinen eigenen Recall-Pfad. Dieses Modul
-//! implementiert BM25 hier **zusätzlich**, für `harw-lens-index` — das ist
-//! eine bewusste, **geduldete** Doppelung, kein Versehen. Geduldet, weil
-//! `harw-knowledge` zum Zeitpunkt dieses Knotens (AW4-06) parallel von vier
-//! anderen Knoten des Ausbauprogramms beschrieben wird; eine Zusammenlegung
-//! der beiden Implementierungen mitten in diesem Programm wäre die
-//! riskantere Wahl, nicht die sauberere. Die Zusammenlegung (etwa: BM25 in
-//! eine gemeinsame Crate ausziehen, beide Konsumenten darauf umstellen) wird
-//! bewusst zurückgestellt und nach Abschluss des Ausbauprogramms bewertet.
-//! Diese Crate hängt **nicht** von `harw-knowledge` ab (siehe `Cargo.toml`);
-//! die Parameter `k1`, `b`, die IDF-Formel mit `+1`-Glättung, der
-//! `avg_dl`-Fallback auf `1.0` bei einem Korpusmittel von `0` und das
-//! Verwerfen von Kandidaten mit Score `0` sind wörtlich aus
-//! `harw-knowledge`s `KeywordRanker` übernommen, nicht neu erfunden.
+//! # BM25-Formel jetzt in `harw-lens-rank` (Knoten W10-L1, F-206)
+//! Vor diesem Knoten implementierte dieses Modul die BM25-Formel
+//! (Termfrequenz-Sättigung, IDF mit `+1`-Glättung, `avg_dl`-Fallback) selbst
+//! — wörtlich identisch zu `harw-knowledge`s `KeywordRanker`
+//! (`harw-knowledge/src/memory/recall.rs`), dokumentiert als bewusst
+//! geduldete Doppelung (Befund F-206 im Register). Der Knoten **W9-C4** hat
+//! diese Formel als reine Funktion [`harw_lens_rank::bm25_scores`] extrahiert;
+//! dieser Knoten (**W10-L1**) stellt [`Bm25Index::search`] darauf um und
+//! löscht die eigene Kopie der Formel. Was hierbleibt, ist ausschließlich
+//! Lens-eigen: die [`Chunk`]/[`IndexManifest`]-Anbindung, das
+//! Persistenzformat ([`Bm25IndexFile`]) und die Tokenisierung
+//! ([`tokenize`], siehe unten) — `harw-lens-rank` kennt weder `Chunk` noch
+//! `IndexManifest` und bleibt entsprechend schlank. Die Tokenisierung bleibt
+//! bewusst hier (nicht auch nach `harw-lens-rank` gezogen): sie ist
+//! Lens-spezifisch (`chunk.text`), während `harw-knowledge`s Tokenisierung
+//! auf eigenen Texttypen arbeitet — nur die BM25-**Formel**, nicht die
+//! Tokenisierung, war die 1:1-Kopie, die F-206 meinte. Die Übernahme durch
+//! `harw-knowledge` selbst ist ausdrücklich **nicht** Teil dieses Knotens
+//! (das Crate ist für W9-K2 gesperrt) und bleibt Folgearbeit.
 //!
 //! # Modell vs. Chunker-Version
 //! Ein `Bm25Index` hat kein Modell — Text braucht kein Embedding-Modell, um
@@ -71,10 +73,9 @@
 //! assert_eq!(hits.len(), 1);
 //! ```
 
-use std::collections::HashMap;
-
 use serde::{Deserialize, Serialize};
 
+use harw_lens_rank::{bm25_scores, Bm25Params};
 use harw_lens_store::LensStore;
 use harw_lens_types::{Chunk, IndexManifest, Ranked};
 
@@ -83,44 +84,36 @@ use crate::query::Query;
 use crate::sort::sort_ranked_desc;
 use crate::vector_index::VectorIndex;
 
-/// BM25-Sättigungsparameter für die Termfrequenz. Wörtlich aus
-/// `harw-knowledge`s `KeywordRanker` übernommen (siehe Modul-Dokumentation).
-const BM25_K1: f64 = 1.2;
-/// BM25-Längennormalisierungsparameter. Wörtlich aus `harw-knowledge`s
-/// `KeywordRanker` übernommen (siehe Modul-Dokumentation).
-const BM25_B: f64 = 0.75;
-
-/// Ein Dokument im BM25-Korpus: der Chunk plus seine vorab berechnete
-/// Termstatistik.
+/// Ein Dokument im BM25-Korpus: der Chunk plus seine vorab tokenisierte
+/// Fassung.
 ///
 /// # Description
-/// Termfrequenzen und Länge werden einmalig in [`Bm25Index::build`]
-/// berechnet, nicht bei jeder Suche neu — der Korpus ändert sich nach dem
-/// Bauen nicht.
+/// Die Tokenisierung wird einmalig in [`Bm25Index::build`] durchgeführt,
+/// nicht bei jeder Suche neu — der Korpus ändert sich nach dem Bauen nicht.
+/// Die eigentliche BM25-Bewertung (Termfrequenz, Dokumentfrequenz,
+/// Längennormalisierung) übernimmt [`harw_lens_rank::bm25_scores`] bei jeder
+/// [`Bm25Index::search`] aus diesen Tokens neu (siehe Modul-Dokumentation).
 #[derive(Debug, Clone, PartialEq)]
 struct Bm25Document {
     /// Der zugrundeliegende Chunk.
     chunk: Chunk,
-    /// Termfrequenzen über den tokenisierten `chunk.text`.
-    term_frequencies: HashMap<String, u32>,
-    /// Die Länge des Dokuments in Tokens (Summe aller Termfrequenzen).
-    length: f64,
+    /// Die tokenisierte Fassung von `chunk.text` (siehe [`tokenize`]).
+    tokens: Vec<String>,
 }
 
 /// Das Persistenzformat eines [`Bm25Index`]: eine Hülle aus dem Manifest und
-/// den rohen Chunks (nicht der abgeleiteten Termstatistik), gemeinsam als
+/// den rohen Chunks (nicht der abgeleiteten Tokenisierung), gemeinsam als
 /// ein JSON-Dokument serialisiert.
 ///
 /// # Description
 /// Es werden bewusst nur die [`Chunk`]s gespeichert, nicht
-/// `Bm25Document::term_frequencies`/`length`: diese sind aus `chunk.text`
-/// deterministisch ableitbar, und [`Bm25Index::load`] baut sie über
-/// [`Bm25Index::build`] neu auf, statt eine zweite, potenziell
-/// inkonsistente Quelle der Wahrheit auf der Platte zu halten. Das Manifest
-/// liegt hier zusätzlich zu dem Manifest, das
-/// [`harw_lens_store::LensStore::put_index`] separat unter
-/// `index/<name>/manifest.json` ablegt — Begründung siehe
-/// `FlatIndexFile` in `flat.rs`.
+/// `Bm25Document::tokens`: diese sind aus `chunk.text` deterministisch
+/// ableitbar, und [`Bm25Index::load`] baut sie über [`Bm25Index::build`] neu
+/// auf, statt eine zweite, potenziell inkonsistente Quelle der Wahrheit auf
+/// der Platte zu halten. Das Manifest liegt hier zusätzlich zu dem
+/// Manifest, das [`harw_lens_store::LensStore::put_index`] separat unter
+/// `index/<name>/manifest.json` ablegt — Begründung siehe `FlatIndexFile`
+/// in `flat.rs`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Bm25IndexFile {
     /// Das Manifest, wie es zum Zeitpunkt von `save` galt.
@@ -132,18 +125,14 @@ struct Bm25IndexFile {
 /// Lexikalischer BM25-Index über die `text`-Felder gespeicherter Chunks.
 ///
 /// # Description
-/// Kein Embedding, kein Modell — siehe Modul-Dokumentation zur bewussten
-/// Doppelung mit `harw-knowledge` und zur Modell/Chunker-Version-Unterscheidung.
+/// Kein Embedding, kein Modell — siehe Modul-Dokumentation zur
+/// Modell/Chunker-Version-Unterscheidung. Die BM25-Formel selbst liegt in
+/// [`harw_lens_rank::bm25_scores`] (Knoten W10-L1, F-206); dieser Typ hält
+/// nur die tokenisierten Chunks und ruft sie bei jeder Suche auf.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Bm25Index {
     manifest: IndexManifest,
     documents: Vec<Bm25Document>,
-    /// Durchschnittliche Dokumentlänge in Tokens über den ganzen Korpus.
-    /// `1.0`, wenn der Korpus leer ist oder das Mittel `0` ergibt (siehe
-    /// `harw-knowledge`s `KeywordRanker`).
-    avg_doc_length: f64,
-    /// Anzahl Dokumente, die jeden Term mindestens einmal enthalten.
-    document_frequency: HashMap<String, usize>,
 }
 
 impl Bm25Index {
@@ -151,11 +140,12 @@ impl Bm25Index {
     /// Chunks.
     ///
     /// # Description
-    /// Tokenisiert jeden `chunk.text` einmalig und berechnet Termfrequenzen,
-    /// Dokumentlänge, die Korpus-Durchschnittslänge und die
-    /// Dokumentfrequenz jedes Terms. Diese Werte sind aus dem Ergebnis
-    /// deterministisch ableitbar; [`Bm25Index::load`] ruft diese Methode
-    /// erneut auf, statt sie zu persistieren.
+    /// Tokenisiert jeden `chunk.text` einmalig; die eigentliche
+    /// BM25-Statistik (Termfrequenzen, Dokumentfrequenz, Korpus-
+    /// Durchschnittslänge) berechnet [`harw_lens_rank::bm25_scores`] erst
+    /// bei jeder [`Bm25Index::search`] aus diesen Tokens — sie ist aus dem
+    /// Ergebnis deterministisch ableitbar, wird deshalb hier nicht
+    /// vorgehalten.
     ///
     /// # Arguments
     /// - `manifest` (`IndexManifest`): das Manifest dieses Index. `model`
@@ -187,38 +177,12 @@ impl Bm25Index {
         let documents: Vec<Bm25Document> = chunks
             .into_iter()
             .map(|chunk| {
-                let terms = tokenize(&chunk.text);
-                let term_frequencies = term_frequencies(&terms);
-                let length = terms.len() as f64;
-                Bm25Document {
-                    chunk,
-                    term_frequencies,
-                    length,
-                }
+                let tokens = tokenize(&chunk.text);
+                Bm25Document { chunk, tokens }
             })
             .collect();
 
-        let avg_doc_length = if documents.is_empty() {
-            1.0
-        } else {
-            let total: f64 = documents.iter().map(|doc| doc.length).sum();
-            let mean = total / documents.len() as f64;
-            if mean > 0.0 { mean } else { 1.0 }
-        };
-
-        let mut document_frequency: HashMap<String, usize> = HashMap::new();
-        for doc in &documents {
-            for term in doc.term_frequencies.keys() {
-                *document_frequency.entry(term.clone()).or_insert(0) += 1;
-            }
-        }
-
-        Self {
-            manifest,
-            documents,
-            avg_doc_length,
-            document_frequency,
-        }
+        Self { manifest, documents }
     }
 
     /// Die Anzahl indizierter Dokumente.
@@ -263,7 +227,7 @@ impl Bm25Index {
     /// # Description
     /// Liest Manifest und Datenteil getrennt aus `store`, vergleicht das im
     /// Datenteil eingebettete Manifest gegen das separat geladene (siehe
-    /// `flat.rs`) und baut die Termstatistik über [`Bm25Index::build`] aus
+    /// `flat.rs`) und baut die Tokenisierung über [`Bm25Index::build`] aus
     /// den geladenen Chunks neu auf.
     ///
     /// # Arguments
@@ -317,22 +281,19 @@ impl VectorIndex for Bm25Index {
         let text = query.text.as_ref().ok_or(IndexError::MissingText)?;
         let query_terms = tokenize(text);
 
-        let mut scored: Vec<Ranked> = Vec::new();
-        if !query_terms.is_empty() {
-            let doc_count = self.documents.len() as f64;
-            for doc in &self.documents {
-                let score: f64 = query_terms
-                    .iter()
-                    .map(|term| self.term_score(term, doc, doc_count))
-                    .sum();
-                if score > 0.0 {
-                    scored.push(Ranked {
-                        chunk: doc.chunk.clone(),
-                        score: score as f32,
-                    });
-                }
-            }
-        }
+        let doc_tokens: Vec<&[String]> = self.documents.iter().map(|doc| doc.tokens.as_slice()).collect();
+        let scores = bm25_scores(&doc_tokens, &query_terms, Bm25Params::default());
+
+        let mut scored: Vec<Ranked> = self
+            .documents
+            .iter()
+            .zip(scores)
+            .filter(|(_, score)| *score > 0.0)
+            .map(|(doc, score)| Ranked {
+                chunk: doc.chunk.clone(),
+                score,
+            })
+            .collect();
 
         sort_ranked_desc(&mut scored);
         scored.truncate(limit);
@@ -340,44 +301,15 @@ impl VectorIndex for Bm25Index {
     }
 }
 
-impl Bm25Index {
-    /// Der BM25-Beitrag eines einzelnen Query-Terms zum Score von `doc`.
-    ///
-    /// # Description
-    /// Identische Formel wie `harw-knowledge`s `KeywordRanker` (siehe
-    /// Modul-Dokumentation): IDF mit `+1`-Glättung, multipliziert mit der
-    /// termfrequenz-gesättigten Gewichtung. `0.0`, wenn `term` in `doc` nicht
-    /// vorkommt.
-    fn term_score(&self, term: &str, doc: &Bm25Document, doc_count: f64) -> f64 {
-        let f = f64::from(doc.term_frequencies.get(term).copied().unwrap_or(0));
-        if f == 0.0 {
-            return 0.0;
-        }
-        let df = self.document_frequency.get(term).copied().unwrap_or(0) as f64;
-        let idf = (((doc_count - df + 0.5) / (df + 0.5)) + 1.0).ln();
-        let denom = f + BM25_K1 * (1.0 - BM25_B + BM25_B * doc.length / self.avg_doc_length);
-        idf * (f * (BM25_K1 + 1.0)) / denom
-    }
-}
-
-/// Tokenisiert Text in kleingeschriebene alphanumerische Terme
-/// (ASCII-Wortgrenzen). Identisch zu `harw-knowledge`s `tokenize` (siehe
-/// Modul-Dokumentation) — absichtlich hier erneut geschrieben, nicht
-/// importiert, weil diese Crate nicht von `harw-knowledge` abhängt.
+/// Tokenisiert Text in kleingeschriebene alphanumerische Terme, getrennt an
+/// jeder Nicht-Alphanumerik-Stelle. `is_alphanumeric` arbeitet mit Unicode,
+/// nicht nur mit ASCII — ein Wort wie "café" bleibt also ein einziges
+/// Token, nicht zwei.
 fn tokenize(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|token| !token.is_empty())
         .map(str::to_lowercase)
         .collect()
-}
-
-/// Zählt Vorkommen jedes Terms.
-fn term_frequencies(terms: &[String]) -> HashMap<String, u32> {
-    let mut map: HashMap<String, u32> = HashMap::new();
-    for term in terms {
-        *map.entry(term.clone()).or_insert(0) += 1;
-    }
-    map
 }
 
 #[cfg(test)]
@@ -486,6 +418,21 @@ mod tests {
     }
 
     #[test]
+    fn test_search_with_empty_query_text_returns_empty_list_not_error() {
+        let manifest = manifest_with(1);
+        let index = Bm25Index::build(manifest.clone(), vec![chunk("match term")]);
+        let query = Query {
+            embedding: None,
+            text: Some("   ".to_owned()),
+            manifest,
+        };
+        let hits = index
+            .search(&query, 10)
+            .expect("whitespace-only text tokenizes to an empty query");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
     fn test_search_rejects_chunker_version_mismatch_before_computing() {
         let manifest = manifest_with(1);
         let index = Bm25Index::build(manifest.clone(), vec![chunk("match term")]);
@@ -582,6 +529,13 @@ mod tests {
             tokenize("Hello, World!"),
             vec!["hello".to_owned(), "world".to_owned()]
         );
+    }
+
+    #[test]
+    fn test_tokenize_keeps_unicode_words_intact() {
+        // Regressionstest fuer F-206: der vorherige Modulkommentar behauptete
+        // "ASCII-Wortgrenzen", obwohl `is_alphanumeric` Unicode-bewusst ist.
+        assert_eq!(tokenize("café"), vec!["café".to_owned()]);
     }
 
     #[test]

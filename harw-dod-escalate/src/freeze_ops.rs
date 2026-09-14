@@ -250,39 +250,27 @@ pub fn authorize_stage_gated(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harw_dod_rules::rule::{Rule, RuleContext};
-    use harw_dod_rules::rules::EgressFlowRule;
-    use harw_dod_rules::{run_rules, triage};
-    use harw_dod_rules::Verdict;
-    use harw_dod_signals::{EventKind, Hardness, Severity, SecurityEvent};
+    use harw_dod_rules::{FindingKind, Verdict, triaged_finding_for_test};
+    use harw_dod_signals::{Hardness, Severity};
     use harw_dod_warden_proto::EscalationStage;
-    use harw_sandbox::NetworkScope;
-    use harw_types::{CgroupId, SensorId};
+    use harw_types::{CgroupId, FindingId};
 
+    // `Severity::Critical` wird derzeit von keiner echten Regel erzeugt
+    // (siehe `harw-dod-rules/src/rules/*`); die Fixtur muss sie trotzdem
+    // direkt setzen können, um `Ladder::stage_for`s `Escalated`-Schwelle zu
+    // erreichen. `triaged_finding_for_test` (Feature `test-support`, siehe
+    // `harw-dod-rules/src/finding.rs`-Moduldoku) ist genau dafür da.
     fn finding_with(severity: Severity, hardness: Hardness, verdict: Verdict) -> Finding<Triaged> {
-        let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);
-        let events = vec![SecurityEvent {
-            sensor: SensorId::from_str("net-0"),
-            observed_at: jiff::Timestamp::UNIX_EPOCH,
-            actor: None,
-            kind: EventKind::EgressFlow {
-                destination: "evil.example.com".to_owned(),
-                port: 443,
-            },
-        }];
-        let ctx = RuleContext {
-            now: jiff::Timestamp::UNIX_EPOCH,
-            samples: &[],
-            events: &events,
-            baselines: &[],
-            network_scope: &scope,
-        };
-        let rule: &dyn Rule = &EgressFlowRule;
-        let checked = run_rules(&[rule], &ctx);
-        let mut finding = checked.into_iter().next().expect("EgressFlowRule löst aus");
-        finding.severity = severity;
-        finding.hardness = hardness;
-        triage(finding, verdict)
+        triaged_finding_for_test(
+            "egress-flow",
+            FindingKind::RuleTriggered,
+            severity,
+            hardness,
+            "egress flow to evil.example.com:443 is outside the allowed network scope",
+            jiff::Timestamp::UNIX_EPOCH,
+            FindingId::try_from_str("freeze-ops-test-finding").expect("non-empty id"),
+            verdict,
+        )
     }
 
     fn actor() -> ApprovalActor {

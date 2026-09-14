@@ -92,6 +92,13 @@
 //! - [`metrics`]: die in [`harw_observe`] deklarierten Kennzahlen dieser
 //!   Crate (Abrufe je Sensor, Fehler nach `Permanence`, degradierte
 //!   Sensoren, Pufferauslastung).
+//! - [`spool`]: [`spool::FindingSpool`] — die dateibasierte Übergabe
+//!   eingefrorener Befunde (`harw_dod_rules::finding::FindingRecord`) an
+//!   Triage und Escalator (W3/C-FIND): atomar geschrieben (`0640`),
+//!   symlinkfest gelesen, größen- und eintragsbegrenzt, Cursor in
+//!   Schreibreihenfolge. Das ist **keine** Parselogik im Sinne der Auflage
+//!   oben: gelesen werden ausschließlich Records, die diese Crate selbst im
+//!   eigenen Format geschrieben hat, nie eine Sensorquelle.
 //! - [`Sentinel`], [`SentinelConfig`]: die Sammelstelle selbst, die die
 //!   drei Bausteine oben zusammenführt — mit zwei Schreibwegen in ihren
 //!   Puffer ([`Sentinel::poll_all`] für Sensor-Abrufe,
@@ -107,8 +114,10 @@
 //! trotzdem mit einem einzigen Sammelthread entworfen ist).
 //!
 //! # Fehler
-//! [`error::SentinelError`] — ein einziger Fehlerpfad
-//! ([`Sentinel::freeze`]/[`buffer::EvidenceBuffer::freeze`]). Ein
+//! [`error::SentinelError`] — ein einziger Fehlerpfad der Sammelstelle
+//! ([`Sentinel::freeze`]/[`buffer::EvidenceBuffer::freeze`]). Der Spool hat
+//! seinen eigenen, von der Sammelstelle getrennten Fehlertyp
+//! [`spool::SpoolError`] (Dateisystem, Größen-/Symlinkschutz). Ein
 //! fehlgeschlagener Sensor-Abruf ist **kein** `Err` dieser Crate, sondern
 //! ein Zustandsübergang im Automaten (siehe [`health`]-Moduldoku).
 //!
@@ -162,8 +171,12 @@ pub mod error;
 pub mod health;
 pub mod metrics;
 pub mod sentinel;
+pub mod spool;
 
 pub use buffer::EvidenceBuffer;
 pub use error::{SentinelError, SentinelResult};
 pub use health::{DegradeReason, RetryPolicy, SensorHealth};
 pub use sentinel::{Sentinel, SentinelConfig};
+pub use spool::{
+    FindingSpool, SpoolCursor, SpoolEntry, SpoolError, SpoolId, SpoolLimits, SpoolResult,
+};

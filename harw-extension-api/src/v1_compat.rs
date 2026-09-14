@@ -53,7 +53,13 @@ use harw_lens_types::{BytesOverFour, CostEstimator};
 /// diese uneinheitlichen Strings zu raten, bekommen alle konvertierten
 /// Fragmente dieselbe, klar als Migration erkennbare Sektion — die sicherste
 /// Annahme, dieselbe Haltung wie bei `trust` und `stability` unten.
-const V1_SECTION: &str = "legacy.v1";
+///
+/// Der Wert kommt seit W3 (C-PROTO, Befund F-163) aus
+/// [`harw_context::ceiling::LEGACY_V1_SECTION`] und ist damit garantiert Teil
+/// von [`harw_context::ceiling::ROOT_CONTEXT_SECTIONS`]: vorher kannte keine
+/// Wurzeldecke `legacy.v1`, und im Kindpfad fiel jedes v1-Fragment als
+/// `BelowCeiling` heraus.
+const V1_SECTION: &str = harw_context::ceiling::LEGACY_V1_SECTION;
 
 /// Fester Namespace in [`FragmentOrigin::namespace`] für jedes über
 /// [`fragment_from_v1`] konvertierte Fragment.
@@ -295,6 +301,45 @@ mod tests {
         assert_eq!(fragment.body, "");
         assert_eq!(fragment.cost, BytesOverFour.estimate(""));
         assert_eq!(fragment.digest, ContentDigest::of(b""));
+    }
+
+    /// F-163: ein über die Brücke konvertiertes Fragment muss von einer Decke
+    /// aus `ROOT_CONTEXT_SECTIONS` zugelassen werden, sonst sieht kein Kind
+    /// je Provider-Kontext.
+    #[test]
+    fn test_fragment_from_v1_section_is_admitted_by_root_context_sections_ceiling() {
+        use harw_context::ceiling::ROOT_CONTEXT_SECTIONS;
+        use harw_context::{ContextBudgetSpec, ContextCeiling, SectionName};
+        use harw_lens_types::BudgetSpec;
+
+        let fragment = fragment_from_v1(&v1("project.root", "project_root=/srv/app"), Timestamp::UNIX_EPOCH)
+            .expect("valid label converts");
+        let ceiling = ContextCeiling {
+            sections: ROOT_CONTEXT_SECTIONS
+                .iter()
+                .map(|name| SectionName::try_new(*name).expect("root sections are valid"))
+                .collect(),
+            max_trust: TrustClass::Instruction,
+            budget: ContextBudgetSpec {
+                total: BudgetSpec { total: 1_000 },
+                per_section: std::collections::BTreeMap::new(),
+            },
+        };
+
+        assert!(ROOT_CONTEXT_SECTIONS.contains(&V1_SECTION));
+        assert_eq!(ceiling.admits(&fragment), Ok(()));
+    }
+
+    /// Alte v1-Fragmente mit Punktpfad-, Formatstring- und Einwort-Labels
+    /// werden weiterhin gelesen und landen alle in derselben Sektion.
+    #[test]
+    fn test_fragment_from_v1_reads_legacy_label_shapes_into_legacy_section() {
+        for label in ["project.root", "project.doc:README.md", "small"] {
+            let fragment = fragment_from_v1(&v1(label, "body"), Timestamp::UNIX_EPOCH)
+                .expect("legacy label shapes stay convertible");
+            assert_eq!(fragment.section.as_str(), harw_context::ceiling::LEGACY_V1_SECTION);
+            assert_eq!(fragment.label.as_str(), label);
+        }
     }
 
     #[test]

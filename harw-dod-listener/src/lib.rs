@@ -14,7 +14,10 @@
 //! [`harw_dod_signals::Sensor`] und orchestriert zwei eigenständige Schritte:
 //!
 //! - [`procnet`]: liest `/proc/net/{tcp,tcp6,udp,udp6}` und liefert Port und
-//!   Socket-Inode jeder Zeile im Zustand `0A` (`TCP_LISTEN`).
+//!   Socket-Inode jeder "lauschend"-Zeile — Zustand `0A` (`TCP_LISTEN`) für
+//!   die beiden TCP-Tabellen, Zustand `07` (UDP-Äquivalent, siehe
+//!   [`procnet`]-Moduldokumentation, Abschnitt „F-065-Nachtrag") für die
+//!   beiden UDP-Tabellen.
 //! - [`owner`]: löst — für genau diese Inodes, in einem einzigen Durchlauf
 //!   über `/proc/<pid>/fd/*` — die besitzende PID sowie deren reale UID und
 //!   cgroup auf.

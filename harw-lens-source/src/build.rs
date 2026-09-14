@@ -415,7 +415,7 @@ fn build_visibility_bucket(
         entries.push((chunk.clone(), embedding));
     }
 
-    let index = FlatIndex::build(manifest.clone(), entries);
+    let index = FlatIndex::build(manifest.clone(), entries)?;
     index.save(&store, index_name)?;
     save_embedding_cache(&store, &cache_name, &manifest, &cache)?;
 

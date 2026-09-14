@@ -15,6 +15,7 @@ pub mod error;
 pub mod model;
 pub mod sandbox;
 pub mod services;
+pub mod session_title;
 pub mod spec;
 pub mod trace;
 
@@ -34,6 +35,7 @@ pub use error::{RuntimeError, RuntimeResult};
 pub use model::{ModelSource, build_root_model, build_root_model_with_resolver};
 pub use sandbox::{permissions_for_tier, plan_node_sandbox, root_sandbox};
 pub use services::{PlanServices, RuntimeServices, RuntimeServicesParts, ServiceSurface};
+pub use session_title::{SessionTitleError, TitleRequest, ensure_title, generate_title, spawn_title_job};
 pub use spec::{
     AskResolution, CeilingPolicy, EntryKind, EntryProfile, OperationSurface, RightsSnapshot,
     RootBudget, RuntimeSpec, SpawnerPolicy,

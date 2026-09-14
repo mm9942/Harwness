@@ -247,7 +247,7 @@ async fn mode(ctx: &OpContext, args: ModeArgs) -> Result<OpOutput, OpError> {
 
     let text = serde_json::to_string_pretty(&report)
         .map_err(|error| OpError::Execution(format!("Bericht nicht serialisierbar: {error}")))?;
-    Ok(OpOutput { text })
+    Ok(OpOutput::from(text))
 }
 
 /// Bildet einen [`SessionControlError`] auf die passende [`OpError`]-Variante ab.

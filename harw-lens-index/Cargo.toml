@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 harw-lens-types = { path = "../harw-lens-types" }
 harw-lens-store = { path = "../harw-lens-store" }
+harw-lens-rank = { path = "../harw-lens-rank" }
 harw-types = { path = "../harw-types" }
 harw-macros = { path = "../harw-macros" }
 serde = { workspace = true }

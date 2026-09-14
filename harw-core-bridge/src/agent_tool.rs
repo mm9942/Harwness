@@ -36,17 +36,26 @@
 //! 3. **Pause** — `AwaitingChild`/`AwaitingApproval` sind nur zulässig, wenn der
 //!    [`ChildRecord`](harw_core::child_controller::ChildRecord) des Kindes
 //!    `allow_pause = true` trägt; sonst fail-closed mit präziser Meldung.
-//! 4. **Lease** — das Schließen eines Kindes (`close_child`) bleibt Aufgabe der
-//!    Orchestrierungs-Laufzeit, die das Ergebnis an den Parent zustellt; weder
-//!    [`AgentToolAdapter::invoke`] noch [`fanout_children`] geben den
-//!    Admission-Slot selbst frei.
+//! 4. **Lease** (W4a/A-BRIDGE, G-016) — [`AgentToolAdapter::invoke`] und
+//!    [`fanout_children`] liefern das Kind-Ergebnis selbst an den Aufrufer aus
+//!    (Rückgabewert); eine andere Orchestrierungs-Laufzeit, die Kinder schließt,
+//!    gibt es nicht. Deshalb gibt ein RAII-Guard (`ChildSlotGuard`) den
+//!    Admission-Slot frei, **nachdem** das Ergebnis vollständig ausgewertet
+//!    (Text kopiert, Contract geprüft) ist — und ebenso bei jedem Fehler,
+//!    Vertragsbruch, Budget-Abbruch oder wenn der aufrufende Future verworfen
+//!    wird. Einzige Ausnahme: eine *zulässige* Pause (`allow_pause = true`)
+//!    hält den Slot, weil die Fortsetzung beim Aufrufer liegt.
 //!
 //! # Grundinvariante — Authority-Monotonie
 //! Gemäß Design-Doc Abschnitt 2: Ein Child-Agent darf **niemals** mehr Authority
 //! besitzen als der Parent-Call, der ihn erzeugt. Die `authority_reducer`-Kennung
 //! referenziert eine monoton fallende Funktion; dieselbe Monotonie gilt für das
 //! Budget (siehe [`tighten_budget`]) und für den Reasoning-Effort
-//! (`clamp_child_reasoning_effort`).
+//! (`clamp_child_reasoning_effort`). Einen Effort-Override aus Modell-Argumenten
+//! gibt es nicht (W4a/A-BRIDGE, G-084): Tool-Argumente sind Modell-Output und
+//! damit kein Owner-Nachweis; `effort`/`reasoning_effort` in den Argumenten wird
+//! abgelehnt. Der Effort stammt allein aus Parent-Erbe, Rolle (Agent-IR) und
+//! deklariertem Budget.
 //!
 //! # Kardinalität
 //! Eine Operation deklariert **maximal eine** `Surface::AgentTool`-Fläche.
@@ -66,10 +75,12 @@
 //!
 //! # Fehlertypen
 //! - [`crate::error::OpError::InvalidArguments`]: Argumente sind kein JSON-Objekt,
-//!   oder ein Budget-Label ist syntaktisch ungültig.
+//!   tragen ein Effort-Feld (`effort`/`reasoning_effort`), oder ein Budget-Label
+//!   ist syntaktisch ungültig.
 //! - [`crate::error::OpError::NotAvailable`]: Kein `ManagedAgentSpawner`/`StateStore`
 //!   im Kontext registriert, die Deklaration trägt ein unlesbares `budget_hint`,
-//!   der Spawn/Lauf schlug fehl, oder das Kind pausierte ohne Pause-Erlaubnis.
+//!   der Spawn/Lauf/Effort-Clamp schlug fehl, oder das Kind pausierte ohne
+//!   Pause-Erlaubnis.
 //!
 //! # Spec-Quelle
 //! `docs/design/wave-4-agents-as-tools.md`, `agent-definition-dsl.md` §13,
@@ -102,10 +113,11 @@
 //!             aliases: &[],
 //!             category: harw_operations::OperationCategory::Agent,
 //!             args_schema: None,
+//!             output_schema: None,
 //!         })
 //!     }
 //!     fn run<'a>(&'a self, _c: &'a OpContext, _i: OpInput) -> OpFuture<'a> {
-//!         Box::pin(async { Ok(OpOutput { text: String::new() }) })
+//!         Box::pin(async { Ok(OpOutput { text: String::new(), data: None }) })
 //!     }
 //! }
 //!
@@ -114,11 +126,13 @@
 //! assert_eq!(adapter.unwrap().child_name(), "researcher");
 //! ```
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::task::Poll;
 
+use harw_core::StateStore;
 use harw_core::child_controller::{
-    AgentBudget, ChildRegistryFactory, ChildRunResult, FanoutRequest, JoinSemantics,
-    ManagedAgentSpawner,
+    AgentBudget, ChildRegistryFactory, ChildRunResult, JoinSemantics, ManagedAgentSpawner,
 };
 use harw_core::turn_loop::{TurnInput, TurnOutcome};
 use harw_sandbox::{Permission, PermissionSet, SandboxSpec};
@@ -338,7 +352,8 @@ impl AgentToolAdapter {
     /// # Beschreibung
     /// Ablauf in dieser Reihenfolge — jede Stufe ist eine Grenze, keine
     /// Bequemlichkeit:
-    /// 1. `args` muss ein JSON-Objekt sein, sonst `InvalidArguments`.
+    /// 1. `args` muss ein JSON-Objekt sein und darf kein Effort-Feld
+    ///    (`effort`/`reasoning_effort`) tragen, sonst `InvalidArguments`.
     /// 2. `ManagedAgentSpawner` und `StateStore` werden aus dem [`OpContext`]
     ///    aufgelöst; fehlen sie, ist das Werkzeug nicht verfügbar.
     /// 3. `budget_hint` wird über [`parse_budget_hint`] typisiert. Ein
@@ -349,11 +364,15 @@ impl AgentToolAdapter {
     ///    ([`resolve_authority_reducer`]) und das Kind gespawnt.
     /// 5. Das deklarierte Budget wird mit dem IR-Budget des Kindes verschnitten;
     ///    je Dimension gewinnt die **strengere** Grenze ([`tighten_budget`]).
-    /// 6. Der Reasoning-Effort wird auf `budget.reasoning_effort` geklammert
-    ///    (Owner-Override aus `args.effort` bleibt möglich).
+    /// 6. Der Reasoning-Effort wird auf `budget.reasoning_effort` geklammert —
+    ///    ohne Override. Scheitert die Klammerung, läuft das Kind **nicht**
+    ///    (fail-closed), statt mit ungeklammertem Effort weiterzulaufen.
     /// 7. Der Turn läuft über `run_child_with_budget`.
     /// 8. Das Ergebnis wird gegen den [`ChildReturnContract`] des Kindes
     ///    ausgewertet (siehe [`resolve_child_contract`]).
+    /// 9. Der Admission-Slot wird freigegeben — nach der Auswertung, und
+    ///    ebenso bei jedem früheren Fehlerausgang ab Schritt 4 (RAII-Guard).
+    ///    Nur eine zulässige Pause hält den Slot für die Fortsetzung.
     ///
     /// `args` wird als kompakter JSON-String an den Child-Turn übergeben — ein
     /// strukturierteres JSON→Prompt-Mapping ist expliziter Backlog einer
@@ -380,8 +399,12 @@ impl AgentToolAdapter {
     ///
     /// # Errors
     /// - [`OpError::InvalidArguments`]: `args` ist kein JSON-Objekt.
+    /// - [`OpError::InvalidArguments`]: `args` trägt `effort` oder
+    ///   `reasoning_effort` — das Modell darf den Effort des Kindes nicht
+    ///   bestimmen (G-084).
     /// - [`OpError::NotAvailable`]: Kein `ManagedAgentSpawner`/`StateStore` im
     ///   Kontext registriert.
+    /// - [`OpError::NotAvailable`]: Die Effort-Klammerung des Kindes schlug fehl.
     /// - [`OpError::NotAvailable`]: Die `Surface::AgentTool`-Deklaration trägt ein
     ///   ungültiges `budget_hint`.
     /// - [`OpError::NotAvailable`]: `spawn_child` oder `run_child_with_budget`
@@ -390,6 +413,9 @@ impl AgentToolAdapter {
     ///   das Pausieren verbietet.
     /// - [`OpError::NotAvailable`]: Die Abschlussantwort des Kindes ist nicht
     ///   abrufbar.
+    /// - [`OpError::Execution`]: Der Kind-Turn endete terminal ohne Erfolg —
+    ///   `TurnOutcome::Cancelled`/`Truncated`/`Refused`/`Failed` (Meldung nennt
+    ///   Kind, Rolle und den jeweiligen Grund/Detail).
     ///
     /// # Panics
     /// Keine.
@@ -430,6 +456,15 @@ impl AgentToolAdapter {
                 return Err(OpError::InvalidArguments(
                     "arguments must be a JSON object".to_owned(),
                 ));
+            }
+            // K5/G-084: Tool-Argumente sind Modell-Output, kein Owner-Nachweis.
+            // Ein Effort-Feld wird sichtbar abgelehnt statt still verworfen,
+            // damit das Modell nicht glaubt, es habe den Effort gesetzt.
+            if let Some(field) = model_effort_field(&args) {
+                return Err(OpError::InvalidArguments(format!(
+                    "`{field}` is not accepted: the child's reasoning effort is fixed by its \
+                     role and declared budget, never by tool arguments"
+                )));
             }
 
             let spawner = ctx.managed_spawner().ok_or_else(|| {
@@ -476,6 +511,9 @@ impl AgentToolAdapter {
             )
             .await
             .map_err(|e| OpError::NotAvailable(format!("Agent-Spawn fehlgeschlagen: {e}")))?;
+            // K1/G-016: ab hier gibt jeder Ausgang (auch `?` und ein verworfener
+            // Future) den Admission-Slot frei; nur eine zulässige Pause hält ihn.
+            let slot = ChildSlotGuard::new(spawner.as_ref(), child.clone());
 
             // Ein einziger Schnappschuss des Admission-Records: Budget, Rolle und
             // Pause-Sperre stammen damit garantiert aus demselben Zustand. Zwei
@@ -503,30 +541,27 @@ impl AgentToolAdapter {
             );
 
             // Wave 8: Reasoning-Effort ist vom Parent bereits monoton geerbt.
-            // Der Budget-Cap verschärft ihn; ein optionaler Owner-Override im
-            // `effort`-Feld der Args darf die Monotonie gezielt durchbrechen
-            // (Owner-Authority).
-            let owner_override = args
-                .get("effort")
-                .or_else(|| args.get("reasoning_effort"))
-                .and_then(serde_json::Value::as_str)
-                .and_then(|s| s.parse::<harw_types::ReasoningEffort>().ok());
-            match spawner.clamp_child_reasoning_effort(
-                &child,
-                budget.reasoning_effort,
-                owner_override,
-            ) {
-                Ok(effective) => tracing::info!(
-                    child = %child,
-                    ?effective,
-                    "AgentToolAdapter: Reasoning-Effort für Child geklammert"
-                ),
-                Err(e) => tracing::warn!(
-                    child = %child,
-                    error = %e,
-                    "AgentToolAdapter: Reasoning-Effort-Clamp fehlgeschlagen"
-                ),
-            }
+            // Der Budget-Cap (Rolle ∩ Deklaration) verschärft ihn. K5/G-084:
+            // kein Override — `owner_override` ist hier immer `None`. Ein
+            // Clamp-Fehler ist fail-closed: das Kind liefe sonst mit
+            // ungeklammertem Effort.
+            let effective = spawner
+                .clamp_child_reasoning_effort(&child, budget.reasoning_effort, None)
+                .map_err(|e| {
+                    tracing::warn!(
+                        child = %child,
+                        error = %e,
+                        "AgentToolAdapter: Reasoning-Effort-Clamp fehlgeschlagen"
+                    );
+                    OpError::NotAvailable(format!(
+                        "Reasoning-Effort des Child-Agenten nicht klammerbar (child={child}): {e}"
+                    ))
+                })?;
+            tracing::info!(
+                child = %child,
+                ?effective,
+                "AgentToolAdapter: Reasoning-Effort für Child geklammert"
+            );
 
             let run_result = spawner
                 .run_child_with_budget(
@@ -568,21 +603,72 @@ impl AgentToolAdapter {
                         }
                     }
                 }
-                TurnOutcome::AwaitingApproval { .. } => paused_child_result(
-                    PauseKind::Approval,
-                    &child,
-                    &role,
-                    allow_pause,
-                    &run_result.outcome,
-                ),
-                TurnOutcome::AwaitingChild { .. } => paused_child_result(
-                    PauseKind::Child,
-                    &child,
-                    &role,
-                    allow_pause,
-                    &run_result.outcome,
-                ),
+                TurnOutcome::AwaitingApproval { .. } | TurnOutcome::AwaitingChild { .. } => {
+                    let kind = match &run_result.outcome {
+                        TurnOutcome::AwaitingApproval { .. } => PauseKind::Approval,
+                        _ => PauseKind::Child,
+                    };
+                    let paused =
+                        paused_child_result(kind, &child, &role, allow_pause, &run_result.outcome);
+                    if paused.is_ok() {
+                        // Zulässige Pause: die Fortsetzung liegt beim Aufrufer,
+                        // der dafür das admittierte Kind braucht.
+                        slot.keep_admitted();
+                    }
+                    paused
+                }
+                // Terminale, nicht-erfolgreiche Ausgänge (K1/G-016: der
+                // Admission-Slot wird hier NICHT gehalten — `slot` fällt am
+                // Ende des Blocks und gibt ihn frei, wie bei `Completed`).
+                // Keine Pause-Erlaubnis ist hier einschlägig: das Kind wartet
+                // auf nichts mehr, es gibt keine Fortsetzung.
+                TurnOutcome::Cancelled { reason } => {
+                    tracing::warn!(
+                        child = %run_result.child,
+                        reason = ?reason,
+                        "AgentToolAdapter: Child-Agent-Turn abgebrochen"
+                    );
+                    Err(OpError::Execution(format!(
+                        "Child-Agent '{}' (Rolle '{role}') wurde abgebrochen (reason={reason:?})",
+                        run_result.child
+                    )))
+                }
+                TurnOutcome::Truncated => {
+                    tracing::warn!(
+                        child = %run_result.child,
+                        "AgentToolAdapter: Child-Agent-Antwort abgeschnitten"
+                    );
+                    Err(OpError::Execution(format!(
+                        "Child-Agent '{}' (Rolle '{role}') brach durch Abschneiden der \
+                         Modellausgabe (max_tokens/Kontextfenster) ab, bevor etwaige Tool-Calls \
+                         der Antwort ausgeführt wurden",
+                        run_result.child
+                    )))
+                }
+                TurnOutcome::Refused { detail } => {
+                    tracing::warn!(
+                        child = %run_result.child,
+                        detail = ?detail,
+                        "AgentToolAdapter: Child-Agent-Antwort abgelehnt"
+                    );
+                    Err(OpError::Execution(format!(
+                        "Child-Agent '{}' (Rolle '{role}') lehnte die Antwort ab (detail={detail:?})",
+                        run_result.child
+                    )))
+                }
+                TurnOutcome::Failed { reason } => {
+                    tracing::warn!(
+                        child = %run_result.child,
+                        reason = %reason,
+                        "AgentToolAdapter: Child-Agent-Wiederaufnahme gescheitert"
+                    );
+                    Err(OpError::Execution(format!(
+                        "Child-Agent '{}' (Rolle '{role}') scheiterte endgültig (reason={reason})",
+                        run_result.child
+                    )))
+                }
             }
+            // Bei `Completed` fällt `slot` hier — nach der Auswertung.
         }
         .instrument(span)
         .await
@@ -662,6 +748,7 @@ impl AgentProductAdapter {
                     .collect();
                 Ok(OpOutput {
                     text: json!({ "children": children }).to_string(),
+                    data: None,
                 })
             }
             AgentProductRequest::Stop { target } => {
@@ -674,6 +761,7 @@ impl AgentProductAdapter {
                 );
                 Ok(OpOutput {
                     text: json!({ "cancelled": cancelled, "child": target.as_str() }).to_string(),
+                    data: None,
                 })
             }
             AgentProductRequest::Budget {
@@ -700,6 +788,7 @@ impl AgentProductAdapter {
                         "note": note,
                     })
                     .to_string(),
+                    data: None,
                 })
             }
         }
@@ -862,7 +951,7 @@ fn completed_child_output(
     final_assistant_text: Result<String, harw_extension_api::AgentSpawnError>,
 ) -> Result<OpOutput, OpError> {
     final_assistant_text
-        .map(|text| OpOutput { text })
+        .map(|text| OpOutput { text, data: None })
         .map_err(|error| {
             OpError::NotAvailable(format!(
                 "Child-Agent-Abschlussantwort nicht verfügbar: {error}"
@@ -1489,10 +1578,12 @@ fn contract_output(contract: ChildReturnContract, text: &str) -> OpOutput {
     match contract {
         ChildReturnContract::Text => OpOutput {
             text: text.to_owned(),
+            data: None,
         },
         typed => match evaluate_child_return(typed, text) {
             Ok(value) => OpOutput {
                 text: value.to_string(),
+                data: None,
             },
             Err(violation) => {
                 tracing::warn!(
@@ -1502,6 +1593,7 @@ fn contract_output(contract: ChildReturnContract, text: &str) -> OpOutput {
                 );
                 OpOutput {
                     text: violation.to_json().to_string(),
+                    data: None,
                 }
             }
         },
@@ -1574,6 +1666,7 @@ fn paused_child_result(
         );
         return Ok(OpOutput {
             text: json!({ "paused": kind.as_str(), "child": child.as_str() }).to_string(),
+            data: None,
         });
     }
     Err(OpError::NotAvailable(format!(
@@ -1589,7 +1682,53 @@ fn paused_child_result(
 // ── Authority-Reducer-Registry ──────────────────────────────────────────────
 
 /// Die vollständige Liste bekannter `authority_reducer`-Kennungen.
-const KNOWN_AUTHORITY_REDUCERS: &[&str] = &["reduce_to_read_only", "reduce_to_read_execute"];
+///
+/// Muss mit `KNOWN_AUTHORITY_REDUCERS` in `harw-macros/src/operation.rs`
+/// übereinstimmen (das Makro weist unbekannte Kennungen zur Compile-Zeit ab).
+/// Die Kennungen `reduce_to_read_only`, `reduce_to_read_registry` und
+/// `reduce_to_read_network` sind wortgleich mit
+/// `harw_registry_defaults::authority::REDUCE_TO_READ_*` (W5/RD), ebenso ihre
+/// Permission-Obergrenzen (siehe [`reducer_ceiling`]).
+const KNOWN_AUTHORITY_REDUCERS: &[&str] = &[
+    "reduce_to_read_only",
+    "reduce_to_read_execute",
+    "reduce_to_read_registry",
+    "reduce_to_read_network",
+];
+
+/// Liefert die Permission-Obergrenze einer bekannten Reducer-Kennung.
+///
+/// # Beschreibung
+/// Gespiegelt aus `harw_registry_defaults::authority::AuthorityReducer::ceiling`
+/// (W5/RD, `docs/remediation/ledger/W5/RD.md` §2/§3.5). Bewusst **gespiegelt,
+/// nicht aufgerufen**: `cargo metadata` zeigt zwar keinen Zyklus, aber
+/// `harw-core-bridge/Cargo.toml` liegt außerhalb der Zuständigkeit von
+/// A-BRIDGE, und `harw-registry-defaults` zöge den gesamten Werkzeugbaum
+/// (Lens, Tool-Provider, Egress) in diese Adapter-Crate.
+///
+/// | Kennung | Obergrenze |
+/// |---|---|
+/// | `reduce_to_read_only` | `{ReadWorkspace}` |
+/// | `reduce_to_read_execute` | `{ReadWorkspace, ExecuteProcess}` (nur Bridge) |
+/// | `reduce_to_read_registry` | `{ReadWorkspace, ReadCargoRegistry}` |
+/// | `reduce_to_read_network` | `{NetworkAccess}` — **ohne** `ReadWorkspace` |
+///
+/// `reduce_to_read_network` liest den Workspace absichtlich nicht: ein Kind mit
+/// Netz und Workspace-Lesezugriff könnte Workspace-Daten über Anfrageparameter
+/// hinaustragen (Plan-Annahme A5).
+///
+/// # Returns
+/// `Some(PermissionSet)` für eine bekannte Kennung, sonst `None`.
+fn reducer_ceiling(name: &str) -> Option<PermissionSet> {
+    let permissions: &[Permission] = match name {
+        "reduce_to_read_only" => &[Permission::ReadWorkspace],
+        "reduce_to_read_execute" => &[Permission::ReadWorkspace, Permission::ExecuteProcess],
+        "reduce_to_read_registry" => &[Permission::ReadWorkspace, Permission::ReadCargoRegistry],
+        "reduce_to_read_network" => &[Permission::NetworkAccess],
+        _ => return None,
+    };
+    Some(PermissionSet::from_policy(permissions.iter().copied()))
+}
 
 /// Löst eine `authority_reducer`-Kennung auf eine monoton reduzierende
 /// Sandbox-Transformation auf. Unbekannte Kennungen fallen sicherheitshalber
@@ -1598,30 +1737,26 @@ const KNOWN_AUTHORITY_REDUCERS: &[&str] = &["reduce_to_read_only", "reduce_to_re
 /// Authority für das Kind führen.
 ///
 /// # Beschreibung
-/// Der `authority_reducer`-String in `Surface::AgentTool` ist eine Kennung,
-/// keine Funktionsreferenz. Diese Funktion bildet die Kennung auf eine
-/// registrierte, monoton fallende Funktion `fn(&SandboxSpec) -> SandboxSpec`
-/// ab (Wave-4-Design-Doc, Abschnitt 2).
+/// Der `authority_reducer`-String in `Surface::AgentTool` bzw. im
+/// [`fanout_children`]-Aufruf ist eine Kennung, keine Funktionsreferenz. Diese
+/// Funktion bildet die Kennung auf eine monoton fallende Funktion
+/// `fn(&SandboxSpec) -> SandboxSpec` ab (Wave-4-Design-Doc, Abschnitt 2). Jede
+/// Reduktion ist ein **Schnitt** mit der Parent-Sandbox: sie entfernt Rechte,
+/// fügt nie welche hinzu (K3). Die so reduzierte Sandbox ist die Sandbox, mit
+/// der das Kind admittiert wird; `admit` prüft zusätzlich `ensure_child_of`.
 ///
-/// Der stille Rückfall bleibt sicherheitsseitig richtig, ist aber diagnostisch
-/// schlecht: ohne Meldung sieht ein Entwickler nur, dass sein Kind weniger darf
-/// als gedacht. Deshalb protokolliert dieser Zweig ein `warn` mit der
-/// unbekannten Kennung und der Liste der bekannten.
-///
-/// **Zur Compile-Zeit gibt es diese Prüfung nicht.** Das `#[operation]`-Makro
-/// erzwingt lediglich, dass `agent_tool(...)` überhaupt ein `authority = "..."`
-/// trägt (`harw-macros/src/operation.rs`, Fehlertext
-/// „`agent_tool(...)` erfordert `authority = \"...\"`"); den *Wert* prüft es
-/// nicht gegen [`KNOWN_AUTHORITY_REDUCERS`]. Diese Laufzeitprüfung samt `warn`
-/// ist damit die einzige Mitgliedschaftsprüfung der Kennung.
+/// Das `#[operation]`-Makro prüft die Kennung zur Compile-Zeit gegen seine
+/// eigene Kopie der Liste. Aufrufer von [`fanout_children`] übergeben die
+/// Kennung aber als Laufzeit-String; für sie ist dieser Rückfall samt `warn`
+/// die Mitgliedschaftsprüfung.
 ///
 /// # Argumente
-/// - `name` (`&str`): Die `authority_reducer`-Kennung aus `Surface::AgentTool`.
+/// - `name` (`&str`): Die `authority_reducer`-Kennung.
 ///
 /// # Returns
 /// `fn(&SandboxSpec) -> SandboxSpec` — eine monoton reduzierende Funktion.
-/// Bekannte Kennungen: `"reduce_to_read_only"`, `"reduce_to_read_execute"`.
-/// Unbekannte Kennungen fallen auf [`reduce_to_read_only`] zurück.
+/// Bekannte Kennungen: siehe [`KNOWN_AUTHORITY_REDUCERS`]. Unbekannte Kennungen
+/// fallen auf [`reduce_to_read_only`] zurück.
 ///
 /// # Concurrency
 /// Reine Funktion (bis auf das `tracing`-Event), lock-frei, threadsicher.
@@ -1629,6 +1764,8 @@ fn resolve_authority_reducer(name: &str) -> fn(&SandboxSpec) -> SandboxSpec {
     match name {
         "reduce_to_read_only" => reduce_to_read_only,
         "reduce_to_read_execute" => reduce_to_read_execute,
+        "reduce_to_read_registry" => reduce_to_read_registry,
+        "reduce_to_read_network" => reduce_to_read_network,
         unknown => {
             tracing::warn!(
                 unknown,
@@ -1640,46 +1777,59 @@ fn resolve_authority_reducer(name: &str) -> fn(&SandboxSpec) -> SandboxSpec {
     }
 }
 
+/// Schneidet `parent` auf die Obergrenze einer Kennung ohne Netzrecht und
+/// leert dabei auch den Host-Scope (ohne `NetworkAccess` bedeutungslos, aber
+/// ein leerer Scope ist die strengere Aussage).
+fn restrict_without_network(parent: &SandboxSpec, name: &str) -> SandboxSpec {
+    let ceiling = reducer_ceiling(name).unwrap_or_else(PermissionSet::empty);
+    parent.restrict_with(&ceiling, &harw_sandbox::NetworkScope::empty())
+}
+
 /// Reduziert eine Sandbox auf ausschließlich lesenden Workspace-Zugriff.
 ///
-/// # Beschreibung
-/// Schnittmenge der Parent-Permissions mit `{ ReadWorkspace }` — die
-/// restriktivste bekannte Reduktion, verwendet auch als Fallback in
+/// Schnittmenge der Parent-Permissions mit `{ ReadWorkspace }`, Host-Scope
+/// geleert — die restriktivste bekannte Reduktion, auch Fallback in
 /// [`resolve_authority_reducer`].
-///
-/// # Argumente
-/// - `parent` (`&SandboxSpec`): Die zu reduzierende Parent-Sandbox.
-///
-/// # Returns
-/// Eine neue `SandboxSpec` mit höchstens `ReadWorkspace`.
-///
-/// # Concurrency
-/// Reine Funktion, lock-frei, threadsicher.
 fn reduce_to_read_only(parent: &SandboxSpec) -> SandboxSpec {
-    parent.restrict(&PermissionSet::from_policy([Permission::ReadWorkspace]))
+    restrict_without_network(parent, "reduce_to_read_only")
 }
 
 /// Reduziert eine Sandbox auf lesenden Workspace-Zugriff plus Prozessausführung.
 ///
-/// # Beschreibung
-/// Schnittmenge der Parent-Permissions mit `{ ReadWorkspace, ExecuteProcess }`.
-///
-/// # Argumente
-/// - `parent` (`&SandboxSpec`): Die zu reduzierende Parent-Sandbox.
-///
-/// # Returns
-/// Eine neue `SandboxSpec` mit höchstens `ReadWorkspace` und `ExecuteProcess`.
-///
-/// # Concurrency
-/// Reine Funktion, lock-frei, threadsicher.
+/// Schnittmenge mit `{ ReadWorkspace, ExecuteProcess }`, Host-Scope geleert.
 fn reduce_to_read_execute(parent: &SandboxSpec) -> SandboxSpec {
-    parent.restrict(&PermissionSet::from_policy([
-        Permission::ReadWorkspace,
-        Permission::ExecuteProcess,
-    ]))
+    restrict_without_network(parent, "reduce_to_read_execute")
+}
+
+/// Reduziert eine Sandbox auf lesende Workspace- und Registry-Quellen.
+///
+/// Schnittmenge mit `{ ReadWorkspace, ReadCargoRegistry }`, Host-Scope geleert
+/// (explorer, analyst, researcher-deps, planner laut W5/RD).
+/// `ReadCargoRegistry` bleibt nur, wenn der Parent es selbst hat.
+fn reduce_to_read_registry(parent: &SandboxSpec) -> SandboxSpec {
+    restrict_without_network(parent, "reduce_to_read_registry")
+}
+
+/// Reduziert eine Sandbox auf ausgehenden Netzzugriff ohne Workspace-Lesen.
+///
+/// Schnittmenge mit `{ NetworkAccess }` (researcher-web laut W5/RD). Der
+/// Host-Scope des Parents bleibt als Obergrenze unverändert (`restrict`);
+/// verengt wird er von der Composition (`researcher_web_network_scope`), nie
+/// erweitert. `NetworkAccess` bleibt nur, wenn der Parent es selbst hat.
+fn reduce_to_read_network(parent: &SandboxSpec) -> SandboxSpec {
+    let ceiling = reducer_ceiling("reduce_to_read_network").unwrap_or_else(PermissionSet::empty);
+    parent.restrict(&ceiling)
 }
 
 // ── Fan-out ──────────────────────────────────────────────────────────────────
+
+/// Meldung für ein Kind, das wegen eines schnelleren Geschwisters
+/// (`JoinSemantics::AnyTerminal`) nicht mehr gewertet wird — wortgleich mit
+/// der Meldung des Kern-Schedulers.
+const CANCELLED_BY_SIBLING: &str = "cancelled: sibling completed first";
+
+/// Maximale Länge einer vom Kind behaupteten `question_id` in Fehlermeldungen.
+const QUESTION_ID_EXCERPT_CHARS: usize = 64;
 
 /// Startet `questions.len()` Kinder derselben Rolle nebenläufig und liefert die
 /// Ergebnisse **in Aufrufreihenfolge**.
@@ -1690,16 +1840,29 @@ fn reduce_to_read_execute(parent: &SandboxSpec) -> SandboxSpec {
 /// dieselbe reduzierte Sandbox und dasselbe Budget; seine Frage geht als
 /// Turn-Input hinein und zusätzlich als `context` in den `SpawnInput`.
 ///
-/// Ablauf:
+/// Ablauf (W4a/A-BRIDGE, K1/K2):
 /// 1. Sandbox einmal monoton reduzieren ([`resolve_authority_reducer`]).
-/// 2. Pro Frage `spawn_child`. Ein fehlgeschlagener Spawn belegt seinen Platz im
-///    Ergebnisvektor mit `Err(...)` und nimmt nicht an der Welle teil.
-/// 3. Pro Kind das übergebene Budget mit dessen IR-Budget verschneiden
-///    ([`tighten_budget`]) und den Reasoning-Effort darauf klammern.
-/// 4. **Ein** `run_children`-Aufruf mit allen [`FanoutRequest`]s; `max_parallel`
-///    deckelt die Gleichzeitigkeit, [`JoinSemantics`] klammert die Welle.
-/// 5. Jedes Ergebnis über denselben Contract-Pfad wie
-///    [`AgentToolAdapter::invoke`] auswerten ([`evaluate_child_return`]).
+/// 2. Ein rollierender Pool mit höchstens `max_parallel` Plätzen. Ein Platz
+///    durchläuft **lazy** und vollständig: `spawn_child` → Budget mit dem
+///    IR-Budget verschneiden ([`tighten_budget`]) → Effort klammern (ohne
+///    Override, fail-closed) → `run_child_with_budget` → Auswertung über
+///    denselben Contract-Pfad wie [`AgentToolAdapter::invoke`]
+///    ([`evaluate_child_return`], plus `question_id`-Bindung) → Slot-Freigabe.
+///    Erst danach wird die nächste Frage admittiert. Damit sind nie mehr als
+///    `max_parallel` Kinder dieser Welle gleichzeitig admittiert — vorher wurden
+///    alle Kinder vorab admittiert, und ab dem neunten scheiterte die Welle am
+///    Admission-Limit, unabhängig von `max_parallel` (G-016).
+/// 3. [`JoinSemantics::AnyTerminal`]: das erste verwertbare Ergebnis gewinnt;
+///    laufende Geschwister werden kooperativ abgebrochen, noch nicht gestartete
+///    gar nicht erst admittiert. `AllTerminal` und `Collect` warten auf alle.
+///
+/// ## `question_id`-Bindung (K4, G-035)
+/// Beim Contract [`ChildReturnContract::ResearchFinding`] muss das Finding zu
+/// **der** offenen Frage gehören, die dieses Kind bekommen hat: seine
+/// `question_id` muss der `id` der Frage gleichen (`question.question.id` in
+/// der Form von `harw-ops::explore::child_payload`, sonst `question.id`). Eine
+/// fremde oder fehlende `question_id` — oder eine Frage ohne `id` — ist ein
+/// Vertragsbruch (`Err` an dieser Position), nie ein verwertbares Finding.
 ///
 /// ## Warum ein Vertragsbruch hier `Err` ist, in `invoke` aber nicht
 /// Bewusst unterschiedliche *Darstellung* derselben Auswertung: `invoke`
@@ -1710,12 +1873,13 @@ fn reduce_to_read_execute(parent: &SandboxSpec) -> SandboxSpec {
 /// Fehlerkanal die brauchbarere Form — und der gekürzte Rohtext steckt in der
 /// Meldung, geht also nicht verloren.
 ///
-/// ## Lease-Grenze
-/// Diese Funktion schließt keine Kinder (`close_child`). Das Freigeben des
-/// Admission-Slots bleibt bei der Orchestrierungs-Laufzeit, die das Ergebnis an
-/// den Parent zustellt — sonst würde ein Kind geschlossen, dessen Ergebnis noch
-/// niemand zugestellt hat. Aufrufer müssen das einplanen
-/// (`max_active_children_per_parent`).
+/// ## Lease-Grenze (K1)
+/// Diese Funktion stellt das Ergebnis selbst zu (Rückgabewert). Deshalb gibt
+/// sie jeden Admission-Slot frei, sobald das Ergebnis des Kindes ausgewertet
+/// ist — ebenso bei Spawn-Folgefehlern, Lauf-/Budgetfehlern, Vertragsbruch,
+/// Geschwister-Abbruch und wenn der Future dieser Funktion verworfen wird
+/// (RAII-Guard). Nur eine **zulässige** Pause (`allow_pause = true`) hält den
+/// Slot, weil der Aufrufer das Kind fortsetzen können muss.
 ///
 /// # Argumente
 /// - `ctx` (`&OpContext`): Parent-Sandbox, Parent-`SessionId`, Spawner, Store.
@@ -1724,7 +1888,8 @@ fn reduce_to_read_execute(parent: &SandboxSpec) -> SandboxSpec {
 ///   zum Ergebnisvektor.
 /// - `authority_reducer` (`&str`): Kennung der Sandbox-Reduktion.
 /// - `budget` ([`AgentBudget`]): Deckel je Kind, vor der Verschneidung mit der IR.
-/// - `max_parallel` (`usize`): gleichzeitig laufende Kinder (`0` wird zu `1`).
+/// - `max_parallel` (`usize`): gleichzeitig admittierte und laufende Kinder
+///   dieser Welle (`0` wird zu `1`).
 /// - `join` ([`JoinSemantics`]): Klammerung der Welle.
 /// - `contract` ([`ChildReturnContract`]): wie die Antworten ausgewertet werden.
 ///
@@ -1743,8 +1908,9 @@ fn reduce_to_read_execute(parent: &SandboxSpec) -> SandboxSpec {
 /// Keine.
 ///
 /// # Concurrency
-/// `async fn`; die Nebenläufigkeit entsteht in `run_children`, das alle
-/// Kind-Futures in einer Task pollt und dabei keinen Session-Lock hält.
+/// `async fn`; alle Plätze werden in **einer** Task gemeinsam gepollt
+/// (`std::future::poll_fn`), es werden keine Tasks gespawnt. Die
+/// Nebenläufigkeit entsteht, weil Kind-Turns den Session-Lock nicht halten.
 ///
 /// # Examples
 /// ```rust,no_run
@@ -1752,14 +1918,14 @@ fn reduce_to_read_execute(parent: &SandboxSpec) -> SandboxSpec {
 /// use harw_core_bridge::{ChildReturnContract, fanout_children};
 /// # async fn run(ctx: &harw_operations::context::OpContext) {
 /// let questions = vec![
-///     serde_json::json!({ "question": "Welche jiff-Version ist aktuell?" }),
-///     serde_json::json!({ "question": "Welche tokio-Version ist aktuell?" }),
+///     serde_json::json!({ "question": { "id": "q-jiff", "question": "Welche jiff-Version?" } }),
+///     serde_json::json!({ "question": { "id": "q-tokio", "question": "Welche tokio-Version?" } }),
 /// ];
 /// let results = fanout_children(
 ///     ctx,
 ///     "researcher-deps",
 ///     &questions,
-///     "reduce_to_read_only",
+///     "reduce_to_read_registry",
 ///     AgentBudget::default(),
 ///     2,
 ///     JoinSemantics::AllTerminal,
@@ -1798,88 +1964,222 @@ pub async fn fanout_children(
     let reducer = resolve_authority_reducer(authority_reducer);
     let child_sandbox = reducer(ctx.sandbox());
 
-    let mut results: Vec<Option<Result<Value, String>>> =
-        (0..questions.len()).map(|_| None).collect();
-    let mut requests: Vec<FanoutRequest> = Vec::new();
-    let mut positions: Vec<usize> = Vec::new();
+    let total = questions.len();
+    let slots = max_parallel.max(1);
+    let winner = AtomicBool::new(false);
+    // Je Position die Session-ID, sobald das Kind admittiert ist — nur damit
+    // der Scheduler laufende Geschwister kooperativ abbrechen kann.
+    let admitted: Vec<OnceLock<SessionId>> = (0..total).map(|_| OnceLock::new()).collect();
+    let shared = FanoutShared {
+        ctx,
+        spawner: spawner.as_ref(),
+        store: store.as_ref(),
+        role,
+        child_sandbox: &child_sandbox,
+        budget,
+        contract,
+        winner: &winner,
+    };
 
-    for (position, question) in questions.iter().enumerate() {
-        let spawn_input = harw_extension_api::SpawnInput {
-            parent_session_id: ctx.session_id().clone(),
-            handoff_call_id: harw_types::ToolCallId::new(),
-            instructions: None,
-            context: question.clone(),
-            // This fan-out tool declares no ceiling demand of its own: each
-            // question-child simply inherits whatever ceiling its parent
-            // already enforces, unchanged (see `SpawnInput::ceiling`).
-            ceiling: None,
-        };
-        let spawned = harw_extension_api::AgentSpawner::spawn_child(
-            spawner.as_ref(),
-            role,
-            spawn_input,
-            child_sandbox.clone(),
-            None,
-        )
-        .await;
+    let mut results: Vec<Option<Result<Value, String>>> = (0..total).map(|_| None).collect();
+    let mut pending = questions.iter().enumerate();
+    let mut running = Vec::with_capacity(slots.min(total));
+    let mut winner_decided = false;
+    // Ein Event statt eines betretenen Spans: `span::Entered` ist `!Send` und
+    // würde über die `await`s gehalten den ganzen Future `!Send` machen.
+    tracing::info!(role, children = total, max_parallel = slots, "agent_fanout.start");
 
-        match spawned {
-            Ok(child) => {
-                let ir_budget = spawner.child_budget(&child).unwrap_or_default();
-                let effective = tighten_budget(budget, ir_budget);
-                if let Err(error) =
-                    spawner.clamp_child_reasoning_effort(&child, effective.reasoning_effort, None)
-                {
-                    tracing::warn!(
-                        child = %child,
-                        error = %error,
-                        "agent_fanout.effort_clamp_failed"
-                    );
-                }
-                requests.push(FanoutRequest {
-                    child,
-                    input: TurnInput::user(question.to_string()),
-                    budget: effective,
-                });
-                positions.push(position);
+    loop {
+        while running.len() < slots {
+            let Some((position, question)) = pending.next() else {
+                break;
+            };
+            if winner_decided {
+                results[position] = Some(Err(CANCELLED_BY_SIBLING.to_owned()));
+                continue;
             }
-            Err(error) => {
-                tracing::warn!(role, position, error = %error, "agent_fanout.spawn_failed");
-                results[position] = Some(Err(format!("Agent-Spawn fehlgeschlagen: {error}")));
+            running.push((
+                position,
+                Box::pin(run_fanout_slot(&shared, position, question, &admitted[position])),
+            ));
+        }
+        if running.is_empty() {
+            break;
+        }
+
+        let (index, value) = std::future::poll_fn(|cx| {
+            for (index, (_, future)) in running.iter_mut().enumerate() {
+                if let Poll::Ready(value) = future.as_mut().poll(cx) {
+                    return Poll::Ready((index, value));
+                }
+            }
+            Poll::Pending
+        })
+        .await;
+        let (position, _finished) = running.remove(index);
+
+        let value = if winner_decided {
+            Err(CANCELLED_BY_SIBLING.to_owned())
+        } else {
+            value
+        };
+        if !winner_decided && matches!(join, JoinSemantics::AnyTerminal) && value.is_ok() {
+            winner_decided = true;
+            winner.store(true, Ordering::SeqCst);
+            for (sibling, _) in &running {
+                if let Some(child) = admitted[*sibling].get() {
+                    if !spawner.request_cancellation(child) {
+                        tracing::warn!(child = %child, "agent_fanout.cancel_channel_missing");
+                    }
+                }
             }
         }
+        results[position] = Some(value);
     }
 
-    let runs = spawner
-        .run_children(requests, store.as_ref(), max_parallel, join)
-        .await;
-
-    for (position, run) in positions.into_iter().zip(runs) {
-        results[position] = Some(match run {
-            Ok(result) => fanout_child_value(spawner.as_ref(), contract, &result),
-            Err(error) => Err(format!("Child-Ausführung fehlgeschlagen: {error}")),
-        });
-    }
-
-    Ok(results
+    let results: Vec<Result<Value, String>> = results
         .into_iter()
         .map(|slot| {
             slot.unwrap_or_else(|| {
                 Err("der Fan-out-Scheduler lieferte für dieses Kind kein Ergebnis".to_owned())
             })
         })
-        .collect())
+        .collect();
+    tracing::info!(
+        role,
+        children = total,
+        failed = results.iter().filter(|slot| slot.is_err()).count(),
+        "agent_fanout.complete"
+    );
+    Ok(results)
+}
+
+/// Für alle Plätze einer Fan-out-Welle identische, geliehene Eingaben.
+struct FanoutShared<'a> {
+    ctx: &'a OpContext,
+    spawner: &'a ManagedAgentSpawner,
+    store: &'a dyn StateStore,
+    role: &'a str,
+    child_sandbox: &'a SandboxSpec,
+    budget: AgentBudget,
+    contract: ChildReturnContract,
+    /// Gesetzt, sobald bei `AnyTerminal` ein Gewinner feststeht.
+    winner: &'a AtomicBool,
+}
+
+impl FanoutShared<'_> {
+    // Ob ein Geschwister bereits gewonnen hat (nur bei `AnyTerminal` je gesetzt).
+    fn sibling_won(&self) -> bool {
+        self.winner.load(Ordering::SeqCst)
+    }
+}
+
+/// Fährt genau einen Platz der Welle: Spawn, Budget, Effort, Lauf, Auswertung,
+/// Freigabe. Jeder Fehler wird zur `Err(String)` dieser Position; der
+/// Admission-Slot wird über [`ChildSlotGuard`] in jedem Ausgang freigegeben,
+/// außer bei einer zulässigen Pause.
+async fn run_fanout_slot(
+    shared: &FanoutShared<'_>,
+    position: usize,
+    question: &Value,
+    admitted: &OnceLock<SessionId>,
+) -> Result<Value, String> {
+    if shared.sibling_won() {
+        return Err(CANCELLED_BY_SIBLING.to_owned());
+    }
+    let spawn_input = harw_extension_api::SpawnInput {
+        parent_session_id: shared.ctx.session_id().clone(),
+        handoff_call_id: harw_types::ToolCallId::new(),
+        instructions: None,
+        context: question.clone(),
+        // This fan-out tool declares no ceiling demand of its own: each
+        // question-child simply inherits whatever ceiling its parent
+        // already enforces, unchanged (see `SpawnInput::ceiling`).
+        ceiling: None,
+    };
+    let child = harw_extension_api::AgentSpawner::spawn_child(
+        shared.spawner,
+        shared.role,
+        spawn_input,
+        shared.child_sandbox.clone(),
+        None,
+    )
+    .await
+    .map_err(|error| {
+        tracing::warn!(role = shared.role, position, error = %error, "agent_fanout.spawn_failed");
+        format!("Agent-Spawn fehlgeschlagen: {error}")
+    })?;
+    let slot = ChildSlotGuard::new(shared.spawner, child.clone());
+    if admitted.set(child.clone()).is_err() {
+        // Unerreichbar (eine Position wird genau einmal gestartet); ohne ID
+        // bleibt nur der kooperative Geschwister-Abbruch aus, nie die Freigabe.
+        tracing::warn!(child = %child, position, "agent_fanout.admitted_cell_occupied");
+    }
+    if shared.sibling_won() {
+        return Err(CANCELLED_BY_SIBLING.to_owned());
+    }
+
+    // Fail-closed: ohne Admission-Record wäre `unwrap_or_default` „kein Limit".
+    let ir_budget = shared
+        .spawner
+        .child_budget(&child)
+        .ok_or_else(|| format!("Admission-Record von Child-Agent '{child}' fehlt"))?;
+    let effective = tighten_budget(shared.budget, ir_budget);
+    shared
+        .spawner
+        .clamp_child_reasoning_effort(&child, effective.reasoning_effort, None)
+        .map_err(|error| {
+            tracing::warn!(child = %child, error = %error, "agent_fanout.effort_clamp_failed");
+            format!("Reasoning-Effort von Child-Agent '{child}' nicht klammerbar: {error}")
+        })?;
+
+    let run = shared
+        .spawner
+        .run_child_with_budget(
+            &child,
+            shared.store,
+            None,
+            TurnInput::user(question.to_string()),
+            effective,
+        )
+        .await
+        .map_err(|error| format!("Child-Ausführung fehlgeschlagen: {error}"))?;
+    if shared.sibling_won() {
+        return Err(CANCELLED_BY_SIBLING.to_owned());
+    }
+
+    match fanout_child_value(shared.spawner, shared.contract, &run, question)? {
+        FanoutValue::Final(value) => Ok(value),
+        FanoutValue::Paused(report) => {
+            slot.keep_admitted();
+            Ok(report)
+        }
+    }
+    // Bei `Final` und jedem `Err` fällt `slot` hier — nach der Auswertung.
+}
+
+/// Verwertbares Ergebnis eines Fan-out-Kindes.
+enum FanoutValue {
+    /// Ausgewertetes Abschlussergebnis; der Slot wird freigegeben.
+    Final(Value),
+    /// Zulässige Pause (`{"paused": …}`); der Slot bleibt für die Fortsetzung.
+    Paused(Value),
 }
 
 /// Wertet das Ergebnis genau eines Fan-out-Kindes aus.
 ///
 /// Folgt derselben Pause-Unterscheidung wie [`paused_child_result`]: eine
 /// erlaubte Pause ist eine Auskunft (`Ok`), eine verbotene ein Fehler (`Err`).
+/// Ein terminaler, nicht-erfolgreicher Ausgang (`Cancelled`/`Truncated`/
+/// `Refused`/`Failed`) ist ebenfalls sofort ein `Err` — dort gibt es nichts
+/// fortzusetzen. Beim Contract `ResearchFinding` wird das Finding zusätzlich
+/// an die gestellte Frage gebunden ([`bind_finding_to_question`]).
 fn fanout_child_value(
     spawner: &ManagedAgentSpawner,
     contract: ChildReturnContract,
     result: &ChildRunResult,
-) -> Result<Value, String> {
+    question: &Value,
+) -> Result<FanoutValue, String> {
     let record = spawner.child_record(&result.child);
     let role = record
         .as_ref()
@@ -1890,11 +2190,41 @@ fn fanout_child_value(
         TurnOutcome::Completed => None,
         TurnOutcome::AwaitingApproval { .. } => Some(PauseKind::Approval),
         TurnOutcome::AwaitingChild { .. } => Some(PauseKind::Child),
+        // Terminale, nicht-erfolgreiche Ausgänge sind keine Pause — hier ist
+        // nichts fortsetzbar, also sofort ein `Err` statt eines `Final`-Werts.
+        TurnOutcome::Cancelled { reason } => {
+            return Err(format!(
+                "Child-Agent '{}' (Rolle '{role}') wurde abgebrochen (reason={reason:?})",
+                result.child
+            ));
+        }
+        TurnOutcome::Truncated => {
+            return Err(format!(
+                "Child-Agent '{}' (Rolle '{role}') brach durch Abschneiden der Modellausgabe \
+                 (max_tokens/Kontextfenster) ab, bevor etwaige Tool-Calls der Antwort \
+                 ausgeführt wurden",
+                result.child
+            ));
+        }
+        TurnOutcome::Refused { detail } => {
+            return Err(format!(
+                "Child-Agent '{}' (Rolle '{role}') lehnte die Antwort ab (detail={detail:?})",
+                result.child
+            ));
+        }
+        TurnOutcome::Failed { reason } => {
+            return Err(format!(
+                "Child-Agent '{}' (Rolle '{role}') scheiterte endgültig (reason={reason})",
+                result.child
+            ));
+        }
     };
 
     if let Some(kind) = pause {
         if allow_pause {
-            return Ok(json!({ "paused": kind.as_str(), "child": result.child.as_str() }));
+            return Ok(FanoutValue::Paused(
+                json!({ "paused": kind.as_str(), "child": result.child.as_str() }),
+            ));
         }
         return Err(format!(
             "Child-Agent '{}' (Rolle '{role}') pausierte auf {} statt abzuschließen \
@@ -1914,7 +2244,114 @@ fn fanout_child_value(
                 result.child
             )
         })?;
-    evaluate_child_return(contract, &text).map_err(|violation| violation.to_message())
+    let value = evaluate_child_return(contract, &text).map_err(|violation| violation.to_message())?;
+    if contract == ChildReturnContract::ResearchFinding {
+        bind_finding_to_question(&value, question)?;
+    }
+    Ok(FanoutValue::Final(value))
+}
+
+/// Liefert die `id` einer gestellten Frage.
+///
+/// Akzeptiert die Nutzlastform von `harw-ops` (`{"question": {"id": …}}`) und
+/// eine flache Form (`{"id": …}`); leere IDs gelten als fehlend.
+fn open_question_id(question: &Value) -> Option<&str> {
+    question
+        .get("question")
+        .and_then(|inner| inner.get("id"))
+        .or_else(|| question.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+}
+
+/// Prüft, dass ein validiertes Finding zu der Frage gehört, die dem Kind
+/// gestellt wurde (K4, G-035).
+///
+/// # Arguments
+/// - `finding` (`&Value`): kanonisches `ResearchFinding`-JSON.
+/// - `question` (`&Value`): die an dieses Kind gestellte Frage.
+///
+/// # Errors
+/// `Err(String)` (Vertragsbruch-Meldung), wenn die Frage keine `id` trägt, das
+/// Finding keine `question_id` hat oder beide nicht exakt übereinstimmen. Die
+/// vom Kind behauptete ID wird nur gekürzt zitiert.
+fn bind_finding_to_question(finding: &Value, question: &Value) -> Result<(), String> {
+    let label = ChildReturnContract::RESEARCH_FINDING_ID;
+    let expected = open_question_id(question).ok_or_else(|| {
+        format!(
+            "Vertragsbruch ({label}): die gestellte Frage trägt keine `id`; ein Finding ist \
+             keiner offenen Frage zuordenbar"
+        )
+    })?;
+    let claimed = finding
+        .get("question_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("Vertragsbruch ({label}): das Finding trägt keine question_id"))?;
+    if claimed == expected {
+        return Ok(());
+    }
+    Err(format!(
+        "Vertragsbruch ({label}): das Finding beantwortet die Frage '{}', gestellt war '{}'",
+        excerpt(claimed, QUESTION_ID_EXCERPT_CHARS),
+        excerpt(expected, QUESTION_ID_EXCERPT_CHARS)
+    ))
+}
+
+// ── Slot-Freigabe und Effort-Sperre ──────────────────────────────────────────
+
+/// Hält den Admission-Slot eines Kindes und gibt ihn beim Drop frei (K1, G-016).
+///
+/// # Beschreibung
+/// Freigabe über [`harw_extension_api::AgentSpawner::child_finished`] — beim
+/// `ManagedAgentSpawner` identisch mit `close_child`. Der Guard wird direkt
+/// nach einem erfolgreichen Spawn angelegt, damit **jeder** spätere Ausgang
+/// (`?`, Vertragsbruch, Budget-Abbruch, verworfener Future) den Slot freigibt.
+/// [`Self::keep_admitted`] entschärft ihn für eine zulässige Pause.
+///
+/// # Concurrency
+/// Leiht den Spawner; `child_finished` nimmt nur kurze interne Locks und hält
+/// keinen über ein `await`.
+struct ChildSlotGuard<'a> {
+    spawner: &'a ManagedAgentSpawner,
+    child: SessionId,
+    armed: bool,
+}
+
+impl<'a> ChildSlotGuard<'a> {
+    // Übernimmt die Freigabepflicht für ein soeben admittiertes Kind.
+    fn new(spawner: &'a ManagedAgentSpawner, child: SessionId) -> Self {
+        Self {
+            spawner,
+            child,
+            armed: true,
+        }
+    }
+
+    // Behält das Kind admittiert (nur für eine zulässige Pause).
+    fn keep_admitted(mut self) {
+        self.armed = false;
+        tracing::debug!(child = %self.child, "agent_tool.child_slot.kept_for_pause");
+    }
+}
+
+impl Drop for ChildSlotGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            harw_extension_api::AgentSpawner::child_finished(self.spawner, &self.child);
+            tracing::debug!(child = %self.child, "agent_tool.child_slot.released");
+        }
+    }
+}
+
+/// Argumentfelder, mit denen ein Modell früher den Kind-Effort überschrieb.
+const MODEL_EFFORT_FIELDS: &[&str] = &["effort", "reasoning_effort"];
+
+/// Liefert das erste Effort-Feld in Modell-Argumenten, falls vorhanden (K5).
+fn model_effort_field(args: &Value) -> Option<&'static str> {
+    MODEL_EFFORT_FIELDS
+        .iter()
+        .copied()
+        .find(|field| args.get(*field).is_some())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1940,8 +2377,10 @@ mod tests {
     use harw_types::{ItemId, ReasoningEffort, SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
 
     use super::{
-        AgentToolAdapter, ChildReturnContract, PauseKind, completed_child_output, contract_output,
-        parse_budget_hint, paused_child_result, resolve_child_contract, tighten_budget,
+        AgentToolAdapter, ChildReturnContract, KNOWN_AUTHORITY_REDUCERS, PauseKind,
+        bind_finding_to_question, completed_child_output, contract_output, model_effort_field,
+        parse_budget_hint, paused_child_result, reducer_ceiling, resolve_authority_reducer,
+        resolve_child_contract, tighten_budget,
     };
     use crate::context_ext::OpContextCoreExt;
     use harw_operations::context::{OpContext, ServiceMap};
@@ -2097,6 +2536,7 @@ contract = "{contract}"
                 aliases: &[],
                 category: harw_operations::OperationCategory::Agent,
                 args_schema: None,
+                output_schema: None,
             })
         }
 
@@ -2104,6 +2544,7 @@ contract = "{contract}"
             Box::pin(async {
                 Ok(OpOutput {
                     text: "op".to_owned(),
+                    data: None,
                 })
             })
         }
@@ -2124,6 +2565,7 @@ contract = "{contract}"
                 aliases: &[],
                 category: harw_operations::OperationCategory::Agent,
                 args_schema: None,
+                output_schema: None,
             })
         }
 
@@ -2131,6 +2573,7 @@ contract = "{contract}"
             Box::pin(async {
                 Ok(OpOutput {
                     text: String::new(),
+                    data: None,
                 })
             })
         }
@@ -2903,6 +3346,180 @@ contract = "{contract}"
                 matches!(result, Err(OpError::NotAvailable(ref message)) if message == "agent target is unavailable in this parent session"),
                 "lesen wie setzen bleiben an der Besitzgrenze: {result:?}"
             );
+        }
+    }
+
+    // ── W4a/A-BRIDGE: K3 Reducer, K4 question_id, K5 Effort ──────────────────
+
+    /// Alle sieben Permissions (Stand `harw-sandbox`).
+    const ALL_PERMISSIONS: [Permission; 7] = [
+        Permission::ReadWorkspace,
+        Permission::WriteWorkspace,
+        Permission::ExecuteProcess,
+        Permission::NetworkAccess,
+        Permission::ReadSecrets,
+        Permission::ManagePlugins,
+        Permission::ReadCargoRegistry,
+    ];
+
+    /// Alle 2⁷ Teilmengen der Permissions.
+    fn every_permission_subset() -> Vec<PermissionSet> {
+        (0_u32..(1 << ALL_PERMISSIONS.len()))
+            .map(|mask| {
+                PermissionSet::from_policy(
+                    ALL_PERMISSIONS
+                        .iter()
+                        .enumerate()
+                        .filter(|(bit, _)| mask & (1 << bit) != 0)
+                        .map(|(_, permission)| *permission),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_resolve_authority_reducer_never_widens_any_parent_permission_set() {
+        let (ctx, tmp) = make_test_ctx();
+        let binding = ctx.sandbox().workspace().clone();
+        std::fs::remove_dir_all(tmp).ok();
+        let names = KNOWN_AUTHORITY_REDUCERS
+            .iter()
+            .copied()
+            .chain(["reduce_ro", "", "reduce_to_everything"]);
+        for name in names {
+            let reducer = resolve_authority_reducer(name);
+            let ceiling = reducer_ceiling(name)
+                .or_else(|| reducer_ceiling("reduce_to_read_only"))
+                .expect("read_only ist bekannt");
+            for granted in every_permission_subset() {
+                let parent = SandboxSpec::from_resolved(binding.clone(), granted.clone())
+                    .with_network_scope(harw_sandbox::NetworkScope::from_hosts([
+                        "docs.rs".to_owned(),
+                    ]));
+                let child = reducer(&parent);
+                assert!(
+                    child.permissions().is_subset_of(parent.permissions()),
+                    "{name}: Kind {:?} erweitert Parent {:?}",
+                    child.permissions(),
+                    parent.permissions()
+                );
+                assert!(
+                    child.permissions().is_subset_of(&ceiling),
+                    "{name}: Kind {:?} überschreitet die Obergrenze {ceiling:?}",
+                    child.permissions()
+                );
+                assert_eq!(
+                    child.permissions(),
+                    &granted.intersection(&ceiling),
+                    "{name}: die Reduktion muss exakt der Schnitt sein"
+                );
+                assert!(
+                    child.ensure_child_of(&parent).is_ok(),
+                    "{name}: die Kind-Sandbox muss die Admission-Prüfung bestehen"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_reducer_ceilings_match_the_registry_defaults_contract() {
+        let set = |permissions: &[Permission]| PermissionSet::from_policy(permissions.to_vec());
+        assert_eq!(
+            reducer_ceiling("reduce_to_read_only"),
+            Some(set(&[Permission::ReadWorkspace]))
+        );
+        assert_eq!(
+            reducer_ceiling("reduce_to_read_registry"),
+            Some(set(&[Permission::ReadWorkspace, Permission::ReadCargoRegistry]))
+        );
+        assert_eq!(
+            reducer_ceiling("reduce_to_read_network"),
+            Some(set(&[Permission::NetworkAccess])),
+            "W5/RD: die Netz-Obergrenze enthält kein ReadWorkspace"
+        );
+        assert_eq!(reducer_ceiling("reduce_ro"), None);
+        for name in KNOWN_AUTHORITY_REDUCERS {
+            assert!(reducer_ceiling(name).is_some(), "{name} ohne Obergrenze");
+        }
+    }
+
+    #[test]
+    fn test_reduce_to_read_network_never_reads_the_workspace_and_keeps_only_parent_hosts() {
+        let (ctx, tmp) = make_test_ctx();
+        let binding = ctx.sandbox().workspace().clone();
+        std::fs::remove_dir_all(tmp).ok();
+        let parent = SandboxSpec::from_resolved(
+            binding,
+            PermissionSet::from_policy(ALL_PERMISSIONS),
+        )
+        .with_network_scope(harw_sandbox::NetworkScope::from_hosts(["docs.rs".to_owned()]));
+
+        let network = resolve_authority_reducer("reduce_to_read_network")(&parent);
+        assert!(!network.permissions().contains(Permission::ReadWorkspace));
+        assert!(network.permissions().contains(Permission::NetworkAccess));
+        assert_eq!(network.network_scope(), parent.network_scope());
+
+        for name in ["reduce_to_read_only", "reduce_to_read_registry", "reduce_to_read_execute"] {
+            let child = resolve_authority_reducer(name)(&parent);
+            assert!(!child.permissions().contains(Permission::NetworkAccess), "{name}");
+            assert!(child.network_scope().is_empty(), "{name}: Host-Scope muss leer sein");
+        }
+    }
+
+    #[test]
+    fn test_bind_finding_to_question_accepts_only_the_open_question() {
+        let finding = serde_json::json!({ "question_id": "q-1" });
+        let nested = serde_json::json!({ "question": { "id": "q-1" }, "response_format": {} });
+        let flat = serde_json::json!({ "id": "q-1" });
+        assert_eq!(bind_finding_to_question(&finding, &nested), Ok(()));
+        assert_eq!(bind_finding_to_question(&finding, &flat), Ok(()));
+
+        let foreign = serde_json::json!({ "question": { "id": "q-2" } });
+        let error = bind_finding_to_question(&finding, &foreign)
+            .expect_err("ein Finding zu einer anderen Frage ist ein Vertragsbruch");
+        assert!(error.contains("'q-1'") && error.contains("'q-2'"), "{error}");
+
+        let without_id = serde_json::json!({ "question": "Welche Version?" });
+        assert!(bind_finding_to_question(&finding, &without_id).is_err());
+        let blank_id = serde_json::json!({ "question": { "id": "  " } });
+        assert!(bind_finding_to_question(&finding, &blank_id).is_err());
+        let no_claim = serde_json::json!({ "conclusion": "c" });
+        assert!(bind_finding_to_question(&no_claim, &nested).is_err());
+    }
+
+    #[test]
+    fn test_model_effort_field_detects_both_override_fields() {
+        assert_eq!(model_effort_field(&serde_json::json!({ "effort": "max" })), Some("effort"));
+        assert_eq!(
+            model_effort_field(&serde_json::json!({ "reasoning_effort": null })),
+            Some("reasoning_effort")
+        );
+        assert_eq!(model_effort_field(&serde_json::json!({ "topic": "effort" })), None);
+    }
+
+    #[tokio::test]
+    async fn test_invoke_rejects_a_model_effort_argument_before_spawning() {
+        let adapter = AgentToolAdapter::from_operation(Arc::new(AgentOp)).expect("Erwartet Some");
+        for args in [
+            serde_json::json!({ "topic": "Rust", "effort": "max" }),
+            serde_json::json!({ "topic": "Rust", "reasoning_effort": "xhigh" }),
+        ] {
+            // Mit vollständiger Laufzeit: die Ablehnung muss vor Budget-Parser
+            // und Spawn greifen, sonst entstünde ein Kind.
+            let (services, _events) = services_with_runtime();
+            let spawner = services
+                .get::<Arc<ManagedAgentSpawner>>()
+                .map(Arc::clone)
+                .expect("Spawner registriert");
+            let (ctx, tmp) = make_test_ctx_with(services);
+            let result = adapter.invoke(&ctx, args).await;
+            let active = spawner.active_children_for(ctx.session_id());
+            std::fs::remove_dir_all(tmp).ok();
+            assert!(
+                matches!(&result, Err(OpError::InvalidArguments(message)) if message.contains("effort")),
+                "ein Effort-Argument des Modells muss abgelehnt werden: {result:?}"
+            );
+            assert_eq!(active, 0, "abgelehnter Aufruf darf kein Kind admittieren");
         }
     }
 

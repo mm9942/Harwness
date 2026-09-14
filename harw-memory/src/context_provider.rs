@@ -45,6 +45,35 @@
 //! [`MEMORY_CONTEXT_NAMESPACE`], [`MEMORY_CONTEXT_MAX_TRUST`],
 //! [`MEMORY_CONTEXT_MAY_CARRY_USER_CONTENT`].
 //!
+//! # Fakten aus zwei Wurzeln (M2, siehe `docs/design/memory-v3-ltm.md` §4)
+//! Zusätzlich zu HOT/STM/WARM kann [`MemoryContextProvider`] optional einen
+//! Projekt- und einen Global-[`crate::facts::FactStore`] tragen
+//! ([`MemoryContextProvider::with_facts`]). Ist keiner konfiguriert, verhält
+//! sich [`MemoryContextProvider::fragments`] exakt wie vor M2 — der
+//! Fakten-Zweig trägt dann schlicht nichts bei. Sind sie konfiguriert, liefert
+//! [`MemoryContextProvider::fragments`] **vor** HOT/STM/WARM zusätzliche
+//! Fragmente, exakt in der Reihenfolge aus §4:
+//! 1. Immer: ein aus dem Projekt-Store abgeleiteter Index (siehe
+//!    [`FACT_INDEX_MAX_LINES`]) — äquivalent zu `MEMORY.md`, aber live aus
+//!    [`crate::facts::FactStore::list`] gebaut, da `FactStore` weder Pfad
+//!    noch Inhalt der generierten Datei exportiert und dieser Provider keinen
+//!    Dateizugriff auf die Store-Wurzel besitzt.
+//! 2. Immer: alle [`crate::facts::FactType::Preference`]-Fakten, Projekt vor
+//!    Global.
+//! 3. Nach Bedarf: Stichworttreffer aus [`crate::facts::FactStore::search`]
+//!    gegen den jüngsten `user`-Eintrag im STM (`TurnInputContext` selbst
+//!    trägt keinen Freitext-Nutzertext — nur `session_id`/`turn_id`/
+//!    `metadata`), Projekt vor Global, bis [`DEFAULT_MEMORY_TOKEN_BUDGET`]
+//!    (änderbar über [`MemoryContextProvider::with_memory_token_budget`])
+//!    erschöpft ist. Nur dieser Schritt prüft das Budget — die „immer"-Teile
+//!    zählen unbedingt, wie in §4 beschrieben.
+//!
+//! Jeder individuell ausgelieferte Fakt (Schritt 2 und 3, nicht der Index)
+//! trägt Scope und Name in seiner [`harw_context::FragmentLabel`] und wird
+//! am Ende genau einmal je Store über
+//! [`crate::facts::FactStore::record_usage`] gezählt; ein Fehler dabei ist
+//! nur `tracing::warn!`, nie propagiert.
+//!
 //! # Concurrency
 //! `MemoryContextProvider<M>` ist `Send + Sync`, solange `M: Memory` es ist
 //! (verlangt vom `Memory`-Trait selbst). `fragments` liest Store und STM
@@ -52,11 +81,15 @@
 //!
 //! # Fehler
 //! Kein eigener Fehlerfall: schlägt `select_for_turn_no_signals` fehl (siehe
-//! [`crate::error::MemoryError`]), ist das Ergebnis eine leere Fragmentliste
-//! statt eines propagierten Fehlers — ein nicht renderbarer Turn-Kontext hat
-//! schlicht nichts zur Montage beizutragen, analog zu
-//! `harw_plan_bridge::GoalContextProvider`s Umgang mit einem fehlenden Plan.
+//! [`crate::error::MemoryError`]), enthält das Ergebnis nur die zuvor bereits
+//! gesammelten Fakten-Fragmente statt eines propagierten Fehlers — ein nicht
+//! renderbarer Turn-Kontext hat schlicht nichts zur HOT/STM/WARM-Montage
+//! beizutragen, analog zu `harw_plan_bridge::GoalContextProvider`s Umgang mit
+//! einem fehlenden Plan. Fehler beim Lesen/Schreiben eines Fakten-Stores
+//! (`FactStore::list`/`search`/`record_usage`) sind ebenfalls nicht fatal:
+//! nur `tracing::warn!`, der betroffene Schritt liefert dann schlicht nichts.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use harw_context::{Fragment, FragmentLabel, FragmentOrigin, SectionName, Stability, TrustClass};
@@ -65,7 +98,8 @@ use harw_lens_types::{BytesOverFour, CostEstimator};
 
 use crate::context_policy::ContextPolicy;
 use crate::context_selector::{SelectionRequest, SelectionRole, select_for_turn_no_signals};
-use crate::short_term::ShortTermMemory;
+use crate::facts::{Fact, FactScope, FactStore, FactType};
+use crate::short_term::{ShortTermMemory, StmRole};
 use crate::store::Memory;
 
 /// Sektionspräfix, unter dem [`MemoryContextProvider`] liefert.
@@ -92,6 +126,32 @@ const PROVIDER_NAME: &str = "MemoryContextProvider";
 /// JSON-Schlüssel in `TurnInputContext::metadata`, unter dem die Runtime die
 /// Selektionsrolle des Turns ablegt.
 const METADATA_KEY: &str = "selection_role";
+
+/// Sektion für den aus dem Projekt-Store abgeleiteten Index (§4.1).
+const SECTION_FACT_INDEX: &str = "memory.facts.index";
+/// Sektion für Präferenz-Fakten (§4.2).
+const SECTION_FACT_PREFERENCE: &str = "memory.facts.preference";
+/// Sektion für Stichwort-Treffer unter Fakten (§4.3).
+const SECTION_FACT_SEARCH: &str = "memory.facts.search";
+
+/// Default-Token-Budget für den Fakten-Anteil aus §4, wenn
+/// [`MemoryContextProvider::with_memory_token_budget`] nicht aufgerufen
+/// wurde. Schätzung überall `len() / 4`, wie im übrigen Crate
+/// (`context_selector::render_stm_above_salience`, `context_policy`).
+pub const DEFAULT_MEMORY_TOKEN_BUDGET: usize = 1500;
+
+/// Höchstzahl Zeilen des in [`render_fact_index`] gebauten Projekt-Index,
+/// analog zu §4.1 („gekürzt auf 40 Zeilen").
+const FACT_INDEX_MAX_LINES: usize = 40;
+
+/// Höchstzahl Treffer, die [`crate::facts::FactStore::search`] je Store für
+/// Schritt §4.3 liefern darf, bevor das Budget in
+/// [`MemoryContextProvider::push_fact_fragments`] selbst greift.
+const FACT_SEARCH_LIMIT_PER_STORE: usize = 20;
+
+/// Höchstzahl Stichworte, die aus dem STM-Nutzertext für §4.3 verwendet
+/// werden (siehe [`MemoryContextProvider::search_keywords`]).
+const MAX_FACT_SEARCH_KEYWORDS: usize = 12;
 
 /// Bestimmt die [`SelectionRole`] eines Turns — die einzige Stelle, die
 /// `ctx.metadata` danach befragt.
@@ -176,10 +236,26 @@ pub struct MemoryContextProvider<M: Memory> {
     stm: ShortTermMemory,
     /// Policy für Token-Budgets.
     policy: ContextPolicy,
+    /// Fakten-Store der Projekt-Wurzel (`<projekt>/.harw/memories/`), siehe
+    /// Design §2. `None`, wenn diesem Provider kein Projekt-Store übergeben
+    /// wurde — dann trägt §4 nichts zu [`Self::fragments`] bei.
+    project_facts: Option<Arc<FactStore>>,
+    /// Fakten-Store der Global-Wurzel (`~/.harw/profiles/<p>/memories/`),
+    /// siehe Design §2. `None` wie bei `project_facts`.
+    global_facts: Option<Arc<FactStore>>,
+    /// Token-Budget für den Fakten-Anteil aus §4 (Default
+    /// [`DEFAULT_MEMORY_TOKEN_BUDGET`]).
+    memory_token_budget: usize,
 }
 
 impl<M: Memory> MemoryContextProvider<M> {
-    /// Konstruiert einen Provider aus Store, STM und Policy.
+    /// Konstruiert einen Provider aus Store, STM und Policy, **ohne**
+    /// Fakten-Stores.
+    ///
+    /// # Beschreibung
+    /// Bleibt für bestehende Aufrufer unverändert lauffähig: ohne einen
+    /// nachträglichen [`Self::with_facts`]-Aufruf trägt §4 nichts zu
+    /// [`Self::fragments`] bei, das Verhalten ist identisch zum Stand vor M2.
     ///
     /// # Arguments
     /// - `store` (`Arc<M>`): LTM-Backend.
@@ -188,14 +264,66 @@ impl<M: Memory> MemoryContextProvider<M> {
     ///   Rendering.
     ///
     /// # Returns
-    /// Den konfigurierten Provider.
+    /// Den konfigurierten Provider, ohne Projekt-/Global-Fakten.
     #[must_use]
     pub fn new(store: Arc<M>, stm: ShortTermMemory, policy: ContextPolicy) -> Self {
         Self {
             store,
             stm,
             policy,
+            project_facts: None,
+            global_facts: None,
+            memory_token_budget: DEFAULT_MEMORY_TOKEN_BUDGET,
         }
+    }
+
+    /// Konstruiert einen Provider mit optionalen Projekt-/Global-Fakten-Stores
+    /// (Design §2/§4).
+    ///
+    /// # Arguments
+    /// - `store` (`Arc<M>`): LTM-Backend (HOT/STM/WARM).
+    /// - `stm` (`ShortTermMemory`): In-Process Short-Term Memory.
+    /// - `policy` ([`ContextPolicy`]): wählt die Token-Budgets für das
+    ///   HOT/STM/WARM-Rendering.
+    /// - `project_facts` (`Option<Arc<FactStore>>`): Fakten-Store der
+    ///   Projekt-Wurzel, `None` wenn keiner verfügbar ist.
+    /// - `global_facts` (`Option<Arc<FactStore>>`): Fakten-Store der
+    ///   Global-Wurzel, `None` wenn keiner verfügbar ist.
+    ///
+    /// # Returns
+    /// Den konfigurierten Provider mit [`DEFAULT_MEMORY_TOKEN_BUDGET`]; siehe
+    /// [`Self::with_memory_token_budget`], um das Budget zu ändern.
+    #[must_use]
+    pub fn with_facts(
+        store: Arc<M>,
+        stm: ShortTermMemory,
+        policy: ContextPolicy,
+        project_facts: Option<Arc<FactStore>>,
+        global_facts: Option<Arc<FactStore>>,
+    ) -> Self {
+        Self {
+            store,
+            stm,
+            policy,
+            project_facts,
+            global_facts,
+            memory_token_budget: DEFAULT_MEMORY_TOKEN_BUDGET,
+        }
+    }
+
+    /// Überschreibt das Token-Budget für den Fakten-Anteil aus §4 (Default
+    /// [`DEFAULT_MEMORY_TOKEN_BUDGET`]).
+    ///
+    /// # Arguments
+    /// - `budget` (`usize`): neues Budget, Schätzung `len() / 4`.
+    ///
+    /// # Returns
+    /// `self` mit geändertem Budget (Builder-Stil, verkettbar mit
+    /// [`Self::new`]/[`Self::with_facts`]).
+    #[must_use]
+    pub fn with_memory_token_budget(mut self, budget: usize) -> Self {
+        self.memory_token_budget = budget;
+        self
     }
 
     /// Baut die Memory-Fragmente für einen Turn.
@@ -214,9 +342,13 @@ impl<M: Memory> MemoryContextProvider<M> {
     ///   `harw_plan_bridge::finding_store`).
     ///
     /// # Returns
-    /// Bis zu drei Fragmente (HOT, STM, ein weiteres je WARM-Treffer); ein
-    /// leerer Abschnitt liefert kein Fragment. Schlägt das Rendering fehl,
-    /// ist das Ergebnis eine leere Liste (siehe Moduldoku „Fehler").
+    /// Zuerst die Fakten-Fragmente aus §4 ([`Self::push_fact_fragments`] —
+    /// leer, wenn kein Fakten-Store konfiguriert ist), danach HOT, STM und
+    /// ein weiteres Fragment je WARM-Treffer; ein leerer Abschnitt liefert
+    /// kein Fragment. Schlägt das HOT/STM/WARM-Rendering fehl, enthält das
+    /// Ergebnis nur die bereits gesammelten Fakten-Fragmente (siehe
+    /// Moduldoku „Fehler") — ohne Fakten-Stores ist das weiterhin die leere
+    /// Liste, identisch zum Verhalten vor M2.
     ///
     /// # Concurrency
     /// Liest Store und STM einmal synchron; hält danach keine Locks mehr.
@@ -227,6 +359,9 @@ impl<M: Memory> MemoryContextProvider<M> {
         now: time::OffsetDateTime,
         produced_at: jiff::Timestamp,
     ) -> Vec<Fragment> {
+        let mut fragments = Vec::new();
+        self.push_fact_fragments(&mut fragments, produced_at);
+
         let role = selection_role_for(ctx);
         let request = SelectionRequest {
             policy: self.policy,
@@ -245,11 +380,14 @@ impl<M: Memory> MemoryContextProvider<M> {
                     error = %error,
                     "Turn-Kontext konnte nicht gerendert werden — keine Memory-Fragmente"
                 );
-                return Vec::new();
+                // Die bereits gesammelten Fakten-Fragmente (§4) sind von
+                // dieser HOT/STM/WARM-Rendering-Frage unabhängig und bleiben
+                // erhalten; ohne konfigurierte Fakten-Stores ist `fragments`
+                // hier ohnehin leer — identisch zum Verhalten vor M2.
+                return fragments;
             }
         };
 
-        let mut fragments = Vec::new();
         push_fragment(&mut fragments, SECTION_HOT, "hot", &result.base.hot, produced_at);
         push_fragment(&mut fragments, SECTION_STM, "stm", &result.base.stm, produced_at);
         for (index, slice) in result.base.warm.iter().enumerate() {
@@ -258,6 +396,278 @@ impl<M: Memory> MemoryContextProvider<M> {
         }
         fragments
     }
+
+    /// Baut die Fakten-Fragmente aus §4(1-3) und pflegt anschließend die
+    /// Nutzungszähler der ausgelieferten Fakten (§4, letzter Satz).
+    ///
+    /// # Beschreibung
+    /// Reihenfolge exakt nach §4: (1) der aus [`FactStore::list`]
+    /// abgeleitete Projekt-Index ([`render_fact_index`]), immer wenn ein
+    /// Projekt-Store konfiguriert ist; (2) alle
+    /// [`FactType::Preference`]-Fakten, Projekt vor Global, je Store bereits
+    /// nach `updated` absteigend sortiert (`FactStore::list`s eigene
+    /// Garantie); (3) Stichworttreffer aus [`FactStore::search`] gegen den
+    /// jüngsten `user`-STM-Eintrag ([`Self::search_keywords`]), Projekt vor
+    /// Global, so lange bis [`Self::memory_token_budget`] erschöpft ist.
+    /// (1) und (2) zählen laut Design "immer" und werden nicht gegen das
+    /// Budget geprüft; nur (3) respektiert das verbleibende Budget
+    /// (`len() / 4`-Schätzung je Fragment-Inhalt, wie überall sonst in
+    /// diesem Crate).
+    ///
+    /// Jeder individuell ausgelieferte Fakt (2 und 3, nicht der Index) wird
+    /// dedupliziert — ein Fakt erscheint höchstens einmal, auch wenn er
+    /// sowohl Präferenz als auch Stichworttreffer ist — und am Ende in
+    /// genau einem gepufferten [`FactStore::record_usage`]-Aufruf je Store
+    /// gezählt; ein Fehler dabei wird nur geloggt (`tracing::warn!`), nie
+    /// propagiert.
+    fn push_fact_fragments(&self, out: &mut Vec<Fragment>, produced_at: jiff::Timestamp) {
+        let mut used_tokens = 0usize;
+        let mut delivered: HashSet<(FactScope, String)> = HashSet::new();
+        let mut project_delivered: Vec<String> = Vec::new();
+        let mut global_delivered: Vec<String> = Vec::new();
+
+        // (1) Projekt-Index — immer, wenn ein Projekt-Store konfiguriert ist.
+        if let Some(project) = &self.project_facts {
+            match project.list() {
+                Ok(facts) => {
+                    used_tokens += push_index_fragment(out, &facts, produced_at);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "facts: Projekt-Index konnte nicht gelesen werden"
+                    );
+                }
+            }
+        }
+
+        // (2) Präferenzen — immer, Projekt vor Global.
+        let mut preference_facts: Vec<(FactScope, Fact)> = Vec::new();
+        for (scope, store) in [
+            (FactScope::Project, &self.project_facts),
+            (FactScope::Global, &self.global_facts),
+        ] {
+            let Some(store) = store else { continue };
+            match store.list() {
+                Ok(facts) => preference_facts.extend(
+                    facts
+                        .into_iter()
+                        .filter(|fact| fact.fact_type == FactType::Preference)
+                        .map(|fact| (scope, fact)),
+                ),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        scope = %scope,
+                        "facts: Präferenzen konnten nicht gelesen werden"
+                    );
+                }
+            }
+        }
+        for (scope, fact) in preference_facts {
+            if !delivered.insert((scope, fact.name.clone())) {
+                continue;
+            }
+            used_tokens +=
+                push_fact_fragment(out, SECTION_FACT_PREFERENCE, scope, &fact, produced_at);
+            record_delivery(scope, &fact.name, &mut project_delivered, &mut global_delivered);
+        }
+
+        // (3) Stichworttreffer — Projekt vor Global, bis das Budget voll ist.
+        if let Some(keywords) = self.search_keywords() {
+            let keyword_refs: Vec<&str> = keywords.iter().map(String::as_str).collect();
+            let mut hits: Vec<(FactScope, Fact)> = Vec::new();
+            for (scope, store) in [
+                (FactScope::Project, &self.project_facts),
+                (FactScope::Global, &self.global_facts),
+            ] {
+                let Some(store) = store else { continue };
+                match store.search(&keyword_refs, FACT_SEARCH_LIMIT_PER_STORE) {
+                    Ok(facts) => hits.extend(facts.into_iter().map(|fact| (scope, fact))),
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            scope = %scope,
+                            "facts: Stichwortsuche fehlgeschlagen"
+                        );
+                    }
+                }
+            }
+            for (scope, fact) in hits {
+                if delivered.contains(&(scope, fact.name.clone())) {
+                    continue;
+                }
+                let body = render_fact_body(&fact);
+                let cost = body.len() / 4;
+                if used_tokens + cost > self.memory_token_budget {
+                    continue;
+                }
+                delivered.insert((scope, fact.name.clone()));
+                push_fact_fragment(out, SECTION_FACT_SEARCH, scope, &fact, produced_at);
+                used_tokens += cost;
+                record_delivery(scope, &fact.name, &mut project_delivered, &mut global_delivered);
+            }
+        }
+
+        if !project_delivered.is_empty() {
+            if let Some(store) = &self.project_facts {
+                let names: Vec<&str> = project_delivered.iter().map(String::as_str).collect();
+                if let Err(error) = store.record_usage(&names) {
+                    tracing::warn!(
+                        error = %error,
+                        "facts: Nutzungszähler (Projekt) konnten nicht geschrieben werden"
+                    );
+                }
+            }
+        }
+        if !global_delivered.is_empty() {
+            if let Some(store) = &self.global_facts {
+                let names: Vec<&str> = global_delivered.iter().map(String::as_str).collect();
+                if let Err(error) = store.record_usage(&names) {
+                    tracing::warn!(
+                        error = %error,
+                        "facts: Nutzungszähler (Global) konnten nicht geschrieben werden"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Leitet Stichworte für §4(3) aus dem letzten Nutzer-Eintrag im STM ab.
+    ///
+    /// # Beschreibung
+    /// `TurnInputContext` trägt in diesem Crate keinen eigenen Freitext-
+    /// Nutzertext (nur `session_id`, `turn_id`, `metadata`) — das
+    /// In-Process-STM dieses Providers hält als einziges bereits den
+    /// laufenden Dialog vor (Design §2: „Session … Ring-Buffer des
+    /// laufenden Gesprächs"). Diese Funktion nimmt deshalb den jüngsten
+    /// [`StmRole::User`]-Eintrag als Nutzertext für die Stichwortsuche,
+    /// zerlegt ihn an nicht-alphanumerischen Zeichen und behält höchstens
+    /// [`MAX_FACT_SEARCH_KEYWORDS`] kleingeschriebene Wörter ab drei
+    /// Zeichen Länge.
+    ///
+    /// # Returns
+    /// `None`, wenn kein Nutzer-Eintrag im STM vorliegt oder keine
+    /// hinreichend langen Wörter übrig bleiben — Schritt (3) entfällt dann
+    /// vollständig.
+    fn search_keywords(&self) -> Option<Vec<String>> {
+        let text = self
+            .stm
+            .snapshot()
+            .into_iter()
+            .rev()
+            .find(|entry| entry.role == StmRole::User)
+            .map(|entry| entry.content)?;
+        let keywords: Vec<String> = text
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|word| word.chars().count() >= 3)
+            .map(str::to_lowercase)
+            .take(MAX_FACT_SEARCH_KEYWORDS)
+            .collect();
+        (!keywords.is_empty()).then_some(keywords)
+    }
+}
+
+/// Ordnet den Namen eines ausgelieferten Fakts seinem Scope-Puffer zu, damit
+/// [`MemoryContextProvider::push_fact_fragments`] am Ende genau einen
+/// gepufferten [`FactStore::record_usage`]-Aufruf je Store absetzen kann.
+fn record_delivery(
+    scope: FactScope,
+    name: &str,
+    project: &mut Vec<String>,
+    global: &mut Vec<String>,
+) {
+    match scope {
+        FactScope::Project => project.push(name.to_owned()),
+        FactScope::Global => global.push(name.to_owned()),
+    }
+}
+
+/// Baut das Index-Fragment aus §4(1) und liefert die geschätzte Tokenzahl
+/// zurück (0, wenn nichts angehängt wurde — leerer Index oder ungültige
+/// Sektion/Beschriftung, siehe [`push_fragment`]).
+fn push_index_fragment(out: &mut Vec<Fragment>, facts: &[Fact], produced_at: jiff::Timestamp) -> usize {
+    let text = render_fact_index(facts);
+    let cost = text.len() / 4;
+    let before = out.len();
+    push_fragment(out, SECTION_FACT_INDEX, "project-index", &text, produced_at);
+    if out.len() > before { cost } else { 0 }
+}
+
+/// Baut ein einzelnes Fakten-Fragment (§4.2/§4.3) mit Scope und Name in der
+/// Beschriftung und liefert die geschätzte Tokenzahl zurück (0, wenn nichts
+/// angehängt wurde, siehe [`push_fragment`]).
+fn push_fact_fragment(
+    out: &mut Vec<Fragment>,
+    section: &str,
+    scope: FactScope,
+    fact: &Fact,
+    produced_at: jiff::Timestamp,
+) -> usize {
+    let label = format!("{}-{}", scope.as_str(), fact.name);
+    let body = render_fact_body(fact);
+    let cost = body.len() / 4;
+    let before = out.len();
+    push_fragment(out, section, &label, &body, produced_at);
+    if out.len() > before { cost } else { 0 }
+}
+
+/// Baut einen `MEMORY.md`-äquivalenten Index aus bereits geladenen Fakten,
+/// gruppiert nach [`FactType`] in [`FactType::ALL`]-Reihenfolge, je Gruppe
+/// alphabetisch nach `name`, gekürzt auf höchstens [`FACT_INDEX_MAX_LINES`]
+/// Zeilen.
+///
+/// # Beschreibung
+/// `FactStore` legt `MEMORY.md` nur als generierte Datei ab
+/// ([`FactStore::write_index`]) und exportiert weder deren Pfad noch ihren
+/// Inhalt — dieser Provider hat keinen Dateizugriff auf die Store-Wurzel.
+/// Der Index wird deshalb hier inhaltlich äquivalent aus
+/// [`FactStore::list`] abgeleitet (gleiche Fakten, gleiche Gruppierung),
+/// statt die persistierte Datei zu lesen — das Ergebnis ist unabhängig
+/// davon, ob zuvor `write_index` gelaufen ist.
+fn render_fact_index(facts: &[Fact]) -> String {
+    let mut by_type: HashMap<FactType, Vec<&Fact>> = HashMap::new();
+    for fact in facts {
+        by_type.entry(fact.fact_type).or_default().push(fact);
+    }
+    let mut lines: Vec<String> = Vec::new();
+    for fact_type in FactType::ALL {
+        let Some(mut group) = by_type.remove(&fact_type) else {
+            continue;
+        };
+        group.sort_by(|a, b| a.name.cmp(&b.name));
+        lines.push(format!("## {fact_type}"));
+        for fact in group {
+            lines.push(format!(
+                "- {} — {fact_type}, aktualisiert {}",
+                fact.description,
+                format_index_date(fact.updated)
+            ));
+        }
+    }
+    lines.truncate(FACT_INDEX_MAX_LINES);
+    lines.join("\n")
+}
+
+/// Formatiert einen Zeitstempel als `yyyy-mm-dd` für [`render_fact_index`].
+fn format_index_date(ts: time::OffsetDateTime) -> String {
+    let format = time::macros::format_description!("[year]-[month]-[day]");
+    ts.format(&format)
+        .unwrap_or_else(|_| ts.unix_timestamp().to_string())
+}
+
+/// Baut den Fragment-Text eines einzelnen Fakts: Beschreibung, danach der
+/// Freitext-`body`, falls nicht leer.
+fn render_fact_body(fact: &Fact) -> String {
+    let mut body = fact.description.clone();
+    body.push('\n');
+    let trimmed_body = fact.body.trim();
+    if !trimmed_body.is_empty() {
+        body.push('\n');
+        body.push_str(trimmed_body);
+        body.push('\n');
+    }
+    body
 }
 
 /// Baut ein Fragment aus einem gerenderten Abschnitt und hängt es an, wenn
@@ -457,5 +867,200 @@ mod tests {
         assert!(!fragments.is_empty(), "erwartet mindestens ein Fragment nach maintain()");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── Fakten (M2, §4) ───────────────────────────────────────────────────
+
+    fn make_fact(name: &str, fact_type: FactType, scope: FactScope, description: &str) -> Fact {
+        let now = time::OffsetDateTime::now_utc();
+        Fact {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            fact_type,
+            scope,
+            created: now,
+            updated: now,
+            confidence: 0.8,
+            sources: Vec::new(),
+            tags: Vec::new(),
+            body: String::new(),
+        }
+    }
+
+    fn facts_provider(
+        mem_root: &std::path::Path,
+        project_facts: Option<Arc<FactStore>>,
+        global_facts: Option<Arc<FactStore>>,
+    ) -> MemoryContextProvider<FileMemoryStore> {
+        let store = Arc::new(FileMemoryStore::open(mem_root).expect("open memory store"));
+        MemoryContextProvider::with_facts(
+            store,
+            ShortTermMemory::new("session-1", 32, 2_048),
+            ContextPolicy::Balanced,
+            project_facts,
+            global_facts,
+        )
+    }
+
+    #[test]
+    fn test_without_fact_stores_behaves_like_before() {
+        let root = tmp_root("no-facts");
+        std::fs::write(root.join("HOT.md"), "Regel 1: keine Doppelantworten.\n")
+            .expect("write HOT.md");
+
+        let fragments = provider(&root).fragments(
+            &TurnInputContext::default(),
+            time::OffsetDateTime::UNIX_EPOCH,
+            jiff::Timestamp::UNIX_EPOCH,
+        );
+
+        assert!(
+            fragments
+                .iter()
+                .all(|f| !f.section.as_str().starts_with("memory.facts")),
+            "ohne Fakten-Stores darf keine Fakten-Sektion erscheinen"
+        );
+        assert!(fragments.iter().any(|f| f.section.as_str() == SECTION_HOT));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_preference_facts_always_included_project_before_global() {
+        let mem_root = tmp_root("pref-mem");
+        let project_root = tmp_root("pref-project");
+        let global_root = tmp_root("pref-global");
+
+        let project_store =
+            Arc::new(FactStore::open(&project_root, FactScope::Project).expect("open project"));
+        project_store
+            .write(&make_fact(
+                "proj-pref",
+                FactType::Preference,
+                FactScope::Project,
+                "Projekt-Präferenz",
+            ))
+            .expect("write project preference");
+
+        let global_store =
+            Arc::new(FactStore::open(&global_root, FactScope::Global).expect("open global"));
+        global_store
+            .write(&make_fact(
+                "glob-pref",
+                FactType::Preference,
+                FactScope::Global,
+                "Global-Präferenz",
+            ))
+            .expect("write global preference");
+
+        let fragments = facts_provider(&mem_root, Some(project_store), Some(global_store))
+            .fragments(
+                &TurnInputContext::default(),
+                time::OffsetDateTime::UNIX_EPOCH,
+                jiff::Timestamp::UNIX_EPOCH,
+            );
+
+        let project_pos = fragments
+            .iter()
+            .position(|f| f.label.as_str() == "project-proj-pref")
+            .expect("project preference fragment present");
+        let global_pos = fragments
+            .iter()
+            .position(|f| f.label.as_str() == "global-glob-pref")
+            .expect("global preference fragment present");
+        assert!(
+            project_pos < global_pos,
+            "Projekt-Präferenz muss vor Global-Präferenz stehen"
+        );
+
+        let _ = std::fs::remove_dir_all(&mem_root);
+        let _ = std::fs::remove_dir_all(&project_root);
+        let _ = std::fs::remove_dir_all(&global_root);
+    }
+
+    #[test]
+    fn test_search_hits_respect_the_memory_token_budget() {
+        let mem_root = tmp_root("budget-mem");
+        let project_root = tmp_root("budget-project");
+
+        let project_store =
+            Arc::new(FactStore::open(&project_root, FactScope::Project).expect("open project"));
+        for i in 0..5 {
+            project_store
+                .write(&make_fact(
+                    &format!("zeppelin-fakt-{i}"),
+                    FactType::Fact,
+                    FactScope::Project,
+                    "Ein langer Text über Zeppeline und ihre Geschichte in der Luftfahrt.",
+                ))
+                .expect("write fact");
+        }
+
+        let stm = ShortTermMemory::new("session-1", 32, 2_048);
+        stm.push(StmRole::User, 80, "Erzähl mir etwas über Zeppelin");
+        let store = Arc::new(FileMemoryStore::open(&mem_root).expect("open memory store"));
+        let provider = MemoryContextProvider::with_facts(
+            store,
+            stm,
+            ContextPolicy::Balanced,
+            Some(project_store),
+            None,
+        )
+        .with_memory_token_budget(5);
+
+        let fragments = provider.fragments(
+            &TurnInputContext::default(),
+            time::OffsetDateTime::UNIX_EPOCH,
+            jiff::Timestamp::UNIX_EPOCH,
+        );
+
+        let search_hits = fragments
+            .iter()
+            .filter(|f| f.section.as_str() == SECTION_FACT_SEARCH)
+            .count();
+        assert!(
+            search_hits < 5,
+            "ein Budget von 5 Token darf nicht alle 5 Treffer zulassen, got {search_hits}"
+        );
+
+        let _ = std::fs::remove_dir_all(&mem_root);
+        let _ = std::fs::remove_dir_all(&project_root);
+    }
+
+    #[test]
+    fn test_delivered_fact_usage_counter_increments() {
+        let mem_root = tmp_root("usage-mem");
+        let project_root = tmp_root("usage-project");
+
+        let project_store =
+            Arc::new(FactStore::open(&project_root, FactScope::Project).expect("open project"));
+        project_store
+            .write(&make_fact(
+                "usage-pref",
+                FactType::Preference,
+                FactScope::Project,
+                "Präferenz",
+            ))
+            .expect("write preference");
+        assert!(project_store.usage("usage-pref").is_none());
+
+        let fragments = facts_provider(&mem_root, Some(Arc::clone(&project_store)), None)
+            .fragments(
+                &TurnInputContext::default(),
+                time::OffsetDateTime::UNIX_EPOCH,
+                jiff::Timestamp::UNIX_EPOCH,
+            );
+        assert!(
+            fragments
+                .iter()
+                .any(|f| f.label.as_str() == "project-usage-pref")
+        );
+
+        let (count, _) = project_store
+            .usage("usage-pref")
+            .expect("usage recorded after delivery");
+        assert_eq!(count, 1);
+
+        let _ = std::fs::remove_dir_all(&mem_root);
+        let _ = std::fs::remove_dir_all(&project_root);
     }
 }

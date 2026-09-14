@@ -60,6 +60,6 @@ pub mod perm;
 pub mod walk;
 
 pub use atomic::{AtomicWriteOptions, write_atomic};
-pub use open::{OpenMode, open_beneath, open_dir_nofollow, open_nofollow};
+pub use open::{OpenMode, is_symlink_loop, open_beneath, open_dir_nofollow, open_nofollow};
 pub use perm::ensure_private_regular;
 pub use walk::{EntryType, WalkBeneath, WalkEntry, WalkLimits, WalkStop, walk_beneath};

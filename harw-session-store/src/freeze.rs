@@ -195,6 +195,25 @@
 //! responsibility to avoid, exactly as `ChildLeaseStore::admit`'s
 //! lock-free `create_new` carries an analogous narrow window.
 //!
+//! # Integrität (A-STORE, F-179)
+//!
+//! [`FreezeStore::freeze`] schreibt **nicht** mehr per `create_new` +
+//! `write_all` direkt ins Ziel — ein Absturz dazwischen hinterließ eine leere
+//! oder halbe `.active.json`, an der jeder Scan und damit die Freeze-Abwehr
+//! insgesamt scheiterte. Stattdessen: temp-Datei + `sync_all` +
+//! no-replace-rename (`crate::store::persist_noclobber`) — dasselbe
+//! Kernel-seitige „genau ein Gewinner“ wie `create_new`, aber atomar. Wo in
+//! diesem Modul noch „`create_new`“ steht, ist diese Operation gemeint.
+//!
+//! Defekte Altdateien (undekodierbar, unsichere Schlüsselteile, Dateiname
+//! passt nicht zum Inhalt) werden in [`FreezeStore::active`] und
+//! [`FreezeStore::reconcile_expired`] nach `<name>.corrupt-<ts>` verschoben
+//! und mit `tracing::error!` gemeldet, statt den ganzen Scan abzubrechen.
+//! **Sicherheitshinweis:** ein so beiseitegelegter Datensatz erscheint nicht
+//! mehr in `active()`; der Kernel-Freeze selbst bleibt unberührt, die Datei
+//! bleibt zur Prüfung erhalten, und die `error!`-Meldung ist das Signal an
+//! den Betreiber.
+//!
 //! # Errors
 //!
 //! Every fallible operation returns [`crate::error::SessionStoreResult`].
@@ -233,16 +252,14 @@
 //! ```
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use fs4::FileExt;
 use harw_types::{CgroupId, FindingId};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
-use tempfile::NamedTempFile;
-
 use crate::error::{SessionStoreError, SessionStoreResult};
+use crate::store::{persist_noclobber, quarantine_file};
 
 /// One durable record: which cgroup was frozen, for which finding, when, and
 /// (optionally) when the freeze auto-lifts.
@@ -568,28 +585,23 @@ impl FreezeStore {
             return Err(non_regular_freeze_path_error());
         }
         let bytes = serde_json::to_vec(record)?;
-        let mut file = match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&active_path)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+        // F-179: atomar (temp + no-replace-rename, Datei- und Eltern-fsync)
+        // statt `create_new` + `write_all` direkt ins Ziel.
+        match persist_noclobber(&active_path, &bytes) {
+            Ok(()) => Ok(()),
+            Err(SessionStoreError::PersistTargetExists { .. }) => {
                 if is_regular_file(&active_path)? {
-                    return Err(SessionStoreError::FreezeAlreadyExists {
+                    Err(SessionStoreError::FreezeAlreadyExists {
                         cgroup: record.cgroup.clone(),
                         finding: record.finding.clone(),
                         frozen_at: record.frozen_at,
-                    });
+                    })
+                } else {
+                    Err(non_regular_freeze_path_error())
                 }
-                return Err(non_regular_freeze_path_error());
             }
-            Err(error) => return Err(SessionStoreError::Io(error)),
-        };
-        file.write_all(&bytes)?;
-        file.sync_data()?;
-        sync_parent_directory(&self.root)?;
-        Ok(())
+            Err(error) => Err(error),
+        }
     }
 
     /// Lists every freeze that is still in force.
@@ -816,7 +828,9 @@ impl FreezeStore {
                 if !has_suffix(&path, ".active.json") || !is_regular_file(&path)? {
                     continue;
                 }
-                let freeze = read_freeze(&path)?;
+                let Some(freeze) = self.load_scanned(&path, "active")? else {
+                    continue;
+                };
                 let Some(expires_at) = freeze.expires_at else {
                     continue;
                 };
@@ -857,7 +871,13 @@ impl FreezeStore {
             if !has_suffix(&path, suffix) || !is_regular_file(&path)? {
                 continue;
             }
-            let freeze = read_freeze(&path)?;
+            let state = suffix
+                .strip_prefix('.')
+                .and_then(|rest| rest.strip_suffix(".json"))
+                .unwrap_or(suffix);
+            let Some(freeze) = self.load_scanned(&path, state)? else {
+                continue;
+            };
             let resolved_path =
                 self.resolved_path(&freeze.cgroup, &freeze.finding, freeze.frozen_at)?;
             if !is_regular_file(&resolved_path)? {
@@ -872,6 +892,44 @@ impl FreezeStore {
                 .then_with(|| left.frozen_at.cmp(&right.frozen_at))
         });
         Ok(records)
+    }
+
+    // Liest einen beim Scan gefundenen Datensatz; defekte Dateien werden in
+    // Quarantäne verschoben (`error!`, sicherheitsrelevant) und übersprungen.
+    fn load_scanned(&self, path: &Path, state: &str) -> SessionStoreResult<Option<Freeze>> {
+        let detail = match read_freeze(path) {
+            Ok(freeze) => match self.path(
+                &freeze.cgroup,
+                &freeze.finding,
+                freeze.frozen_at,
+                state,
+            ) {
+                Ok(expected) if expected == path => return Ok(Some(freeze)),
+                Ok(_) => "freeze file name does not match its key".to_owned(),
+                Err(error) => error.to_string(),
+            },
+            Err(SessionStoreError::Serde(error)) => error.to_string(),
+            Err(SessionStoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        match quarantine_file(path) {
+            Ok(Some(quarantine)) => tracing::error!(
+                path = %path.display(),
+                quarantine = %quarantine.display(),
+                detail = %detail,
+                "corrupt freeze record quarantined; it is no longer listed as active"
+            ),
+            Ok(None) => {}
+            Err(error) => tracing::error!(
+                path = %path.display(),
+                error = %error,
+                detail = %detail,
+                "corrupt freeze record could not be quarantined; skipped"
+            ),
+        }
+        Ok(None)
     }
 
     fn ensure_root(&self) -> SessionStoreResult<()> {
@@ -936,32 +994,18 @@ fn unlock<T>(lock: File, result: SessionStoreResult<T>) -> SessionStoreResult<T>
     }
 }
 
-/// Writes `value` to a sibling temp file, syncs it, persists it to `path`
-/// without clobbering an existing file, then fsyncs `path`'s parent
-/// directory.
+/// Writes `value` via `crate::store::persist_noclobber`: sibling temp file,
+/// `sync_all`, no-clobber persist to `path`, parent-directory fsync.
 ///
 /// This is the "exactly one winner" write every terminal freeze record uses
-/// (see module docs). Unlike `child_lease.rs`'s `persist_json`, this
-/// version also fsyncs the parent directory after the persist — see the
-/// module docs on the double fsync.
+/// (see module docs).
 fn persist_json<T: Serialize>(path: &Path, value: &T) -> SessionStoreResult<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| SessionStoreError::Io(std::io::Error::other("freeze path has no parent")))?;
-    let mut temp = NamedTempFile::new_in(parent)?;
-    serde_json::to_writer(temp.as_file_mut(), value)?;
-    temp.as_file().sync_data()?;
-    temp.persist_noclobber(path)
-        .map_err(|error| SessionStoreError::Io(error.error))?;
-    sync_parent_directory(parent)?;
-    Ok(())
+    let bytes = serde_json::to_vec(value)?;
+    persist_noclobber(path, &bytes)
 }
 
-// Die eine Fassung liegt in `crate::durability`; sie stand vorher in fünf
-// Dateien. Der frühere Kommentar hier behauptete, `child_lease.rs`,
-// `approval.rs` und `job_store.rs` ließen den Eltern-fsync weg — das galt bis
-// zu ihrer Nachbesserung und ist mit der Zusammenlegung erledigt.
-use crate::durability::sync_parent_directory;
+// Der Eltern-fsync (`crate::durability::sync_parent_directory`) läuft seit
+// A-STORE ausschließlich über `crate::store::persist_noclobber`.
 
 fn has_suffix(path: &Path, suffix: &str) -> bool {
     path.file_name()

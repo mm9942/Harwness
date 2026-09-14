@@ -100,6 +100,7 @@ pub use op_schema::OpArgsSchema;
 pub use operation::{
     ApprovalPolicy, CommandVisibility, FromRawArgs, OpFuture, OpInput, OpInvocation, OpOutput,
     Operation, OperationCategory, OperationDomain, OperationMeta, PermissionTier, Surface,
+    WebMethod,
 };
 pub use session_control::{
     NullSessionController, SessionControlError, SessionControlSnapshot, SessionController,

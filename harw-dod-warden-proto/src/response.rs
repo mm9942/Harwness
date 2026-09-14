@@ -11,6 +11,20 @@
 //! `deny_unknown_fields` (K19): sie nehmen Daten entgegen, die von der
 //! jeweils anderen Seite der Leitung kommen.
 //!
+//! # Proof v2 (C-WPROTO, F-088)
+//! [`WardenRequest`] ist die v2-Anfragehülle (ersetzt `WardenActionRequest` und
+//! das bisher nur im Binary definierte `WardenRequestEnvelope`): Version,
+//! Aktion und [`crate::signed::SignedAuthorization`] — **ohne** separates
+//! `finding`-Feld (die v1-Bindung daran war tautologisch). [`WardenReply`]
+//! versioniert die Antwort. [`WardenRequest::peek_version`] liest nur die
+//! Version, damit der Warden auch auf eine unbekannte Fassung mit
+//! [`Denial::UnsupportedVersion`] antworten kann, obwohl die übrigen Felder
+//! `deny_unknown_fields` verletzen würden.
+//!
+//! `WardenActionRequest` bleibt als v1-Altlast nur bis W5 (D-WARDEN/D-ESC)
+//! bestehen, damit abhängige Crates bis dahin kompilieren; der Warden darf
+//! ihn nicht mehr akzeptieren.
+//!
 //! # Warum `WardenResponse` ein eigener Typ ist, kein `Result<T, E>`
 //! `std::result::Result` ist fremd — diese Crate kann ihm kein
 //! `#[serde(deny_unknown_fields)]` mitgeben. `WardenResponse` ist die
@@ -20,11 +34,129 @@ use serde::{Deserialize, Serialize};
 
 use crate::action::{ProposedAction, WardenAction};
 use crate::denial::Denial;
+use crate::error::ProofError;
 use crate::proof::AuthorizationProof;
+use crate::signed::{
+    KeyRing, NonceLedger, ProofPolicy, SignedAuthorization, VerifiedAuthorization,
+    WARDEN_PROTOCOL_VERSION,
+};
 
-/// Die tatsächliche Wire-Nachricht vom Eskalationsleiter zum Durchsetzer:
-/// eine Aktion plus der Autorisierungsbeleg, ohne den der Durchsetzer sie
-/// ablehnt.
+/// v2-Anfrage vom Escalator an den Warden.
+///
+/// # Description
+/// `version` muss [`WARDEN_PROTOCOL_VERSION`] sein; `authorization` bindet
+/// `action` (siehe [`SignedAuthorization::verify`]).
+///
+/// # Wire-Format
+/// `deny_unknown_fields`.
+///
+/// # Examples
+/// ```rust
+/// use harw_dod_warden_proto::{
+///     EscalationStage, KeyId, ProofKey, SignedAuthorization, WardenAction, WardenRequest,
+/// };
+/// use harw_types::CgroupId;
+///
+/// let cgroup = CgroupId::try_from_str("harw.slice/job-1").unwrap();
+/// let action = WardenAction::FreezeCgroup { cgroup: cgroup.clone() };
+/// let auth = SignedAuthorization::sign(
+///     &ProofKey::from_bytes([3; 32]), &KeyId::new("k1").unwrap(), &action,
+///     EscalationStage::RuleTriggered, &cgroup, [0; 16], jiff::Timestamp::UNIX_EPOCH, 60,
+/// );
+/// let request = WardenRequest::new(action, auth);
+/// let json = serde_json::to_vec(&request).unwrap();
+/// assert_eq!(WardenRequest::peek_version(&json).unwrap(), 2);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WardenRequest {
+    /// Protokollversion der Hülle.
+    pub version: u16,
+    /// Die angeforderte Aktion.
+    pub action: WardenAction,
+    /// Die signierte Autorisierung für `action`.
+    pub authorization: SignedAuthorization,
+}
+
+// Liest nur `version`, ignoriert alle anderen Felder.
+#[derive(Deserialize)]
+struct VersionProbe {
+    version: u16,
+}
+
+impl WardenRequest {
+    /// Wraps an action and its signed authorization with the current version.
+    #[must_use]
+    pub fn new(action: WardenAction, authorization: SignedAuthorization) -> Self {
+        Self {
+            version: WARDEN_PROTOCOL_VERSION,
+            action,
+            authorization,
+        }
+    }
+
+    /// Reads only the `version` field of a JSON request.
+    ///
+    /// # Description
+    /// Toleriert unbekannte Felder, damit auch Anfragen anderer Fassungen
+    /// (v3 mit neuen Feldern → Wert) eine definierte Antwort bekommen; eine
+    /// v1-Hülle ohne `version`-Feld ergibt einen Fehler.
+    ///
+    /// # Errors
+    /// `serde_json::Error`, wenn die Bytes kein JSON-Objekt mit numerischem
+    /// `version` (u16) sind — der Warden antwortet dann [`Denial::Malformed`]
+    /// bzw. [`Denial::UnsupportedVersion`] (Entscheidung D-WARDEN).
+    pub fn peek_version(json: &[u8]) -> Result<u16, serde_json::Error> {
+        serde_json::from_slice::<VersionProbe>(json).map(|probe| probe.version)
+    }
+
+    /// Checks the envelope version, then verifies the authorization for `self.action`.
+    ///
+    /// # Errors
+    /// - [`ProofError::UnsupportedVersion`]: `self.version` ≠ [`WARDEN_PROTOCOL_VERSION`].
+    /// - alles aus [`SignedAuthorization::verify`].
+    pub fn verify(
+        &self,
+        ring: &KeyRing,
+        now: jiff::Timestamp,
+        policy: &ProofPolicy,
+        ledger: &dyn NonceLedger,
+    ) -> Result<VerifiedAuthorization, ProofError> {
+        if self.version != WARDEN_PROTOCOL_VERSION {
+            return Err(ProofError::UnsupportedVersion(self.version));
+        }
+        self.authorization.verify(ring, &self.action, now, policy, ledger)
+    }
+}
+
+/// Versionierte v2-Antwort des Wardens (F-088).
+///
+/// # Wire-Format
+/// `deny_unknown_fields`; `outcome` ist die bestehende [`WardenResponse`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WardenReply {
+    /// Protokollversion der Antwort.
+    pub version: u16,
+    /// Ergebnis (ausgeführt oder inhaltsfreie Ablehnung).
+    pub outcome: WardenResponse,
+}
+
+impl WardenReply {
+    /// Wraps an outcome with the current protocol version.
+    #[must_use]
+    pub fn new(outcome: WardenResponse) -> Self {
+        Self {
+            version: WARDEN_PROTOCOL_VERSION,
+            outcome,
+        }
+    }
+}
+
+/// **v1-Altlast** (nicht mehr akzeptiert, Entfernung nach W5 D-WARDEN/D-ESC;
+/// Nachfolger: [`WardenRequest`]). Die frühere Wire-Nachricht vom
+/// Eskalationsleiter zum Durchsetzer: eine Aktion plus fälschbarer
+/// Autorisierungsbeleg (F-001).
 ///
 /// # Wire-Format
 /// `deny_unknown_fields` (K19).
@@ -148,7 +280,9 @@ pub enum WardenResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{WardenActionAudit, WardenActionRequest, WardenResponse};
+    use super::{WardenActionAudit, WardenActionRequest, WardenReply, WardenRequest, WardenResponse};
+    use crate::error::ProofError;
+    use crate::signed::{KeyId, KeyRing, MemoryNonceLedger, ProofKey, ProofPolicy, SignedAuthorization};
     use crate::action::{ProposedAction, WardenAction};
     use crate::denial::Denial;
     use crate::proof::AuthorizationProof;
@@ -284,6 +418,107 @@ mod tests {
             WardenResponse::Denied { reason } => assert_eq!(reason, Denial::NotAdmissibleAtStage),
             WardenResponse::Executed { .. } => panic!("expected Denied"),
         }
+    }
+
+    // -- v2: WardenRequest / WardenReply ---------------------------------------
+
+    fn v2_request() -> WardenRequest {
+        let action = WardenAction::FreezeCgroup {
+            cgroup: cgroup("harw.slice/job-1"),
+        };
+        let auth = SignedAuthorization::sign(
+            &ProofKey::from_bytes([3; 32]),
+            &KeyId::new("k1").unwrap(),
+            &action,
+            EscalationStage::RuleTriggered,
+            action.cgroup(),
+            [9; 16],
+            jiff::Timestamp::from_second(1_800_000_000).unwrap(),
+            60,
+        );
+        WardenRequest::new(action, auth)
+    }
+
+    fn v2_ring() -> KeyRing {
+        let mut ring = KeyRing::new();
+        ring.insert(KeyId::new("k1").unwrap(), ProofKey::from_bytes([3; 32]))
+            .unwrap();
+        ring
+    }
+
+    fn v2_policy() -> ProofPolicy {
+        ProofPolicy::new(60, 5, vec!["harw.slice".to_owned()]).unwrap()
+    }
+
+    #[test]
+    fn test_warden_request_serde_roundtrip_and_verify() {
+        let request = v2_request();
+        let json = serde_json::to_vec(&request).expect("serializes");
+        let back: WardenRequest = serde_json::from_slice(&json).expect("deserializes");
+        assert_eq!(back, request);
+        let verified = back
+            .verify(
+                &v2_ring(),
+                jiff::Timestamp::from_second(1_800_000_010).unwrap(),
+                &v2_policy(),
+                &MemoryNonceLedger::new(),
+            )
+            .expect("verifies");
+        assert_eq!(verified.stage(), EscalationStage::RuleTriggered);
+    }
+
+    #[test]
+    fn test_warden_request_verify_rejects_envelope_version() {
+        let mut request = v2_request();
+        request.version = 1;
+        let err = request
+            .verify(
+                &v2_ring(),
+                jiff::Timestamp::from_second(1_800_000_010).unwrap(),
+                &v2_policy(),
+                &MemoryNonceLedger::new(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, ProofError::UnsupportedVersion(1)));
+    }
+
+    #[test]
+    fn test_warden_request_peek_version_tolerates_unknown_fields() {
+        assert_eq!(
+            WardenRequest::peek_version(br#"{"version":3,"future":true}"#).unwrap(),
+            3
+        );
+        // v1-Hülle ohne `version`-Feld ist nicht lesbar.
+        assert!(WardenRequest::peek_version(br#"{"finding":"f","request":{}}"#).is_err());
+        assert!(WardenRequest::peek_version(b"not json").is_err());
+    }
+
+    #[test]
+    fn test_warden_request_rejects_unknown_field() {
+        let request = v2_request();
+        let mut value = serde_json::to_value(&request).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("finding".to_owned(), serde_json::Value::from("f-1"));
+        assert!(serde_json::from_value::<WardenRequest>(value).is_err());
+    }
+
+    #[test]
+    fn test_warden_reply_new_sets_version_and_roundtrips() {
+        let reply = WardenReply::new(WardenResponse::Denied {
+            reason: Denial::UnsupportedVersion,
+        });
+        assert_eq!(reply.version, 2);
+        let json = serde_json::to_string(&reply).unwrap();
+        let back: WardenReply = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.version, 2);
+        assert!(matches!(
+            back.outcome,
+            WardenResponse::Denied {
+                reason: Denial::UnsupportedVersion
+            }
+        ));
     }
 
     #[test]

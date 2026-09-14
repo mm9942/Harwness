@@ -16,6 +16,8 @@ harw-observe = { path = "../harw-observe" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 jiff = { workspace = true }
+# C-APPR: defekte Approval-Einträge werden in `pending_all` mit `warn!` übersprungen.
+tracing = { workspace = true }
 fs4 = "1.1.0"
 tempfile = "3.27.0"
 

@@ -302,11 +302,11 @@ fn grep_blocking(root: &Path, args: &GrepArgs) -> ToolOutput {
         .context_lines
         .unwrap_or(DEFAULT_CONTEXT_LINES)
         .min(MAX_CONTEXT_LINES);
+    // `clamp(1, HARD_MAX_RESULTS)`: siehe `glob.rs` — gleiche Grenzen.
     let cap = args
         .max_matches
         .unwrap_or(DEFAULT_MAX_MATCHES)
-        .min(HARD_MAX_RESULTS)
-        .max(1);
+        .clamp(1, HARD_MAX_RESULTS);
 
     let mut run = GrepRun {
         regex: &regex,

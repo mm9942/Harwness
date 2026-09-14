@@ -1,7 +1,8 @@
 //! `harw-types` — Phase-0-Vokabular des Harness.
 //!
 //! Reine serde-Daten: ID-Newtypes, `AgentRole`, `RiskLevel`, `ReviewDecision`,
-//! `MessagePhase`, `TokenUsage`, `ReasoningEffort`, `Principal`/`PermissionTier`.
+//! `MessagePhase`, `TokenUsage`, `ReasoningEffort`, `Principal`/`PermissionTier`,
+//! die Wanduhr-Abstraktion `Clock`/`SystemClock`.
 //! Keine `tokio`-, `reqwest`- oder Provider-Abhängigkeiten. Höchste Stabilität,
 //! maximaler Fan-in.
 //!
@@ -12,6 +13,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod clock;
 pub mod confidence;
 pub mod digest;
 pub mod error;
@@ -23,6 +25,7 @@ pub mod reasoning;
 pub mod roles;
 pub mod usage;
 
+pub use clock::{Clock, SystemClock};
 pub use confidence::Confidence;
 pub use digest::ContentDigest;
 pub use error::{ImpactAssessmentError, InvalidDigest, InvalidId};

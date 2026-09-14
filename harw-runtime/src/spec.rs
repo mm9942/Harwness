@@ -103,24 +103,31 @@ pub struct EntryProfile {
     pub spawner: SpawnerPolicy,
     /// Kontext-Decke.
     pub ceiling: CeilingPolicy,
+    /// Ob der Projektkontext (Doku-Kaskade `HARW.md`/`AGENTS.md`/`CLAUDE.md`
+    /// sowie `project_root`/`cwd` des Hosts) in den Modellkontext der
+    /// Wurzel-Registry gelangt. `false` für Einstiege, deren Ergebnis ein
+    /// entfernter oder nicht lokal vertrauenswürdiger Einreicher liest
+    /// (Befund Z2d2-R1): die Montage übergibt dann einen Projektkontext ohne
+    /// Doku und mit neutralem Platzhalter statt Host-Pfaden.
+    pub project_context: bool,
 }
 
 impl EntryKind {
     /// Die **einzige** Reduktionstabelle Einstieg → Profil.
     ///
     /// # Tabelle (CONTRACTS.md §runtime-spec)
-    /// | Entry | Rechte | Registry / Ops | Ask | Spawner | Decke |
-    /// |---|---|---|---|---|---|
-    /// | Tui | {R, W, X} | Full + AllWithModelTools | Interactive | BuiltinRoles | LocalRoot |
-    /// | OneShot | {R, W, X} | Full + AllWithModelTools | RejectTurn | BuiltinRoles | LocalRoot |
-    /// | LocalEcho | {R, W, X} | Full + None | Fail | None | LocalRoot |
-    /// | Analyze | {R, W, X} | Full + CommandsOnly | Fail | BuiltinRoles | LocalRoot |
-    /// | Doctor | {R, W, X} | Full + AllWithModelTools | Fail | None | LocalRoot |
-    /// | Web | {R} | Full + CommandsOnly | Fail | None | Closed |
-    /// | McpServe | {} | NoTools + None | BlockJob | None | Closed |
-    /// | JobPrompt | {} | NoTools + None | BlockJob | None | Closed |
-    /// | JobPlanNode | {R, W} | Full + None | Fail | None | LocalRoot |
-    /// | GatewayTelegram / GatewayDream | {} | NoTools + None | Fail | None | Closed |
+    /// | Entry | Rechte | Registry / Ops | Ask | Spawner | Decke | Projektkontext |
+    /// |---|---|---|---|---|---|---|
+    /// | Tui | {R, W, X} | Full + AllWithModelTools | Interactive | BuiltinRoles | LocalRoot | ja |
+    /// | OneShot | {R, W, X} | Full + AllWithModelTools | RejectTurn | BuiltinRoles | LocalRoot | ja |
+    /// | LocalEcho | {R, W, X} | Full + None | Fail | None | LocalRoot | ja |
+    /// | Analyze | {R, W, X} | Full + CommandsOnly | Fail | BuiltinRoles | LocalRoot | ja |
+    /// | Doctor | {R, W, X} | Full + AllWithModelTools | Fail | None | LocalRoot | ja |
+    /// | Web | {R} | Full + CommandsOnly | Fail | None | Closed | nein |
+    /// | McpServe | {} | NoTools + None | BlockJob | None | Closed | nein |
+    /// | JobPrompt | {} | NoTools + None | BlockJob | None | Closed | nein |
+    /// | JobPlanNode | {R, W} | Full + None | Fail | None | LocalRoot | ja |
+    /// | GatewayTelegram / GatewayDream | {} | NoTools + None | Fail | None | Closed | nein |
     ///
     /// `R` = [`Permission::ReadWorkspace`], `W` = [`Permission::WriteWorkspace`],
     /// `X` = [`Permission::ExecuteProcess`]. Für `Web` ist `{R}` die
@@ -143,6 +150,7 @@ impl EntryKind {
                 ask: AskResolution::Interactive,
                 spawner: SpawnerPolicy::BuiltinRoles,
                 ceiling: CeilingPolicy::LocalRoot,
+                project_context: true,
             },
             EntryKind::OneShot => EntryProfile {
                 permissions: rwx(),
@@ -151,6 +159,7 @@ impl EntryKind {
                 ask: AskResolution::RejectTurn,
                 spawner: SpawnerPolicy::BuiltinRoles,
                 ceiling: CeilingPolicy::LocalRoot,
+                project_context: true,
             },
             EntryKind::LocalEcho => EntryProfile {
                 permissions: rwx(),
@@ -159,6 +168,7 @@ impl EntryKind {
                 ask: AskResolution::Fail,
                 spawner: SpawnerPolicy::None,
                 ceiling: CeilingPolicy::LocalRoot,
+                project_context: true,
             },
             EntryKind::Analyze => EntryProfile {
                 permissions: rwx(),
@@ -167,6 +177,7 @@ impl EntryKind {
                 ask: AskResolution::Fail,
                 spawner: SpawnerPolicy::BuiltinRoles,
                 ceiling: CeilingPolicy::LocalRoot,
+                project_context: true,
             },
             EntryKind::Doctor => EntryProfile {
                 permissions: rwx(),
@@ -175,6 +186,7 @@ impl EntryKind {
                 ask: AskResolution::Fail,
                 spawner: SpawnerPolicy::None,
                 ceiling: CeilingPolicy::LocalRoot,
+                project_context: true,
             },
             EntryKind::Web => EntryProfile {
                 permissions: PermissionSet::from_policy([ReadWorkspace]),
@@ -183,6 +195,7 @@ impl EntryKind {
                 ask: AskResolution::Fail,
                 spawner: SpawnerPolicy::None,
                 ceiling: CeilingPolicy::Closed,
+                project_context: false,
             },
             EntryKind::McpServe | EntryKind::JobPrompt => EntryProfile {
                 permissions: PermissionSet::empty(),
@@ -191,6 +204,7 @@ impl EntryKind {
                 ask: AskResolution::BlockJob,
                 spawner: SpawnerPolicy::None,
                 ceiling: CeilingPolicy::Closed,
+                project_context: false,
             },
             EntryKind::JobPlanNode => EntryProfile {
                 permissions: PermissionSet::from_policy([ReadWorkspace, WriteWorkspace]),
@@ -199,6 +213,7 @@ impl EntryKind {
                 ask: AskResolution::Fail,
                 spawner: SpawnerPolicy::None,
                 ceiling: CeilingPolicy::LocalRoot,
+                project_context: true,
             },
             EntryKind::GatewayTelegram | EntryKind::GatewayDream => EntryProfile {
                 permissions: PermissionSet::empty(),
@@ -207,6 +222,7 @@ impl EntryKind {
                 ask: AskResolution::Fail,
                 spawner: SpawnerPolicy::None,
                 ceiling: CeilingPolicy::Closed,
+                project_context: false,
             },
         }
     }
@@ -263,7 +279,9 @@ pub struct RightsSnapshot {
     pub tools: Vec<String>,
     /// Approval-Kette in Auswertungsreihenfolge: `(label, kind)`.
     pub approval_chain: Vec<(&'static str, ApprovalHandlerKind)>,
-    /// Werkzeuge, die die Konfigurationspolitik ohne Rückfrage erlaubt.
+    /// Werkzeuge, für die die Konfigurationspolitik eine Freigabe verlangt
+    /// (`[policy].require_approval_for`, sortiert und dublettenfrei; siehe
+    /// [`crate::approval::ApprovalChain::config_policy_tools`]).
     pub config_policy_tools: Vec<String>,
     /// Aktive Abschnitte der Kontext-Decke.
     pub ceiling_sections: Vec<String>,
@@ -336,6 +354,7 @@ mod tests {
         AskResolution,
         SpawnerPolicy,
         CeilingPolicy,
+        bool,
     );
 
     #[test]
@@ -363,6 +382,7 @@ mod tests {
                 A::Interactive,
                 S::BuiltinRoles,
                 C::LocalRoot,
+                true,
             ),
             (
                 EntryKind::OneShot,
@@ -372,6 +392,7 @@ mod tests {
                 A::RejectTurn,
                 S::BuiltinRoles,
                 C::LocalRoot,
+                true,
             ),
             (
                 EntryKind::LocalEcho,
@@ -381,6 +402,7 @@ mod tests {
                 A::Fail,
                 S::None,
                 C::LocalRoot,
+                true,
             ),
             (
                 EntryKind::Analyze,
@@ -390,6 +412,7 @@ mod tests {
                 A::Fail,
                 S::BuiltinRoles,
                 C::LocalRoot,
+                true,
             ),
             (
                 EntryKind::Doctor,
@@ -399,6 +422,7 @@ mod tests {
                 A::Fail,
                 S::None,
                 C::LocalRoot,
+                true,
             ),
             (
                 EntryKind::Web,
@@ -408,6 +432,7 @@ mod tests {
                 A::Fail,
                 S::None,
                 C::Closed,
+                false,
             ),
             (
                 EntryKind::McpServe,
@@ -417,6 +442,7 @@ mod tests {
                 A::BlockJob,
                 S::None,
                 C::Closed,
+                false,
             ),
             (
                 EntryKind::JobPrompt,
@@ -426,6 +452,7 @@ mod tests {
                 A::BlockJob,
                 S::None,
                 C::Closed,
+                false,
             ),
             (
                 EntryKind::JobPlanNode,
@@ -435,6 +462,7 @@ mod tests {
                 A::Fail,
                 S::None,
                 C::LocalRoot,
+                true,
             ),
             (
                 EntryKind::GatewayTelegram,
@@ -444,6 +472,7 @@ mod tests {
                 A::Fail,
                 S::None,
                 C::Closed,
+                false,
             ),
             (
                 EntryKind::GatewayDream,
@@ -453,10 +482,11 @@ mod tests {
                 A::Fail,
                 S::None,
                 C::Closed,
+                false,
             ),
         ];
 
-        for (kind, perms, registry, ops, ask, spawner, ceiling) in expected {
+        for (kind, perms, registry, ops, ask, spawner, ceiling, project_context) in expected {
             let want = EntryProfile {
                 permissions: set(perms),
                 registry_profile: registry,
@@ -464,6 +494,7 @@ mod tests {
                 ask,
                 spawner,
                 ceiling,
+                project_context,
             };
             assert_eq!(kind.profile(), want, "{kind:?}");
         }
@@ -503,6 +534,28 @@ mod tests {
             assert_eq!(profile.operations, OperationSurface::None);
             assert_eq!(profile.spawner, SpawnerPolicy::None);
             assert_eq!(profile.ceiling, CeilingPolicy::Closed);
+        }
+    }
+
+    #[test]
+    fn test_profile_project_context_only_for_local_project_entries() {
+        let local = [
+            EntryKind::Tui,
+            EntryKind::OneShot,
+            EntryKind::LocalEcho,
+            EntryKind::Analyze,
+            EntryKind::Doctor,
+            EntryKind::JobPlanNode,
+        ];
+        for kind in ALL {
+            assert_eq!(kind.profile().project_context, local.contains(&kind), "{kind:?}");
+        }
+        // Jeder Einstieg mit geschlossener Decke bekommt keinen Projektkontext.
+        for kind in ALL {
+            let profile = kind.profile();
+            if profile.ceiling == CeilingPolicy::Closed {
+                assert!(!profile.project_context, "{kind:?}");
+            }
         }
     }
 

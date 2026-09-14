@@ -121,12 +121,19 @@ impl From<SensorHandle<Bound>> for ThermalSensor {
     ///
     /// # Examples
     /// ```rust
+    /// use harw_dod_cap::scope::AliasRoot;
     /// use harw_dod_cap::{Capability, ReadScope, SensorHandle};
     /// use harw_dod_thermal::ThermalSensor;
     /// use harw_types::SensorId;
     /// use std::path::PathBuf;
     ///
-    /// let scope = ReadScope::from_roots([PathBuf::from("/sys/class/thermal")]);
+    /// // sysfs-Klasseneinträge sind Symlinks nach `/sys/devices/...` (F-005) —
+    /// // `AliasRoot::sysfs_class` baut den einzigen Bereich, der solche Ziele
+    /// // zulässt, statt der veralteten, für sysfs-Klassenwurzeln unsicheren
+    /// // `ReadScope::from_roots`.
+    /// let alias = AliasRoot::sysfs_class(PathBuf::from("/sys/class/thermal"))
+    ///     .expect("gültige sysfs-Klassenwurzel");
+    /// let scope = ReadScope::from_roots_and_aliases(Vec::new(), [alias]);
     /// let handle = SensorHandle::new(SensorId::from_str("thermal-0"), Capability::ReadSysfsThermal)
     ///     .bind(scope);
     /// let _sensor = ThermalSensor::from(handle);
@@ -193,13 +200,16 @@ impl Sensor for ThermalSensor {
     ///
     /// # Examples
     /// ```rust,no_run
+    /// use harw_dod_cap::scope::AliasRoot;
     /// use harw_dod_cap::{Capability, ReadScope, SensorHandle};
     /// use harw_dod_signals::Sensor;
     /// use harw_dod_thermal::ThermalSensor;
     /// use harw_types::SensorId;
     /// use std::path::PathBuf;
     ///
-    /// let scope = ReadScope::from_roots([PathBuf::from("/sys/class/thermal")]);
+    /// let alias = AliasRoot::sysfs_class(PathBuf::from("/sys/class/thermal"))
+    ///     .expect("gültige sysfs-Klassenwurzel");
+    /// let scope = ReadScope::from_roots_and_aliases(Vec::new(), [alias]);
     /// let handle = SensorHandle::new(SensorId::from_str("thermal-0"), Capability::ReadSysfsThermal)
     ///     .bind(scope);
     /// let sensor = ThermalSensor::from(handle);
@@ -349,7 +359,13 @@ fn map_readfs_err(err: ReadFsError) -> SensorError {
         ReadFsError::Scope(inner) => inner,
         ReadFsError::TooLarge { .. }
         | ReadFsError::GlobPatternAbsolute { .. }
-        | ReadFsError::GlobPatternTraversal { .. } => SensorError::MalformedSource,
+        | ReadFsError::GlobPatternTraversal { .. }
+        // Eine überschrittene Glob-Grenze (`harw_dod_readfs::glob::MAX_GLOB_COMPONENTS`/
+        // `MAX_GLOB_CANDIDATES`) beschreibt, wie bei `TooLarge`, eine Quelle mit
+        // unerwarteter Form (ungewöhnlich tiefe/breite Zonenstruktur), nicht einen
+        // Fehler dieses Werkzeugs — dieselbe Abbildung wie die drei Geschwister
+        // oben (C-SCOPE-Nachfolge, F-005-Register).
+        | ReadFsError::GlobLimitExceeded { .. } => SensorError::MalformedSource,
     }
 }
 
@@ -445,6 +461,65 @@ mod tests {
         assert!(
             !rendered.contains("not-a-number"),
             "Fehlermeldung darf den gelesenen Inhalt nicht enthalten: {rendered}"
+        );
+    }
+
+    /// Der Ordner der echten Pi-Captures (`C-FIXT`, `harw-dod-fixtures`),
+    /// relativ zum eigenen Crate-Wurzelverzeichnis dieser Crate erreicht —
+    /// die Captures leben nicht in dieser Crate, sondern werden über den
+    /// Geschwister-Pfad `../harw-dod-fixtures/captures/rpi5-6.18` referenziert
+    /// (Workspace-Geschwisterlayout, wie `path = "../harw-dod-cap"` in
+    /// `Cargo.toml`).
+    fn rpi5_captures_dir() -> PathBuf {
+        PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../harw-dod-fixtures/captures/rpi5-6.18"
+        ))
+    }
+
+    /// Regressionstest für F-005/F-202 mit einer echten, auf diesem
+    /// Raspberry Pi 5 erhobenen Capture (`thermal.json`): `thermal_zone0`
+    /// erscheint dort als echter Symlink nach `/sys/devices/virtual/...`
+    /// (nicht als synthetisches Testverzeichnis). Vor C-SCOPE hätte
+    /// `ReadScope::from_roots` diesen Treffer verworfen
+    /// (`SensorError::SourceUnavailable`, das Kernproblem von F-005); mit
+    /// [`harw_dod_cap::scope::AliasRoot`] löst der Sensor die reale
+    /// Symlink-Kette auf und liest den echten erfassten Wert.
+    #[test]
+    fn test_poll_reads_real_pi_capture_through_alias_scope_regression_f005() {
+        let manifest_path = rpi5_captures_dir().join("thermal.json");
+        let manifest = harw_dod_fixtures::capture_manifest::load(&manifest_path)
+            .expect("captures/rpi5-6.18/thermal.json muss ladbar sein");
+
+        let tmp = tempfile::tempdir().expect("tempdir für die Materialisierung");
+        harw_dod_fixtures::capture_manifest::materialize(&manifest, tmp.path())
+            .expect("materialize muss die echte Symlink-Struktur anlegen");
+
+        // Dieselbe Beziehung wie in Produktion (`AliasRoot::sysfs_class`:
+        // declared = Klassenpfad, resolved_prefix = `/sys/devices`), nur mit
+        // einer Tempdir-Wurzel statt der realen `/`-Wurzel, damit der Test
+        // ohne echten sysfs-Zugriff läuft.
+        let declared = tmp.path().join("sys/class/thermal");
+        let resolved_prefix = tmp.path().join("sys/devices");
+        let alias = harw_dod_cap::scope::AliasRoot::new(declared, resolved_prefix)
+            .expect("AliasRoot::new mit Tempdir-Wurzeln");
+        let scope = ReadScope::from_roots_and_aliases(Vec::new(), [alias]);
+        let handle = SensorHandle::new(
+            SensorId::from_str("thermal-alias-capture-test"),
+            Capability::ReadSysfsThermal,
+        )
+        .bind(scope);
+        let sensor = ThermalSensor::from(handle);
+
+        let reading = sensor
+            .poll(Timestamp::UNIX_EPOCH)
+            .expect("Alias-Scope muss die reale Pi-Capture über den Symlink lesen");
+
+        assert_eq!(reading.samples.len(), 1);
+        assert!(
+            (reading.samples[0].value - 69.95).abs() < f64::EPSILON,
+            "69950 Millidegree aus der echten Capture müssen 69.95 °C ergeben, war {}",
+            reading.samples[0].value
         );
     }
 

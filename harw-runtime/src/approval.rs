@@ -39,6 +39,7 @@ use std::sync::Arc;
 
 use harw_config::ResolvedConfig;
 use harw_core::ConfigApprovalPolicy;
+use harw_extension_api::allow_rules::{AllowRuleSet, RuleDecision};
 use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
 use harw_extension_api::contributors::ApprovalHandlerKind;
 use harw_extension_api::{
@@ -105,6 +106,10 @@ pub struct AskResolutionPolicy {
     mode: ApprovalModeCell,
     /// Dieselbe Config-Politik, die in der Kette steht; `None` bei leerer Liste.
     config: Option<Arc<ConfigApprovalPolicy>>,
+    /// Dieselbe [`AllowRuleSet`], die auch die [`DefaultApprovalPolicy`] dieser
+    /// Kette befragt (Contract §2/§4) — ohne sie würde die Vorhersage eine
+    /// Allow-Regel als Rückfrage missdeuten und eine Deny-Regel übersehen.
+    rules: AllowRuleSet,
 }
 
 impl std::fmt::Debug for AskResolutionPolicy {
@@ -128,6 +133,7 @@ impl AskResolutionPolicy {
         resolution: AskResolution,
         mode: ApprovalModeCell,
         config: Option<Arc<ConfigApprovalPolicy>>,
+        rules: AllowRuleSet,
     ) -> Option<Self> {
         match resolution {
             AskResolution::Interactive => None,
@@ -136,6 +142,7 @@ impl AskResolutionPolicy {
                     resolution,
                     mode,
                     config,
+                    rules,
                 })
             }
         }
@@ -165,6 +172,15 @@ impl AskResolutionPolicy {
     }
 
     /// Ob die übrige Kette dieses Laufs für `call` `AskUser` liefern würde.
+    ///
+    /// # Beschreibung
+    /// Rechnet seit Contract §2/§4 dieselbe Reihenfolge nach, die
+    /// [`DefaultApprovalPolicy::review`] tatsächlich anwendet: eine passende
+    /// `Deny`-Regel würde dort **immer** `AskUser` liefern (fail-closed), eine
+    /// passende `Allow`-Regel **immer** `Allow` — beides unabhängig vom Modus.
+    /// Ohne diesen Abgleich würde die Vorhersage eine Allow-Regel als
+    /// Rückfrage missdeuten (und einen an sich freigegebenen Aufruf hier
+    /// fälschlich ablehnen) oder eine Deny-Regel übersehen.
     fn would_ask(&self, call: &ToolCall) -> bool {
         if self
             .config
@@ -172,6 +188,11 @@ impl AskResolutionPolicy {
             .is_some_and(|policy| policy.requires_approval(call))
         {
             return true;
+        }
+        match self.rules.evaluate(call.name.as_str(), &call.arguments) {
+            Some(RuleDecision::Deny) => return true,
+            Some(RuleDecision::Allow) => return false,
+            None => {}
         }
         match self.mode.get() {
             ApprovalMode::AlwaysAsk => true,
@@ -266,6 +287,10 @@ pub struct ApprovalChain {
     /// Der Freigabemodus dieses Laufs. Geteilt mit [`Self::default`], damit
     /// eine Umschaltung sofort wirkt.
     mode: ApprovalModeCell,
+    /// Die geteilten Freigaberegeln dieses Laufs (Contract §2/§4). Geteilt
+    /// mit [`Self::default`] (der [`DefaultApprovalPolicy`], die sie befragt)
+    /// und mit [`Self::ask`] (dessen Vorhersage dieselbe Regelmenge braucht).
+    rules: AllowRuleSet,
 }
 
 impl std::fmt::Debug for ApprovalChain {
@@ -304,6 +329,11 @@ impl ApprovalChain {
     ///   (`/permissions set`), mit dem sich der Modus umstellen lässt.
     /// - `responder` (`Option<Arc<dyn ApprovalHandler>>`): der interaktive
     ///   Handler des Einstiegs, oder `None`.
+    /// - `rules` ([`AllowRuleSet`]): die geteilten Freigaberegeln dieses
+    ///   Laufs (Contract §2/§4, Plan Schritt 4), etwa aus globaler und
+    ///   Projekt-Konfiguration gesät. Eigentum geht über; ein Klon beim
+    ///   Aufrufer bleibt der Schalter, mit dem `/permissions` neue Regeln
+    ///   anlegt.
     ///
     /// # Rückgabe
     /// Die Kette in der Reihenfolge Config → Default → Ask-Auflösung →
@@ -314,6 +344,7 @@ impl ApprovalChain {
         ask: AskResolution,
         mode: ApprovalModeCell,
         responder: Option<Arc<dyn ApprovalHandler>>,
+        rules: AllowRuleSet,
     ) -> Self {
         let section = &config.harness.policy;
         let mut config_tools: Vec<String> = section.require_approval_for.clone();
@@ -327,12 +358,14 @@ impl ApprovalChain {
         };
 
         Self {
-            ask: AskResolutionPolicy::new(ask, mode.clone(), config_policy.clone()).map(Arc::new),
+            ask: AskResolutionPolicy::new(ask, mode.clone(), config_policy.clone(), rules.clone())
+                .map(Arc::new),
             config: config_policy,
             config_tools,
-            default: Arc::new(DefaultApprovalPolicy::new(mode.clone())),
+            default: Arc::new(DefaultApprovalPolicy::with_rules(mode.clone(), rules.clone())),
             responder,
             mode,
+            rules,
         }
     }
 
@@ -354,6 +387,14 @@ impl ApprovalChain {
     ///   erhalten: eine Absenkung auf `Delegated` wäre eine Lockerung.
     /// - Es gibt **keinen Responder**. Ein Kind und ein Job-Worker fragen
     ///   niemanden; sie haben keine Oberfläche, an der eine Antwort ankäme.
+    /// - Die **Freigaberegeln werden unverändert weitergereicht** (dieselbe
+    ///   [`AllowRuleSet`], kein `detached()`) — nach derselben Begründung wie
+    ///   die Config-Politik: eine Regel kann einem Kind nie **mehr** erlauben,
+    ///   als seine eigene Werkzeugfläche (Registry-Profil, Sandbox-Rechte)
+    ///   ohnehin zulässt (`a_child_never_inherits_full_access` gilt sinngemäß
+    ///   auch hier — nur die *Rückfrage* für einen bereits erlaubten Aufruf
+    ///   entfällt, keine neue Fähigkeit entsteht). Eine `Deny`-Regel wirkt im
+    ///   Kind genauso einschränkend wie in der Wurzel.
     ///
     /// # Wie `AskUser` im Kind endet
     /// Die Kette entscheidet das nicht. Ein [`ApprovalDecision::AskUser`]
@@ -386,15 +427,32 @@ impl ApprovalChain {
                         ask.resolution(),
                         child_mode.clone(),
                         self.config.clone(),
+                        self.rules.clone(),
                     )
                 })
                 .map(Arc::new),
             config: self.config.clone(),
             config_tools: self.config_tools.clone(),
-            default: Arc::new(DefaultApprovalPolicy::new(child_mode.clone())),
+            default: Arc::new(DefaultApprovalPolicy::with_rules(
+                child_mode.clone(),
+                self.rules.clone(),
+            )),
             responder: None,
             mode: child_mode,
+            rules: self.rules.clone(),
         }
+    }
+
+    /// Die geteilten Freigaberegeln dieser Kette.
+    ///
+    /// # Rückgabe
+    /// Ein Klon der [`AllowRuleSet`]; da sie ihren Zustand über einen
+    /// `Arc<RwLock<_>>` teilt, wirkt eine über diesen Klon hinzugefügte Regel
+    /// sofort auf die bereits montierte [`DefaultApprovalPolicy`] dieser
+    /// Kette — genau wie [`Self::mode`] für den Freigabemodus.
+    #[must_use]
+    pub fn rules(&self) -> &AllowRuleSet {
+        &self.rules
     }
 
     /// Die Handler dieser Kette in Auswertungsreihenfolge.
@@ -579,6 +637,7 @@ impl ApprovalChain {
 mod tests {
     use super::*;
     use harw_config::ResolvedConfig;
+    use harw_extension_api::allow_rules::{ApprovalRule, RuleScope};
     use harw_extension_api::{ApprovalDecision, ExtFuture, ToolCall, ToolName};
     use std::task::{Context, Poll, Waker};
 
@@ -643,6 +702,7 @@ mod tests {
             AskResolution::Interactive,
             ApprovalModeCell::new(mode),
             None,
+            AllowRuleSet::new(),
         )
     }
 
@@ -709,6 +769,7 @@ mod tests {
             AskResolution::Interactive,
             ApprovalModeCell::new(ApprovalMode::Delegated),
             Some(Arc::new(TestResponder)),
+            AllowRuleSet::new(),
         );
 
         assert_eq!(
@@ -730,6 +791,7 @@ mod tests {
             AskResolution::Interactive,
             ApprovalModeCell::new(ApprovalMode::FullAccess),
             Some(Arc::new(TestResponder)),
+            AllowRuleSet::new(),
         );
         let child = root.for_child();
 
@@ -791,6 +853,7 @@ mod tests {
             AskResolution::Interactive,
             ApprovalModeCell::new(ApprovalMode::Delegated),
             Some(Arc::new(TestResponder)),
+            AllowRuleSet::new(),
         );
         let child = root.for_child();
 
@@ -813,6 +876,7 @@ mod tests {
             AskResolution::Interactive,
             ApprovalModeCell::new(ApprovalMode::Delegated),
             Some(Arc::new(TestResponder)),
+            AllowRuleSet::new(),
         );
 
         let registry = chain.install(ExtensionRegistryBuilder::default()).build();
@@ -865,6 +929,7 @@ mod tests {
             AskResolution::Interactive,
             cell.clone(),
             None,
+            AllowRuleSet::new(),
         );
         let registry = chain.install(ExtensionRegistryBuilder::default()).build();
         let handler = Arc::clone(&registry.approval_handlers()[0]);
@@ -900,6 +965,7 @@ mod tests {
                 resolution,
                 ApprovalModeCell::new(ApprovalMode::Delegated),
                 None,
+                AllowRuleSet::new(),
             );
             assert_eq!(chain.ask_resolution(), Some(resolution));
             assert_eq!(
@@ -934,6 +1000,7 @@ mod tests {
             AskResolution::Fail,
             ApprovalModeCell::new(ApprovalMode::Delegated),
             None,
+            AllowRuleSet::new(),
         );
         let handlers = chain.handlers();
         let ask = &handlers[1];
@@ -964,6 +1031,7 @@ mod tests {
             AskResolution::BlockJob,
             ApprovalModeCell::new(ApprovalMode::FullAccess),
             None,
+            AllowRuleSet::new(),
         );
         assert!(matches!(
             block_on(chain.handlers()[1].review(&call("shell.exec"))),
@@ -981,6 +1049,7 @@ mod tests {
             AskResolution::RejectTurn,
             ApprovalModeCell::new(ApprovalMode::FullAccess),
             None,
+            AllowRuleSet::new(),
         );
         // Reihenfolge: Config, Default, Ask.
         assert!(matches!(
@@ -997,6 +1066,7 @@ mod tests {
             AskResolution::Fail,
             ApprovalModeCell::new(ApprovalMode::FullAccess),
             None,
+            AllowRuleSet::new(),
         );
         let child = root.for_child();
 
@@ -1023,6 +1093,7 @@ mod tests {
             AskResolution::Fail,
             cell.clone(),
             None,
+            AllowRuleSet::new(),
         );
         // Die Gestalt, die `assemble_registry_for_project` liefert: genau eine
         // `DefaultApprovalPolicy` über derselben Zelle.
@@ -1049,6 +1120,154 @@ mod tests {
         assert!(matches!(
             block_on(registry.approval_handlers()[0].review(&call("shell.exec"))),
             ApprovalDecision::AskUser(_)
+        ));
+    }
+
+    // ── Contract §2/§4: Freigaberegeln in der Kette ──────────────────────────
+
+    fn shell_call(command: &str) -> ToolCall {
+        let mut call = call("shell.exec");
+        call.arguments = serde_json::json!({ "command": command });
+        call
+    }
+
+    /// Eine passende Erlauben-Regel überspringt die Rückfrage der
+    /// Standardpolitik, ohne dass die Kette einen zweiten Handler bräuchte.
+    #[test]
+    fn review_allow_rule_bypasses_default_policys_ask() {
+        let rules = AllowRuleSet::new();
+        rules.add(ApprovalRule {
+            tool: "shell.exec".to_owned(),
+            pattern: Some("git status".to_owned()),
+            decision: RuleDecision::Allow,
+            scope: RuleScope::Project,
+        });
+        let chain = ApprovalChain::for_root(
+            &config_with(&[]),
+            AskResolution::Interactive,
+            ApprovalModeCell::new(ApprovalMode::Delegated),
+            None,
+            rules,
+        );
+
+        assert!(matches!(
+            block_on(chain.handlers()[0].review(&shell_call("git status --short"))),
+            ApprovalDecision::Allow
+        ));
+    }
+
+    /// Contract §2: Deny gewinnt über eine passende Allow-Regel und über den
+    /// Modus `full` — beides würde ohne die Deny-Regel automatisch freigeben.
+    #[test]
+    fn review_deny_rule_beats_allow_rule_and_full_access_mode() {
+        let rules = AllowRuleSet::new();
+        rules.add(ApprovalRule {
+            tool: "shell.exec".to_owned(),
+            pattern: Some("git push".to_owned()),
+            decision: RuleDecision::Allow,
+            scope: RuleScope::Global,
+        });
+        rules.add(ApprovalRule {
+            tool: "shell.exec".to_owned(),
+            pattern: Some("git push".to_owned()),
+            decision: RuleDecision::Deny,
+            scope: RuleScope::Session,
+        });
+        let chain = ApprovalChain::for_root(
+            &config_with(&[]),
+            AskResolution::Interactive,
+            ApprovalModeCell::new(ApprovalMode::FullAccess),
+            None,
+            rules,
+        );
+
+        assert!(matches!(
+            block_on(chain.handlers()[0].review(&shell_call("git push origin main"))),
+            ApprovalDecision::AskUser(_)
+        ));
+    }
+
+    /// Ein Kind teilt exakt die Regelmenge der Wurzel (kein `detached()`):
+    /// eine über die Wurzel hinzugefügte Regel wirkt sofort auch im Kind.
+    #[test]
+    fn a_child_shares_exactly_the_parents_rule_set() {
+        let root = ApprovalChain::for_root(
+            &config_with(&[]),
+            AskResolution::Interactive,
+            ApprovalModeCell::new(ApprovalMode::Delegated),
+            None,
+            AllowRuleSet::new(),
+        );
+        let child = root.for_child();
+
+        root.rules().add(ApprovalRule {
+            tool: "shell.exec".to_owned(),
+            pattern: Some("git status".to_owned()),
+            decision: RuleDecision::Allow,
+            scope: RuleScope::Session,
+        });
+
+        assert!(
+            matches!(
+                block_on(child.handlers()[0].review(&shell_call("git status"))),
+                ApprovalDecision::Allow
+            ),
+            "das Kind muss dieselbe (geteilte) Regelmenge sehen wie die Wurzel"
+        );
+        assert_eq!(child.rules().snapshot(), root.rules().snapshot());
+    }
+
+    /// Ein Kind bekommt eine Deny-Regel der Wurzel niemals „geschenkt" weg —
+    /// sie wirkt dort genauso einschränkend wie in der Wurzel selbst, auch
+    /// unter `FullAccess` (analog zu `a_child_never_inherits_full_access`).
+    #[test]
+    fn a_child_never_loses_a_deny_rule_of_the_parent() {
+        let rules = AllowRuleSet::new();
+        rules.add(ApprovalRule {
+            tool: "fs.write".to_owned(),
+            pattern: None,
+            decision: RuleDecision::Deny,
+            scope: RuleScope::Global,
+        });
+        let root = ApprovalChain::for_root(
+            &config_with(&[]),
+            AskResolution::Interactive,
+            ApprovalModeCell::new(ApprovalMode::FullAccess),
+            None,
+            rules,
+        );
+        let child = root.for_child();
+
+        assert!(matches!(
+            block_on(child.handlers()[0].review(&call("fs.write"))),
+            ApprovalDecision::AskUser(_)
+        ));
+    }
+
+    /// Die Ask-Vorhersage (`AskResolutionPolicy::would_ask`) muss dieselbe
+    /// Regelmenge lesen wie die Standardpolitik — sonst würde ein nicht
+    /// interaktiver Einstieg eine per Regel freigegebene Anfrage fälschlich
+    /// ablehnen (kein Responder kann sie sonst je beantworten).
+    #[test]
+    fn ask_resolution_prediction_honors_an_allow_rule() {
+        let rules = AllowRuleSet::new();
+        rules.add(ApprovalRule {
+            tool: "shell.exec".to_owned(),
+            pattern: Some("git status".to_owned()),
+            decision: RuleDecision::Allow,
+            scope: RuleScope::Project,
+        });
+        let chain = ApprovalChain::for_root(
+            &config_with(&[]),
+            AskResolution::Fail,
+            ApprovalModeCell::new(ApprovalMode::Delegated),
+            None,
+            rules,
+        );
+        // Reihenfolge ohne Config-Politik: Default, Ask.
+        assert!(matches!(
+            block_on(chain.handlers()[1].review(&shell_call("git status --short"))),
+            ApprovalDecision::Allow
         ));
     }
 }

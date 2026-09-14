@@ -5,27 +5,29 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# W5 N-WEB: HTTP-Client und Egress-Policy ausschließlich aus harw-egress
+# (Scoped-Resolver, Adressklassen, keine Auto-Redirects, kein Proxy).
+harw-egress = { path = "../harw-egress" }
+# Symlinkfestes Lesen/Schreiben des Antwort-Caches (0600, Eigentümerprüfung).
+harw-fsutil = { path = "../harw-fsutil" }
 harw-extension-api = { path = "../harw-extension-api" }
 harw-macros = { path = "../harw-macros" }
 harw-sandbox = { path = "../harw-sandbox" }
 harw-tools = { path = "../harw-tools" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Übernommen aus harw-core/Cargo.toml (identische Zeile) — eine zweite
-# reqwest-Konfiguration im Workspace würde die Feature-Vereinigung aufweichen.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-# Feature-Satz wie harw-core; `time` trägt die Gesamt-Deadline in `fetch.rs`.
-tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
-# Version wie harw-secrets/harw-catalog (0.10.x ist im Workspace dominant).
-sha2 = "0.10.9"
+# Cache-Schlüssel und Scope-Digest (Cargo.lock: blake3 1.8.7).
+blake3 = { workspace = true }
+# Identischer Feature-Satz wie harw-egress/harw-core (Cargo.lock: reqwest 0.12.28);
+# eine abweichende Konfiguration ergäbe einen inkompatiblen `Client`-Typ.
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+# `rt`: `spawn_blocking` für Parsen und Cache-I/O; `time`: Gesamt-Deadline.
+tokio = { version = "1", features = ["rt", "time"] }
 tracing = "0.1.44"
-# `scraper` und `htmd` sind neu für den Workspace: weder in Cargo.lock noch im
-# Registry-Cache auflösbar. Die Versionszeilen sind Platzhalter, bis die
-# Hauptsitzung `cargo add scraper` / `cargo add htmd` ausführt. Danach die API
-# von `htmd::convert` gegen docs.rs prüfen — einziger Berührungspunkt ist
-# `crate::fetch::html_to_markdown`.
-scraper = "0.23"  # TODO(cargo add): Version nicht aus Cargo.lock belegbar
-htmd = "0.2"  # TODO(cargo add): Version nicht aus Cargo.lock belegbar
+# Versionen aus Cargo.lock (scraper 0.23.1, htmd 0.2.2); einzige Berührungspunkte
+# sind `crate::html` und `crate::docs_rs::extract_main_content`.
+scraper = "0.23.1"
+htmd = "0.2.2"
 
 [dev-dependencies]
 tempfile = "3"

@@ -84,7 +84,7 @@ pub use crate::error::{PlanError, PlanResult, PlanToolConfigError};
 pub use crate::file_store::FilePlanStore;
 pub use crate::ids::{ContractRef, PathOrSymbol, PlanId, RevisionId, TaskId};
 pub use crate::memory_store::InMemoryPlanStore;
-pub use crate::store::PlanStore;
+pub use crate::store::{PlanRevision, PlanStore};
 pub use crate::types::{
     Assignment, Criterion, EvidenceKind, EvidenceRef, InvalidationCondition, Plan, PlanNode,
     PlanNodeKind, PlanNodeStatus, VerificationStep,

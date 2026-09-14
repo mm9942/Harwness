@@ -142,7 +142,10 @@ use crate::authz::PeerAuthorizer;
 use crate::error::WebError;
 use crate::events::{WebEventBus, WebEventKind, WebEventReceiveError};
 use crate::peer::{PeerCredentials, read_peer_credentials};
-use crate::router::{ForbiddenReason, RouteDecision, WebMethod, WebRouteTable, decide_route};
+use crate::router::{
+    ForbiddenReason, RouteDecision, WebMethod, WebRouteTable, decide_route, method_name,
+    parse_web_method,
+};
 
 /// Obergrenze eines HTTP-Rumpfs (Anfrage-JSON für eine `Surface::Web`-Route).
 const MAX_BODY_BYTES: usize = 64 * 1024;
@@ -521,11 +524,9 @@ async fn handle(
         return Ok(handle_events(&request, &peer, authorizer.as_ref(), &events));
     }
 
-    let method = match *request.method() {
-        Method::GET => Some(WebMethod::Get),
-        Method::POST => Some(WebMethod::Post),
-        _ => None,
-    };
+    // Nur exakt GET/POST; HEAD/OPTIONS/… werden nie implizit auf eine
+    // deklarierte Methode abgebildet und enden in 405 (F-031).
+    let method = parse_web_method(request.method().as_str());
     let path = request.uri().path().to_owned();
     let decision = decide_route(&routes, authorizer.as_ref(), &peer, &path, method);
 
@@ -672,6 +673,11 @@ fn sse_response(events: Arc<WebEventBus>) -> WebResponse {
 /// - `Ok(value)`: dekodierte JSON-Argumente.
 /// - `Err(response)`: eine fertige Fehlerantwort (400/408/413), die `handle`
 ///   unverändert zurückgibt.
+// Der Fehlerfall trägt bewusst eine fertige `WebResponse` (rund 128 Bytes),
+// die `handle` unverändert zurückgibt — das ist der Sinn dieser Funktion. Sie
+// lebt genau einen Request lang auf dem Stack; ein `Box` würde nur jede
+// Aufrufstelle verumständlichen.
+#[allow(clippy::result_large_err)]
 async fn read_json_body(
     request: Request<Incoming>,
     max_bytes: usize,
@@ -727,19 +733,24 @@ async fn read_json_body(
 /// # Description
 /// Reicht `OpOutput::text` unverändert als JSON-Zeichenkette weiter — kein
 /// Markdown-Rendering, keine aktiven Links (das ist UI-01s Sache, siehe
-/// crate-Moduldoku). Trägt zusätzlich `trust`: `OpOutput` liefert keine
+/// crate-Moduldoku). Trägt `OpOutput::data` eine strukturierte Nutzlast, wird
+/// sie additiv als Feld `data` ausgeliefert; ohne Nutzlast bleibt das
+/// Antwortobjekt unverändert `{"text", "trust"}` (F-222). Trägt zusätzlich `trust`: `OpOutput` liefert keine
 /// `TrustClass` (siehe `crate::events`-Moduldoku), daher immer
 /// [`harw_context::TrustClass::Data`] — die niedrigste Klasse, nie eine
 /// erfundene.
 fn op_result_response(result: Result<harw_operations::operation::OpOutput, OpError>) -> WebResponse {
     match result {
-        Ok(output) => json_response(
-            StatusCode::OK,
-            &serde_json::json!({
+        Ok(output) => {
+            let mut body = serde_json::json!({
                 "text": output.text,
                 "trust": harw_context::TrustClass::Data,
-            }),
-        ),
+            });
+            if let (Some(data), Some(object)) = (output.data, body.as_object_mut()) {
+                object.insert("data".to_owned(), data);
+            }
+            json_response(StatusCode::OK, &body)
+        }
         Err(error) => {
             let status = status_for_op_error(&error);
             json_response(status, &serde_json::json!({"error": error.to_string()}))
@@ -765,14 +776,17 @@ fn forbidden_reason_str(reason: ForbiddenReason) -> &'static str {
 }
 
 /// Baut eine `405 Method Not Allowed`-Antwort mit `Allow`-Header.
+///
+/// `Allow` nennt genau die deklarierte Methode der Route (RFC 9110 §15.5.6).
 fn method_not_allowed_response(expected: WebMethod) -> WebResponse {
+    let name = method_name(expected);
     let mut response = json_response(
         StatusCode::METHOD_NOT_ALLOWED,
-        &serde_json::json!({"error": "method_not_allowed", "expected": expected.as_str()}),
+        &serde_json::json!({"error": "method_not_allowed", "expected": name}),
     );
-    if let Ok(value) = HeaderValue::from_str(expected.as_str()) {
-        response.headers_mut().insert(hyper::header::ALLOW, value);
-    }
+    response
+        .headers_mut()
+        .insert(hyper::header::ALLOW, HeaderValue::from_static(name));
     response
 }
 
@@ -797,7 +811,7 @@ mod tests {
         ACCEPT_BACKOFF_BASE, ACCEPT_BACKOFF_MAX, BoundWebServer, HEADER_READ_TIMEOUT, MAX_BODY_BYTES,
         WebContextFactory, WebServerConfig, accept_backoff, bind_unix_listener, forbidden_reason_str,
         http_connection_builder, is_fatal_accept_error, json_response, method_not_allowed_response,
-        read_json_body, status_for_op_error,
+        op_result_response, read_json_body, status_for_op_error,
     };
     use crate::authz::StaticUidTierMap;
     use crate::error::WebError;
@@ -958,6 +972,49 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("application/json")
         );
+    }
+
+    #[test]
+    fn test_method_not_allowed_response_allow_header_names_post() {
+        let response = method_not_allowed_response(WebMethod::Post);
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response
+                .headers()
+                .get(hyper::header::ALLOW)
+                .and_then(|v| v.to_str().ok()),
+            Some("POST")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_op_result_response_without_data_keeps_text_trust_shape() {
+        use http_body_util::BodyExt;
+        let output = harw_operations::operation::OpOutput { text: "hallo".to_owned(), data: None };
+        let response = op_result_response(Ok(output));
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let object = body.as_object().unwrap();
+        assert_eq!(object.get("text"), Some(&serde_json::json!("hallo")));
+        assert!(object.contains_key("trust"));
+        assert!(!object.contains_key("data"), "ohne Nutzlast kein data-Feld: {body}");
+    }
+
+    #[tokio::test]
+    async fn test_op_result_response_with_data_adds_data_field() {
+        use http_body_util::BodyExt;
+        let output = harw_operations::operation::OpOutput {
+            text: "2 Einträge".to_owned(),
+            data: Some(serde_json::json!({"items": [1, 2]})),
+        };
+        let response = op_result_response(Ok(output));
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["text"], serde_json::json!("2 Einträge"));
+        assert_eq!(body["data"], serde_json::json!({"items": [1, 2]}));
+        assert!(body.get("trust").is_some());
     }
 
     #[test]

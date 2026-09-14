@@ -8,9 +8,10 @@
 //! Bundles the extension crates (fs, shell, deps, web, instructions,
 //! project-discovery) into a single `ExtensionRegistry`, plus discovers the
 //! current project context so the model knows where it is. Behind the
-//! optional `browser` Cargo feature it additionally registers the Harwness
+//! optional `browser` Cargo feature it additionally offers the Harwness
 //! browser tool surface (`harw-tool-browser` over a `harw-browser-thirtyfour`
-//! `FirefoxHost`).
+//! `FirefoxHost`) — only through `profile::browser_tool_provider` with an
+//! explicit `BrowserOpenGrant`, never as part of a profile (W5 RD).
 //!
 //! Welche dieser Provider tatsächlich registriert werden, entscheidet das
 //! [`profile::RegistryProfile`]: `Full` ist der bisherige Coding-Satz,
@@ -26,16 +27,23 @@
 //! - [`profile::assemble_registry_for_project`]: builds any profile über einem
 //!   **bereits** erkannten Projektkontext — der Weg, auf dem eine Sitzung ihre
 //!   Kind-Registries montiert, ohne die Projekterkennung je Kind zu wiederholen.
+//! - [`profile::assemble_registry_for_sandbox`]: wie oben, registriert aber nur
+//!   Werkzeuge, deren Recht der gewährte `PermissionSet` trägt (W5 RD).
+//! - [`authority`]: Werkzeug→Recht, Rollen-Reducer (`reduce_to_read_only`,
+//!   `reduce_to_read_registry`, `reduce_to_read_network`).
+//! - [`research_web`]: Egress-Policy der Rolle `researcher-web` aus
+//!   `[network].researcher_web_hosts`.
 //! - [`embedded_agents`]: die eingebauten Agentendefinitionen als TOML und IR.
 //!
 //! # Feature `browser`
 //! Disabled by default so the standard binary stays lean. When enabled,
-//! [`assemble_default_registry`] constructs a `FirefoxHost` and registers
-//! `HarwnessBrowserToolProvider`. `FirefoxHost::new` never starts Firefox or
-//! geckodriver at construction time, so enabling this feature cannot break
-//! default startup even without a running WebDriver; a missing driver only
-//! surfaces as a normal tool execution error the first time a `browser.*`
-//! tool actually dispatches.
+//! `profile::browser_tool_provider(grant)` constructs a `FirefoxHost` and a
+//! `HarwnessBrowserToolProvider` whose `browser.open` authority is exactly the
+//! given grant. No profile — including [`assemble_default_registry`] — registers
+//! browser tools on its own (F-073: previously `Full` did, without any grant).
+//! `FirefoxHost::new` never starts Firefox or geckodriver at construction time;
+//! a missing driver only surfaces as a normal tool execution error the first
+//! time a `browser.*` tool actually dispatches.
 //!
 //! # Concurrency
 //! `assemble_default_registry` is synchronous; all produced providers are
@@ -45,11 +53,14 @@
 
 mod error;
 
+pub mod authority;
 pub mod embedded_agents;
 pub mod profile;
+pub mod research_web;
 
 use std::path::PathBuf;
 
+use harw_extension_api::allow_rules::{AllowRuleSet, RuleDecision};
 use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_extension_api::{
     ApprovalDecision, ApprovalHandler, ApprovalMode, ExtFuture, ExtensionRegistry, ToolCall,
@@ -58,10 +69,12 @@ use harw_instructions::AgentIdentity;
 use harw_project_discovery::ProjectContext;
 
 pub use error::{RegistryDefaultsError, RegistryDefaultsResult};
+pub use authority::{AuthorityReducer, authority_reducer_for_role, tool_permission};
 pub use profile::{
     IdentityOverrides, RegistryProfile, RestrictedToolProvider, assemble_registry,
-    assemble_registry_for_project, profile_for_role, role_names,
+    assemble_registry_for_project, assemble_registry_for_sandbox, profile_for_role, role_names,
 };
+pub use research_web::{researcher_web_network_scope, researcher_web_policy};
 
 /// Die Werkzeuge, die ohne Nutzerrückfrage ausgeführt werden dürfen.
 ///
@@ -122,7 +135,9 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // Agenten. Die Sichtbarkeitsgrenze zieht `ReadScope`, nicht die
     // Genehmigung — der Aufrufer kann seinen Bereich nicht selbst wählen.
     "lens.ask",
-    // Web-Recherche (`harw-tool-web`) — die Netzgrenze zieht die Sandbox-Allowlist.
+    // Web-Recherche (`harw-tool-web`) — nur im Profil `Research` (Rolle
+    // `researcher-web`, ohne `fs.*`/`deps.*`); die Netzgrenze zieht die
+    // `EgressPolicy` aus `[network].researcher_web_hosts` (W5 RD).
     "web.fetch",
     "web.docs_rs",
     "web.crates_io",
@@ -158,15 +173,35 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
 /// den Modus mit wem teilt — ein Klon teilt ihn, [`ApprovalModeCell::detached`]
 /// löst ihn. Die Zelle wird bei **jedem** [`ApprovalHandler::review`] frisch
 /// gelesen, damit eine Umschaltung sofort und nicht erst im nächsten Turn wirkt.
+///
+/// # Freigaberegeln (`AllowRuleSet`)
+/// Vor der Modus-Logik befragt [`Self::review`] die geteilte
+/// [`AllowRuleSet`] dieser Politik (Contract §2/§4, Plan Schritt 4):
+/// - `Some(`[`RuleDecision::Deny`]`)`: dieselbe „immer fragen“-Auskunft, die
+///   die Politik auch für nicht in [`AUTO_APPROVED_TOOLS`] gelistete Aufrufe
+///   liefert ([`ApprovalDecision::AskUser`]) — fail-closed, **niemals**
+///   automatisch freigegeben, unabhängig vom Modus (auch nicht bei
+///   [`ApprovalMode::FullAccess`]).
+/// - `Some(`[`RuleDecision::Allow`]`)`: freigegeben, ohne dass die
+///   Modus-Logik überhaupt befragt wird.
+/// - `None`: keine Regel passt, die bisherige Modus-Logik entscheidet
+///   unverändert.
+///
+/// Ohne ausdrücklich übergebene Regelmenge ([`Self::new`]) trägt die Politik
+/// eine leere [`AllowRuleSet`] — bestehende Aufrufer ändern ihr Verhalten
+/// damit nicht.
 #[derive(Debug)]
 pub struct DefaultApprovalPolicy {
     /// Der Freigabemodus dieser Politik; geteilt mit jedem Klon der Zelle.
     mode: ApprovalModeCell,
+    /// Geteilte Freigaberegeln (`/permissions` „nicht mehr fragen“, Contract
+    /// §2/§4); leer, wenn [`Self::new`] ohne eigene Regelmenge gebaut wurde.
+    rules: AllowRuleSet,
 }
 
 impl Default for DefaultApprovalPolicy {
     /// Erzeugt eine Politik mit einer **eigenen**, nicht geteilten Zelle auf
-    /// [`ApprovalMode::Delegated`].
+    /// [`ApprovalMode::Delegated`] und einer leeren [`AllowRuleSet`].
     ///
     /// # Beschreibung
     /// Das ist kein stiller Rückfall auf mehr Rechte: `Delegated` ist die
@@ -181,7 +216,8 @@ impl Default for DefaultApprovalPolicy {
 }
 
 impl DefaultApprovalPolicy {
-    /// Erzeugt die Politik über der Freigabemodus-Zelle `mode`.
+    /// Erzeugt die Politik über der Freigabemodus-Zelle `mode`, mit einer
+    /// **leeren** [`AllowRuleSet`].
     ///
     /// # Arguments
     /// - `mode` ([`ApprovalModeCell`]): die Zelle, aus der jeder
@@ -191,10 +227,27 @@ impl DefaultApprovalPolicy {
     ///
     /// # Returns
     /// Die Politik; sie hält nur einen Zeiger auf die Zelle, keine Kopie des
-    /// Modus.
+    /// Modus. Bestehende Aufrufer, die keine Regeln kennen, bleiben
+    /// unverändert: eine leere [`AllowRuleSet`] liefert für jeden Aufruf
+    /// `None` aus [`AllowRuleSet::evaluate`].
     #[must_use]
     pub fn new(mode: ApprovalModeCell) -> Self {
-        Self { mode }
+        Self::with_rules(mode, AllowRuleSet::new())
+    }
+
+    /// Erzeugt die Politik über Freigabemodus **und** Freigaberegeln.
+    ///
+    /// # Arguments
+    /// - `mode` ([`ApprovalModeCell`]): siehe [`Self::new`].
+    /// - `rules` ([`AllowRuleSet`]): geteilte Regelmenge; ein Klon beim
+    ///   Aufrufer (etwa `harw-runtime`, das sie zusätzlich in die
+    ///   `ServiceMap` legt) bleibt der Schalter für `/permissions`.
+    ///
+    /// # Returns
+    /// Die Politik; hält nur Zeiger auf beide geteilten Zellen.
+    #[must_use]
+    pub fn with_rules(mode: ApprovalModeCell, rules: AllowRuleSet) -> Self {
+        Self { mode, rules }
     }
 
     /// Returns whether `call` must be explicitly approved before dispatch.
@@ -204,6 +257,11 @@ impl DefaultApprovalPolicy {
     ///
     /// # Returns
     /// `false`, wenn der Name in [`AUTO_APPROVED_TOOLS`] steht, sonst `true`.
+    ///
+    /// # Beschreibung
+    /// Reines Modus-Prädikat, unabhängig von einer [`AllowRuleSet`] — passend
+    /// zu seinen Aufrufern (`ApprovalChain`s Rückfrage-Vorhersage), die selbst
+    /// keine Regelmenge kennen und darum nur die Modus-Logik nachrechnen.
     #[must_use]
     pub fn requires_explicit_approval(call: &ToolCall) -> bool {
         !AUTO_APPROVED_TOOLS.contains(&call.name.as_str())
@@ -211,29 +269,40 @@ impl DefaultApprovalPolicy {
 }
 
 impl ApprovalHandler for DefaultApprovalPolicy {
-    /// Entscheidet anhand des Freigabemodus in der eigenen
-    /// [`ApprovalModeCell`].
+    /// Entscheidet zuerst anhand der [`AllowRuleSet`], dann anhand des
+    /// Freigabemodus in der eigenen [`ApprovalModeCell`].
     ///
     /// # Description
-    /// - [`ApprovalMode::AlwaysAsk`]: jeder Aufruf wird bestätigt, auch ein
-    ///   lesender.
-    /// - [`ApprovalMode::Delegated`]: die Voreinstellung — [`AUTO_APPROVED_TOOLS`]
-    ///   läuft durch, alles andere fragt.
-    /// - [`ApprovalMode::FullAccess`]: nichts fragt.
+    /// 1. [`AllowRuleSet::evaluate`] auf `call.name`/`call.arguments`:
+    ///    - `Some(`[`RuleDecision::Deny`]`)` → [`ApprovalDecision::AskUser`],
+    ///      unabhängig vom Modus (fail-closed, nie automatisch freigegeben).
+    ///    - `Some(`[`RuleDecision::Allow`]`)` → [`ApprovalDecision::Allow`],
+    ///      ohne die Modus-Logik zu befragen.
+    ///    - `None` → weiter mit Schritt 2.
+    /// 2. Modus-Logik (unverändert):
+    ///    - [`ApprovalMode::AlwaysAsk`]: jeder Aufruf wird bestätigt, auch ein
+    ///      lesender.
+    ///    - [`ApprovalMode::Delegated`]: die Voreinstellung —
+    ///      [`AUTO_APPROVED_TOOLS`] läuft durch, alles andere fragt.
+    ///    - [`ApprovalMode::FullAccess`]: nichts fragt.
     ///
-    /// Der Modus wird bei **jedem** Aufruf frisch gelesen, damit eine
+    /// Regeln und Modus werden bei **jedem** Aufruf frisch gelesen, damit eine
     /// Umschaltung sofort greift und nicht erst im nächsten Turn.
     fn review<'a>(&'a self, call: &'a ToolCall) -> ExtFuture<'a, ApprovalDecision> {
+        let rule_decision = self.rules.evaluate(call.name.as_str(), &call.arguments);
         let requires_approval = match self.mode.get() {
             ApprovalMode::AlwaysAsk => true,
             ApprovalMode::Delegated => Self::requires_explicit_approval(call),
             ApprovalMode::FullAccess => false,
         };
         Box::pin(async move {
-            if requires_approval {
-                ApprovalDecision::AskUser(Default::default())
-            } else {
-                ApprovalDecision::Allow
+            match rule_decision {
+                // Fail-closed: eine Deny-Regel darf niemals automatisch
+                // freigegeben werden, auch nicht unter `FullAccess`.
+                Some(RuleDecision::Deny) => ApprovalDecision::AskUser(Default::default()),
+                Some(RuleDecision::Allow) => ApprovalDecision::Allow,
+                None if requires_approval => ApprovalDecision::AskUser(Default::default()),
+                None => ApprovalDecision::Allow,
             }
         })
     }
@@ -265,8 +334,8 @@ pub struct AssembledRegistry {
 /// `Ok(AssembledRegistry)` mit dem vollen Coding-Werkzeugsatz.
 ///
 /// # Errors
-/// Returns a typed error when project discovery fails, or — under the
-/// `browser` feature — when the Firefox host configuration is invalid.
+/// Returns a typed error when project discovery fails. Browser tools are not
+/// part of this set, with or without the `browser` feature (W5 RD).
 ///
 /// # Examples
 /// ```rust,no_run
@@ -320,9 +389,8 @@ mod tests {
         let cwd = std::env::current_dir().expect("cwd");
         let ar = assemble_default_registry(cwd).expect("assemble");
 
-        // `mut` wird nur unter Feature "browser" gebraucht (siehe `extend` unten).
-        #[cfg_attr(not(feature = "browser"), allow(unused_mut))]
-        let mut expected_tools = vec![
+        // Ohne Browser — auch unter Feature `browser` (W5 RD: nur mit Grant).
+        let expected_tools = vec![
             "fs.read".to_owned(),
             "fs.write".to_owned(),
             "fs.list".to_owned(),
@@ -331,16 +399,6 @@ mod tests {
             "fs.grep".to_owned(),
             "shell.exec".to_owned(),
         ];
-        #[cfg(feature = "browser")]
-        expected_tools.extend([
-            "browser.open".to_owned(),
-            "browser.observe".to_owned(),
-            "browser.find".to_owned(),
-            "browser.act".to_owned(),
-            "browser.wait".to_owned(),
-            "browser.events".to_owned(),
-            "browser.close".to_owned(),
-        ]);
 
         let advertised_tools = registered_names(&ar);
         assert_eq!(advertised_tools, expected_tools);
@@ -626,6 +684,84 @@ mod tests {
             ),
             "ein `set` auf der übergebenen Zelle muss die montierte Registry erreichen"
         );
+    }
+
+    /// Eine passende `Allow`-Regel gibt frei, ohne dass die Modus-Logik
+    /// überhaupt gefragt würde — selbst wenn der Modus `AlwaysAsk` wäre.
+    #[test]
+    fn review_allows_a_call_matching_an_allow_rule_without_asking() {
+        use harw_extension_api::allow_rules::{ApprovalRule, RuleDecision, RuleScope};
+
+        let rules = AllowRuleSet::new();
+        rules.add(ApprovalRule {
+            tool: "shell.exec".to_owned(),
+            pattern: Some("git status".to_owned()),
+            decision: RuleDecision::Allow,
+            scope: RuleScope::Project,
+        });
+        let policy = DefaultApprovalPolicy::with_rules(
+            ApprovalModeCell::new(ApprovalMode::AlwaysAsk),
+            rules,
+        );
+
+        let mut call = call("shell.exec");
+        call.arguments = serde_json::json!({"command": "git status --short"});
+
+        assert!(matches!(
+            block_on(policy.review(&call)),
+            ApprovalDecision::Allow
+        ));
+    }
+
+    /// Eine `Deny`-Regel gewinnt über eine passende `Allow`-Regel und über
+    /// den Modus `FullAccess` — beides würde ohne Regel automatisch
+    /// freigeben.
+    #[test]
+    fn review_deny_rule_beats_allow_rule_and_full_access_mode() {
+        use harw_extension_api::allow_rules::{ApprovalRule, RuleDecision, RuleScope};
+
+        let rules = AllowRuleSet::new();
+        rules.add(ApprovalRule {
+            tool: "shell.exec".to_owned(),
+            pattern: Some("git push".to_owned()),
+            decision: RuleDecision::Allow,
+            scope: RuleScope::Global,
+        });
+        rules.add(ApprovalRule {
+            tool: "shell.exec".to_owned(),
+            pattern: Some("git push".to_owned()),
+            decision: RuleDecision::Deny,
+            scope: RuleScope::Session,
+        });
+        let policy = DefaultApprovalPolicy::with_rules(
+            ApprovalModeCell::new(ApprovalMode::FullAccess),
+            rules,
+        );
+
+        let mut call = call("shell.exec");
+        call.arguments = serde_json::json!({"command": "git push origin main"});
+
+        assert!(matches!(
+            block_on(policy.review(&call)),
+            ApprovalDecision::AskUser(_)
+        ));
+    }
+
+    /// Ohne passende Regel bleibt die bisherige Modus-Logik unverändert in
+    /// Kraft — `AllowRuleSet::new()` (leer) ändert nichts am Verhalten von
+    /// [`DefaultApprovalPolicy::new`].
+    #[test]
+    fn review_without_a_matching_rule_falls_back_to_mode_logic() {
+        let policy = DefaultApprovalPolicy::new(ApprovalModeCell::new(ApprovalMode::Delegated));
+
+        assert!(matches!(
+            block_on(policy.review(&call("fs.read"))),
+            ApprovalDecision::Allow
+        ));
+        assert!(matches!(
+            block_on(policy.review(&call("shell.exec"))),
+            ApprovalDecision::AskUser(_)
+        ));
     }
 
     #[test]

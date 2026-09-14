@@ -89,7 +89,8 @@
 //!     metric: Metric::Cosine,
 //!     source_set_digest: ContentDigest::of(b"sources"),
 //! };
-//! let index = FlatIndex::build(manifest, vec![(chunk, embedding)]);
+//! let index = FlatIndex::build(manifest, vec![(chunk, embedding)])
+//!     .expect("consistent embedding dimension");
 //!
 //! // Die Provenienz sagt, womit *diese Abfrage* eingebettet wurde. Sie wird
 //! // bewusst nicht aus `index.manifest()` abgeleitet — sonst vergliche die

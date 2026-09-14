@@ -7,114 +7,129 @@
 //! Netzwerkschnittstellen.
 //!
 //! # Verantwortungsbereich
-//! Besitzt [`glob`] und den privaten Wildcard-Matcher `component_matches`.
-//! Prüft Musterhygiene (kein absolutes Muster, kein `..`) **vor** jedem
-//! Dateisystemzugriff und jeden Treffer **nach** dem Auflisten erneut gegen
-//! [`harw_dod_cap::ReadScope::allows`].
+//! Besitzt [`glob`], die Grenzen [`MAX_GLOB_COMPONENTS`] und
+//! [`MAX_GLOB_CANDIDATES`] und den privaten Wildcard-Matcher
+//! `component_matches`. Prüft Musterhygiene (kein absolutes Muster, kein
+//! `..`, Tiefengrenze) **vor** jedem Dateisystemzugriff, beschneidet die
+//! Suche unterwegs auf Namen, die zu einer Bereichswurzel passen, und prüft
+//! jeden Treffer abschließend über [`harw_dod_cap::ReadScope::resolve`] —
+//! dieselbe Prüfung, die auch [`harw_dod_cap::ReadScope::open`] nutzt,
+//! inklusive der Alias-Wurzeln für sysfs-Klassenverzeichnisse (Befund F-005).
 //!
 //! # Warum das Muster relativ ist, aber ab `/` durchsucht wird
-//! [`harw_dod_cap::ReadScope`] legt seine Wurzeln nicht offen (keine
-//! `roots()`-artige Methode in seinem Vertrag) — [`glob`] kann sie also
-//! nicht kennen und nicht als Startpunkt verwenden. Die Suche beginnt daher
-//! immer bei `/`; „relativ zum Bereich" bezieht sich auf die **Syntax** des
-//! Musters, nicht auf einen zweiten, versteckten Startpunkt: ein Muster darf
-//! sich nie selbst als absolut ausweisen (kein führendes `/`) und nie ein
-//! `..`-Segment enthalten. Die eigentliche Bereichsgrenze wird ausschließlich
-//! durch die abschließende, verbindliche `scope.allows`-Prüfung auf jedem
-//! Treffer durchgesetzt (siehe unten) — die Syntaxprüfung ist zusätzliche
-//! Absicherung, kein Ersatz dafür.
+//! Sensoren bauen das Muster aus `scope.roots().next()` plus einem Suffix;
+//! „relativ“ bezieht sich auf die **Syntax** des Musters: es darf sich nie
+//! selbst als absolut ausweisen (kein führendes `/`) und nie ein
+//! `..`-Segment enthalten. Die Suche beginnt bei `/`, verfolgt aber nur
+//! Kandidaten, die lexikalisch Vorfahr einer Anfragewurzel sind oder unter
+//! einer liegen (komponentenweise, `Path::starts_with`). Verzeichnisse
+//! unterhalb einer Wurzel werden erst gelistet, nachdem sie selbst
+//! [`harw_dod_cap::ReadScope::resolve`] bestanden haben — eine Suche folgt
+//! also keinem Symlink nach außerhalb und listet dort nichts.
 //!
 //! # Warum keine `glob`-Abhängigkeit
-//! Der Workspace verlangt Zurückhaltung bei neuen Abhängigkeiten und genau
-//! eine Fassung je geteilter Abhängigkeit. Diese Crate braucht nur Abgleich
-//! von `*` und `?` **auf einer einzelnen Pfadkomponente** — kein `**`, keine
-//! Zeichenklassen, keine Ausschlussmuster. `harw-context/src/selector.rs`
-//! (`segment_matches`) und `harw-plan/src/admission.rs` (`glob_matches`)
-//! lösen im Workspace bereits genau dieses Teilproblem, mit demselben
-//! klassischen Zwei-Zeiger-Algorithmus (`*`-Anker merken, bei Fehlschlag
-//! zurückspringen). `component_matches` unten ist eine eigenständige Kopie
-//! dieses ~25-Zeilen-Musters — eine neue Abhängigkeit dafür wäre nicht zu
-//! rechtfertigen, und ein Re-Export aus `harw-context` würde eine
-//! Abhängigkeit auf eine Crate ziehen, die mit Sensor-Lesezugriff nichts zu
-//! tun hat.
+//! Diese Crate braucht nur Abgleich von `*` und `?` **auf einer einzelnen
+//! Pfadkomponente** — kein `**`, keine Zeichenklassen.
+//! `harw-context/src/selector.rs` (`segment_matches`) und
+//! `harw-plan/src/admission.rs` (`glob_matches`) lösen im Workspace bereits
+//! genau dieses Teilproblem mit demselben Zwei-Zeiger-Algorithmus;
+//! `component_matches` unten ist eine eigenständige Kopie dieses
+//! ~25-Zeilen-Musters.
 //!
 //! # Bewusste Ausnahme von „kein direkter `std::fs`-Zugriff"
-//! `ReadScope` bietet kein Auflisten von Verzeichnisinhalten — nur `open`
-//! und `allows`. Ein Glob **muss** aber Verzeichnisse auflisten können, um
-//! `*`/`?` gegen tatsächliche Dateinamen abzugleichen. [`glob`] ruft dafür
-//! ausdrücklich `std::fs::read_dir` auf Zwischen- und Zielverzeichnissen auf
-//! — die einzige Stelle in dieser Crate, die das tut. Jeder auf diesem Weg
-//! gefundene Pfad wird vor der Rückgabe zusätzlich über
-//! `std::fs::canonicalize` aufgelöst (löst Symlinks auf) und mit dem
-//! aufgelösten Ziel gegen [`harw_dod_cap::ReadScope::allows`] geprüft; ein
-//! Treffer, dessen aufgelöstes Ziel außerhalb des Bereichs liegt — etwa weil
-//! eine Zwischenkomponente ein Symlink nach außerhalb ist — erscheint
-//! **nicht** im Ergebnis.
+//! `ReadScope` bietet kein Auflisten von Verzeichnisinhalten. [`glob`] ruft
+//! dafür ausdrücklich `std::fs::read_dir` auf — die einzige Stelle in dieser
+//! Crate, die das tut — und nur auf Verzeichnissen, die entweder
+//! lexikalische Vorfahren einer Wurzel sind oder `resolve` bestanden haben.
+//!
+//! # Grenzen
+//! [`MAX_GLOB_COMPONENTS`] begrenzt die Musterlänge, [`MAX_GLOB_CANDIDATES`]
+//! die Zahl gleichzeitig verfolgter Kandidaten je Schritt. Beides verhindert,
+//! dass ein Sensor über eine sysfs-Schleife (z. B. `…/subsystem/…`) oder ein
+//! riesiges Verzeichnis unbegrenzt Arbeit erzeugt.
 //!
 //! # Exportierte Typen
-//! Die freie Funktion [`glob`].
+//! Die freie Funktion [`glob`] und die Konstanten [`MAX_GLOB_COMPONENTS`],
+//! [`MAX_GLOB_CANDIDATES`].
 //!
 //! # Nebenläufigkeit
 //! Zustandslos; `Send + Sync`, von jedem Thread parallel aufrufbar. Jeder
 //! Aufruf öffnet und schließt seine eigenen Verzeichnis-Handles.
 //!
 //! # Fehler
-//! [`crate::error::ReadFsError::GlobPatternAbsolute`] und
+//! [`crate::error::ReadFsError::GlobPatternAbsolute`],
 //! [`crate::error::ReadFsError::GlobPatternTraversal`] für ein ungültiges
-//! Muster. Ein Verzeichnis, das während der Suche nicht gelesen werden kann
-//! (fehlt, keine Berechtigung), liefert an dieser Stelle einfach keine
-//! Treffer — das ist kein Fehler des Glob-Aufrufs insgesamt.
+//! Muster und [`crate::error::ReadFsError::GlobLimitExceeded`] bei
+//! überschrittener Grenze. Ein Verzeichnis, das während der Suche nicht
+//! gelesen werden kann, liefert an dieser Stelle einfach keine Treffer.
 //!
 //! # Examples
 //! ```rust,no_run
-//! use harw_dod_cap::ReadScope;
-//! use std::path::Path;
+//! use harw_dod_cap::scope::{AliasRoot, ReadScope};
+//! use std::path::PathBuf;
 //!
-//! let scope = ReadScope::from_roots([Path::new("/sys/class/thermal").to_path_buf()]);
+//! let thermal = AliasRoot::sysfs_class(PathBuf::from("/sys/class/thermal"))
+//!     .map_err(|_| harw_dod_cap::SensorError::ToolFault)?;
+//! let scope = ReadScope::from_roots_and_aliases(Vec::<PathBuf>::new(), [thermal]);
 //! let zones = harw_dod_readfs::glob::glob(&scope, "sys/class/thermal/thermal_zone*/temp")?;
 //! # Ok::<(), harw_dod_readfs::ReadFsError>(())
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use harw_dod_cap::ReadScope;
 
 use crate::error::{ReadFsError, ReadFsResult};
 
+/// Höchstzahl nicht-leerer Komponenten eines Glob-Musters: **32**.
+///
+/// # Begründung
+/// Die tiefsten Produktionsmuster (`sys/class/drm/card*/device/hwmon/hwmon*/temp1_input`)
+/// haben 7 Komponenten, Fixture-Muster unter einem Checkout-Pfad rund 15.
+/// 32 lässt großzügig Luft und begrenzt trotzdem sysfs-Schleifen.
+pub const MAX_GLOB_COMPONENTS: usize = 32;
+
+/// Höchstzahl gleichzeitig verfolgter Kandidaten je Suchschritt: **4096**.
+///
+/// # Begründung
+/// `/sys/block` hat auf dem RPi 5 rund 30 Einträge, `/sys/class/drm` 8; ein
+/// Server mit vielen Blockgeräten oder Schnittstellen bleibt im niedrigen
+/// dreistelligen Bereich. Mehr als 4096 Treffer deuten auf ein falsch
+/// gewähltes Muster oder einen ungeeigneten Baum hin.
+pub const MAX_GLOB_CANDIDATES: usize = 4096;
+
 /// Findet Pfade, die auf `pattern` passen und im Bereich `scope` liegen.
 ///
 /// # Description
 /// `pattern` wird an `/` in Komponenten zerlegt. Eine Komponente ohne `*`
-/// oder `?` wird als Literal an den bisherigen Kandidatenpfad angehängt;
-/// eine Komponente mit `*`/`?` listet das jeweilige Verzeichnis auf
-/// (`std::fs::read_dir`, siehe Modul-Dokumentation) und behält nur
-/// Einträge, deren Name `component_matches` erfüllt. Zwischenkomponenten
-/// müssen zu einem Verzeichnis führen, um weiterverfolgt zu werden. Nach dem
-/// Aufbau aller Kandidatenpfade wird jeder über `std::fs::canonicalize`
-/// aufgelöst und mit [`ReadScope::allows`] geprüft; nur zulässige, aufgelöst
-/// im Bereich liegende Treffer bleiben im Ergebnis. Ein Kandidat, der sich
-/// nicht auflösen lässt (kaputter Symlink, ein während der Suche
-/// verschwundener Eintrag), wird stillschweigend ausgelassen statt die
-/// gesamte Suche scheitern zu lassen.
+/// oder `?` wird als Literal angehängt; eine Komponente mit `*`/`?` listet
+/// das jeweilige Verzeichnis auf und behält Einträge, deren Name
+/// `component_matches` erfüllt. Nach jedem Schritt bleiben nur Kandidaten,
+/// die lexikalisch Vorfahr einer Anfragewurzel sind oder darunter liegen;
+/// Zwischenkomponenten müssen zu einem Verzeichnis führen. Ein Verzeichnis
+/// unterhalb einer Wurzel wird nur gelistet, wenn es
+/// [`ReadScope::resolve`] besteht. Abschließend bleibt jeder Kandidat nur,
+/// wenn [`ReadScope::resolve`] ihn zulässt (einfache Wurzel oder Alias-Regeln);
+/// ein Kandidat, der sich nicht auflösen lässt, wird ausgelassen.
 ///
 /// # Arguments
-/// - `scope` (`&ReadScope`): der Lesebereich, gegen den jeder Treffer geprüft
-///   wird.
+/// - `scope` (`&ReadScope`): der Lesebereich.
 /// - `pattern` (`&str`): `/`-getrenntes, bereichsrelatives Muster mit `*`
-///   (beliebig viele Zeichen) und `?` (genau ein Zeichen) je
-///   Pfadkomponente. Darf nicht mit `/` beginnen und keine `..`-Komponente
-///   enthalten.
+///   und `?` je Pfadkomponente. Darf nicht mit `/` beginnen, keine
+///   `..`-Komponente enthalten und höchstens [`MAX_GLOB_COMPONENTS`]
+///   Komponenten haben.
 ///
 /// # Returns
-/// Die passenden, im Bereich liegenden Pfade, **sortiert**.
-/// Verzeichnisreihenfolge ist dateisystemabhängig; ein Sensor, der sich
-/// darauf verließe, wäre nicht deterministisch — und Determinismus ist die
-/// erste der sechs Fixture-Prüfungen.
+/// Die passenden, zugelassenen Pfade **so wie angefragt** (nicht kanonisch —
+/// z. B. `/sys/class/thermal/thermal_zone0`, nicht das `/sys/devices`-Ziel),
+/// **sortiert**.
 ///
 /// # Errors
 /// - [`ReadFsError::GlobPatternAbsolute`]: `pattern` beginnt mit `/`.
-/// - [`ReadFsError::GlobPatternTraversal`]: `pattern` enthält eine
-///   `..`-Komponente.
+/// - [`ReadFsError::GlobPatternTraversal`]: `pattern` enthält `..`.
+/// - [`ReadFsError::GlobLimitExceeded`]: mehr als [`MAX_GLOB_COMPONENTS`]
+///   Komponenten oder mehr als [`MAX_GLOB_CANDIDATES`] Kandidaten in einem
+///   Schritt.
 ///
 /// # Concurrency
 /// Zustandslos; von jedem Thread parallel aufrufbar.
@@ -124,9 +139,9 @@ use crate::error::{ReadFsError, ReadFsResult};
 /// use harw_dod_cap::ReadScope;
 /// use std::path::Path;
 ///
-/// let scope = ReadScope::from_roots([Path::new("/sys/class/thermal").to_path_buf()]);
-/// let zones = harw_dod_readfs::glob::glob(&scope, "sys/class/thermal/thermal_zone*/temp")?;
-/// assert!(zones.iter().all(|p| p.ends_with("temp")));
+/// let scope = ReadScope::from_roots([Path::new("/proc").to_path_buf()]);
+/// let stats = harw_dod_readfs::glob::glob(&scope, "proc/*/stat")?;
+/// assert!(stats.iter().all(|p| p.ends_with("stat")));
 /// # Ok::<(), harw_dod_readfs::ReadFsError>(())
 /// ```
 pub fn glob(scope: &ReadScope, pattern: &str) -> ReadFsResult<Vec<PathBuf>> {
@@ -145,6 +160,13 @@ pub fn glob(scope: &ReadScope, pattern: &str) -> ReadFsResult<Vec<PathBuf>> {
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect();
+    if components.len() > MAX_GLOB_COMPONENTS {
+        return Err(ReadFsError::GlobLimitExceeded {
+            pattern: pattern.to_owned(),
+            limit_name: "components",
+            limit: MAX_GLOB_COMPONENTS,
+        });
+    }
     let last_index = components.len().saturating_sub(1);
 
     let mut candidates: Vec<PathBuf> = vec![PathBuf::from("/")];
@@ -155,50 +177,81 @@ pub fn glob(scope: &ReadScope, pattern: &str) -> ReadFsResult<Vec<PathBuf>> {
 
         for dir in &candidates {
             if has_wildcard {
+                if !may_list(scope, dir) {
+                    continue;
+                }
                 // Bewusste, dokumentierte Ausnahme von „kein direkter
                 // std::fs-Zugriff": `ReadScope` bietet kein Auflisten.
-                // Jeder so gefundene Pfad wird unten vor der Rückgabe
-                // erneut — aufgelöst — gegen `scope.allows` geprüft.
                 let Ok(entries) = std::fs::read_dir(dir) else {
                     continue;
                 };
                 for entry in entries.flatten() {
                     let name = entry.file_name();
+                    // Nicht-UTF-8-Namen können kein `&str`-Muster erfüllen.
                     let Some(name) = name.to_str() else {
                         continue;
                     };
                     if component_matches(component, name) {
-                        next.push(entry.path());
+                        push_related(scope, &mut next, entry.path(), pattern)?;
                     }
                 }
             } else {
-                next.push(dir.join(component));
+                push_related(scope, &mut next, dir.join(component), pattern)?;
             }
         }
 
         if index != last_index {
-            // Zwischenkomponenten müssen zu einem Verzeichnis führen, um
-            // weiterverfolgt zu werden. `is_dir` folgt Symlinks — das ist
-            // hier erwünscht, die Sicherheitsprüfung erfolgt separat unten
-            // über den aufgelösten Pfad.
+            // `is_dir` folgt Symlinks; ob das Ziel erlaubt ist, prüft
+            // `may_list` vor dem Auflisten bzw. `resolve` am Ende.
             next.retain(|path| path.is_dir());
         }
 
         candidates = next;
     }
 
-    let mut results = Vec::new();
-    for candidate in candidates {
-        let Ok(canonical) = std::fs::canonicalize(&candidate) else {
-            continue;
-        };
-        if scope.allows(&canonical) {
-            results.push(candidate);
-        }
-    }
-
+    let mut results: Vec<PathBuf> = candidates
+        .into_iter()
+        .filter(|candidate| scope.resolve(candidate).is_ok())
+        .collect();
     results.sort();
     Ok(results)
+}
+
+// Hängt `path` an `next`, wenn der Name lexikalisch zu einer Anfragewurzel
+// passt (Vorfahr oder darunter); scheitert, sobald `MAX_GLOB_CANDIDATES`
+// überschritten würde.
+fn push_related(
+    scope: &ReadScope,
+    next: &mut Vec<PathBuf>,
+    path: PathBuf,
+    pattern: &str,
+) -> ReadFsResult<()> {
+    let related = scope
+        .roots()
+        .any(|root| root.starts_with(&path) || path.starts_with(root));
+    if !related {
+        return Ok(());
+    }
+    if next.len() >= MAX_GLOB_CANDIDATES {
+        return Err(ReadFsError::GlobLimitExceeded {
+            pattern: pattern.to_owned(),
+            limit_name: "candidates",
+            limit: MAX_GLOB_CANDIDATES,
+        });
+    }
+    next.push(path);
+    Ok(())
+}
+
+// Ein Verzeichnis darf gelistet werden, wenn es ein echter lexikalischer
+// Vorfahr einer Anfragewurzel ist (nötig, um die Wurzel zu erreichen; die
+// Einträge werden sofort per `push_related` beschnitten) oder wenn es selbst
+// `ReadScope::resolve` besteht (kein Listen hinter einem Symlink nach außen).
+fn may_list(scope: &ReadScope, dir: &Path) -> bool {
+    let strict_ancestor = scope
+        .roots()
+        .any(|root| root != dir && root.starts_with(dir));
+    strict_ancestor || scope.resolve(dir).is_ok()
 }
 
 /// Klassischer Wildcard-Abgleich auf einer einzelnen Pfadkomponente: `*`
@@ -247,6 +300,8 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use harw_dod_cap::ReadScope;
+    #[cfg(unix)]
+    use harw_dod_cap::scope::AliasRoot;
     use tempfile::tempdir;
 
     use super::*;
@@ -299,6 +354,37 @@ mod tests {
         assert!(matches!(err, ReadFsError::GlobPatternTraversal { .. }));
     }
 
+    #[test]
+    fn test_glob_rejects_pattern_over_component_limit() {
+        let dir = tempdir().expect("tempdir");
+        let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
+        let pattern = vec!["a"; MAX_GLOB_COMPONENTS + 1].join("/");
+
+        let err = glob(&scope, &pattern).expect_err("zu tiefes Muster muss scheitern");
+        assert!(matches!(
+            err,
+            ReadFsError::GlobLimitExceeded { limit_name: "components", limit, .. }
+                if limit == MAX_GLOB_COMPONENTS
+        ));
+    }
+
+    #[test]
+    fn test_glob_rejects_more_candidates_than_limit() {
+        let dir = tempdir().expect("tempdir");
+        for i in 0..=MAX_GLOB_CANDIDATES {
+            fs::write(dir.path().join(format!("f{i}")), "").expect("write");
+        }
+        let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
+        let pattern = pattern_for(dir.path(), "f*");
+
+        let err = glob(&scope, &pattern).expect_err("zu viele Kandidaten müssen scheitern");
+        assert!(matches!(
+            err,
+            ReadFsError::GlobLimitExceeded { limit_name: "candidates", limit, .. }
+                if limit == MAX_GLOB_CANDIDATES
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_glob_excludes_symlink_pointing_outside_scope() {
@@ -331,5 +417,111 @@ mod tests {
 
         let results = glob(&scope, &pattern).expect("glob muss gelingen");
         assert_eq!(results, vec![dir.path().join("link").join("value.txt")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_glob_prunes_sibling_names_outside_root() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path().join("a");
+        fs::create_dir(&root).expect("create_dir");
+        fs::write(root.join("x.txt"), "1").expect("write");
+        // `b` zeigt kanonisch in die Wurzel, liegt aber namentlich daneben.
+        symlink(&root, dir.path().join("b")).expect("symlink");
+
+        let scope = ReadScope::from_roots([root.clone()]);
+        let pattern = pattern_for(dir.path(), "*/x.txt");
+
+        let results = glob(&scope, &pattern).expect("glob muss gelingen");
+        assert_eq!(results, vec![root.join("x.txt")]);
+    }
+
+    /// Nachgebauter sysfs-Baum mit echten Symlinks (class -> devices),
+    /// strukturgleich zu `/sys/class/thermal` auf dem RPi 5.
+    #[cfg(unix)]
+    fn fake_sysfs(base: &std::path::Path) {
+        let zones = base.join("sys/devices/virtual/thermal");
+        for zone in ["thermal_zone0", "thermal_zone1"] {
+            fs::create_dir_all(zones.join(zone)).expect("create zone");
+            fs::write(zones.join(zone).join("temp"), "42000\n").expect("write temp");
+        }
+        let class = base.join("sys/class/thermal");
+        fs::create_dir_all(&class).expect("create class");
+        symlink(
+            "../../devices/virtual/thermal/thermal_zone0",
+            class.join("thermal_zone0"),
+        )
+        .expect("symlink zone0");
+        symlink(
+            "../../devices/virtual/thermal/thermal_zone1",
+            class.join("thermal_zone1"),
+        )
+        .expect("symlink zone1");
+        fs::create_dir_all(base.join("outside")).expect("create outside");
+        fs::write(base.join("outside/temp"), "1\n").expect("write outside");
+    }
+
+    #[cfg(unix)]
+    fn thermal_alias_scope(base: &std::path::Path) -> ReadScope {
+        let alias = AliasRoot::new(base.join("sys/class/thermal"), base.join("sys/devices"))
+            .expect("valid alias root");
+        ReadScope::from_roots_and_aliases(Vec::<PathBuf>::new(), [alias])
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_glob_alias_root_finds_class_symlinks_regression_f005() {
+        let dir = tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonical tempdir");
+        fake_sysfs(&base);
+        let class = base.join("sys/class/thermal");
+
+        let plain = ReadScope::from_roots([class.clone()]);
+        let pattern = pattern_for(&class, "thermal_zone*/temp");
+        assert!(
+            glob(&plain, &pattern).expect("glob muss gelingen").is_empty(),
+            "ohne Alias-Wurzel bleibt sysfs unsichtbar (Befund F-005)"
+        );
+
+        let results = glob(&thermal_alias_scope(&base), &pattern).expect("glob muss gelingen");
+        assert_eq!(
+            results,
+            vec![
+                class.join("thermal_zone0/temp"),
+                class.join("thermal_zone1/temp"),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_glob_alias_root_excludes_entry_pointing_outside() {
+        let dir = tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonical tempdir");
+        fake_sysfs(&base);
+        let class = base.join("sys/class/thermal");
+        symlink("../../../outside", class.join("thermal_zone9")).expect("evil symlink");
+
+        let pattern = pattern_for(&class, "thermal_zone*/temp");
+        let results = glob(&thermal_alias_scope(&base), &pattern).expect("glob muss gelingen");
+        assert!(!results.contains(&class.join("thermal_zone9/temp")));
+        assert_eq!(results.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_glob_alias_root_excludes_double_symlink() {
+        let dir = tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonical tempdir");
+        fake_sysfs(&base);
+        let class = base.join("sys/class/thermal");
+        symlink("virtual/thermal/thermal_zone0", base.join("sys/devices/hop"))
+            .expect("second-level symlink");
+        symlink("../../devices/hop", class.join("thermal_zone5")).expect("first-level symlink");
+
+        let pattern = pattern_for(&class, "thermal_zone*/temp");
+        let results = glob(&thermal_alias_scope(&base), &pattern).expect("glob muss gelingen");
+        assert!(!results.contains(&class.join("thermal_zone5/temp")));
+        assert_eq!(results.len(), 2);
     }
 }

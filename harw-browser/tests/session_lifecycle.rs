@@ -28,7 +28,9 @@ use harw_browser::observation::{
 use harw_browser::page_bridge::{
     PageBridgeInstallRequest, PageBridgeInstallationId, PageBridgeInstallationReceipt,
 };
-use harw_browser::policy::{BiDiRequirement, OpenBrowserRequest, OriginPolicy, ProfilePolicy};
+use harw_browser::policy::{
+    BiDiRequirement, BrowserLimits, OpenBrowserRequest, OriginPolicy, ProfilePolicy,
+};
 use harw_browser::selector::{Selector, Target};
 use harw_browser::session::BrowserSessionHandle;
 use harw_browser::wait::{WaitCondition, WaitOutcome, WaitTimeout};
@@ -170,7 +172,8 @@ impl BrowserRuntime for MockRuntime {
 fn test_full_session_lifecycle_round_trips_across_modules() {
     // 1. Build an open request gated by an origin policy, and confirm the
     //    policy allows the intended start URL before "opening" the session.
-    let allowed_origins = OriginPolicy::new(vec!["erp.example.com".to_owned()], true);
+    let allowed_origins = OriginPolicy::from_origins(["https://erp.example.com"], true)
+        .expect("valid allowed-origins policy");
     let open_request = OpenBrowserRequest {
         start_url: url::Url::parse("https://erp.example.com/login").expect("valid url"),
         headless: true,
@@ -179,7 +182,9 @@ fn test_full_session_lifecycle_round_trips_across_modules() {
         },
         bidi: BiDiRequirement::Required,
         allowed_origins,
+        authentication_origins: OriginPolicy::default(),
         viewport: None,
+        limits: BrowserLimits::default(),
     };
     assert!(
         open_request

@@ -39,7 +39,8 @@ use crate::admission::ScopeMatcher;
 use crate::config::PlanToolConfig;
 use crate::error::{PlanError, PlanResult};
 use crate::ids::{PathOrSymbol, TaskId};
-use crate::types::{EvidenceKind, Plan, PlanNode, PlanNodeKind, PlanNodeStatus};
+use crate::types::{Plan, PlanNode, PlanNodeKind, PlanNodeStatus};
+use crate::validate::{EXPLORATION_KINDS, is_fresh_finding};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Interne Hilfsfunktionen
@@ -90,27 +91,31 @@ fn union(parent: &mut [usize], a: usize, b: usize) {
     }
 }
 
-/// Prüft, ob ein Knoten eine abgeschlossene Explore-Dependency besitzt.
-fn has_completed_explore_dependency(plan: &Plan, node: &PlanNode) -> bool {
+/// Prüft, ob ein Knoten eine abgeschlossene Explorations-Dependency besitzt
+/// (`Explore` **oder** `Research`, identisch zu Regel 12 in `validate`; F-130).
+fn has_completed_exploration_dependency(plan: &Plan, node: &PlanNode) -> bool {
     node.dependencies.iter().any(|dependency_id| {
         find_node(plan, dependency_id).is_some_and(|dependency| {
-            dependency.kind == PlanNodeKind::Explore
+            EXPLORATION_KINDS.contains(&dependency.kind)
                 && dependency.status == PlanNodeStatus::Completed
         })
     })
 }
 
-/// Prüft, ob ein Knoten ein hinreichend frisches `Finding`-Evidence-Item besitzt.
+/// Prüft, ob ein Knoten ein frisches `Finding`-Evidence-Item besitzt.
 ///
-/// "Hinreichend frisch" bedeutet: Alter (`now - attached_at`) ist nicht
-/// größer als `ttl_secs`. Ein Alter von 0 oder negativ (Uhrzeit-Ungenauigkeit)
-/// gilt ebenfalls als frisch.
+/// Delegiert an `validate::is_fresh_finding` — eine Frist-Semantik für
+/// Validierung und Graph (Zukunfts-Zeitstempel gelten nicht als frisch).
 fn has_fresh_finding(node: &PlanNode, ttl_secs: u64, now: OffsetDateTime) -> bool {
-    let ttl = time::Duration::seconds(i64::try_from(ttl_secs).unwrap_or(i64::MAX));
-    node.evidence.iter().any(|evidence| {
-        evidence.kind == EvidenceKind::Finding && (now - evidence.attached_at) <= ttl
-    })
+    node.evidence
+        .iter()
+        .any(|evidence| is_fresh_finding(evidence, now, ttl_secs))
 }
+
+/// Status, in denen ein Knoten noch nach `Ready` wechseln muss und deshalb
+/// eine fehlende Exploration nachgeholt werden kann (G-014/F-130).
+const EXPLORATION_PENDING_STATUSES: &[PlanNodeStatus] =
+    &[PlanNodeStatus::Draft, PlanNodeStatus::Blocked];
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Öffentliche Funktionen
@@ -335,15 +340,22 @@ pub fn partition_write_sets(nodes: &[&PlanNode]) -> Vec<Vec<TaskId>> {
 }
 
 /// Knoten, deren Art laut Konfiguration eine frische Exploration verlangt,
-/// die aber weder aufweisen.
+/// die aber keine aufweisen.
 ///
 /// # Description
-/// Liefert alle Knoten, deren `kind` in `cfg.require_exploration_for`
-/// vorkommt, die aber weder eine `Completed`-Dependency vom Typ
-/// [`PlanNodeKind::Explore`] noch ein Evidence-Item der Art
-/// [`EvidenceKind::Finding`] besitzen, das nicht älter als
-/// `cfg.exploration_ttl_secs` ist. `now` wird injiziert — dieses Modul
-/// greift nicht auf Systemzeit zu.
+/// Liefert alle Knoten mit Status `Draft` oder `Blocked` (Statusfilter,
+/// G-014/F-130), deren `kind` in `cfg.require_exploration_for` vorkommt und
+/// die weder eine `Completed`-Dependency vom Typ [`PlanNodeKind::Explore`]
+/// oder [`PlanNodeKind::Research`] noch ein Evidence-Item der Art
+/// [`crate::types::EvidenceKind::Finding`] innerhalb der Frist
+/// `cfg.exploration_ttl_secs` besitzen (Zukunfts-Zeitstempel zählen nicht).
+///
+/// Knoten in `Ready`/`InProgress` haben Regel 12 beim Übergang bereits
+/// bestanden; `Completed`/`Superseded`/`Invalidated` werden nie mehr
+/// gestartet. Beide Gruppen erscheinen deshalb nach Fristablauf **nicht**
+/// erneut — sonst hinge der Controller neue Explore-Knoten vor abgeschlossene
+/// oder laufende Arbeit. `now` wird injiziert — dieses Modul greift nicht auf
+/// Systemzeit zu.
 ///
 /// # Arguments
 /// - `plan` (`&Plan`): der zu prüfende Plan.
@@ -364,8 +376,9 @@ pub fn missing_explorations(
 ) -> Vec<TaskId> {
     plan.nodes
         .iter()
+        .filter(|node| EXPLORATION_PENDING_STATUSES.contains(&node.status))
         .filter(|node| cfg.require_exploration_for.contains(&node.kind))
-        .filter(|node| !has_completed_explore_dependency(plan, node))
+        .filter(|node| !has_completed_exploration_dependency(plan, node))
         .filter(|node| !has_fresh_finding(node, cfg.exploration_ttl_secs, now))
         .map(|node| node.id.clone())
         .collect()
@@ -702,5 +715,84 @@ mod tests {
         assert_eq!(children.len(), 2);
         assert!(children.contains(&TaskId::new("child-a")));
         assert!(children.contains(&TaskId::new("child-b")));
+    }
+
+    // ── missing_explorations: Statusfilter + Frist (G-014, F-130) ───────────
+
+    fn exploration_cfg() -> PlanToolConfig {
+        PlanToolConfig {
+            require_exploration_for: vec![PlanNodeKind::Coding],
+            exploration_ttl_secs: 3600,
+            ..PlanToolConfig::enabled_defaults()
+        }
+    }
+
+    fn finding(attached_at: OffsetDateTime) -> crate::types::EvidenceRef {
+        crate::types::EvidenceRef {
+            kind: crate::types::EvidenceKind::Finding,
+            locator: "q-1".to_owned(),
+            attached_at,
+            actor: "explorer".to_owned(),
+            digest: None,
+        }
+    }
+
+    #[test]
+    fn test_missing_explorations_filters_by_status() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::days(3);
+        let stale = finding(now - time::Duration::days(2));
+        let nodes: Vec<PlanNode> = [
+            ("draft", PlanNodeStatus::Draft),
+            ("blocked", PlanNodeStatus::Blocked),
+            ("ready", PlanNodeStatus::Ready),
+            ("running", PlanNodeStatus::InProgress),
+            ("done", PlanNodeStatus::Completed),
+            ("old", PlanNodeStatus::Superseded),
+            ("dead", PlanNodeStatus::Invalidated),
+        ]
+        .into_iter()
+        .map(|(id, status)| {
+            let mut node = make_node(id, status, PlanNodeKind::Coding);
+            node.evidence = vec![stale.clone()];
+            node
+        })
+        .collect();
+        let plan = make_plan(nodes);
+
+        let missing = missing_explorations(&plan, &exploration_cfg(), now);
+
+        assert_eq!(
+            missing,
+            vec![TaskId::new("draft"), TaskId::new("blocked")],
+            "nach Fristablauf nur Knoten, die noch nach Ready wechseln müssen"
+        );
+    }
+
+    #[test]
+    fn test_missing_explorations_respects_ttl_and_rejects_future_timestamps() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::days(3);
+        let mut fresh = make_node("fresh", PlanNodeStatus::Draft, PlanNodeKind::Coding);
+        fresh.evidence = vec![finding(now - time::Duration::minutes(59))];
+        let mut expired = make_node("expired", PlanNodeStatus::Draft, PlanNodeKind::Coding);
+        expired.evidence = vec![finding(now - time::Duration::minutes(61))];
+        let mut future = make_node("future", PlanNodeStatus::Draft, PlanNodeKind::Coding);
+        future.evidence = vec![finding(now + time::Duration::days(3650))];
+        let plan = make_plan(vec![fresh, expired, future]);
+
+        let missing = missing_explorations(&plan, &exploration_cfg(), now);
+
+        assert_eq!(missing, vec![TaskId::new("expired"), TaskId::new("future")]);
+    }
+
+    #[test]
+    fn test_missing_explorations_counts_completed_research_dependency() {
+        let research = make_node("r1", PlanNodeStatus::Completed, PlanNodeKind::Research);
+        let mut coding = make_node("impl", PlanNodeStatus::Draft, PlanNodeKind::Coding);
+        coding.dependencies = vec![TaskId::new("r1")];
+        let plan = make_plan(vec![research, coding]);
+
+        let missing = missing_explorations(&plan, &exploration_cfg(), OffsetDateTime::UNIX_EPOCH);
+
+        assert!(missing.is_empty(), "F-130: Research deckt wie in validate ab");
     }
 }

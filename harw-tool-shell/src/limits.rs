@@ -139,7 +139,7 @@ impl ShellLimits {
             ("tmpfs_bytes", self.tmpfs_bytes),
         ];
         match fields.iter().find(|(_, value)| *value == 0) {
-            Some((name, _)) => Err(ShellLimitsError::ZeroLimit { name: *name }),
+            Some((name, _)) => Err(ShellLimitsError::ZeroLimit { name }),
             None => Ok(()),
         }
     }

@@ -8,6 +8,13 @@ rust-version.workspace = true
 name = "harw"
 path = "src/main.rs"
 
+[features]
+default = []
+# jemalloc als globaler Allokator nur auf ausdrücklichen Wunsch (G-067): auf
+# Kerneln mit 16K-Seiten (RPi 5, `PAGESIZE=16384`) kann ein auf 4K-Systemen
+# gebautes jemalloc abstürzen. Ohne Feature gilt der System-Allokator.
+jemalloc = ["dep:tikv-jemallocator"]
+
 [dependencies]
 harw-config = { path = "../harw-config" }
 harw-agent-dsl = { path = "../harw-agent-dsl" }
@@ -39,15 +46,24 @@ harw-job-runtime = { path = "../harw-job-runtime" }
 #    und meldet den Job-Ausgang über `PlanJobBridge` zurück in den Plan.
 #  * `src/main.rs` (W5-08): Composition-Root — Plan-/Goal-Store, `PlanToolConfig`,
 #    `register_plan_services`, `FindingStore`, `GoalContextProvider`.
-#  * `src/chat.rs` (W5-06): reicht dieselben Stores in den One-shot-Kontext.
+#  * `src/chat.rs`: reicht dieselben Stores an die RuntimeAssembly.
 # Produktions-, nicht Test-Abhängigkeiten.
 harw-plan = { path = "../harw-plan" }
 harw-plan-bridge = { path = "../harw-plan-bridge" }
-tokio = { version = "1", features = ["rt", "net", "macros", "time", "signal"] }
+# `sync`: watch/oneshot für den geordneten Shutdown von `harw serve`
+# (`main.rs::serve_until`); `signal`: SIGTERM/SIGINT (`lifecycle::ShutdownSignals`).
+tokio = { version = "1", features = ["rt", "net", "macros", "time", "signal", "sync"] }
 jiff = { workspace = true }
 clap = { version = "4.6.1", features = ["derive"] }
 harw-home = { path = "../harw-home" }
 toml = "1.1.3"
+# Für `harw settings` (ConfigWriter::set_value braucht ein `toml_edit::Item`):
+# Version wie im Schwester-Crate `harw-config` gepinnt.
+toml_edit = "0.25.13"
+# Für `harw settings`: liest `[permissions]` aus einer beliebigen Config-Datei
+# in ein lokales `#[derive(Deserialize)]`-Hilfsdokument (siehe
+# `settings::load_permissions_section`). Workspace-Version, wie überall sonst.
+serde = { workspace = true }
 harw-provider-http = { path = "../harw-provider-http" }
 harw-oauth = { path = "../harw-oauth" }
 harw-knowledge = { path = "../harw-knowledge" }
@@ -60,15 +76,9 @@ harw-model-catalog = { path = "../harw-model-catalog" }
 clap_complete = "4.6.7"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tracing = "0.1.44"
-tikv-jemallocator = "0.7.0"
-# AP W5-06 — `ChildRegistryFactory::build_registry` nimmt
-# `harw_catalog::AgentSuggestions`; der One-shot-Pfad implementiert den Trait.
-harw-catalog = { path = "../harw-catalog" }
-# AW1-01c — die Wurzel-Erzeuger in chat.rs/lifecycle.rs/main.rs bauen den
-# ersten `harw_observe::TraceContext` einer Arbeit; Version identisch zu
-# harw-types/harw-core, damit im Workspace nur eine `uuid`-Auflösung existiert.
+tikv-jemallocator = { version = "0.7.0", optional = true }
+# Telemetrie-Senken für Gateway und `src/observe.rs`.
 harw-observe = { path = "../harw-observe" }
-uuid = { version = "1", features = ["v4"] }
 # Bottom-up-Befund: `harw-web` hatte null Produktionskonsumenten. `src/web.rs`
 # ist die Komposition, die den Unix-Socket-Server aus derselben
 # `harw-operations`-Registry baut, die auch `harw-cli` sonst zusammenstellt.

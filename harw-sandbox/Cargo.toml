@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# Drop-Guard `SandboxChild` (W5 N-SBX) protokolliert Kill/Wait-Fehler.
+tracing = { workspace = true }
 harw-types = { path = "../harw-types" }
 ipnet = { workspace = true }
 serde = { version = "1", features = ["derive"] }

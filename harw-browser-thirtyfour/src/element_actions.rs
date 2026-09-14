@@ -1,3 +1,5 @@
+//! Click/Type/Clear/Focus/Select execution. File upload is intentionally not supported.
+
 use crate::error::{AdapterError, DriverOperation};
 use crate::runtime::FirefoxRuntime;
 use crate::selector::target_candidates;
@@ -58,7 +60,6 @@ impl FirefoxRuntime {
             BrowserAction::Type { text, .. } => element.send_keys(text).await,
             BrowserAction::Clear { .. } => element.clear().await,
             BrowserAction::Focus { .. } => element.focus().await,
-            BrowserAction::Upload { file_path, .. } => element.send_keys(file_path).await,
             BrowserAction::Select { value, .. } => {
                 SelectElement::new(&element)
                     .await
@@ -95,7 +96,6 @@ fn action_target(action: &BrowserAction) -> harw_browser::Result<&Target> {
         | BrowserAction::Type { target, .. }
         | BrowserAction::Clear { target }
         | BrowserAction::Focus { target }
-        | BrowserAction::Upload { target, .. }
         | BrowserAction::Select { target, .. } => Ok(target),
         _ => Err(Error::InvalidArgument {
             detail: "unsupported element action".to_owned(),

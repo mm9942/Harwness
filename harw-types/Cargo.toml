@@ -22,6 +22,8 @@ rust-version.workspace = true
 # Featureänderung hier keinen Nutzen hätte und ungeprüfte Abwahl verboten
 # ist.
 blake3 = { workspace = true }
+# C-APPR: `Clock::now() -> jiff::Timestamp` (Serveruhr, F-122).
+jiff = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }

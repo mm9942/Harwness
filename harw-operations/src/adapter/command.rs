@@ -54,10 +54,11 @@
 //!             aliases: &[],
 //!             category: OperationCategory::Misc,
 //!             args_schema: None,
+//!             output_schema: None,
 //!         })
 //!     }
 //!     fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
-//!         Box::pin(async { Ok(OpOutput { text: "ok".to_owned() }) })
+//!         Box::pin(async { Ok(OpOutput::from("ok".to_owned())) })
 //!     }
 //! }
 //!
@@ -406,15 +407,12 @@ mod tests {
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
 
         fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
-            Box::pin(async {
-                Ok(OpOutput {
-                    text: "noop".to_owned(),
-                })
-            })
+            Box::pin(async { Ok(OpOutput::from("noop".to_owned())) })
         }
     }
 
@@ -436,15 +434,12 @@ mod tests {
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
 
         fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
-            Box::pin(async {
-                Ok(OpOutput {
-                    text: "single".to_owned(),
-                })
-            })
+            Box::pin(async { Ok(OpOutput::from("single".to_owned())) })
         }
     }
 
@@ -472,15 +467,12 @@ mod tests {
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
 
         fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
-            Box::pin(async {
-                Ok(OpOutput {
-                    text: "two".to_owned(),
-                })
-            })
+            Box::pin(async { Ok(OpOutput::from("two".to_owned())) })
         }
     }
 
@@ -508,15 +500,12 @@ mod tests {
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
 
         fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
-            Box::pin(async {
-                Ok(OpOutput {
-                    text: "mixed".to_owned(),
-                })
-            })
+            Box::pin(async { Ok(OpOutput::from("mixed".to_owned())) })
         }
     }
 
@@ -538,14 +527,16 @@ mod tests {
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
 
         fn run<'a>(&'a self, _ctx: &'a OpContext, input: OpInput) -> OpFuture<'a> {
             Box::pin(async move {
-                Ok(OpOutput {
-                    text: format!("{}", input.invocation.raw_args().len()),
-                })
+                Ok(OpOutput::from(format!(
+                    "{}",
+                    input.invocation.raw_args().len()
+                )))
             })
         }
     }
@@ -568,6 +559,7 @@ mod tests {
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
 

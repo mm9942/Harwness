@@ -136,7 +136,7 @@ use std::sync::Arc;
 
 use harw_operations::context::{OpContext, ServiceMap};
 use harw_operations::operation::PermissionTier;
-use harw_runtime::{EntryKind, RuntimeAssembly, ServiceSurface};
+use harw_runtime::{RuntimeAssembly, ServiceSurface};
 use harw_sandbox::SandboxSpec;
 use harw_session_store::approval::ApprovalStore;
 use harw_types::{SessionId, TurnId};
@@ -207,12 +207,13 @@ pub(crate) fn serve_web(
     );
 
     let plan_config = crate::plan_tool_config_from_section(&config.harness.tools.plan)?;
-    let plan = runtime_plan_services(crate::build_plan_services(
+    let plan = crate::build_plan_services(
         &home,
         &plan_config,
         crate::DEFAULT_PLAN_SPACE,
         crate::DEFAULT_GOAL_SPACE,
-    )?);
+    )?
+    .to_runtime();
 
     // `ApprovalStore::new` hängt sein eigenes `approvals`-Unterverzeichnis an
     // (siehe Moduldoc, Abschnitt „Der Genehmigungsspeicher").
@@ -281,38 +282,6 @@ pub(crate) fn serve_web(
         eprintln!("harw web listening on unix:{}", socket_path.display());
         server.serve().await.map_err(|error| error.to_string())
     })
-}
-
-/// Übersetzt die crate-eigene Planungsfläche in [`harw_runtime::PlanServices`].
-///
-/// # Description
-/// `crate::build_plan_services` trägt Plan-, Goal- und Finding-Store als
-/// einzelne `Option`s (abgeschaltete Planungsfläche ⇒ alle `None`). Die
-/// Montage nimmt nur eine vollständige Fläche an: alle drei oder keiner.
-///
-/// # Arguments
-/// - `services` (`crate::PlanServices`): Ergebnis von
-///   `crate::build_plan_services`; wird verbraucht.
-///
-/// # Returns
-/// `Some`, wenn Plan, Goal **und** Findings vorhanden sind, sonst `None`.
-fn runtime_plan_services(services: crate::PlanServices) -> Option<harw_runtime::PlanServices> {
-    let crate::PlanServices {
-        plan,
-        goal,
-        findings,
-        config,
-        ..
-    } = services;
-    match (plan, goal, findings) {
-        (Some(plan), Some(goal), Some(findings)) => Some(harw_runtime::PlanServices {
-            plan,
-            goal,
-            findings,
-            plan_config: config,
-        }),
-        _ => None,
-    }
 }
 
 /// Baut den [`OpContext`] einer freigegebenen Web-Anfrage aus der Montage.
@@ -402,6 +371,7 @@ fn web_op_context(
 mod tests {
     use super::*;
     use harw_operations::registry::OperationRegistry;
+    use harw_runtime::EntryKind;
     use harw_sandbox::Permission;
     use harw_types::Principal;
 
@@ -684,28 +654,30 @@ mod tests {
     }
 
     /// Eine halb geöffnete Planungsfläche wird nie an die Montage gereicht.
+    ///
+    /// `crate::build_plan_services` liefert `crate::PlanServices`, dessen
+    /// [`crate::PlanServices::to_runtime`] serve_web direkt in
+    /// `harw_runtime::PlanServices` übersetzt (seit W2d-2/F-MAIN: keine
+    /// separate `runtime_plan_services`-Übersetzung mehr).
     #[test]
-    fn test_runtime_plan_services_requires_all_three_stores() {
+    fn test_plan_services_to_runtime_requires_all_three_stores() {
         let disabled = crate::PlanServices {
-            services: ServiceMap::new(),
             plan: None,
             goal: None,
             findings: None,
             config: harw_plan::PlanToolConfig::default(),
         };
-        assert!(runtime_plan_services(disabled).is_none());
+        assert!(disabled.to_runtime().is_none());
 
         let partial = crate::PlanServices {
-            services: ServiceMap::new(),
             plan: Some(Arc::new(harw_plan::InMemoryPlanStore::new())),
             goal: Some(Arc::new(harw_plan::InMemoryGoalStore::new())),
             findings: None,
             config: harw_plan::PlanToolConfig::default(),
         };
-        assert!(runtime_plan_services(partial).is_none());
+        assert!(partial.to_runtime().is_none());
 
         let complete = crate::PlanServices {
-            services: ServiceMap::new(),
             plan: Some(Arc::new(harw_plan::InMemoryPlanStore::new())),
             goal: Some(Arc::new(harw_plan::InMemoryGoalStore::new())),
             findings: Some(Arc::new(harw_plan_bridge::FindingStore::new(
@@ -713,7 +685,7 @@ mod tests {
             ))),
             config: harw_plan::PlanToolConfig::default(),
         };
-        assert!(runtime_plan_services(complete).is_some());
+        assert!(complete.to_runtime().is_some());
     }
 
     /// F-W/W6: `WebRouteTable::from_registry(assembly.operations())` gegen
@@ -726,6 +698,8 @@ mod tests {
     /// durch, sie fehlen also nicht in der Web-Registrierung.
     #[test]
     fn test_web_route_table_from_registry_includes_approval_routes() {
+        use harw_web::router::WebMethod;
+
         let (_home, _cwd, assembly) = test_assembly(true);
 
         let routes = WebRouteTable::from_registry(assembly.operations())
@@ -735,12 +709,20 @@ mod tests {
             .find("/api/approval-pending")
             .expect("approval.pending is registered as a web route from the assembly");
         assert_eq!(pending.operation_name(), "approval.pending");
-        assert!(pending.readonly(), "approval.pending is declared readonly");
+        assert_eq!(
+            routes.method_for("/api/approval-pending"),
+            Some(WebMethod::Get),
+            "approval.pending is declared readonly (GET)"
+        );
 
         let resolve = routes
             .find("/api/approval-resolve")
             .expect("approval.resolve is registered as a web route from the assembly");
         assert_eq!(resolve.operation_name(), "approval.resolve");
-        assert!(!resolve.readonly(), "approval.resolve is declared mutating");
+        assert_eq!(
+            routes.method_for("/api/approval-resolve"),
+            Some(WebMethod::Post),
+            "approval.resolve is declared mutating (POST)"
+        );
     }
 }

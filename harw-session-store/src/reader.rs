@@ -15,7 +15,11 @@ use std::path::Path;
 use crate::error::{SessionStoreError, SessionStoreResult};
 use crate::record::TranscriptRecord;
 
-const MAX_RECORD_BYTES: usize = 1024 * 1024;
+/// Maximale Größe einer JSONL-Zeile inklusive abschließendem `\n` (1 MiB).
+///
+/// Gilt lesend hier und — seit A-STORE (F-156) — schreibend in
+/// `TranscriptStore::append`/`rewrite`, damit jede geschriebene Zeile lesbar bleibt.
+pub const MAX_RECORD_BYTES: usize = 1024 * 1024;
 
 /// Streaming, non-buffering iterator over a transcript file's records.
 pub struct TranscriptReader {

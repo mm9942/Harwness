@@ -144,6 +144,7 @@ impl ModelProvider for MissingContextAwareModel {
                         arguments: serde_json::json!({"attempt": "ambient authority"}),
                     }],
                     usage: Default::default(),
+                    ..Default::default()
                 });
             }
 
@@ -193,6 +194,7 @@ impl ModelProvider for ToolResultAwareModel {
                         arguments: serde_json::json!({"invoice_volume": 900}),
                     }],
                     usage: Default::default(),
+                    ..Default::default()
                 });
             }
 
@@ -380,6 +382,7 @@ async fn tool_call_then_final() {
                 arguments: serde_json::json!({"k": "v"}),
             }],
             usage: Default::default(),
+            ..Default::default()
         },
         // second call: final answer, no tools
         ModelResponse::text("done"),
@@ -507,6 +510,7 @@ async fn explicitly_parallel_safe_tool_calls_are_joined_before_the_next_model_ru
                 },
             ],
             usage: Default::default(),
+            ..Default::default()
         },
         ModelResponse::text("both lookups are available"),
     ]);
@@ -546,6 +550,7 @@ async fn handoff_pauses_then_resumes() {
                 arguments: serde_json::json!({"task": "sub"}),
             }],
             usage: Default::default(),
+            ..Default::default()
         },
         // after resume: final answer
         ModelResponse::text("child done, finishing"),
@@ -628,6 +633,7 @@ async fn approval_pause_resumes_the_original_call_then_runs_the_model_again() {
                 arguments: serde_json::json!({"approved": true}),
             }],
             usage: Default::default(),
+            ..Default::default()
         },
         ModelResponse::text("approved tool result consumed"),
     ]);
@@ -698,6 +704,7 @@ async fn configured_policy_section_is_a_runtime_approval_handler() {
             arguments: serde_json::json!({"command": "echo governed"}),
         }],
         usage: Default::default(),
+        ..Default::default()
     }]);
 
     let outcome = run_turn(&mut session, &model, &store, TurnInput::user("run it"))
@@ -765,6 +772,7 @@ async fn durable_approval_is_written_then_consumed_once_before_resuming() {
                 arguments: serde_json::json!({"durable": true}),
             }],
             usage: Default::default(),
+            ..Default::default()
         },
         ModelResponse::text("durable approval consumed"),
     ]);
@@ -802,10 +810,10 @@ async fn durable_approval_is_written_then_consumed_once_before_resuming() {
         .resolve(
             session.id(),
             &request,
-            &test_approval_actor(),
             ReviewDecision::Approved,
             None,
-            jiff::Timestamp::now(),
+            &test_approval_actor(),
+            &harw_types::SystemClock,
         )
         .expect_err("the durable request cannot be consumed twice");
     assert!(matches!(

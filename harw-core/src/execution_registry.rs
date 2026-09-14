@@ -5,6 +5,16 @@
 //! child.  In particular, it never indexes an execution by `holder`: a
 //! restarted worker may reuse that display name while carrying a stale epoch
 //! or nonce.
+//!
+//! # Key types
+//! - [`JobExecutionRegistry`]: token-keyed map of live executions.
+//! - [`ExecutionGuard`]: RAII binding that unregisters its exact token on drop
+//!   (A-JOBRUN, F-071/G-021), so an aborted runner future cannot leave a
+//!   dangling live execution behind.
+//!
+//! # Concurrency
+//! The registry is `Send + Sync`; a `std::sync::Mutex` is held only for map
+//! access and never across an `.await`.
 
 use harw_job_runtime::LeaseToken;
 use std::collections::HashMap;
@@ -12,6 +22,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
+use tracing::warn;
 
 /// A cancellation handle owned by the execution runner.
 ///
@@ -127,6 +138,50 @@ impl JobExecutionRegistry {
         Ok(())
     }
 
+    /// Binds one live execution and returns an RAII guard for the binding.
+    ///
+    /// # Description
+    /// Identical to [`JobExecutionRegistry::register`], but the returned
+    /// [`ExecutionGuard`] unregisters the exact token when it is dropped
+    /// without an explicit [`ExecutionGuard::release`]. This is the binding the
+    /// durable runner uses, so cancelling or aborting the runner future frees
+    /// the live execution slot.
+    ///
+    /// # Arguments
+    /// - `token` (`LeaseToken`): the complete fencing credential, moved in.
+    /// - `control` (`Arc<dyn ExecutionControl>`): the cancellation handle.
+    ///
+    /// # Returns
+    /// An [`ExecutionGuard`] owning a pointer clone of this registry.
+    ///
+    /// # Errors
+    /// - [`ExecutionRegistryError::DuplicateToken`]: the token is already bound.
+    /// - [`ExecutionRegistryError::LockPoisoned`]: the map lock is poisoned.
+    ///
+    /// # Concurrency
+    /// Takes the internal mutex briefly; does not await.
+    ///
+    /// # Examples
+    /// ```rust,no_run
+    /// use std::sync::Arc;
+    /// use harw_core::JobExecutionRegistry;
+    /// let registry = Arc::new(JobExecutionRegistry::new());
+    /// // let guard = registry.register_guarded(token, control)?;
+    /// // drop(guard); // unregisters the exact token
+    /// ```
+    pub fn register_guarded(
+        self: &Arc<Self>,
+        token: LeaseToken,
+        control: Arc<dyn ExecutionControl>,
+    ) -> Result<ExecutionGuard, ExecutionRegistryError> {
+        self.register(token.clone(), control)?;
+        Ok(ExecutionGuard {
+            registry: Arc::clone(self),
+            token,
+            armed: true,
+        })
+    }
+
     /// Remove a live binding only when the full token matches.
     pub fn unregister(&self, token: &LeaseToken) -> Result<bool, ExecutionRegistryError> {
         let mut entries = self
@@ -231,6 +286,59 @@ impl JobExecutionRegistry {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+/// RAII binding of one live execution to its exact lease token.
+///
+/// # Description
+/// Created by [`JobExecutionRegistry::register_guarded`]. Dropping an armed
+/// guard removes the binding (a poisoned lock is logged, never panics);
+/// [`ExecutionGuard::release`] removes it explicitly and reports the result.
+///
+/// # Concurrency
+/// `Send + Sync`; holds an `Arc` to the registry and a cloned token.
+#[must_use = "dropping the guard immediately unregisters the execution"]
+pub struct ExecutionGuard {
+    registry: Arc<JobExecutionRegistry>,
+    token: LeaseToken,
+    armed: bool,
+}
+
+impl ExecutionGuard {
+    /// Returns the exact fencing token this guard keeps registered.
+    #[must_use]
+    pub fn token(&self) -> &LeaseToken {
+        &self.token
+    }
+
+    /// Unregisters the binding now and disarms the drop hook.
+    ///
+    /// # Returns
+    /// `Ok(true)` when the binding was still present, `Ok(false)` when it had
+    /// already been removed (for example by [`JobExecutionRegistry::cancel`]).
+    ///
+    /// # Errors
+    /// - [`ExecutionRegistryError::LockPoisoned`]: the map lock is poisoned.
+    pub fn release(mut self) -> Result<bool, ExecutionRegistryError> {
+        self.armed = false;
+        self.registry.unregister(&self.token)
+    }
+}
+
+impl Drop for ExecutionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(error) = self.registry.unregister(&self.token) {
+            warn!(
+                work_id = %self.token.work_id,
+                epoch = self.token.epoch,
+                error = %error,
+                "execution guard could not unregister on drop"
+            );
+        }
     }
 }
 
@@ -381,5 +489,47 @@ mod tests {
 
         assert!(registry.unregister(&token(2, "current")).unwrap());
         assert!(!registry.contains(&token(2, "current")));
+    }
+
+    #[test]
+    fn test_register_guarded_drop_unregisters_exact_token() {
+        let registry = Arc::new(JobExecutionRegistry::new());
+        let control = FakeControl::new(false);
+        let guard = registry
+            .register_guarded(token(5, "guarded"), control)
+            .unwrap();
+        assert!(registry.contains(&token(5, "guarded")));
+        assert_eq!(guard.token(), &token(5, "guarded"));
+        drop(guard);
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn test_register_guarded_release_reports_presence() {
+        let registry = Arc::new(JobExecutionRegistry::new());
+        let guard = registry
+            .register_guarded(token(6, "release"), FakeControl::new(false))
+            .unwrap();
+        assert!(guard.release().unwrap());
+        assert!(registry.is_empty());
+
+        let guard = registry
+            .register_guarded(token(7, "gone"), FakeControl::new(false))
+            .unwrap();
+        assert!(registry.unregister(&token(7, "gone")).unwrap());
+        assert!(!guard.release().unwrap());
+    }
+
+    #[test]
+    fn test_register_guarded_rejects_duplicate_token() {
+        let registry = Arc::new(JobExecutionRegistry::new());
+        let _guard = registry
+            .register_guarded(token(8, "dup"), FakeControl::new(false))
+            .unwrap();
+        assert!(matches!(
+            registry.register_guarded(token(8, "dup"), FakeControl::new(false)),
+            Err(ExecutionRegistryError::DuplicateToken { epoch: 8, .. })
+        ));
+        assert_eq!(registry.len(), 1);
     }
 }

@@ -128,6 +128,11 @@ fn map_home_error(error: HomeError) -> RuntimeError {
         | HomeError::HomeNotADirectory { .. }
         | HomeError::InvalidProfileName { .. }
         | HomeError::InvalidVisibilityName { .. }
+        // Projekt-Erkennung (Scopes-Vertrag §3): ein unbrauchbarer
+        // Projektschlüssel oder eine abgelehnte Projekt-Wurzel (`/`, `$HOME`)
+        // sind Konfigurationsfehler — sie sagen nichts über Vertrauen aus.
+        | HomeError::InvalidProjectKey { .. }
+        | HomeError::UnsupportedProjectHomeRoot { .. }
         | HomeError::Io { .. } => RuntimeError::Config {
             detail: error.to_string(),
         },

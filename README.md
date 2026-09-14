@@ -27,10 +27,12 @@ The workspace has **97 crates** and roughly **350,000 lines of Rust** (inline te
 8. [Crate inventory](#crate-inventory)
 9. [Getting started](#getting-started)
 10. [Configuration](#configuration)
-11. [Development](#development)
-12. [Roadmap](#roadmap)
-13. [Repository layout](#repository-layout)
-14. [License](#license)
+11. [Bedienung der TUI](#bedienung-der-tui)
+12. [Lebensdauern (Scopes von Einstellungen)](#lebensdauern-scopes-von-einstellungen)
+13. [Development](#development)
+14. [Roadmap](#roadmap)
+15. [Repository layout](#repository-layout)
+16. [License](#license)
 
 ---
 
@@ -848,8 +850,8 @@ No entry kind receives `NetworkAccess`, `ReadSecrets`, `ManagePlugins` or `ReadC
 ### Principals, tiers and the approval chain
 
 - **`Principal`**: `kind` (Human / Model / Operation / Channel), `surface` (Tui / Cli / Web / Mcp / Telegram / Gateway / JobWorker / Child) and `tier` (`Observer` < `Operator` < `Maintainer` < `Owner`). The web transport derives identity from `SO_PEERCRED` and narrows permissions by tier.
-- **`ApprovalChain`**: config policy (`[policy].require_approval_for`) → fail-closed default policy with a per-session `ApprovalModeCell`, where only `fs.read/list/search/glob/grep`, the `deps.*` readers, `lens.ask`, `web.fetch/docs_rs/crates_io`, `status` and `ps` are exempt → responder by `AskResolution`. Child sessions inherit the config policy but never the interactive responder.
-- **TUI approval dialog**: shows full arguments (path or command first), sanitizes C0/C1/ESC/bidi/zero-width characters in every history cell type, and applies an arming delay.
+- **`ApprovalChain`**: config policy (`[policy].require_approval_for`) → a shared `AllowRuleSet` of per-tool allow/deny rules (see [Lebensdauern](#lebensdauern-scopes-von-einstellungen)), consulted before the mode logic; a matching deny rule always wins and forces a prompt even in `full` mode → fail-closed default policy with a per-session `ApprovalModeCell`, where only `fs.read/list/search/glob/grep`, the `deps.*` readers, `lens.ask`, `web.fetch/docs_rs/crates_io`, `status` and `ps` are exempt → responder by `AskResolution`. Child sessions inherit the config policy but never the interactive responder.
+- **TUI approval dialog**: shows full arguments (path or command first), sanitizes C0/C1/ESC/bidi/zero-width characters in every history cell type, and applies an arming delay. A four-option panel widget (`harw-tui/src/approval_dialog.rs`) exists for this; see [Bedienung der TUI](#bedienung-der-tui) for its current wiring status.
 
 ### Turn loop, sessions and child agents
 
@@ -870,7 +872,7 @@ No entry kind receives `NetworkAccess`, `ReadSecrets`, `ManagePlugins` or `ReadC
 
 ### Operations
 
-One `Operation` contract (`harw-operations`) exposed on command, model-tool, agent-tool and web surfaces. The web route table is derived from the registry, so a route without an operation cannot be expressed. `harw-ops` ships 28 operations: `agent`, `analyze`, `approval.pending`, `approval.resolve`, `attach`, `compact`, `context-proposal`, `diff`, `effort`, `explore`, `goal`, `help`, `memory`, `mode`, `model`, `new`, `permissions`, `plan`, `plugins`, `provider`, `ps`, `quit`, `research_deps`, `research_web`, `skills`, `status`, `stop`, `work`. `diff` runs git without textconv or external diff, with fsmonitor and hooks disabled, system and global config ignored, literal pathspecs, and approval required.
+One `Operation` contract (`harw-operations`) exposed on command, model-tool, agent-tool and web surfaces. The web route table is derived from the registry, so a route without an operation cannot be expressed. `harw-ops` ships 30 operations: `add-workdir`, `agent`, `analyze`, `approval.pending`, `approval.resolve`, `attach`, `compact`, `context-proposal`, `diff`, `effort`, `explore`, `export`, `goal`, `help`, `memory`, `mode`, `model`, `new`, `permissions`, `plan`, `plugins`, `provider`, `ps`, `quit`, `research_deps`, `research_web`, `skills`, `status`, `stop`, `work`. `diff` runs git without textconv or external diff, with fsmonitor and hooks disabled, system and global config ignored, literal pathspecs, and approval required. `permissions` and `add-workdir` write into scoped configuration layers (see [Lebensdauern](#lebensdauern-scopes-von-einstellungen)); `memory` and `export` are documented in the same section together with the TUI building blocks that support them.
 
 ### Providers and model catalog
 
@@ -891,7 +893,7 @@ A per-secret DEK is sealed under a hybrid ML-KEM KEK (ML-KEM-1024 + P-384 by def
 ### Context, memory, knowledge and Lens
 
 - **Context** (`harw-context`): trust-classed fragments, ceilings, budgets, two-block rendering.
-- **Memory** (`harw-memory`): *working and episodic*. Tiered (HOT / short-term / WARM / COLD) and signal-driven (corrections, reflections, pattern candidates), with maintenance-driven promotion, epistemic status, outcome tracking and a contradiction index.
+- **Memory** (`harw-memory`): *working and episodic*, plus an addressable long-term layer (v3). Tiered (HOT / short-term / WARM / COLD) and signal-driven (corrections, reflections, pattern candidates), with maintenance-driven promotion, epistemic status, outcome tracking and a contradiction index. On top of that, `harw-memory::facts` stores individually addressable facts as one Markdown file per fact (`facts/<name>.md`, typed frontmatter, redaction before every write, a generated `MEMORY.md` index, usage counters and confidence decay). See [Lebensdauern](#lebensdauern-scopes-von-einstellungen) for where project and global facts live. Model-driven extraction and steward-agent consolidation of these facts are not yet implemented.
 - **Knowledge** (`harw-knowledge`): *curated long-term*. A markdown + frontmatter artifact store with one index and one `VisibilityScope` for core memory, topics, palace, diary, dream, workbench, Kanban, security findings and baselines, and context and model-behavior proposals with a steward that never applies itself.
 - **Lens**: `lens-types` → `lens-chunk` (markdown/Rust/plain) → `lens-embed` → `lens-store` (content-addressed) → `lens-index` (vector + BM25) → `lens-rank` (RRF, MMR, collapse) → `lens-query` → `lens-source` → `lens-federation` → `harw-lens` / `lens.ask`.
 
@@ -991,6 +993,7 @@ Global flags: `--home <DIR>`, `--log <trace|debug|info|warn|error>`, `--log-sens
 - **Profiles**: `<home>/profiles/<name>` (`HARW_PROFILE` / `active_profile`).
 - **Layers** (ascending precedence): root → active profile → repo-local `./.harw`, where the last one only applies with full authority if the project is **trusted**.
 - **Project trust** (`<home>/trusted-projects.toml`, atomic, `0600`, owner-checked): bound to the canonical root, the owner UID and a BLAKE3 digest of the security-relevant `.harw` files, read symlink-free. On any change the status becomes `Changed` and the layer falls back to restricted merging, which never contributes providers, auth, `.env`, MCP servers, listeners or channels. The API (`trust_project`, `untrust_project`, `project_trust_status`) exists in `harw-home`. A **`harw project trust | untrust | status` command is planned** and not yet in the CLI.
+- **`[permissions]`**: `default_mode`, `approval_timeout_secs`, `allow`/`deny` rule lists and `extra_roots`, written by `harw-config::writer::ConfigWriter` and read into the running assembly from both the global and the project settings file. See [Lebensdauern](#lebensdauern-scopes-von-einstellungen) for exactly which file each field lives in.
 
 ```toml
 # ~/.harw/config.toml
@@ -1025,6 +1028,33 @@ base_url = "http://127.0.0.1:0"
 id = "echo"
 provider = "local"
 ```
+
+---
+
+## Bedienung der TUI
+
+Wie im Rest dieses Dokuments markiert: **wired** (heute über einen Produktions-Einstiegspunkt erreichbar), **built** (implementiert und getestet, noch nicht verdrahtet), **planned** (noch nicht implementiert).
+
+- **Befehle (wired, `harw-ops`)**: `/permissions` zeigt und ändert Freigabemodus sowie Allow-/Deny-Regeln, wahlweise mit `--session`, `--project` oder `--global`; `/add-workdir <pfad> [--save]` gibt einer laufenden Session zusätzlichen Dateisystem-Zugriff frei; `/memory recall <stichwort>`, `/memory record <text> [--project|--global]` und `/memory forget <name>` verwalten die adressierbaren Langzeit-Fakten aus `harw-memory::facts`; `/export [--tools] [--datei <pfad>]` stößt einen Export des aktuellen Verlaufs an.
+- **Freigabe-Panel mit vier Optionen (built, `harw-tui/src/approval_dialog.rs`)**: Ja / Ja und nicht mehr fragen für diesen Befehl / Ja und in den Auto-Modus wechseln / Nein mit optionaler Freitext-Begründung. Tastendrücke wirken erst nach einer Arming-Verzögerung, Esc gilt als Nein. Ob dieses Panel bereits bei jeder laufenden Freigabeanfrage angezeigt wird, war anhand des Codes nicht abschließend zu bestimmen.
+- **Session-Auswahl (built, `harw-tui/src/session_picker.rs`, `relative_time.rs`)**: durchsuchbare Liste mit Titel, relativer Zeit (`vor 5 min`, `vor 3 h`, …) und Projekt-Zuordnung; Navigation per Pfeiltasten/PageUp/PageDown/Home/End, Tippen filtert. Die Verdrahtung an `harw -r`/`/resume` konnte im Code nicht bestätigt werden.
+- **Export-Auswahl (built, `harw-tui/src/choice_dialog.rs`, `clipboard.rs`, `export.rs`)**: Zwischenablage kopieren / als Datei speichern / abbrechen; Kopieren läuft über `wl-copy`/`xclip`/`xsel`/`pbcopy` je nach Umgebung, mit OSC-52-Fallback.
+- **Kompakte Tool-Darstellung (built, `harw-tui/src/history_cell.rs`)**: `ToolCell`/`ToolGroupCell` mit einstellbarer Ausführlichkeit (`ToolVerbosity`) als vorgesehener Ersatz für die bisherigen Tool-Verlaufszellen.
+- Ein Moduswechsel per Shift+Tab (ask → auto → full → plan) ist im aktuellen Code **nicht** vorhanden. Der Freigabemodus lässt sich heute nur über `/permissions` bzw. `/mode` ändern.
+
+## Lebensdauern (Scopes von Einstellungen)
+
+Jede Einstellung mit dauerhaftem Charakter (Freigabemodus, Allow-/Deny-Regeln, zusätzliche Arbeitsverzeichnisse, Gedächtnis-Fakten) hat eine von drei Lebensdauern, mit aufsteigender Präzedenz `Global < Project < Session` (Typ `SettingScope`, `harw-config/src/scope.rs`):
+
+| Scope | Lebensdauer | Speicherort | Beispiele |
+|---|---|---|---|
+| `Session` | endet mit der Session, nur im Prozessspeicher | geteilte Zellen (`ApprovalModeCell`, `AllowRuleSet`, `ExtraRootsCell`) | Freigabemodus der laufenden Sitzung, `/add-workdir` ohne `--save` |
+| `Project` | dauerhaft pro Projekt | autoritätsgewährend **außerhalb** des Repos: `~/.harw/profiles/<profil>/projects/<projekt-schlüssel>/settings.toml`; inhaltlich (Gedächtnis, Pläne, Goals): `<repo>/.harw/` | Allow-/Deny-Regeln, mit `--save` gemerkte Arbeitswurzeln, Projekt-Gedächtnis-Fakten |
+| `Global` | dauerhaft für den Nutzer | `~/.harw/config.toml` bzw. aktives Profil | Standard-Freigabemodus, Provider, globale Gedächtnis-Fakten |
+
+- Eine passende Deny-Regel gewinnt scope-übergreifend immer über eine passende Allow-Regel (`AllowRuleSet::evaluate`, `harw-extension-api`), unabhängig davon, aus welchem Scope sie stammt.
+- Der Projekt-Schlüssel (`project_key`, `harw-home/src/project.rs`) verbindet einen sanitisierten Basisnamen mit den ersten 12 Hex-Zeichen eines BLAKE3-Hashs über den kanonischen Projekt-Root — stabil, aber bewusst außerhalb des Repos abgelegt, damit ein geklontes Projekt sich keine Rechte selbst geben kann.
+- Die Projekt-Erkennung (`discover_project`) läuft von `cwd` aufwärts bis zum ersten Marker (Default `.git`, konfigurierbar über `project_root_markers`); ein Git-Worktree wird für Vertrauensentscheidungen auf sein Haupt-Repository abgebildet. `$HOME` und `/` selbst erhalten kein Projekt-Home.
 
 ---
 

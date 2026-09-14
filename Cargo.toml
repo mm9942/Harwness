@@ -41,7 +41,6 @@ members = [
     "harw-browser",
     "harw-browser-thirtyfour",
     "harw-tool-browser",
-    "harw-channel-browser",
     "harw-instructions",
     "harw-project-discovery",
     "harw-plan-bridge",
@@ -101,6 +100,7 @@ members = [
     "harw-web",
 
     # === Remediation (Plan P0–P3) ===
+    "harw-egress",
     "harw-fsutil",
     "harw-runtime",
     "xtask",

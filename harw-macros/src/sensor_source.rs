@@ -679,12 +679,20 @@ pub(crate) fn expand_sensor_source(input: &DeriveInput) -> syn::Result<TokenStre
             /// Bildet einen `harw_dod_readfs::ReadFsError` auf `SensorError` ab.
             ///
             /// `ReadFsError::Scope` reicht den bereits inhaltsfreien
-            /// `SensorError` unverändert durch. Die drei übrigen Varianten
-            /// (`TooLarge`, `GlobPatternAbsolute`, `GlobPatternTraversal`)
-            /// beschreiben eine Quelle, die nicht die erwartete Form/Größe
-            /// hat bzw. ein Glob-Muster, das nicht wie erwartet aufgelöst
-            /// werden konnte — beides bildet auf `MalformedSource` ab, ohne
-            /// den mitgeführten Text (Muster oder Grenze) zu übernehmen.
+            /// `SensorError` unverändert durch. Die vier übrigen Varianten
+            /// (`TooLarge`, `GlobPatternAbsolute`, `GlobPatternTraversal`,
+            /// `GlobLimitExceeded`) beschreiben eine Quelle, die nicht die
+            /// erwartete Form/Größe hat, bzw. ein Glob-Muster, das nicht wie
+            /// erwartet aufgelöst werden konnte oder eine der
+            /// `harw_dod_readfs::glob`-Grenzen (Musterlänge, Kandidatenzahl)
+            /// überschritten hat — alle vier bilden auf `MalformedSource` ab,
+            /// ohne den mitgeführten Text (Muster oder Grenze) zu übernehmen.
+            /// `GlobLimitExceeded` neu seit der `harw-dod-cap`/`harw-dod-readfs`-
+            /// Korrektur C-SCOPE (Register `x-findings-register-w1-w3.md`,
+            /// Alias-Wurzeln/Glob-Grenzen für sysfs-Klassenpfade): ohne diesen
+            /// Arm kompiliert jeder `#[derive(SensorSource)]`-Sensor nicht
+            /// mehr, sobald `ReadFsError` diese Variante trägt (erschöpfendes
+            /// `match`, siehe `harw-dod-cap`-Vertrag Regel 7).
             pub(super) fn map_readfs_err(
                 err: ::harw_dod_readfs::ReadFsError,
             ) -> ::harw_dod_cap::SensorError {
@@ -692,7 +700,8 @@ pub(crate) fn expand_sensor_source(input: &DeriveInput) -> syn::Result<TokenStre
                     ::harw_dod_readfs::ReadFsError::Scope(inner) => inner,
                     ::harw_dod_readfs::ReadFsError::TooLarge { .. }
                     | ::harw_dod_readfs::ReadFsError::GlobPatternAbsolute { .. }
-                    | ::harw_dod_readfs::ReadFsError::GlobPatternTraversal { .. } => {
+                    | ::harw_dod_readfs::ReadFsError::GlobPatternTraversal { .. }
+                    | ::harw_dod_readfs::ReadFsError::GlobLimitExceeded { .. } => {
                         ::harw_dod_cap::SensorError::MalformedSource
                     }
                 }

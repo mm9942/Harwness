@@ -429,7 +429,7 @@ pub(crate) fn finding_output(
     }
     let text = serde_json::to_string_pretty(&payload)
         .map_err(|error| OpError::Execution(format!("Ausgabe nicht serialisierbar: {error}")))?;
-    Ok(OpOutput { text })
+    Ok(OpOutput::from(text))
 }
 
 // ── Operation ────────────────────────────────────────────────────────────────
@@ -482,7 +482,7 @@ pub(crate) fn finding_output(
     // Web-Fläche übernimmt dieselbe Achse wie das ModelTool: der Kindagent
     // läuft mit `reduce_to_read_only`-Autorität, die Operation selbst
     // schreibt nichts.
-    web(path = "/api/explore", readonly, approval = "none"),
+    web(path = "/api/explore", method = "get", approval = "none"),
     agent_tool(
         child = "explorer",
         authority = "reduce_to_read_only",

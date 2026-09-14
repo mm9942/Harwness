@@ -1,0 +1,34 @@
+[package]
+name = "harw-egress"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# W3 C-EGRESS: URL-Parsing und Host-Suffix-Regel kommen ausschließlich aus
+# `harw_sandbox::egress` (EgressUrl, EgressHost, host_matches_suffix) — keine
+# zweite Parser- oder Suffix-Implementierung (F-002, F-197).
+harw-sandbox = { path = "../harw-sandbox" }
+# Kanonischer Policy-Digest (`EgressPolicy::digest`).
+blake3 = { workspace = true }
+tracing = { workspace = true }
+# Dieselbe Hauptversion und derselbe Feature-Satz wie harw-tool-web/harw-core
+# (Cargo.lock: reqwest 0.12.28). N-WEB bekommt den Client aus diesem Crate;
+# eine abweichende Hauptversion (0.13) ergäbe inkompatible `Client`-Typen.
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
+# `tokio::net::lookup_host` im Scoped-Resolver (Cargo.lock: tokio 1.53.0).
+# W5 N-EGRESS (SOCKS5-Proxy): `rt` (JoinSet/spawn), `io-util` (read_exact,
+# write_all), `time` (timeout, sleep), `macros` (select!).
+tokio = { version = "1.53.0", features = ["net", "rt", "io-util", "time", "macros"] }
+# `url::Host::parse` normalisiert Allowlist-Einträge mit demselben WHATWG-
+# Host-Parser, den `EgressUrl::parse` für URLs nutzt (Cargo.lock: url 2.5.8).
+url = "2.5.8"
+
+[dev-dependencies]
+# `sync` (oneshot) nur für Proxy-Tests; `tempfile` für Unix-Socket-Tempdirs
+# (Workspace-Dep, Cargo.lock: tempfile 3.27.0).
+tokio = { version = "1.53.0", features = ["rt", "macros", "net", "io-util", "time", "sync"] }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

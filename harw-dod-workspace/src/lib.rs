@@ -94,5 +94,7 @@ pub mod sensor;
 mod test_support;
 
 pub use error::{WorkspaceError, WorkspaceResult};
-pub use inventory::{Edge, Inventory, StructureChange, VersionSeverity, classify_version_change};
+pub use inventory::{
+    Edge, Inventory, LockedDependency, StructureChange, VersionSeverity, classify_version_change,
+};
 pub use sensor::WorkspaceDriftSensor;

@@ -1,0 +1,112 @@
+# Eingebauter Executor-Worker (Slice B7) — Registry-Profil `Full`.
+#
+# Anders als die fünf ursprünglichen eingebauten Rollen unter `agents/`
+# (`explorer`, `researcher-deps`, `researcher-web`, `planner`, `analyst`) ist
+# `executor` **nicht** read-only: er führt Befehls- und Dateioperationen im
+# Auftrag des Haupt-Agenten aus (`fs.write`, `shell.exec`) und liefert eine
+# kurze Zusammenfassung statt der Rohausgaben zurück. Zweck laut Contract
+# (`harw-scopes-contract.md`, Abschnitt „Nachträgliche Entscheidungen“ /
+# Welle-B-Tabelle): die TUI soll Befehlsfolgen an diesen Worker delegieren
+# können, damit im Hauptfenster nur eine kompakte Fortschrittszeile erscheint
+# statt vieler einzelner Tool-Aufrufe.
+#
+# ── Der Haupt-Agent verliert dadurch nichts ─────────────────────────────────
+# Diese Rolle KOMMT HINZU, sie ERSETZT keine bestehende Werkzeugoberfläche:
+# der Haupt-Agent (Session-Rolle) behält alle seine Werkzeugrechte
+# unverändert und delegiert nur *optional* an `executor`. Jeder Aufruf, den
+# `executor` ausführt, läuft weiterhin durch die Freigabekette des
+# Elternteils (`harw-core/src/session.rs`, `DefaultApprovalPolicy`) — diese
+# Rollendatei erweitert die Werkzeugoberfläche eines Kindes, nicht die
+# Freigabegrenze der Sandbox.
+#
+# ── Warum `RegistryProfile::Full` ───────────────────────────────────────────
+# `Full` ist das einzige Profil, das `fs.write`/`shell.exec` überhaupt
+# registriert (`harw-registry-defaults/src/profile.rs`,
+# `RegistryProfile::Full::registered_tool_names`). Vor diesem Knoten bildete
+# `profile_for_role` **keine** eingebaute Rolle auf `Full` ab (siehe den
+# damaligen Test `test_full_is_the_only_writable_profile_and_never_a_fallback`
+# in `profile.rs`) — `executor` ist die erste ausdrückliche Ausnahme, keine
+# stillschweigende.
+#
+# ── `admitted` deckt `Full` vollstaendig ab ─────────────────────────────────
+# `RegistryProfile::Full::registered_tool_names()` liefert sieben Werkzeuge
+# (`fs.read`, `fs.write`, `fs.list`, `fs.search`, `fs.glob`, `fs.grep`,
+# `shell.exec`). Dieser Knoten admittiert alle sieben: `executor` fuehrt
+# Befehls- und Dateioperationen im Auftrag des Haupt-Agenten aus und braucht
+# dafuer auch die Suchwerkzeuge, um vor einem Schreibzugriff nachzusehen.
+# Die Deckungspruefung `tests/tool_admission_coverage.rs::
+# every_profile_registered_tool_is_admitted_by_its_role` verlangt genau diese
+# Gleichheit — eine Teilmenge waere ein Testbruch, keine Haertung.
+#
+# Die Rechte sind trotzdem nicht schrankenlos: jeder Aufruf dieses Kindes
+# laeuft weiter durch die Freigabekette des Elternteils, und die Sandbox
+# begrenzt ihn auf dieselben Wurzeln.
+#
+# ── Rückgabevertrag ──────────────────────────────────────────────────────────
+# `harwness.return.execution-summary@1`: eine kurze, für den Haupt-Agenten
+# lesbare Zusammenfassung dessen, was ausgeführt wurde — keine Rohausgaben
+# (kein rohes stdout/stderr, kein vollständiger Dateiinhalt). Für
+# `ReturnPipeline` ist `contract` ein undurchsichtiges Label
+# (`harw-agent-dsl/src/executable.rs`); die IR prüft weder Existenz noch Form
+# des Schemas, sie transportiert nur den Vertrag.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.executor@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "executor"
+
+name = "Executor"
+description = "Führt Befehls- und Dateioperationen im Auftrag des Haupt-Agenten aus und liefert eine Zusammenfassung."
+
+[work]
+mode = "delegated-execution"
+may_write_code = true
+may_research_web = false
+
+# Die zugelassene Werkzeugoberflaeche. `forbidden` benennt die verweigerten
+# Werkzeuge ausdruecklich, damit ein Konsument die Ablehnung begruenden kann,
+# statt nur "nicht in admitted" zu melden.
+[tools]
+admitted = [
+  "fs.read",
+  "fs.search",
+  "fs.list",
+  "fs.glob",
+  "fs.grep",
+  "fs.write",
+  "shell.exec",
+]
+forbidden = [
+  "web.fetch",
+  "web.docs_rs",
+  "web.crates_io",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+  "lens.ask",
+  "browser.open",
+  "browser.observe",
+  "browser.find",
+  "browser.act",
+  "browser.wait",
+  "browser.events",
+  "browser.close",
+]
+
+# Ein reiner Ausführungs-Job braucht keine eigenen Kind-Agenten: `executor`
+# führt die ihm übergebene Befehlsfolge selbst aus und meldet zurück, statt
+# weiter zu delegieren.
+[spawn]
+max_depth = 0
+
+[spawn.budget]
+max_tokens = 60000
+max_tool_calls = 40
+max_wall_secs = 180
+
+[return]
+contract = "harwness.return.execution-summary@1"

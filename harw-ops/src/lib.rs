@@ -14,10 +14,18 @@
 //!   registriert (z. B. via `inventory::submit!` durch Extension-Crate).
 //!
 //! # Op-Set
-//! **Grundausstattung** ([`register_all`], 22 Ops): `help`, `status`, `quit`,
+//! **Grundausstattung** ([`register_all`], 24 Ops): `help`, `status`, `quit`,
 //! `new`, `work`, `ps`, `attach`, `stop`, `diff`, `agent`, `skills`, `plugins`,
 //! `model`, `provider`, `permissions`, `compact`, `memory`, `effort`, `mode`,
-//! `context-proposal`, `approval.pending`, `approval.resolve`.
+//! `context-proposal`, `approval.pending`, `approval.resolve`, `add-workdir`,
+//! `export`.
+//! `add-workdir` (Slice B4, Contract §2 A8) legt eine zusätzliche
+//! Workspace-Wurzel für die Sitzung frei (`harw_sandbox::ExtraRootsCell`),
+//! optional dauerhaft fürs Projekt gemerkt; `export` (Slice B4, „Nachträgliche
+//! Entscheidungen") liefert nur den `data`-Marker für den TUI-Exportdialog
+//! (siehe `crate::export`-Moduldoku) — beide sind Sitzungs-/Oberflächen-
+//! Steuerung wie `mode`, nicht Recherche/Plan, und stehen deshalb in der
+//! Grundausstattung statt hinter dem `[tools.plan]`-Gate.
 //! `context-proposal` (Knoten AW5-09) steht hier statt in
 //! der Planungsfläche, weil es genau wie `/mode` keine Recherche/Plan-Aktion
 //! ist, sondern eine Operator-Governance-Fläche auf
@@ -48,10 +56,10 @@
 //! Operation zufällig ein `Command`- oder `ModelTool`-Surface trägt, sondern
 //! nur, wenn sich für genau diese Operation begründen lässt:
 //!
-//! 1. **Ist sie wirklich lesend?** `readonly: true` steht nur an Operationen,
-//!    deren Rumpf nachweislich nichts verändert (reine Auflistungen, Ansichten,
-//!    read-only-Kindagenten). Ein `GET`, das mutiert, wird von Zwischenschichten
-//!    (Prefetch, Retry, Cache) still ausgenutzt.
+//! 1. **Ist sie wirklich lesend?** `method: WebMethod::Get` steht nur an
+//!    Operationen, deren Rumpf nachweislich nichts verändert (reine
+//!    Auflistungen, Ansichten, read-only-Kindagenten). Ein `GET`, das mutiert,
+//!    wird von Zwischenschichten (Prefetch, Retry, Cache) still ausgenutzt.
 //! 2. **Welche `ApprovalPolicy`?** Wiederverwendet ausschließlich das Feld, das
 //!    `Surface::ModelTool` bereits kennt — keine eigene Web-Autoritätsachse.
 //!    Irreversible Aktionen (`stop`, `plan`, `goal`) bekommen `approval =
@@ -64,10 +72,10 @@
 //!    Aufrufpfad bedient (`memory`, `context-proposal`, `agent`, `plugins`,
 //!    `skills`) und die deshalb schon keine `ModelTool`-Fläche haben, bekommen
 //!    aus demselben Grund auch keine Web-Fläche: weder ein pauschales
-//!    `readonly` (würde die mutierenden Sub-Kommandos falsch labeln) noch ein
-//!    pauschales `approval` auf die lesenden Sub-Kommandos (unnötige
-//!    Bestätigungspflicht) ist korrekt, ohne die Operation in getrennte
-//!    Surfaces aufzuteilen — das liegt außerhalb dieses Knotens.
+//!    `method: WebMethod::Get` (würde die mutierenden Sub-Kommandos falsch
+//!    labeln) noch ein pauschales `approval` auf die lesenden Sub-Kommandos
+//!    (unnötige Bestätigungspflicht) ist korrekt, ohne die Operation in
+//!    getrennte Surfaces aufzuteilen — das liegt außerhalb dieses Knotens.
 //! 5. **Ausschluss bei fail-closed-Stubs.** Operationen, die heute für jede
 //!    Aktion `OpError::NotAvailable` liefern (`new`, `skills`, `plugins`,
 //!    `compact`), bekommen keine Web-Fläche — es gäbe nichts zu bedienen.
@@ -90,6 +98,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod add_workdir;
 pub mod agent;
 pub mod analyze;
 pub mod approval;
@@ -100,6 +109,7 @@ pub mod context_proposal;
 pub mod diff;
 pub mod effort;
 pub mod explore;
+pub mod export;
 pub mod goal;
 pub mod help;
 pub mod memory;
@@ -152,6 +162,7 @@ impl Operation for UnavailableCompactOperation {
             aliases: &[],
             category: OperationCategory::Session,
             args_schema: None,
+            output_schema: None,
         })
     }
 
@@ -161,19 +172,17 @@ impl Operation for UnavailableCompactOperation {
 }
 
 fn compact_unavailable_output() -> OpOutput {
-    OpOutput {
-        text: "Session compaction is not available in this runtime.".to_owned(),
-    }
+    OpOutput::from("Session compaction is not available in this runtime.".to_owned())
 }
 
-/// Registriert alle 22 in dieser Crate definierten Kern-Operationen in der Registry.
+/// Registriert alle 24 in dieser Crate definierten Kern-Operationen in der Registry.
 ///
 /// # Beschreibung
 /// Fügt der übergebenen [`OperationRegistry`] eine `Arc<dyn Operation>`-Instanz
 /// jeder konkreten Op-Struct hinzu — jeweils genau einmal, in fester Reihenfolge:
 /// `help, status, quit, new, work, ps, attach, stop, diff, agent, skills,
 /// plugins, model, provider, permissions, compact, memory, effort, mode,
-/// context-proposal, approval.pending, approval.resolve`.
+/// context-proposal, approval.pending, approval.resolve, add-workdir, export`.
 ///
 /// Die Reihenfolge steuert nur die `iter()`-Reihenfolge und den Fallback-Namens-
 /// Vorschlag; die eigentliche Auflösung erfolgt über `find_by_name` /
@@ -193,7 +202,7 @@ fn compact_unavailable_output() -> OpOutput {
 ///
 /// let mut registry = OperationRegistry::new();
 /// harw_ops::register_all(&mut registry);
-/// assert_eq!(registry.len(), 22);
+/// assert_eq!(registry.len(), 24);
 /// assert!(registry.find_by_name("help").is_some());
 /// assert!(registry.find_by_command("/status").is_some());
 /// assert!(registry.find_by_command("/effort").is_some());
@@ -201,9 +210,11 @@ fn compact_unavailable_output() -> OpOutput {
 /// assert!(registry.find_by_command("/context-proposal").is_some());
 /// assert!(registry.find_by_name("approval.pending").is_some());
 /// assert!(registry.find_by_name("approval.resolve").is_some());
+/// assert!(registry.find_by_command("/add-workdir").is_some());
+/// assert!(registry.find_by_command("/export").is_some());
 /// ```
 pub fn register_all(registry: &mut OperationRegistry) {
-    let ops: [Arc<dyn Operation>; 22] = [
+    let ops: [Arc<dyn Operation>; 24] = [
         Arc::new(help::HelpOperation),
         Arc::new(status::StatusOperation),
         Arc::new(quit::QuitOperation),
@@ -237,6 +248,11 @@ pub fn register_all(registry: &mut OperationRegistry) {
         // demselben Grund wie `mode`/`context-proposal` oben.
         Arc::new(approval::ApprovalPendingOperation),
         Arc::new(approval::ApprovalResolveOperation),
+        // Slice B4 (Contract §2 A8): Sitzungs-/Oberflächen-Steuerung wie
+        // `mode`/`context-proposal` oben — Grundausstattung, nicht hinter
+        // dem `[tools.plan]`-Gate.
+        Arc::new(add_workdir::AddWorkdirOperation),
+        Arc::new(export::ExportOperation),
     ];
     for op in ops {
         registry.register(op);
@@ -319,6 +335,7 @@ pub fn register_plan_tools(registry: &mut OperationRegistry, config: &PlanToolCo
 #[cfg(test)]
 mod tests {
     use super::{compact_unavailable_output, register_all};
+    use harw_operations::operation::WebMethod;
     use harw_operations::registry::OperationRegistry;
     use harw_operations::{ApprovalPolicy, PermissionTier, Surface};
     use harw_plan::config::PlanToolConfig;
@@ -332,49 +349,66 @@ mod tests {
         reg
     }
 
-    /// Erwartete `Surface::Web`-Deklaration: Operationsname, Pfad, `readonly`
+    /// Erwartete `Surface::Web`-Deklaration: Operationsname, Pfad, `method`
     /// und `approval`. Die genehmigende Begründung für jede Zeile steht am
     /// jeweiligen `#[operation(...)]`-Aufruf in der Op-Datei (siehe dort).
-    const EXPECTED_WEB_SURFACES: &[(&str, &str, bool, ApprovalPolicy)] = &[
-        ("help", "/api/help", true, ApprovalPolicy::None),
-        ("status", "/api/status", true, ApprovalPolicy::None),
-        ("ps", "/api/ps", true, ApprovalPolicy::None),
-        ("diff", "/api/diff", true, ApprovalPolicy::None),
-        ("work", "/api/work", true, ApprovalPolicy::None),
-        ("attach", "/api/attach", true, ApprovalPolicy::None),
+    const EXPECTED_WEB_SURFACES: &[(&str, &str, WebMethod, ApprovalPolicy)] = &[
+        ("help", "/api/help", WebMethod::Get, ApprovalPolicy::None),
+        ("status", "/api/status", WebMethod::Get, ApprovalPolicy::None),
+        ("ps", "/api/ps", WebMethod::Get, ApprovalPolicy::None),
+        ("diff", "/api/diff", WebMethod::Get, ApprovalPolicy::None),
+        ("work", "/api/work", WebMethod::Get, ApprovalPolicy::None),
+        ("attach", "/api/attach", WebMethod::Get, ApprovalPolicy::None),
         (
             "permissions",
             "/api/permissions",
-            false,
+            WebMethod::Post,
             ApprovalPolicy::Always,
         ),
-        ("explore", "/api/explore", true, ApprovalPolicy::None),
+        (
+            "explore",
+            "/api/explore",
+            WebMethod::Get,
+            ApprovalPolicy::None,
+        ),
         (
             "research_deps",
             "/api/research-deps",
-            true,
+            WebMethod::Get,
             ApprovalPolicy::None,
         ),
         (
             "research_web",
             "/api/research-web",
-            true,
+            WebMethod::Get,
             ApprovalPolicy::None,
         ),
-        ("analyze", "/api/analyze", true, ApprovalPolicy::None),
-        ("stop", "/api/stop", false, ApprovalPolicy::Always),
-        ("plan", "/api/plan", false, ApprovalPolicy::Always),
-        ("goal", "/api/goal", false, ApprovalPolicy::Always),
+        // `analyze` deklarierte vor W3-M `readonly`, obwohl sein Rumpf dauerhaft
+        // in den Plan-Store schreibt und einen Fan-out startet (F-031,
+        // Register `x-findings-register-w1-w3.md:359`). Agent OPS-1 hat das in
+        // seinem Owned-File `harw-ops/src/analyze.rs` bereits auf
+        // `method = "post"` korrigiert (siehe `ledger/W3M/OPS-1.md` §3.1) —
+        // diese Tabelle folgt dem tatsächlichen, korrigierten Code, nicht der
+        // alten (falschen) `readonly`-Deklaration.
+        (
+            "analyze",
+            "/api/analyze",
+            WebMethod::Post,
+            ApprovalPolicy::None,
+        ),
+        ("stop", "/api/stop", WebMethod::Post, ApprovalPolicy::Always),
+        ("plan", "/api/plan", WebMethod::Post, ApprovalPolicy::Always),
+        ("goal", "/api/goal", WebMethod::Post, ApprovalPolicy::Always),
         (
             "approval.pending",
             "/api/approval-pending",
-            true,
+            WebMethod::Get,
             ApprovalPolicy::None,
         ),
         (
             "approval.resolve",
             "/api/approval-resolve",
-            false,
+            WebMethod::Post,
             ApprovalPolicy::None,
         ),
     ];
@@ -387,7 +421,7 @@ mod tests {
         // belegt, dass jede hier als exponiert entschiedene Operation jetzt
         // tatsächlich über die Registry mit ihrem Web-Pfad auffindbar ist.
         let reg = full_registry();
-        for (name, path, readonly, approval) in EXPECTED_WEB_SURFACES {
+        for (name, path, method, approval) in EXPECTED_WEB_SURFACES {
             let op = reg
                 .find_by_name(name.trim())
                 .unwrap_or_else(|| panic!("operation '{name}' must be registered"));
@@ -395,39 +429,47 @@ mod tests {
             for surface in &op.meta().surfaces {
                 if let Surface::Web {
                     path: p,
-                    readonly: r,
+                    method: m,
                     approval: a,
                 } = surface
                 {
-                    if *p == *path && *r == *readonly && *a == *approval {
+                    if *p == *path && *m == *method && *a == *approval {
                         found = true;
                     }
                 }
             }
             assert!(
                 found,
-                "operation '{name}' must declare Surface::Web {{ path: \"{path}\", readonly: {readonly}, approval: {approval:?} }}"
+                "operation '{name}' must declare Surface::Web {{ path: \"{path}\", method: {method:?}, approval: {approval:?} }}"
             );
         }
     }
 
     #[test]
-    fn readonly_web_surfaces_only_appear_on_operations_that_do_not_mutate() {
-        // Die Gegenprobe zur obigen Tabelle: alle als `readonly = true`
+    fn web_surfaces_use_get_only_for_operations_that_do_not_mutate() {
+        // Die Gegenprobe zur obigen Tabelle: alle als `WebMethod::Get`
         // deklarierten Web-Flächen gehören zu Operationen, die laut ihrer
         // eigenen Moduldoku nichts verändern (reine Auflistungen/Ansichten/
         // read-only-Kindagenten); die mutierenden Operationen (`stop`, `plan`,
-        // `goal`, `approval.resolve`, `permissions`) stehen bewusst mit
-        // `readonly = false` in der Tabelle. `permissions` ist seit der
-        // Umschaltung des Freigabemodus (`/permissions set`) darunter.
-        for (name, _path, readonly, _approval) in EXPECTED_WEB_SURFACES {
+        // `goal`, `approval.resolve`, `permissions`, `analyze`) stehen bewusst
+        // mit `WebMethod::Post` in der Tabelle. `permissions` ist seit der
+        // Umschaltung des Freigabemodus (`/permissions set`) darunter;
+        // `analyze` seit dem F-031-Sicherheitsfix (siehe Kommentar an der
+        // Tabellenzeile oben) — es persistiert dauerhaft im Plan-Store und
+        // startet einen Fan-out, trotz vormals falsch deklariertem `readonly`.
+        for (name, _path, method, _approval) in EXPECTED_WEB_SURFACES {
             let is_mutating = matches!(
                 *name,
-                "stop" | "plan" | "goal" | "approval.resolve" | "permissions"
+                "stop" | "plan" | "goal" | "approval.resolve" | "permissions" | "analyze"
             );
+            let expected = if is_mutating {
+                WebMethod::Post
+            } else {
+                WebMethod::Get
+            };
             assert_eq!(
-                *readonly, !is_mutating,
-                "operation '{name}': readonly flag must match its actual mutation behaviour"
+                *method, expected,
+                "operation '{name}': web method must match its actual mutation behaviour"
             );
         }
     }
@@ -516,10 +558,10 @@ mod tests {
     }
 
     #[test]
-    fn register_all_adds_twenty_two_operations() {
+    fn register_all_adds_twenty_four_operations() {
         let mut reg = OperationRegistry::new();
         register_all(&mut reg);
-        assert_eq!(reg.len(), 22);
+        assert_eq!(reg.len(), 24);
     }
 
     #[test]
@@ -599,6 +641,8 @@ mod tests {
             "/effort",
             "/mode",
             "/context-proposal",
+            "/add-workdir",
+            "/export",
         ] {
             assert!(
                 reg.find_by_command(path).is_some(),
@@ -674,6 +718,8 @@ mod tests {
             "context-proposal",
             "approval.pending",
             "approval.resolve",
+            "add-workdir",
+            "export",
             "plan",
             "goal",
             "explore",
@@ -722,8 +768,8 @@ mod tests {
         register_all(&mut reg);
         assert_eq!(
             reg.len(),
-            22,
-            "first register_all must produce exactly 22 ops"
+            24,
+            "first register_all must produce exactly 24 ops"
         );
 
         // Attempt to register HelpOperation a second time via the fallible path.
@@ -737,8 +783,8 @@ mod tests {
         // Registry must not have grown — the rejected op was not inserted.
         assert_eq!(
             reg.len(),
-            22,
-            "registry must stay at 22 after a rejected duplicate"
+            24,
+            "registry must stay at 24 after a rejected duplicate"
         );
     }
 }

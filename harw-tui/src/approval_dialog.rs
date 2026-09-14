@@ -1,0 +1,1119 @@
+//! Freigabe-Panel: hervorgehobener Dialog anstelle des Composers.
+//!
+//! Spec-Quelle: `nope-permissions-gibt-es-wild-lobster.md` Schritt 3
+//! (Freigabe als Dialog) und `harw-scopes-contract.md` §2/§5 Slice B2.
+//!
+//! # Verantwortung
+//! Dieses Modul besitzt ausschließlich die Darstellung und Tastaturlogik des
+//! Freigabe-Panels — es kennt weder den Freigabe-Kanal (`crate::approval`)
+//! noch das Arming-Delay selbst (`classify_armed_approval_key` in `app.rs`).
+//! Der Aufrufer (spätere Verdrahtung in `app.rs`/Slice B3) reicht das
+//! Ergebnis von `classify_armed_approval_key` als `armed`-Flag durch und
+//! wertet die zurückgegebene [`DialogAction`] aus. Ebenso berechnet der
+//! Aufrufer die „nicht mehr fragen“-Regel (`harw_extension_api::allow_rules::
+//! derive_shell_rule`) **vorher** — dieses Modul rendert die Regel nur, wenn
+//! sie als [`ApprovalDialogRequest::remember_rule`] übergeben wird.
+//!
+//! # Schlüsseltypen
+//! - [`ApprovalDialog`] — Widget-Zustand (Argumente, Auswahl, Details,
+//!   Freitext-Eingabe). Zeichnet sich selbst in einen `ratatui::Buffer`,
+//!   analog zu [`crate::command_popup::CommandPopup`] und
+//!   [`crate::choice_dialog::ChoiceDialog`].
+//! - [`ApprovalDialogRequest`] — unveränderliche Eingaben für
+//!   [`ApprovalDialog::new`].
+//! - [`ApprovalChoice`] — die vier möglichen Entscheidungen des Nutzers.
+//! - [`DialogAction`] — Ereignis, das [`ApprovalDialog::handle_key`]
+//!   zurückgibt.
+//!
+//! # Terminal-Sicherheit
+//! Wie `history_cell.rs` (W1-08, Register G-007/G-008): Werkzeugname,
+//! Argumente, `cwd`, Risiko, Begründung, Herkunft und die „nicht mehr
+//! fragen“-Regel sind nicht vertrauenswürdiger Text (Modell- bzw.
+//! Agentenausgabe) und laufen vor dem Rendern durch
+//! [`crate::sanitize::sanitize_reveal`]/[`crate::sanitize::sanitize_reveal_inline`]
+//! (Argumentwerte, nichts wird verschluckt) bzw.
+//! [`crate::sanitize::sanitize_inline`] (einzeilige Zusatzfelder). Die vom
+//! Nutzer selbst getippte Freitext-Ablehnung nimmt nur Zeichen an, für die
+//! `char::is_control()` falsch ist (siehe [`ApprovalDialog::handle_key`]).
+//!
+//! # Nebenläufigkeit
+//! Kein interner Zustand wird geteilt; der Aufrufer hält `ApprovalDialog`
+//! exklusiv. Keine Locks, keine Threads.
+//!
+//! # Fehlertypen
+//! Keine — alle Operationen sind infallibel.
+//!
+//! # Beispiele
+//! ```ignore
+//! use std::time::{Duration, Instant};
+//! use harw_tui::approval_dialog::{ApprovalDialog, ApprovalDialogRequest};
+//!
+//! let call = harw_extension_api::ToolCall {
+//!     id: harw_types::ToolCallId::new(),
+//!     name: harw_extension_api::ToolName::new("shell.exec"),
+//!     arguments: serde_json::json!({ "command": "git status --short" }),
+//! };
+//! let dialog = ApprovalDialog::new(ApprovalDialogRequest {
+//!     call,
+//!     cwd: Some("/home/u/project".to_owned()),
+//!     justification: None,
+//!     risk: None,
+//!     origin: None,
+//!     remember_rule: Some("git status".to_owned()),
+//!     deadline: Instant::now() + Duration::from_secs(1800),
+//!     reason_input_enabled: true,
+//! });
+//! assert!(dialog.desired_height(60) > 0);
+//! ```
+
+use std::time::{Duration, Instant};
+
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Widget},
+};
+
+use harw_extension_api::ToolCall;
+
+use crate::history_cell::{
+    APPROVAL_COLLAPSED_ARGUMENT_LINES, ApprovalArgument, ApprovalArgumentValue, wrap_plain,
+};
+use crate::sanitize::{sanitize_inline, sanitize_reveal, sanitize_reveal_inline};
+use crate::style::{self, Theme};
+
+/// Fußzeilen-Hinweis mit der Tastaturbelegung des Panels.
+const FOOTER_HINT: &str = "↑↓ wählen · Enter bestätigen · v Details · Esc = Nein";
+
+/// Hinweis auf `Esc` in der Beschriftung der Ablehnungs-Option.
+const REJECT_HINT_PLAIN: &str = "(Esc)";
+
+/// Hinweis auf `Esc` plus `Tab`, wenn eine Begründung eingegeben werden kann.
+const REJECT_HINT_WITH_REASON: &str = "(Esc) · Tab: Grund angeben";
+
+/// Text vor dem Freitext-Eingabefeld für die Ablehnungsbegründung.
+const REASON_PROMPT: &str = "Grund: ";
+
+/// Schwelle (Sekunden), ab der der Countdown in Warnfarbe erscheint.
+const COUNTDOWN_WARNING_THRESHOLD_SECS: u64 = 60;
+
+/// Die Entscheidung, die der Nutzer im Freigabe-Panel getroffen hat.
+///
+/// # Beschreibung
+/// Entspricht den vier Optionen aus Plan Schritt 3. Der Aufrufer übersetzt
+/// dies in eine [`harw_core::ApprovalResolution`] (Approve/Reject) und, bei
+/// [`Self::ApproveAndRemember`]/[`Self::ApproveAndAutoMode`], in
+/// zusätzliche Seiteneffekte (Regel speichern, Modus wechseln) — dieses
+/// Modul selbst löst keinen dieser Effekte aus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalChoice {
+    /// Option 1: einmalig freigeben.
+    Approve,
+    /// Option 2 (nur sichtbar, wenn eine Regel ableitbar ist): freigeben und
+    /// die genannte Regel dauerhaft als „nicht mehr fragen“ hinterlegen.
+    ApproveAndRemember(String),
+    /// Option 3: freigeben und in den auto-Modus wechseln.
+    ApproveAndAutoMode,
+    /// Option 4: ablehnen, optional mit einer vom Nutzer getippten Begründung.
+    Reject {
+        /// `Some(text)`, wenn der Nutzer über `Tab` eine Begründung eingegeben
+        /// und mit `Enter` abgeschickt hat; sonst `None`.
+        reason: Option<String>,
+    },
+}
+
+/// Ereignis, das [`ApprovalDialog::handle_key`] zurückgibt.
+///
+/// # Beschreibung
+/// - `Stay`: Panel bleibt offen, keine Entscheidung.
+/// - `Decided(choice)`: der Nutzer hat entschieden; der Aufrufer schließt
+///   das Panel und löst die Entscheidung ein.
+/// - `ToggleDetails`: `v` wurde gedrückt; der interne Aufklapp-Zustand hat
+///   bereits gewechselt (siehe [`ApprovalDialog::desired_height`] für die
+///   neue Höhe), der Aufrufer muss nur neu rendern/die Fläche neu bemessen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DialogAction {
+    /// Panel bleibt offen, keine Entscheidung getroffen.
+    Stay,
+    /// Der Nutzer hat entschieden.
+    Decided(ApprovalChoice),
+    /// Der Aufklapp-Zustand der Argumente wurde umgeschaltet.
+    ToggleDetails,
+}
+
+/// Eingaben für [`ApprovalDialog::new`].
+///
+/// # Beschreibung
+/// Trägt bewusst den vollständigen [`ToolCall`] statt getrennter
+/// `tool_name`/`arguments`-Felder: `harw-tui` führt `serde_json` nicht als
+/// eigene Abhängigkeit (nur transitiv über `harw-extension-api`/
+/// `harw-tools`), und `ToolCall` ist bereits der Typ, den
+/// [`crate::history_cell::ApprovalArgument::from_call`] für genau diesen
+/// Zweck entgegennimmt — die Zerlegung in Schlüssel/Wert-Paare bleibt damit
+/// über einen zentralen Ort definiert, statt zweimal (hier und in
+/// `history_cell.rs`) leicht abweichend nachgebaut zu werden.
+#[derive(Debug, Clone)]
+pub struct ApprovalDialogRequest {
+    /// Der vom Kern festgehaltene Werkzeugaufruf (Name + Argumente).
+    pub call: ToolCall,
+    /// Arbeitsverzeichnis des Aufrufs, falls bekannt.
+    pub cwd: Option<String>,
+    /// Vom Agenten mitgelieferte Begründung für den Aufruf.
+    pub justification: Option<String>,
+    /// Risikoeinschätzung als kurzer Text (z. B. „hoch — löscht Dateien“).
+    pub risk: Option<String>,
+    /// Herkunftsangabe, wenn der Aufruf von einem Kind-/Unteragenten stammt
+    /// (z. B. `"von executor"`).
+    pub origin: Option<String>,
+    /// Vom Aufrufer über `harw_extension_api::allow_rules::derive_shell_rule`
+    /// abgeleitete Regel-Vorschlag; `None`, wenn keine sichere Regel
+    /// ableitbar ist (Option 2 entfällt dann, siehe [`ApprovalDialog`]).
+    pub remember_rule: Option<String>,
+    /// Zeitpunkt, zu dem die Freigabefrage automatisch als Ablehnung gilt.
+    /// Ein [`Instant`] statt einer Restsekundenzahl, damit der Countdown bei
+    /// jedem Rendern gegen die tatsächlich verstrichene Zeit neu berechnet
+    /// wird, statt einen einmal übergebenen Wert veralten zu lassen.
+    pub deadline: Instant,
+    /// `true`, wenn der Aufrufer eine getippte Ablehnungsbegründung erlaubt
+    /// (`Tab`-Hinweis und Freitexteingabe erscheinen dann in Option 4).
+    pub reason_input_enabled: bool,
+}
+
+/// Eine der vier Optionen, unabhängig von ihrer sichtbaren Nummer.
+///
+/// # Beschreibung
+/// Die sichtbare Nummer ergibt sich allein aus der Position in
+/// [`ApprovalDialog::visible_options`] — [`OptionKind::Remember`] fehlt in
+/// dieser Liste, wenn keine Regel vorgeschlagen wurde, und alle folgenden
+/// Optionen rücken automatisch nach (Plan Schritt 3: „Renumber correctly
+/// when option 2 is absent“).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptionKind {
+    /// „Ja“.
+    Approve,
+    /// „Ja, und nicht mehr fragen für: …“.
+    Remember,
+    /// „Ja, und in den auto-Modus wechseln“.
+    AutoMode,
+    /// „Nein“.
+    Reject,
+}
+
+/// Stil-Kategorie einer gerenderten Zeile; die tatsächliche Farbe entsteht
+/// erst in [`ApprovalDialog::render`] aus dem übergebenen [`Theme`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowStyle {
+    /// Countdown-Zeile; `true` = unter der Warnschwelle.
+    Countdown { warn: bool },
+    /// Hervorgehobenes Hauptargument (Befehl/Pfad).
+    Primary,
+    /// Gedimmte Zusatzinformation (cwd, Risiko, Begründung, Herkunft,
+    /// eingeklappte übrige Argumente).
+    Dim,
+    /// Optionszeile; `true` = aktuell markiert.
+    Option { selected: bool },
+    /// Freitext-Eingabezeile für die Ablehnungsbegründung.
+    ReasonInput,
+    /// Unformatierte Zeile (Leerzeile, Fußzeile).
+    Plain,
+}
+
+impl RowStyle {
+    /// Löst diese Kategorie in einen konkreten [`Style`] auf.
+    fn resolve(self, theme: Theme) -> Style {
+        match self {
+            RowStyle::Countdown { warn: true } => Style::default()
+                .fg(style::warning_color(theme))
+                .add_modifier(Modifier::BOLD),
+            RowStyle::Countdown { warn: false } => style::dim_style(theme),
+            RowStyle::Primary => Style::default().add_modifier(Modifier::BOLD),
+            RowStyle::Dim => style::dim_style(theme),
+            RowStyle::Option { selected: true } => style::selected_style(theme),
+            RowStyle::Option { selected: false } => Style::default(),
+            RowStyle::ReasonInput => Style::default(),
+            RowStyle::Plain => Style::default(),
+        }
+    }
+}
+
+/// Freigabe-Panel: ersetzt den Composer, solange eine Freigabe offen ist.
+///
+/// # Beschreibung
+/// Hält Titel-relevante Daten ([`ApprovalDialogRequest`]), den aus dem
+/// [`ToolCall`] gelösten Argumentsatz (über
+/// [`ApprovalArgument::from_call`], damit die Darstellung mit der
+/// bestehenden Freigabe-Zelle übereinstimmt), die aktuelle Auswahl, den
+/// Aufklapp-Zustand der übrigen Argumente sowie den Zustand der optionalen
+/// Freitext-Eingabe.
+///
+/// # Nebenläufigkeit
+/// Nicht thread-sicher; exklusiver `&mut`-Zugriff des Aufrufers erwartet
+/// (analog [`crate::command_popup::CommandPopup`]).
+#[derive(Debug)]
+pub struct ApprovalDialog {
+    /// Name des zur Freigabe anstehenden Werkzeugs (bestimmt den Titel und
+    /// das bevorzugte Hauptargument).
+    tool_name: String,
+    /// Aus dem `ToolCall` gelöste Argumente; `None`, wenn die Argumente kein
+    /// JSON-Objekt sind (dann bleibt der Argumentblock leer).
+    arguments: Option<Vec<ApprovalArgument>>,
+    /// Arbeitsverzeichnis des Aufrufs, falls bekannt.
+    cwd: Option<String>,
+    /// Vom Agenten mitgelieferte Begründung.
+    justification: Option<String>,
+    /// Risikoeinschätzung.
+    risk: Option<String>,
+    /// Herkunftsangabe (Kind-/Unteragent).
+    origin: Option<String>,
+    /// Regel-Vorschlag für „nicht mehr fragen“; steuert, ob Option 2
+    /// erscheint.
+    remember_rule: Option<String>,
+    /// Zeitpunkt, zu dem die Frage automatisch als Ablehnung gilt.
+    deadline: Instant,
+    /// Ob die Freitext-Ablehnungsbegründung angeboten wird.
+    reason_input_enabled: bool,
+    /// Index der aktuell markierten Option in [`Self::visible_options`].
+    selected: usize,
+    /// `true`, wenn die übrigen Argumente vollständig angezeigt werden.
+    expanded: bool,
+    /// `true`, während die Freitext-Eingabe aktiv ist (nach `Tab`).
+    reason_editing: bool,
+    /// Bisher getippter Text der Freitext-Eingabe.
+    reason_text: String,
+}
+
+impl ApprovalDialog {
+    /// Baut ein neues Freigabe-Panel mit der ersten Option markiert und
+    /// eingeklappten übrigen Argumenten.
+    ///
+    /// # Argumente
+    /// - `request` ([`ApprovalDialogRequest`]): siehe Feldbeschreibungen dort.
+    ///
+    /// # Rückgabe
+    /// Ein einsatzbereites `ApprovalDialog`.
+    #[must_use]
+    pub fn new(request: ApprovalDialogRequest) -> Self {
+        let tool_name = request.call.name.as_str().to_owned();
+        let arguments = ApprovalArgument::from_call(&request.call);
+        Self {
+            tool_name,
+            arguments,
+            cwd: request.cwd,
+            justification: request.justification,
+            risk: request.risk,
+            origin: request.origin,
+            remember_rule: request.remember_rule,
+            deadline: request.deadline,
+            reason_input_enabled: request.reason_input_enabled,
+            selected: 0,
+            expanded: false,
+            reason_editing: false,
+            reason_text: String::new(),
+        }
+    }
+
+    /// Gibt die aktuell sichtbaren Optionen in Anzeigereihenfolge zurück.
+    ///
+    /// [`OptionKind::Remember`] fehlt, wenn kein Regel-Vorschlag vorliegt —
+    /// alle folgenden Optionen rücken dadurch automatisch eine Nummer nach.
+    fn visible_options(&self) -> Vec<OptionKind> {
+        let mut options = vec![OptionKind::Approve];
+        if self.remember_rule.is_some() {
+            options.push(OptionKind::Remember);
+        }
+        options.push(OptionKind::AutoMode);
+        options.push(OptionKind::Reject);
+        options
+    }
+
+    /// Übersetzt eine [`OptionKind`] in die zugehörige [`ApprovalChoice`].
+    fn choice_for(&self, kind: OptionKind) -> ApprovalChoice {
+        match kind {
+            OptionKind::Approve => ApprovalChoice::Approve,
+            OptionKind::Remember => {
+                ApprovalChoice::ApproveAndRemember(self.remember_rule.clone().unwrap_or_default())
+            }
+            OptionKind::AutoMode => ApprovalChoice::ApproveAndAutoMode,
+            OptionKind::Reject => ApprovalChoice::Reject { reason: None },
+        }
+    }
+
+    /// Baut die Beschriftung einer Option (ohne Nummer/Marker).
+    fn option_label(&self, kind: OptionKind) -> String {
+        match kind {
+            OptionKind::Approve => "Ja".to_owned(),
+            OptionKind::Remember => {
+                let rule = self.remember_rule.as_deref().unwrap_or_default();
+                format!("Ja, und nicht mehr fragen für: {}", sanitize_inline(rule))
+            }
+            OptionKind::AutoMode => "Ja, und in den auto-Modus wechseln".to_owned(),
+            OptionKind::Reject => {
+                let hint = if self.reason_input_enabled {
+                    REJECT_HINT_WITH_REASON
+                } else {
+                    REJECT_HINT_PLAIN
+                };
+                format!("Nein {hint}")
+            }
+        }
+    }
+
+    /// Verbleibende Zeit bis zum automatischen Ablehnen.
+    ///
+    /// # Rückgabe
+    /// `Duration::ZERO`, wenn die Frist bereits verstrichen ist — der
+    /// Countdown zeigt dann `noch 0:00` statt zu unterlaufen.
+    fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    /// Verarbeitet einen Tastendruck und gibt eine [`DialogAction`] zurück.
+    ///
+    /// # Beschreibung
+    /// **Arming-Vertrag**: Ist `armed == false`, liefert diese Methode für
+    /// **jede** Taste `DialogAction::Stay` — sie wertet die Taste nicht
+    /// einmal aus. Der Aufrufer bestimmt `armed` über
+    /// `classify_armed_approval_key` (`app.rs`) und ist allein dafür
+    /// zuständig, dass die erste kurze Zeitspanne nach dem Erscheinen des
+    /// Panels keine Taste wirken lässt (Schutz vor versehentlicher
+    /// Übernahme eines im Terminalpuffer wartenden Tastendrucks). Dieses
+    /// Modul kennt die Dauer der Sperre nicht und darf sie nicht selbst
+    /// durchsetzen — es verlässt sich vollständig auf den übergebenen Wert.
+    ///
+    /// Ist eine Freitext-Eingabe aktiv (nach `Tab`), gehen alle Tasten außer
+    /// `Enter`/`Esc`/`Backspace` als Zeichen in den Eingabepuffer ein;
+    /// `y`/`n`/`v`/Ziffern lösen währenddessen **keine** Auswahl aus.
+    ///
+    /// Tasten außerhalb der Eingabe:
+    /// - `Up`/`Down`: Auswahl bewegen (an den Rändern begrenzt).
+    /// - `1`-`9`: Auswahl direkt auf die entsprechende (1-basierte) Option
+    ///   setzen, sofern sie existiert; wählt noch nicht aus — dafür `Enter`.
+    /// - `Enter`: aktuell markierte Option entscheiden.
+    /// - `y`/`Y`: sofort [`ApprovalChoice::Approve`] (Kurzwahl für Option 1).
+    /// - `n`/`N`/`Esc`: sofort [`ApprovalChoice::Reject`] ohne Begründung
+    ///   (Kurzwahl für Option 4).
+    /// - `v`/`V`: Aufklapp-Zustand der übrigen Argumente umschalten.
+    /// - `Tab`: Freitext-Eingabe öffnen, sofern
+    ///   [`ApprovalDialogRequest::reason_input_enabled`] gesetzt war.
+    ///
+    /// # Argumente
+    /// - `key` (`KeyEvent`): das eingegangene Crossterm-Tastenereignis.
+    /// - `armed` (`bool`): `true`, wenn das Arming-Delay des Aufrufers
+    ///   bereits abgelaufen ist.
+    ///
+    /// # Rückgabe
+    /// Siehe [`DialogAction`].
+    pub fn handle_key(&mut self, key: KeyEvent, armed: bool) -> DialogAction {
+        if !armed {
+            return DialogAction::Stay;
+        }
+        if self.reason_editing {
+            return self.handle_reason_key(key);
+        }
+
+        let options = self.visible_options();
+        match key.code {
+            KeyCode::Up => {
+                self.selected = self.selected.saturating_sub(1);
+                DialogAction::Stay
+            }
+            KeyCode::Down => {
+                if !options.is_empty() {
+                    self.selected = (self.selected + 1).min(options.len() - 1);
+                }
+                DialogAction::Stay
+            }
+            KeyCode::Char(c @ '1'..='9') => {
+                let zero_based = (c as usize) - ('1' as usize);
+                if zero_based < options.len() {
+                    self.selected = zero_based;
+                }
+                DialogAction::Stay
+            }
+            KeyCode::Enter => {
+                let kind = options
+                    .get(self.selected)
+                    .copied()
+                    .unwrap_or(OptionKind::Reject);
+                DialogAction::Decided(self.choice_for(kind))
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                DialogAction::Decided(ApprovalChoice::Approve)
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                DialogAction::Decided(ApprovalChoice::Reject { reason: None })
+            }
+            KeyCode::Char('v') | KeyCode::Char('V') => {
+                self.expanded = !self.expanded;
+                DialogAction::ToggleDetails
+            }
+            KeyCode::Tab if self.reason_input_enabled => {
+                self.reason_editing = true;
+                self.reason_text.clear();
+                DialogAction::Stay
+            }
+            _ => DialogAction::Stay,
+        }
+    }
+
+    /// Verarbeitet einen Tastendruck, während die Freitext-Eingabe aktiv ist.
+    ///
+    /// Wird nur von [`Self::handle_key`] gerufen, nachdem `armed` bereits
+    /// geprüft wurde.
+    fn handle_reason_key(&mut self, key: KeyEvent) -> DialogAction {
+        match key.code {
+            KeyCode::Enter => {
+                let reason = std::mem::take(&mut self.reason_text);
+                self.reason_editing = false;
+                DialogAction::Decided(ApprovalChoice::Reject {
+                    reason: Some(reason),
+                })
+            }
+            KeyCode::Esc => {
+                // „Esc leaves the input“: nur die Eingabe verlassen, nicht
+                // ablehnen — die Ablehnung bleibt `n`/Esc außerhalb der
+                // Eingabe vorbehalten.
+                self.reason_editing = false;
+                self.reason_text.clear();
+                DialogAction::Stay
+            }
+            KeyCode::Backspace => {
+                self.reason_text.pop();
+                DialogAction::Stay
+            }
+            KeyCode::Char(c) if !c.is_control() => {
+                self.reason_text.push(c);
+                DialogAction::Stay
+            }
+            _ => DialogAction::Stay,
+        }
+    }
+
+    /// Berechnet die Höhe (in Zeilen, inklusive Rahmen), die [`Self::render`]
+    /// bei der gegebenen Breite benötigt.
+    ///
+    /// # Beschreibung
+    /// Der Aufrufer nutzt dies, um die Fläche zu bemessen, die den Composer
+    /// ersetzt (Plan Schritt 3). Wächst mit ausgeklappten Argumenten
+    /// (`v`) und mit aktiver Freitext-Eingabe.
+    ///
+    /// # Argumente
+    /// - `width` (`u16`): Gesamtbreite in Spalten (inklusive Rahmen).
+    ///
+    /// # Rückgabe
+    /// Benötigte Gesamthöhe in Zeilen (inklusive oberem und unterem Rahmen).
+    #[must_use]
+    pub fn desired_height(&self, width: u16) -> u16 {
+        let inner_width = width.saturating_sub(2).max(1);
+        let rows = self.layout_rows(inner_width).len();
+        u16::try_from(rows.saturating_add(2)).unwrap_or(u16::MAX)
+    }
+
+    /// Zeichnet das Panel (Rahmen, Titel, Inhalt) in den angegebenen
+    /// `Buffer`-Bereich.
+    ///
+    /// # Beschreibung
+    /// Rahmen und Titel in der Warnfarbe des Themes; Inhalt darunter gemäß
+    /// [`Self::layout_rows`], zeilenweise abgeschnitten, sobald `area` nicht
+    /// ausreicht (der Aufrufer sollte vorher [`Self::desired_height`]
+    /// nutzen, damit das nie nötig ist).
+    ///
+    /// # Argumente
+    /// - `area` (`Rect`): der Zeichenbereich im Terminal-Buffer.
+    /// - `buf` (`&mut Buffer`): der ratatui-Buffer, in den geschrieben wird.
+    /// - `theme` (`&Theme`): aktives Farbschema.
+    ///
+    /// # Nebenläufigkeit
+    /// Rein synchron; kein Locking erforderlich.
+    ///
+    /// # Sichtbarkeit
+    /// `pub(crate)` statt `pub`: [`Theme`] ist crate-privat (`style`-Modul ist
+    /// `pub(crate)`, siehe `lib.rs`), eine `pub`-Methode mit `&Theme`-Parameter
+    /// wäre von außerhalb der Crate ohnehin nicht aufrufbar gewesen — externer
+    /// Code kann keinen `Theme`-Wert konstruieren. Rendering ist damit
+    /// konsequent als interne Implementierung markiert, konsistent mit
+    /// `history_cell`/`style` (beide `pub(crate)`); nur der Zustand
+    /// (`ApprovalDialog` selbst, `handle_key`, `desired_height`) bleibt Teil
+    /// der öffentlichen Fläche des Crates.
+    pub(crate) fn render(&self, area: Rect, buf: &mut Buffer, theme: &Theme) {
+        let theme = *theme;
+        let border_color = style::warning_color(theme);
+        let title_style = Style::default().fg(border_color).add_modifier(Modifier::BOLD);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border_color))
+            .title(Span::styled(self.title_text(), title_style));
+        let inner = block.inner(area);
+        Widget::render(block, area, buf);
+
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        for (row_idx, (kind, text)) in self
+            .layout_rows(inner.width)
+            .into_iter()
+            .enumerate()
+            .take(inner.height as usize)
+        {
+            let row_area = Rect::new(inner.x, inner.y + row_idx as u16, inner.width, 1);
+            Widget::render(Line::styled(text, kind.resolve(theme)), row_area, buf);
+        }
+    }
+
+    /// Wählt den Titel anhand des Werkzeugnamens (Plan Schritt 3).
+    fn title_text(&self) -> String {
+        match self.tool_name.as_str() {
+            "shell.exec" => " Befehl ausführen? ".to_owned(),
+            "fs.write" | "fs.patch" => " Datei schreiben? ".to_owned(),
+            _ => " Werkzeug freigeben? ".to_owned(),
+        }
+    }
+
+    /// Baut alle Inhaltszeilen (ohne Rahmen) in Anzeigereihenfolge.
+    ///
+    /// Gemeinsam von [`Self::desired_height`] (nur Anzahl) und
+    /// [`Self::render`] (Text + Stil-Kategorie) genutzt, damit beide nie
+    /// auseinanderlaufen.
+    fn layout_rows(&self, width: u16) -> Vec<(RowStyle, String)> {
+        let mut rows: Vec<(RowStyle, String)> = Vec::new();
+
+        let remaining = self.remaining();
+        let countdown = right_align(&format_countdown(remaining), width);
+        rows.push((
+            RowStyle::Countdown {
+                warn: remaining.as_secs() < COUNTDOWN_WARNING_THRESHOLD_SECS,
+            },
+            countdown,
+        ));
+
+        for line in self.primary_argument_strings(width) {
+            rows.push((RowStyle::Primary, line));
+        }
+
+        for (label, value) in self.info_fields() {
+            let text = format!("{label}: {}", sanitize_inline(&value));
+            for line in wrapped_strings(&text, width) {
+                rows.push((RowStyle::Dim, line));
+            }
+        }
+
+        let rest = self.other_argument_strings(width);
+        if !rest.is_empty() {
+            rows.push((RowStyle::Plain, String::new()));
+            for line in rest {
+                rows.push((RowStyle::Dim, line));
+            }
+        }
+
+        rows.push((RowStyle::Plain, String::new()));
+        for (idx, kind) in self.visible_options().into_iter().enumerate() {
+            let selected = idx == self.selected;
+            let marker = if selected { "❯ " } else { "  " };
+            let text = format!("{marker}{}. {}", idx + 1, self.option_label(kind));
+            for line in wrapped_strings(&text, width) {
+                rows.push((RowStyle::Option { selected }, line));
+            }
+        }
+
+        if self.reason_editing {
+            let text = format!("{REASON_PROMPT}{}", self.reason_text);
+            for line in wrapped_strings(&text, width) {
+                rows.push((RowStyle::ReasonInput, line));
+            }
+        }
+
+        rows.push((RowStyle::Plain, String::new()));
+        for line in wrapped_strings(FOOTER_HINT, width) {
+            rows.push((RowStyle::Plain, line));
+        }
+
+        rows
+    }
+
+    /// Zusatzfelder (cwd, Risiko, Begründung, Herkunft) in Anzeigereihenfolge,
+    /// jeweils mit Beschriftung; fehlende Felder werden ausgelassen.
+    fn info_fields(&self) -> Vec<(&'static str, String)> {
+        let mut fields = Vec::new();
+        if let Some(origin) = &self.origin {
+            fields.push(("Herkunft", origin.clone()));
+        }
+        if let Some(cwd) = &self.cwd {
+            fields.push(("cwd", cwd.clone()));
+        }
+        if let Some(risk) = &self.risk {
+            fields.push(("Risiko", risk.clone()));
+        }
+        if let Some(justification) = &self.justification {
+            fields.push(("Begründung", justification.clone()));
+        }
+        fields
+    }
+
+    /// Zeilen des Hauptarguments (Befehl/Pfad), niemals eingeklappt.
+    fn primary_argument_strings(&self, width: u16) -> Vec<String> {
+        let Some(arguments) = &self.arguments else {
+            return Vec::new();
+        };
+        let Some(argument) =
+            primary_argument_index(&self.tool_name, arguments).and_then(|i| arguments.get(i))
+        else {
+            return Vec::new();
+        };
+        argument_display_strings(argument, width)
+    }
+
+    /// Zeilen der übrigen Argumente (alles außer dem Hauptargument),
+    /// eingeklappt auf [`APPROVAL_COLLAPSED_ARGUMENT_LINES`], solange
+    /// [`Self::expanded`] `false` ist.
+    fn other_argument_strings(&self, width: u16) -> Vec<String> {
+        let Some(arguments) = &self.arguments else {
+            return Vec::new();
+        };
+        let primary = primary_argument_index(&self.tool_name, arguments);
+        let mut rest = Vec::new();
+        for (index, argument) in arguments.iter().enumerate() {
+            if Some(index) == primary {
+                continue;
+            }
+            rest.extend(argument_display_strings(argument, width));
+        }
+        if !self.expanded && rest.len() > APPROVAL_COLLAPSED_ARGUMENT_LINES {
+            let hidden = rest.len() - APPROVAL_COLLAPSED_ARGUMENT_LINES;
+            rest.truncate(APPROVAL_COLLAPSED_ARGUMENT_LINES);
+            rest.extend(wrapped_strings(
+                &format!("… {hidden} weitere Zeilen ausgeblendet — [v] vollständig anzeigen"),
+                width,
+            ));
+        }
+        rest
+    }
+}
+
+/// Wählt das Hauptargument, das direkt hinter dem Werkzeugnamen steht.
+///
+/// Eigene, kleine Kopie von `history_cell::approval_primary_index` (dort
+/// modul-privat und daher von hier aus nicht aufrufbar) — identische Logik,
+/// damit die Darstellung übereinstimmt.
+///
+/// # Rückgabe
+/// Index in `arguments`, falls ein passender Schlüssel vorhanden ist.
+fn primary_argument_index(tool_name: &str, arguments: &[ApprovalArgument]) -> Option<usize> {
+    let preferred: &[&str] = match tool_name {
+        "fs.write" => &["path"],
+        "shell.exec" => &["command"],
+        _ => &["command", "path"],
+    };
+    preferred
+        .iter()
+        .find_map(|key| arguments.iter().position(|argument| argument.key == *key))
+}
+
+/// Setzt eine einzeilige Zeichenkette in Anführungszeichen (`"`/`\` escaped).
+fn quote_text(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Rendert ein einzelnes Argument (Schlüssel + Wert) als Textzeilen,
+/// terminal-sicher über [`sanitize_reveal`]/[`sanitize_reveal_inline`].
+///
+/// Mehrzeilige Textwerte bekommen eine Randmarke `│ ` je Zeile, damit eine
+/// Werteszeile nie eine eigene Options- oder Fußzeile vortäuschen kann.
+fn argument_display_strings(argument: &ApprovalArgument, width: u16) -> Vec<String> {
+    let key = sanitize_reveal_inline(&argument.key);
+    match &argument.value {
+        ApprovalArgumentValue::Text(text) => {
+            let value = sanitize_reveal(text);
+            if value.contains('\n') {
+                let mut lines = wrapped_strings(&format!("{key}:"), width);
+                for part in value.split('\n') {
+                    lines.extend(wrapped_strings(&format!("│ {part}"), width));
+                }
+                lines
+            } else {
+                wrapped_strings(&format!("{key}: {}", quote_text(&value)), width)
+            }
+        }
+        ApprovalArgumentValue::Json(json) => {
+            wrapped_strings(&format!("{key}: {}", sanitize_reveal_inline(json)), width)
+        }
+    }
+}
+
+/// Bricht `text` über [`wrap_plain`] um und extrahiert die reinen
+/// Zeicheninhalte (ohne Stil) als `String`s.
+fn wrapped_strings(text: &str, width: u16) -> Vec<String> {
+    wrap_plain(text, width)
+        .into_iter()
+        .map(|line| line.spans.into_iter().map(|s| s.content.into_owned()).collect())
+        .collect()
+}
+
+/// Formatiert die verbleibende Zeit als `"noch M:SS"` (z. B. `"noch 4:52"`).
+fn format_countdown(remaining: Duration) -> String {
+    let total_secs = remaining.as_secs();
+    format!("noch {}:{:02}", total_secs / 60, total_secs % 60)
+}
+
+/// Polstert `text` links mit Leerzeichen, bis es genau `width` Zeichen breit
+/// ist (rechtsbündig); ist `text` bereits mindestens so breit, bleibt es
+/// unverändert.
+fn right_align(text: &str, width: u16) -> String {
+    let text_len = text.chars().count();
+    let width = width as usize;
+    if text_len >= width {
+        return text.to_owned();
+    }
+    format!("{}{text}", " ".repeat(width - text_len))
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crossterm::event::KeyModifiers;
+    use ratatui::layout::Rect;
+
+    /// Baut einen `ToolCall` mit den gegebenen Argumenten.
+    fn tool_call(tool: &str, arguments: harw_tools::serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: harw_types::ToolCallId::new(),
+            name: harw_extension_api::ToolName::new(tool),
+            arguments,
+        }
+    }
+
+    /// Baut ein Panel mit `shell.exec` und einem einzelnen `command`-Argument,
+    /// einer Restlaufzeit von 300s und optionalem Regel-Vorschlag.
+    fn shell_dialog(remember_rule: Option<&str>) -> ApprovalDialog {
+        ApprovalDialog::new(ApprovalDialogRequest {
+            call: tool_call(
+                "shell.exec",
+                harw_tools::serde_json::json!({ "command": "git status --short" }),
+            ),
+            cwd: Some("/home/u/project".to_owned()),
+            justification: None,
+            risk: None,
+            origin: None,
+            remember_rule: remember_rule.map(str::to_owned),
+            deadline: Instant::now() + Duration::from_secs(300),
+            reason_input_enabled: true,
+        })
+    }
+
+    fn make_key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn buffer_to_string(buf: &Buffer) -> String {
+        let area = buf.area();
+        let mut out = String::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn render_dialog(dialog: &ApprovalDialog, width: u16, height: u16) -> String {
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        dialog.render(area, &mut buf, &Theme::Dark);
+        buffer_to_string(&buf)
+    }
+
+    // ── Optionsliste und Nummerierung ───────────────────────────────────
+
+    #[test]
+    fn test_options_with_remember_rule_are_numbered_one_to_four() {
+        let dialog = shell_dialog(Some("git status"));
+        let rendered = render_dialog(&dialog, 70, 20);
+        assert!(rendered.contains("1. Ja"), "{rendered}");
+        assert!(
+            rendered.contains("2. Ja, und nicht mehr fragen für: git status"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("3. Ja, und in den auto-Modus wechseln"), "{rendered}");
+        assert!(rendered.contains("4. Nein"), "{rendered}");
+    }
+
+    #[test]
+    fn test_options_without_remember_rule_are_renumbered() {
+        let dialog = shell_dialog(None);
+        let rendered = render_dialog(&dialog, 70, 20);
+        assert!(rendered.contains("1. Ja"), "{rendered}");
+        assert!(!rendered.contains("nicht mehr fragen"), "{rendered}");
+        assert!(rendered.contains("2. Ja, und in den auto-Modus wechseln"), "{rendered}");
+        assert!(rendered.contains("3. Nein"), "{rendered}");
+        assert!(!rendered.contains("4."), "{rendered}");
+    }
+
+    // ── Auswahl per Ziffer/Pfeil, Enter entscheidet ─────────────────────
+
+    #[test]
+    fn test_digit_and_arrow_selection_move_selected_index() {
+        let mut dialog = shell_dialog(None); // Optionen: Ja / AutoMode / Nein
+        assert_eq!(dialog.selected, 0);
+
+        assert_eq!(dialog.handle_key(make_key(KeyCode::Down), true), DialogAction::Stay);
+        assert_eq!(dialog.selected, 1);
+
+        assert_eq!(dialog.handle_key(make_key(KeyCode::Char('3')), true), DialogAction::Stay);
+        assert_eq!(dialog.selected, 2);
+
+        assert_eq!(dialog.handle_key(make_key(KeyCode::Up), true), DialogAction::Stay);
+        assert_eq!(dialog.selected, 1);
+    }
+
+    #[test]
+    fn test_enter_returns_choice_for_currently_selected_option() {
+        let mut dialog = shell_dialog(Some("git status"));
+        // Option 3 (AutoMode) über Ziffer markieren, dann mit Enter bestätigen.
+        assert_eq!(dialog.handle_key(make_key(KeyCode::Char('3')), true), DialogAction::Stay);
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Enter), true),
+            DialogAction::Decided(ApprovalChoice::ApproveAndAutoMode)
+        );
+    }
+
+    #[test]
+    fn test_enter_returns_remember_choice_with_rule_text() {
+        let mut dialog = shell_dialog(Some("git status"));
+        assert_eq!(dialog.handle_key(make_key(KeyCode::Char('2')), true), DialogAction::Stay);
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Enter), true),
+            DialogAction::Decided(ApprovalChoice::ApproveAndRemember("git status".to_owned()))
+        );
+    }
+
+    // ── n/Esc → Reject, y → Approve ─────────────────────────────────────
+
+    #[test]
+    fn test_n_and_esc_reject_without_reason() {
+        let mut dialog = shell_dialog(None);
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Char('n')), true),
+            DialogAction::Decided(ApprovalChoice::Reject { reason: None })
+        );
+        let mut dialog = shell_dialog(None);
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Esc), true),
+            DialogAction::Decided(ApprovalChoice::Reject { reason: None })
+        );
+    }
+
+    #[test]
+    fn test_y_approves_immediately() {
+        let mut dialog = shell_dialog(None);
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Char('y')), true),
+            DialogAction::Decided(ApprovalChoice::Approve)
+        );
+    }
+
+    // ── v → ToggleDetails ────────────────────────────────────────────────
+
+    #[test]
+    fn test_v_toggles_details() {
+        let mut dialog = shell_dialog(None);
+        assert_eq!(dialog.handle_key(make_key(KeyCode::Char('v')), true), DialogAction::ToggleDetails);
+        assert!(dialog.expanded);
+        assert_eq!(dialog.handle_key(make_key(KeyCode::Char('v')), true), DialogAction::ToggleDetails);
+        assert!(!dialog.expanded);
+    }
+
+    // ── Arming-Vertrag ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_unarmed_keys_never_decide() {
+        let mut dialog = shell_dialog(Some("git status"));
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('y'),
+            KeyCode::Char('n'),
+            KeyCode::Esc,
+            KeyCode::Char('1'),
+            KeyCode::Char('v'),
+            KeyCode::Tab,
+        ] {
+            assert_eq!(dialog.handle_key(make_key(code), false), DialogAction::Stay);
+        }
+        // Kein Tastendruck darf trotz vieler Versuche eine Entscheidung
+        // ausgelöst oder auch nur die Auswahl bewegt haben.
+        assert_eq!(dialog.selected, 0);
+        assert!(!dialog.expanded);
+        assert!(!dialog.reason_editing);
+    }
+
+    // ── Countdown ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_format_countdown_formats_five_minutes() {
+        assert_eq!(format_countdown(Duration::from_secs(300)), "noch 5:00");
+        assert_eq!(format_countdown(Duration::from_secs(292)), "noch 4:52");
+        assert_eq!(format_countdown(Duration::from_secs(5)), "noch 0:05");
+    }
+
+    #[test]
+    fn test_countdown_appears_in_render() {
+        let dialog = ApprovalDialog::new(ApprovalDialogRequest {
+            call: tool_call("shell.exec", harw_tools::serde_json::json!({ "command": "ls" })),
+            cwd: None,
+            justification: None,
+            risk: None,
+            origin: None,
+            remember_rule: None,
+            deadline: Instant::now() + Duration::from_secs(300),
+            reason_input_enabled: false,
+        });
+        let rendered = render_dialog(&dialog, 70, 20);
+        assert!(rendered.contains("noch 4:5") || rendered.contains("noch 5:00"), "{rendered}");
+    }
+
+    // ── Terminal-Sicherheit ──────────────────────────────────────────────
+
+    #[test]
+    fn test_hostile_argument_text_is_sanitized() {
+        let dialog = ApprovalDialog::new(ApprovalDialogRequest {
+            call: tool_call(
+                "shell.exec",
+                harw_tools::serde_json::json!({
+                    "command": "printf '\u{1b}]52;c;ZXZpbA==\u{07}'\nrm -rf /",
+                }),
+            ),
+            cwd: None,
+            justification: None,
+            risk: None,
+            origin: None,
+            remember_rule: None,
+            deadline: Instant::now() + Duration::from_secs(300),
+            reason_input_enabled: false,
+        });
+        let rendered = render_dialog(&dialog, 70, 20);
+        assert!(!rendered.contains('\u{1b}'), "{rendered}");
+        assert!(rendered.contains("⟨U+001B⟩") || rendered.contains("⟨ESC⟩"), "{rendered}");
+        // Der Befehl bleibt trotzdem lesbar (nichts wird verschluckt).
+        assert!(rendered.contains("rm -rf /"), "{rendered}");
+    }
+
+    // ── desired_height wächst mit ausgeklappten Details ─────────────────
+
+    #[test]
+    fn test_desired_height_grows_when_expanded() {
+        let mut arguments = harw_tools::serde_json::Map::new();
+        arguments.insert(
+            "command".to_owned(),
+            harw_tools::serde_json::Value::String("do-something".to_owned()),
+        );
+        for i in 0..12 {
+            arguments.insert(
+                format!("arg_{i}"),
+                harw_tools::serde_json::Value::String(format!("wert-nummer-{i}")),
+            );
+        }
+        let mut dialog = ApprovalDialog::new(ApprovalDialogRequest {
+            call: tool_call("shell.exec", harw_tools::serde_json::Value::Object(arguments)),
+            cwd: None,
+            justification: None,
+            risk: None,
+            origin: None,
+            remember_rule: None,
+            deadline: Instant::now() + Duration::from_secs(300),
+            reason_input_enabled: false,
+        });
+
+        let collapsed_height = dialog.desired_height(70);
+        dialog.handle_key(make_key(KeyCode::Char('v')), true);
+        let expanded_height = dialog.desired_height(70);
+        assert!(expanded_height > collapsed_height, "{expanded_height} <= {collapsed_height}");
+    }
+
+    // ── Freitext-Ablehnung ───────────────────────────────────────────────
+
+    #[test]
+    fn test_reason_input_captures_text_and_enter_rejects_with_reason() {
+        let mut dialog = shell_dialog(None);
+        assert_eq!(dialog.handle_key(make_key(KeyCode::Tab), true), DialogAction::Stay);
+        assert!(dialog.reason_editing);
+
+        for c in "zu riskant".chars() {
+            assert_eq!(dialog.handle_key(make_key(KeyCode::Char(c)), true), DialogAction::Stay);
+        }
+        assert_eq!(dialog.reason_text, "zu riskant");
+
+        assert_eq!(
+            dialog.handle_key(make_key(KeyCode::Enter), true),
+            DialogAction::Decided(ApprovalChoice::Reject {
+                reason: Some("zu riskant".to_owned())
+            })
+        );
+    }
+
+    #[test]
+    fn test_reason_input_backspace_and_esc_leaves_without_deciding() {
+        let mut dialog = shell_dialog(None);
+        dialog.handle_key(make_key(KeyCode::Tab), true);
+        dialog.handle_key(make_key(KeyCode::Char('x')), true);
+        assert_eq!(dialog.reason_text, "x");
+        dialog.handle_key(make_key(KeyCode::Backspace), true);
+        assert_eq!(dialog.reason_text, "");
+
+        assert_eq!(dialog.handle_key(make_key(KeyCode::Esc), true), DialogAction::Stay);
+        assert!(!dialog.reason_editing);
+    }
+
+    #[test]
+    fn test_reason_input_not_offered_when_disabled() {
+        let dialog = ApprovalDialog::new(ApprovalDialogRequest {
+            call: tool_call("shell.exec", harw_tools::serde_json::json!({ "command": "ls" })),
+            cwd: None,
+            justification: None,
+            risk: None,
+            origin: None,
+            remember_rule: None,
+            deadline: Instant::now() + Duration::from_secs(300),
+            reason_input_enabled: false,
+        });
+        let rendered = render_dialog(&dialog, 70, 20);
+        assert!(!rendered.contains("Tab: Grund angeben"), "{rendered}");
+    }
+
+    // ── Titel je Werkzeug ────────────────────────────────────────────────
+
+    #[test]
+    fn test_title_depends_on_tool_name() {
+        let shell = shell_dialog(None);
+        assert!(render_dialog(&shell, 70, 20).contains("Befehl ausführen?"));
+
+        let write = ApprovalDialog::new(ApprovalDialogRequest {
+            call: tool_call("fs.write", harw_tools::serde_json::json!({ "path": "/tmp/x" })),
+            cwd: None,
+            justification: None,
+            risk: None,
+            origin: None,
+            remember_rule: None,
+            deadline: Instant::now() + Duration::from_secs(300),
+            reason_input_enabled: false,
+        });
+        assert!(render_dialog(&write, 70, 20).contains("Datei schreiben?"));
+
+        let other = ApprovalDialog::new(ApprovalDialogRequest {
+            call: tool_call("mcp.custom", harw_tools::serde_json::json!({})),
+            cwd: None,
+            justification: None,
+            risk: None,
+            origin: None,
+            remember_rule: None,
+            deadline: Instant::now() + Duration::from_secs(300),
+            reason_input_enabled: false,
+        });
+        assert!(render_dialog(&other, 70, 20).contains("Werkzeug freigeben?"));
+    }
+}

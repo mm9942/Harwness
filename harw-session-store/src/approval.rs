@@ -9,6 +9,40 @@
 //! Datei auch ihr Elternverzeichnis: eine verlorene Genehmigung ist
 //! ärgerlich, eine verlorene Ablehnung, die den vorherigen Zustand
 //! zurückfallen lässt, ist ein Sicherheitsproblem.
+//!
+//! # C-APPR (W3): Serveruhr, TTL, Leser
+//! - [`ApprovalStore::resolve`] nimmt keine Client-Zeit mehr entgegen, sondern
+//!   eine [`Clock`] (F-122); `resolved_at` ist immer `clock.now()`.
+//! - Jede Anfrage lebt höchstens [`ApprovalStore::ttl`] ab `issued_at`
+//!   (Default [`DEFAULT_APPROVAL_TTL`]). Eine abgelaufene Anfrage ist nicht
+//!   mehr auflösbar ([`SessionStoreError::ApprovalExpired`]) und erscheint
+//!   nicht in [`ApprovalStore::pending_all`].
+//! - [`ApprovalStore::resolution`] ist der Leser für pausierte Turns
+//!   (TUI-Polling, G-011): fehlend → `None`, defekt → `Err` (fail-closed).
+//! - [`ApprovalStore::pending_all`] listet offene Anfragen über alle Sessions;
+//!   defekte Einträge werden mit `tracing::warn!` übersprungen.
+//!
+//! `ApprovalRecord::actor` ist der bei Ausstellung gebundene *Beantworter*,
+//! nicht der Anfragende. Eine Selbstgenehmigungsprüfung (Anfragender ==
+//! Beantworter) ist ohne neues Feld nicht möglich; siehe Ledger
+//! `docs/remediation/ledger/W3/C-APPR.md` (Folgearbeit A-APPR/WB-SRV).
+//!
+//! # Nebenläufigkeit
+//! `ApprovalStore` ist zustandslos bis auf Pfad und TTL (`Send + Sync`).
+//! `resolve` serialisiert über einen `fs4`-Dateilock je Session;
+//! `resolution` und `pending_all` lesen ohne Lock, weil `.resolved.json`
+//! ausschließlich per atomarem `persist()` erscheint.
+//!
+//! # Examples
+//! ```rust,no_run
+//! use harw_session_store::ApprovalStore;
+//! use harw_types::SystemClock;
+//!
+//! let store = ApprovalStore::new(std::path::Path::new("/tmp/harw-home"));
+//! let open = store.pending_all(50, &SystemClock)?;
+//! assert!(open.len() <= 50);
+//! # Ok::<(), harw_session_store::SessionStoreError>(())
+//! ```
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -17,12 +51,24 @@ use std::path::{Path, PathBuf};
 use fs4::FileExt;
 #[cfg(unix)]
 use harw_fsutil::OpenMode;
-use harw_types::{ApprovalActor, ItemId, ReviewDecision, SessionId, ToolCallId};
-use jiff::Timestamp;
+use harw_types::{ApprovalActor, Clock, ItemId, ReviewDecision, SessionId, ToolCallId};
+use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 use crate::error::{SessionStoreError, SessionStoreResult};
+
+/// Default lifetime of an approval request, measured from `issued_at`.
+///
+/// # Description
+/// 30 Minuten (Orchestrator-Entscheidung C-APPR). Danach ist die Anfrage
+/// nicht mehr auflösbar; der pausierte Turn muss neu fragen.
+pub const DEFAULT_APPROVAL_TTL: SignedDuration = SignedDuration::from_mins(30);
+
+// Dateinamen-Suffixe für den Scan in `pending_all`; müssen zu den
+// `with_extension`-Werten in `pending_path`/`resolved_path` passen.
+const PENDING_SUFFIX: &str = ".pending.json";
+const RESOLVED_SUFFIX: &str = ".resolved.json";
 
 /// Immutable authorization captured before an approval prompt reaches a
 /// channel. `actor` must match byte-for-byte when the response is consumed.
@@ -48,21 +94,63 @@ pub struct ApprovalResolutionRecord {
 }
 
 /// Per-session file store for approval state.
+///
+/// # Concurrency
+/// `Send + Sync`; see the module docs for the locking model.
+#[derive(Debug, Clone)]
 pub struct ApprovalStore {
     root: PathBuf,
+    ttl: SignedDuration,
 }
 
 impl ApprovalStore {
+    /// Creates a store under `<root>/approvals` with [`DEFAULT_APPROVAL_TTL`].
+    ///
+    /// # Arguments
+    /// - `root` (`&Path`): harness home; no file is opened yet.
     #[must_use]
     pub fn new(root: &Path) -> Self {
+        Self::with_ttl(root, DEFAULT_APPROVAL_TTL)
+    }
+
+    /// Creates a store under `<root>/approvals` with an explicit request TTL.
+    ///
+    /// # Description
+    /// `ttl` wird gegen `issued_at` jeder Anfrage geprüft. Ein TTL `<= 0`
+    /// lässt jede Anfrage sofort ablaufen (fail-closed), statt sie ewig
+    /// gültig zu machen.
+    ///
+    /// # Arguments
+    /// - `root` (`&Path`): harness home.
+    /// - `ttl` (`SignedDuration`): lifetime of a request from `issued_at`.
+    ///
+    /// # Examples
+    /// ```rust,no_run
+    /// use harw_session_store::ApprovalStore;
+    ///
+    /// let store = ApprovalStore::with_ttl(
+    ///     std::path::Path::new("/tmp/harw-home"),
+    ///     jiff::SignedDuration::from_mins(5),
+    /// );
+    /// assert_eq!(store.ttl(), jiff::SignedDuration::from_mins(5));
+    /// ```
+    #[must_use]
+    pub fn with_ttl(root: &Path, ttl: SignedDuration) -> Self {
         Self {
             root: root.join("approvals"),
+            ttl,
         }
     }
 
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Returns the configured request TTL.
+    #[must_use]
+    pub fn ttl(&self) -> SignedDuration {
+        self.ttl
     }
 
     /// Durably issues a request. Reusing an existing request id is rejected;
@@ -97,17 +185,41 @@ impl ApprovalStore {
         Ok(())
     }
 
-    /// Atomically consumes a pending request. The lock covers checking the
-    /// pending record, verifying actor identity, detecting a prior decision,
-    /// and persisting the terminal resolution.
+    /// Atomically consumes a pending request using the server clock.
+    ///
+    /// # Description
+    /// Der Lock deckt ab: Prüfung des Pending-Datensatzes, Actor-Identität,
+    /// TTL gegen `clock.now()`, Erkennung einer früheren Entscheidung und das
+    /// durable Schreiben der Auflösung. `resolved_at` ist immer
+    /// `clock.now()` — nie ein vom Client gelieferter Wert (F-122).
+    /// Reihenfolge der Prüfungen: bereits aufgelöst → nicht gefunden →
+    /// Actor → TTL, damit ein fremder Actor nichts über den TTL-Zustand
+    /// erfährt.
+    ///
+    /// # Arguments
+    /// - `session`, `request`: Schlüssel der Anfrage.
+    /// - `decision` (`ReviewDecision`), `comment` (`Option<String>`): Entscheidung.
+    /// - `actor` (`&ApprovalActor`): vertrauenswürdig ermittelter Beantworter.
+    /// - `clock` (`&dyn Clock`): Serveruhr.
+    ///
+    /// # Errors
+    /// - [`SessionStoreError::ApprovalAlreadyResolved`]: bereits entschieden.
+    /// - [`SessionStoreError::ApprovalNotFound`]: keine (vertrauenswürdige) Anfrage.
+    /// - [`SessionStoreError::ApprovalActorMismatch`]: anderer Actor als gebunden.
+    /// - [`SessionStoreError::ApprovalExpired`]: TTL abgelaufen.
+    /// - [`SessionStoreError::LockContended`], `Io`, `Serde`.
+    ///
+    /// # Concurrency
+    /// Nicht-blockierender Dateilock je Session; paralleler Aufruf liefert
+    /// `LockContended`.
     pub fn resolve(
         &self,
         session: &SessionId,
         request: &ItemId,
-        actor: &ApprovalActor,
         decision: ReviewDecision,
         comment: Option<String>,
-        resolved_at: Timestamp,
+        actor: &ApprovalActor,
+        clock: &dyn Clock,
     ) -> SessionStoreResult<ApprovalResolutionRecord> {
         let pending_path = self.pending_path(session, request)?;
         let resolved_path = self.resolved_path(session, request)?;
@@ -151,6 +263,14 @@ impl ApprovalStore {
                     request: request.clone(),
                 });
             }
+            let now = clock.now();
+            if let Some(expires_at) = self.expiry_if_expired(&record, now) {
+                return Err(SessionStoreError::ApprovalExpired {
+                    request: request.clone(),
+                    issued_at: record.issued_at,
+                    expires_at,
+                });
+            }
 
             let resolution = ApprovalResolutionRecord {
                 request: request.clone(),
@@ -159,7 +279,7 @@ impl ApprovalStore {
                 actor: actor.clone(),
                 decision,
                 comment,
-                resolved_at,
+                resolved_at: now,
             };
             self.persist_resolution(&resolved_path, &resolution)?;
             Ok(resolution)
@@ -189,6 +309,261 @@ impl ApprovalStore {
             }
         })?;
         Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    /// Reads the terminal resolution of a request, if one exists.
+    ///
+    /// # Description
+    /// Leser für pausierte Turns (TUI-Polling). Liest ohne Lock, symlinkfest
+    /// (`O_NOFOLLOW`). Fail-closed: ein Symlink, eine Nicht-Datei, nicht
+    /// dekodierbarer Inhalt oder ein Datensatz mit fremdem
+    /// Session-/Request-Schlüssel ist ein Fehler, nie `None`.
+    ///
+    /// # Returns
+    /// `Ok(None)` wenn keine `.resolved.json` existiert, sonst den Datensatz.
+    ///
+    /// # Errors
+    /// - [`SessionStoreError::ApprovalCorrupt`]: Datei vorhanden, aber nicht vertrauenswürdig.
+    /// - [`SessionStoreError::UnsafeApprovalPath`]: unsichere ID.
+    /// - [`SessionStoreError::Io`]: sonstiger Lesefehler.
+    ///
+    /// # Concurrency
+    /// Lock-frei; `.resolved.json` erscheint nur per atomarem Rename.
+    pub fn resolution(
+        &self,
+        session: &SessionId,
+        request: &ItemId,
+    ) -> SessionStoreResult<Option<ApprovalResolutionRecord>> {
+        let path = self.resolved_path(session, request)?;
+        let corrupt = |detail: String| SessionStoreError::ApprovalCorrupt {
+            session: session.clone(),
+            request: request.clone(),
+            detail,
+        };
+        if path_is_symlink(&path)? {
+            return Err(corrupt("resolution file is a symlink".to_owned()));
+        }
+        let bytes = match read_pending(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // `read_pending` meldet auch Symlink (ELOOP) und Nicht-Datei als
+                // NotFound; nur ein wirklich fehlender Eintrag ist `None`.
+                return match std::fs::symlink_metadata(&path) {
+                    Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(other) => Err(SessionStoreError::Io(other)),
+                    Ok(_) => Err(corrupt("resolution entry is not a regular file".to_owned())),
+                };
+            }
+            Err(error) => return Err(SessionStoreError::Io(error)),
+        };
+        let record: ApprovalResolutionRecord =
+            serde_json::from_slice(&bytes).map_err(|error| corrupt(error.to_string()))?;
+        if record.session != *session || record.request != *request {
+            return Err(corrupt(format!(
+                "resolution is keyed to session '{}' request '{}'",
+                record.session, record.request
+            )));
+        }
+        Ok(Some(record))
+    }
+
+    /// Lists open, unexpired requests across all sessions.
+    ///
+    /// # Description
+    /// Durchläuft `<root>/approvals/<session>/*.pending.json`. Offen heißt:
+    /// keine `.resolved.json` (auch kein Symlink an dieser Stelle) und
+    /// `clock.now()` vor Ablauf der TTL. Defekte Einträge (unsichere Namen,
+    /// Symlinks, nicht dekodierbar, Schlüssel passt nicht zum Pfad,
+    /// Lesefehler einzelner Einträge) werden mit `tracing::warn!`
+    /// übersprungen statt die Liste abzubrechen. Ergebnis aufsteigend nach
+    /// `issued_at` (Gleichstand: Session, dann Request), auf `limit` gekappt.
+    ///
+    /// # Arguments
+    /// - `limit` (`usize`): Höchstzahl der Einträge; `0` liefert eine leere Liste.
+    /// - `clock` (`&dyn Clock`): Serveruhr für die TTL-Prüfung.
+    ///
+    /// # Errors
+    /// - [`SessionStoreError::Io`]: nur wenn das Wurzelverzeichnis selbst nicht
+    ///   lesbar ist (ein fehlendes Wurzelverzeichnis liefert eine leere Liste).
+    ///
+    /// # Concurrency
+    /// Lock-freier Schnappschuss; ein parallel aufgelöster Eintrag kann noch
+    /// erscheinen — die Autorität bleibt `resolve`.
+    pub fn pending_all(
+        &self,
+        limit: usize,
+        clock: &dyn Clock,
+    ) -> SessionStoreResult<Vec<ApprovalRecord>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let sessions = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(SessionStoreError::Io(error)),
+        };
+        let now = clock.now();
+        let mut open = Vec::new();
+        for entry in sessions {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::warn!(
+                        root = %self.root.display(),
+                        error = %error,
+                        "approval session entry unreadable; skipped"
+                    );
+                    continue;
+                }
+            };
+            let dir = entry.path();
+            let Some(session) = entry.file_name().to_str().and_then(|name| {
+                safe_component(name).ok().map(SessionId::from_str)
+            }) else {
+                tracing::warn!(
+                    path = %dir.display(),
+                    "approval session directory name is unsafe; skipped"
+                );
+                continue;
+            };
+            match std::fs::symlink_metadata(&dir) {
+                Ok(metadata) if metadata.file_type().is_dir() => {}
+                Ok(_) => {
+                    tracing::warn!(
+                        path = %dir.display(),
+                        "approval session entry is not a real directory; skipped"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        path = %dir.display(),
+                        error = %error,
+                        "approval session directory unreadable; skipped"
+                    );
+                    continue;
+                }
+            }
+            self.collect_open_in_session(&dir, &session, now, &mut open);
+        }
+        open.sort_by(|left, right| {
+            left.issued_at
+                .cmp(&right.issued_at)
+                .then_with(|| left.session.as_str().cmp(right.session.as_str()))
+                .then_with(|| left.request.as_str().cmp(right.request.as_str()))
+        });
+        open.truncate(limit);
+        Ok(open)
+    }
+
+    // Sammelt offene, nicht abgelaufene Anfragen einer Session; alles Defekte
+    // wird mit `warn!` übersprungen.
+    fn collect_open_in_session(
+        &self,
+        dir: &Path,
+        session: &SessionId,
+        now: Timestamp,
+        open: &mut Vec<ApprovalRecord>,
+    ) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                tracing::warn!(
+                    path = %dir.display(),
+                    error = %error,
+                    "approval session directory unreadable; skipped"
+                );
+                return;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %dir.display(),
+                        error = %error,
+                        "approval entry unreadable; skipped"
+                    );
+                    continue;
+                }
+            };
+            let file_name = entry.file_name();
+            let Some(stem) = file_name
+                .to_str()
+                .and_then(|name| name.strip_suffix(PENDING_SUFFIX))
+            else {
+                // `.lock`, `.resolved.json`, Tempdateien: kein Pending-Eintrag.
+                continue;
+            };
+            let path = entry.path();
+            if safe_component(stem).is_err() {
+                tracing::warn!(
+                    path = %path.display(),
+                    "approval request file name is unsafe; skipped"
+                );
+                continue;
+            }
+            let request = ItemId::from_str(stem);
+            let resolved = dir.join(format!("{stem}{RESOLVED_SUFFIX}"));
+            match std::fs::symlink_metadata(&resolved) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Ok(_) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %resolved.display(),
+                        error = %error,
+                        "approval resolution state unreadable; skipped"
+                    );
+                    continue;
+                }
+            }
+            let bytes = match read_pending(&path) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "approval request file unreadable or not a regular file; skipped"
+                    );
+                    continue;
+                }
+            };
+            let record: ApprovalRecord = match serde_json::from_slice(&bytes) {
+                Ok(record) => record,
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "approval request file is corrupt; skipped"
+                    );
+                    continue;
+                }
+            };
+            if record.session != *session || record.request != request {
+                tracing::warn!(
+                    path = %path.display(),
+                    record_session = %record.session,
+                    record_request = %record.request,
+                    "approval request is keyed to another path; skipped"
+                );
+                continue;
+            }
+            if self.expiry_if_expired(&record, now).is_some() {
+                continue;
+            }
+            open.push(record);
+        }
+    }
+
+    // `Some(expires_at)` wenn die Anfrage zu `now` abgelaufen ist. Grenze
+    // inklusiv (`now >= expires_at`); Überlauf von `issued_at + ttl` gilt
+    // fail-closed als abgelaufen (`Timestamp::MAX`).
+    fn expiry_if_expired(&self, record: &ApprovalRecord, now: Timestamp) -> Option<Timestamp> {
+        match record.issued_at.checked_add(self.ttl) {
+            Ok(expires_at) => (now >= expires_at).then_some(expires_at),
+            Err(_overflow) => Some(Timestamp::MAX),
+        }
     }
 
     fn persist_resolution(
@@ -320,7 +695,7 @@ fn open_lock_file_without_following_symlinks(path: &Path) -> std::io::Result<Fil
 #[cfg(unix)]
 fn read_pending(path: &Path) -> std::io::Result<Vec<u8>> {
     let file = harw_fsutil::open_nofollow(path, OpenMode::read_only()).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::FilesystemLoop {
+        if harw_fsutil::is_symlink_loop(&error) {
             std::io::Error::from(std::io::ErrorKind::NotFound)
         } else {
             error
@@ -359,6 +734,22 @@ fn safe_component(value: &str) -> SessionStoreResult<&str> {
 mod tests {
     use super::*;
 
+    // Feste Serveruhr für deterministische TTL-/Zeitstempel-Tests.
+    struct FixedClock(Timestamp);
+
+    impl Clock for FixedClock {
+        fn now(&self) -> Timestamp {
+            self.0
+        }
+    }
+
+    // Ausstellungszeitpunkt aller Test-Datensätze.
+    const ISSUED: Timestamp = Timestamp::constant(1_700_000_000, 0);
+
+    fn at_offset_mins(mins: i64) -> FixedClock {
+        FixedClock(ISSUED.checked_add(SignedDuration::from_mins(mins)).unwrap())
+    }
+
     fn actor(name: &str) -> ApprovalActor {
         ApprovalActor::Operator {
             id: name.to_owned(),
@@ -366,12 +757,16 @@ mod tests {
     }
 
     fn record() -> ApprovalRecord {
+        record_for("session-1", "approval-1", ISSUED)
+    }
+
+    fn record_for(session: &str, request: &str, issued_at: Timestamp) -> ApprovalRecord {
         ApprovalRecord {
-            request: ItemId::from_str("approval-1"),
-            session: SessionId::from_str("session-1"),
+            request: ItemId::from_str(request),
+            session: SessionId::from_str(session),
             call_id: ToolCallId::from_str("call-1"),
             actor: actor("alice"),
-            issued_at: Timestamp::now(),
+            issued_at,
         }
     }
 
@@ -380,6 +775,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = ApprovalStore::new(temp.path());
         let request = record();
+        let clock = at_offset_mins(1);
         store.issue(&request).unwrap();
         assert_eq!(
             store.pending(&request.session, &request.request).unwrap(),
@@ -390,10 +786,10 @@ mod tests {
             .resolve(
                 &request.session,
                 &request.request,
-                &actor("mallory"),
                 ReviewDecision::Approved,
                 None,
-                Timestamp::now(),
+                &actor("mallory"),
+                &clock,
             )
             .unwrap_err();
         assert!(matches!(
@@ -405,10 +801,10 @@ mod tests {
             .resolve(
                 &request.session,
                 &request.request,
-                &request.actor,
                 ReviewDecision::ApprovedOnce,
                 Some("bounded exception".to_owned()),
-                Timestamp::now(),
+                &request.actor,
+                &clock,
             )
             .unwrap();
         assert_eq!(resolution.call_id, request.call_id);
@@ -418,16 +814,295 @@ mod tests {
             .resolve(
                 &request.session,
                 &request.request,
-                &request.actor,
                 ReviewDecision::Approved,
                 None,
-                Timestamp::now(),
+                &request.actor,
+                &clock,
             )
             .unwrap_err();
         assert!(matches!(
             replay,
             SessionStoreError::ApprovalAlreadyResolved { .. }
         ));
+    }
+
+    #[test]
+    fn test_resolve_uses_server_clock_for_resolved_at() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ApprovalStore::new(temp.path());
+        let request = record();
+        store.issue(&request).unwrap();
+        let clock = at_offset_mins(7);
+
+        let resolution = store
+            .resolve(
+                &request.session,
+                &request.request,
+                ReviewDecision::Rejected,
+                None,
+                &request.actor,
+                &clock,
+            )
+            .unwrap();
+
+        assert_eq!(resolution.resolved_at, clock.now());
+        let durable = store
+            .resolution(&request.session, &request.request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable, resolution);
+        assert_eq!(durable.resolved_at, clock.now());
+    }
+
+    #[test]
+    fn test_resolve_rejects_expired_request_and_writes_nothing() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ApprovalStore::new(temp.path());
+        let request = record();
+        store.issue(&request).unwrap();
+
+        // Grenze inklusiv: genau `issued_at + TTL` ist bereits abgelaufen.
+        let error = store
+            .resolve(
+                &request.session,
+                &request.request,
+                ReviewDecision::Approved,
+                None,
+                &request.actor,
+                &at_offset_mins(30),
+            )
+            .unwrap_err();
+
+        match error {
+            SessionStoreError::ApprovalExpired {
+                request: expired,
+                issued_at,
+                expires_at,
+            } => {
+                assert_eq!(expired, request.request);
+                assert_eq!(issued_at, ISSUED);
+                assert_eq!(expires_at, at_offset_mins(30).now());
+            }
+            other => panic!("expected ApprovalExpired, got {other:?}"),
+        }
+        assert_eq!(
+            store
+                .resolution(&request.session, &request.request)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_accepts_request_just_before_ttl() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ApprovalStore::new(temp.path());
+        let request = record();
+        store.issue(&request).unwrap();
+        let clock = FixedClock(
+            ISSUED
+                .checked_add(DEFAULT_APPROVAL_TTL - SignedDuration::from_secs(1))
+                .unwrap(),
+        );
+
+        let resolution = store
+            .resolve(
+                &request.session,
+                &request.request,
+                ReviewDecision::Approved,
+                None,
+                &request.actor,
+                &clock,
+            )
+            .unwrap();
+        assert_eq!(resolution.decision, ReviewDecision::Approved);
+    }
+
+    #[test]
+    fn test_with_ttl_applies_custom_ttl_and_new_uses_default() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(ApprovalStore::new(temp.path()).ttl(), DEFAULT_APPROVAL_TTL);
+        assert_eq!(DEFAULT_APPROVAL_TTL, SignedDuration::from_mins(30));
+
+        let store = ApprovalStore::with_ttl(temp.path(), SignedDuration::from_mins(5));
+        assert_eq!(store.ttl(), SignedDuration::from_mins(5));
+        let request = record();
+        store.issue(&request).unwrap();
+        assert!(matches!(
+            store.resolve(
+                &request.session,
+                &request.request,
+                ReviewDecision::Approved,
+                None,
+                &request.actor,
+                &at_offset_mins(6),
+            ),
+            Err(SessionStoreError::ApprovalExpired { .. })
+        ));
+    }
+
+    #[test]
+    fn test_resolution_missing_returns_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ApprovalStore::new(temp.path());
+        let request = record();
+        assert_eq!(
+            store
+                .resolution(&request.session, &request.request)
+                .unwrap(),
+            None
+        );
+        store.issue(&request).unwrap();
+        assert_eq!(
+            store
+                .resolution(&request.session, &request.request)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolution_corrupt_file_is_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ApprovalStore::new(temp.path());
+        let request = record();
+        store.issue(&request).unwrap();
+        let path = store
+            .resolved_path(&request.session, &request.request)
+            .unwrap();
+        std::fs::write(&path, b"{ not json").unwrap();
+
+        assert!(matches!(
+            store.resolution(&request.session, &request.request),
+            Err(SessionStoreError::ApprovalCorrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn test_resolution_record_keyed_to_other_request_is_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ApprovalStore::new(temp.path());
+        let request = record();
+        let foreign = ApprovalResolutionRecord {
+            request: ItemId::from_str("approval-other"),
+            session: request.session.clone(),
+            call_id: request.call_id.clone(),
+            actor: request.actor.clone(),
+            decision: ReviewDecision::Approved,
+            comment: None,
+            resolved_at: ISSUED,
+        };
+        let path = store
+            .resolved_path(&request.session, &request.request)
+            .unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&foreign).unwrap()).unwrap();
+
+        assert!(matches!(
+            store.resolution(&request.session, &request.request),
+            Err(SessionStoreError::ApprovalCorrupt { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_resolution_symlink_is_error_not_none() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let store = ApprovalStore::new(temp.path());
+        let request = record();
+        store.issue(&request).unwrap();
+        let external = temp.path().join("external-resolved.json");
+        std::fs::write(&external, b"sentinel").unwrap();
+        let path = store
+            .resolved_path(&request.session, &request.request)
+            .unwrap();
+        symlink(&external, &path).unwrap();
+
+        assert!(matches!(
+            store.resolution(&request.session, &request.request),
+            Err(SessionStoreError::ApprovalCorrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn test_pending_all_sorts_by_issued_at_and_applies_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ApprovalStore::new(temp.path());
+        let t = |mins: i64| ISSUED.checked_add(SignedDuration::from_mins(mins)).unwrap();
+        let late = record_for("session-b", "approval-late", t(3));
+        let early = record_for("session-a", "approval-early", t(1));
+        let middle = record_for("session-b", "approval-middle", t(2));
+        for item in [&late, &early, &middle] {
+            store.issue(item).unwrap();
+        }
+        let clock = at_offset_mins(4);
+
+        let all = store.pending_all(10, &clock).unwrap();
+        assert_eq!(all, vec![early.clone(), middle.clone(), late]);
+
+        let limited = store.pending_all(2, &clock).unwrap();
+        assert_eq!(limited, vec![early, middle]);
+
+        assert!(store.pending_all(0, &clock).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_pending_all_excludes_resolved_and_expired() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ApprovalStore::new(temp.path());
+        let old = record_for("session-1", "approval-old", ISSUED);
+        let fresh_at = ISSUED.checked_add(SignedDuration::from_mins(20)).unwrap();
+        let resolved = record_for("session-1", "approval-done", fresh_at);
+        let open = record_for("session-2", "approval-open", fresh_at);
+        for item in [&old, &resolved, &open] {
+            store.issue(item).unwrap();
+        }
+        let clock = at_offset_mins(35);
+        store
+            .resolve(
+                &resolved.session,
+                &resolved.request,
+                ReviewDecision::Approved,
+                None,
+                &resolved.actor,
+                &clock,
+            )
+            .unwrap();
+
+        assert_eq!(store.pending_all(10, &clock).unwrap(), vec![open]);
+    }
+
+    #[test]
+    fn test_pending_all_skips_corrupt_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ApprovalStore::new(temp.path());
+        let good = record_for("session-1", "approval-good", ISSUED);
+        store.issue(&good).unwrap();
+        let session_dir = store.session_dir(&good.session).unwrap();
+        std::fs::write(session_dir.join("approval-broken.pending.json"), b"garbage").unwrap();
+        // Datensatz, dessen Inhalt auf einen anderen Request zeigt.
+        let misfiled = record_for("session-1", "approval-elsewhere", ISSUED);
+        std::fs::write(
+            session_dir.join("approval-misfiled.pending.json"),
+            serde_json::to_vec(&misfiled).unwrap(),
+        )
+        .unwrap();
+        // Unsicherer Session-Verzeichnisname.
+        std::fs::create_dir_all(store.root().join("bad.name")).unwrap();
+
+        assert_eq!(
+            store.pending_all(10, &at_offset_mins(1)).unwrap(),
+            vec![good]
+        );
+    }
+
+    #[test]
+    fn test_pending_all_without_root_is_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ApprovalStore::new(temp.path());
+        assert!(store.pending_all(5, &at_offset_mins(1)).unwrap().is_empty());
     }
 
     #[test]
@@ -475,13 +1150,15 @@ mod tests {
             store.resolve(
                 &request.session,
                 &request.request,
-                &request.actor,
                 ReviewDecision::Approved,
                 None,
-                Timestamp::now(),
+                &request.actor,
+                &at_offset_mins(1),
             ),
             Err(SessionStoreError::ApprovalNotFound { .. })
         ));
+        // Ein Symlink ist auch in der Übersicht keine offene Anfrage.
+        assert!(store.pending_all(10, &at_offset_mins(1)).unwrap().is_empty());
         assert_eq!(
             std::fs::read(&external).unwrap(),
             serde_json::to_vec(&request).unwrap()
@@ -506,10 +1183,10 @@ mod tests {
             store.resolve(
                 &request.session,
                 &request.request,
-                &request.actor,
                 ReviewDecision::Approved,
                 None,
-                Timestamp::now(),
+                &request.actor,
+                &at_offset_mins(1),
             ),
             Err(SessionStoreError::ApprovalNotFound { .. })
         ));
@@ -541,10 +1218,10 @@ mod tests {
             .resolve(
                 &request.session,
                 &request.request,
-                &request.actor,
                 ReviewDecision::Approved,
                 None,
-                Timestamp::now(),
+                &request.actor,
+                &at_offset_mins(1),
             )
             .unwrap_err();
 

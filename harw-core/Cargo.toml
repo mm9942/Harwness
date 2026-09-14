@@ -31,13 +31,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 jiff = { workspace = true }
 tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
-url = "2"
 # Zufallsquelle für frische Span-IDs beim Trace-Handoff an ein Kind
 # (AW1-01b). Version/Feature-Zeile identisch zu `harw-types`, das dieselbe
 # Crate für seine ID-Newtypes bindet — keine neue, unabgestimmte Version.
 uuid = { version = "1", features = ["v4"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tracing = "0.1.44"
+tokio-util = "0.7.18"
 
 [dev-dependencies]
 tempfile = "3"

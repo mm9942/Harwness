@@ -1,4 +1,5 @@
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Selector {
     TestId(String),
     Css(String),
@@ -12,6 +13,7 @@ pub enum Selector {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Target {
     pub primary: Selector,
     pub fallbacks: Vec<Selector>,
@@ -110,5 +112,29 @@ mod tests {
         let json = serde_json::to_string(&target).expect("target serializes");
         let decoded: Target = serde_json::from_str(&json).expect("target deserializes");
         assert_eq!(decoded, target);
+    }
+
+    #[test]
+    fn test_selector_deserialize_rejects_unknown_field_in_struct_variant() {
+        let json = serde_json::json!({
+            "TagClass": { "tag": "div", "class": "container", "extra": "nope" }
+        });
+
+        let result: Result<Selector, serde_json::Error> = serde_json::from_value(json);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_target_deserialize_rejects_unknown_field() {
+        let json = serde_json::json!({
+            "primary": { "Css": "div.a" },
+            "fallbacks": [],
+            "extra": "nope"
+        });
+
+        let result: Result<Target, serde_json::Error> = serde_json::from_value(json);
+
+        assert!(result.is_err());
     }
 }

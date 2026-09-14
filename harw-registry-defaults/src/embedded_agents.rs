@@ -1520,7 +1520,27 @@ mod tests {
 
     #[test]
     fn test_every_builtin_role_forbids_write_and_shell_tools() {
+        // Ausdrückliche Ausnahmeliste (Slice B7) — genau `executor`, kein
+        // Wildcard. `executor` (`RegistryProfile::Full`, siehe
+        // `harw-registry-defaults/src/profile.rs::profile_for_role`) darf
+        // `fs.write` und `shell.exec` zulassen: er führt Befehls- und
+        // Dateioperationen im Auftrag des Haupt-Agenten aus, damit die TUI
+        // Befehlsfolgen delegieren kann, statt sie als viele einzelne
+        // Tool-Aufrufe im Hauptfenster zu zeigen (siehe
+        // `agents/executor.toml`). Das ist keine Lockerung der
+        // Freigabegrenze: jeder Aufruf, den `executor` ausführt, läuft
+        // weiterhin durch die Freigabekette des Elternteils
+        // (`DefaultApprovalPolicy`) — diese Rolle bekommt nur eine
+        // zusätzliche Werkzeugoberfläche, keinen eigenen, ungeprüften
+        // Freigabeweg. Eine zweite schreibende Rolle muss diese Liste (und
+        // den begleitenden Test unten) bewusst anfassen, statt
+        // stillschweigend durchzurutschen.
+        const ALLOWED_TO_WRITE_AND_EXEC: &[&str] = &[role_names::EXECUTOR];
+
         for (role, ir) in builtin() {
+            if ALLOWED_TO_WRITE_AND_EXEC.contains(&role.as_str()) {
+                continue;
+            }
             let admitted = ir.tool_surface().admitted();
             let forbidden = ir.tool_surface().forbidden();
             for tool in ["fs.write", "shell.exec"] {
@@ -1533,6 +1553,54 @@ mod tests {
                     "{role} muss {tool} ausdrücklich verbieten"
                 );
             }
+        }
+    }
+
+    /// Ergänzung zu [`test_every_builtin_role_forbids_write_and_shell_tools`]:
+    /// die Ausnahme dort darf sich nicht unbemerkt ausweiten. Dieser Test
+    /// prüft in beide Richtungen — `executor` ist die EINZIGE Rolle, die
+    /// `fs.write`/`shell.exec` zulässt, und `executor` bekommt tatsächlich
+    /// [`crate::profile::RegistryProfile::Full`] (nicht nur eine TOML, die
+    /// zufällig dieselben Werkzeugnamen admittiert).
+    #[test]
+    fn test_only_executor_gets_the_full_writable_profile() {
+        use crate::profile::{RegistryProfile, profile_for_role};
+
+        for (role, ir) in builtin() {
+            let admitted = ir.tool_surface().admitted();
+            let admits_write_or_exec = admitted
+                .iter()
+                .any(|name| name == "fs.write" || name == "shell.exec");
+            if role == role_names::EXECUTOR {
+                assert!(
+                    admits_write_or_exec,
+                    "executor muss fs.write und/oder shell.exec zulassen"
+                );
+            } else {
+                assert!(
+                    !admits_write_or_exec,
+                    "{role} admittiert fs.write/shell.exec, aber nur \
+                     executor darf das (Slice B7)"
+                );
+            }
+        }
+
+        assert_eq!(
+            profile_for_role(role_names::EXECUTOR),
+            Some(RegistryProfile::Full),
+            "executor muss RegistryProfile::Full bekommen, sonst besäße die \
+             Rolle keinen Executor für die von ihr admittierten Werkzeuge"
+        );
+        for role in role_names::ALL {
+            if *role == role_names::EXECUTOR {
+                continue;
+            }
+            assert_ne!(
+                profile_for_role(role),
+                Some(RegistryProfile::Full),
+                "{role} darf RegistryProfile::Full nicht bekommen — nur \
+                 executor ist die dokumentierte Ausnahme"
+            );
         }
     }
 
@@ -1880,9 +1948,14 @@ mod tests {
 
     #[test]
     fn test_coding_family_lists_only_roles_that_exist_in_role_names() {
-        // Heute schreibt keine eingebaute Rolle Code; das Roster nennt deshalb
-        // die Rollen, die die Coding-Spur vorbereiten. Erfundene IDs wären eine
-        // Zusage, die der Spawn nicht einlösen kann.
+        // Seit Slice B7 admittiert `executor` `fs.write`/`shell.exec` und
+        // führt damit Befehls- und Dateioperationen im Auftrag des
+        // Haupt-Agenten aus — er entwirft aber keinen Code, er führt bereits
+        // entschiedene Operationen aus und fasst sie zusammen. Das Roster
+        // nennt deshalb weiterhin sowohl die Rollen, die die Coding-Spur
+        // vorbereiten (`planner`, `explorer`), als auch `executor`, der sie
+        // ausführt. Erfundene IDs wären eine Zusage, die der Spawn nicht
+        // einlösen kann.
         let resolved = family(CODING_FAMILY_NAME);
         for name in role_names_of(&resolved.workers) {
             assert!(

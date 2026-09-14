@@ -10,12 +10,16 @@
 
 pub mod app;
 pub mod approval;
+pub mod approval_dialog;
 pub(crate) mod chat_scroll;
 pub(crate) mod input_history;
 mod command;
 pub(crate) mod command_exec;
 pub(crate) mod command_popup;
+pub(crate) mod choice_dialog;
+pub mod clipboard;
 mod error;
+pub mod export;
 pub(crate) mod events;
 pub(crate) mod frame_requester;
 pub mod gateway;
@@ -24,10 +28,12 @@ mod input;
 pub(crate) mod input_editor;
 pub(crate) mod input_reader;
 mod registry;
+pub mod relative_time;
 pub(crate) mod runtime_commands;
 pub(crate) mod runtime_root;
 pub(crate) mod sanitize;
 pub mod session_controller;
+pub mod session_picker;
 pub mod setup;
 pub(crate) mod spinner;
 pub(crate) mod streaming;
@@ -40,15 +46,23 @@ pub use approval::{
     ApprovalDriver, ApprovalDriverError, ApprovalPrompt, ApprovalScope, ChildTurnDriver,
     ResumeStage, TuiApprovalHandler,
 };
+pub use approval_dialog::{ApprovalChoice, ApprovalDialog, ApprovalDialogRequest, DialogAction};
+pub use clipboard::{ClipboardTarget, copy_or_sequence, copy_to_clipboard, osc52_sequence};
 pub use command::{
     CommandDomain, CommandName, CommandScope, CommandSpec, OutputSurface, PermissionTier,
 };
 pub use error::{CommandError, CommandResult};
+pub use export::{
+    ExportEntry, ExportError, ExportMeta, ExportOptions, default_export_path, render_markdown,
+    write_export,
+};
 pub use gateway::{ChatGateway, LocalGateway};
 pub use input::{Invocation, classify_input};
 pub use registry::{
     CapabilitySet, CommandAction, CommandRegistry, DispatchContext, InvocationSurface,
     ShellCapability,
 };
+pub use relative_time::relative_time;
 pub use runtime_root::{TuiAssemblyFactory, TuiResume, TuiRunOptions, TuiSessionWiring, run_tui};
+pub use session_picker::{PickerAction, SessionEntry, SessionPicker};
 pub use setup::{SetupApp, SetupOutcome, SetupStage, run_setup};

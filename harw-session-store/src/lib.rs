@@ -30,11 +30,14 @@ pub mod child_lease;
 pub mod error;
 pub mod freeze;
 pub mod job_store;
+pub mod meta;
 pub mod reader;
 pub mod record;
 pub mod store;
 
-pub use approval::{ApprovalRecord, ApprovalResolutionRecord, ApprovalStore};
+pub use approval::{
+    ApprovalRecord, ApprovalResolutionRecord, ApprovalStore, DEFAULT_APPROVAL_TTL,
+};
 pub use child_lease::{ChildLeaseCompletionRecord, ChildLeaseRecord, ChildLeaseStore};
 pub use error::{SessionStoreError, SessionStoreResult};
 pub use freeze::{Freeze, FreezeResolution, FreezeResolutionOutcome, FreezeStore};
@@ -42,6 +45,7 @@ pub use job_store::{
     CancelRequest, CancellationTransition, ClaimRequest, CompleteRequest, ExpiredJob, JobEventSink,
     JobLifecycleEvent, JobListQuery, JobPage, JobStore, NoopJobEventSink, RenewalRequest,
 };
+pub use meta::{SessionMeta, TitleSource, SESSION_META_VERSION};
 pub use reader::TranscriptReader;
 pub use record::{RecordKind, TranscriptRecord};
 pub use store::TranscriptStore;

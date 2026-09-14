@@ -223,6 +223,21 @@ pub(crate) const READABLE_DIR_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
 
+/// Prüft, ob `error` ein `ELOOP` ist (Symlink als letztes Pfadglied bei
+/// [`open_nofollow`]).
+///
+/// Ersetzt `io::ErrorKind::FilesystemLoop`, das hinter dem instabilen
+/// Feature `io_error_more` liegt; der Vergleich läuft über den rohen `errno`.
+///
+/// # Examples
+/// ```rust
+/// use std::io;
+/// assert!(!harw_fsutil::is_symlink_loop(&io::Error::from(io::ErrorKind::NotFound)));
+/// ```
+pub fn is_symlink_loop(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error())
+}
+
 /// Öffnet `path`; das letzte Pfadglied darf kein Symlink sein.
 ///
 /// Elternverzeichnisse werden normal aufgelöst (auch über Symlinks). Ist das

@@ -67,6 +67,15 @@
 //!    [`crate::goal::Goal`] so vor (`revision: u64`,
 //!    [`GoalStore::revision`] → `u64`); der Newtype gehört dem Plan-Aggregat.
 //!
+//! # Integritätssiegel (W3/C-PLAN)
+//! [`FileGoalStore`] versiegelt jeden Snapshot wie `FilePlanStore`
+//! (`rev-<n>.seal`, gemeinsamer crate-privater Code in
+//! `crate::file_store::seal`) und prüft das Siegel des neuesten Snapshots
+//! beim Öffnen ([`PlanError::SealMismatch`]). Ein Verzeichnis ohne jedes
+//! Siegel gilt als Legacy-Stand (einmal `warn!`, der nächste Write
+//! versiegelt). Ungeschlüsselt: erkennt Beschädigung und naive Manipulation,
+//! nicht einen Angreifer mit Schreibrecht auf `HARW_HOME`.
+//!
 //! # Examples
 //! ```rust,no_run
 //! use harw_plan::error::PlanError;
@@ -92,6 +101,7 @@ use time::OffsetDateTime;
 use tracing::{debug, info};
 
 use crate::error::{PlanError, PlanResult};
+use crate::file_store::seal;
 use crate::goal::{
     Goal, GoalAction, GoalEvent, GoalStore, apply_goal_action, validate_goal_action,
 };
@@ -128,9 +138,15 @@ struct FileInner {
     history: Vec<GoalEvent>,
     /// Nächste zu vergebende Revisionsnummer.
     next_revision: u64,
+    /// Letztes Glied der Siegelkette (`None` vor dem ersten Siegel).
+    seal: Option<seal::SealLink>,
     /// Wurzelverzeichnis dieses einen Ziels.
     root: PathBuf,
 }
+
+/// Ergebnis von `FileGoalStore::load`: Ziel, History, nächste Revision und
+/// letztes Siegel-Kettenglied.
+type LoadedGoalState = (Option<Goal>, Vec<GoalEvent>, u64, Option<seal::SealLink>);
 
 /// Vollständig synchronisierter, aber noch nicht sichtbarer Snapshot-Write.
 ///
@@ -441,12 +457,13 @@ impl FileGoalStore {
     pub fn new(root: impl AsRef<Path>) -> PlanResult<Self> {
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
-        let (goal, history, next_revision) = Self::load(&root)?;
+        let (goal, history, next_revision, seal) = Self::load(&root)?;
         Ok(Self {
             inner: RwLock::new(FileInner {
                 goal,
                 history,
                 next_revision,
+                seal,
                 root,
             }),
         })
@@ -460,12 +477,15 @@ impl FileGoalStore {
     /// Revision existiert genau eine Datei. Die nächste Revision ist das Maximum
     /// aus Dateiname, `goal.revision` und der höchsten History-Revision plus
     /// eins, damit ein halb geschriebener Stand keine Nummer doppelt vergibt.
-    fn load(root: &Path) -> PlanResult<(Option<Goal>, Vec<GoalEvent>, u64)> {
+    ///
+    /// Nur der neueste Snapshot wird gelesen; sein Siegel wird vor der
+    /// Deserialisierung geprüft.
+    fn load(root: &Path) -> PlanResult<LoadedGoalState> {
         if !root.exists() {
-            return Ok((None, Vec::new(), 1));
+            return Ok((None, Vec::new(), 1, None));
         }
 
-        let mut newest: Option<(u64, Goal)> = None;
+        let mut newest: Option<(u64, PathBuf)> = None;
         for entry in std::fs::read_dir(root)? {
             let entry = entry?;
             if !entry.file_type()?.is_file() {
@@ -481,15 +501,18 @@ impl FileGoalStore {
             else {
                 continue;
             };
-            let goal: Goal = serde_json::from_reader(std::fs::File::open(entry.path())?)?;
             if newest.as_ref().is_none_or(|(current, _)| number > *current) {
-                newest = Some((number, goal));
+                newest = Some((number, entry.path()));
             }
         }
 
-        let Some((file_revision, goal)) = newest else {
-            return Ok((None, Vec::new(), 1));
+        let Some((file_revision, snapshot_path)) = newest else {
+            return Ok((None, Vec::new(), 1, None));
         };
+        let bytes = std::fs::read(&snapshot_path)?;
+        let dir_sealed = seal::directory_is_sealed(root)?;
+        let link = seal::verify(&snapshot_path, file_revision, &bytes, dir_sealed)?;
+        let goal: Goal = serde_json::from_slice(&bytes)?;
 
         let history_path = Self::history_path(root);
         let history = if history_path.exists() {
@@ -517,7 +540,7 @@ impl FileGoalStore {
             .max(goal.revision)
             .max(history_revision)
             .saturating_add(1);
-        Ok((Some(goal), history, next))
+        Ok((Some(goal), history, next, link))
     }
 
     /// Gibt den Snapshot-Pfad einer Revision zurück.
@@ -723,7 +746,15 @@ impl GoalStore for FileGoalStore {
 
         let bytes = serde_json::to_vec_pretty(&candidate)?;
         let snapshot_path = Self::goal_path(&inner.root, revision);
+        let (seal_bytes, link) = seal::build(inner.seal.as_ref(), revision, &bytes)?;
         let staged_snapshot = Self::stage_atomic_write(&snapshot_path, &bytes)?;
+        let staged_seal = match seal::stage(&seal::seal_path(&snapshot_path), &seal_bytes) {
+            Ok(staged) => staged,
+            Err(error) => {
+                staged_snapshot.discard();
+                return Err(error);
+            }
+        };
 
         let event = GoalEvent {
             revision,
@@ -732,6 +763,13 @@ impl GoalStore for FileGoalStore {
             applied_at: now,
         };
         if let Err(error) = Self::append_event(&inner.root, &event) {
+            staged_seal.discard();
+            staged_snapshot.discard();
+            return Err(error);
+        }
+        // Siegel vor dem Snapshot (siehe `FilePlanStore`): ein Absturz
+        // dazwischen hinterlässt nie einen unversiegelten neuesten Snapshot.
+        if let Err(error) = staged_seal.commit() {
             staged_snapshot.discard();
             return Err(error);
         }
@@ -744,6 +782,7 @@ impl GoalStore for FileGoalStore {
         );
         inner.next_revision = revision.saturating_add(1);
         inner.goal = Some(candidate);
+        inner.seal = Some(link);
         inner.history.push(event.clone());
         Ok(event)
     }
@@ -1348,5 +1387,71 @@ mod tests {
             !dir.path().join("rev-1.json").exists(),
             "ein fehlgeschlagener History-Append darf keinen Snapshot veröffentlichen"
         );
+    }
+
+    // ── Integritätssiegel ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_file_goal_store_rejects_manipulated_snapshot_on_open() {
+        let dir = temp_dir();
+        {
+            let store = file_store(&dir);
+            apply_ok(
+                &store,
+                GoalAction::Set {
+                    goal: make_goal(GoalStatus::Active),
+                },
+                "human:mia",
+            );
+        }
+        assert!(dir.path().join("rev-1.seal").exists(), "Siegel geschrieben");
+        let snapshot = dir.path().join("rev-1.json");
+        let original = match std::fs::read_to_string(&snapshot) {
+            Ok(content) => content,
+            Err(error) => panic!("Snapshot lesen: {error}"),
+        };
+        let tampered = original.replace("\"active\"", "\"achieved\"");
+        assert_ne!(original, tampered, "Testaufbau: Status muss im Snapshot stehen");
+        if let Err(error) = std::fs::write(&snapshot, tampered) {
+            panic!("Snapshot schreiben: {error}");
+        }
+
+        let result = FileGoalStore::new(dir.path());
+
+        assert!(
+            matches!(result, Err(PlanError::SealMismatch { .. })),
+            "manipuliertes Ziel muss beim Öffnen abgewiesen werden"
+        );
+    }
+
+    #[test]
+    fn test_file_goal_store_legacy_without_seal_opens_and_seals_next_write() {
+        let dir = temp_dir();
+        {
+            let store = file_store(&dir);
+            apply_ok(
+                &store,
+                GoalAction::Set {
+                    goal: make_goal(GoalStatus::Active),
+                },
+                "human:mia",
+            );
+        }
+        if let Err(error) = std::fs::remove_file(dir.path().join("rev-1.seal")) {
+            panic!("Siegel entfernen: {error}");
+        }
+
+        let legacy = file_store(&dir);
+        assert_eq!(current_ok(&legacy).revision, 1);
+        apply_ok(
+            &legacy,
+            GoalAction::Set {
+                goal: make_goal(GoalStatus::Active),
+            },
+            "human:mia",
+        );
+        assert!(dir.path().join("rev-2.seal").exists());
+        drop(legacy);
+        assert_eq!(current_ok(&file_store(&dir)).revision, 2);
     }
 }

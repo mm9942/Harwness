@@ -1,4 +1,6 @@
-use harw_browser::policy::{BiDiRequirement, OpenBrowserRequest, OriginPolicy, ProfilePolicy};
+use harw_browser::policy::{
+    BiDiRequirement, BrowserLimits, OpenBrowserRequest, OriginPolicy, ProfilePolicy,
+};
 use harw_browser_thirtyfour::{
     BackpressureDisposition, BidiEventClass, BidiEventDomain, BidiSubscriptionPlan,
     EventJournalPolicy, FirefoxCapabilityFactory, FirefoxHostConfig,
@@ -16,8 +18,11 @@ fn firefox_request() -> OpenBrowserRequest {
         headless: true,
         profile: ProfilePolicy::Ephemeral,
         bidi: BiDiRequirement::Required,
-        allowed_origins: OriginPolicy::new(vec!["erp.example".to_owned()], true),
+        allowed_origins: OriginPolicy::from_origins(["https://erp.example"], true)
+            .expect("fixture origin policy is valid"),
+        authentication_origins: OriginPolicy::default(),
         viewport: None,
+        limits: BrowserLimits::default(),
     }
 }
 

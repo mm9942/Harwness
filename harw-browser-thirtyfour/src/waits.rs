@@ -1,3 +1,5 @@
+//! Wait routing. Model-supplied script predicates are not supported (F-007).
+
 use harw_browser::error::Error;
 use harw_browser::ids::BrowserContextId;
 use harw_browser::wait::{WaitCondition, WaitOutcome, WaitTimeout};
@@ -25,10 +27,6 @@ impl FirefoxRuntime {
             | WaitCondition::TitleMatches(_)
             | WaitCondition::NavigationComplete) => {
                 self.wait_navigation_condition(context_id, condition, timeout)
-                    .await
-            }
-            condition @ WaitCondition::CustomScript { .. } => {
-                self.wait_for_custom_script(context_id, condition, timeout)
                     .await
             }
             WaitCondition::NetworkQuiescence { .. } => {

@@ -4,9 +4,11 @@
 //! Ein einziges Enum [`IndexError`] für alle Fehler dieses Crates: die
 //! zurückgewiesene Abfrage gegen ein abweichendes Manifest (die wichtigste
 //! Zusage des Knotens AW4-06), eine Abfrage ohne das für den jeweiligen
-//! Indextyp nötige Feld (`Query::embedding` bzw. `Query::text`), Fehler aus
-//! `harw-lens-store` beim Laden/Speichern eines Index sowie
-//! JSON-(De-)Serialisierungsfehler des Persistenzformats. `Display`, die
+//! Indextyp nötige Feld (`Query::embedding` bzw. `Query::text`), eine
+//! abweichende Embedding-Dimension bei Einfügen oder Abfrage gegen
+//! [`crate::FlatIndex`] (Knoten W10-L1), Fehler aus `harw-lens-store` beim
+//! Laden/Speichern eines Index sowie JSON-(De-)Serialisierungsfehler des
+//! Persistenzformats. `Display`, die
 //! `Debug`-Delegation und
 //! `std::error::Error` werden nicht von Hand geschrieben, sondern von
 //! `#[derive(harw_macros::HarwError)]` erzeugt (Muster:
@@ -65,6 +67,29 @@ pub enum IndexError {
     /// beantwortbar.
     #[msg("query has no text, but Bm25Index::search requires one")]
     MissingText,
+
+    /// [`crate::FlatIndex`] hat ein Embedding gesehen, dessen Dimension von
+    /// der Dimension aller bisherigen Embeddings dieses Index abweicht.
+    /// Entsteht entweder beim Einfügen — [`crate::FlatIndex::build`] oder
+    /// [`crate::FlatIndex::load`] prüfen jedes Embedding gegen die Dimension
+    /// des ersten —, oder bei der Abfrage — [`crate::FlatIndex::search`]
+    /// prüft `query.embedding` gegen die im Index festgestellte Dimension,
+    /// **bevor** irgendeine Ähnlichkeit berechnet wird. Ein leerer Index hat
+    /// keine festgestellte Dimension und kann diesen Fehler nicht auslösen.
+    ///
+    /// # Arguments
+    /// - `expected` (`usize`): die Dimension, die der Index bereits
+    ///   festgestellt hat (aus dem ersten Embedding bzw. den vorhandenen
+    ///   Einträgen).
+    /// - `actual` (`usize`): die abweichende Dimension des neu eingefügten
+    ///   oder abgefragten Embeddings.
+    #[msg("embedding dimension mismatch: expected {expected}, got {actual}")]
+    EmbeddingDimensionMismatch {
+        /// Die bereits festgestellte, erwartete Dimension.
+        expected: usize,
+        /// Die abweichende, tatsächlich erhaltene Dimension.
+        actual: usize,
+    },
 
     /// Kein Index namens `name` im übergebenen `LensStore` gefunden (weder
     /// Manifest noch Datenteil vorhanden). Entsteht ausschließlich in
@@ -181,6 +206,15 @@ mod tests {
             name: "my-index".to_owned(),
         };
         assert_eq!(err.to_string(), "no index named 'my-index' exists in the store");
+    }
+
+    #[test]
+    fn test_index_error_display_embedding_dimension_mismatch() {
+        let err = IndexError::EmbeddingDimensionMismatch {
+            expected: 8,
+            actual: 4,
+        };
+        assert_eq!(err.to_string(), "embedding dimension mismatch: expected 8, got 4");
     }
 
     #[test]

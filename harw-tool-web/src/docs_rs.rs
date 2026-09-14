@@ -5,7 +5,9 @@
 //! # Verantwortung
 //! Dieses Modul baut die docs.rs-URL, holt sie über [`crate::fetch::WebFetcher`]
 //! als Rohdokument, schneidet den Doku-Bereich (`#main-content`, Fallback
-//! `body`) heraus und konvertiert ihn nach Markdown. Es besitzt **keinen**
+//! `body`) heraus und konvertiert ihn über [`crate::html::html_to_markdown`]
+//! (bereinigt: script/style/noscript/versteckte Elemente) nach Markdown —
+//! blockierend auf dem Blocking-Pool ([`crate::fetch::run_blocking`]). Es besitzt **keinen**
 //! eigenen HTTP-Zugriff — die gesamte Netz-Ausgangstür liegt in
 //! [`crate::fetch`].
 //!
@@ -42,7 +44,8 @@
 //! );
 //! ```
 
-use crate::fetch::{OutputFormat, html_to_markdown, scoped_fetcher};
+use crate::fetch::{run_blocking, scoped_fetcher};
+use crate::html::html_to_markdown;
 use harw_macros::Tool;
 use harw_tools::{ToolExecutionContext, ToolOutput, ToolsError};
 use serde::{Deserialize, Serialize};
@@ -341,19 +344,27 @@ async fn web_docs_rs(
         Err(err) => return Ok(ToolOutput::error(err.to_string())),
     };
 
-    // `Raw` holen: die HTML-Struktur wird hier gebraucht, um `#main-content`
-    // herauszuschneiden, bevor konvertiert wird.
-    let document = match fetcher.fetch(&url, OutputFormat::Raw).await {
+    // Rohkörper holen: die HTML-Struktur wird gebraucht, um `#main-content`
+    // herauszuschneiden. Der Körper ist byte-gekappt, aber noch nicht
+    // textgekappt; die Kappung auf `MAX_DOC_CHARS` folgt nach der Konvertierung.
+    let document = match fetcher.fetch_source(&url).await {
         Ok(document) => document,
         Err(err) => return Ok(ToolOutput::error(err.to_string())),
     };
 
-    let fragment = extract_main_content(&document.body);
-    let markdown = match html_to_markdown(&fragment) {
-        Ok(markdown) => markdown,
+    // Parsen, Bereinigen (script/style/versteckte Elemente) und Konvertieren
+    // sind CPU-gebunden und laufen auf dem Blocking-Pool (F-169).
+    let body = document.body.clone();
+    let converted = run_blocking("docs-rs-markdown", move || {
+        let fragment = extract_main_content(&body);
+        let markdown = html_to_markdown(&fragment)?;
+        Ok(truncate_with_hint(markdown.trim(), MAX_DOC_CHARS))
+    })
+    .await;
+    let (markdown, truncated) = match converted {
+        Ok(result) => result,
         Err(err) => return Ok(ToolOutput::error(err.to_string())),
     };
-    let (markdown, truncated) = truncate_with_hint(markdown.trim(), MAX_DOC_CHARS);
 
     let result = DocsRsResult {
         url: document.url,

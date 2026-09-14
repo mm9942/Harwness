@@ -54,6 +54,29 @@ pub enum MemoryError {
         /// Beschreibung der versuchten Aktion.
         attempted: &'static str,
     },
+    /// Frontmatter eines Fakts (`facts/<name>.md`) ist fehlerhaft oder
+    /// unvollständig — z. B. fehlendes schließendes `---`, ein Pflichtfeld
+    /// fehlt, oder ein Wert lässt sich nicht parsen.
+    FrontmatterInvalid {
+        /// Betroffene Datei.
+        path: PathBuf,
+        /// Menschenlesbare Ursache.
+        reason: String,
+    },
+    /// Ein Fakt-Name verstößt gegen `[a-z0-9][a-z0-9-]{0,59}`
+    /// (Pfad-Traversal-Schutz für `facts/<name>.md`).
+    InvalidFactName {
+        /// Vom Aufrufer übergebener Name.
+        name: String,
+    },
+    /// Ein Frontmatter-Feld enthält einen Wert außerhalb der erlaubten
+    /// Aufzählung (z. B. `type: unsinn`).
+    InvalidEnumValue {
+        /// Name des betroffenen Feldes (`"type"`, `"scope"`).
+        field: &'static str,
+        /// Der ungültige Rohwert.
+        value: String,
+    },
 }
 
 impl fmt::Display for MemoryError {
@@ -79,6 +102,19 @@ impl fmt::Display for MemoryError {
             Self::LockContention { attempted } => {
                 write!(f, "memory maintenance lock contended during {attempted}")
             }
+            Self::FrontmatterInvalid { path, reason } => {
+                write!(
+                    f,
+                    "fact frontmatter invalid at {}: {reason}",
+                    path.display()
+                )
+            }
+            Self::InvalidFactName { name } => {
+                write!(f, "fact name is invalid: {name:?}")
+            }
+            Self::InvalidEnumValue { field, value } => {
+                write!(f, "fact field {field:?} has invalid value: {value:?}")
+            }
         }
     }
 }
@@ -96,7 +132,10 @@ impl std::error::Error for MemoryError {
             Self::Serde { source, .. } => Some(source),
             Self::TierOverflow { .. }
             | Self::InvalidNamespace { .. }
-            | Self::LockContention { .. } => None,
+            | Self::LockContention { .. }
+            | Self::FrontmatterInvalid { .. }
+            | Self::InvalidFactName { .. }
+            | Self::InvalidEnumValue { .. } => None,
         }
     }
 }

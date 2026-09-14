@@ -1,5 +1,5 @@
 use harw_browser::error::{Error, Result};
-use harw_browser::ids::{BrowserContextId, BrowserEventCursor, BrowserObservationRevision};
+use harw_browser::ids::{BrowserContextId, BrowserObservationRevision};
 use harw_browser::observation::{
     BoundingBox, BrowserObservation, DocumentIdentity, ObservationMode, ObservedElement,
 };
@@ -34,12 +34,7 @@ pub(crate) async fn observe(
         .await
         .map_err(|error| map_driver_error("read document title", error))?;
     let elements = collect_elements(webdriver, mode).await?;
-    let event_cursor = runtime
-        .events()
-        .lock()
-        .await
-        .back()
-        .map_or_else(BrowserEventCursor::zero, |event| event.cursor);
+    let event_cursor = runtime.last_event_cursor().await;
 
     Ok(BrowserObservation {
         session_id: runtime.session_id(),

@@ -25,8 +25,13 @@ harw-macros = { path = "../harw-macros" }
 # Injizierte Zeit (`jiff::Timestamp`) für den Automaten und den Ringpuffer;
 # diese Crate liest nie die Systemuhr selbst (siehe `//!`-Doku von `lib.rs`).
 jiff = { workspace = true }
+# `FindingSpool` (W3 C-FIND): Records aus harw-dod-rules, symlinkfestes Schreiben/Lesen.
+harw-dod-rules = { path = "../harw-dod-rules" }
+harw-fsutil = { path = "../harw-fsutil" }
+serde_json = { workspace = true }
 
 [dev-dependencies]
+harw-sandbox = { path = "../harw-sandbox" }
 tempfile = { workspace = true }
 # Nur für `error.rs`-Tests: konstruiert einen echten `serde_json::Error`, um
 # den `#[from]`-Pfad von `SentinelError::Evidence` zu prüfen, ohne den

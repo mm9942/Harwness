@@ -13,6 +13,10 @@
 //! Workspace-Bindung entsteht nach genau einem Muster, und Netzrechte
 //! vergibt keine der drei Funktionen.
 //!
+//! `build_local_spawn_context` selbst ist seit W2d-2 entfernt; sein
+//! Nachfolger ist [`root_sandbox`] hier, aufgerufen aus der
+//! RuntimeAssembly-Montage (siehe [`crate::RuntimeAssembly`]).
+//!
 //! # Netz
 //! Jede hier gebaute [`SandboxSpec`] entsteht über
 //! [`SandboxSpec::from_resolved`] und trägt damit den leeren

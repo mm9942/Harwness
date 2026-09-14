@@ -34,11 +34,11 @@
 //!
 //! ## Slash-Kommandos und `/tools`
 //! - `/command`-Zeilen laufen über
-//!   [`crate::command_exec::execute_command_as`]. Die Berechtigungsstufe kommt
-//!   aus dem Principal der Montage ([`crate::runtime_commands::caller_tier`]),
+//!   `crate::command_exec::execute_command_as`. Die Berechtigungsstufe kommt
+//!   aus dem Principal der Montage (`crate::runtime_commands::caller_tier`),
 //!   die Dienste aus ihrer Slash-Fläche
-//!   ([`crate::runtime_commands::slash_service_map`]) — erst nach
-//!   erfolgreicher Admission gebaut. Ohne Montage ([`ChatApp::with_runtime`]
+//!   (`crate::runtime_commands::slash_service_map`) — erst nach
+//!   erfolgreicher Admission gebaut. Ohne Montage (`ChatApp::with_runtime`
 //!   nicht aufgerufen) antwortet der Loop mit "Fehler: keine Runtime-Montage".
 //! - `/tools` läuft lokal über
 //!   [`crate::tools_command::dispatch_tools_command_bounded`] und kann die
@@ -94,9 +94,9 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write as _};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, KeyCode, KeyEvent, KeyModifiers,
@@ -113,7 +113,11 @@ use harw_core::{
     AgentSession, ConversationHistory, CoreError, InteractionMode, ManagedAgentSpawner,
     ModelError, ModelMessage, TurnInput, TurnOutcome, run_turn,
 };
+use harw_extension_api::allow_rules::{ApprovalRule, RuleDecision, RuleScope, derive_shell_rule};
+use harw_extension_api::approval_mode::ApprovalMode;
 use harw_extension_api::registry::ContextProviderRegistrationError;
+use harw_extension_api::{ToolCall, ToolName};
+use harw_operations::SessionController;
 use harw_operations::adapter::CommandAdapter;
 use harw_plan::PlanStore;
 use harw_plan::goal::{GoalStore, evaluate_goal};
@@ -127,15 +131,19 @@ use crate::CommandRegistry;
 use crate::approval::{
     ApprovalDriver, ApprovalDriverError, ApprovalPrompt, ApprovalPromptReceiver, ChildTurnDriver,
 };
+use crate::approval_dialog::{ApprovalChoice, ApprovalDialog, ApprovalDialogRequest, DialogAction};
 use crate::chat_scroll::{ChatScroll, ScrollAction};
+use crate::choice_dialog::{ChoiceAction, ChoiceDialog};
+use crate::clipboard::{self, ClipboardTarget};
 use crate::command_exec::execute_command_as;
 use crate::command_popup::{CommandPopup, PopupAction};
 use crate::events::{HarwEvent, HarwEventSender};
+use crate::export::{self, ExportEntry, ExportMeta, ExportOptions};
 use crate::frame_requester::{FrameRequester, MIN_FRAME_INTERVAL};
 use crate::history_cell::{
-    ApprovalPromptCell, AssistantHistoryCell, GoalCell, HistoryCell, PlainHistoryCell,
-    PlanGraphCell, ReasoningHistoryCell, SubAgentCell, SubAgentStatus, ToolCallHistoryCell,
-    ToolResultHistoryCell, UserHistoryCell,
+    AssistantHistoryCell, GoalCell, HistoryCell, PlainHistoryCell, PlanGraphCell,
+    ReasoningHistoryCell, SharedToolCell, SubAgentCell, SubAgentStatus, ToolCell, ToolGroupCell,
+    ToolVerbosity, UserHistoryCell,
 };
 use crate::input_editor::{InputAction, InputEditor};
 use crate::input_history::InputHistoryStore;
@@ -144,7 +152,9 @@ use crate::runtime_commands;
 // Coercion-Hilfe noch unqualifiziert auf; Prod in app.rs nutzt sie nicht.
 #[cfg(test)]
 use crate::runtime_root::as_dyn_approval_handler;
+use crate::runtime_root::TitleJobContext;
 use crate::session_controller::TuiSessionController;
+use crate::session_picker::{PickerAction, SessionEntry, SessionPicker};
 use crate::spinner::Spinner;
 use crate::style;
 use crate::tui_event::TuiEvent;
@@ -156,9 +166,6 @@ const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 pub(crate) const WELCOME: &str = "Willkommen. Tippe eine Nachricht — Enter zum Senden.";
 
 const NON_TEXT_CONTENT_PLACEHOLDER: &str = "[non-text content]";
-
-/// Obergrenze der in einer [`ToolCallHistoryCell`] gezeigten Argument-Vorschau.
-const TOOL_ARGUMENTS_PREVIEW_CHARS: usize = 80;
 
 /// Wie viele Einträge die persistente Eingabe-Historie beim Start zurückliefert.
 /// Großzügig genug, dass Wochen alter Gebrauch erreichbar bleibt, klein genug,
@@ -179,8 +186,8 @@ const REASON_OPERATOR_CANCELLED: &str = "operator cancelled the approval prompt 
 /// [`HistoryCell`] bietet **kein** Downcasting, und [`ChatApp`] hält den Verlauf
 /// als `Vec<Box<dyn HistoryCell>>`. Eine Zelle, die über mehrere Ereignisse
 /// hinweg fortgeschrieben wird — [`SubAgentCell`] über `ChildSpawned` →
-/// `ChildProgress` → `ChildCompleted`, [`ApprovalPromptCell`] über Frage →
-/// Entscheidung — braucht deshalb einen Seitenkanal auf **dieselbe** Instanz.
+/// `ChildProgress` → `ChildCompleted`, [`ToolCell`] über angefordert →
+/// abgeschlossen — braucht deshalb einen Seitenkanal auf **dieselbe** Instanz.
 ///
 /// Gewählte Lösung: genau eine Instanz hinter einem `Arc<Mutex<T>>`. Der
 /// Verlauf hält einen `SharedHistoryCell`-Wrapper, der Seitenkanal (bzw. die
@@ -231,19 +238,27 @@ impl<T: HistoryCell> HistoryCell for SharedHistoryCell<T> {
 ///
 /// # Beschreibung
 /// Zwei Seitenkanäle, die der Verlauf selbst nicht ausdrücken kann:
-/// - `pending_tool_names` korreliert `ToolCallRequested` → `ToolCallCompleted`
-///   (letzteres trägt nur die `call_id`),
+/// - `pending_tool_cells` korreliert `ToolCallRequested`/eine Freigabefrage →
+///   `ToolCallCompleted` (letzteres trägt nur die `call_id`) über **dieselbe**
+///   geteilte [`ToolCell`] (Plan Schritt 2, Contract-Slice B3) — ersetzt die
+///   frühere `HashMap<ToolCallId, String>`, die nur den Werkzeugnamen für eine
+///   zweite, separate Ergebniszelle vorhielt.
 /// - `child_cells` findet zu einer `child_id` die **eine** bereits angehängte
 ///   [`SubAgentCell`] wieder, damit `ChildProgress`/`ChildCompleted` sie
 ///   fortschreiben statt eine zweite Zelle anzulegen.
 ///
 /// Ein Eintrag in `child_cells` bleibt nach `ChildCompleted` bewusst bestehen:
 /// eine verspätet eintreffende Fortschrittsmeldung soll dieselbe Zelle treffen
-/// und keine neue erzeugen.
+/// und keine neue erzeugen. `pending_tool_cells`-Einträge bleiben nach
+/// `ToolCallCompleted` ebenfalls bestehen (statt entfernt zu werden): eine
+/// Freigabefrage für denselben Aufruf, die knapp vor oder nach dem
+/// `ToolCallRequested`-Ereignis eintrifft, muss dieselbe Zelle wiederfinden,
+/// egal in welcher Reihenfolge beide beim Renderer ankommen (siehe
+/// [`ensure_tool_cell`]).
 #[derive(Debug, Default)]
 struct TurnEventState {
-    /// `call_id` → Werkzeugname des zugehörigen `ToolCallRequested`.
-    pending_tool_names: HashMap<harw_types::ToolCallId, String>,
+    /// `call_id` → die eine geteilte Werkzeugzelle dieses Aufrufs.
+    pending_tool_cells: HashMap<harw_types::ToolCallId, SharedToolCell>,
     /// `child_id` → die eine Verlaufszelle dieses Kindes.
     child_cells: HashMap<String, Arc<Mutex<SubAgentCell>>>,
 }
@@ -279,6 +294,145 @@ impl TurnEventState {
             }
         }
     }
+}
+
+// ── Werkzeugzellen: Handle, Verbosity-Wrapper (Plan Schritt 2) ───────────────
+
+/// Kennung einer einzelnen oder gruppierten Werkzeugzelle, wie sie
+/// [`ChatApp`] für Ctrl+O „letzte bzw. alle aufklappen“ vorhält.
+///
+/// # Beschreibung
+/// Nur **Top-Level**-Zellen bekommen ein Handle: eine [`ToolCell`], die einer
+/// [`ToolGroupCell`] beigetreten ist, wird ausschließlich über die Gruppe
+/// auf-/zugeklappt, nie einzeln (siehe [`ChatApp::append_tool_cell`]).
+#[derive(Debug, Clone)]
+enum ToolCellHandle {
+    /// Eine einzelne, nicht gruppierte Werkzeugzelle.
+    Single(SharedToolCell),
+    /// Eine Sammelzelle aufeinanderfolgender lesender `fs.*`-Aufrufe.
+    Group(Arc<Mutex<ToolGroupCell>>),
+}
+
+impl ToolCellHandle {
+    /// Liest den aktuellen Ausklapp-Zustand.
+    ///
+    /// # Rückgabe
+    /// Ein vergifteter Lock zählt als eingeklappt — konservativ für die
+    /// „sind noch nicht alle ausgeklappt"-Entscheidung von Ctrl+O.
+    fn is_expanded(&self) -> bool {
+        match self {
+            Self::Single(cell) => cell.lock().map(|guard| guard.expanded).unwrap_or(false),
+            Self::Group(group) => group.lock().map(|guard| guard.expanded).unwrap_or(false),
+        }
+    }
+
+    /// Setzt den Ausklapp-Zustand direkt (Ctrl+O „alle").
+    fn set_expanded(&self, expanded: bool) {
+        match self {
+            Self::Single(cell) => {
+                if let Ok(mut guard) = cell.lock() {
+                    guard.set_expanded(expanded);
+                }
+            }
+            Self::Group(group) => {
+                if let Ok(mut guard) = group.lock() {
+                    guard.expanded = expanded;
+                }
+            }
+        }
+    }
+
+    /// Schaltet den Ausklapp-Zustand um (Ctrl+O „letzte").
+    fn toggle_expanded(&self) {
+        let next = !self.is_expanded();
+        self.set_expanded(next);
+    }
+}
+
+/// Verlaufszelle für eine geteilte Werkzeugzelle/-gruppe mit fest
+/// eingebranntem [`ToolVerbosity`] zum Zeitpunkt des Anhängens.
+///
+/// # Beschreibung
+/// Plan Schritt 2 „Verbosity". `tool_verbosity` ändert sich innerhalb einer
+/// laufenden Sitzung nicht — es wird einmalig beim Start über
+/// [`ChatApp::with_verbose_tools`] gesetzt (die CLI reicht `--verbose`
+/// durch, ein anderer Slice) — ein Erfassen bei Erzeugung genügt daher, statt
+/// bei jedem Rendern erneut `self.tool_verbosity` von der `App` zu lesen
+/// (wofür `HistoryCell::display_lines` ohnehin keinen Zugriff böte).
+#[derive(Debug)]
+struct ToolHistoryCell {
+    /// Die zugrunde liegende Einzel- oder Sammelzelle.
+    handle: ToolCellHandle,
+    /// Zum Anhängezeitpunkt aktive Verbosity.
+    verbosity: ToolVerbosity,
+}
+
+impl HistoryCell for ToolHistoryCell {
+    /// Delegiert an [`ToolCell::display_lines_with`] bzw.
+    /// [`ToolGroupCell::display_lines_with`] mit der eingebrannten Verbosity;
+    /// ein vergifteter Lock ergibt eine sichtbare Hinweiszeile statt eines Panics.
+    fn display_lines(&self, width: u16, theme: style::Theme) -> Vec<Line<'static>> {
+        match &self.handle {
+            ToolCellHandle::Single(cell) => match cell.lock() {
+                Ok(guard) => guard.display_lines_with(width, theme, self.verbosity),
+                Err(_) => vec![Line::from(Span::styled(
+                    "⚠ Werkzeugzelle nicht lesbar (Sperre vergiftet)".to_owned(),
+                    style::warning_style(theme),
+                ))],
+            },
+            ToolCellHandle::Group(group) => match group.lock() {
+                Ok(guard) => guard.display_lines_with(width, theme, self.verbosity),
+                Err(_) => vec![Line::from(Span::styled(
+                    "⚠ Werkzeuggruppe nicht lesbar (Sperre vergiftet)".to_owned(),
+                    style::warning_style(theme),
+                ))],
+            },
+        }
+    }
+}
+
+// ── Freigabemodus-Zyklus (Plan Schritt 5) ────────────────────────────────────
+
+/// Die vier Stufen des Shift+Tab-Zyklus: `ask → auto → full → plan → ask`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PermissionCycleStage {
+    /// Jeder Werkzeugaufruf wird bestätigt ([`ApprovalMode::AlwaysAsk`]).
+    Ask,
+    /// Harw entscheidet die harmlosen Fälle selbst ([`ApprovalMode::Delegated`]).
+    Auto,
+    /// Kein Werkzeugaufruf fragt nach ([`ApprovalMode::FullAccess`]).
+    Full,
+    /// Plan-Modus: Freigabe `AlwaysAsk` plus [`InteractionMode::Plan`].
+    Plan,
+}
+
+impl PermissionCycleStage {
+    /// Nächste Stufe im Zyklus (zyklisch, `Plan` → `Ask`).
+    fn next(self) -> Self {
+        match self {
+            Self::Ask => Self::Auto,
+            Self::Auto => Self::Full,
+            Self::Full => Self::Plan,
+            Self::Plan => Self::Ask,
+        }
+    }
+}
+
+// ── Vollflächige Overlays (Schritt 6/7) ──────────────────────────────────────
+
+/// Vollflächiges Overlay, das den normalen Eingabe-/Popup-Pfad ersetzt.
+///
+/// # Beschreibung
+/// Analog zum `/command`-Popup, aber exklusiv: solange ein Overlay offen ist,
+/// gehen Tasten ausschließlich an das Overlay (siehe `handle_overlay_key`).
+#[derive(Debug)]
+enum Overlay {
+    /// `/resume` ohne Argument öffnet eine filterbare Liste vergangener
+    /// Sitzungen (Plan Schritt 7).
+    SessionPicker(SessionPicker),
+    /// `/export` ohne `--datei` öffnet die Auswahl Zwischenablage/Datei/Abbrechen
+    /// (Contract „Nachträgliche Entscheidungen", Slice E1).
+    ExportChoice(ChoiceDialog),
 }
 
 /// Plan- und Ziel-Dienste, die der Renderer für [`PlanGraphCell`] und
@@ -414,8 +568,8 @@ pub enum LineAction {
     /// Einen Chat-Turn mit dem enthaltenen Text treiben.
     Chat(String),
     /// Eine `/command`-Zeile (oder `!`-Shell/Note/Mention) asynchron über die
-    /// Operation-Adapter-Pipeline ausführen ([`HarwEvent::Command`] →
-    /// [`crate::command_exec::execute_command_as`]); enthält die unveränderte
+    /// Operation-Adapter-Pipeline ausführen (`HarwEvent::Command` →
+    /// `crate::command_exec::execute_command_as`); enthält die unveränderte
     /// Rohzeile. Die lokale [`CommandRegistry`] wird davon unabhängig
     /// weiterhin für die Popup-Autocomplete-Anzeige verwendet.
     Command(String),
@@ -476,8 +630,8 @@ pub fn classify_line(line: &str) -> LineAction {
 ///
 /// Zusätzlich hält `ChatApp` die Operation-Adapter-Pipeline
 /// ([`CommandAdapter`], [`SandboxSpec`], [`SessionId`]), über die abgeschickte
-/// `/command`-Zeilen asynchron dispatcht werden ([`HarwEvent::Command`] →
-/// [`crate::command_exec::execute_command_as`]). Die separate `command_registry`
+/// `/command`-Zeilen asynchron dispatcht werden (`HarwEvent::Command` →
+/// `crate::command_exec::execute_command_as`). Die separate `command_registry`
 /// bleibt unabhängig davon ausschließlich für die Popup-Autocomplete-Anzeige
 /// zuständig.
 ///
@@ -567,6 +721,44 @@ pub struct ChatApp {
     /// Optionale Plan-/Ziel-Dienste der Composition-Root für [`PlanGraphCell`]
     /// und [`GoalCell`]; `None` degradiert beide zu Systemzeilen.
     plan_services: Option<TuiPlanServices>,
+    /// Detailgrad, mit dem Werkzeugzellen gerendert werden (Plan Schritt 2
+    /// „Verbosity"); gesetzt über [`Self::with_verbose_tools`].
+    tool_verbosity: ToolVerbosity,
+    /// Alle bisher angehängten Top-Level-Werkzeugzellen (einzeln oder
+    /// gruppiert), in Ankunftsreihenfolge — Grundlage für Ctrl+O „letzte bzw.
+    /// alle aufklappen" (Plan Schritt 2).
+    tool_cells: Vec<ToolCellHandle>,
+    /// Die aktuell offene Lese-Gruppe aufeinanderfolgender `fs.*`-Aufrufe,
+    /// sofern noch erweiterbar; `None` schließt implizit jede vorherige
+    /// Gruppe (Plan Schritt 2 „Gruppierung").
+    open_tool_group: Option<Arc<Mutex<ToolGroupCell>>>,
+    /// Ctrl+O-Vormerkung: `true` unmittelbar nach einem Druck, der nur die
+    /// letzte Werkzeugzelle umgeschaltet hat — ein erneuter Druck schaltet
+    /// dann alle um (Plan Schritt 2).
+    ctrl_o_expand_last_armed: bool,
+    /// Die aktuell offene Freigabefrage, die anstelle des Composers gezeichnet
+    /// wird (Plan Schritt 3); `None` zeigt den normalen Composer.
+    pending_approval_dialog: Option<ApprovalDialog>,
+    /// Vorgemerktes Ziel des Shift+Tab-Zyklus, solange ein Turn läuft (Plan
+    /// Schritt 5, AP W5-05: der Wechsel gilt erst an der nächsten Turn-Grenze).
+    pending_permission_stage: Option<PermissionCycleStage>,
+    /// Interaktionsmodus, zu dem der Zyklus nach Verlassen der `Plan`-Stufe
+    /// zurückkehrt (Plan Schritt 5).
+    mode_before_plan: Option<InteractionMode>,
+    /// Vollflächiges Overlay (Session-Picker, `/export`-Auswahl), das den
+    /// normalen Eingabe-/Popup-Pfad ersetzt (Plan Schritt 6/7).
+    overlay: Option<Overlay>,
+    /// Gesprächsverlauf als quellcode-unabhängige Einträge für `/export`
+    /// (Contract „Nachträgliche Entscheidungen", Slice E1); parallel zu
+    /// `cells` aufgebaut, weil [`HistoryCell`] keinen Text-Accessor bietet.
+    export_entries: Vec<ExportEntry>,
+    /// Anzeigetitel der Sitzung, sobald bekannt (Plan Schritt 7); `None` zeigt
+    /// keinen Titel in der Statuszeile.
+    session_title: Option<String>,
+    /// Kontext für die einmalige Titel-Job-Anstoßung nach dem ersten
+    /// abgeschlossenen Turn (Plan Schritt 7); wird beim ersten Gebrauch über
+    /// `take()` konsumiert.
+    title_job_context: Option<TitleJobContext>,
 }
 
 /// Handgeschriebene `Debug`-Implementierung, da [`CommandAdapter`] (enthält
@@ -590,6 +782,17 @@ impl std::fmt::Debug for ChatApp {
             .field("has_managed_spawner", &self.managed_spawner.is_some())
             .field("has_plan_services", &self.plan_services.is_some())
             .field("has_runtime", &self.runtime.is_some())
+            .field("tool_verbosity", &self.tool_verbosity)
+            .field("tool_cells_len", &self.tool_cells.len())
+            .field(
+                "has_pending_approval_dialog",
+                &self.pending_approval_dialog.is_some(),
+            )
+            .field("pending_permission_stage", &self.pending_permission_stage)
+            .field("has_overlay", &self.overlay.is_some())
+            .field("export_entries_len", &self.export_entries.len())
+            .field("session_title", &self.session_title)
+            .field("has_title_job_context", &self.title_job_context.is_some())
             .finish()
     }
 }
@@ -635,7 +838,7 @@ impl ChatApp {
     /// # Beschreibung
     /// Hinterlegt `memory` für die Korrektur-Erkennung im Chat-Pfad. Die
     /// Dienste der `/memory`-Kommandos kommen aus der Runtime-Montage
-    /// ([`Self::with_runtime`]).
+    /// (`Self::with_runtime`).
     #[must_use]
     pub fn with_memory(
         adapters: Vec<CommandAdapter>,
@@ -673,6 +876,17 @@ impl ChatApp {
             managed_spawner: None,
             active_mode: InteractionMode::default(),
             plan_services: None,
+            tool_verbosity: ToolVerbosity::Compact,
+            tool_cells: Vec::new(),
+            open_tool_group: None,
+            ctrl_o_expand_last_armed: false,
+            pending_approval_dialog: None,
+            pending_permission_stage: None,
+            mode_before_plan: None,
+            overlay: None,
+            export_entries: Vec::new(),
+            session_title: None,
+            title_job_context: None,
         }
     }
 
@@ -774,6 +988,300 @@ impl ChatApp {
     #[must_use]
     pub(crate) fn plan_services(&self) -> Option<&TuiPlanServices> {
         self.plan_services.as_ref()
+    }
+
+    /// Setzt den Detailgrad, mit dem Werkzeugzellen gerendert werden (Plan
+    /// Schritt 2 „Verbosity").
+    ///
+    /// # Beschreibung
+    /// Öffentliche, von `--verbose` unabhängige API: der interne
+    /// [`ToolVerbosity`]-Typ ist `pub(crate)` und kann deshalb nicht direkt in
+    /// einer öffentlichen Signatur erscheinen. Die CLI (ein anderer Slice)
+    /// reicht `--verbose` als `bool` durch; `true` entspricht
+    /// `ToolVerbosity::Verbose` (zusätzlich immer ausgeklappt, rohe Argumente
+    /// sichtbar), `false` dem Default `ToolVerbosity::Compact`.
+    ///
+    /// # Argumente
+    /// - `verbose` (`bool`): `true` aktiviert die ausführliche Darstellung.
+    ///
+    /// # Rückgabe
+    /// `Self` für Builder-Verkettung.
+    #[must_use]
+    pub fn with_verbose_tools(mut self, verbose: bool) -> Self {
+        self.tool_verbosity = if verbose {
+            ToolVerbosity::Verbose
+        } else {
+            ToolVerbosity::Compact
+        };
+        self
+    }
+
+    /// Hinterlegt den Kontext für die einmalige Titel-Job-Anstoßung nach dem
+    /// ersten abgeschlossenen Turn (Plan Schritt 7).
+    ///
+    /// # Beschreibung
+    /// Wird von der Composition-Root (`crate::runtime_root::build_root_runtime`)
+    /// gesetzt, wenn Titel-Generierung konfiguriert und eine
+    /// Session-Store-Wurzel bekannt ist. `run_loop` löst den Job beim ersten
+    /// `SessionEvent::TurnCompleted` ein und verwirft den Kontext danach
+    /// (`Option::take`) — er wird also höchstens einmal je Sitzung verwendet.
+    ///
+    /// # Rückgabe
+    /// `Self` für Builder-Verkettung.
+    #[must_use]
+    pub(crate) fn with_title_job_context(mut self, ctx: TitleJobContext) -> Self {
+        self.title_job_context = Some(ctx);
+        self
+    }
+
+    /// Setzt den Anzeigetitel der Sitzung (Plan Schritt 7).
+    ///
+    /// # Beschreibung
+    /// Öffentlicher Setter, damit eine spätere Verdrahtung (Titel-Job-Ergebnis,
+    /// `/resume`-Wiederherstellung) den Titel unabhängig vom Konstruktor
+    /// nachtragen kann. Erscheint danach in der Statuszeile ([`status_line`]).
+    ///
+    /// # Argumente
+    /// - `title` (`impl Into<String>`): der neue Anzeigetitel.
+    pub fn set_session_title(&mut self, title: impl Into<String>) {
+        self.session_title = Some(title.into());
+    }
+
+    /// Gibt den aktuellen Anzeigetitel der Sitzung zurück, falls bekannt.
+    #[must_use]
+    pub(crate) fn session_title(&self) -> Option<&str> {
+        self.session_title.as_deref()
+    }
+
+    /// Öffnet den Session-Picker als Vollflächen-Overlay (Plan Schritt 7).
+    ///
+    /// # Beschreibung
+    /// Aufgerufen von der Composition-Root (`runtime_root::run_tui`), nachdem
+    /// `/resume` ohne Argument den Loop mit
+    /// `TuiRunOutcome::Resume { selector: None }` verlassen hat und die
+    /// verfügbaren Sitzungen geladen wurden. Ein bereits offenes Overlay wird
+    /// ersetzt.
+    ///
+    /// # Argumente
+    /// - `entries` (`Vec<SessionEntry>`): die anzuzeigenden Sitzungen.
+    pub(crate) fn open_session_picker(&mut self, entries: Vec<SessionEntry>) {
+        self.overlay = Some(Overlay::SessionPicker(SessionPicker::new(
+            entries,
+            SystemTime::now(),
+        )));
+    }
+
+    /// Öffnet die `/export`-Zielauswahl als Vollflächen-Overlay.
+    ///
+    /// # Spec
+    /// Contract „Nachträgliche Entscheidungen" (Slice E1): „In die
+    /// Zwischenablage kopieren" / „Als Datei speichern" / „Abbrechen".
+    fn open_export_choice(&mut self) {
+        self.overlay = Some(Overlay::ExportChoice(ChoiceDialog::new(
+            "Export",
+            Some("Wie soll die Session exportiert werden?".to_owned()),
+            vec![
+                "In die Zwischenablage kopieren".to_owned(),
+                "Als Datei speichern".to_owned(),
+                "Abbrechen".to_owned(),
+            ],
+        )));
+    }
+
+    /// Gibt `true` zurück, wenn gerade ein Vollflächen-Overlay geöffnet ist.
+    #[must_use]
+    fn has_overlay(&self) -> bool {
+        self.overlay.is_some()
+    }
+
+    /// Leitet die aktuell wirksame [`PermissionCycleStage`] aus dem
+    /// Freigabemodus der Montage und dem aktiven Interaktionsmodus ab (Plan
+    /// Schritt 5).
+    ///
+    /// # Rückgabe
+    /// [`PermissionCycleStage::Plan`], wenn die Sitzung im Plan-Modus ist;
+    /// sonst die Stufe, die dem aktuellen [`ApprovalMode`] entspricht. Ohne
+    /// Runtime-Montage gilt [`PermissionCycleStage::Ask`] als sicherer Default.
+    #[must_use]
+    pub(crate) fn current_permission_stage(&self) -> PermissionCycleStage {
+        if self.active_mode == InteractionMode::Plan {
+            return PermissionCycleStage::Plan;
+        }
+        match self.runtime.as_ref().map(|rt| rt.approval_mode().get()) {
+            Some(ApprovalMode::AlwaysAsk) | None => PermissionCycleStage::Ask,
+            Some(ApprovalMode::Delegated) => PermissionCycleStage::Auto,
+            Some(ApprovalMode::FullAccess) => PermissionCycleStage::Full,
+        }
+    }
+
+    /// Gibt die vorgemerkte, noch nicht angewendete Zyklus-Stufe zurück, falls
+    /// ein Wechsel während eines laufenden Turns angefordert wurde (Plan
+    /// Schritt 5).
+    #[must_use]
+    pub(crate) fn pending_permission_stage(&self) -> Option<PermissionCycleStage> {
+        self.pending_permission_stage
+    }
+
+    /// Schreibt einen neuen [`ApprovalMode`] in die geteilte Zelle der
+    /// Montage; ohne Montage ein No-op (es gibt dann nichts zu schreiben).
+    fn set_approval_mode(&self, mode: ApprovalMode) {
+        if let Some(rt) = self.runtime.as_ref() {
+            rt.approval_mode().set(mode);
+        }
+    }
+
+    /// Setzt eine Stufe des Shift+Tab-Zyklus sofort um (Plan Schritt 5).
+    ///
+    /// # Beschreibung
+    /// `Plan` merkt sich den bisherigen Interaktionsmodus
+    /// (`Self::mode_before_plan`) und fordert [`InteractionMode::Plan`] an;
+    /// jede andere Stufe setzt nur den Freigabemodus — kehrt der Zyklus dabei
+    /// gerade aus `Plan` zurück, wird zusätzlich der gemerkte vorherige Modus
+    /// angefordert. Beide Anforderungen laufen über
+    /// [`harw_operations::SessionController::request_mode`] und wirken daher
+    /// erst an der nächsten Turn-Grenze (AP W5-05, siehe
+    /// [`Self::apply_pending_controller_state`]).
+    ///
+    /// # Argumente
+    /// - `stage` ([`PermissionCycleStage`]): die anzuwendende Zielstufe.
+    fn apply_permission_stage(&mut self, stage: PermissionCycleStage) {
+        match stage {
+            PermissionCycleStage::Plan => {
+                if self.mode_before_plan.is_none() {
+                    self.mode_before_plan = Some(self.active_mode);
+                }
+                self.set_approval_mode(ApprovalMode::AlwaysAsk);
+                if let Err(error) =
+                    self.session_controller.request_mode(InteractionMode::Plan.as_str())
+                {
+                    tracing::warn!(
+                        error = %error,
+                        "tui.permission_cycle.request_plan_mode_failed"
+                    );
+                }
+            }
+            PermissionCycleStage::Ask | PermissionCycleStage::Auto | PermissionCycleStage::Full => {
+                let approval = match stage {
+                    PermissionCycleStage::Ask => ApprovalMode::AlwaysAsk,
+                    PermissionCycleStage::Auto => ApprovalMode::Delegated,
+                    PermissionCycleStage::Full => ApprovalMode::FullAccess,
+                    PermissionCycleStage::Plan => unreachable!("oben behandelt"),
+                };
+                self.set_approval_mode(approval);
+                if let Some(previous) = self.mode_before_plan.take() {
+                    if let Err(error) = self.session_controller.request_mode(previous.as_str()) {
+                        tracing::warn!(
+                            error = %error,
+                            "tui.permission_cycle.restore_mode_failed"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Verarbeitet einen Shift+Tab-Druck: zyklischer Wechsel
+    /// `ask → auto → full → plan → ask` (Plan Schritt 5).
+    ///
+    /// # Argumente
+    /// - `turn_running` (`bool`): `true`, wenn gerade ein Turn läuft — der
+    ///   Zielzustand wird dann nur vorgemerkt (AP W5-05) und die Statuszeile
+    ///   zeigt „(ab nächstem Turn)", statt sofort zu wirken.
+    pub(crate) fn cycle_permission_stage(&mut self, turn_running: bool) {
+        let current = self
+            .pending_permission_stage
+            .unwrap_or_else(|| self.current_permission_stage());
+        let next = current.next();
+        if turn_running {
+            self.pending_permission_stage = Some(next);
+        } else {
+            self.pending_permission_stage = None;
+            self.apply_permission_stage(next);
+        }
+    }
+
+    /// Schließt die aktuell offene Lese-Gruppe (Plan Schritt 2 „Gruppierung").
+    ///
+    /// # Beschreibung
+    /// Aufgerufen, sobald ein anderes Werkzeug, Assistententext oder eine
+    /// sonstige Verlaufszelle angehängt wird — die nächste passende `fs.*`-
+    /// Anfrage beginnt danach eine neue Gruppe statt der alten beizutreten.
+    fn close_tool_group(&mut self) {
+        self.open_tool_group = None;
+    }
+
+    /// Hängt eine neue, geteilte Werkzeugzelle an den Verlauf an und gruppiert
+    /// sie bei Bedarf mit der zuletzt offenen Lese-Gruppe (Plan Schritt 2).
+    ///
+    /// # Beschreibung
+    /// Passt `tool_name` in [`ToolGroupCell::accepts`], wird die Zelle der
+    /// zuletzt offenen Gruppe beigetreten (oder eine neue Gruppe eröffnet);
+    /// sonst wird jede offene Gruppe geschlossen und die Zelle einzeln
+    /// angehängt. Nur Top-Level-Zellen/-Gruppen bekommen ein
+    /// [`ToolCellHandle`] in `self.tool_cells` (Ctrl+O „alle").
+    ///
+    /// # Argumente
+    /// - `tool_name` (`&str`): roher Werkzeugname des Aufrufs.
+    /// - `cell` ([`SharedToolCell`]): die neu erzeugte, geteilte Zelle.
+    fn append_tool_cell(&mut self, tool_name: &str, cell: SharedToolCell) {
+        if ToolGroupCell::accepts(tool_name) {
+            if let Some(group) = self.open_tool_group.clone() {
+                if let Ok(mut guard) = group.lock() {
+                    guard.push(cell);
+                }
+                return;
+            }
+            let group = Arc::new(Mutex::new(ToolGroupCell::new()));
+            if let Ok(mut guard) = group.lock() {
+                guard.push(cell);
+            }
+            self.push_cell(Box::new(ToolHistoryCell {
+                handle: ToolCellHandle::Group(Arc::clone(&group)),
+                verbosity: self.tool_verbosity,
+            }));
+            self.tool_cells.push(ToolCellHandle::Group(Arc::clone(&group)));
+            self.open_tool_group = Some(group);
+        } else {
+            self.close_tool_group();
+            self.push_cell(Box::new(ToolHistoryCell {
+                handle: ToolCellHandle::Single(Arc::clone(&cell)),
+                verbosity: self.tool_verbosity,
+            }));
+            self.tool_cells.push(ToolCellHandle::Single(cell));
+        }
+    }
+
+    /// Verarbeitet Ctrl+O: klappt die zuletzt angehängte Werkzeugzelle auf/zu,
+    /// ein unmittelbar folgender zweiter Druck klappt stattdessen alle um
+    /// (Plan Schritt 2).
+    ///
+    /// # Rückgabe
+    /// `true`, wenn mindestens eine Zelle vorhanden war (Redraw nötig);
+    /// `false` bei leerem Verlauf.
+    pub(crate) fn toggle_tool_cells(&mut self) -> bool {
+        if self.tool_cells.is_empty() {
+            return false;
+        }
+        if self.ctrl_o_expand_last_armed {
+            let target = !self.tool_cells.iter().all(ToolCellHandle::is_expanded);
+            for handle in &self.tool_cells {
+                handle.set_expanded(target);
+            }
+            self.ctrl_o_expand_last_armed = false;
+        } else {
+            if let Some(last) = self.tool_cells.last() {
+                last.toggle_expanded();
+            }
+            self.ctrl_o_expand_last_armed = true;
+        }
+        true
+    }
+
+    /// Gibt `true` zurück, wenn mindestens eine Werkzeugzelle eingeklappt ist
+    /// (Statuszeilen-Hinweis auf Ctrl+O, Plan Schritt 5).
+    #[must_use]
+    fn has_collapsed_tool_cells(&self) -> bool {
+        self.tool_cells.iter().any(|handle| !handle.is_expanded())
     }
 
     /// Gibt den zuletzt beobachteten Interaktionsmodus zurück.
@@ -905,8 +1413,13 @@ impl ChatApp {
     ///
     /// # Spec
     /// harw-tui Design §session_controller — apply_pending_controller_state.
-    /// AP W5-05 — `/mode` wirkt an der Turn-Grenze.
+    /// AP W5-05 — `/mode` wirkt an der Turn-Grenze. Löst zusätzlich einen
+    /// während des letzten Turns vorgemerkten Shift+Tab-Zyklus ein (Plan
+    /// Schritt 5, [`Self::cycle_permission_stage`]).
     pub(crate) fn apply_pending_controller_state(&mut self, session: &mut AgentSession) -> bool {
+        if let Some(stage) = self.pending_permission_stage.take() {
+            self.apply_permission_stage(stage);
+        }
         let applied = self.session_controller.apply_to_session(session);
         // Immer nachziehen, nicht nur bei `applied`: der Anzeigezustand soll
         // auch dann stimmen, wenn der Modus beim Aufbau der Session gesetzt
@@ -965,6 +1478,15 @@ impl ChatApp {
     /// - `text` (`impl Into<String>`): Nachrichtentext; Ownership wird übernommen.
     pub fn push_line(&mut self, role: Role, text: impl Into<String>) {
         let text = text.into();
+        // Eine neue User-/Assistant-/System-Zeile schließt jede offene
+        // Lese-Gruppe (Plan Schritt 2 „Gruppierung": „sobald … Assistententext
+        // kommt, wird die Gruppe geschlossen").
+        self.close_tool_group();
+        self.export_entries.push(match role {
+            Role::User => ExportEntry::User(text.clone()),
+            Role::Assistant => ExportEntry::Assistant(text.clone()),
+            Role::System => ExportEntry::System(text.clone()),
+        });
         let cell: Box<dyn HistoryCell> = match role {
             Role::User => Box::new(UserHistoryCell { text }),
             Role::Assistant => Box::new(AssistantHistoryCell { source: text }),
@@ -1498,6 +2020,33 @@ pub(crate) async fn run_loop(
                             if let Some(cell) = goal_cell_for_command(app, &raw) {
                                 app.push_cell(Box::new(cell));
                             }
+                            // `/export`: bei `--datei <pfad>` direkt schreiben,
+                            // sonst die Zielauswahl öffnen (Slice E1).
+                            if let Some(request) = export_request_for_command(&raw) {
+                                match request.path {
+                                    Some(path) => {
+                                        let opts = ExportOptions {
+                                            include_tool_calls: request.include_tool_calls,
+                                            ..ExportOptions::default()
+                                        };
+                                        let markdown = build_export_markdown(app, &opts);
+                                        match export::write_export(
+                                            std::path::Path::new(&path),
+                                            &markdown,
+                                        ) {
+                                            Ok(()) => app.push_line(
+                                                Role::System,
+                                                format!("Export gespeichert: {path}"),
+                                            ),
+                                            Err(error) => app.push_line(
+                                                Role::System,
+                                                format!("Export fehlgeschlagen: {error}"),
+                                            ),
+                                        }
+                                    }
+                                    None => app.open_export_choice(),
+                                }
+                            }
                             frame_req.schedule_frame();
                         }
                     }
@@ -1506,6 +2055,30 @@ pub(crate) async fn run_loop(
             maybe_sev = event_rx.recv() => {
                 if let Some(SessionEvent::TurnCompleted { usage, .. }) = maybe_sev {
                     app.total_usage.add(&usage);
+                    // Plan Schritt 7: einmalige Titel-Job-Anstoßung nach dem
+                    // ersten abgeschlossenen Turn der Sitzung. Der Kontext wird
+                    // dabei verbraucht (`Option::take`) — höchstens ein Versuch
+                    // je Sitzung, unabhängig davon, ob ein Modell auflösbar war
+                    // (siehe `TitleJobContext`-Doku in `runtime_root.rs`).
+                    if let Some(ctx) = app.title_job_context.take() {
+                        let model = ctx.title_model.clone().or_else(|| {
+                            gateway
+                                .session_mut()
+                                .active_model()
+                                .map(|id| id.as_str().to_owned())
+                        });
+                        match model {
+                            Some(model) => harw_runtime::spawn_title_job(
+                                ctx.session_store_root,
+                                app.session_id().clone(),
+                                ctx.provider,
+                                model,
+                            ),
+                            None => tracing::debug!(
+                                "tui.session_title.no_model_available_skipping_job"
+                            ),
+                        }
+                    }
                     frame_req.schedule_frame();
                 }
                 // Andere SessionEvent-Varianten (TurnStarted, SessionConfigured, ...) und
@@ -1585,6 +2158,44 @@ pub(crate) async fn run_loop(
     }
 }
 
+/// Findet oder erzeugt die eine geteilte [`ToolCell`] für `call_id` (Plan
+/// Schritt 2/3, Contract-Slice B3).
+///
+/// # Beschreibung
+/// Eine Freigabefrage für einen Aufruf trifft ein, **bevor** dessen
+/// `ToolCallCompleted` feststeht, aber unter Umständen knapp **vor oder nach**
+/// dem zugehörigen `TurnEvent::ToolCallRequested` — beide laufen über
+/// getrennte Kanäle (`turn_event_rx` bzw. der Fragekanal des
+/// [`ApprovalDriver`]), deren relative Ankunftsreihenfolge nicht garantiert
+/// ist. Diese Funktion macht beide Aufrufer robust: existiert bereits eine
+/// Zelle für `call_id` (`state.pending_tool_cells`), wird sie unverändert
+/// zurückgegeben (keine zweite Zelle, kein zweiter Verlaufseintrag); sonst
+/// wird sie über [`ToolCell::started`] neu angelegt, in `state` vermerkt und
+/// über [`ChatApp::append_tool_cell`] an den Verlauf gehängt.
+///
+/// # Argumente
+/// - `app` (`&mut ChatApp`): Renderer-Zustand, der die Zelle aufnimmt.
+/// - `state` (`&mut TurnEventState`): hält `call_id → Zelle`.
+/// - `call_id` (`harw_types::ToolCallId`): Kennung des Aufrufs.
+/// - `call` (`&ToolCall`): vollständiger Aufruf (Name + Argumente).
+///
+/// # Rückgabe
+/// Die eine, geteilte [`SharedToolCell`] dieses Aufrufs.
+fn ensure_tool_cell(
+    app: &mut ChatApp,
+    state: &mut TurnEventState,
+    call_id: harw_types::ToolCallId,
+    call: &ToolCall,
+) -> SharedToolCell {
+    if let Some(existing) = state.pending_tool_cells.get(&call_id) {
+        return Arc::clone(existing);
+    }
+    let cell: SharedToolCell = Arc::new(Mutex::new(ToolCell::started(call)));
+    state.pending_tool_cells.insert(call_id, Arc::clone(&cell));
+    app.append_tool_cell(call.name.as_str(), Arc::clone(&cell));
+    cell
+}
+
 /// Verarbeitet genau ein [`TurnEvent`] in den Renderer-Zustand.
 ///
 /// # Beschreibung
@@ -1593,13 +2204,17 @@ pub(crate) async fn run_loop(
 /// Verarbeitung benutzen — und damit sie ohne Terminal testbar ist.
 ///
 /// Zuordnung Ereignis → Zelle:
-/// - `ToolCallRequested` → [`ToolCallHistoryCell`] (Name wird für das spätere
-///   `ToolCallCompleted` in `state.pending_tool_names` gemerkt),
-/// - `ToolCallCompleted` → [`ToolResultHistoryCell`],
+/// - `ToolCallRequested` → **eine** geteilte [`ToolCell`] je `call_id`, über
+///   [`ensure_tool_cell`] angelegt bzw. wiedergefunden (Plan Schritt 2:
+///   „eine Zelle statt zwei"); aufeinanderfolgende lesende `fs.*`-Aufrufe
+///   werden über [`ChatApp::append_tool_cell`] zu einer [`ToolGroupCell`]
+///   gebündelt,
+/// - `ToolCallCompleted` → schreibt **dieselbe** Zelle über [`ToolCell::complete`]
+///   fort (kein zweiter Verlaufseintrag),
 /// - `ItemAdded(Reasoning)` → [`ReasoningHistoryCell`], nur bei nicht-leerer
-///   Zusammenfassung,
+///   Zusammenfassung; schließt eine offene Lese-Gruppe,
 /// - `ChildSpawned` → **eine** [`SubAgentCell`] je `child_id`, geteilt über
-///   [`SharedHistoryCell`],
+///   [`SharedHistoryCell`]; schließt eine offene Lese-Gruppe,
 /// - `ChildProgress` / `ChildCompleted` → schreiben **dieselbe** Zelle fort
 ///   (drei Ereignisse, eine Zelle),
 /// - `PlanUpdated` → [`PlanGraphCell`], wenn Plan-Dienste vorliegen und der
@@ -1611,7 +2226,7 @@ pub(crate) async fn run_loop(
 ///
 /// # Argumente
 /// - `app` (`&mut ChatApp`): Renderer-Zustand, der die Zellen aufnimmt.
-/// - `state` (`&mut TurnEventState`): Seitenkanäle (Werkzeugnamen, Kind-Zellen).
+/// - `state` (`&mut TurnEventState`): Seitenkanäle (Werkzeugzellen, Kind-Zellen).
 /// - `event` ([`TurnEvent`]): das zu verarbeitende Ereignis; Besitz geht über.
 ///
 /// # Rückgabe
@@ -1624,25 +2239,17 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             arguments,
             ..
         } => {
-            let preview = {
-                let raw = arguments.to_string();
-                if raw.chars().count() > TOOL_ARGUMENTS_PREVIEW_CHARS {
-                    format!(
-                        "{}…",
-                        raw.chars()
-                            .take(TOOL_ARGUMENTS_PREVIEW_CHARS)
-                            .collect::<String>()
-                    )
-                } else {
-                    raw
-                }
+            let already_known = state.pending_tool_cells.contains_key(&call_id);
+            let call = ToolCall {
+                id: call_id.clone(),
+                name: ToolName::new(tool_name),
+                arguments,
             };
-            state.pending_tool_names.insert(call_id, tool_name.clone());
-            app.push_cell(Box::new(ToolCallHistoryCell {
-                tool_name,
-                arguments_preview: preview,
-            }));
-            true
+            ensure_tool_cell(app, state, call_id, &call);
+            // Bereits während einer Freigabefrage angelegt (Wettlauf zwischen
+            // den beiden Kanälen, siehe `ensure_tool_cell`-Doku): kein neuer
+            // sichtbarer Zustand, kein Redraw nötig.
+            !already_known
         }
         TurnEvent::ToolCallCompleted {
             call_id,
@@ -1650,15 +2257,26 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             duration_ms,
             ..
         } => {
-            let tool_name = state
-                .pending_tool_names
-                .remove(&call_id)
-                .unwrap_or_else(|| "tool".to_owned());
-            app.push_cell(Box::new(ToolResultHistoryCell {
-                tool_name,
-                success: result.is_success(),
-                duration_ms,
-            }));
+            let Some(cell) = state.pending_tool_cells.get(&call_id).cloned() else {
+                tracing::warn!(call_id = %call_id, "tui.tool_cell.completed_without_request");
+                return false;
+            };
+            let export_entry = match cell.lock() {
+                Ok(mut guard) => {
+                    guard.complete(&result, duration_ms);
+                    Some(ExportEntry::Tool {
+                        label: guard.label.clone(),
+                        summary: guard.summary.clone(),
+                    })
+                }
+                Err(_) => {
+                    tracing::error!(call_id = %call_id, "tui.tool_cell.lock_poisoned");
+                    None
+                }
+            };
+            if let Some(entry) = export_entry {
+                app.export_entries.push(entry);
+            }
             true
         }
         TurnEvent::ItemAdded {
@@ -1669,6 +2287,8 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             if summary.is_empty() {
                 return false;
             }
+            app.close_tool_group();
+            app.export_entries.push(ExportEntry::Reasoning(summary.clone()));
             app.push_cell(Box::new(ReasoningHistoryCell { summary }));
             true
         }
@@ -1678,6 +2298,7 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             question,
             ..
         } => {
+            app.close_tool_group();
             let child_id = child.as_str().to_owned();
             let cell = Arc::new(Mutex::new(SubAgentCell {
                 child_id: child_id.clone(),
@@ -1723,6 +2344,7 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                 .map(|services| services.plan_store.current());
             match current_plan {
                 Some(Ok(plan)) => {
+                    app.close_tool_group();
                     app.push_cell(Box::new(PlanGraphCell { plan }));
                 }
                 Some(Err(error)) => {
@@ -1819,6 +2441,193 @@ fn is_goal_check_command(raw: &str) -> bool {
     words.next() == Some("/goal") && words.next() == Some("check")
 }
 
+// ── `/export` (Contract „Nachträgliche Entscheidungen", Slice E1) ───────────
+
+/// Eine erkannte `/export`-Anfrage.
+struct ExportRequest {
+    /// `--tools`: Werkzeugaufrufe im Export einschließen.
+    include_tool_calls: bool,
+    /// `--datei <pfad>`: `Some(pfad)` überspringt die Auswahl und schreibt
+    /// direkt dorthin; `None` öffnet [`Overlay::ExportChoice`].
+    path: Option<String>,
+}
+
+/// Erkennt `/export [--tools] [--datei <pfad>]` in der rohen Befehlszeile.
+///
+/// # Beschreibung
+/// Tokenisiert über [`crate::input::tokenize`] — dieselbe Quotierung wie der
+/// reguläre `/command`-Dispatch — statt naiv auf Leerzeichen zu splitten (wie
+/// [`is_goal_check_command`]): `--datei` kann einen Pfad mit Leerzeichen
+/// tragen (`--datei "mit leerzeichen.md"`), den ein naiver Split zerrisse.
+/// Spiegelt `harw_ops::export::ExportArgs::from_raw_args` (dort Op-intern,
+/// von hier aus nicht referenzierbar) — siehe dessen Moduldoku für den
+/// vollständigen Vertrag.
+///
+/// # Argumente
+/// - `raw` (`&str`): die unveränderte Befehlszeile.
+///
+/// # Rückgabe
+/// `Some(request)` für jede erkennbare `/export`-Zeile (auch mit unbekannten
+/// Flags — die überlässt diese Funktion dem regulären `/command`-Dispatch,
+/// der sie als Fehler meldet); `None` für jede andere Zeile oder bei einem
+/// Tokenisierungsfehler (der reguläre Dispatch meldet ihn ohnehin bereits als
+/// Systemzeile).
+fn export_request_for_command(raw: &str) -> Option<ExportRequest> {
+    let rest = raw.trim().strip_prefix('/')?;
+    let mut tokens = crate::input::tokenize(rest).ok()?.into_iter();
+    if tokens.next()?.as_str() != "export" {
+        return None;
+    }
+    let tail: Vec<String> = tokens.collect();
+
+    let mut include_tool_calls = false;
+    let mut path = None;
+    let mut index = 0;
+    while index < tail.len() {
+        match tail[index].as_str() {
+            "--tools" => {
+                include_tool_calls = true;
+                index += 1;
+            }
+            "--datei" => {
+                let Some(value) = tail.get(index + 1) else {
+                    // Fehlender Pfad: der reguläre Dispatch meldet den Fehler
+                    // über `OpError::InvalidArguments`; hier keine Auswahl öffnen.
+                    return Some(ExportRequest {
+                        include_tool_calls,
+                        path: None,
+                    });
+                };
+                path = Some(value.clone());
+                index += 2;
+            }
+            _ => {
+                // Unbekanntes Token: der reguläre Dispatch meldet den Fehler.
+                index += 1;
+            }
+        }
+    }
+    Some(ExportRequest {
+        include_tool_calls,
+        path,
+    })
+}
+
+/// Baut einen dateinamensicheren Zeitstempel aus der Systemzeit.
+///
+/// # Beschreibung
+/// `time`/`jiff` sind in `harw-tui` bewusst nur Dev-Dependencies (siehe
+/// `Cargo.toml`, Kommentar über `harw-fsutil`) — eine Kalenderdatum-Formatierung
+/// steht in Produktionscode deshalb nicht zur Verfügung. Sekunden seit der
+/// Unix-Epoche (`"1757831400"`) sind für [`export::default_export_path`]
+/// ausreichend eindeutig; Kollisionen fängt ohnehin [`export::write_export`]
+/// über Nummernsuffixe ab.
+fn export_timestamp_now() -> String {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_owned())
+}
+
+/// Baut das Markdown-Dokument für `/export` aus dem parallel mitgeführten
+/// [`ExportEntry`]-Verlauf ([`ChatApp::export_entries`]).
+///
+/// # Beschreibung
+/// Werkzeugaufrufe und Denkschritte bleiben standardmäßig ausgeblendet
+/// ([`ExportOptions::default`]) — dieselbe Zurückhaltung wie im Freigabe-Panel:
+/// beide können interne Details offenlegen, die nicht jeder Export teilen
+/// soll. `started_at` bleibt `None` (siehe [`export_timestamp_now`] für den
+/// Grund); Titel, Verzeichnis und Session-ID kommen aus der laufenden Sitzung.
+///
+/// # Argumente
+/// - `app` (`&ChatApp`): liefert Titel, Projekt-Root, Session-ID und Verlauf.
+/// - `opts` (`&ExportOptions`): Inhaltsauswahl (siehe [`export_request_for_command`]).
+fn build_export_markdown(app: &ChatApp, opts: &ExportOptions) -> String {
+    let meta = ExportMeta {
+        title: app.session_title().map(str::to_owned),
+        session_id: app.session_id().to_string(),
+        started_at: None,
+        cwd: if app.project_root().is_empty() {
+            None
+        } else {
+            Some(app.project_root().to_owned())
+        },
+        model: None,
+    };
+    export::render_markdown(&meta, &app.export_entries, opts)
+}
+
+/// Löst eine getroffene `/export`-Auswahl ein (Zwischenablage/Datei/Abbrechen).
+///
+/// # Beschreibung
+/// Index `0` kopiert über [`clipboard::copy_or_sequence`] in die
+/// Zwischenablage; landet die Sequenz dabei als [`ClipboardTarget::Osc52`]
+/// (kein Systemwerkzeug erreichbar), wird sie roh auf `stdout` geschrieben —
+/// denselben Deskriptor, den auch `TerminalGuard` für das Terminal verwendet;
+/// ein `TerminalGuard` ist an dieser Stelle (Overlay-Tastenbehandlung) nicht
+/// erreichbar. Index `1` schreibt über [`export::write_export`] in das
+/// aktuelle Arbeitsverzeichnis. Jeder andere Index (insbesondere „Abbrechen")
+/// tut nichts. Das Ergebnis erscheint als Systemzeile.
+///
+/// # Argumente
+/// - `app` (`&mut ChatApp`): liefert den Verlauf und nimmt die Ergebniszeile auf.
+/// - `bus` (`&HarwEventSender`): ungenutzt heute; symmetrische Signatur zu
+///   [`handle_overlay_key`], falls ein künftiger Export-Pfad asynchron wird.
+/// - `index` (`usize`): der von [`ChoiceDialog`] gemeldete Auswahlindex.
+fn resolve_export_choice(app: &mut ChatApp, _bus: &HarwEventSender, index: usize) {
+    match index {
+        0 => {
+            let markdown = build_export_markdown(app, &ExportOptions::default());
+            match clipboard::copy_or_sequence(&markdown) {
+                Ok((ClipboardTarget::Osc52, Some(sequence))) => {
+                    let mut stdout = io::stdout();
+                    let written = stdout
+                        .write_all(sequence.as_bytes())
+                        .and_then(|()| stdout.flush());
+                    if written.is_ok() {
+                        app.push_line(
+                            Role::System,
+                            "Export in die Zwischenablage kopiert (OSC-52).",
+                        );
+                    } else {
+                        app.push_line(
+                            Role::System,
+                            "Export: OSC-52-Sequenz konnte nicht geschrieben werden.",
+                        );
+                    }
+                }
+                Ok((target, _)) => {
+                    app.push_line(
+                        Role::System,
+                        format!("Export in die Zwischenablage kopiert ({target:?})."),
+                    );
+                }
+                Err(error) => {
+                    app.push_line(
+                        Role::System,
+                        format!("Export: Zwischenablage nicht verfügbar: {error}"),
+                    );
+                }
+            }
+        }
+        1 => {
+            let markdown = build_export_markdown(app, &ExportOptions::default());
+            let now = export_timestamp_now();
+            let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let path = export::default_export_path(&now, &dir);
+            match export::write_export(&path, &markdown) {
+                Ok(()) => {
+                    app.push_line(Role::System, format!("Export gespeichert: {}", path.display()))
+                }
+                Err(error) => {
+                    app.push_line(Role::System, format!("Export fehlgeschlagen: {error}"))
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Koalesziert Frame-Anforderungen und speist `TuiEvent::Draw` in den TUI-Kanal.
 ///
 /// # Beschreibung
@@ -1846,6 +2655,46 @@ pub(crate) async fn frame_scheduler(
         }
         tokio::time::sleep(MIN_FRAME_INTERVAL).await;
     }
+}
+
+/// Verarbeitet einen Tastendruck, während ein Vollflächen-Overlay
+/// (Session-Picker, `/export`-Auswahl) den normalen Eingabepfad ersetzt.
+///
+/// # Beschreibung
+/// - [`Overlay::SessionPicker`]: delegiert an [`SessionPicker::handle_key`].
+///   `PickerAction::Open(id)` schließt das Overlay und synthetisiert eine
+///   `/resume <id>`-Befehlszeile über den bestehenden [`HarwEvent::Command`]-
+///   Pfad (`resume_request` in `run_loop` erkennt sie und beendet den Loop
+///   mit `TuiRunOutcome::Resume { selector: Some(id) }`, genau wie bei einer
+///   getippten Zeile) — kein neuer Ereignistyp nötig.
+/// - [`Overlay::ExportChoice`]: delegiert an [`ChoiceDialog::handle_key`].
+///   Eine getroffene Wahl schließt das Overlay und wird über
+///   [`resolve_export_choice`] eingelöst.
+///
+/// # Rückgabe
+/// `true` (jede Taste verändert entweder den Overlay-Zustand oder schließt
+/// ihn — in beiden Fällen ist ein Redraw nötig).
+fn handle_overlay_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -> bool {
+    match app.overlay.as_mut() {
+        Some(Overlay::SessionPicker(picker)) => match picker.handle_key(key) {
+            PickerAction::Stay => {}
+            PickerAction::Cancel => app.overlay = None,
+            PickerAction::Open(id) => {
+                app.overlay = None;
+                bus.send(HarwEvent::Command(format!("/resume {id}")));
+            }
+        },
+        Some(Overlay::ExportChoice(dialog)) => match dialog.handle_key(key) {
+            ChoiceAction::Stay => {}
+            ChoiceAction::Cancel => app.overlay = None,
+            ChoiceAction::Chosen(index) => {
+                app.overlay = None;
+                resolve_export_choice(app, bus, index);
+            }
+        },
+        None => {}
+    }
+    true
 }
 
 /// Verarbeitet einen Tastendruck: mutiert den Eingabezustand und emittiert
@@ -1923,6 +2772,30 @@ fn handle_key(
 
     // Jede andere Taste macht eine Scharfstellung rückgängig.
     *pending_quit = None;
+
+    // ── Vollflächige Overlays (Session-Picker, `/export`-Auswahl) ────────
+    // Exklusiv: solange eines offen ist, geht keine Taste an Popup, Editor
+    // oder ChatScroll (Plan Schritt 6/7).
+    if app.has_overlay() {
+        return handle_overlay_key(app, key, bus);
+    }
+
+    // Shift+Tab — Zyklus ask → auto → full → plan (Plan Schritt 5). Nur
+    // außerhalb eines offenen `/command`-Popups: sonst hätte dieselbe Taste
+    // zwei Bedeutungen (Popup-Navigation vs. Moduszyklus).
+    if matches!(key.code, KeyCode::BackTab) && !app.has_popup() {
+        // `handle_key` läuft ausschließlich außerhalb eines laufenden Turns
+        // (während eines Turns übernimmt `handle_busy_event`) — der Wechsel
+        // wirkt hier also sofort, nicht vorgemerkt.
+        app.cycle_permission_stage(false);
+        return true;
+    }
+
+    // Ctrl+O — klappt die letzte bzw. bei erneutem Druck alle Werkzeugzellen
+    // auf/zu (Plan Schritt 2).
+    if ctrl && matches!(key.code, KeyCode::Char('o' | 'O')) {
+        return app.toggle_tool_cells();
+    }
 
     // ── ChatScroll konsultieren (PageUp/PageDown/Shift+Up/Shift+Down etc.) ──
     // Echte Werte aus dem letzten `draw_viewport`-Aufruf (vor dem ersten Draw:
@@ -2147,13 +3020,15 @@ fn rate_limit_retry_input() -> TurnInput {
 ///
 /// Während der Treiber läuft, pollt diese Funktion in **einem** `select!` neben
 /// dem [`SPINNER_INTERVAL`]-Timer:
-/// - `approvals` — jede eintreffende Frage wird als [`ApprovalPromptCell`]
-///   angezeigt. Ohne dieses Pollen liefe jede Frage in den Timeout und würde
-///   damit zur Ablehnung.
-/// - `tui_rx` — **nur solange eine Frage offen ist**: `y` gibt frei, `n`/`Esc`/
-///   `Ctrl+C` lehnt ab. Ohne offene Frage bleibt der Zweig deaktiviert, damit
-///   während eines Turns getippte Zeichen wie bisher im Kanal warten statt
-///   verworfen zu werden.
+/// - `approvals` — jede eintreffende Frage öffnet das [`ApprovalDialog`]-Panel
+///   anstelle des Composers (Plan Schritt 3). Ohne dieses Pollen liefe jede
+///   Frage in den Timeout und würde damit zur Ablehnung.
+/// - `tui_rx` — **nur solange eine Frage offen ist**: alle Tasten, die
+///   [`ApprovalDialog::handle_key`] entgegennimmt (`y`/`n`/`Esc`/Pfeile/
+///   Ziffern/`v`/`Tab`), plus `Ctrl+C` als fail-safe sofortige Ablehnung.
+///   Ohne offene Frage bleibt der Zweig deaktiviert, damit während eines
+///   Turns getippte Zeichen wie bisher im Kanal warten statt verworfen zu
+///   werden.
 /// - `turn_event_rx` — Werkzeug-, Kind- und Plan-Zellen erscheinen dadurch
 ///   **während** des Turns statt erst danach.
 ///
@@ -2329,6 +3204,17 @@ const APPROVAL_ARMING_DELAY: Duration = Duration::from_millis(700);
 /// AP W5-03. Bewusst als reine, terminalfreie Klassifikation ausgelagert, damit
 /// die Tastenbelegung ohne TTY testbar ist. Es gibt **keinen** Wert, der eine
 /// Freigabe aus etwas anderem als einem ausdrücklichen `y` macht.
+///
+/// Seit Plan Schritt 3 zeichnet [`drive_pauses_to_completion`] die Freigabe
+/// als [`crate::approval_dialog::ApprovalDialog`] statt als eigene
+/// Verlaufszelle; dessen Tastenbelegung übernimmt `ApprovalDialog::handle_key`
+/// vollständig (inklusive eines eigenen Arming-Vertrags für **jede** Taste,
+/// nicht nur `y`/`n`). Dieser Typ und die zugehörigen Funktionen
+/// ([`classify_approval_key`], [`is_approval_answer_key`],
+/// [`classify_armed_approval_key`]) bleiben unverändert bestehen — sie werden
+/// im Produktionspfad nicht mehr aufgerufen, aber ihre Tests dokumentieren
+/// weiterhin den historischen Arming-Vertrag der `y`/`n`-Kurzwahl.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ApprovalKeyAction {
     /// Ausdrückliche Freigabe (`y` / `Y`).
@@ -2354,6 +3240,7 @@ enum ApprovalKeyAction {
 /// [`ApprovalKeyAction::Reject`] für `n`/`N`, `Esc` und `Ctrl+C`;
 /// [`ApprovalKeyAction::ToggleDetails`] für `v`/`V`; sonst
 /// [`ApprovalKeyAction::Ignore`].
+#[allow(dead_code)] // Siehe Moduldoku von `ApprovalKeyAction`.
 fn classify_approval_key(key: KeyEvent) -> ApprovalKeyAction {
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
@@ -2371,6 +3258,7 @@ fn classify_approval_key(key: KeyEvent) -> ApprovalKeyAction {
 }
 
 /// Prüft, ob `key` eine Antworttaste (`y`/`n`) ohne Modifier ist.
+#[allow(dead_code)] // Siehe Moduldoku von `ApprovalKeyAction`.
 fn is_approval_answer_key(key: KeyEvent) -> bool {
     !key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('y' | 'Y' | 'n' | 'N'))
@@ -2399,6 +3287,7 @@ fn is_approval_answer_key(key: KeyEvent) -> bool {
 /// # Rückgabe
 /// [`ApprovalKeyAction::NotArmed`] statt `Approve`/`Reject`, solange eine der
 /// drei Bedingungen verletzt ist.
+#[allow(dead_code)] // Siehe Moduldoku von `ApprovalKeyAction`.
 fn classify_armed_approval_key(
     key: KeyEvent,
     since_shown: Duration,
@@ -2413,77 +3302,207 @@ fn classify_armed_approval_key(
     classify_approval_key(key)
 }
 
-/// Eine im Verlauf sichtbare, noch unbeantwortete Freigabefrage.
+/// Ob eine Taste während einer offenen Freigabefrage überhaupt zählt — die
+/// Arming-Bedingung des neuen [`ApprovalDialog`]-Panels (Plan Schritt 3).
 ///
 /// # Beschreibung
-/// Hält die Frage und die **eine** [`ApprovalPromptCell`], die sie anzeigt,
-/// zusammen — damit die Antwort und die Anzeige nicht auseinanderlaufen können.
-struct PendingApprovalPrompt {
-    /// Die noch unbeantwortete Frage; wird beim Beantworten konsumiert.
-    prompt: ApprovalPrompt,
-    /// Die zugehörige, geteilte Verlaufszelle.
-    cell: Arc<Mutex<ApprovalPromptCell>>,
+/// Dieselbe Grundüberlegung wie bei [`classify_armed_approval_key`] (W1-08,
+/// Register G-008): seit dem Anzeigen der Frage muss mindestens
+/// [`APPROVAL_ARMING_DELAY`] vergangen sein, und der Tastendruck darf keine
+/// Auto-Wiederholung sein. Die frühere dritte Bedingung „die Frage steht im
+/// Sichtbereich" entfällt strukturell: das Panel ersetzt seit Plan Schritt 3
+/// den Composer vollständig und ist damit immer sichtbar, sobald eine Frage
+/// offen ist.
+///
+/// Anders als [`classify_armed_approval_key`] (dort nur für `y`/`n`) gilt
+/// diese Bedingung für **jede** Taste — genau der Vertrag, den
+/// [`ApprovalDialog::handle_key`] von seinem Aufrufer verlangt (siehe dessen
+/// Moduldoku: „liefert für jede Taste `DialogAction::Stay`, solange
+/// `armed == false`").
+///
+/// # Argumente
+/// - `key` ([`KeyEvent`]): der bereits auf Press/Repeat gefilterte Tastendruck.
+/// - `since_shown` (`Duration`): Zeit seit dem Anzeigen der Frage.
+fn approval_dialog_key_is_armed(key: KeyEvent, since_shown: Duration) -> bool {
+    since_shown >= APPROVAL_ARMING_DELAY && key.kind != crossterm::event::KeyEventKind::Repeat
 }
 
-/// Anzeigezustand der einen offenen Freigabefrage.
+/// Setzt `value` in doppelte Anführungszeichen, mit denselben Escapes, die
+/// [`crate::input::tokenize`] im Quote-Modus erwartet (`\"`, `\\`).
 ///
 /// # Beschreibung
-/// Getrennt von [`PendingApprovalPrompt`], weil dort Frage und Zelle liegen
-/// (Antwortweg), hier dagegen Darstellung und Scharfschaltung: die
-/// aufklappbare Ansicht im Verlauf und der Zeitpunkt, ab dem `y`/`n` zählen.
-struct ApprovalPresentation {
-    /// Die im Verlauf hängende, aufklappbare Ansicht derselben Zelle.
-    view: Arc<Mutex<crate::history_cell::ApprovalPromptView>>,
-    /// Zeitpunkt, zu dem die Frage sichtbar gezeichnet wurde.
-    shown_at: Instant,
+/// Für synthetische `/command`-Zeilen, die ein mehrwortiges Argument (hier
+/// eine von [`derive_shell_rule`] abgeleitete Regel wie `"git status"`)
+/// unversehrt durch den regulären Dispatch schleusen — ohne Quotierung würde
+/// `/permissions allow shell.exec git status --project` `status` als
+/// eigenständiges, dem Op unbekanntes drittes Token missverstehen.
+fn quote_for_synthetic_command(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
 }
 
-impl ApprovalPresentation {
-    /// Setzt die Totzeit neu (Frage wurde gerade erst sichtbar bzw. verändert).
-    fn rearm(&mut self) {
-        self.shown_at = Instant::now();
-    }
-
-    /// Zeit seit dem Anzeigen der Frage.
-    fn since_shown(&self) -> Duration {
-        self.shown_at.elapsed()
-    }
+/// Baut das [`ApprovalDialog`] für eine soeben eingetroffene [`ApprovalPrompt`]
+/// (Plan Schritt 3).
+///
+/// # Argumente
+/// - `prompt` (`&ApprovalPrompt`): die anzuzeigende Frage.
+/// - `app` (`&ChatApp`): liefert `cwd` (Projekt-Root, falls bekannt).
+/// - `timeout` (`Duration`): Restlaufzeit bis zur automatischen Ablehnung,
+///   aus [`crate::approval::TuiApprovalHandler::timeout`].
+///
+/// # Rückgabe
+/// Ein einsatzbereites [`ApprovalDialog`] mit Option 2 („nicht mehr fragen")
+/// nur, wenn [`derive_shell_rule`] für `shell.exec` einen Vorschlag liefert.
+fn build_approval_dialog(prompt: &ApprovalPrompt, app: &ChatApp, timeout: Duration) -> ApprovalDialog {
+    let call = prompt.call();
+    let remember_rule = if call.name.as_str() == "shell.exec" {
+        call.arguments
+            .get("command")
+            .and_then(|value| value.as_str())
+            .and_then(derive_shell_rule)
+    } else {
+        None
+    };
+    ApprovalDialog::new(ApprovalDialogRequest {
+        call: call.clone(),
+        cwd: if app.project_root().is_empty() {
+            None
+        } else {
+            Some(app.project_root().to_owned())
+        },
+        justification: None,
+        risk: None,
+        origin: None,
+        remember_rule,
+        deadline: Instant::now() + timeout,
+        reason_input_enabled: true,
+    })
 }
 
-impl PendingApprovalPrompt {
-    /// Beantwortet die Frage und zieht die Zelle nach.
-    ///
-    /// # Beschreibung
-    /// Die Zelle bekommt `true` nur, wenn ausdrücklich freigegeben **und** die
-    /// Antwort auch zugestellt wurde. Konnte eine Freigabe nicht zugestellt
-    /// werden, wartet niemand mehr darauf — sie als „freigegeben" anzuzeigen
-    /// wäre falsch.
-    ///
-    /// # Argumente
-    /// - `approved` (`bool`): `true` nur bei ausdrücklicher Freigabe.
-    /// - `delivered` (`bool`): ob die Antwort den wartenden Treiber erreicht hat.
-    fn record_decision(cell: &Arc<Mutex<ApprovalPromptCell>>, approved: bool, delivered: bool) {
-        match cell.lock() {
-            Ok(mut cell) => cell.apply_decision(approved && delivered),
-            Err(_) => tracing::error!("tui.approval.cell_lock_poisoned"),
+/// Setzt eine Entscheidung aus dem Freigabe-Panel um (Plan Schritt 3).
+///
+/// # Beschreibung
+/// - [`ApprovalChoice::ApproveAndRemember`]: legt zusätzlich eine
+///   Projekt-Regel im geteilten `harw_extension_api::allow_rules::AllowRuleSet`
+///   der Montage an und stößt best-effort die Persistenz über den bestehenden
+///   `/permissions allow`-Pfad an (schreibt dieselbe Regel zusätzlich nach
+///   `.harw`/Projekt-Settings). Ohne Runtime-Montage bleibt die Freigabe auf
+///   diesen einen Aufruf beschränkt; eine Systemzeile erklärt das.
+/// - [`ApprovalChoice::ApproveAndAutoMode`]: schaltet zusätzlich die geteilte
+///   `harw_extension_api::approval_mode::ApprovalModeCell` auf `auto`
+///   ([`ApprovalMode::Delegated`]).
+/// - [`ApprovalChoice::Reject`]: lehnt mit der eingegebenen Begründung ab,
+///   falls eine vorliegt — [`ApprovalPrompt::reject`] unterstützt das direkt;
+///   ohne Begründung gilt [`REASON_OPERATOR_REJECTED`].
+///
+/// Am Ende wird immer eine kompakte Notiz an der zugehörigen [`ToolCell`]
+/// gesetzt (`✓ freigegeben` nur bei ausdrücklicher Freigabe **und**
+/// zugestellter Antwort, sonst `✗ abgelehnt`).
+///
+/// # Argumente
+/// - `app` (`&mut ChatApp`): liefert Adapter/Sandbox/Runtime für die
+///   Persistenz-Anstoßung und nimmt eine optionale Systemzeile auf.
+/// - `pending` ([`PendingApprovalPrompt`]): die zu beantwortende Frage samt Zelle.
+/// - `choice` ([`ApprovalChoice`]): die getroffene Entscheidung.
+async fn apply_approval_decision(app: &mut ChatApp, pending: PendingApprovalPrompt, choice: ApprovalChoice) {
+    let PendingApprovalPrompt { prompt, tool_cell } = pending;
+    let tool_name = prompt.tool_name().to_owned();
+
+    if let ApprovalChoice::ApproveAndRemember(rule) = &choice {
+        match app.runtime() {
+            Some(rt) => {
+                rt.services().allow_rules().add(ApprovalRule {
+                    tool: tool_name.clone(),
+                    pattern: Some(rule.clone()),
+                    decision: RuleDecision::Allow,
+                    scope: RuleScope::Project,
+                });
+                let command = format!(
+                    "/permissions allow {tool_name} {} --project",
+                    quote_for_synthetic_command(rule)
+                );
+                let output = execute_command_as(
+                    app.adapters(),
+                    app.sandbox(),
+                    app.session_id(),
+                    runtime_commands::caller_tier(rt.principal()),
+                    &command,
+                    || runtime_commands::slash_service_map(rt.services()),
+                )
+                .await;
+                tracing::info!(
+                    tool = %tool_name,
+                    rule = %rule,
+                    result = %output,
+                    "tui.approval.remember_rule_persist_attempted"
+                );
+            }
+            None => {
+                tracing::warn!(tool = %tool_name, rule = %rule, "tui.approval.remember_rule_no_runtime");
+                app.push_line(
+                    Role::System,
+                    format!(
+                        "„Nicht mehr fragen“ für {tool_name} ({rule}) gilt nur für diesen \
+                         Aufruf — keine Laufzeit-Montage zum Speichern verfügbar."
+                    ),
+                );
+            }
         }
     }
 
-    /// Gibt den Werkzeugaufruf ausdrücklich frei.
-    fn approve(self) {
-        let delivered = self.prompt.approve();
-        Self::record_decision(&self.cell, true, delivered);
+    if matches!(choice, ApprovalChoice::ApproveAndAutoMode) {
+        match app.runtime() {
+            Some(rt) => rt.approval_mode().set(ApprovalMode::Delegated),
+            None => app.push_line(
+                Role::System,
+                "Auto-Modus konnte nicht gesetzt werden — keine Laufzeit-Montage verfügbar.",
+            ),
+        }
     }
 
-    /// Lehnt den Werkzeugaufruf mit Begründung ab.
-    ///
-    /// # Argumente
-    /// - `reason` (`&str`): Begründung, die als Werkzeugergebnis in den
-    ///   Modellverlauf wandert.
-    fn reject(self, reason: &str) {
-        let delivered = self.prompt.reject(reason.to_owned());
-        Self::record_decision(&self.cell, false, delivered);
+    let (approved, delivered) = match choice {
+        ApprovalChoice::Approve
+        | ApprovalChoice::ApproveAndRemember(_)
+        | ApprovalChoice::ApproveAndAutoMode => (true, prompt.approve()),
+        ApprovalChoice::Reject { reason } => {
+            let reason = reason.unwrap_or_else(|| REASON_OPERATOR_REJECTED.to_owned());
+            (false, prompt.reject(reason))
+        }
+    };
+
+    let note = if approved && delivered {
+        "✓ freigegeben"
+    } else {
+        "✗ abgelehnt"
+    };
+    match tool_cell.lock() {
+        Ok(mut cell) => cell.set_approval_note(note),
+        Err(_) => tracing::error!("tui.approval.tool_cell_lock_poisoned"),
     }
+}
+
+/// Eine offene, noch unbeantwortete Freigabefrage samt der zugehörigen
+/// Werkzeugzelle (Plan Schritt 3).
+///
+/// # Beschreibung
+/// Ersetzt die frühere separate Verlaufszelle (`ApprovalPromptCell`/
+/// `ApprovalPromptView`): der Verlauf bekommt nach der Entscheidung nur eine
+/// kompakte Notiz an der ohnehin über [`ensure_tool_cell`] angelegten
+/// [`ToolCell`] ([`apply_approval_decision`], `ToolCell::set_approval_note`).
+struct PendingApprovalPrompt {
+    /// Die noch unbeantwortete Frage; wird beim Beantworten konsumiert.
+    prompt: ApprovalPrompt,
+    /// Die zugehörige, geteilte Werkzeugzelle im Verlauf.
+    tool_cell: SharedToolCell,
 }
 
 /// Arbeitet jede Pause eines Turns ab, während der Renderer weiterläuft.
@@ -2493,6 +3512,16 @@ impl PendingApprovalPrompt {
 /// Übergibt `outcome` an [`ApprovalDriver::drive_to_completion`] und pollt
 /// dessen Future gemeinsam mit dem Fragekanal, der Tastatur (nur bei offener
 /// Frage), den Turn-Ereignissen und dem Spinner-Timer.
+///
+/// Seit Plan Schritt 3 zeichnet [`render_viewport`] anstelle des Composers das
+/// [`ApprovalDialog`]-Panel, solange `app.pending_approval_dialog` gesetzt ist
+/// — diese Funktion setzt und löscht es synchron mit `pending`
+/// ([`PendingApprovalPrompt`]), beide immer gemeinsam. Die Arming-Bedingung
+/// bleibt dieselbe wie zuvor ([`approval_dialog_key_is_armed`], abgeleitet aus
+/// [`classify_armed_approval_key`]), gilt jetzt aber für **jede** Taste, die
+/// [`ApprovalDialog::handle_key`] entgegennimmt — nicht mehr nur für `y`/`n`.
+/// `Ctrl+C` bleibt fail-safe und lehnt unabhängig vom Arming-Delay sofort ab
+/// (Sicherheitsinvariante aus der ursprünglichen Freigabe-Logik).
 ///
 /// Der Kind-Treiber wird **vor** dem Anlegen des Futures als `Arc` aus `app`
 /// herausgezogen: sonst hielte das Future eine unveränderliche Leihe auf `app`
@@ -2537,7 +3566,7 @@ async fn drive_pauses_to_completion(
     };
 
     let mut pending: Option<PendingApprovalPrompt> = None;
-    let mut presentation: Option<ApprovalPresentation> = None;
+    let mut dialog_shown_at: Option<Instant> = None;
     let mut approvals_open = true;
     let mut input_open = true;
 
@@ -2554,10 +3583,24 @@ async fn drive_pauses_to_completion(
                     "drive_to_completion must only ever return Completed"
                 );
                 // Eine noch offene Frage nach Turn-Ende: Ablehnung ist der
-                // Default, und die Zelle darf nicht als Frage stehenbleiben.
+                // Default, und das Panel darf nicht als Frage stehenbleiben.
                 if let Some(open) = pending.take() {
-                    open.reject(REASON_OPERATOR_CANCELLED);
-                    presentation = None;
+                    apply_approval_decision(
+                        app,
+                        open,
+                        ApprovalChoice::Reject { reason: Some(REASON_OPERATOR_CANCELLED.to_owned()) },
+                    )
+                    .await;
+                    app.pending_approval_dialog = None;
+                    // `dialog_shown_at` wird hier bewusst NICHT zurückgesetzt:
+                    // die Funktion kehrt direkt danach zurück, die lokale
+                    // Variable fällt mit ihr weg. Die Arming-Uhr selbst ist
+                    // davon unberührt — sie wird beim Öffnen einer neuen Frage
+                    // (unten, `dialog_shown_at = Some(Instant::now())`) frisch
+                    // gesetzt und nur gelesen, während `pending_approval_dialog`
+                    // tatsächlich `Some` ist (siehe unten); ein verwaister
+                    // `Some`-Wert würde also nie fälschlich als „schon lange
+                    // offen" gelesen.
                     draw_viewport(guard, app, spinner, None)?;
                 }
                 return Ok(());
@@ -2576,30 +3619,23 @@ async fn drive_pauses_to_completion(
                         // Fragen im Verlauf, und `y` beantwortete die falsche.
                         if let Some(stale) = pending.take() {
                             tracing::warn!("tui.approval.stale_prompt_closed");
-                            stale.reject(REASON_OPERATOR_CANCELLED);
+                            apply_approval_decision(
+                                app,
+                                stale,
+                                ApprovalChoice::Reject { reason: Some(REASON_OPERATOR_CANCELLED.to_owned()) },
+                            )
+                            .await;
                         }
-                        let cell = Arc::new(Mutex::new(ApprovalPromptCell {
-                            tool_name: prompt.tool_name().to_owned(),
-                            arguments_raw: prompt.arguments_json(),
-                            decision: None,
-                        }));
-                        let view = Arc::new(Mutex::new(
-                            crate::history_cell::ApprovalPromptView::new(
-                                Arc::clone(&cell),
-                                prompt.call(),
-                            ),
-                        ));
-                        app.push_shared_cell(Arc::clone(&view));
-                        // Die Frage muss sichtbar sein, sonst beantwortet der
-                        // Nutzer etwas, das außerhalb des Sichtbereichs steht
-                        // (w4-tui-control K2).
-                        app.scroll.force_follow();
-                        pending = Some(PendingApprovalPrompt { prompt, cell });
+                        // Dieselbe Zelle, die auch `TurnEvent::ToolCallRequested`
+                        // anlegt bzw. wiederfindet (Wettlauf beider Kanäle, siehe
+                        // `ensure_tool_cell`-Doku).
+                        let tool_cell =
+                            ensure_tool_cell(app, turn_state, prompt.call_id().clone(), prompt.call());
+                        let timeout = approval_driver.handler().timeout();
+                        app.pending_approval_dialog = Some(build_approval_dialog(&prompt, app, timeout));
+                        dialog_shown_at = Some(Instant::now());
+                        pending = Some(PendingApprovalPrompt { prompt, tool_cell });
                         draw_viewport(guard, app, spinner, None)?;
-                        presentation = Some(ApprovalPresentation {
-                            view,
-                            shown_at: Instant::now(),
-                        });
                     }
                     None => {
                         tracing::warn!("tui.approval.prompt_channel_ended");
@@ -2620,64 +3656,41 @@ async fn drive_pauses_to_completion(
                             draw_viewport(guard, app, spinner, None)?;
                             continue;
                         }
-                        let since_shown = presentation
-                            .as_ref()
-                            .map_or(Duration::ZERO, ApprovalPresentation::since_shown);
-                        // Sichtbar heißt hier: die Ansicht folgt dem Ende der
-                        // Historie, in dem die Frage als jüngste Zelle steht.
-                        let question_visible = app.scroll.is_at_tail();
-                        match classify_armed_approval_key(key, since_shown, question_visible) {
-                            ApprovalKeyAction::Ignore => {}
-                            ApprovalKeyAction::NotArmed => {
-                                tracing::debug!(
-                                    since_shown_ms = u64::try_from(since_shown.as_millis())
-                                        .unwrap_or(u64::MAX),
-                                    question_visible,
-                                    "tui.approval.key_not_armed"
-                                );
-                                if !question_visible {
-                                    // Erst zeigen, dann fragen: die Frage wird
-                                    // eingeblendet und die Totzeit läuft neu.
-                                    app.scroll.force_follow();
-                                    draw_viewport(guard, app, spinner, None)?;
-                                    if let Some(open) = presentation.as_mut() {
-                                        open.rearm();
-                                    }
-                                }
+                        // Ctrl+C bleibt fail-safe und lehnt sofort ab,
+                        // unabhängig vom Arming-Delay des Panels — dieselbe
+                        // Sicherheitsinvariante wie zuvor.
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && matches!(key.code, KeyCode::Char('c' | 'C'))
+                        {
+                            if let Some(open) = pending.take() {
+                                apply_approval_decision(
+                                    app,
+                                    open,
+                                    ApprovalChoice::Reject { reason: Some(REASON_OPERATOR_CANCELLED.to_owned()) },
+                                )
+                                .await;
                             }
-                            ApprovalKeyAction::ToggleDetails => {
-                                if let Some(open) = presentation.as_mut() {
-                                    match open.view.lock() {
-                                        Ok(mut view) => {
-                                            let expanded = view.toggle_expanded();
-                                            tracing::debug!(
-                                                expanded,
-                                                "tui.approval.details_toggled"
-                                            );
-                                        }
-                                        Err(_) => {
-                                            tracing::error!("tui.approval.view_lock_poisoned");
-                                        }
-                                    }
-                                }
-                                app.scroll.force_follow();
-                                draw_viewport(guard, app, spinner, None)?;
-                                if let Some(open) = presentation.as_mut() {
-                                    open.rearm();
-                                }
-                            }
-                            ApprovalKeyAction::Approve => {
-                                if let Some(open) = pending.take() {
-                                    open.approve();
-                                }
-                                presentation = None;
+                            app.pending_approval_dialog = None;
+                            dialog_shown_at = None;
+                            draw_viewport(guard, app, spinner, None)?;
+                            continue;
+                        }
+                        let since_shown = dialog_shown_at.map_or(Duration::ZERO, |shown| shown.elapsed());
+                        let armed = approval_dialog_key_is_armed(key, since_shown);
+                        let Some(dialog) = app.pending_approval_dialog.as_mut() else {
+                            continue;
+                        };
+                        match dialog.handle_key(key, armed) {
+                            DialogAction::Stay => {}
+                            DialogAction::ToggleDetails => {
                                 draw_viewport(guard, app, spinner, None)?;
                             }
-                            ApprovalKeyAction::Reject(reason) => {
+                            DialogAction::Decided(choice) => {
                                 if let Some(open) = pending.take() {
-                                    open.reject(reason);
+                                    apply_approval_decision(app, open, choice).await;
                                 }
-                                presentation = None;
+                                app.pending_approval_dialog = None;
+                                dialog_shown_at = None;
                                 draw_viewport(guard, app, spinner, None)?;
                             }
                         }
@@ -2697,8 +3710,14 @@ async fn drive_pauses_to_completion(
                         tracing::warn!("tui.approval.input_channel_ended");
                         input_open = false;
                         if let Some(open) = pending.take() {
-                            open.reject(REASON_OPERATOR_CANCELLED);
-                            presentation = None;
+                            apply_approval_decision(
+                                app,
+                                open,
+                                ApprovalChoice::Reject { reason: Some(REASON_OPERATOR_CANCELLED.to_owned()) },
+                            )
+                            .await;
+                            app.pending_approval_dialog = None;
+                            dialog_shown_at = None;
                         }
                     }
                 }
@@ -2727,6 +3746,16 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> bool {
             app.scroll.handle_mouse(mouse, total, rows) == ScrollAction::Redraw
         }
         TuiEvent::Key(key) if app.scroll.handle_key(key, total, rows) == ScrollAction::Redraw => {
+            true
+        }
+        // Shift+Tab wirkt während eines laufenden Turns nicht sofort, sondern
+        // wird vorgemerkt (AP W5-05, Plan Schritt 5): die Statuszeile zeigt
+        // ab diesem Tastendruck „(ab nächstem Turn)", bis die nächste
+        // Turn-Grenze den Wechsel über `apply_pending_controller_state`
+        // einlöst. Nicht in `deferred_input` einreihen — sonst würde
+        // derselbe Zyklus-Schritt nach Turn-Ende ein zweites Mal ausgelöst.
+        TuiEvent::Key(key) if matches!(key.code, KeyCode::BackTab) => {
+            app.cycle_permission_stage(true);
             true
         }
         TuiEvent::Draw | TuiEvent::Resize(_, _) => true,
@@ -2814,14 +3843,40 @@ fn render_viewport(
     let theme = app.theme;
     let area = frame.area();
 
-    // Eingabehöhe wächst mit der Zeilenanzahl, begrenzt auf 3–10.
+    // Vollflächige Overlays (Session-Picker, `/export`-Auswahl) ersetzen die
+    // gesamte Viewport (Plan Schritt 6/7) — `Clear` erst, sonst bliebe
+    // Chat-Text unter dem Overlay stehen (dasselbe Muster wie beim
+    // `/command`-Popup weiter unten).
+    match &app.overlay {
+        Some(Overlay::SessionPicker(picker)) => {
+            frame.render_widget(Clear, area);
+            picker.render(area, frame.buffer_mut(), &theme);
+            return;
+        }
+        Some(Overlay::ExportChoice(dialog)) => {
+            frame.render_widget(Clear, area);
+            dialog.render(area, frame.buffer_mut(), theme);
+            return;
+        }
+        None => {}
+    }
+
+    // Eingabehöhe wächst mit der Zeilenanzahl, begrenzt auf 3–10 — außer eine
+    // Freigabefrage ist offen (Plan Schritt 3): dann ersetzt das
+    // [`ApprovalDialog`]-Panel den Composer, und seine eigene
+    // `desired_height` bestimmt die Höhe dieser Layout-Zeile.
     // Rahmen (2 Spalten) und das `"› "`-Präfix (2 Spalten) gehen von der
     // nutzbaren Textbreite ab; eine weitere Spalte bleibt für den Cursor frei.
     // Höhe und Cursor-Position müssen mit
     // derselben Breite rechnen, sonst laufen sie auseinander.
     let input_width = (area.width.saturating_sub(5)) as usize;
-    let input_line_count = app.input.visible_lines(input_width).len().clamp(1, 8) as u16;
-    let input_height = input_line_count + 2;
+    let input_height = match &app.pending_approval_dialog {
+        Some(dialog) => dialog.desired_height(area.width),
+        None => {
+            let input_line_count = app.input.visible_lines(input_width).len().clamp(1, 8) as u16;
+            input_line_count + 2
+        }
+    };
 
     // Dreiteiliges vertikales Layout: History | Eingabe | Status.
     // Status kommt bewusst UNTER die Eingabebox — dort erwartet das Auge
@@ -2904,10 +3959,23 @@ fn render_viewport(
         quit_hint,
         &app.total_usage,
         app.active_mode(),
+        app.current_permission_stage(),
+        app.pending_permission_stage().is_some(),
+        app.session_title(),
+        app.has_collapsed_tool_cells(),
     );
     frame.render_widget(Paragraph::new(sl), status_area);
 
-    // ── Eingabe ──────────────────────────────────────────────────────
+    // ── Eingabe / Freigabe-Panel ─────────────────────────────────────
+    // Solange eine Freigabefrage offen ist, ersetzt das `ApprovalDialog` den
+    // Composer vollständig (Plan Schritt 3); der Rest des Layouts (History,
+    // Status) bleibt unverändert. Kein Text-Cursor in diesem Fall — das Panel
+    // wird über Pfeiltasten/Ziffern bedient, nicht getippt.
+    if let Some(dialog) = &app.pending_approval_dialog {
+        dialog.render(input_area, frame.buffer_mut(), &theme);
+        return;
+    }
+
     let mut input_lines: Vec<Line<'static>> = Vec::new();
     for (index, segment) in app.input.visible_lines(input_width).iter().enumerate() {
         let prefix = if index == 0 { "› " } else { "  " };
@@ -2963,6 +4031,49 @@ fn format_tokens_compact(n: u64) -> String {
     }
 }
 
+/// Baut das Statuszeilen-Segment für den Freigabemodus-Zyklus (Plan Schritt 5).
+///
+/// # Beschreibung
+/// `Ask` ohne Vormerkung zeigt **nichts** (der Standardmodus braucht keine
+/// Hervorhebung); jede andere Stufe — und `Ask` selbst, sobald ein Wechsel
+/// vorgemerkt ist — bekommt ein farbiges Segment mit dem Shift+Tab-Hinweis.
+/// `Full` erscheint in Warnfarbe (rot): voller Zugriff ohne Rückfrage ist das
+/// riskanteste der vier Stufen. Ist `pending` gesetzt (Shift+Tab während eines
+/// laufenden Turns, AP W5-05), wird `" (ab nächstem Turn)"` angehängt.
+///
+/// # Argumente
+/// - `theme` ([`style::Theme`]): aktives Farbschema.
+/// - `stage` ([`PermissionCycleStage`]): die anzuzeigende (aktuelle oder
+///   vorgemerkte) Stufe.
+/// - `pending` (`bool`): `true`, wenn die Stufe noch nicht angewendet wurde.
+fn permission_stage_segment(
+    theme: style::Theme,
+    stage: PermissionCycleStage,
+    pending: bool,
+) -> Option<Span<'static>> {
+    let suffix = if pending { " (ab nächstem Turn)" } else { "" };
+    let (text, style) = match stage {
+        PermissionCycleStage::Ask if !pending => return None,
+        PermissionCycleStage::Ask => (
+            format!("· ask mode{suffix} "),
+            style::dim_style(theme),
+        ),
+        PermissionCycleStage::Auto => (
+            format!("· ⏵⏵ auto mode on (shift+tab){suffix} "),
+            style::selected_style(theme),
+        ),
+        PermissionCycleStage::Full => (
+            format!("· ⏺ full access on (shift+tab){suffix} "),
+            style::error_style(theme),
+        ),
+        PermissionCycleStage::Plan => (
+            format!("· ⏸ plan mode on (shift+tab){suffix} "),
+            style::dim_style(theme),
+        ),
+    };
+    Some(Span::styled(text, style))
+}
+
 /// Baut die Statuszeile für die Fullscreen-Viewport.
 ///
 /// # Beschreibung
@@ -2970,7 +4081,10 @@ fn format_tokens_compact(n: u64) -> String {
 /// 1. Laufender Turn → animierter Spinner-Glyph + „denkt…" + Modus-Anzeige.
 /// 2. Scharfgestelltes Beenden → gelber Hinweis mit dem Taste-Label.
 /// 3. Standard-Tastenlegende (Enter, Ctrl+J, Ctrl+C/D) — gefolgt vom aktiven
-///    Interaktionsmodus (AP W5-05) und, bei `total_usage.total() > 0`, einem
+///    Interaktionsmodus (AP W5-05), dem Freigabemodus-Segment (Plan Schritt 5,
+///    [`permission_stage_segment`]), dem Session-Titel (falls bekannt, Plan
+///    Schritt 7), einem Ctrl+O-Hinweis (sofern Werkzeugzellen eingeklappt
+///    sind, Plan Schritt 2) und, bei `total_usage.total() > 0`, einem
 ///    kompakten Token-Nutzungs-Suffix (z. B.
 ///    `" · 1.2k Tokens (0.9k in + 0.3k out)"`), formatiert über
 ///    [`format_tokens_compact`].
@@ -2985,18 +4099,30 @@ fn format_tokens_compact(n: u64) -> String {
 ///   Token-Nutzung; nur im Standard-Legenden-Zweig als Suffix sichtbar.
 /// - `mode` ([`InteractionMode`]): der zuletzt an einer Turn-Grenze angewendete
 ///   Interaktionsmodus.
+/// - `permission_stage` ([`PermissionCycleStage`]): aktuelle bzw. vorgemerkte
+///   Shift+Tab-Stufe.
+/// - `permission_pending` (`bool`): `true`, solange der Wechsel noch nicht
+///   angewendet wurde.
+/// - `session_title` (`Option<&str>`): Anzeigetitel der Sitzung, falls bekannt.
+/// - `tool_cells_collapsed` (`bool`): `true`, wenn mindestens eine
+///   Werkzeugzelle eingeklappt ist (Ctrl+O-Hinweis).
 ///
 /// # Rückgabe
 /// Eine fertig gestaltete [`ratatui::text::Line`] mit Lebensdauer `'static`.
+#[allow(clippy::too_many_arguments)]
 fn status_line(
     theme: style::Theme,
     spinner: &Spinner,
     quit_hint: Option<&str>,
     total_usage: &TokenUsage,
     mode: InteractionMode,
+    permission_stage: PermissionCycleStage,
+    permission_pending: bool,
+    session_title: Option<&str>,
+    tool_cells_collapsed: bool,
 ) -> Line<'static> {
     if spinner.is_active() {
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled(
                 format!("{} ", spinner.glyph()),
                 style::selected_style(theme),
@@ -3006,25 +4132,52 @@ fn status_line(
                 format!(" · Modus: {} ", mode.as_str()),
                 style::dim_style(theme),
             ),
-        ])
+        ];
+        if let Some(segment) = permission_stage_segment(theme, permission_stage, permission_pending) {
+            spans.push(segment);
+        }
+        Line::from(spans)
     } else if let Some(label) = quit_hint {
         Line::from(Span::styled(
             format!(" {label} erneut drücken zum Beenden "),
             style::warning_style(theme),
         ))
     } else {
-        let mut text =
-            " Enter: senden · Ctrl+J: neue Zeile · Ctrl+C 2× / Ctrl+D: beenden ".to_owned();
-        text.push_str(&format!("· Modus: {} ", mode.as_str()));
-        if total_usage.total() > 0 {
-            text.push_str(&format!(
-                "· {} Tokens ({} in + {} out) ",
-                format_tokens_compact(total_usage.total()),
-                format_tokens_compact(total_usage.input_tokens),
-                format_tokens_compact(total_usage.output_tokens),
+        let mut spans = vec![Span::styled(
+            " Enter: senden · Ctrl+J: neue Zeile · Ctrl+C 2× / Ctrl+D: beenden ".to_owned(),
+            style::dim_style(theme),
+        )];
+        spans.push(Span::styled(
+            format!("· Modus: {} ", mode.as_str()),
+            style::dim_style(theme),
+        ));
+        if let Some(segment) = permission_stage_segment(theme, permission_stage, permission_pending) {
+            spans.push(segment);
+        }
+        if let Some(title) = session_title {
+            spans.push(Span::styled(
+                format!("· {title} "),
+                style::dim_style(theme),
             ));
         }
-        Line::from(Span::styled(text, style::dim_style(theme)))
+        if tool_cells_collapsed {
+            spans.push(Span::styled(
+                "· ctrl+o: Werkzeuge ausklappen ".to_owned(),
+                style::dim_style(theme),
+            ));
+        }
+        if total_usage.total() > 0 {
+            spans.push(Span::styled(
+                format!(
+                    "· {} Tokens ({} in + {} out) ",
+                    format_tokens_compact(total_usage.total()),
+                    format_tokens_compact(total_usage.input_tokens),
+                    format_tokens_compact(total_usage.output_tokens),
+                ),
+                style::dim_style(theme),
+            ));
+        }
+        Line::from(spans)
     }
 }
 
@@ -3138,6 +4291,7 @@ mod tests {
 
     use crate::approval::TuiApprovalHandler;
     use crate::command_exec::build_services;
+    use crate::events::harw_event_channel;
 
     // ────────────────────────────────────────────────────────────────────
     // W2d-2 / T2b (CONTRACTS-W2d2 §2 T2b): dieses Testmodul lief bis W2d-2
@@ -3693,8 +4847,8 @@ forbidden = [{forbidden}]
     #[test]
     fn durable_history_hydrates_core_and_redacts_non_text_visible_content() {
         use harw_protocol::items::{
-            AssistantMessageItem, ErrorItem, ReasoningItem, ToolCallItem, ToolCallResult,
-            ToolResultItem, UserMessageItem,
+            AssistantMessageItem, ErrorItem, ReasoningItem, ResultTrust, ToolCallItem,
+            ToolCallResult, ToolResultItem, UserMessageItem,
         };
         use harw_types::{ItemId, ToolCallId};
 
@@ -3730,6 +4884,7 @@ forbidden = [{forbidden}]
             call_id,
             result: ToolCallResult::error("do-not-render"),
             duration_ms: 3,
+            trust: ResultTrust::Untrusted,
         }));
         history.push(TurnItem::Reasoning(ReasoningItem {
             id: ItemId::new(),
@@ -3809,6 +4964,9 @@ forbidden = [{forbidden}]
                     arguments,
                 }],
                 usage: TokenUsage::default(),
+                // `reasoning`/`stop` sind für die Freigabetests irrelevant —
+                // Default liefert `None` bzw. `StopReason::EndTurn`.
+                ..Default::default()
             }
         }
     }
@@ -4026,7 +5184,15 @@ forbidden = [{forbidden}]
         assert_eq!(classify_approval_key(other), ApprovalKeyAction::Ignore);
     }
 
-    /// Die Antwort landet beim wartenden Treiber **und** in derselben Zelle.
+    /// Die Antwort landet beim wartenden Treiber **und** an derselben
+    /// Werkzeugzelle.
+    ///
+    /// Seit der Umstellung auf das Freigabe-Panel (`ApprovalDialog`) trägt
+    /// nicht mehr eine eigene `ApprovalPromptCell` die Entscheidung, sondern
+    /// dieselbe [`SharedToolCell`], die auch `TurnEvent::ToolCallRequested`
+    /// über `ensure_tool_cell` anlegt (siehe [`PendingApprovalPrompt`]). Die
+    /// geprüfte Eigenschaft bleibt dieselbe: die Freigabe erreicht den
+    /// Treiber, und dieselbe Zelle trägt danach das Ergebnis.
     #[tokio::test]
     async fn answering_a_prompt_updates_the_same_cell() {
         let (handler, mut prompts) = TuiApprovalHandler::new();
@@ -4042,28 +5208,32 @@ forbidden = [{forbidden}]
             Ok(prompt) => prompt,
             Err(error) => panic!("die Frage muss den Renderer erreichen: {error}"),
         };
-        let cell = Arc::new(Mutex::new(ApprovalPromptCell {
-            tool_name: prompt.tool_name().to_owned(),
-            arguments_raw: prompt.arguments_json(),
-            decision: None,
-        }));
-        PendingApprovalPrompt {
-            prompt,
-            cell: Arc::clone(&cell),
-        }
-        .approve();
+        let tool_cell: SharedToolCell = Arc::new(Mutex::new(ToolCell::started(&call)));
+        let mut app = ChatApp::new(Vec::new(), test_sandbox(), SessionId::new());
+
+        apply_approval_decision(
+            &mut app,
+            PendingApprovalPrompt {
+                prompt,
+                tool_cell: Arc::clone(&tool_cell),
+            },
+            ApprovalChoice::Approve,
+        )
+        .await;
 
         match handler.await_resolution(&request).await {
             ApprovalResolution::Approve => {}
             other => panic!("eine Freigabe muss den Treiber erreichen, war: {other:?}"),
         }
-        match cell.lock() {
-            Ok(cell) => assert_eq!(cell.decision, Some(true)),
+        match tool_cell.lock() {
+            Ok(cell) => assert_eq!(cell.approval_note.as_deref(), Some("✓ freigegeben")),
             Err(_) => panic!("die Zelle muss nach der Antwort lesbar bleiben"),
         }
     }
 
-    /// Eine Ablehnung schreibt dieselbe Zelle auf `Some(false)` fort.
+    /// Eine Ablehnung schreibt dieselbe Werkzeugzelle mit der Ablehnungsnotiz
+    /// fort — die Nachfolgerin des früheren `Some(false)` an der
+    /// `ApprovalPromptCell` (siehe Kommentar oben).
     #[tokio::test]
     async fn rejecting_a_prompt_marks_the_same_cell_as_denied() {
         let (handler, mut prompts) = TuiApprovalHandler::new();
@@ -4078,17 +5248,20 @@ forbidden = [{forbidden}]
             Ok(prompt) => prompt,
             Err(error) => panic!("die Frage muss den Renderer erreichen: {error}"),
         };
-        let cell = Arc::new(Mutex::new(ApprovalPromptCell {
-            tool_name: prompt.tool_name().to_owned(),
-            arguments_raw: prompt.arguments_json(),
-            decision: None,
-        }));
+        let tool_cell: SharedToolCell = Arc::new(Mutex::new(ToolCell::started(&call)));
+        let mut app = ChatApp::new(Vec::new(), test_sandbox(), SessionId::new());
 
-        PendingApprovalPrompt {
-            prompt,
-            cell: Arc::clone(&cell),
-        }
-        .reject(REASON_OPERATOR_REJECTED);
+        apply_approval_decision(
+            &mut app,
+            PendingApprovalPrompt {
+                prompt,
+                tool_cell: Arc::clone(&tool_cell),
+            },
+            ApprovalChoice::Reject {
+                reason: Some(REASON_OPERATOR_REJECTED.to_owned()),
+            },
+        )
+        .await;
 
         match handler.await_resolution(&request).await {
             ApprovalResolution::Reject { reason } => {
@@ -4096,8 +5269,8 @@ forbidden = [{forbidden}]
             }
             other => panic!("eine Ablehnung muss den Treiber erreichen, war: {other:?}"),
         }
-        match cell.lock() {
-            Ok(cell) => assert_eq!(cell.decision, Some(false)),
+        match tool_cell.lock() {
+            Ok(cell) => assert_eq!(cell.approval_note.as_deref(), Some("✗ abgelehnt")),
             Err(_) => panic!("die Zelle muss nach der Antwort lesbar bleiben"),
         }
     }
@@ -4208,6 +5381,10 @@ forbidden = [{forbidden}]
             None,
             &TokenUsage::default(),
             app.active_mode(),
+            app.current_permission_stage(),
+            app.pending_permission_stage().is_some(),
+            app.session_title(),
+            app.has_collapsed_tool_cells(),
         )
         .spans
         .iter()
@@ -4527,32 +5704,26 @@ mod approval_arming_tests {
         );
     }
 
-    /// Der Anzeigezustand schaltet nach `rearm` wieder scharf.
+    /// Der Anzeigezustand schaltet nach dem erneuten Anzeigen einer Frage
+    /// (Rearm) wieder scharf.
+    ///
+    /// Seit der Umstellung auf das Freigabe-Panel gibt es keinen eigenen
+    /// `ApprovalPresentation`-Wrapper mit `since_shown`/`rearm` mehr — die
+    /// Schleife in `drive_pauses_to_completion` hält nur noch ein rohes
+    /// `Option<Instant>` (`dialog_shown_at`) und setzt es bei jeder neuen
+    /// Frage auf `Instant::now()` zurück. Die geprüfte Eigenschaft bleibt
+    /// dieselbe — nur direkt an der Bedingungsfunktion des Panels
+    /// ([`approval_dialog_key_is_armed`]) statt am inzwischen entfernten
+    /// Wrapper: vor dem Rearm (Anzeigedauer erreicht die Verzögerung) ist die
+    /// Taste scharf, unmittelbar danach (Anzeigedauer zurück auf null) wieder
+    /// nicht.
     #[test]
     fn rearm_restarts_the_arming_delay() {
-        // `checked_sub` statt `-`: auf einer gerade erst gestarteten Maschine
-        // reicht die monotone Uhr womöglich keine fünf Sekunden zurück, und
-        // `Instant::sub` würde dann paniken.
-        let Some(past) = Instant::now().checked_sub(Duration::from_secs(5)) else {
-            return;
-        };
-        let mut presentation = ApprovalPresentation {
-            view: Arc::new(Mutex::new(crate::history_cell::ApprovalPromptView::new(
-                Arc::new(Mutex::new(ApprovalPromptCell {
-                    tool_name: "fs.write".to_owned(),
-                    arguments_raw: "{}".to_owned(),
-                    decision: None,
-                })),
-                &harw_extension_api::ToolCall {
-                    id: harw_types::ToolCallId::new(),
-                    name: harw_extension_api::ToolName::new("fs.write"),
-                    arguments: harw_tools::serde_json::json!({ "path": "a.txt" }),
-                },
-            ))),
-            shown_at: past,
-        };
-        assert!(presentation.since_shown() >= APPROVAL_ARMING_DELAY);
-        presentation.rearm();
-        assert!(presentation.since_shown() < APPROVAL_ARMING_DELAY);
+        let answer_key = key(KeyCode::Char('y'));
+
+        assert!(approval_dialog_key_is_armed(answer_key, ARMED));
+        // Rearm: eine neu eingetroffene Frage setzt die seit dem Anzeigen
+        // verstrichene Zeit auf null zurück.
+        assert!(!approval_dialog_key_is_armed(answer_key, Duration::ZERO));
     }
 }

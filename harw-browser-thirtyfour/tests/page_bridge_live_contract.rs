@@ -1,13 +1,16 @@
 //! Explicit opt-in, end-to-end Firefox coverage for the typed page bridge.
 //!
-//! This test is ignored by default because it starts a real Firefox and may
-//! cause thirtyfour to manage a local geckodriver.  It is additionally gated
+//! This test is ignored by default because it starts a real Firefox through a
+//! pinned, sandboxed geckodriver. Without a configured pin and launcher it
+//! fails closed at `open` (follow-up I-CONTRIB wires a real launcher).  It is additionally gated
 //! on `HARW_RUN_FIREFOX_LIVE=1` so even `cargo test -- --ignored` cannot
 //! accidentally start browser infrastructure.
 
 use harw_browser::host::BrowserHost;
 use harw_browser::page_bridge::{PageBridgeInstallRequest, PageBridgePolicy};
-use harw_browser::policy::{BiDiRequirement, OpenBrowserRequest, OriginPolicy, ProfilePolicy};
+use harw_browser::policy::{
+    BiDiRequirement, BrowserLimits, OpenBrowserRequest, OriginPolicy, ProfilePolicy,
+};
 use harw_browser_thirtyfour::{FirefoxHost, FirefoxHostConfig};
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
@@ -38,8 +41,11 @@ async fn firefox_bidi_installs_a_bounded_page_bridge_with_a_typed_receipt() -> R
         headless: true,
         profile: ProfilePolicy::Ephemeral,
         bidi: BiDiRequirement::Required,
-        allowed_origins: OriginPolicy::new(vec!["example.com".to_owned()], true),
+        allowed_origins: OriginPolicy::from_origins(["https://example.com"], true)
+            .map_err(|error| format!("live test origin policy must be valid: {error}"))?,
+        authentication_origins: OriginPolicy::default(),
         viewport: None,
+        limits: BrowserLimits::default(),
     };
     let policy = PageBridgePolicy::new(1_024, 2, Duration::from_secs(5))
         .map_err(|error| format!("live bridge policy must be valid: {error}"))?;

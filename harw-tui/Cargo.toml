@@ -13,6 +13,8 @@ harw-core = { path = "../harw-core" }
 harw-context = { path = "../harw-context" }
 harw-lens-types = { path = "../harw-lens-types" }
 harw-extension-api = { path = "../harw-extension-api" }
+# Atomares, überschreibsicheres Schreiben der `/export`-Markdown-Datei (src/export.rs).
+harw-fsutil = { path = "../harw-fsutil" }
 harw-registry-defaults = { path = "../harw-registry-defaults" }
 harw-model-catalog = { path = "../harw-model-catalog" }
 harw-operations = { path = "../harw-operations" }
@@ -34,11 +36,6 @@ tokio = { version = "1.52.3", features = ["macros", "rt", "sync", "time"] }
 # Strukturierte Diagnose im Approval-/Child-Resume-Treiber (`src/approval.rs`).
 # Version bewusst identisch zu harw-cli/Cargo.toml.
 tracing = "0.1.44"
-# AW1-01c — `trusted_tui_spawn_context` (src/app.rs) baut den ersten
-# `harw_observe::TraceContext` einer lokalen TUI-Sitzung; Version identisch
-# zu harw-types/harw-core, damit im Workspace nur eine `uuid`-Auflösung existiert.
-harw-observe = { path = "../harw-observe" }
-uuid = { version = "1", features = ["v4"] }
 harw-home = { version = "0.2.0", path = "../harw-home" }
 harw-runtime = { path = "../harw-runtime" }
 

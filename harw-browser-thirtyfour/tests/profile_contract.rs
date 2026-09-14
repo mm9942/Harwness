@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use harw_browser::policy::{BiDiRequirement, OpenBrowserRequest, OriginPolicy, ProfilePolicy};
+use harw_browser::policy::{
+    BiDiRequirement, BrowserLimits, OpenBrowserRequest, OriginPolicy, ProfilePolicy,
+};
 use harw_browser_thirtyfour::{FirefoxCapabilityFactory, FirefoxHostConfig};
 
 const PROFILE_BINDING: &str = "support-operator";
@@ -14,8 +16,11 @@ fn persistent_request(binding: &str) -> OpenBrowserRequest {
             binding: binding.to_owned(),
         },
         bidi: BiDiRequirement::Required,
-        allowed_origins: OriginPolicy::new(vec!["erp.example.com".to_owned()], true),
+        allowed_origins: OriginPolicy::from_origins(["https://erp.example.com"], true)
+            .expect("fixture origin policy is valid"),
+        authentication_origins: OriginPolicy::default(),
         viewport: None,
+        limits: BrowserLimits::default(),
     }
 }
 

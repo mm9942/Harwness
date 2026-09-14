@@ -118,5 +118,11 @@ pub use baseline::{Baseline, PalaceStatus, finding_kind_for_status};
 pub use confidence::epistemic_confidence_for;
 pub use engine::run_rules;
 pub use finding::{Finding, FindingKind, Raw, RuleChecked, Triaged, Verdict, triage};
+// Nur für Tests abhängiger Crates (Feature `test-support`, z. B. von
+// `harw-dod-escalate`s `Ladder`-Tests genutzt) — siehe `finding.rs`-Moduldoku
+// zu `triaged_finding_for_test` für die Begründung und die geschützte
+// Invariante.
+#[cfg(any(test, feature = "test-support"))]
+pub use finding::triaged_finding_for_test;
 pub use rule::{Rule, RuleContext};
 pub use rules::{BaselineDeviationRule, EgressFlowRule, StructureDriftRule};

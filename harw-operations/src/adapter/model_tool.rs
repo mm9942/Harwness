@@ -324,10 +324,11 @@ fn map_operation_error(name: &str, error: OpError) -> ToolsError {
 ///             aliases: &[],
 ///             category: OperationCategory::Misc,
 ///             args_schema: None,
+///             output_schema: None,
 ///         })
 ///     }
 ///     fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
-///         Box::pin(async { Ok(OpOutput { text: "ok".to_owned() }) })
+///         Box::pin(async { Ok(OpOutput::from("ok".to_owned())) })
 ///     }
 /// }
 ///
@@ -645,14 +646,11 @@ mod tests {
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
         fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
-            Box::pin(async {
-                Ok(OpOutput {
-                    text: "no-surface-ok".to_owned(),
-                })
-            })
+            Box::pin(async { Ok(OpOutput::from("no-surface-ok".to_owned())) })
         }
     }
 
@@ -674,14 +672,11 @@ mod tests {
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
         fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
-            Box::pin(async {
-                Ok(OpOutput {
-                    text: "readonly-ok".to_owned(),
-                })
-            })
+            Box::pin(async { Ok(OpOutput::from("readonly-ok".to_owned())) })
         }
     }
 
@@ -703,14 +698,11 @@ mod tests {
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
         fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
-            Box::pin(async {
-                Ok(OpOutput {
-                    text: "writing-ok".to_owned(),
-                })
-            })
+            Box::pin(async { Ok(OpOutput::from("writing-ok".to_owned())) })
         }
     }
 
@@ -738,14 +730,11 @@ mod tests {
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
         fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
-            Box::pin(async {
-                Ok(OpOutput {
-                    text: "mixed-ok".to_owned(),
-                })
-            })
+            Box::pin(async { Ok(OpOutput::from("mixed-ok".to_owned())) })
         }
     }
 
@@ -767,6 +756,7 @@ mod tests {
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
         fn run<'a>(&'a self, _ctx: &'a OpContext, input: OpInput) -> OpFuture<'a> {
@@ -777,7 +767,7 @@ mod tests {
                     .get("x")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                Ok(OpOutput { text: x.to_owned() })
+                Ok(OpOutput::from(x.to_owned()))
             })
         }
     }
@@ -800,6 +790,7 @@ mod tests {
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
         fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
@@ -824,20 +815,19 @@ mod tests {
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
 
         fn run<'a>(&'a self, ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
             Box::pin(async move {
                 let marker = ctx.service::<TrustedMarker>().map_or("missing", |v| v.0);
-                Ok(OpOutput {
-                    text: format!(
-                        "{}|{}|{}",
-                        ctx.session_id().as_str(),
-                        ctx.turn_id().as_str(),
-                        marker
-                    ),
-                })
+                Ok(OpOutput::from(format!(
+                    "{}|{}|{}",
+                    ctx.session_id().as_str(),
+                    ctx.turn_id().as_str(),
+                    marker
+                )))
             })
         }
     }
@@ -854,11 +844,7 @@ mod tests {
         }
 
         fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
-            Box::pin(async {
-                Ok(OpOutput {
-                    text: "named-model-tool-ok".to_owned(),
-                })
-            })
+            Box::pin(async { Ok(OpOutput::from("named-model-tool-ok".to_owned())) })
         }
     }
 
@@ -886,6 +872,7 @@ mod tests {
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema,
+                output_schema: None,
             },
         })
     }
@@ -1035,13 +1022,14 @@ mod tests {
                     aliases: &[],
                     category: OperationCategory::Misc,
                     args_schema: None,
+                    output_schema: None,
                 })
             }
             fn run<'a>(&'a self, _ctx: &'a OpContext, input: OpInput) -> OpFuture<'a> {
                 Box::pin(async move {
-                    Ok(OpOutput {
-                        text: input.invocation.raw_args().len().to_string(),
-                    })
+                    Ok(OpOutput::from(
+                        input.invocation.raw_args().len().to_string(),
+                    ))
                 })
             }
         }

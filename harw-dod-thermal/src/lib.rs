@@ -137,13 +137,20 @@
 //!
 //! # Examples
 //! ```rust,no_run
+//! use harw_dod_cap::scope::AliasRoot;
 //! use harw_dod_cap::{Capability, ReadScope, SensorHandle};
 //! use harw_dod_signals::Sensor;
 //! use harw_dod_thermal::ThermalSensor;
 //! use harw_types::SensorId;
 //! use std::path::PathBuf;
 //!
-//! let scope = ReadScope::from_roots([PathBuf::from("/sys/class/thermal")]);
+//! // sysfs-Klasseneinträge sind Symlinks nach `/sys/devices/...` (F-005) —
+//! // `ReadScope::from_roots` allein prüft gegen die nicht kanonisierte
+//! // Klassenwurzel und würde jeden Treffer verwerfen; `AliasRoot::sysfs_class`
+//! // baut den Bereich, der das Symlink-Ziel korrekt zulässt.
+//! let alias = AliasRoot::sysfs_class(PathBuf::from("/sys/class/thermal"))
+//!     .expect("gültige sysfs-Klassenwurzel");
+//! let scope = ReadScope::from_roots_and_aliases(Vec::new(), [alias]);
 //! let handle = SensorHandle::new(SensorId::from_str("thermal-0"), Capability::ReadSysfsThermal)
 //!     .bind(scope);
 //! let sensor = ThermalSensor::from(handle);

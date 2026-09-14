@@ -6,9 +6,17 @@ rust-version.workspace = true
 
 [dependencies]
 harw-agent-dsl = { path = "../harw-agent-dsl" }
+# `[network]`-Sektion (`NetworkSection::researcher_web_hosts`) als einzige
+# Quelle des Netz-Scopes der Rolle `researcher-web` (W5 RD, Annahme A5).
+harw-config = { path = "../harw-config" }
+# `EgressPolicy` für die Web-Werkzeuge der Rolle `researcher-web` (W5 RD).
+harw-egress = { path = "../harw-egress" }
 harw-extension-api = { path = "../harw-extension-api" }
 harw-instructions = { path = "../harw-instructions" }
 harw-project-discovery = { path = "../harw-project-discovery" }
+# `Permission`/`PermissionSet`/`NetworkScope`: Rechte-Obergrenzen der
+# eingebauten Rollen und Werkzeugfilter nach gewährten Rechten (W5 RD).
+harw-sandbox = { path = "../harw-sandbox" }
 harw-tool-deps = { path = "../harw-tool-deps" }
 harw-tool-fs = { path = "../harw-tool-fs" }
 harw-tool-lens = { path = "../harw-tool-lens" }
@@ -51,3 +59,8 @@ browser = ["dep:harw-browser", "dep:harw-tool-browser", "dep:harw-browser-thirty
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# Nur für Tests: die Freigabe-Regeln in `DefaultApprovalPolicy::review`
+# bekommen ihre Werkzeug-Argumente als `serde_json::Value`.
+serde_json = { workspace = true }

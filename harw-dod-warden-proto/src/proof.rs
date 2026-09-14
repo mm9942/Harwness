@@ -1,4 +1,12 @@
-//! Der Autorisierungsbeleg: [`AuthorizationProof`].
+//! Der Autorisierungsbeleg v1: [`AuthorizationProof`] — **Altlast**.
+//!
+//! # v1 ist nicht mehr gültig (C-WPROTO, W3)
+//! Dieser Beleg hat weder MAC noch Nonce noch Ablauf und ist von jedem
+//! Absender fälschbar (Befund F-001); die unten stehende Aussage, er sei eine
+//! „Schicht, die selbst ein Absender, der den Socket benutzen darf, nicht
+//! umgehen kann“, trifft nicht zu. Nachfolger: [`crate::signed::SignedAuthorization`].
+//! Der Typ bleibt nur, bis `harw-dod-warden`/`harw-warden`/`harw-dod-escalate`
+//! in W5 (D-WARDEN, D-ESC) umgestellt sind, und wird danach entfernt.
 //!
 //! # Verantwortungsbereich
 //! Der Beleg, dass eine Aktion autorisiert wurde — so beschaffen, dass der

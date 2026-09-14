@@ -109,11 +109,23 @@
 //! über die Laufzeit stabil ist**: ein Server hat typischerweise null, eine
 //! oder wenige Karten, ein GPU-Rechenknoten selten mehr als eine niedrige
 //! zweistellige Zahl. `sensor::MAX_CARDS` deklariert diese Obergrenze
-//! ausdrücklich (16, wie `harw-dod-thermal`s Zonen-Obergrenze), statt sie
-//! stillschweigend anzunehmen; [`sensor::MAX_CARDINALITY`] multipliziert sie
-//! mit der festen Zahl der vier möglichen Metriken je Karte und ist der
+//! ausdrücklich (16, wie `harw-dod-thermal`s Zonen-Obergrenze) **und
+//! erzwingt sie** bei der Kartensuche (vor F-203 deklariert, aber nirgends
+//! durchgesetzt); [`sensor::MAX_CARDINALITY`] multipliziert
+//! sie mit der festen Zahl der vier möglichen Metriken je Karte und ist der
 //! Wert, den [`harw_dod_fixtures::sensor_suite!`] als `max_cardinality`
 //! erhält.
+//!
+//! **F-203 — Connector-Verzeichnisse ausgeschlossen.** `card*` matcht auf
+//! einem Host mit mehreren Bildschirmausgängen nicht nur echte
+//! Kartenverzeichnisse (`card0`, `card1`), sondern auch die
+//! Connector-Verzeichnisse, die DRM je Anschluss zusätzlich unter
+//! `/sys/class/drm` anlegt (`card1-HDMI-A-1`, `card1-DP-1`, …) — jedes mit
+//! einem eigenen `device`-Symlink zurück zur Karte. Ohne Filterung würde ein
+//! Multi-Monitor-Host dieselbe physische Karte unter mehreren Labels
+//! doppelt melden und dabei die deklarierte Kardinalitätsgrenze
+//! überschreiten. [`sensor::is_card_root_name`] lässt ausschließlich `card`
+//! gefolgt von Ziffern zu.
 //!
 //! # Warum kein `#[derive(harw_macros::SensorSource)]`
 //! `#[derive(harw_macros::SensorSource)]` trägt genau einen Fall: ein
@@ -180,13 +192,18 @@
 //!
 //! # Examples
 //! ```rust,no_run
+//! use harw_dod_cap::scope::AliasRoot;
 //! use harw_dod_cap::{Capability, ReadScope, SensorHandle};
 //! use harw_dod_gpu::GpuSensor;
 //! use harw_dod_signals::Sensor;
 //! use harw_types::SensorId;
 //! use std::path::PathBuf;
 //!
-//! let scope = ReadScope::from_roots([PathBuf::from("/sys/class/drm")]);
+//! // `/sys/class/drm/*`-Einträge sind Symlinks nach `/sys/devices/...`
+//! // (F-005); `AliasRoot::sysfs_class` baut den Bereich, der das zulässt.
+//! let alias =
+//!     AliasRoot::sysfs_class(PathBuf::from("/sys/class/drm")).expect("gültige sysfs-Klassenwurzel");
+//! let scope = ReadScope::from_roots_and_aliases(Vec::new(), [alias]);
 //! let handle = SensorHandle::new(SensorId::from_str("gpu-0"), Capability::ReadSysfsDrm)
 //!     .bind(scope);
 //! let sensor = GpuSensor::from(handle);

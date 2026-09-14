@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod allow_rules;
 pub mod approval_mode;
 pub mod capabilities;
 pub mod contributors;
@@ -25,6 +26,7 @@ pub use harw_tools::{
 // hängen muss. Der Trait `ContextProvider` trägt `max_trust()` -- der
 // Typ gehört damit zur Fläche dieser Crate, nicht zu ihrer Innerei.
 pub use harw_context::TrustClass;
+pub use allow_rules::{AllowRuleSet, ApprovalRule, RuleDecision, RuleScope, derive_shell_rule};
 pub use approval_mode::ApprovalMode;
 pub use capabilities::{AgentSpawnError, AgentSpawner, SpawnFuture, SpawnInput};
 pub use contributors::{

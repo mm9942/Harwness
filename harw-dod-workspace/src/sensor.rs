@@ -195,6 +195,18 @@ impl Sensor for WorkspaceDriftSensor {
 ///   erreichen kann; das ist die Frage, die die Kanten-Gates stellen.
 /// - **`VersionChanged`** → aus [`VersionSeverity`]: `Breaking` → `High`,
 ///   `Unparseable` → `Medium`, `Minor` → `Medium`, `Patch` → `Low`.
+/// - **`DependencyVersionAdded`** → `High`, dieselbe Begründung wie
+///   `DependencyAdded`: eine zusätzliche, gleichzeitig gesperrte Version ist
+///   zusätzlicher fremder Code im Baum, unabhängig davon, ob der
+///   Abhängigkeitsname selbst schon bekannt war (F-097).
+/// - **`DependencyVersionRemoved`** → `Low`, dieselbe Begründung wie
+///   `DependencyRemoved`: weniger gleichzeitig gesperrter Code ist keine
+///   Verschlechterung, aber meldenswert.
+/// - **`ProvenanceChanged`** → `High`. Ein Wechsel von Herkunft oder
+///   Prüfsumme **bei unveränderter Version** ist genau die Form, in der eine
+///   nachträglich ausgetauschte oder kompromittierte Abhängigkeit auffiele,
+///   ohne dass sich die Versionszeile ändert (F-096) — das verdient
+///   mindestens dieselbe Aufmerksamkeit wie eine neue Abhängigkeit.
 ///
 /// **`Unparseable` wird nicht kleingeredet.** Eine Version, die sich nicht
 /// auswerten lässt, ist keine Patchversion — sie ist ein unbekannter Fall,
@@ -208,8 +220,11 @@ impl Sensor for WorkspaceDriftSensor {
 /// Die grobe Schwere für den Signalstrom.
 fn drift_severity(change: &StructureChange) -> DriftSeverity {
     match change {
-        StructureChange::DependencyAdded { .. } => DriftSeverity::High,
-        StructureChange::DependencyRemoved { .. } => DriftSeverity::Low,
+        StructureChange::DependencyAdded { .. }
+        | StructureChange::DependencyVersionAdded { .. }
+        | StructureChange::ProvenanceChanged { .. } => DriftSeverity::High,
+        StructureChange::DependencyRemoved { .. }
+        | StructureChange::DependencyVersionRemoved { .. } => DriftSeverity::Low,
         StructureChange::MemberAdded { .. } | StructureChange::EdgeAdded { .. } => {
             DriftSeverity::Medium
         }
@@ -248,6 +263,22 @@ fn describe(change: &StructureChange) -> String {
             to,
             severity,
         } => format!("Versionssprung ({severity:?}) bei {name}: {from} -> {to}"),
+        StructureChange::DependencyVersionAdded { name, version, .. } => {
+            format!("zusätzliche gesperrte Version bei {name}: {version}")
+        }
+        StructureChange::DependencyVersionRemoved { name, version } => {
+            format!("gesperrte Version entfernt bei {name}: {version}")
+        }
+        StructureChange::ProvenanceChanged {
+            name,
+            version,
+            from_source,
+            to_source,
+            from_checksum,
+            to_checksum,
+        } => format!(
+            "Herkunft/Prüfsumme geändert bei {name} {version}: source {from_source:?} -> {to_source:?}, checksum {from_checksum:?} -> {to_checksum:?}"
+        ),
     }
 }
 

@@ -35,14 +35,25 @@
 //!
 //! Der Root-cgroup der Bereichswurzel selbst (ihre eigenen Kontrolldateien,
 //! z. B. `<wurzel>/memory.current`) wird **nicht** gemeldet — nur ihre
-//! Kind-Verzeichnisse. Ein Kandidat, der sich beim Lesen als gewöhnliche
-//! Datei statt als Verzeichnis herausstellt (z. B. `memory.current` selbst,
-//! das auf `*` genauso passt wie ein echtes Kind-Verzeichnis), liefert für
-//! alle vier Kontrolldateien `ENOTDIR` und damit — siehe unten — für jede
-//! einzelne Metrik `None`; ein solcher Kandidat erzeugt am Ende schlicht
-//! keinen einzigen `HostSample` und wird so, ohne eigene
-//! Verzeichnis-Erkennung, implizit herausgefiltert (siehe [`sensor`] für die
-//! Details).
+//! Kind-Verzeichnisse. `*` matcht auf derselben Ebene gleichermaßen echte
+//! Kind-Verzeichnisse **und** die Kontrolldateien der Wurzel selbst
+//! (`cgroup.controllers`, `cpu.stat`, `memory.stat`, …) — beide liegen
+//! direkt unterhalb der Bereichswurzel.
+//!
+//! **F-095 (behoben):** eine frühere Fassung verließ sich darauf, dass ein
+//! solcher Kandidat beim späteren Lesen für alle vier Kontrolldateien
+//! `ENOTDIR` und damit `None` liefert, also implizit keinen `HostSample`
+//! erzeugt — filterte dabei aber **nach** der Kürzung auf
+//! [`sensor::MAX_CGROUPS`]. Die Kontrolldateien der Wurzel sortieren
+//! alphabetisch früh (`cgroup.*`, `cpu.*`, `memory.*`, …) und belegten so
+//! auf einem `systemd`-Host praktisch alle 16 Plätze, bevor `system.slice`/
+//! `user.slice` je an die Reihe kamen — die reale Quelle blieb dauerhaft
+//! unsichtbar, ohne dass ein Fehler das anzeigte. [`sensor`] filtert
+//! deshalb jetzt explizit **vor** der Kürzung: ein Kandidat gilt als echte
+//! cgroup, wenn unter ihm `cgroup.controllers` lesbar ist — ein Attribut,
+//! das laut cgroup-v2-Kontrakt jede cgroup (Wurzel wie Kind, unabhängig von
+//! aktivierten Controllern) trägt, eine Kontrolldatei der Wurzel dagegen
+//! nie (siehe `sensor::is_child_cgroup_dir` für die Details).
 //!
 //! # Welche Kontrolldateien, und warum genau diese vier
 //! Von den vielen Kontrolldateien einer cgroup-v2-Hierarchie liest dieser
@@ -128,18 +139,22 @@
 //! cgroup alle vier Kontrolldateien trägt.
 //!
 //! **Entscheidung, asymmetrisch:**
-//! - **Fehlt** eine Kontrolldatei vollständig (oder ist der Kandidat gar
-//!   kein Verzeichnis, siehe oben), wird **nur diese eine Metrik** für diese
-//!   eine cgroup ausgelassen — kein Fehler, keine Auswirkung auf andere
-//!   Metriken derselben oder anderer cgroups.
+//! - **Fehlt** eine Kontrolldatei vollständig, wird **nur diese eine
+//!   Metrik** für diese eine cgroup ausgelassen — kein Fehler, keine
+//!   Auswirkung auf andere Metriken derselben oder anderer cgroups.
 //! - **Existiert** eine Kontrolldatei, ihr Inhalt ist aber nicht die
 //!   erwartete Form (leer, nicht numerisch, kein `usage_usec`-Feld in
-//!   `cpu.stat`), bricht der **gesamte** Abruf mit
-//!   `SensorError::MalformedSource` ab — analog zu `harw-dod-thermal`s und
-//!   `harw-dod-netcounters`s Umgang mit einer fehlerhaft geformten,
-//!   tatsächlich vorhandenen Quelle: ein Konsument, der diese Zähler für
-//!   Schwellwertentscheidungen nutzt, soll eine teilweise gescheiterte
-//!   cgroup nie mit „alles in Ordnung" verwechseln können.
+//!   `cpu.stat`), wird ebenfalls **nur diese eine Metrik** ausgelassen — der
+//!   Fehler wird gesammelt (F-095, „Teilergebnisse statt Totalausfall"),
+//!   aber nicht sofort propagiert: andere cgroups und andere Metriken
+//!   derselben cgroup werden weiter gelesen. Erst wenn am Ende **keine
+//!   einzige** Probe zustande kam, meldet [`sensor::CgroupSensor::poll`]
+//!   einen der gesammelten Fehler (typischerweise
+//!   `SensorError::MalformedSource`) statt eines leeren `Ok`. Anders als in
+//!   einer früheren Fassung dieser Crate bricht eine einzelne fehlerhaft
+//!   geformte Kontrolldatei damit nicht mehr den gesamten Abruf für alle
+//!   anderen, gesunden cgroups ab — ein Host mit hunderten cgroups soll
+//!   nicht wegen einer einzigen defekten Quelle blind werden.
 //!
 //! # Kardinalität — eine harte Obergrenze, alphabetisch sortiert vor dem
 //! Kürzen
@@ -149,8 +164,9 @@
 //! Containername kommt von dem, der den Container startet.
 //! [`sensor::MAX_CGROUPS`] begrenzt die je Poll berücksichtigten cgroups auf
 //! **16** (dieselbe Größenordnung wie `harw-dod-netcounters`s
-//! `MAX_INTERFACES` und `harw-dod-thermal`s `max_cardinality`) — sortiert
-//! nach Namen **vor** dem Kürzen, damit die Auswahl deterministisch ist und
+//! `MAX_INTERFACES` und `harw-dod-thermal`s `max_cardinality`) — zuerst auf
+//! echte Kind-cgroups gefiltert (F-095, siehe oben), erst danach nach Namen
+//! sortiert **vor** dem Kürzen, damit die Auswahl deterministisch ist und
 //! ein Sortierfehler sofort sichtbar würde (siehe
 //! [`sensor::cap_and_sort_cgroups`]). Mit vier Metriken je cgroup ergibt das
 //! eine feste Obergrenze von [`sensor::MAX_CARDINALITY`] `= 64`

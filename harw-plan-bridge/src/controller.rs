@@ -37,17 +37,41 @@
 //! bereits abgeschlossenen Knoten — wird als [`ReconcileStep::AskModel`]
 //! ausgegeben, damit ein Modell die Frage beantwortet.
 //!
+//! # Fixpunkt und Idempotenz (G-013, G-038, F-131)
+//! `reconcile` schlägt nur Schritte vor, die den Zustand tatsächlich ändern:
+//! ein Knoten, der schon `Ready` ist, wird nicht erneut bereit gemeldet, ein
+//! bereits abgeschlossener Knoten bekommt keine zweite Job-Evidenz, ein
+//! bereits invalidierter keinen zweiten `Invalidate`. `apply` prüft dieselbe
+//! Bedingung noch einmal gegen den frisch gelesenen Plan und überspringt
+//! einen bereits wirksamen Schritt ohne Event. Zwei aufeinanderfolgende
+//! Runden `reconcile → apply` auf einem Zustand, in dem nichts mehr zu tun
+//! ist, erzeugen deshalb keine Events.
+//!
+//! # Atomarität
+//! Jeder mutierende Schritt läuft als **ein** `PlanStore::apply_batch` mit
+//! der Revision des gelesenen Snapshots als `expected_rev`
+//! (`AddNode + AddDependency` für `InsertExplore`,
+//! `AttachEvidence + SetStatus(Completed)` für Job-Evidenz). Scheitert eine
+//! Aktion, bleibt der Plan unverändert. Meldet der Store einen
+//! Revisionskonflikt, wird der Plan einmal neu gelesen, der Schritt gegen
+//! den neuen Stand neu aufgebaut und erneut versucht; ein zweiter Konflikt
+//! wird als Fehler gemeldet. Die Schritte einer Runde bilden zusammen
+//! **keine** Transaktion: bricht Schritt `n` ab, bleiben die Schritte
+//! `0..n` wirksam.
+//!
 //! # Exportierte Typen
 //! [`ReconcileInput`], [`ReconcileStep`], [`PlanController`].
 //!
 //! # Concurrency
 //! `PlanController` ist ein zustandsloser Namensraum (`Send + Sync`).
 //! `reconcile` arbeitet auf einem Snapshot ohne gehaltene Locks; `apply`
-//! serialisiert über die `PlanStore`-Implementierung.
+//! serialisiert über die `PlanStore`-Implementierung und erkennt fremde
+//! Schreiber über die Revisionsprüfung von `apply_batch`.
 //!
 //! # Fehler
 //! `apply` gibt [`PlanBridgeError::Plan`] weiter, wenn `harw-plan` eine
-//! Mutation ablehnt, und [`PlanBridgeError::GoalUnbound`], wenn ein
+//! Mutation ablehnt (darunter `BatchActionRejected` und ein wiederholter
+//! `RevisionConflict`), und [`PlanBridgeError::GoalUnbound`], wenn ein
 //! `GoalStatus`-Vorschlag ohne gebundenen Goal-Store ankommt.
 
 use std::collections::HashSet;
@@ -55,6 +79,7 @@ use std::collections::HashSet;
 use harw_job_runtime::JobState;
 use harw_observe::TelemetrySink;
 use harw_plan::actions::{PlanAction, PlanEvent};
+use harw_plan::error::PlanError;
 use harw_plan::goal::{Goal, GoalStatus, GoalStore, evaluate_goal};
 use harw_plan::graph;
 use harw_plan::{
@@ -76,6 +101,10 @@ const COARSE_WRITE_SCOPE: usize = 5;
 
 /// Akteur, unter dem Job-Evidenz angehängt wird.
 const JOB_ACTOR: &str = "runtime:job";
+
+/// Höchstzahl der `apply_batch`-Versuche je Schritt: ein Versuch plus genau
+/// eine Wiederholung nach einem Revisionskonflikt.
+const MAX_BATCH_ATTEMPTS: usize = 2;
 
 /// Knotenarten, die als Job an einen Worker gehen.
 const JOB_KINDS: &[PlanNodeKind] = &[
@@ -247,21 +276,28 @@ impl PlanController {
     ///    semantische Widerspruchsanalyse versucht.
     /// c. Knoten aus `graph::missing_explorations` bekommen je einen
     ///    generierten `Explore`-Knoten (`<zielid>-explore`) vorgeschaltet.
+    ///    Existiert der Knoten schon, fehlt aber die Kante (Halbzustand),
+    ///    wird nur die Kante nachgezogen. Ist er unbrauchbar (`Invalidated`,
+    ///    `Superseded` oder keine Explorationsart), entsteht ein
+    ///    [`ReconcileStep::AskModel`] statt eines stillen Deadlocks.
     /// d. Gruppen aus `graph::condense_candidates` (ab
     ///    [`CONDENSE_MIN_GROUP`] Mitgliedern) werden als
     ///    [`ReconcileStep::ProposeCondense`] vorgeschlagen — sortiert, damit
     ///    die Ausgabe deterministisch ist.
-    /// e. Composite-Knoten mit ausschließlich abgeschlossenen Kindern werden
-    ///    bereit gemeldet bzw. zum Abschluss angeregt; Draft-Knoten mit
-    ///    mindestens [`COARSE_WRITE_SCOPE`] Schreibzielen als
+    /// e. Composite-Knoten mit ausschließlich abgeschlossenen Kindern und
+    ///    abgeschlossenen Abhängigkeiten werden bereit gemeldet bzw. zum
+    ///    Abschluss angeregt; Draft-Knoten mit mindestens
+    ///    [`COARSE_WRITE_SCOPE`] Schreibzielen als
     ///    [`ReconcileStep::ProposeExpand`].
     /// f. Ausführbare Knoten der Arten [`JOB_KINDS`] werden zur Admission
-    ///    vorgeschlagen, die übrigen auf `Ready` gesetzt. Knoten, denen laut
-    ///    (c) noch eine Exploration fehlt, werden dabei übersprungen — sie
-    ///    dürfen laut Plan-Validation ohnehin nicht starten.
+    ///    vorgeschlagen, übrige `Draft`-Knoten auf `Ready` gesetzt. Ein Knoten,
+    ///    der schon `Ready` ist, wird **nicht** erneut gemeldet (G-013). Knoten,
+    ///    denen laut (c) noch eine Exploration fehlt, werden übersprungen —
+    ///    sie dürfen laut Plan-Validation ohnehin nicht starten.
     /// g. Beobachtete Job-Zustände: `Completed` erzeugt Job-Evidenz (und damit
     ///    den Abschluss des Knotens, siehe Konvention an [`ReconcileStep`]),
-    ///    `Failed` eine Invalidierung.
+    ///    `Failed` eine Invalidierung — beides nur, solange der Knoten noch
+    ///    nicht in dem jeweiligen Endzustand ist.
     /// h. Ist ein Goal gebunden und vollständig belegt, wird
     ///    [`ReconcileStep::GoalStatus`] als *Vorschlag* ausgegeben.
     ///
@@ -328,15 +364,26 @@ impl PlanController {
                 continue;
             };
             let explore_id = TaskId::new(format!("{target_id}-explore"));
-            if plan.nodes.iter().any(|node| node.id == explore_id) {
-                // Die Exploration existiert bereits — sie ist nur noch nicht
-                // abgeschlossen. Kein zweiter Knoten.
-                continue;
+            match find_node(plan, &explore_id) {
+                None => steps.push(ReconcileStep::InsertExplore {
+                    before: target_id.clone(),
+                    node: Box::new(explore_node_for(target, explore_id, input.now)),
+                }),
+                Some(existing) if is_usable_exploration(existing) => {
+                    // Die Exploration existiert bereits und ist nur noch nicht
+                    // abgeschlossen. Kein zweiter Knoten — höchstens die
+                    // fehlende Kante eines Halbzustands (G-038, K2).
+                    if !target.dependencies.contains(&explore_id) {
+                        steps.push(ReconcileStep::InsertExplore {
+                            before: target_id.clone(),
+                            node: Box::new(existing.clone()),
+                        });
+                    }
+                }
+                Some(existing) => steps.push(ReconcileStep::AskModel {
+                    prompt: unusable_exploration_prompt(target, existing),
+                }),
             }
-            steps.push(ReconcileStep::InsertExplore {
-                before: target_id.clone(),
-                node: Box::new(explore_node_for(target, explore_id, input.now)),
-            });
         }
 
         // ── d) Verdichtungskandidaten ────────────────────────────────────
@@ -376,7 +423,11 @@ impl PlanController {
                         .all(|child| child.status == PlanNodeStatus::Completed);
                 if all_done {
                     match node.status {
-                        PlanNodeStatus::Draft | PlanNodeStatus::Blocked => {
+                        // Ohne abgeschlossene Abhängigkeiten würde `SetStatus`
+                        // mit `DependencyNotCompleted` die ganze Runde abbrechen.
+                        PlanNodeStatus::Draft | PlanNodeStatus::Blocked
+                            if graph::blocked_by(plan, &node.id).is_empty() =>
+                        {
                             composite_ready.push(node.id.clone());
                         }
                         PlanNodeStatus::Ready | PlanNodeStatus::InProgress => {
@@ -433,7 +484,10 @@ impl PlanController {
             }
             if JOB_KINDS.contains(&node.kind) {
                 admit.push(node.id.clone());
-            } else {
+            } else if node.status == PlanNodeStatus::Draft {
+                // `graph::ready_nodes` liefert `Draft | Ready`. Ein bereits
+                // bereiter Knoten ist am Ziel; ein zweites `SetStatus(Ready)`
+                // wäre `Ready → Ready` und damit `IllegalTransition` (G-013).
                 mark.push(node.id.clone());
             }
         }
@@ -541,11 +595,19 @@ impl PlanController {
     ///   Goal als erreicht erklären.
     ///
     /// Ein `AttachEvidence` mit `kind == EvidenceKind::Job` zieht zusätzlich
-    /// ein `SetStatus(Completed)` nach sich (Konvention an [`ReconcileStep`]).
+    /// ein `SetStatus(Completed)` nach sich (Konvention an [`ReconcileStep`]);
+    /// beide Aktionen laufen in **einem** `apply_batch`.
     ///
-    /// Die Verarbeitung bricht beim ersten Fehler ab; bereits erzeugte Events
-    /// sind dann bereits im Store persistiert — der Aufrufer reagiert darauf
-    /// mit einer neuen `reconcile`-Runde, nicht mit einem Rollback.
+    /// Jeder mutierende Schritt wird gegen den frisch gelesenen Plan neu
+    /// aufgebaut und als atomarer Batch mit `expected_rev` angewandt (siehe
+    /// Moduldoku, „Atomarität“). Ein bereits wirksamer Schritt (Knoten schon
+    /// `Ready`, Job-Knoten schon `Completed`, Knoten schon `Invalidated`,
+    /// Explore-Knoten samt Kante schon vorhanden) erzeugt kein Event.
+    ///
+    /// Die Verarbeitung bricht beim ersten Fehler ab; die Events der davor
+    /// angewandten Schritte sind dann bereits im Store persistiert — der
+    /// Aufrufer reagiert darauf mit einer neuen `reconcile`-Runde. Der
+    /// fehlgeschlagene Schritt selbst hinterlässt nichts.
     ///
     /// # Arguments
     /// - `steps` (`&[ReconcileStep]`): die anzuwendende Schrittfolge.
@@ -559,129 +621,39 @@ impl PlanController {
     /// die nicht angewandten Vorschläge, in Eingabereihenfolge.
     ///
     /// # Errors
-    /// - [`PlanBridgeError::Plan`]: wenn `harw-plan` eine Mutation ablehnt.
+    /// - [`PlanBridgeError::Plan`]: wenn `harw-plan` eine Mutation ablehnt
+    ///   (`BatchActionRejected` mit Index und Ursache) oder die Revision auch
+    ///   nach einmaligem Neulesen nicht passt (`RevisionConflict`).
     /// - [`PlanBridgeError::GoalUnbound`]: wenn ein `GoalStatus`-Vorschlag
     ///   ankommt, obwohl kein Goal-Store gebunden ist — der Vorschlag hätte
     ///   dann keinen Adressaten.
     ///
     /// # Concurrency
-    /// Serialisiert über die Mutationsstelle des `PlanStore`; mehrere
-    /// gleichzeitige `apply`-Aufrufe auf denselben Store sind sicher, aber
-    /// nicht als Transaktion isoliert.
+    /// Jeder Schritt ist über `apply_batch` atomar und gegen fremde Schreiber
+    /// per Revisionsprüfung abgesichert; die Schritte einer Runde zusammen
+    /// sind nicht als Transaktion isoliert.
     pub fn apply(
         steps: &[ReconcileStep],
         plan: &dyn PlanStore,
         goal: Option<&dyn GoalStore>,
         actor: &str,
     ) -> Result<(Vec<PlanEvent>, Vec<ReconcileStep>), PlanBridgeError> {
-        let mut events: Vec<PlanEvent> = Vec::new();
-        let mut deferred: Vec<ReconcileStep> = Vec::new();
-
-        for step in steps {
-            match step {
-                ReconcileStep::AttachEvidence { task, evidence } => {
-                    let closes_node = evidence.kind == EvidenceKind::Job;
-                    events.push(plan.apply(
-                        PlanAction::AttachEvidence {
-                            id: task.clone(),
-                            evidence: evidence.clone(),
-                        },
-                        actor,
-                    )?);
-                    if closes_node {
-                        events.push(plan.apply(
-                            PlanAction::SetStatus {
-                                id: task.clone(),
-                                status: PlanNodeStatus::Completed,
-                                reason: Some(format!(
-                                    "Job '{}' erfolgreich beendet",
-                                    evidence.locator
-                                )),
-                            },
-                            actor,
-                        )?);
-                    }
-                }
-
-                ReconcileStep::Invalidate { ids, condition } => {
-                    events.push(plan.apply(
-                        PlanAction::Invalidate {
-                            ids: ids.clone(),
-                            condition: condition.clone(),
-                        },
-                        actor,
-                    )?);
-                }
-
-                ReconcileStep::InsertExplore { before, node } => {
-                    events.push(plan.apply(
-                        PlanAction::AddNode {
-                            node: node.as_ref().clone(),
-                        },
-                        actor,
-                    )?);
-                    events.push(plan.apply(
-                        PlanAction::AddDependency {
-                            child: before.clone(),
-                            parent: node.id.clone(),
-                        },
-                        actor,
-                    )?);
-                }
-
-                ReconcileStep::MarkReady { ids } => {
-                    for id in ids {
-                        events.push(plan.apply(
-                            PlanAction::SetStatus {
-                                id: id.clone(),
-                                status: PlanNodeStatus::Ready,
-                                reason: Some("alle Abhängigkeiten abgeschlossen".to_owned()),
-                            },
-                            actor,
-                        )?);
-                    }
-                }
-
-                ReconcileStep::GoalStatus { .. } => {
-                    // Bewusst nicht angewandt: nur ein menschlicher Akteur darf
-                    // ein Goal für erreicht erklären. Ohne gebundenen
-                    // Goal-Store hätte der Vorschlag aber keinen Adressaten.
-                    if goal.is_none() {
-                        return Err(PlanBridgeError::GoalUnbound);
-                    }
-                    deferred.push(step.clone());
-                }
-
-                ReconcileStep::AdmitJobs { .. }
-                | ReconcileStep::ProposeExpand { .. }
-                | ReconcileStep::ProposeCondense { .. }
-                | ReconcileStep::AskModel { .. } => deferred.push(step.clone()),
-            }
-        }
-
-        tracing::info!(
-            applied = events.len(),
-            deferred = deferred.len(),
-            actor = actor,
-            "Reconcile-Schritte angewandt"
-        );
-        Ok((events, deferred))
+        let outcome = apply_steps(steps, plan, goal, actor)?;
+        Ok((outcome.events, outcome.deferred))
     }
 
     /// Wie [`Self::apply`], zusätzlich mit Telemetrie über tatsächlich
     /// angewandte Seiteneffekte (Knoten AW1-05).
     ///
     /// # Description
-    /// Ruft [`Self::apply`] unverändert auf. Bei `Ok` emittiert diese
+    /// Wendet die Schritte wie [`Self::apply`] an. Bei `Ok` emittiert diese
     /// Methode, falls `sink` `Some` ist,
-    /// [`crate::metrics::record_apply_side_effects`] über die
-    /// *eingegebene* Schrittfolge: `apply` bricht beim ersten Fehler ab, bei
-    /// `Ok` wurde also jeder Schritt entweder angewandt oder als Vorschlag
-    /// zurückgegeben, und ein Auszählen von `steps` ist damit exakt (siehe
-    /// [`crate::metrics::record_apply_side_effects`]). Bei `Err` wird nichts
-    /// emittiert — der Fehler wird unverändert weitergereicht, ohne dass
-    /// diese Methode einen nicht abgeschlossenen Lauf als vollständig
-    /// gemessen ausgibt.
+    /// [`crate::metrics::record_apply_side_effects`] über die **tatsächlich
+    /// wirksamen** Schritte: ein Schritt, der schon wirksam war und deshalb
+    /// kein Event erzeugt hat, wird nicht gezählt (sonst zählte jede
+    /// Fixpunkt-Runde erneut). Bei `Err` wird nichts emittiert — der Fehler
+    /// wird unverändert weitergereicht, ohne dass diese Methode einen nicht
+    /// abgeschlossenen Lauf als vollständig gemessen ausgibt.
     ///
     /// # Arguments
     /// - `steps` (`&[ReconcileStep]`): identisch zu [`Self::apply`].
@@ -706,12 +678,267 @@ impl PlanController {
         actor: &str,
         sink: Option<&dyn TelemetrySink>,
     ) -> Result<(Vec<PlanEvent>, Vec<ReconcileStep>), PlanBridgeError> {
-        let result = Self::apply(steps, plan, goal, actor)?;
+        let outcome = apply_steps(steps, plan, goal, actor)?;
         if let Some(sink) = sink {
-            crate::metrics::record_apply_side_effects(sink, steps);
+            crate::metrics::record_apply_side_effects(sink, &outcome.effective);
         }
-        Ok(result)
+        Ok((outcome.events, outcome.deferred))
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Atomare Anwendung
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Ergebnis eines `apply`-Laufs samt der tatsächlich wirksamen Schritte.
+struct ApplyOutcome {
+    // Alle erzeugten Plan-Events in Anwendungsreihenfolge.
+    events: Vec<PlanEvent>,
+    // Nicht angewandte Vorschläge in Eingabereihenfolge.
+    deferred: Vec<ReconcileStep>,
+    // Die Schritte, die mindestens ein Event erzeugt haben (für Metriken).
+    effective: Vec<ReconcileStep>,
+}
+
+impl ApplyOutcome {
+    // Übernimmt die Events eines Schrittes; nur ein Schritt mit Events zählt
+    // als wirksam.
+    fn record(&mut self, step: &ReconcileStep, events: Vec<PlanEvent>) {
+        if !events.is_empty() {
+            self.effective.push(step.clone());
+            self.events.extend(events);
+        }
+    }
+}
+
+/// Gemeinsamer Kern von [`PlanController::apply`] und
+/// [`PlanController::apply_observed`].
+fn apply_steps(
+    steps: &[ReconcileStep],
+    plan: &dyn PlanStore,
+    goal: Option<&dyn GoalStore>,
+    actor: &str,
+) -> Result<ApplyOutcome, PlanBridgeError> {
+    let mut outcome = ApplyOutcome {
+        events: Vec::new(),
+        deferred: Vec::new(),
+        effective: Vec::new(),
+    };
+
+    for step in steps {
+        match step {
+            ReconcileStep::AttachEvidence { task, evidence } => {
+                let events = apply_atomically(plan, actor, |snapshot| {
+                    attach_evidence_actions(snapshot, task, evidence)
+                })?;
+                outcome.record(step, events);
+            }
+
+            ReconcileStep::Invalidate { ids, condition } => {
+                let events = apply_atomically(plan, actor, |snapshot| {
+                    invalidate_actions(snapshot, ids, condition)
+                })?;
+                outcome.record(step, events);
+            }
+
+            ReconcileStep::InsertExplore { before, node } => {
+                let events = apply_atomically(plan, actor, |snapshot| {
+                    insert_explore_actions(snapshot, before, node)
+                })?;
+                outcome.record(step, events);
+            }
+
+            ReconcileStep::MarkReady { ids } => {
+                // Je Knoten ein eigener Batch: ein einzelner abgelehnter
+                // Knoten (z. B. Scope-Konflikt) darf die übrigen nicht
+                // dauerhaft mit blockieren.
+                let mut marked: Vec<TaskId> = Vec::new();
+                for id in ids {
+                    let events =
+                        apply_atomically(plan, actor, |snapshot| mark_ready_actions(snapshot, id))?;
+                    if !events.is_empty() {
+                        marked.push(id.clone());
+                        outcome.events.extend(events);
+                    }
+                }
+                if !marked.is_empty() {
+                    outcome
+                        .effective
+                        .push(ReconcileStep::MarkReady { ids: marked });
+                }
+            }
+
+            ReconcileStep::GoalStatus { .. } => {
+                // Bewusst nicht angewandt: nur ein menschlicher Akteur darf
+                // ein Goal für erreicht erklären. Ohne gebundenen
+                // Goal-Store hätte der Vorschlag aber keinen Adressaten.
+                if goal.is_none() {
+                    return Err(PlanBridgeError::GoalUnbound);
+                }
+                outcome.deferred.push(step.clone());
+            }
+
+            ReconcileStep::AdmitJobs { .. }
+            | ReconcileStep::ProposeExpand { .. }
+            | ReconcileStep::ProposeCondense { .. }
+            | ReconcileStep::AskModel { .. } => outcome.deferred.push(step.clone()),
+        }
+    }
+
+    tracing::info!(
+        applied = outcome.events.len(),
+        deferred = outcome.deferred.len(),
+        actor = actor,
+        "Reconcile-Schritte angewandt"
+    );
+    Ok(outcome)
+}
+
+/// Wendet die aus dem aktuellen Plan abgeleiteten Aktionen atomar an.
+///
+/// # Description
+/// Liest den Plan, baut über `build` die Aktionen gegen genau diesen
+/// Snapshot und ruft `PlanStore::apply_batch` mit dessen Revision als
+/// `expected_rev`. Liefert `build` keine Aktion, ist der Schritt bereits
+/// wirksam und es wird nichts geschrieben. Bei `RevisionConflict` wird der
+/// Plan einmal neu gelesen und `build` erneut aufgerufen (höchstens
+/// [`MAX_BATCH_ATTEMPTS`] Versuche); ein weiterer Konflikt wird gemeldet.
+///
+/// # Arguments
+/// - `store` (`&dyn PlanStore`): der zu mutierende Store.
+/// - `actor` (`&str`): Akteur der Mutationen.
+/// - `build` (`FnMut(&Plan) -> Vec<PlanAction>`): leitet die Aktionen aus
+///   dem jeweils frisch gelesenen Snapshot ab.
+///
+/// # Returns
+/// Die Events des Batches; leer, wenn nichts zu tun war.
+///
+/// # Errors
+/// - [`PlanBridgeError::Plan`]: Lesefehler, abgelehnte Aktion
+///   (`BatchActionRejected`) oder wiederholter `RevisionConflict`.
+///
+/// # Concurrency
+/// Atomar je Aufruf; fremde Schreiber zwischen Lesen und Schreiben werden
+/// über die Revisionsprüfung erkannt.
+pub(crate) fn apply_atomically<F>(
+    store: &dyn PlanStore,
+    actor: &str,
+    mut build: F,
+) -> Result<Vec<PlanEvent>, PlanBridgeError>
+where
+    F: FnMut(&Plan) -> Vec<PlanAction>,
+{
+    let mut attempt: usize = 1;
+    loop {
+        let snapshot = store.current()?;
+        let actions = build(&snapshot);
+        if actions.is_empty() {
+            tracing::debug!(
+                plan_id = %snapshot.id,
+                revision = %snapshot.revision,
+                "Schritt bereits wirksam — keine Mutation"
+            );
+            return Ok(Vec::new());
+        }
+        match store.apply_batch(&snapshot.id, actions, actor, snapshot.revision) {
+            Ok(applied) => return Ok(applied.events),
+            Err(PlanError::RevisionConflict {
+                plan,
+                expected,
+                actual,
+            }) if attempt < MAX_BATCH_ATTEMPTS => {
+                tracing::warn!(
+                    plan_id = %plan,
+                    expected = %expected,
+                    actual = %actual,
+                    attempt = attempt,
+                    "Revisionskonflikt — Plan wird neu gelesen und der Schritt wiederholt"
+                );
+                attempt += 1;
+            }
+            Err(error) => return Err(PlanBridgeError::from(error)),
+        }
+    }
+}
+
+/// Aktionen für `AttachEvidence`; Job-Evidenz an einem schon abgeschlossenen
+/// Knoten ist bereits wirksam.
+fn attach_evidence_actions(
+    snapshot: &Plan,
+    task: &TaskId,
+    evidence: &EvidenceRef,
+) -> Vec<PlanAction> {
+    let closes_node = evidence.kind == EvidenceKind::Job;
+    if closes_node
+        && find_node(snapshot, task).is_some_and(|node| node.status == PlanNodeStatus::Completed)
+    {
+        return Vec::new();
+    }
+    let mut actions = vec![PlanAction::AttachEvidence {
+        id: task.clone(),
+        evidence: evidence.clone(),
+    }];
+    if closes_node {
+        actions.push(PlanAction::SetStatus {
+            id: task.clone(),
+            status: PlanNodeStatus::Completed,
+            reason: Some(format!("Job '{}' erfolgreich beendet", evidence.locator)),
+        });
+    }
+    actions
+}
+
+/// Aktionen für `Invalidate`; bereits invalidierte Knoten fallen heraus.
+fn invalidate_actions(
+    snapshot: &Plan,
+    ids: &[TaskId],
+    condition: &InvalidationCondition,
+) -> Vec<PlanAction> {
+    let open: Vec<TaskId> = ids
+        .iter()
+        .filter(|id| {
+            !find_node(snapshot, id)
+                .is_some_and(|node| node.status == PlanNodeStatus::Invalidated)
+        })
+        .cloned()
+        .collect();
+    if open.is_empty() {
+        return Vec::new();
+    }
+    vec![PlanAction::Invalidate {
+        ids: open,
+        condition: condition.clone(),
+    }]
+}
+
+/// Aktionen für `InsertExplore`: nur, was noch fehlt (Knoten, Kante).
+fn insert_explore_actions(snapshot: &Plan, before: &TaskId, node: &PlanNode) -> Vec<PlanAction> {
+    let mut actions = Vec::with_capacity(2);
+    if find_node(snapshot, &node.id).is_none() {
+        actions.push(PlanAction::AddNode { node: node.clone() });
+    }
+    let edge_exists =
+        find_node(snapshot, before).is_some_and(|target| target.dependencies.contains(&node.id));
+    if !edge_exists {
+        actions.push(PlanAction::AddDependency {
+            child: before.clone(),
+            parent: node.id.clone(),
+        });
+    }
+    actions
+}
+
+/// Aktion für `MarkReady` eines Knotens; ein schon bereiter Knoten bleibt
+/// unberührt (G-013).
+fn mark_ready_actions(snapshot: &Plan, id: &TaskId) -> Vec<PlanAction> {
+    if find_node(snapshot, id).is_some_and(|node| node.status == PlanNodeStatus::Ready) {
+        return Vec::new();
+    }
+    vec![PlanAction::SetStatus {
+        id: id.clone(),
+        status: PlanNodeStatus::Ready,
+        reason: Some("alle Abhängigkeiten abgeschlossen".to_owned()),
+    }]
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -719,8 +946,29 @@ impl PlanController {
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Sucht einen Knoten anhand seiner ID.
-fn find_node<'a>(plan: &'a Plan, id: &TaskId) -> Option<&'a PlanNode> {
+pub(crate) fn find_node<'a>(plan: &'a Plan, id: &TaskId) -> Option<&'a PlanNode> {
     plan.nodes.iter().find(|node| &node.id == id)
+}
+
+/// Ein vorhandener Knoten taugt als Exploration, wenn er eine
+/// Explorationsart hat und nicht terminal verworfen ist.
+fn is_usable_exploration(node: &PlanNode) -> bool {
+    matches!(node.kind, PlanNodeKind::Explore | PlanNodeKind::Research)
+        && !matches!(
+            node.status,
+            PlanNodeStatus::Invalidated | PlanNodeStatus::Superseded
+        )
+}
+
+/// Prompt für einen Zielknoten, dessen vorgesehene Exploration unbrauchbar
+/// ist — ohne ihn hinge der Knoten still fest (G-038).
+fn unusable_exploration_prompt(target: &PlanNode, existing: &PlanNode) -> String {
+    format!(
+        "Knoten '{}' braucht eine Exploration, aber der dafür vorgesehene Knoten '{}' ist \
+         unbrauchbar (Art {:?}, Status {:?}). Lege eine neue Exploration an oder öffne die \
+         vorhandene wieder (Reopen mit Begründung); sonst kann '{}' nicht starten.",
+        target.id, existing.id, existing.kind, existing.status, target.id
+    )
 }
 
 /// Ordnet ein Finding dem Knoten zu, den es belegt.
@@ -830,6 +1078,31 @@ fn job_state_steps<'a>(
         };
 
         match state {
+            JobState::Completed if node.status == PlanNodeStatus::Completed => {
+                // Bereits abgeschlossen — ein erneut gemeldeter Zustand ist
+                // kein neues Ergebnis (sonst `Completed → Completed`).
+                tracing::debug!(
+                    task = %node.id,
+                    work_id = work_id,
+                    "Job-Knoten schon abgeschlossen"
+                );
+            }
+            JobState::Failed
+                if matches!(
+                    node.status,
+                    PlanNodeStatus::Completed
+                        | PlanNodeStatus::Invalidated
+                        | PlanNodeStatus::Superseded
+                ) =>
+            {
+                // Nicht (mehr) invalidierbar: abgeschlossene Knoten sind
+                // versiegelt, invalidierte/abgelöste bereits am Ende.
+                tracing::debug!(
+                    task = %node.id,
+                    work_id = work_id,
+                    "Fehlgeschlagener Job an bereits terminalem Knoten — kein Schritt"
+                );
+            }
             JobState::Completed => {
                 touched.insert(node.id.as_str());
                 steps.push(ReconcileStep::AttachEvidence {

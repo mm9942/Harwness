@@ -22,9 +22,9 @@
 //!
 //! Der gemeinsame Zustand liegt deshalb nicht im Provider, sondern in einem
 //! prozessweiten [`crate::fetch::shared_fetcher`] (`OnceLock<Arc<WebFetcher>>`):
-//! ein Verbindungspool, ein Cache-Verzeichnis, konfigurierbar über
-//! [`configure`] bzw. [`crate::fetch::install_fetcher`]. Der geteilte Fetcher
-//! trägt **keinen** Host-Scope; jeder Tool-Aufruf leitet mit
+//! ein Verbindungspool, eine Egress-Policy, ein Cache-Verzeichnis, gesetzt über
+//! [`configure`] bzw. [`crate::fetch::install_fetcher`] (ohne Aufruf kein
+//! Abruf). Der geteilte Fetcher trägt **keinen** Sandbox-Scope; jeder Tool-Aufruf leitet mit
 //! [`crate::fetch::scoped_fetcher`] eine Kopie ab, die den
 //! [`harw_sandbox::NetworkScope`] der aktiven Sandbox trägt. Damit ist die
 //! Allowlist pro Aufruf gebunden und nicht prozessweit eingefroren.
@@ -52,10 +52,10 @@
 use crate::crates_io::WebCratesIoTool;
 use crate::docs_rs::WebDocsRsTool;
 use crate::error::WebToolResult;
-use crate::fetch::{WebFetchTool, WebFetcher, install_fetcher};
+use crate::fetch::{WebFetchOptions, WebFetchTool, WebFetcher, install_fetcher};
+use harw_egress::EgressPolicy;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 harw_tools::tool_provider! {
     /// Stellt die drei Recherche-Tools `web.fetch`, `web.docs_rs` und
@@ -75,43 +75,49 @@ harw_tools::tool_provider! {
     }
 }
 
-/// Hinterlegt Cache-Verzeichnis, TTL und Byte-Limit für alle Web-Tools.
+/// Hinterlegt Egress-Policy, Cache-Verzeichnis und Limits für alle Web-Tools.
 ///
 /// # Description
-/// Baut einen [`WebFetcher`] und installiert ihn als prozessweiten
-/// Basis-Fetcher. Nur der erste Aufruf gewinnt — danach bleibt die
-/// Konfiguration unveränderlich, damit ein späterer Aufruf die Limits nicht
-/// nachträglich lockern kann. Das Harness ruft die Funktion beim Start auf;
-/// ohne Aufruf greifen die Voreinstellungen aus
-/// [`WebFetcher::with_defaults`].
+/// Baut einen [`WebFetcher`] mit dem Client aus [`harw_egress::build_client`]
+/// und installiert ihn als prozessweiten Basis-Fetcher. Nur der erste Aufruf
+/// gewinnt. Ohne Aufruf ist **kein** Abruf möglich (fail-closed). Vorgesehene
+/// Quellen: Policy aus `[network]` (`harw_config::NetworkSection`:
+/// `allow_hosts`, `allow_private`), Cache-Verzeichnis
+/// `harw_home::paths::cache_dir(home)` — die Verdrahtung liegt in
+/// Registry-Defaults/Runtime.
 ///
 /// # Arguments
-/// - `cache_dir` (`PathBuf`): Basis-Cache-Verzeichnis; Eigentum geht über.
-/// - `ttl` ([`Duration`]): Lebensdauer eines Cache-Eintrags.
-/// - `max_bytes` (`usize`): Byte-Obergrenze; wird auf
-///   [`crate::fetch::HARD_MAX_BYTES`] gedeckelt.
+/// - `policy` (`Arc<EgressPolicy>`): Egress-Policy; geteilt.
+/// - `cache_dir` (`PathBuf`): Basis-Cache-Verzeichnis unter `HARW_HOME`.
+/// - `options` ([`WebFetchOptions`]): Limits und Schalter.
 ///
 /// # Returns
 /// `Ok(())`, wenn dieser Aufruf die Konfiguration gesetzt hat.
 ///
 /// # Errors
-/// - [`crate::WebToolError::Http`]: der `reqwest::Client` ließ sich nicht bauen.
-/// - [`crate::WebToolError::Io`]: es war bereits ein Fetcher installiert; die
-///   übergebene Konfiguration greift dann **nicht**.
+/// - [`crate::WebToolError::NotConfigured`]: der Client ließ sich nicht bauen.
+/// - [`crate::WebToolError::Io`] (`AlreadyExists`): es war bereits ein Fetcher
+///   installiert; die übergebene Konfiguration greift **nicht**.
 ///
 /// # Concurrency
-/// Thread-sicher; intern über `OnceLock`.
+/// Thread-sicher über `OnceLock`.
 ///
 /// # Examples
 /// ```rust,no_run
-/// use std::{path::PathBuf, time::Duration};
-/// use harw_tool_web::provider::configure;
+/// use std::{path::PathBuf, sync::Arc};
+/// use harw_egress::EgressPolicy;
+/// use harw_tool_web::{WebFetchOptions, configure};
 ///
-/// configure(PathBuf::from("/var/lib/harw/cache"), Duration::from_secs(900), 512 * 1024)?;
+/// let policy = Arc::new(EgressPolicy::new(vec!["docs.rs".into()], false).unwrap());
+/// configure(policy, PathBuf::from("/home/u/.harw/cache"), WebFetchOptions::default())?;
 /// # Ok::<(), harw_tool_web::WebToolError>(())
 /// ```
-pub fn configure(cache_dir: PathBuf, ttl: Duration, max_bytes: usize) -> WebToolResult<()> {
-    let fetcher = Arc::new(WebFetcher::new(cache_dir, ttl, max_bytes)?);
+pub fn configure(
+    policy: Arc<EgressPolicy>,
+    cache_dir: PathBuf,
+    options: WebFetchOptions,
+) -> WebToolResult<()> {
+    let fetcher = Arc::new(WebFetcher::new(policy, cache_dir, options)?);
     install_fetcher(fetcher).map_err(|_| {
         crate::WebToolError::Io(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,

@@ -10,9 +10,15 @@
 //! Elternverzeichnis, damit ihr Verzeichniseintrag einen Stromausfall
 //! übersteht — sonst könnte ein Kind nach einem Absturz ein zweites Mal
 //! übernommen werden.
+//!
+//! A-STORE (F-179): `admit` schreibt nicht mehr per `create_new` direkt ins
+//! Ziel, sondern atomar über `persist_noclobber` (temp + no-replace-rename);
+//! eine leere oder halbe `.active.json` kann nicht mehr entstehen. Defekte
+//! Altdateien (undekodierbar, unsicherer `child`, Name ≠ Inhalt) blockieren
+//! `active`/`claim_expired` nicht mehr: sie werden nach
+//! `<name>.corrupt-<ts>` verschoben und mit `warn!` übersprungen.
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use fs4::FileExt;
@@ -20,9 +26,8 @@ use harw_observe::TraceContext;
 use harw_types::{SessionId, ToolCallId};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
-use tempfile::NamedTempFile;
-
 use crate::error::{SessionStoreError, SessionStoreResult};
+use crate::store::{persist_noclobber, quarantine_file};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChildLeaseRecord {
@@ -89,28 +94,22 @@ impl ChildLeaseStore {
             return Err(non_regular_lease_path_error());
         }
         let bytes = serde_json::to_vec(record)?;
-        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+        // F-179: temp + no-replace-rename statt `create_new` + `write_all` ins
+        // Ziel; `persist_noclobber` synct Datei und Elternverzeichnis. Das
+        // Kernel-seitige „genau ein Gewinner“ bleibt erhalten.
+        match persist_noclobber(&path, &bytes) {
+            Ok(()) => Ok(()),
+            Err(SessionStoreError::PersistTargetExists { .. }) => {
                 if is_regular_file(&path)? {
-                    return Err(SessionStoreError::ChildLeaseAlreadyExists {
+                    Err(SessionStoreError::ChildLeaseAlreadyExists {
                         child: record.child.clone(),
-                    });
+                    })
+                } else {
+                    Err(non_regular_lease_path_error())
                 }
-                return Err(non_regular_lease_path_error());
             }
-            Err(error) => return Err(SessionStoreError::Io(error)),
-        };
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        // Das Elternverzeichnis wird gesynct, weil `create_new` nur die neue
-        // Datei selbst sichert, nicht ihren Verzeichniseintrag. Bliebe dieser
-        // Eintrag nach einem Stromausfall im Cache stehen, könnte ein
-        // zweiter `admit()`-Aufruf für dasselbe Kind unbemerkt ein zweites
-        // Mal durchgehen — genau die doppelte Übernahme, die die
-        // Einmal-Zustellungsgarantie ausschließen soll.
-        sync_parent_directory(&self.root)?;
-        Ok(())
+            Err(error) => Err(error),
+        }
     }
 
     /// Lists unclaimed active leases. A completion record wins over a stale
@@ -133,7 +132,9 @@ impl ChildLeaseStore {
                 if !has_suffix(&path, ".active.json") || !is_regular_file(&path)? {
                     continue;
                 }
-                let lease = read_lease(&path)?;
+                let Some(lease) = self.load_scanned(&path, "active")? else {
+                    continue;
+                };
                 if is_regular_file(&self.completed_path(&lease.child)?)?
                     || now < lease.lease_expires_at
                 {
@@ -230,13 +231,57 @@ impl ChildLeaseStore {
             if !has_suffix(&path, suffix) || !is_regular_file(&path)? {
                 continue;
             }
-            let lease = read_lease(&path)?;
+            let state = suffix
+                .strip_prefix('.')
+                .and_then(|rest| rest.strip_suffix(".json"))
+                .unwrap_or(suffix);
+            let Some(lease) = self.load_scanned(&path, state)? else {
+                continue;
+            };
             if !is_regular_file(&self.completed_path(&lease.child)?)? {
                 records.push(lease);
             }
         }
         records.sort_by(|left, right| left.child.as_str().cmp(right.child.as_str()));
         Ok(records)
+    }
+
+    // Liest einen beim Scan gefundenen Datensatz. Defekte Dateien (undekodierbar,
+    // unsicherer `child`, Dateiname passt nicht zum Inhalt) werden in Quarantäne
+    // verschoben und als `None` übersprungen, statt den Scan abzubrechen.
+    fn load_scanned(
+        &self,
+        path: &Path,
+        state: &str,
+    ) -> SessionStoreResult<Option<ChildLeaseRecord>> {
+        let detail = match read_lease(path) {
+            Ok(lease) => match self.path(&lease.child, state) {
+                Ok(expected) if expected == path => return Ok(Some(lease)),
+                Ok(_) => "lease file name does not match its child".to_owned(),
+                Err(error) => error.to_string(),
+            },
+            Err(SessionStoreError::Serde(error)) => error.to_string(),
+            Err(SessionStoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        match quarantine_file(path) {
+            Ok(Some(quarantine)) => tracing::warn!(
+                path = %path.display(),
+                quarantine = %quarantine.display(),
+                detail = %detail,
+                "corrupt child lease record quarantined"
+            ),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                detail = %detail,
+                "corrupt child lease record could not be quarantined; skipped"
+            ),
+        }
+        Ok(None)
     }
 
     fn ensure_root(&self) -> SessionStoreResult<()> {
@@ -287,23 +332,14 @@ fn unlock<T>(lock: File, result: SessionStoreResult<T>) -> SessionStoreResult<T>
     }
 }
 
+// No-Clobber-Persist über den crate-weiten Helfer (`store::persist_noclobber`):
+// temp-Datei, `sync_all`, no-replace-rename, Eltern-fsync. Das Elternverzeichnis
+// wird gesynct, weil erst dieser Verzeichniseintrag die Completion-Datei
+// sichtbar macht; `records_with_suffix` behandelt eine vorhandene Completion als
+// Autorität über aktive/expired-Datensätze.
 fn persist_json<T: Serialize>(path: &Path, value: &T) -> SessionStoreResult<()> {
-    let parent = path.parent().ok_or_else(|| {
-        SessionStoreError::Io(std::io::Error::other("child lease path has no parent"))
-    })?;
-    let mut temp = NamedTempFile::new_in(parent)?;
-    serde_json::to_writer(temp.as_file_mut(), value)?;
-    temp.as_file().sync_all()?;
-    temp.persist_noclobber(path)
-        .map_err(|error| SessionStoreError::Io(error.error))?;
-    // Das Elternverzeichnis wird gesynct, weil erst dieser Verzeichnis-
-    // eintrag die Completion-Datei sichtbar macht, nicht ihr Inhalt.
-    // `records_with_suffix` behandelt eine vorhandene Completion als
-    // Autorität über aktive/expired-Datensätze; fiele der Eintrag nach
-    // einem Absturz zurück, erschiene ein bereits abgeschlossenes Kind
-    // wieder als offen und könnte erneut beansprucht werden.
-    sync_parent_directory(parent)?;
-    Ok(())
+    let bytes = serde_json::to_vec(value)?;
+    persist_noclobber(path, &bytes)
 }
 
 /// Synct das Elternverzeichnis einer soeben angelegten, ersetzten oder

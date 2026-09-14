@@ -60,6 +60,29 @@ pub enum EscalationStage {
     Escalated,
 }
 
+impl EscalationStage {
+    /// Returns the kebab-case wire name of this stage.
+    ///
+    /// # Description
+    /// Identisch mit der serde-Form (`"rule-triggered"`, `"escalated"`);
+    /// Proof v2 nimmt diesen festen Wert in die kanonische MAC-Eingabe auf
+    /// (siehe `canonical.rs`), statt sich auf eine JSON-Kodierung zu verlassen.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_dod_warden_proto::EscalationStage;
+    ///
+    /// assert_eq!(EscalationStage::Escalated.wire_name(), "escalated");
+    /// ```
+    #[must_use]
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::RuleTriggered => "rule-triggered",
+            Self::Escalated => "escalated",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::EscalationStage;
@@ -80,6 +103,14 @@ mod tests {
 
         let json = serde_json::to_string(&EscalationStage::Escalated).expect("serializes");
         assert_eq!(json, "\"escalated\"");
+    }
+
+    #[test]
+    fn test_wire_name_matches_serde_form() {
+        for stage in [EscalationStage::RuleTriggered, EscalationStage::Escalated] {
+            let json = serde_json::to_string(&stage).expect("serializes");
+            assert_eq!(json, format!("\"{}\"", stage.wire_name()));
+        }
     }
 
     #[test]

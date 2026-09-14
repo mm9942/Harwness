@@ -830,6 +830,33 @@ impl ChildTurnDriver for ManagedAgentSpawner {
                          not driven from the terminal UI"
                     )))
                 }
+                // Terminale Ausgänge: kein Antworttext, aber auch keine Pause —
+                // der Aufrufer bekommt den Grund als Werkzeugfehler zu sehen.
+                TurnOutcome::Cancelled { reason } => {
+                    tracing::warn!(child = %child, ?reason, "tui.child.cancelled");
+                    Ok(ToolCallResult::error(format!(
+                        "child agent was cancelled: {reason:?}"
+                    )))
+                }
+                TurnOutcome::Truncated => {
+                    tracing::warn!(child = %child, "tui.child.truncated");
+                    Ok(ToolCallResult::error(
+                        "child agent stopped because its model output was truncated",
+                    ))
+                }
+                TurnOutcome::Refused { detail } => {
+                    tracing::warn!(child = %child, ?detail, "tui.child.refused");
+                    Ok(ToolCallResult::error(match detail {
+                        Some(detail) => format!("child agent refused to answer: {detail}"),
+                        None => "child agent refused to answer".to_owned(),
+                    }))
+                }
+                TurnOutcome::Failed { reason } => {
+                    tracing::warn!(child = %child, %reason, "tui.child.failed");
+                    Ok(ToolCallResult::error(format!(
+                        "child agent failed: {reason}"
+                    )))
+                }
             }
         })
     }
@@ -1087,6 +1114,14 @@ impl ApprovalDriver {
             match outcome {
                 TurnOutcome::Completed => return Ok(TurnOutcome::Completed),
 
+                // Terminale Ausgänge sind keine Pause: sie werden unverändert
+                // durchgereicht, damit der Aufrufer den echten Grund sieht,
+                // statt ihn als „abgeschlossen" zu lesen.
+                terminal @ (TurnOutcome::Cancelled { .. }
+                | TurnOutcome::Truncated
+                | TurnOutcome::Refused { .. }
+                | TurnOutcome::Failed { .. }) => return Ok(terminal),
+
                 TurnOutcome::AwaitingApproval { call_id, request } => {
                     let Some(pending) = session.pending_approval().cloned() else {
                         tracing::error!(
@@ -1215,6 +1250,10 @@ fn pause_label(outcome: &TurnOutcome) -> &'static str {
         TurnOutcome::Completed => "completed",
         TurnOutcome::AwaitingApproval { .. } => "awaiting approval",
         TurnOutcome::AwaitingChild { .. } => "awaiting child",
+        TurnOutcome::Cancelled { .. } => "cancelled",
+        TurnOutcome::Truncated => "truncated",
+        TurnOutcome::Refused { .. } => "refused",
+        TurnOutcome::Failed { .. } => "failed",
     }
 }
 
@@ -1269,6 +1308,9 @@ mod tests {
                     arguments,
                 }],
                 usage: harw_types::TokenUsage::default(),
+                // `reasoning`/`stop` spielen für die Freigabe-Tests keine
+                // Rolle — Default liefert `None` bzw. `StopReason::EndTurn`.
+                ..Default::default()
             }
         }
     }

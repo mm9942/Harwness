@@ -45,10 +45,11 @@
 //! # Beispiel
 //! ```rust,ignore
 //! let startup = ChatStartup { mode: InteractionMode::Chat, plan: None, goal_context: None };
-//! chat::run_chat(None, Some("Hallo".to_owned()), None, startup)?;
+//! chat::run_chat(None, Some("Hallo".to_owned()), None, startup, chat::ChatOptions::default())?;
 //! ```
 
 use std::{
+    io::IsTerminal,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -59,6 +60,7 @@ use harw_core::{
     resume_after_approval, run_turn,
 };
 use harw_extension_api::ContextProvider;
+use harw_memory::facts::{FactScope, FactStore};
 use harw_protocol::{SessionEvent, TurnEvent};
 use harw_runtime::{
     AssemblyContributor, AssemblyInputs, AssemblyParts, EntryKind, ModelSource, PlanServices,
@@ -71,7 +73,9 @@ use harw_types::{IngressSurface, SessionId, ThreadRef};
 use tokio::{runtime::Builder, sync::mpsc::UnboundedSender};
 
 use crate::home::resolve_home;
-use crate::resume::{discover_sessions, prompt_for_session, resolve_session_selector};
+use crate::resume::{
+    discover_sessions, prompt_for_session, resolve_session_selector, session_matches_project,
+};
 use crate::runtime_entry::{
     configured_secret_resolver, local_principal, profile_sessions_root, runtime_spec,
     transcript_state_store,
@@ -113,6 +117,33 @@ pub(crate) struct ChatStartup {
     pub(crate) goal_context: Option<Arc<dyn ContextProvider>>,
 }
 
+/// Zusätzliche Chat-Flags, die `harw-cli/src/cli.rs::ChatArgs` heute noch
+/// nicht alle trägt (Scope-Contract §5 Zeile B5: `--all`, `--verbose`,
+/// `--add-dir`; diese Datei besitzt nur `resume.rs`/`chat.rs`, nicht
+/// `cli.rs`). `Default` bildet exakt das heutige Verhalten ab (kein
+/// Projektfilter-Override, keine ausführlichere TUI-Darstellung, keine
+/// zusätzlichen Arbeitsverzeichnis-Wurzeln), damit `main.rs` bis zur
+/// Ergänzung der fehlenden `ChatArgs`-Felder unverändert
+/// `ChatOptions::default()` an [`run_chat`] übergeben kann — sobald `cli.rs`
+/// die Felder ergänzt, genügt in `main.rs` je eine Zeile
+/// (`all_projects: cli.chat.all`, `verbose: cli.chat.verbose`,
+/// `add_dirs: cli.chat.add_dir`) an derselben Konstruktionsstelle.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ChatOptions {
+    /// `--all`: `harw -r` ohne Selektor zeigt Sessions aller Projekte statt
+    /// nur des aktuellen (Contract §4: "`harw -r` zeigt standardmäßig die
+    /// Sessions des aktuellen Projekts, `harw -r --all` alle").
+    pub(crate) all_projects: bool,
+    /// `--verbose`: ausführlichere TUI-Darstellung beim Start (Plan Schritt 2,
+    /// Ctrl+O-Äquivalent). Wird in [`ChatRuntimeInputs::verbose`] bereitgehalten;
+    /// siehe dort für den erwarteten Abnehmer.
+    pub(crate) verbose: bool,
+    /// `--add-dir`: zusätzliche, für diese Sitzung freigegebene
+    /// Arbeitsverzeichnis-Wurzeln, registriert über
+    /// `harw_sandbox::ExtraRootsCell` ([`apply_extra_dirs`]).
+    pub(crate) add_dirs: Vec<PathBuf>,
+}
+
 /// Startet den Default-Chat-Pfad.
 ///
 /// # Description
@@ -127,6 +158,9 @@ pub(crate) struct ChatStartup {
 /// - `resume_selection` (`Option<Option<String>>`): vorhandene Session
 ///   fortsetzen; ohne Selector wird sie interaktiv ausgewählt.
 /// - `startup` (`ChatStartup`): Modus, Planungsdienste, Ziel-Kontext.
+/// - `options` ([`ChatOptions`]): `--all`/`--verbose`/`--add-dir` (Schritt 7 /
+///   Contract §5 Zeile B5), bis `cli.rs` die zugehörigen `ChatArgs`-Felder
+///   ergänzt per [`ChatOptions::default`] aufrufbar.
 ///
 /// # Returns
 /// `Ok(())`, sobald der Turn ausgegeben bzw. die TUI beendet wurde.
@@ -140,19 +174,25 @@ pub(crate) struct ChatStartup {
 ///
 /// # Examples
 /// ```rust,ignore
-/// run_chat(None, None, Some(None), startup)?; // interaktive Session-Auswahl
+/// run_chat(None, None, Some(None), startup, ChatOptions::default())?; // interaktive Session-Auswahl
 /// ```
 pub fn run_chat(
     home_override: Option<PathBuf>,
     initial_prompt: Option<String>,
     resume_selection: Option<Option<String>>,
     startup: ChatStartup,
+    options: ChatOptions,
 ) -> Result<(), String> {
     validate_chat_mode(initial_prompt.as_deref(), resume_selection.as_ref())?;
 
     let home = resolve_home(home_override)?;
     harw_home::ensure_home(&home).map_err(|error| error.to_string())?;
     let cwd = std::env::current_dir().map_err(|error| format!("cwd: {error}"))?;
+    let ChatOptions {
+        all_projects,
+        verbose,
+        add_dirs,
+    } = options;
 
     let (entry, surface) = if initial_prompt.is_some() {
         (EntryKind::OneShot, IngressSurface::Cli)
@@ -174,22 +214,43 @@ pub fn run_chat(
         config = load_chat_config(&spec)?;
     }
 
-    let inputs = ChatRuntimeInputs::new(spec, &config, startup)?;
+    let inputs = ChatRuntimeInputs::new(spec, &config, startup, verbose)?;
 
     match initial_prompt {
-        Some(prompt) => run_one_shot(&inputs, &prompt),
+        Some(prompt) => run_one_shot(&inputs, &prompt, &add_dirs),
         None => {
             let sessions_root = profile_sessions_root(&home)?;
-            let existing_session_id =
-                resolve_startup_resume_selection(&sessions_root, resume_selection)?;
-            let factory = ChatTuiFactory::new(inputs, configured_model_source);
+            let project_key = current_project_key(&cwd);
+            // `-r` ohne Selektor am Terminal: die Auflösung liefert bewusst
+            // keine Sitzung, die Auswahl übernimmt der Picker der TUI. Ohne
+            // Terminal hat `prompt_for_session` bereits entschieden, dann
+            // bleibt der Picker aus.
+            let bare_resume = matches!(resume_selection, Some(None));
+            let existing_session_id = resolve_startup_resume_selection(
+                &sessions_root,
+                resume_selection,
+                project_key.as_deref(),
+                all_projects,
+            )?;
+            let open_picker_at_start = bare_resume && existing_session_id.is_none();
+            let factory = ChatTuiFactory::new(inputs, configured_model_source, add_dirs);
             let (assembly, wiring) = factory.assemble(existing_session_id)?;
             harw_tui::run_tui(
                 assembly,
                 TuiRunOptions {
                     wiring,
                     resume: Some(TuiResume {
-                        selector: Box::new(ProfileResumeSelector::new(sessions_root)),
+                        selector: Box::new(ProfileResumeSelector::new(
+                            sessions_root.clone(),
+                            cwd.clone(),
+                            all_projects,
+                        )),
+                        // Wurzel der Transcript-/Meta-Sidecars für den Picker
+                        // (Nachbar-Slice, `harw-tui/src/runtime_root.rs`); dieselbe
+                        // Wurzel, die `ProfileResumeSelector`/`discover_sessions`
+                        // schon für dieses Profil verwenden.
+                        session_store_root: sessions_root,
+                        open_picker_at_start,
                         factory: Box::new(factory),
                     }),
                 },
@@ -251,15 +312,35 @@ struct ChatRuntimeInputs {
     memory: Option<Arc<dyn harw_memory::Memory>>,
     // `secrets:`-Resolver, falls die Konfiguration einen verlangt.
     secret_resolver: Option<Arc<dyn harw_provider_http::SecretResolver + Send + Sync>>,
+    // Projekt-Fakten-Wurzel (Memory v3, `docs/design/memory-v3-ltm.md` §2/§4),
+    // `<projekt>/.harw/memories`, sofern Projekterkennung und `ensure()`
+    // gelingen. Noch an keine Montage gebunden — der bestehende
+    // `chat_builder` registriert weiterhin nur `memory` (v2, `Memory`-Trait);
+    // siehe `open_fact_stores` für die dokumentierte Annahme des parallelen
+    // Memory-Slices (M2).
+    #[allow(dead_code)]
+    project_facts: Option<Arc<FactStore>>,
+    // Globale Fakten-Wurzel (`<home>/profiles/<profil>/memories`), analog zu
+    // `project_facts`; Projekt geht laut Design §4 im Lesepfad vor.
+    #[allow(dead_code)]
+    global_facts: Option<Arc<FactStore>>,
+    // `--verbose` (Contract §5 Zeile B5, Plan Schritt 2 Ctrl+O-Äquivalent).
+    // Bereitgehalten für die TUI-Montage; `TuiRunOptions`/`TuiSessionWiring`
+    // (Nachbar-Slice B3) tragen heute noch kein `verbose`-Feld, das diesen
+    // Wert entgegennimmt.
+    #[allow(dead_code)]
+    verbose: bool,
 }
 
 impl ChatRuntimeInputs {
-    // Ergänzt `spec` um Modus und aktiven Agenten (E6) und öffnet die
-    // profilgebundenen Speicher genau einmal.
+    // Ergänzt `spec` um Modus und aktiven Agenten (E6), öffnet die
+    // profilgebundenen Speicher genau einmal und hält `verbose` sowie die
+    // Projekt-/Global-Fakten-Wurzeln für die Montage bereit.
     fn new(
         mut spec: RuntimeSpec,
         config: &ResolvedConfig,
         startup: ChatStartup,
+        verbose: bool,
     ) -> Result<Self, String> {
         spec.mode_override = Some(startup.mode);
         spec.active_agent = config.harness.active_agent_definition.clone();
@@ -270,6 +351,7 @@ impl ChatRuntimeInputs {
         let job_store = Arc::new(JobStore::new(&active_profile_job_store_root(&home)?));
         let memory = build_memory(&home);
         let secret_resolver = configured_secret_resolver(&home, config)?;
+        let (project_facts, global_facts) = open_fact_stores(&home, &spec.cwd);
 
         Ok(Self {
             spec,
@@ -278,6 +360,9 @@ impl ChatRuntimeInputs {
             job_store,
             memory,
             secret_resolver,
+            project_facts,
+            global_facts,
+            verbose,
         })
     }
 }
@@ -366,12 +451,21 @@ struct ChatTuiFactory {
     inputs: ChatRuntimeInputs,
     // Quelle des Wurzel-Modells je Montage (produktiv: `Configured`).
     model: fn() -> ModelSource,
+    // `--add-dir`-Wurzeln (Contract §5 Zeile B5); jede Montage bekommt eine
+    // frische `harw_sandbox::ExtraRootsCell` (siehe `RuntimeServices`), daher
+    // registriert [`Self::assemble`] sie bei jedem Aufruf erneut — sonst
+    // gingen sie bei jedem `/resume` verloren.
+    add_dirs: Vec<PathBuf>,
 }
 
 impl ChatTuiFactory {
-    // Übernimmt die Zutaten und die Modellquelle.
-    fn new(inputs: ChatRuntimeInputs, model: fn() -> ModelSource) -> Self {
-        Self { inputs, model }
+    // Übernimmt die Zutaten, die Modellquelle und die `--add-dir`-Wurzeln.
+    fn new(inputs: ChatRuntimeInputs, model: fn() -> ModelSource, add_dirs: Vec<PathBuf>) -> Self {
+        Self {
+            inputs,
+            model,
+            add_dirs,
+        }
     }
 }
 
@@ -386,6 +480,7 @@ impl TuiAssemblyFactory for ChatTuiFactory {
             builder = builder.root_session_id(id);
         }
         let assembly = builder.build().map_err(assembly_error)?;
+        apply_extra_dirs(&assembly, &self.add_dirs);
         tracing::info!(
             session_id = %assembly.root_session_id(),
             "chat.tui.assembled"
@@ -396,13 +491,36 @@ impl TuiAssemblyFactory for ChatTuiFactory {
 
 /// CLI-owned bridge from durable profile transcripts to the TUI `/resume`
 /// runtime boundary.
+///
+/// # Projektfilter (Schritt 7, Contract §5 Zeile B5)
+/// `runtime_root.rs` (Nachbar-Slice B3) baut `SessionEntry`s bereits selbst
+/// aus `available_sessions()` (unverändert, dieser Trait-Methode) plus
+/// `TuiResume::session_store_root` (siehe dessen `session_entries`-Helfer
+/// und `app.push_line`-Aufrufer `app.open_session_picker`) — dieser Typ
+/// liefert also **keinen** eigenen `Vec<SessionEntry>`-Baustein, sondern
+/// wendet den Projektfilter direkt auf die von `available_sessions()`
+/// gelieferte ID-Liste an. Ein späteres `Ctrl+A` (`SessionPicker::show_all`)
+/// kann diesen Filter zur Laufzeit noch nicht umschalten, da
+/// `ResumeSessionSelector::available_sessions` keinen `all`-Parameter
+/// entgegennimmt; `self.all` gilt bis dahin nur für den Startwert aus
+/// `--all`.
 struct ProfileResumeSelector {
     sessions_root: PathBuf,
+    // Arbeitsverzeichnis des Prozesses; nötig, um den Projekt-Schlüssel für
+    // den Filter in [`ResumeSessionSelector::available_sessions`] zu
+    // ermitteln (Schritt 7 Projektfilter).
+    cwd: PathBuf,
+    // `--all` (Contract §5 Zeile B5): hebt den Projektfilter auf.
+    all: bool,
 }
 
 impl ProfileResumeSelector {
-    fn new(sessions_root: PathBuf) -> Self {
-        Self { sessions_root }
+    fn new(sessions_root: PathBuf, cwd: PathBuf, all: bool) -> Self {
+        Self {
+            sessions_root,
+            cwd,
+            all,
+        }
     }
 
     fn discover(&self) -> Result<Vec<crate::resume::DiscoveredSession>, String> {
@@ -412,8 +530,13 @@ impl ProfileResumeSelector {
 
 impl harw_tui::app::ResumeSessionSelector for ProfileResumeSelector {
     fn available_sessions(&self) -> Result<Vec<SessionId>, String> {
-        self.discover()
-            .map(|sessions| sessions.into_iter().map(|session| session.id).collect())
+        let project_key = current_project_key(&self.cwd);
+        Ok(self
+            .discover()?
+            .into_iter()
+            .filter(|session| self.all || session_matches_project(session, project_key.as_deref()))
+            .map(|session| session.id)
+            .collect())
     }
 
     fn resolve_session(&self, selector: &str) -> Result<SessionId, String> {
@@ -422,11 +545,65 @@ impl harw_tui::app::ResumeSessionSelector for ProfileResumeSelector {
     }
 }
 
+/// Ermittelt den Projekt-Schlüssel des aktuellen Arbeitsverzeichnisses für
+/// den `-r`-Projektfilter (Contract §3/§4).
+///
+/// # Returns
+/// `None` bei Erkennungsfehlern (z. B. `cwd` nicht kanonisierbar) — der
+/// Filter behandelt das dann symmetrisch zu Sessions ohne `project_key`
+/// (siehe [`crate::resume::session_matches_project`]).
+fn current_project_key(cwd: &Path) -> Option<String> {
+    match harw_home::project::discover_project(cwd, &[]) {
+        Ok(project) => Some(harw_home::project::project_key(&project.root)),
+        Err(error) => {
+            tracing::warn!(%error, "resume: konnte Projekt-Schlüssel nicht ermitteln");
+            None
+        }
+    }
+}
+
+/// Registriert `--add-dir`-Wurzeln sitzungsweit über
+/// `assembly.services().extra_roots()` (`harw_sandbox::ExtraRootsCell`,
+/// bereits von A8/B1 bereitgestellt).
+///
+/// # Description
+/// Ein abgelehnter Kandidat (z. B. `TooMany`, `AncestorOfPrimary`) wird nur
+/// mit `tracing::warn!` gemeldet — ein ungültiges `--add-dir` darf den
+/// Chatstart nicht verhindern, analog zu [`build_memory`].
+fn apply_extra_dirs(assembly: &RuntimeAssembly, add_dirs: &[PathBuf]) {
+    if add_dirs.is_empty() {
+        return;
+    }
+    let primary_root = assembly.spec().cwd.clone();
+    let user_home = std::env::var_os("HOME").map(PathBuf::from);
+    let extra_roots = assembly.services().extra_roots();
+    for dir in add_dirs {
+        if let Err(error) = extra_roots.add(dir, false, &primary_root, user_home.as_deref()) {
+            tracing::warn!(
+                path = %dir.display(),
+                %error,
+                "--add-dir: Wurzel wurde nicht registriert"
+            );
+        }
+    }
+}
+
 /// Resolves startup `--resume` input without allowing a selector to fall back
 /// to a freshly-created session.
+///
+/// # Description
+/// `Some(None)` (bare `-r`) unterscheidet zwei Fälle: an einem Terminal gibt
+/// diese Funktion `Ok(None)` zurück (frische Sitzung; die eigentliche
+/// Auswahl übernimmt der TUI-Picker über `TuiResume::selector`, dessen
+/// `available_sessions()` denselben Projektfilter anwendet, siehe
+/// [`ProfileResumeSelector`]). Ohne Terminal (Pipes, nicht-interaktive Tests)
+/// bleibt [`prompt_for_session`] der einzig mögliche Weg und respektiert
+/// denselben Projektfilter wie der Picker.
 fn resolve_startup_resume_selection(
     sessions_root: &Path,
     resume_selection: Option<Option<String>>,
+    current_project_key: Option<&str>,
+    all_projects: bool,
 ) -> Result<Option<SessionId>, String> {
     let Some(selector) = resume_selection else {
         return Ok(None);
@@ -437,10 +614,22 @@ fn resolve_startup_resume_selection(
         Some(selector) => resolve_session_selector(&sessions, &selector)
             .map(Some)
             .map_err(|error| error.to_string()),
+        None if std::io::stdin().is_terminal() => {
+            // Ein Terminal bekommt den Vollbild-Picker der TUI statt eines
+            // blockierenden stdin-Prompts vor dem eigentlichen Start (siehe
+            // Funktions- und `prompt_for_session`-Doku).
+            Ok(None)
+        }
         None => {
+            let filtered: Vec<crate::resume::DiscoveredSession> = sessions
+                .into_iter()
+                .filter(|session| {
+                    all_projects || session_matches_project(session, current_project_key)
+                })
+                .collect();
             let stdin = std::io::stdin();
             let stdout = std::io::stdout();
-            prompt_for_session(&sessions, &mut stdin.lock(), &mut stdout.lock())
+            prompt_for_session(&filtered, &mut stdin.lock(), &mut stdout.lock())
                 .map_err(|error| error.to_string())?
                 .map(Some)
                 .ok_or_else(|| RESUME_SELECTION_CANCELLED.to_owned())
@@ -473,6 +662,83 @@ fn build_memory(home: &Path) -> Option<Arc<dyn harw_memory::Memory>> {
             None
         }
     }
+}
+
+/// Öffnet die projekt- und profilweiten Fakten-Wurzeln (Memory v3,
+/// `docs/design/memory-v3-ltm.md` §2/§4: "Projekt-Treffer zuerst").
+///
+/// # Beschreibung
+/// Projekt zuerst: `<projekt>/.harw/memories` über
+/// [`harw_home::project::ProjectHome::memories_dir`] (Root wird best-effort
+/// über `ProjectHome::ensure` angelegt); danach global unter
+/// `<home>/profiles/<profil>/memories`. Jeder Fehlschlag (Projekterkennung,
+/// `ensure`, `FactStore::open`) liefert für diese Rolle `None` und wird nur
+/// mit `tracing::warn!` gemeldet — wie [`build_memory`] darf ein
+/// Gedächtnisproblem den Chatstart nie verhindern.
+///
+/// # Annahme für den parallelen Memory-Slice (M2)
+/// [`harw_memory::context_provider::MemoryContextProvider`] kennt heute nur
+/// eine Wurzel über `M: harw_memory::Memory`; `FactStore` implementiert
+/// dieses Trait nicht. Bis M2 einen Zwei-Wurzel-Kontext-Provider für
+/// `FactStore` liefert (Projekt vor Global, siehe Design §4), hält diese
+/// Funktion beide Stores bereit ([`ChatRuntimeInputs::project_facts`]/
+/// [`ChatRuntimeInputs::global_facts`]), ohne sie an `chat_builder`/die
+/// Montage zu binden.
+fn open_fact_stores(home: &Path, cwd: &Path) -> (Option<Arc<FactStore>>, Option<Arc<FactStore>>) {
+    let project = project_memories_root(cwd).and_then(|root| {
+        match FactStore::open(&root, FactScope::Project) {
+            Ok(store) => Some(Arc::new(store)),
+            Err(error) => {
+                tracing::warn!(
+                    path = %root.display(),
+                    %error,
+                    "harw-memory: konnte Projekt-Fakten-Wurzel nicht öffnen"
+                );
+                None
+            }
+        }
+    });
+
+    let global = match active_profile_memories_root(home) {
+        Ok(root) => match FactStore::open(&root, FactScope::Global) {
+            Ok(store) => Some(Arc::new(store)),
+            Err(error) => {
+                tracing::warn!(
+                    path = %root.display(),
+                    %error,
+                    "harw-memory: konnte globale Fakten-Wurzel nicht öffnen"
+                );
+                None
+            }
+        },
+        Err(error) => {
+            tracing::warn!(%error, "harw-memory: konnte Profilverzeichnis für Fakten nicht auflösen");
+            None
+        }
+    };
+
+    (project, global)
+}
+
+/// Ermittelt und stellt die projekt-lokale Fakten-Wurzel sicher.
+///
+/// `None` bei jedem Fehlschlag der Projekterkennung; ein Fehlschlag von
+/// `ProjectHome::ensure` wird nur gewarnt — `FactStore::open` legt `facts/`
+/// bei Bedarf ohnehin selbst an, `.harw/plans`/`.harw/goals` fehlen dann nur
+/// vorübergehend.
+fn project_memories_root(cwd: &Path) -> Option<PathBuf> {
+    let project = match harw_home::project::discover_project(cwd, &[]) {
+        Ok(project) => project,
+        Err(error) => {
+            tracing::warn!(%error, "harw-memory: konnte Projekt-Root nicht ermitteln");
+            return None;
+        }
+    };
+    let project_home = harw_home::project::ProjectHome::at(&project);
+    if let Err(error) = project_home.ensure() {
+        tracing::warn!(%error, "harw-memory: konnte Projekt-Home nicht anlegen");
+    }
+    Some(project_home.memories_dir())
 }
 
 /// Ordnet jede lokale CLI-Session stabil ihrem Transcript-Thread zu.
@@ -522,7 +788,7 @@ fn one_shot_assembly(
 }
 
 // Führt genau einen Turn über die One-shot-Montage aus und druckt die Antwort.
-fn run_one_shot(inputs: &ChatRuntimeInputs, prompt: &str) -> Result<(), String> {
+fn run_one_shot(inputs: &ChatRuntimeInputs, prompt: &str, add_dirs: &[PathBuf]) -> Result<(), String> {
     let runtime = Builder::new_current_thread()
         .enable_all()
         .build()
@@ -534,6 +800,7 @@ fn run_one_shot(inputs: &ChatRuntimeInputs, prompt: &str) -> Result<(), String> 
     let (turn_tx, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
 
     let assembly = one_shot_assembly(inputs, ModelSource::Configured, event_tx.clone())?;
+    apply_extra_dirs(&assembly, add_dirs);
     let root_id = assembly.root_session_id().clone();
     let RootSession { mut session, .. } = assembly
         .new_root_session(root_id.clone(), event_tx, turn_tx, None)
@@ -549,6 +816,23 @@ fn run_one_shot(inputs: &ChatRuntimeInputs, prompt: &str) -> Result<(), String> 
             TurnOutcome::Completed => {}
             TurnOutcome::AwaitingChild { .. } => {
                 return Err("provider unexpectedly paused a turn".to_owned());
+            }
+            // Terminale Ausgänge: der Lauf endet ohne Antwort, und der Grund
+            // gehört in die Meldung statt in ein stilles „fertig".
+            TurnOutcome::Cancelled { reason } => {
+                return Err(format!("turn was cancelled: {reason:?}"));
+            }
+            TurnOutcome::Truncated => {
+                return Err("model output was truncated".to_owned());
+            }
+            TurnOutcome::Refused { detail } => {
+                return Err(match detail {
+                    Some(detail) => format!("model refused to answer: {detail}"),
+                    None => "model refused to answer".to_owned(),
+                });
+            }
+            TurnOutcome::Failed { reason } => {
+                return Err(format!("turn failed: {reason}"));
             }
             TurnOutcome::AwaitingApproval { .. } => {
                 // Defensiv: `AskResolution::RejectTurn` lehnt Rückfragen schon
@@ -594,8 +878,11 @@ fn run_one_shot(inputs: &ChatRuntimeInputs, prompt: &str) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harw_extension_api::{ContextFragment, ExtFuture, TurnInputContext};
+    use harw_core::{ModelError, ModelFuture, ModelProvider, ModelRequest, ModelResponse, ToolCallResult};
+    use harw_extension_api::{ContextFragment, ExtFuture, ToolCall, ToolName, TurnInputContext};
+    use harw_protocol::TurnItem;
     use harw_session_store::TranscriptStore;
+    use harw_types::ToolCallId;
     use std::io::Write as _;
 
     const TEST_GOAL_NAMESPACE: &str = "chat-test.goal";
@@ -646,7 +933,7 @@ mod tests {
     ) -> ChatRuntimeInputs {
         let spec = runtime_spec(entry, &fixture.home, &fixture.cwd, local_principal(surface));
         let config = load_chat_config(&spec).expect("load fixture config");
-        ChatRuntimeInputs::new(spec, &config, startup).expect("build chat inputs")
+        ChatRuntimeInputs::new(spec, &config, startup, false).expect("build chat inputs")
     }
 
     fn startup(mode: InteractionMode) -> ChatStartup {
@@ -732,9 +1019,13 @@ mod tests {
         let sessions = tempfile::tempdir().expect("create sessions directory");
         write_transcript(sessions.path(), "session-42");
 
-        let selected =
-            resolve_startup_resume_selection(sessions.path(), Some(Some("session-42".to_owned())))
-                .expect("resolve explicit session");
+        let selected = resolve_startup_resume_selection(
+            sessions.path(),
+            Some(Some("session-42".to_owned())),
+            None,
+            false,
+        )
+        .expect("resolve explicit session");
 
         assert_eq!(selected, Some(SessionId::from_str("session-42")));
     }
@@ -744,9 +1035,13 @@ mod tests {
         let sessions = tempfile::tempdir().expect("create sessions directory");
         write_transcript(sessions.path(), "session-42");
 
-        let error =
-            resolve_startup_resume_selection(sessions.path(), Some(Some("missing".to_owned())))
-                .expect_err("unknown selector must not create a new session");
+        let error = resolve_startup_resume_selection(
+            sessions.path(),
+            Some(Some("missing".to_owned())),
+            None,
+            false,
+        )
+        .expect_err("unknown selector must not create a new session");
 
         assert!(error.contains("unbekannte Session-Auswahl"));
     }
@@ -756,9 +1051,113 @@ mod tests {
         let sessions = tempfile::tempdir().expect("create sessions directory");
 
         assert_eq!(
-            resolve_startup_resume_selection(sessions.path(), None)
+            resolve_startup_resume_selection(sessions.path(), None, None, false)
                 .expect("no resume request is valid"),
             None
+        );
+    }
+
+    // Ein `-r` ohne Wert an einem Terminal darf nicht mehr blockierend über
+    // stdin auflösen — das übernimmt seit Schritt 7 der TUI-Picker über
+    // `ProfileResumeSelector::available_sessions`. Da `cargo test` selbst
+    // typischerweise ohne TTY läuft, dokumentiert dieser Test nur den
+    // Nicht-TTY-Zweig: er respektiert denselben Projektfilter wie der
+    // Picker, statt alle Sessions unbesehen anzuzeigen.
+    #[test]
+    fn bare_resume_without_a_tty_prompts_only_over_sessions_matching_the_project_filter() {
+        let sessions_dir = tempfile::tempdir().expect("create sessions directory");
+        // Leere Datei (kein `{}`-Inhalt wie `write_transcript`): ein leeres
+        // Transcript lässt `meta::load_or_derive` einen frischen Sidecar
+        // ableiten, statt an einem nicht-parsbaren Datensatz zu scheitern.
+        std::fs::File::create(sessions_dir.path().join("session-other-project.jsonl"))
+            .expect("create empty transcript for meta derivation");
+        harw_session_store::meta::set_project(
+            sessions_dir.path(),
+            &SessionId::from_str("session-other-project"),
+            None,
+            None,
+            Some("other-project-key"),
+        )
+        .expect("tag session with a foreign project key");
+
+        assert!(
+            !std::io::stdin().is_terminal(),
+            "test runners are expected to run without a TTY; \
+             this test only covers the non-TTY fallback branch"
+        );
+
+        // Der Projektfilter greift bereits vor `prompt_for_session`: die
+        // einzige Session gehört zu einem anderen Projekt, die gefilterte
+        // Liste ist leer, und `prompt_for_session` lehnt eine leere Liste
+        // mit `ResumeError::NoSessions` ab, statt stdin überhaupt zu lesen.
+        let error = resolve_startup_resume_selection(
+            sessions_dir.path(),
+            Some(None),
+            Some("current-project-key"),
+            false,
+        )
+        .expect_err("no session matches the current project");
+
+        assert!(error.contains("keine dauerhaften Sessions gefunden"), "{error}");
+    }
+
+    // `ProfileResumeSelector::available_sessions` ist der reale Abnehmer des
+    // Projektfilters: `runtime_root.rs` (B3) baut `SessionEntry`s direkt aus
+    // dieser Liste plus `TuiResume::session_store_root`, ohne einen eigenen
+    // `Vec<SessionEntry>`-Baustein von hier entgegenzunehmen.
+    #[test]
+    fn profile_resume_selector_filters_available_sessions_by_project_unless_all() {
+        use harw_tui::app::ResumeSessionSelector;
+
+        let project_dir = tempfile::tempdir().expect("create project directory");
+        let sessions_dir = tempfile::tempdir().expect("create sessions directory");
+        std::fs::File::create(sessions_dir.path().join("in-project.jsonl"))
+            .expect("create empty transcript for meta derivation");
+        std::fs::File::create(sessions_dir.path().join("other-project.jsonl"))
+            .expect("create empty transcript for meta derivation");
+
+        let current_key =
+            current_project_key(project_dir.path()).expect("a real directory always yields a project key");
+        harw_session_store::meta::set_project(
+            sessions_dir.path(),
+            &SessionId::from_str("in-project"),
+            None,
+            None,
+            Some(current_key.as_str()),
+        )
+        .expect("tag in-project session with the current project key");
+        harw_session_store::meta::set_project(
+            sessions_dir.path(),
+            &SessionId::from_str("other-project"),
+            None,
+            None,
+            Some("some-other-project-key"),
+        )
+        .expect("tag other-project session with a foreign project key");
+
+        let filtered = ProfileResumeSelector::new(
+            sessions_dir.path().to_path_buf(),
+            project_dir.path().to_path_buf(),
+            false,
+        );
+        assert_eq!(
+            filtered.available_sessions().expect("list filtered sessions"),
+            vec![SessionId::from_str("in-project")]
+        );
+
+        let unfiltered = ProfileResumeSelector::new(
+            sessions_dir.path().to_path_buf(),
+            project_dir.path().to_path_buf(),
+            true,
+        );
+        let mut all_ids = unfiltered.available_sessions().expect("list all sessions with --all");
+        all_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        assert_eq!(
+            all_ids,
+            vec![
+                SessionId::from_str("in-project"),
+                SessionId::from_str("other-project"),
+            ]
         );
     }
 
@@ -904,7 +1303,7 @@ mod tests {
             IngressSurface::Tui,
             startup(InteractionMode::Chat),
         );
-        let factory = ChatTuiFactory::new(inputs, echo_model_source);
+        let factory = ChatTuiFactory::new(inputs, echo_model_source, Vec::new());
         let selected = SessionId::from_str("session-42");
 
         let (resumed, _wiring) = factory
@@ -919,5 +1318,116 @@ mod tests {
             Arc::ptr_eq(resumed.state_store(), fresh.state_store()),
             "every assembly of one factory must share the same transcript store"
         );
+    }
+
+    /// Liefert eine vorprogrammierte Folge von Model-Antworten, eine pro Aufruf
+    /// (Muster aus `harw-core/tests/turn_loop.rs::ScriptedModel`).
+    struct ScriptedModel {
+        responses: std::sync::Mutex<std::collections::VecDeque<ModelResponse>>,
+    }
+
+    impl ScriptedModel {
+        fn new(responses: Vec<ModelResponse>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses.into_iter().collect()),
+            }
+        }
+    }
+
+    impl ModelProvider for ScriptedModel {
+        fn respond<'a>(&'a self, _request: ModelRequest) -> ModelFuture<'a> {
+            let next = self.responses.lock().unwrap().pop_front();
+            Box::pin(async move { next.ok_or(ModelError::EmptyResponse) })
+        }
+    }
+
+    // Befund C8: ein one-shot-Turn ohne interaktiven Responder darf einen
+    // per `[policy] require_approval_for` gesperrten Tool-Call nicht in
+    // `AwaitingApproval` pausieren lassen — `AskResolution::RejectTurn`
+    // (harw-runtime/src/spec.rs:114-115) hängt für `EntryKind::OneShot` eine
+    // `AskResolutionPolicy` in die Freigabekette, die jede Rückfrage ohne
+    // Responder sofort ablehnt (harw-runtime/src/approval.rs ~:201-211:
+    // `would_ask` → `Deny`, nie `AskUser`, wenn niemand antworten kann).
+    #[test]
+    fn test_one_shot_policy_gated_tool_call_is_denied_without_pausing() {
+        let fixture = chat_fixture();
+        let mut config_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(fixture.home.join("config.toml"))
+            .expect("open home config");
+        config_file
+            .write_all(b"\n[policy]\nrequire_approval_for = [\"fs.write\"]\n")
+            .expect("append approval policy");
+        drop(config_file);
+
+        let inputs = fixture_inputs(
+            &fixture,
+            EntryKind::OneShot,
+            IngressSurface::Cli,
+            startup(InteractionMode::Chat),
+        );
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+        let (turn_tx, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
+
+        let gated_call_id = ToolCallId::new();
+        let model: Arc<dyn ModelProvider> = Arc::new(ScriptedModel::new(vec![
+            ModelResponse {
+                message: None,
+                tool_calls: vec![ToolCall {
+                    id: gated_call_id.clone(),
+                    name: ToolName::new("fs.write"),
+                    arguments: serde_json::json!({"path": "note.txt", "content": "hi"}),
+                }],
+                ..Default::default()
+            },
+            ModelResponse::text("the write request was not carried out"),
+        ]));
+
+        let assembly = one_shot_assembly(&inputs, ModelSource::Override(model), event_tx.clone())
+            .expect("assemble one-shot runtime with a scripted, policy-gated tool call");
+        let mut root = assembly
+            .new_root_session(assembly.root_session_id().clone(), event_tx, turn_tx, None)
+            .expect("create root session");
+
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+        let outcome = runtime
+            .block_on(run_turn(
+                &mut root.session,
+                assembly.model().as_ref(),
+                assembly.state_store().as_ref(),
+                TurnInput::user("please write the file"),
+            ))
+            .expect("a rejected turn still runs to completion, it never errors out");
+
+        assert!(
+            matches!(outcome, TurnOutcome::Completed),
+            "one-shot's AskResolution::RejectTurn must deny the gated call outright \
+             instead of pausing into AwaitingApproval without a responder: {outcome:?}"
+        );
+
+        let denial = root
+            .session
+            .history()
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                TurnItem::ToolResult(result) if result.call_id == gated_call_id => {
+                    Some(result.result.clone())
+                }
+                _ => None,
+            })
+            .expect("the gated tool call must have produced a tool result in history");
+        match denial {
+            ToolCallResult::Error { message } => assert!(
+                message.contains("denied"),
+                "the tool result must record the denial: {message}"
+            ),
+            ToolCallResult::Success { .. } => panic!(
+                "a policy-gated fs.write must never be dispatched without an interactive responder"
+            ),
+        }
     }
 }

@@ -198,12 +198,19 @@ impl From<SensorHandle<Bound>> for BlockioSensor {
     ///
     /// # Examples
     /// ```rust
+    /// use harw_dod_cap::scope::AliasRoot;
     /// use harw_dod_cap::{Capability, ReadScope, SensorHandle};
     /// use harw_dod_blockio::BlockioSensor;
     /// use harw_types::SensorId;
     /// use std::path::PathBuf;
     ///
-    /// let scope = ReadScope::from_roots([PathBuf::from("/sys/block")]);
+    /// // `/sys/block/*`-Einträge sind Symlinks nach `/sys/devices/...`
+    /// // (F-005) — `AliasRoot::sysfs_class` baut den Bereich, der solche
+    /// // Ziele zulässt, statt der für sysfs-Klassenwurzeln unsicheren
+    /// // `ReadScope::from_roots`.
+    /// let alias =
+    ///     AliasRoot::sysfs_class(PathBuf::from("/sys/block")).expect("gültige sysfs-Klassenwurzel");
+    /// let scope = ReadScope::from_roots_and_aliases(Vec::new(), [alias]);
     /// let handle = SensorHandle::new(SensorId::from_str("blockio-0"), Capability::ReadSysfsBlock)
     ///     .bind(scope);
     /// let _sensor = BlockioSensor::from(handle);
@@ -230,9 +237,11 @@ impl Sensor for BlockioSensor {
     /// Ermittelt zuerst alle `<gerät>/stat`-Pfade unterhalb der ersten
     /// Bereichswurzel ([`DEVICE_STAT_GLOB_SUFFIX`], siehe `lib.rs`-Moduldoku
     /// für die Begründung, warum das Muster zur Laufzeit gebaut wird).
-    /// Schließt virtuelle Rauschgeräte ([`is_noise_device`]) und Partitionen
-    /// ([`is_partition_of_any`]) aus, begrenzt die verbleibenden Geräte auf
-    /// [`MAX_DEVICES`] (siehe `lib.rs`-Moduldoku, Entscheidung 2). Für jedes
+    /// Schließt virtuelle Rauschgeräte aus ([`is_noise_device`]; **keine**
+    /// gesonderte Partitionsfilterung mehr — F-204, siehe `lib.rs`-Moduldoku,
+    /// Entscheidung 2, für die Begründung, warum `DEVICE_STAT_GLOB_SUFFIX`
+    /// bereits strukturell keine Partitionen trifft), begrenzt die
+    /// verbleibenden Geräte auf [`MAX_DEVICES`]. Für jedes
     /// verbleibende Gerät: liest dessen `stat`-Zeile und ordnet ihre Felder
     /// [`FIELD_METRICS`] zu ([`map_stat_fields`]), angehängt an das
     /// sanitisierte Gerätelabel ([`sanitize_device_label`]).
@@ -293,9 +302,17 @@ impl Sensor for BlockioSensor {
 
         named.retain(|(name, _)| !is_noise_device(name));
 
-        let candidate_names: Vec<String> = named.iter().map(|(name, _)| name.clone()).collect();
-        named.retain(|(name, _)| !is_partition_of_any(name, &candidate_names));
-
+        // Keine Partitionsfilterung mehr (F-204): `DEVICE_STAT_GLOB_SUFFIX`
+        // (`*/stat`) passt nur eine einzige Verzeichnisebene unterhalb der
+        // Bereichswurzel — echte Partitionen liegen unter `/sys/block` aber
+        // stets eine Ebene *tiefer*, im Verzeichnis ihres Ganzgeräts
+        // (`/sys/block/sda/sda1/stat`, nicht `/sys/block/sda1/stat`). Das
+        // frühere `is_partition_of_any` beruhte auf der falschen Annahme,
+        // `/sys/block` liste Partitionen als Geschwister ihres Ganzgeräts,
+        // und erzeugte deshalb nur Fehlklassifikationen ohne echten Nutzen
+        // (z. B. `nvme0n10` fälschlich als „Partition 0" von `nvme0n1`
+        // ausgeschlossen) — siehe `lib.rs`-Moduldoku, Entscheidung 2, für die
+        // vollständige Herleitung.
         named.truncate(MAX_DEVICES);
 
         if named.is_empty() {
@@ -371,64 +388,17 @@ pub fn is_noise_device(name: &str) -> bool {
     NOISE_PREFIXES.iter().any(|prefix| name.starts_with(prefix))
 }
 
-/// Ist der Rest von `candidate` nach Abzug eines Elternnamens ein gültiges
-/// Partitionssuffix? Rein numerisch (`sda` + `1`) oder `p` gefolgt von
-/// Ziffern (`nvme0n1` + `p1`, `mmcblk0` + `p1`).
-fn is_partition_suffix(suffix: &str) -> bool {
-    if suffix.is_empty() {
-        return false;
-    }
-    let digits = suffix.strip_prefix('p').unwrap_or(suffix);
-    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
-}
-
-/// Ist `candidate` die Partition eines *anderen* Namens in `devices`?
-///
-/// # Description
-/// Verlässt sich nicht auf eine einzelne Namensfamilie (siehe `lib.rs`-
-/// Moduldoku, Entscheidung 2, Teilentscheidung 2, für die Begründung, warum
-/// eine morphologische Regel allein — „endet auf Ziffern" — sowohl bei
-/// SCSI-artigen Namen (`sda`/`sda1`) als auch bei NVMe-/MMC-artigen Namen
-/// (`nvme0n1`/`nvme0n1p1`) gleichzeitig richtig liegen müsste, was mit einer
-/// einzigen Regel ohne Kenntnis der Namensfamilie nicht geht), sondern auf
-/// **Koexistenz**: `candidate` ist eine Partition, wenn irgendein *anderer*
-/// tatsächlich sichtbarer Name `other` ein exaktes Präfix von `candidate`
-/// ist und der Rest ein gültiges Partitionssuffix ist
-/// ([`is_partition_suffix`]).
-///
-/// # Arguments
-/// - `candidate` (`&str`): der zu prüfende Gerätename.
-/// - `devices` (`&[String]`): alle im selben Poll sichtbaren Gerätenamen
-///   (nach Rauschenfilterung), einschließlich `candidate` selbst.
-///
-/// # Returns
-/// `true`, wenn `candidate` die Partition eines anderen Namens in `devices`
-/// ist.
-///
-/// # Examples
-/// ```rust
-/// use harw_dod_blockio::sensor::is_partition_of_any;
-///
-/// let devices = vec![
-///     "sda".to_owned(),
-///     "sda1".to_owned(),
-///     "nvme0n1".to_owned(),
-///     "nvme0n1p1".to_owned(),
-/// ];
-/// assert!(is_partition_of_any("sda1", &devices));
-/// assert!(is_partition_of_any("nvme0n1p1", &devices));
-/// assert!(!is_partition_of_any("sda", &devices));
-/// assert!(!is_partition_of_any("nvme0n1", &devices));
-/// ```
-#[must_use]
-pub fn is_partition_of_any(candidate: &str, devices: &[String]) -> bool {
-    devices.iter().any(|other| {
-        other.as_str() != candidate
-            && candidate
-                .strip_prefix(other.as_str())
-                .is_some_and(is_partition_suffix)
-    })
-}
+// F-204: `is_partition_suffix`/`is_partition_of_any` (Koexistenz-Heuristik
+// über sichtbare Gerätenamen) wurden entfernt. Sie beruhten auf der falschen
+// Annahme, `/sys/block` liste Partitionen als Geschwister ihres Ganzgeräts
+// (`sda`, `sda1` beide direkt unter der Bereichswurzel) — tatsächlich listet
+// `/sys/block` ausschließlich Ganzgeräte; echte Partitionen liegen genau eine
+// Ebene tiefer, im Verzeichnis ihres Ganzgeräts (`sda/sda1`), und werden von
+// [`DEVICE_STAT_GLOB_SUFFIX`] (`*/stat`, eine einzige Ebene) strukturell nie
+// getroffen. Die Heuristik erzeugte deshalb nur Fehlklassifikationen ohne
+// echten Nutzen, zum Beispiel `nvme0n10` (ein eigenständiges, physisches
+// Gerät) fälschlich als „Partition 0" von `nvme0n1` ausgeschlossen. Siehe
+// `lib.rs`-Moduldoku, Entscheidung 2, für die vollständige Herleitung.
 
 /// Reduziert einen Geräte-Verzeichnisnamen auf sichere Metriknamen-Zeichen
 /// (`[a-z0-9_]`), gekürzt auf [`MAX_LABEL_LEN`] Zeichen.
@@ -544,7 +514,12 @@ fn map_readfs_err(err: ReadFsError) -> SensorError {
         ReadFsError::Scope(inner) => inner,
         ReadFsError::TooLarge { .. }
         | ReadFsError::GlobPatternAbsolute { .. }
-        | ReadFsError::GlobPatternTraversal { .. } => SensorError::MalformedSource,
+        | ReadFsError::GlobPatternTraversal { .. }
+        // Eine überschrittene Glob-Grenze beschreibt, wie `TooLarge`, eine
+        // Quelle mit unerwarteter Form (ungewöhnlich viele/tiefe
+        // Geräteverzeichnisse), nicht einen Fehler dieses Werkzeugs
+        // (C-SCOPE-Nachfolge, F-005-Register).
+        | ReadFsError::GlobLimitExceeded { .. } => SensorError::MalformedSource,
     }
 }
 
@@ -663,37 +638,18 @@ mod tests {
         assert!(!is_noise_device("vda"));
     }
 
-    // ---- Partitionserkennung (`is_partition_of_any`) ----
-
+    // F-204: die frühere Partitionserkennung (`is_partition_of_any`) und ihre
+    // Tests wurden entfernt — siehe die Begründung über
+    // `sanitize_device_label` weiter oben in dieser Datei.
     #[test]
-    fn test_is_partition_of_any_detects_classic_scsi_style_partitions() {
-        let devices = vec!["sda".to_owned(), "sda1".to_owned(), "sda2".to_owned()];
-        assert!(is_partition_of_any("sda1", &devices));
-        assert!(is_partition_of_any("sda2", &devices));
-        assert!(!is_partition_of_any("sda", &devices));
-    }
-
-    #[test]
-    fn test_is_partition_of_any_detects_nvme_style_partitions() {
-        let devices = vec!["nvme0n1".to_owned(), "nvme0n1p1".to_owned()];
-        assert!(is_partition_of_any("nvme0n1p1", &devices));
-        // Die Namensraum-Ziffer selbst ("n1") darf nicht als Partition
-        // fehlinterpretiert werden — das wäre der Fall, würde diese
-        // Funktion sich auf eine reine "endet auf Ziffern"-Regel verlassen.
-        assert!(!is_partition_of_any("nvme0n1", &devices));
-    }
-
-    #[test]
-    fn test_is_partition_of_any_detects_mmc_style_partitions() {
-        let devices = vec!["mmcblk0".to_owned(), "mmcblk0p1".to_owned()];
-        assert!(is_partition_of_any("mmcblk0p1", &devices));
-        assert!(!is_partition_of_any("mmcblk0", &devices));
-    }
-
-    #[test]
-    fn test_is_partition_of_any_false_for_lone_device() {
-        let devices = vec!["sda".to_owned()];
-        assert!(!is_partition_of_any("sda", &devices));
+    fn test_device_glob_suffix_matches_exactly_one_level_never_nested_partitions() {
+        // Regressionsanker für F-204: das Suffix hat genau einen `*` und
+        // keinen weiteren Pfadtrenner — ein zweiter Wildcard-Level (der
+        // tatsächliche Ort echter Partitionen, `<gerät>/<gerät>N/stat`) würde
+        // hier nie erzeugt werden. Das ist der strukturelle Grund, warum
+        // diese Crate keine gesonderte Partitionsfilterung mehr braucht.
+        assert_eq!(DEVICE_STAT_GLOB_SUFFIX, "*/stat");
+        assert_eq!(DEVICE_STAT_GLOB_SUFFIX.matches('/').count(), 1);
     }
 
     // ---- Konstanten ----
@@ -807,5 +763,62 @@ mod tests {
             .poll(Timestamp::UNIX_EPOCH)
             .expect_err("ein Baum mit ausschließlich Rauschgeräten darf kein Ok liefern");
         assert!(matches!(err, SensorError::SourceUnavailable));
+    }
+
+    /// Der Ordner der echten Pi-Captures (`C-FIXT`, `harw-dod-fixtures`),
+    /// über den Workspace-Geschwisterpfad erreicht (analog zu `path =
+    /// "../harw-dod-cap"` in `Cargo.toml`).
+    fn rpi5_captures_dir() -> PathBuf {
+        PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../harw-dod-fixtures/captures/rpi5-6.18"
+        ))
+    }
+
+    /// Regressionstest für F-005/F-202 mit einer echten, auf diesem
+    /// Raspberry Pi 5 erhobenen Capture (`block.json`): `mmcblk0` erscheint
+    /// dort als echter Symlink nach `/sys/devices/platform/.../mmcblk0`. Die
+    /// Capture wurde unter `/sys/class/block/mmcblk0` erhoben (nicht unter
+    /// `/sys/block/mmcblk0`, der Produktionswurzel dieser Crate) — beide
+    /// Pfade sind unabhängige, gleichermaßen echte sysfs-Aliaswurzeln auf
+    /// denselben Gerätebaum; dieser Test belegt den Resolutionsmechanismus
+    /// von [`harw_dod_cap::scope::AliasRoot`] anhand der einzigen
+    /// verfügbaren Blockgeräte-Capture, unabhängig vom konkreten
+    /// Klassennamen.
+    #[test]
+    fn test_poll_reads_real_pi_capture_through_alias_scope_regression_f005() {
+        let manifest_path = rpi5_captures_dir().join("block.json");
+        let manifest = harw_dod_fixtures::capture_manifest::load(&manifest_path)
+            .expect("captures/rpi5-6.18/block.json muss ladbar sein");
+
+        let tmp = tempfile::tempdir().expect("tempdir für die Materialisierung");
+        harw_dod_fixtures::capture_manifest::materialize(&manifest, tmp.path())
+            .expect("materialize muss die echte Symlink-Struktur anlegen");
+
+        let declared = tmp.path().join("sys/class/block");
+        let resolved_prefix = tmp.path().join("sys/devices");
+        let alias = harw_dod_cap::scope::AliasRoot::new(declared, resolved_prefix)
+            .expect("AliasRoot::new mit Tempdir-Wurzeln");
+        let scope = ReadScope::from_roots_and_aliases(Vec::new(), [alias]);
+        let handle = SensorHandle::new(
+            SensorId::from_str("blockio-alias-capture-test"),
+            Capability::ReadSysfsBlock,
+        )
+        .bind(scope);
+        let sensor = BlockioSensor::from(handle);
+
+        let reading = sensor
+            .poll(Timestamp::UNIX_EPOCH)
+            .expect("Alias-Scope muss die reale Pi-Capture über den Symlink lesen");
+
+        assert_eq!(reading.samples.len(), FIELD_METRICS.len());
+        assert!(
+            reading
+                .samples
+                .iter()
+                .all(|s| s.metric.ends_with("_mmcblk0")),
+            "alle Samples müssen das Gerätelabel der echten Capture tragen: {:?}",
+            reading.samples
+        );
     }
 }

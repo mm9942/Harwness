@@ -24,8 +24,20 @@
 //! Index abweicht (geprüft über
 //! [`harw_lens_types::IndexManifest::compatible_with`], nicht
 //! zweitgeschrieben). [`crate::IndexError::MissingEmbedding`], wenn die
-//! Abfrage kein Embedding trägt. [`crate::IndexError::Store`] und
+//! Abfrage kein Embedding trägt. [`crate::IndexError::EmbeddingDimensionMismatch`]
+//! (Knoten W10-L1), wenn ein eingefügtes oder abgefragtes Embedding von der
+//! Dimension der übrigen Einträge dieses Index abweicht — geprüft in
+//! [`FlatIndex::build`]/[`FlatIndex::load`] (Einfügen) und
+//! [`FlatIndex::search`] (Abfrage), in beiden Fällen vor jeder
+//! Ähnlichkeitsberechnung. [`crate::IndexError::Store`] und
 //! [`crate::IndexError::Serde`] aus [`FlatIndex::save`]/[`FlatIndex::load`].
+//!
+//! # Top-k-Auswahl (W10-L1)
+//! [`FlatIndex::search`] sammelt nicht mehr alle Kandidaten, sortiert sie
+//! vollständig und schneidet dann auf `limit` zu (`O(n log n)`). Stattdessen
+//! hält die interne `top_k_ranked`-Hilfe (`sort.rs`, `pub(crate)`) einen
+//! Min-Heap fester Kapazität `limit` (`O(n log limit)`) — siehe dort für die
+//! Begründung und die `NaN`-Sicherheit über `f32::total_cmp`.
 //!
 //! # Examples
 //! ```rust
@@ -47,7 +59,8 @@
 //!     span: ByteSpan::new(0, 5).expect("valid span"),
 //!     text: "hello".to_owned(),
 //! };
-//! let index = FlatIndex::build(manifest.clone(), vec![(chunk, vec![1.0, 0.0])]);
+//! let index = FlatIndex::build(manifest.clone(), vec![(chunk, vec![1.0, 0.0])])
+//!     .expect("consistent embedding dimension");
 //! let query = Query { embedding: Some(vec![1.0, 0.0]), text: None, manifest };
 //! let hits = index.search(&query, 10).expect("compatible manifest");
 //! assert_eq!(hits.len(), 1);
@@ -60,7 +73,7 @@ use harw_lens_types::{Chunk, IndexManifest, Metric, Ranked};
 
 use crate::error::IndexError;
 use crate::query::Query;
-use crate::sort::sort_ranked_desc;
+use crate::sort::top_k_ranked;
 use crate::vector_index::VectorIndex;
 
 /// Ein gespeicherter Chunk samt seinem Embedding.
@@ -106,20 +119,55 @@ struct FlatIndexFile {
 /// # Description
 /// Hält alle Einträge in einem `Vec` und bewertet bei jeder Suche jeden
 /// Eintrag einzeln — bewusst ohne Indexstruktur, siehe Modul-Dokumentation.
+/// `dimension` ist die Embedding-Länge, die [`FlatIndex::build`]/
+/// [`FlatIndex::load`] beim Einfügen aus dem ersten Eintrag festgestellt und
+/// gegen jeden weiteren geprüft haben; `None` heißt: der Index ist leer und
+/// hat (noch) keine Dimension festgestellt (Knoten W10-L1).
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlatIndex {
     manifest: IndexManifest,
     entries: Vec<FlatEntry>,
+    dimension: Option<usize>,
+}
+
+/// Prüft, dass jedes Embedding in `entries` dieselbe Dimension hat.
+///
+/// # Description
+/// Die Dimension des ersten Eintrags gilt als erwartete Dimension für alle
+/// folgenden; ein leerer Korpus hat keine Dimension. Wird sowohl von
+/// [`FlatIndex::build`] (neu eingefügte Rohdaten) als auch
+/// [`FlatIndex::load`] (aus dem Store gelesene Daten) verwendet, damit beide
+/// Einfügepfade dieselbe Prüfung durchlaufen.
+///
+/// # Errors
+/// [`IndexError::EmbeddingDimensionMismatch`]: ein Eintrag nach dem ersten
+/// hat eine abweichende Embedding-Länge.
+fn dimension_of(entries: &[FlatEntry]) -> Result<Option<usize>, IndexError> {
+    let mut dimension: Option<usize> = None;
+    for entry in entries {
+        match dimension {
+            None => dimension = Some(entry.embedding.len()),
+            Some(expected) if expected != entry.embedding.len() => {
+                return Err(IndexError::EmbeddingDimensionMismatch {
+                    expected,
+                    actual: entry.embedding.len(),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(dimension)
 }
 
 impl FlatIndex {
     /// Baut einen `FlatIndex` aus einem Manifest und seinen Einträgen.
     ///
     /// # Description
-    /// Übernimmt `entries` unverändert; prüft weder Dimensionsgleichheit der
-    /// Embeddings untereinander noch, ob `manifest.metric` zu ihnen passt —
-    /// beides liegt in der Verantwortung des Aufrufers (typischerweise
-    /// `harw-lens-embed`, nachgelagert).
+    /// Übernimmt `entries`, nachdem [`dimension_of`] geprüft hat, dass alle
+    /// Embeddings dieselbe Länge haben (Knoten W10-L1; vorher unbeprüft).
+    /// Ob `manifest.metric` zu den Embeddings passt, bleibt weiterhin
+    /// Verantwortung des Aufrufers (typischerweise `harw-lens-embed`,
+    /// nachgelagert) — das ist keine Dimensionsfrage.
     ///
     /// # Arguments
     /// - `manifest` (`IndexManifest`): das Manifest dieses Index.
@@ -128,6 +176,10 @@ impl FlatIndex {
     ///
     /// # Returns
     /// Ein neuer `FlatIndex`.
+    ///
+    /// # Errors
+    /// - [`IndexError::EmbeddingDimensionMismatch`]: nicht alle `entries`
+    ///   haben dieselbe Embedding-Länge.
     ///
     /// # Examples
     /// ```rust
@@ -143,18 +195,20 @@ impl FlatIndex {
     ///     metric: Metric::Cosine,
     ///     source_set_digest: ContentDigest::of(b"s"),
     /// };
-    /// let index = FlatIndex::build(manifest, Vec::new());
+    /// let index = FlatIndex::build(manifest, Vec::new()).expect("empty corpus has no dimension");
     /// assert_eq!(index.len(), 0);
     /// ```
-    #[must_use]
-    pub fn build(manifest: IndexManifest, entries: Vec<(Chunk, Vec<f32>)>) -> Self {
-        Self {
+    pub fn build(manifest: IndexManifest, entries: Vec<(Chunk, Vec<f32>)>) -> Result<Self, IndexError> {
+        let entries: Vec<FlatEntry> = entries
+            .into_iter()
+            .map(|(chunk, embedding)| FlatEntry { chunk, embedding })
+            .collect();
+        let dimension = dimension_of(&entries)?;
+        Ok(Self {
             manifest,
-            entries: entries
-                .into_iter()
-                .map(|(chunk, embedding)| FlatEntry { chunk, embedding })
-                .collect(),
-        }
+            entries,
+            dimension,
+        })
     }
 
     /// Die Anzahl gespeicherter Einträge.
@@ -211,7 +265,7 @@ impl FlatIndex {
     ///     metric: Metric::Cosine,
     ///     source_set_digest: ContentDigest::of(b"s"),
     /// };
-    /// let index = FlatIndex::build(manifest, Vec::new());
+    /// let index = FlatIndex::build(manifest, Vec::new())?;
     /// let store = LensStore::open(Path::new("/tmp/example-harw-home"))?;
     /// index.save(&store, "my-index")?;
     /// # Ok::<(), Box<dyn std::error::Error>>(())
@@ -251,6 +305,10 @@ impl FlatIndex {
     /// - [`IndexError::Serde`]: der Datenteil ist kein gültiges
     ///   [`FlatIndexFile`]-JSON.
     /// - [`IndexError::Store`]: ein Lesefehler in `store`.
+    /// - [`IndexError::EmbeddingDimensionMismatch`]: die geladenen Einträge
+    ///   haben unterschiedliche Embedding-Längen (Knoten W10-L1) — kann nur
+    ///   auftreten, wenn die gespeicherten Daten außerhalb von
+    ///   [`FlatIndex::build`]s Prüfung entstanden sind.
     pub fn load(store: &LensStore, name: &str) -> Result<Self, IndexError> {
         let stored_manifest =
             store
@@ -269,9 +327,11 @@ impl FlatIndex {
                 name: name.to_owned(),
             });
         }
+        let dimension = dimension_of(&file.entries)?;
         Ok(Self {
             manifest: stored_manifest,
             entries: file.entries,
+            dimension,
         })
     }
 }
@@ -288,18 +348,21 @@ impl VectorIndex for FlatIndex {
 
         let query_embedding = query.embedding.as_ref().ok_or(IndexError::MissingEmbedding)?;
 
-        let mut scored: Vec<Ranked> = self
-            .entries
-            .iter()
-            .map(|entry| Ranked {
-                chunk: entry.chunk.clone(),
-                score: similarity(self.manifest.metric, query_embedding, &entry.embedding),
-            })
-            .collect();
+        if let Some(expected) = self.dimension {
+            if query_embedding.len() != expected {
+                return Err(IndexError::EmbeddingDimensionMismatch {
+                    expected,
+                    actual: query_embedding.len(),
+                });
+            }
+        }
 
-        sort_ranked_desc(&mut scored);
-        scored.truncate(limit);
-        Ok(scored)
+        let scored = self.entries.iter().map(|entry| Ranked {
+            chunk: entry.chunk.clone(),
+            score: similarity(self.manifest.metric, query_embedding, &entry.embedding),
+        });
+
+        Ok(top_k_ranked(scored, limit))
     }
 }
 
@@ -389,7 +452,8 @@ mod tests {
                 (chunk("near"), vec![1.0, 0.0]),
                 (chunk("mid"), vec![0.7, 0.7]),
             ],
-        );
+        )
+        .expect("consistent embedding dimension");
         let query = Query {
             embedding: Some(vec![1.0, 0.0]),
             text: None,
@@ -413,7 +477,8 @@ mod tests {
                 (chunk("b"), vec![2.0]),
                 (chunk("c"), vec![3.0]),
             ],
-        );
+        )
+        .expect("consistent embedding dimension");
         let query = Query {
             embedding: Some(vec![1.0]),
             text: None,
@@ -426,7 +491,7 @@ mod tests {
     #[test]
     fn test_search_on_empty_index_returns_empty_list_not_error() {
         let manifest = manifest_with("m", 1, Metric::Cosine);
-        let index = FlatIndex::build(manifest.clone(), Vec::new());
+        let index = FlatIndex::build(manifest.clone(), Vec::new()).expect("empty corpus has no dimension");
         let query = Query {
             embedding: Some(vec![1.0, 0.0]),
             text: None,
@@ -440,7 +505,8 @@ mod tests {
     fn test_search_rejects_model_mismatch_before_computing() {
         let manifest = manifest_with("model-a", 1, Metric::Cosine);
         // A candidate whose similarity would be perfect if it were ever scored.
-        let index = FlatIndex::build(manifest.clone(), vec![(chunk("x"), vec![1.0, 0.0])]);
+        let index = FlatIndex::build(manifest.clone(), vec![(chunk("x"), vec![1.0, 0.0])])
+            .expect("consistent embedding dimension");
         let mut query_manifest = manifest;
         query_manifest.model = "model-b".to_owned();
         let query = Query {
@@ -458,7 +524,8 @@ mod tests {
     #[test]
     fn test_search_rejects_chunker_version_mismatch_before_computing() {
         let manifest = manifest_with("m", 1, Metric::Cosine);
-        let index = FlatIndex::build(manifest.clone(), vec![(chunk("x"), vec![1.0, 0.0])]);
+        let index = FlatIndex::build(manifest.clone(), vec![(chunk("x"), vec![1.0, 0.0])])
+            .expect("consistent embedding dimension");
         let mut query_manifest = manifest;
         query_manifest.chunker_version = 2;
         let query = Query {
@@ -480,7 +547,8 @@ mod tests {
     #[test]
     fn test_search_without_embedding_returns_missing_embedding() {
         let manifest = manifest_with("m", 1, Metric::Cosine);
-        let index = FlatIndex::build(manifest.clone(), vec![(chunk("x"), vec![1.0, 0.0])]);
+        let index = FlatIndex::build(manifest.clone(), vec![(chunk("x"), vec![1.0, 0.0])])
+            .expect("consistent embedding dimension");
         let query = Query {
             embedding: None,
             text: None,
@@ -496,7 +564,8 @@ mod tests {
         let index = FlatIndex::build(
             manifest.clone(),
             vec![(chunk("a"), vec![0.0]), (chunk("b"), vec![0.0])],
-        );
+        )
+        .expect("consistent embedding dimension");
         let query = Query {
             embedding: Some(vec![1.0]),
             text: None,
@@ -527,11 +596,12 @@ mod tests {
     #[test]
     fn test_len_and_is_empty() {
         let manifest = manifest_with("m", 1, Metric::Cosine);
-        let empty = FlatIndex::build(manifest.clone(), Vec::new());
+        let empty = FlatIndex::build(manifest.clone(), Vec::new()).expect("empty corpus has no dimension");
         assert!(empty.is_empty());
         assert_eq!(empty.len(), 0);
 
-        let one = FlatIndex::build(manifest, vec![(chunk("x"), vec![1.0])]);
+        let one = FlatIndex::build(manifest, vec![(chunk("x"), vec![1.0])])
+            .expect("consistent embedding dimension");
         assert!(!one.is_empty());
         assert_eq!(one.len(), 1);
     }
@@ -539,7 +609,7 @@ mod tests {
     #[test]
     fn test_manifest_returns_stored_manifest() {
         let manifest = manifest_with("m", 3, Metric::Euclidean);
-        let index = FlatIndex::build(manifest.clone(), Vec::new());
+        let index = FlatIndex::build(manifest.clone(), Vec::new()).expect("empty corpus has no dimension");
         assert_eq!(index.manifest(), &manifest);
     }
 
@@ -553,5 +623,108 @@ mod tests {
         b.chunker_version = 2;
         let err = a.compatible_with(&b).expect_err("both fields differ");
         assert_eq!(err, LensTypesError::ManifestMismatch { field: "model" });
+    }
+
+    #[test]
+    fn test_build_rejects_mismatched_embedding_dimensions() {
+        let manifest = manifest_with("m", 1, Metric::Cosine);
+        let err = FlatIndex::build(
+            manifest,
+            vec![(chunk("a"), vec![1.0, 0.0]), (chunk("b"), vec![1.0])],
+        )
+        .expect_err("second entry has a different dimension than the first");
+        assert!(matches!(
+            err,
+            IndexError::EmbeddingDimensionMismatch {
+                expected: 2,
+                actual: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn test_build_accepts_uniform_embedding_dimensions() {
+        let manifest = manifest_with("m", 1, Metric::Cosine);
+        let index = FlatIndex::build(
+            manifest,
+            vec![(chunk("a"), vec![1.0, 0.0]), (chunk("b"), vec![0.0, 1.0])],
+        )
+        .expect("uniform dimension is accepted");
+        assert_eq!(index.len(), 2);
+    }
+
+    #[test]
+    fn test_build_on_empty_corpus_has_no_dimension_and_never_errors() {
+        let manifest = manifest_with("m", 1, Metric::Cosine);
+        let index = FlatIndex::build(manifest, Vec::new()).expect("empty corpus is always valid");
+        assert!(index.is_empty());
+    }
+
+    #[test]
+    fn test_search_rejects_query_embedding_with_wrong_dimension() {
+        let manifest = manifest_with("m", 1, Metric::Cosine);
+        let index = FlatIndex::build(manifest.clone(), vec![(chunk("x"), vec![1.0, 0.0])])
+            .expect("consistent embedding dimension");
+        let query = Query {
+            embedding: Some(vec![1.0, 0.0, 0.0]),
+            text: None,
+            manifest,
+        };
+        let err = index
+            .search(&query, 10)
+            .expect_err("query embedding dimension does not match the index");
+        assert!(matches!(
+            err,
+            IndexError::EmbeddingDimensionMismatch {
+                expected: 2,
+                actual: 3
+            }
+        ));
+    }
+
+    #[test]
+    fn test_search_on_empty_index_accepts_any_query_dimension() {
+        let manifest = manifest_with("m", 1, Metric::Cosine);
+        let index = FlatIndex::build(manifest.clone(), Vec::new()).expect("empty corpus has no dimension");
+        let query = Query {
+            embedding: Some(vec![1.0, 0.0, 0.0, 0.0]),
+            text: None,
+            manifest,
+        };
+        let hits = index
+            .search(&query, 10)
+            .expect("an empty index has no dimension to violate");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn test_save_and_load_roundtrip_preserves_dimension_check() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let store = LensStore::open(dir.path()).expect("open store");
+        let manifest = manifest_with("m", 1, Metric::Cosine);
+        let index = FlatIndex::build(
+            manifest.clone(),
+            vec![(chunk("a"), vec![1.0, 0.0]), (chunk("b"), vec![0.0, 1.0])],
+        )
+        .expect("consistent embedding dimension");
+        index.save(&store, "roundtrip-flat").expect("save");
+        let loaded = FlatIndex::load(&store, "roundtrip-flat").expect("load");
+        assert_eq!(loaded, index);
+
+        let query = Query {
+            embedding: Some(vec![1.0]),
+            text: None,
+            manifest,
+        };
+        let err = loaded
+            .search(&query, 10)
+            .expect_err("loaded index still enforces its dimension");
+        assert!(matches!(
+            err,
+            IndexError::EmbeddingDimensionMismatch {
+                expected: 2,
+                actual: 1
+            }
+        ));
     }
 }

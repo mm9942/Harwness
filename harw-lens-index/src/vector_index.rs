@@ -85,8 +85,11 @@ pub trait VectorIndex: Send + Sync {
     ///   Indextypen) vom Manifest dieses Index ab.
     /// - [`IndexError::MissingEmbedding`]: [`crate::FlatIndex::search`] ohne
     ///   `query.embedding`.
-    /// - [`IndexError::MissingText`]: [`crate::Bm25Index::search`] ohne
+    /// - [`IndexError::MissingText`][]: [`crate::Bm25Index::search`] ohne
     ///   `query.text`.
+    /// - [`IndexError::EmbeddingDimensionMismatch`][]: nur
+    ///   [`crate::FlatIndex::search`] — `query.embedding` hat eine andere
+    ///   Länge als die im Index gespeicherten Embeddings (Knoten W10-L1).
     ///
     /// # Concurrency
     /// Nimmt `&self`; sicher aus mehreren Threads gleichzeitig aufrufbar.

@@ -118,7 +118,10 @@
 //! - **Keine eigene Genehmigungsfläche.** Eine Route mit
 //!   `approval != ApprovalPolicy::None` wird nie ausgeführt — sie liefert
 //!   `403` mit `reason: "approval_required"` (siehe `router::RouteDecision::ApprovalRequired`).
-//!   Die tatsächliche Genehmigung ist UI-06s Sache.
+//!   Die tatsächliche Genehmigung ist UI-06s Sache; [`security`] bestimmt
+//!   den Genehmiger ausschließlich aus dem `Principal` (für Web zusätzlich
+//!   durch den `SO_PEERCRED`-Peer bestätigt) und nutzt die Serveruhr, nie
+//!   eine Client-Zeit (A-APPR).
 //! - **Kein Markdown-Rendering, keine aktiven Links.** `OpOutput::text`
 //!   wird unverändert als JSON-Zeichenkette weitergereicht.
 //!
@@ -140,6 +143,12 @@ pub use authz::{PeerAuthorizer, StaticUidTierMap, tier_permits};
 pub use error::{WebError, WebResult};
 pub use events::{WebEvent, WebEventBus, WebEventKind, WebEventReceiveError, WebEventSubscription};
 pub use peer::{PeerCredentials, read_peer_credentials};
-pub use router::{ForbiddenReason, RouteDecision, WebMethod, WebRouteTable, decide_route};
-pub use security::{ApprovalActorResolver, StaticUidApprovalActorMap, resolve_approval};
+pub use router::{
+    ForbiddenReason, RouteDecision, WebMethod, WebRouteTable, decide_route, method_name,
+    parse_web_method,
+};
+pub use security::{
+    ApprovalActorResolver, ApprovalCaller, SecurityError, StaticUidApprovalActorMap,
+    list_pending_approvals, resolve_approval,
+};
 pub use server::{BoundWebServer, WebContextFactory, WebServerConfig};

@@ -10,12 +10,121 @@
 //! Beide Implementierungen (`InMemoryPlanStore`, `FilePlanStore`) sind
 //! `Send + Sync` (Design-Doc §4).
 //!
-//! Exportierte Typen: [`PlanStore`].
+//! [`PlanStore::apply_batch`] wendet mehrere Aktionen atomar an (alles oder
+//! nichts, optimistische Revisionsprüfung). Die gemeinsame, crate-private
+//! Batch-Mechanik (`stage_actions`) liegt ebenfalls hier, damit beide Stores
+//! dieselbe Validierungs- und Revisionsvergabe-Reihenfolge nutzen.
+//!
+//! # Errors
+//! [`PlanError::RevisionConflict`], [`PlanError::BatchActionRejected`],
+//! [`PlanError::PlanNotFound`] sowie alle Validierungs- und Persistenzfehler.
+//!
+//! Exportierte Typen: [`PlanStore`], [`PlanRevision`].
+
+use time::OffsetDateTime;
 
 use crate::actions::{PlanAction, PlanEvent};
-use crate::error::PlanResult;
-use crate::ids::{RevisionId, TaskId};
+use crate::config::PlanToolConfig;
+use crate::error::{PlanError, PlanResult};
+use crate::ids::{PlanId, RevisionId, TaskId};
+use crate::mutation::apply_mutation;
 use crate::types::Plan;
+use crate::validate::validate_with;
+
+/// Ergebnis eines erfolgreich angewendeten Batches.
+///
+/// # Description
+/// Jede Aktion eines Batches erhält eine eigene, lückenlos aufsteigende
+/// Revision (ein [`PlanEvent`] je Aktion, wie bei [`PlanStore::apply`]);
+/// `revision` ist die Revision des Plans nach der letzten Aktion. Bei einem
+/// leeren Batch ist `events` leer und `revision` die unveränderte aktuelle
+/// Revision.
+///
+/// # Concurrency
+/// Reiner Werttyp, `Send + Sync`.
+#[derive(Debug, Clone)]
+pub struct PlanRevision {
+    /// Revision des Plans nach dem Batch.
+    pub revision: RevisionId,
+    /// Die angewendeten Events in Anwendungsreihenfolge.
+    pub events: Vec<PlanEvent>,
+}
+
+/// Wendet `actions` nacheinander auf eine Kopie von `base` an (crate-privat).
+///
+/// # Description
+/// Für jede Aktion in Reihenfolge: `Create` wird abgewiesen (ein Batch
+/// arbeitet immer auf einem bestehenden Plan), dann Knotenlimit
+/// (`cfg.validate_action` mit laufender Knotenzahl), `validate_with` auf dem
+/// **laufenden** Kandidaten, `apply_mutation`, Revision setzen. Der Kandidat
+/// wird nur zurückgegeben, wenn *alle* Aktionen gültig sind; `base` bleibt
+/// immer unverändert.
+///
+/// # Returns
+/// `(Kandidat, Events)` — der Aufrufer veröffentlicht beides atomar.
+///
+/// # Errors
+/// `(index, fehler)` der ersten abgewiesenen Aktion.
+pub(crate) fn stage_actions(
+    base: &Plan,
+    actions: Vec<PlanAction>,
+    actor: &str,
+    cfg: &PlanToolConfig,
+    first_revision: RevisionId,
+    now: OffsetDateTime,
+) -> Result<(Plan, Vec<PlanEvent>), (usize, PlanError)> {
+    let mut candidate = base.clone();
+    let mut events = Vec::with_capacity(actions.len());
+    let mut revision = first_revision;
+    for (index, action) in actions.into_iter().enumerate() {
+        if matches!(action, PlanAction::Create { .. }) {
+            return Err((
+                index,
+                PlanError::PlanExists {
+                    id: candidate.id.clone(),
+                },
+            ));
+        }
+        cfg.validate_action(&action, candidate.nodes.len())
+            .map_err(|error| (index, PlanError::Config(error)))?;
+        validate_with(&candidate, &action, cfg, now).map_err(|error| (index, error))?;
+        apply_mutation(&mut candidate, &action, actor, now);
+        candidate.updated_at = now;
+        candidate.revision = revision;
+        events.push(PlanEvent {
+            revision,
+            action,
+            actor: actor.to_owned(),
+            applied_at: now,
+        });
+        revision = revision.next();
+    }
+    Ok((candidate, events))
+}
+
+/// Prüft Plan-Identität und erwartete Revision eines Batches (crate-privat).
+///
+/// # Errors
+/// - [`PlanError::PlanNotFound`]: kein Plan oder ein anderer Plan als `plan`.
+/// - [`PlanError::RevisionConflict`]: `expected_rev` ≠ aktuelle Revision.
+pub(crate) fn check_batch_target<'a>(
+    current: Option<&'a Plan>,
+    plan: &PlanId,
+    expected_rev: RevisionId,
+) -> PlanResult<&'a Plan> {
+    let current = current.ok_or(PlanError::PlanNotFound)?;
+    if &current.id != plan {
+        return Err(PlanError::PlanNotFound);
+    }
+    if current.revision != expected_rev {
+        return Err(PlanError::RevisionConflict {
+            plan: plan.clone(),
+            expected: expected_rev,
+            actual: current.revision,
+        });
+    }
+    Ok(current)
+}
 
 /// Einheitliches Interface für Plan-Stores.
 ///
@@ -70,6 +179,46 @@ pub trait PlanStore: Send + Sync {
     /// # Errors
     /// - [`PlanError::Io`] / [`PlanError::Serde`] bei Lesefehler.
     fn history(&self, since: Option<RevisionId>) -> PlanResult<Vec<PlanEvent>>;
+
+    /// Wendet mehrere Aktionen atomar an — alles oder nichts.
+    ///
+    /// # Description
+    /// Optimistische Nebenläufigkeit: der Batch wird nur angewendet, wenn der
+    /// aktuelle Plan `plan` ist und seine Revision exakt `expected_rev`
+    /// entspricht. Alle Aktionen werden unter dem Schreib-Lock auf einem
+    /// Kandidaten (Kopie des Plans) validiert und angewendet; jede Aktion sieht
+    /// den Zustand nach ihren Vorgängern (z. B. `AddNode` gefolgt von
+    /// `AddDependency` auf den neuen Knoten). Scheitert eine Aktion, bleibt der
+    /// Plan unverändert, es entsteht kein Event und (bei `FilePlanStore`) kein
+    /// Snapshot und keine History-Zeile. Jede Aktion erhält eine eigene
+    /// Revision. `Create` ist im Batch nicht erlaubt.
+    ///
+    /// # Arguments
+    /// - `plan` (`&PlanId`): Plan, auf den sich der Batch bezieht.
+    /// - `actions` (`Vec<PlanAction>`): anzuwendende Aktionen in Reihenfolge.
+    /// - `actor` (`&str`): Akteur (runtime-gesetzt).
+    /// - `expected_rev` (`RevisionId`): Revision, auf der der Aufrufer plant.
+    ///
+    /// # Returns
+    /// [`PlanRevision`] mit neuer Revision und allen Events.
+    ///
+    /// # Errors
+    /// - [`PlanError::PlanNotFound`]: kein Plan oder ein anderer Plan.
+    /// - [`PlanError::RevisionConflict`]: Revision passt nicht.
+    /// - [`PlanError::BatchActionRejected`]: eine Aktion ist ungültig
+    ///   (Index + Ursache; auch `PlanExists` für `Create`, `Config` für das
+    ///   Knotenlimit).
+    /// - [`PlanError::Io`] / [`PlanError::Serde`] bei Persistenzfehlern.
+    ///
+    /// # Concurrency
+    /// Hält den Schreib-Lock über Prüfung, Validierung und Veröffentlichung.
+    fn apply_batch(
+        &self,
+        plan: &PlanId,
+        actions: Vec<PlanAction>,
+        actor: &str,
+        expected_rev: RevisionId,
+    ) -> PlanResult<PlanRevision>;
 
     /// Gibt die IDs aller aktuell ausführbaren Knoten zurück.
     ///

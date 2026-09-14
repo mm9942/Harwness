@@ -34,9 +34,7 @@ async fn explore_typo(
     _ctx: &harw_operations::OpContext,
     _args: ExploreArgs,
 ) -> Result<harw_operations::OpOutput, harw_operations::OpError> {
-    Ok(harw_operations::OpOutput {
-        text: String::new(),
-    })
+    Ok(harw_operations::OpOutput::from(String::new()))
 }
 
 fn main() {}

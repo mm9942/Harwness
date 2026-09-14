@@ -62,6 +62,23 @@ pub enum SessionStoreError {
     #[msg("approval id component is unsafe for filesystem storage: '{0}'")]
     UnsafeApprovalPath(String),
 
+    /// C-APPR: the request's TTL elapsed (server clock) before it was resolved.
+    #[msg("approval '{request}' issued at {issued_at} expired at {expires_at}")]
+    ApprovalExpired {
+        request: ItemId,
+        issued_at: jiff::Timestamp,
+        expires_at: jiff::Timestamp,
+    },
+
+    /// C-APPR: a durable approval file exists but cannot be trusted
+    /// (undecodable, symlinked, or keyed to another session/request).
+    #[msg("approval '{request}' for session '{session}' is corrupt: {detail}")]
+    ApprovalCorrupt {
+        session: SessionId,
+        request: ItemId,
+        detail: String,
+    },
+
     #[msg("child lease for '{child}' already exists")]
     ChildLeaseAlreadyExists { child: SessionId },
 
@@ -155,6 +172,22 @@ pub enum SessionStoreError {
 
     #[msg("job cancellation reason must not be empty")]
     InvalidJobCancellationReason,
+
+    /// A-STORE (G-020): `JobStore::unblock` on a job that is not `Blocked`.
+    #[msg("job '{work_id}' cannot be unblocked from state {state:?}")]
+    JobNotBlocked { work_id: WorkId, state: JobState },
+
+    /// A-STORE (F-156): an encoded transcript line exceeds the per-record write limit.
+    #[msg("transcript record for session '{session}' has {size} bytes (limit {limit})")]
+    TranscriptRecordTooLarge {
+        session: SessionId,
+        size: usize,
+        limit: usize,
+    },
+
+    /// A-STORE (F-179): an atomic no-clobber persist found its target already present.
+    #[msg("refusing to overwrite existing store file '{path}'")]
+    PersistTargetExists { path: String },
 
     #[msg("job '{work_id}' lifecycle transition failed: {detail}")]
     JobRuntime { work_id: WorkId, detail: String },

@@ -29,30 +29,33 @@
 //! [`JobAdmissionTemplate`], [`PlanJobBridge`].
 //!
 //! # Concurrency
-//! [`PlanJobBridge`] ist zustandslos (`Send + Sync`). Die Mutationen laufen
-//! über `PlanStore::apply` und `JobStore::admit`, die beide selbst
-//! thread-sicher sind; die Bridge bildet **keine** Transaktion über beide.
+//! [`PlanJobBridge`] ist zustandslos (`Send + Sync`). Plan-Mutationen laufen
+//! als atomare `PlanStore::apply_batch`-Aufrufe mit Revisionsprüfung, Jobs
+//! über `JobStore::admit`; beide sind selbst thread-sicher. Über beide Stores
+//! bildet die Bridge **keine** Transaktion — die Admission ist stattdessen
+//! idempotent (deterministische `WorkId` je Knoten und Plan-Revision).
 //!
 //! # Fehler
 //! [`PlanBridgeError::Plan`], [`PlanBridgeError::JobStore`],
 //! [`PlanBridgeError::NodeNotFound`], [`PlanBridgeError::NoReadyNodes`],
 //! [`PlanBridgeError::Json`].
 
-use harw_job_runtime::{Budget, Job, JobKind, JobScope, RetryPolicy, StoredJob};
+use harw_job_runtime::{Budget, Job, JobKind, JobScope, JobState, RetryPolicy, StoredJob};
 use harw_observe::TelemetrySink;
 use harw_plan::actions::{NodePatch, PlanAction};
 use harw_plan::admission::{MutationContract, RepoRevision, contract_from_node};
 use harw_plan::graph;
 use harw_plan::types::Assignment;
 use harw_plan::{
-    EvidenceKind, EvidenceRef, InvalidationCondition, PlanNode, PlanNodeKind, PlanNodeStatus,
-    PlanStore, TaskId,
+    EvidenceKind, EvidenceRef, InvalidationCondition, Plan, PlanId, PlanNode, PlanNodeKind,
+    PlanNodeStatus, PlanStore, RevisionId, TaskId,
 };
-use harw_session_store::JobStore;
-use harw_types::{ApprovalActor, WorkId};
+use harw_session_store::{JobStore, SessionStoreError};
+use harw_types::{ApprovalActor, ContentDigest, WorkId};
 use serde_json::json;
 use time::OffsetDateTime;
 
+use crate::controller::{apply_atomically, find_node};
 use crate::error::PlanBridgeError;
 
 /// `JobKind`-Diskriminator für Jobs, die aus einem Plan-Knoten entstehen.
@@ -145,15 +148,25 @@ impl PlanJobBridge {
     /// `Ready`-Job im Job-Store an. Der Payload ist der vollständige
     /// Ausführungsvertrag (siehe Modul-Dokumentation).
     ///
-    /// Danach wandert der Knoten im Plan auf `InProgress` und trägt die
-    /// `WorkId` in seinem [`Assignment`]; ein `Draft`-Knoten geht dabei über
-    /// den regulären Zwischenschritt `Ready` — die Statusmatrix von `harw-plan`
-    /// kennt keinen Sprung `Draft → InProgress`. Der `attempt`-Zähler eines
-    /// bereits zugewiesenen Knotens wird erhöht.
+    /// Je Knoten in drei Schritten (G-038, K4/K5):
+    /// 1. Ein `Draft`-Knoten wird **vor** dem Anlegen eines Jobs atomar auf
+    ///    `Ready` gesetzt. Damit prüft `harw-plan` Exploration (Regel 12),
+    ///    Abhängigkeiten und Schreibbereich, bevor ein Job existiert — ein
+    ///    abgelehnter Knoten hinterlässt keinen Waisen-Job.
+    /// 2. Der Job wird mit einer **deterministischen** `WorkId` aus
+    ///    `(Plan, Knoten, Plan-Revision)` angelegt. Existiert dieser Job schon
+    ///    (ein früherer Lauf scheiterte nach dem Anlegen), wird er
+    ///    wiederverwendet, sofern er noch `Pending`/`Ready` ist und zu Plan
+    ///    und Knoten gehört. Pro Knoten und Revision entsteht so höchstens ein
+    ///    Job.
+    /// 3. `UpdateNode(assignment)` und `SetStatus(InProgress)` laufen als
+    ///    **ein** `apply_batch` (bei Revisionskonflikt einmal neu gelesen).
     ///
-    /// Der Job wird **vor** der Plan-Mutation angelegt: ein Job ohne
-    /// zugewiesenen Knoten ist ein sichtbares Waisenkind, ein Knoten mit
-    /// WorkId ohne Job wäre eine stille Lüge.
+    /// Der Job wird vor der Bindung im Plan angelegt: ein Job ohne
+    /// zugewiesenen Knoten ist ein sichtbares (und beim nächsten Lauf
+    /// wiederverwendetes) Waisenkind, ein Knoten mit WorkId ohne Job wäre
+    /// eine stille Lüge. Der `attempt`-Zähler eines bereits zugewiesenen
+    /// Knotens wird erhöht.
     ///
     /// # Arguments
     /// - `plan` (`&dyn PlanStore`): der Plan-Store der Session.
@@ -180,8 +193,11 @@ impl PlanJobBridge {
     ///
     /// # Concurrency
     /// Sicher aus mehreren Threads, aber **nicht** atomar über Job-Store und
-    /// Plan-Store hinweg: bricht eine Plan-Mutation ab, bleibt der bereits
-    /// admittierte Job bestehen und muss vom Aufrufer storniert werden.
+    /// Plan-Store hinweg: scheitert Schritt 3, bleibt der Job `Ready` im
+    /// Job-Store und der Knoten `Ready`. Ein erneuter Aufruf auf derselben
+    /// Plan-Revision bindet denselben Job; hat sich die Revision inzwischen
+    /// geändert, bleibt der alte Job ein Waise, den der Aufrufer stornieren
+    /// muss.
     pub fn admit_ready_nodes(
         plan: &dyn PlanStore,
         jobs: &JobStore,
@@ -189,10 +205,10 @@ impl PlanJobBridge {
         actor: &str,
     ) -> Result<Vec<(TaskId, String)>, PlanBridgeError> {
         let snapshot = plan.current()?;
-        let candidates: Vec<PlanNode> = graph::ready_nodes(&snapshot)
+        let candidates: Vec<TaskId> = graph::ready_nodes(&snapshot)
             .into_iter()
             .filter(|node| JOB_KINDS.contains(&node.kind))
-            .cloned()
+            .map(|node| node.id.clone())
             .collect();
 
         if candidates.is_empty() {
@@ -200,87 +216,10 @@ impl PlanJobBridge {
         }
 
         let mut admitted: Vec<(TaskId, String)> = Vec::with_capacity(candidates.len());
-        for node in &candidates {
-            let plan_revision = plan.revision();
-            let contract = contract_from_node(node, template.base_revision.clone(), plan_revision);
-            let payload = node_payload(snapshot.id.as_str(), node, plan_revision, &contract)?;
-
-            let work_id = WorkId::new();
-            let mut job = Job::new(
-                work_id.clone(),
-                JobKind::Custom(PLAN_NODE_JOB_KIND.to_owned()),
-                template.budget.clone(),
-                template.retry.clone(),
-                template.now,
-            );
-            job.mark_ready(template.now)
-                .map_err(|error| PlanBridgeError::JobStore(error.to_string()))?;
-
-            let record = StoredJob {
-                job,
-                scope: template.scope.clone(),
-                input: payload,
-                submitted_at: template.now,
-                not_before: template.now,
-                lease: None,
-                lease_epoch: 0,
-                completion: None,
-                cancellation: None,
-                revision: 0,
-                // JobAdmissionTemplate (scope, budget, retry, base_revision,
-                // now) carries no trace context, and no production caller of
-                // `admit_ready_nodes` exists yet to supply one.
-                trace: None,
-            };
-            jobs.admit(&record)
-                .map_err(|error| PlanBridgeError::JobStore(error.to_string()))?;
-
-            // Ab hier gehört der Knoten dem Job.
-            if node.status == PlanNodeStatus::Draft {
-                plan.apply(
-                    PlanAction::SetStatus {
-                        id: node.id.clone(),
-                        status: PlanNodeStatus::Ready,
-                        reason: Some("wird als Job admittiert".to_owned()),
-                    },
-                    actor,
-                )?;
+        for task in &candidates {
+            if let Some(work_id) = admit_node(plan, jobs, template, actor, task)? {
+                admitted.push((task.clone(), work_id));
             }
-
-            let attempt = node
-                .assignment
-                .as_ref()
-                .map_or(0, |assignment| assignment.attempt.saturating_add(1));
-            plan.apply(
-                PlanAction::UpdateNode {
-                    id: node.id.clone(),
-                    patch: NodePatch {
-                        assignment: Some(Some(Assignment {
-                            worker: actor.to_owned(),
-                            attempt,
-                            job: Some(work_id.as_str().to_owned()),
-                        })),
-                        ..Default::default()
-                    },
-                },
-                actor,
-            )?;
-            plan.apply(
-                PlanAction::SetStatus {
-                    id: node.id.clone(),
-                    status: PlanNodeStatus::InProgress,
-                    reason: Some(format!("Job '{}' admittiert", work_id.as_str())),
-                },
-                actor,
-            )?;
-
-            tracing::info!(
-                task = %node.id,
-                work_id = work_id.as_str(),
-                attempt = attempt,
-                "Plan-Knoten als Job admittiert"
-            );
-            admitted.push((node.id.clone(), work_id.as_str().to_owned()));
         }
 
         Ok(admitted)
@@ -312,9 +251,13 @@ impl PlanJobBridge {
     /// - [`PlanBridgeError::Plan`]: wenn eine der beiden Mutationen abgelehnt
     ///   wird (z.B. weil der Knoten nicht `InProgress` war).
     ///
+    /// Ist der Knoten bereits `Completed`, ist der Rückkanal schon wirksam
+    /// und die Methode kehrt ohne Mutation mit `Ok(())` zurück.
+    ///
     /// # Concurrency
-    /// Zwei getrennte `apply`-Aufrufe; nicht atomar. Schlägt der zweite fehl,
-    /// bleibt die Evidenz angehängt — das ist der harmlosere Zwischenzustand.
+    /// Beide Aktionen laufen als **ein** `apply_batch` (G-038, K1): lehnt
+    /// `harw-plan` den Abschluss ab, wird auch die Evidenz nicht angehängt.
+    /// Bei Revisionskonflikt wird einmal neu gelesen.
     pub fn on_job_completed(
         plan: &dyn PlanStore,
         task: &TaskId,
@@ -325,29 +268,35 @@ impl PlanJobBridge {
     ) -> Result<(), PlanBridgeError> {
         ensure_node_exists(plan, task)?;
 
-        plan.apply(
-            PlanAction::AttachEvidence {
-                id: task.clone(),
-                evidence: EvidenceRef {
-                    kind: EvidenceKind::Job,
-                    locator: work_id.to_owned(),
-                    attached_at: now,
-                    actor: actor.to_owned(),
-                    // Nur die WorkId (ein Lokator/ID) liegt hier vor; der
-                    // Job-Inhalt selbst wird an dieser Stelle nicht gelesen.
-                    digest: None,
+        let events = apply_atomically(plan, actor, |snapshot| {
+            if find_node(snapshot, task).is_some_and(|node| node.status == PlanNodeStatus::Completed)
+            {
+                return Vec::new();
+            }
+            vec![
+                PlanAction::AttachEvidence {
+                    id: task.clone(),
+                    evidence: EvidenceRef {
+                        kind: EvidenceKind::Job,
+                        locator: work_id.to_owned(),
+                        attached_at: now,
+                        actor: actor.to_owned(),
+                        // Nur die WorkId (ein Lokator/ID) liegt hier vor; der
+                        // Job-Inhalt selbst wird an dieser Stelle nicht gelesen.
+                        digest: None,
+                    },
                 },
-            },
-            actor,
-        )?;
-        plan.apply(
-            PlanAction::SetStatus {
-                id: task.clone(),
-                status: PlanNodeStatus::Completed,
-                reason: Some(summary.to_owned()),
-            },
-            actor,
-        )?;
+                PlanAction::SetStatus {
+                    id: task.clone(),
+                    status: PlanNodeStatus::Completed,
+                    reason: Some(summary.to_owned()),
+                },
+            ]
+        })?;
+        if events.is_empty() {
+            tracing::debug!(task = %task, work_id = work_id, "Knoten war bereits completed");
+            return Ok(());
+        }
 
         tracing::info!(
             task = %task,
@@ -426,8 +375,11 @@ impl PlanJobBridge {
     /// - [`PlanBridgeError::Plan`]: wenn der Knoten nicht invalidierbar ist
     ///   (etwa weil er bereits `Completed` ist — dafür gibt es `Supersede`).
     ///
+    /// Ist der Knoten bereits `Invalidated`, kehrt die Methode ohne Mutation
+    /// mit `Ok(())` zurück (ein doppelt gemeldeter Fehlschlag ist kein Fehler).
+    ///
     /// # Concurrency
-    /// Ein einzelner `apply`-Aufruf; thread-sicher.
+    /// Ein einzelner atomarer Batch; thread-sicher.
     pub fn on_job_failed(
         plan: &dyn PlanStore,
         task: &TaskId,
@@ -443,13 +395,17 @@ impl PlanJobBridge {
             reason = reason,
             "Job gescheitert — Knoten wird invalidiert"
         );
-        plan.apply(
-            PlanAction::Invalidate {
+        apply_atomically(plan, actor, |snapshot| {
+            if find_node(snapshot, task)
+                .is_some_and(|node| node.status == PlanNodeStatus::Invalidated)
+            {
+                return Vec::new();
+            }
+            vec![PlanAction::Invalidate {
                 ids: vec![task.clone()],
                 condition: InvalidationCondition::ManualInvalidate,
-            },
-            actor,
-        )?;
+            }]
+        })?;
         Ok(())
     }
 
@@ -495,6 +451,200 @@ impl PlanJobBridge {
 // Interne Hilfsfunktionen
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// Domänentrenner für die deterministische Admission-`WorkId`.
+const ADMISSION_DOMAIN: &[u8] = b"harw-plan-bridge:plan-node-admission:v1\0";
+
+/// Präfix der deterministischen Admission-`WorkId`.
+const ADMISSION_WORK_ID_PREFIX: &str = "plan-node-";
+
+/// Ein Knoten, der gerade als Job admittiert werden darf (Draft/Ready,
+/// Abhängigkeiten abgeschlossen, Arbeitsart).
+fn job_candidate<'a>(snapshot: &'a Plan, task: &TaskId) -> Option<&'a PlanNode> {
+    graph::ready_nodes(snapshot)
+        .into_iter()
+        .find(|node| &node.id == task && JOB_KINDS.contains(&node.kind))
+}
+
+/// Admittiert genau einen Knoten (siehe [`PlanJobBridge::admit_ready_nodes`]).
+///
+/// # Returns
+/// `Some(WorkId)`, wenn der Knoten an einen Job gebunden wurde; `None`, wenn
+/// er zwischenzeitlich nicht mehr admittierbar war.
+fn admit_node(
+    plan: &dyn PlanStore,
+    jobs: &JobStore,
+    template: &JobAdmissionTemplate,
+    actor: &str,
+    task: &TaskId,
+) -> Result<Option<String>, PlanBridgeError> {
+    // Schritt 1: Draft → Ready, bevor ein Job existiert (K5).
+    apply_atomically(plan, actor, |snapshot| match job_candidate(snapshot, task) {
+        Some(node) if node.status == PlanNodeStatus::Draft => vec![PlanAction::SetStatus {
+            id: task.clone(),
+            status: PlanNodeStatus::Ready,
+            reason: Some("wird als Job admittiert".to_owned()),
+        }],
+        _ => Vec::new(),
+    })?;
+
+    let snapshot = plan.current()?;
+    let Some(node) = job_candidate(&snapshot, task)
+        .filter(|node| node.status == PlanNodeStatus::Ready)
+    else {
+        tracing::debug!(task = %task, "Knoten ist nicht mehr admittierbar — übersprungen");
+        return Ok(None);
+    };
+
+    // Schritt 2: Job mit deterministischer Identität (idempotent).
+    let revision = snapshot.revision;
+    let work_id = admission_work_id(&snapshot.id, &node.id, revision)?;
+    let contract = contract_from_node(node, template.base_revision.clone(), revision);
+    let payload = node_payload(snapshot.id.as_str(), node, revision, &contract)?;
+    ensure_job_admitted(jobs, template, &work_id, payload, snapshot.id.as_str(), task)?;
+
+    // Schritt 3: Bindung und Start atomar.
+    let attempt = node
+        .assignment
+        .as_ref()
+        .map_or(0, |assignment| assignment.attempt.saturating_add(1));
+    let events = apply_atomically(plan, actor, |current| match job_candidate(current, task) {
+        Some(candidate) if candidate.status == PlanNodeStatus::Ready => vec![
+            PlanAction::UpdateNode {
+                id: task.clone(),
+                patch: NodePatch {
+                    assignment: Some(Some(Assignment {
+                        worker: actor.to_owned(),
+                        attempt,
+                        job: Some(work_id.as_str().to_owned()),
+                    })),
+                    ..Default::default()
+                },
+            },
+            PlanAction::SetStatus {
+                id: task.clone(),
+                status: PlanNodeStatus::InProgress,
+                reason: Some(format!("Job '{}' admittiert", work_id.as_str())),
+            },
+        ],
+        _ => Vec::new(),
+    })?;
+    if events.is_empty() {
+        tracing::warn!(
+            task = %task,
+            work_id = work_id.as_str(),
+            "Job angelegt, Knoten inzwischen nicht mehr admittierbar — Job ist verwaist"
+        );
+        return Ok(None);
+    }
+
+    tracing::info!(
+        task = %task,
+        work_id = work_id.as_str(),
+        attempt = attempt,
+        "Plan-Knoten als Job admittiert"
+    );
+    Ok(Some(work_id.as_str().to_owned()))
+}
+
+/// Leitet die `WorkId` einer Admission deterministisch ab.
+///
+/// # Description
+/// `plan-node-<BLAKE3-Hex>` über Domäne ‖ längenpräfixierte Plan-ID ‖
+/// längenpräfixierte Task-ID ‖ Revision (u64 BE). Die Längenpräfixe machen
+/// die Kodierung injektiv; das Ergebnis besteht nur aus `[a-z0-9-]` und ist
+/// damit ein gültiges Job-Store-Pfadsegment.
+///
+/// # Errors
+/// [`PlanBridgeError::JobStore`], falls die ID abgelehnt würde (nicht
+/// erreichbar, da nie leer).
+fn admission_work_id(
+    plan_id: &PlanId,
+    task: &TaskId,
+    revision: RevisionId,
+) -> Result<WorkId, PlanBridgeError> {
+    let mut material: Vec<u8> = Vec::with_capacity(ADMISSION_DOMAIN.len() + 96);
+    material.extend_from_slice(ADMISSION_DOMAIN);
+    for part in [plan_id.as_str(), task.as_str()] {
+        material.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        material.extend_from_slice(part.as_bytes());
+    }
+    material.extend_from_slice(&revision.value().to_be_bytes());
+    let digest = ContentDigest::of(&material);
+    WorkId::try_from_str(format!("{ADMISSION_WORK_ID_PREFIX}{digest}"))
+        .map_err(|error| PlanBridgeError::JobStore(error.to_string()))
+}
+
+/// Legt den Job an oder übernimmt einen bereits vorhandenen, passenden Job.
+///
+/// # Errors
+/// [`PlanBridgeError::JobStore`], wenn die Aufnahme scheitert oder unter der
+/// `WorkId` ein nicht wiederverwendbarer Job liegt (terminal oder fremd).
+fn ensure_job_admitted(
+    jobs: &JobStore,
+    template: &JobAdmissionTemplate,
+    work_id: &WorkId,
+    payload: serde_json::Value,
+    plan_id: &str,
+    task: &TaskId,
+) -> Result<(), PlanBridgeError> {
+    let mut job = Job::new(
+        work_id.clone(),
+        JobKind::Custom(PLAN_NODE_JOB_KIND.to_owned()),
+        template.budget.clone(),
+        template.retry.clone(),
+        template.now,
+    );
+    job.mark_ready(template.now)
+        .map_err(|error| PlanBridgeError::JobStore(error.to_string()))?;
+
+    let record = StoredJob {
+        job,
+        scope: template.scope.clone(),
+        input: payload,
+        submitted_at: template.now,
+        not_before: template.now,
+        lease: None,
+        lease_epoch: 0,
+        completion: None,
+        cancellation: None,
+        revision: 0,
+        // JobAdmissionTemplate (scope, budget, retry, base_revision,
+        // now) carries no trace context, and no production caller of
+        // `admit_ready_nodes` exists yet to supply one.
+        trace: None,
+    };
+    match jobs.admit(&record) {
+        Ok(()) => Ok(()),
+        Err(SessionStoreError::JobAlreadyExists { .. }) => {
+            let existing = jobs
+                .get(work_id)
+                .map_err(|error| PlanBridgeError::JobStore(error.to_string()))?;
+            let belongs = existing.job.kind == JobKind::Custom(PLAN_NODE_JOB_KIND.to_owned())
+                && existing.input.get("plan_id").and_then(serde_json::Value::as_str)
+                    == Some(plan_id)
+                && existing.input.get("task_id").and_then(serde_json::Value::as_str)
+                    == Some(task.as_str());
+            let reusable = matches!(existing.job.state, JobState::Pending | JobState::Ready);
+            if belongs && reusable {
+                tracing::debug!(
+                    task = %task,
+                    work_id = work_id.as_str(),
+                    "Job dieser Knoten-Revision existiert bereits — wird wiederverwendet"
+                );
+                Ok(())
+            } else {
+                Err(PlanBridgeError::JobStore(format!(
+                    "Job '{}' für Knoten '{task}' existiert bereits und ist nicht \
+                     wiederverwendbar (Zustand {:?})",
+                    work_id.as_str(),
+                    existing.job.state
+                )))
+            }
+        }
+        Err(error) => Err(PlanBridgeError::JobStore(error.to_string())),
+    }
+}
+
 /// Stellt sicher, dass ein Knoten im aktuellen Plan existiert.
 fn ensure_node_exists(plan: &dyn PlanStore, task: &TaskId) -> Result<(), PlanBridgeError> {
     let snapshot = plan.current()?;
@@ -539,37 +689,27 @@ fn scope_strings(scopes: &[harw_plan::PathOrSymbol]) -> Vec<&str> {
 mod tests {
     use super::*;
     use crate::metrics::{EVIDENCE_ATTACHED_TOTAL, INVALIDATIONS_TOTAL};
-    use crate::testing::{RecordingSink, coding_node, research_node, seeded_plan_store, timestamp};
-    use harw_plan::{InMemoryPlanStore, PlanId};
-    use harw_types::{TenantId, WorkspaceId};
-    use jiff::SignedDuration;
+    use crate::testing::{
+        RecordingSink, ScriptedPlanStore, admission_template, coding_node, exploration_config,
+        job_count, plan_id, research_node, seeded_plan_store, seeded_plan_store_with_config,
+        temp_job_store,
+    };
+    use harw_plan::InMemoryPlanStore;
+    use harw_plan::error::PlanError;
 
     fn template() -> JobAdmissionTemplate {
-        let retry = match RetryPolicy::try_new(1, SignedDuration::ZERO, 2.0, SignedDuration::ZERO) {
-            Ok(retry) => retry,
-            Err(error) => panic!("RetryPolicy: {error}"),
-        };
-        JobAdmissionTemplate::new(
-            JobScope::new(
-                TenantId::from_str("tenant-test"),
-                WorkspaceId::from_str("workspace"),
-                ApprovalActor::Operator {
-                    id: "operator-1".to_owned(),
-                },
-            ),
-            Budget::unbounded(),
-            retry,
-            RepoRevision("abc123".to_owned()),
-            timestamp(),
-        )
+        admission_template()
     }
 
     fn job_store() -> (JobStore, tempfile::TempDir) {
-        let dir = match tempfile::tempdir() {
-            Ok(dir) => dir,
-            Err(error) => panic!("Temp-Verzeichnis: {error}"),
-        };
-        (JobStore::new(dir.path()), dir)
+        temp_job_store()
+    }
+
+    fn snapshot_of(plan: &dyn PlanStore) -> Plan {
+        match plan.current() {
+            Ok(snapshot) => snapshot,
+            Err(error) => panic!("current: {error}"),
+        }
     }
 
     #[test]
@@ -608,6 +748,7 @@ mod tests {
     fn test_admit_ready_nodes_payload_carries_the_full_contract() {
         let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)]);
         let (jobs, _dir) = job_store();
+        let revision_before = plan.revision();
 
         let admitted = match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime")
         {
@@ -627,7 +768,7 @@ mod tests {
         let input = &stored.input;
         assert_eq!(input["plan_id"].as_str(), Some("p-test"));
         assert_eq!(input["task_id"].as_str(), Some("t-1"));
-        assert_eq!(input["plan_revision"].as_u64(), Some(2));
+        assert_eq!(input["plan_revision"].as_u64(), Some(revision_before.value()));
         assert!(input["contract"].is_object());
         assert!(input["objective"].is_string());
         assert!(input["write_scope"].is_array());
@@ -679,7 +820,7 @@ mod tests {
         let plan = InMemoryPlanStore::new();
         if let Err(error) = plan.apply(
             PlanAction::Create {
-                plan_id: PlanId::new("p-empty"),
+                plan_id: plan_id("p-empty"),
                 goal: "Ziel".to_owned(),
             },
             "test",
@@ -872,5 +1013,206 @@ mod tests {
             template.submitter(),
             ApprovalActor::Operator { id } if id == "operator-1"
         ));
+    }
+
+    #[test]
+    fn test_admit_ready_nodes_twice_admits_exactly_one_job() {
+        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)]);
+        let (jobs, _dir) = job_store();
+
+        if let Err(error) = PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime") {
+            panic!("erste Admission schlug fehl: {error}");
+        }
+        match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime") {
+            Err(PlanBridgeError::NoReadyNodes) => {}
+            other => panic!("erwartet NoReadyNodes, bekommen: {other:?}"),
+        }
+        assert_eq!(job_count(&jobs), 1);
+    }
+
+    #[test]
+    fn test_admit_ready_nodes_is_idempotent_after_a_failed_plan_batch() {
+        let plan = ScriptedPlanStore::new(seeded_plan_store(vec![coding_node(
+            "t-1",
+            PlanNodeStatus::Ready,
+        )]));
+        let (jobs, _dir) = job_store();
+        plan.inject_failures(1);
+
+        match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime") {
+            Err(PlanBridgeError::Plan(PlanError::Io(_))) => {}
+            other => panic!("erwartet injizierten Batch-Fehler, bekommen: {other:?}"),
+        }
+        // Der Job existiert, der Knoten ist aber noch nicht gebunden.
+        assert_eq!(job_count(&jobs), 1);
+        let first = snapshot_of(&plan);
+        assert_eq!(first.nodes[0].status, PlanNodeStatus::Ready);
+        assert!(first.nodes[0].assignment.is_none());
+
+        let admitted = match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime")
+        {
+            Ok(admitted) => admitted,
+            Err(error) => panic!("Wiederholung schlug fehl: {error}"),
+        };
+
+        // Kein zweiter Job: derselbe Job wird gebunden.
+        assert_eq!(job_count(&jobs), 1);
+        assert_eq!(admitted.len(), 1);
+        let bound = snapshot_of(&plan);
+        let node = &bound.nodes[0];
+        assert_eq!(node.status, PlanNodeStatus::InProgress);
+        assert_eq!(
+            node.assignment.as_ref().and_then(|assignment| assignment.job.as_deref()),
+            Some(admitted[0].1.as_str())
+        );
+        match jobs.list(&harw_session_store::JobListQuery::default()) {
+            Ok(page) => assert_eq!(page.jobs[0].job.id.as_str(), admitted[0].1),
+            Err(error) => panic!("Jobs auflisten: {error}"),
+        }
+    }
+
+    #[test]
+    fn test_admit_ready_nodes_retries_once_after_a_revision_conflict() {
+        let plan = ScriptedPlanStore::new(seeded_plan_store(vec![coding_node(
+            "t-1",
+            PlanNodeStatus::Ready,
+        )]));
+        let (jobs, _dir) = job_store();
+        plan.inject_conflicts(1);
+
+        let admitted = match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime")
+        {
+            Ok(admitted) => admitted,
+            Err(error) => panic!("admit schlug fehl: {error}"),
+        };
+
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(plan.batch_calls(), 2, "erwartet genau eine Wiederholung");
+        assert_eq!(job_count(&jobs), 1);
+        assert_eq!(snapshot_of(&plan).nodes[0].status, PlanNodeStatus::InProgress);
+    }
+
+    #[test]
+    fn test_admit_ready_nodes_creates_no_job_when_exploration_is_missing() {
+        let plan = seeded_plan_store_with_config(
+            exploration_config(),
+            vec![coding_node("t-1", PlanNodeStatus::Draft)],
+        );
+        let (jobs, _dir) = job_store();
+
+        match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime") {
+            Err(PlanBridgeError::Plan(PlanError::BatchActionRejected { source, .. })) => {
+                assert!(
+                    matches!(*source, PlanError::ExplorationRequired { .. }),
+                    "unerwartete Ursache: {source}"
+                );
+            }
+            other => panic!("erwartet ExplorationRequired, bekommen: {other:?}"),
+        }
+        assert_eq!(job_count(&jobs), 0, "Waisen-Job trotz abgelehnter Admission");
+        assert_eq!(snapshot_of(&plan).nodes[0].status, PlanNodeStatus::Draft);
+    }
+
+    #[test]
+    fn test_admission_work_id_is_deterministic_per_node_and_revision() {
+        let plan = plan_id("p-test");
+        let task = TaskId::new("t-1");
+        let first = admission_work_id(&plan, &task, RevisionId::new(3));
+        let second = admission_work_id(&plan, &task, RevisionId::new(3));
+        let other_revision = admission_work_id(&plan, &task, RevisionId::new(4));
+        let other_task = admission_work_id(&plan, &TaskId::new("t-2"), RevisionId::new(3));
+        match (first, second, other_revision, other_task) {
+            (Ok(first), Ok(second), Ok(other_revision), Ok(other_task)) => {
+                assert_eq!(first, second);
+                assert_ne!(first, other_revision);
+                assert_ne!(first, other_task);
+                assert!(first.as_str().starts_with(ADMISSION_WORK_ID_PREFIX));
+                assert!(
+                    first
+                        .as_str()
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                );
+            }
+            other => panic!("WorkId-Ableitung schlug fehl: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_on_job_completed_twice_is_a_noop() {
+        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)]);
+        let (jobs, _dir) = job_store();
+        let admitted = match PlanJobBridge::admit_ready_nodes(&plan, &jobs, &template(), "runtime")
+        {
+            Ok(admitted) => admitted,
+            Err(error) => panic!("admit schlug fehl: {error}"),
+        };
+        let (task, work_id) = &admitted[0];
+        for round in 0..2 {
+            if let Err(error) = PlanJobBridge::on_job_completed(
+                &plan,
+                task,
+                work_id,
+                "fertig",
+                "runtime",
+                OffsetDateTime::UNIX_EPOCH,
+            ) {
+                panic!("on_job_completed Runde {round}: {error}");
+            }
+        }
+        let revision_after_first = plan.revision();
+        if let Err(error) = PlanJobBridge::on_job_completed(
+            &plan,
+            task,
+            work_id,
+            "fertig",
+            "runtime",
+            OffsetDateTime::UNIX_EPOCH,
+        ) {
+            panic!("on_job_completed dritte Runde: {error}");
+        }
+        assert_eq!(plan.revision(), revision_after_first, "No-op erzeugte eine Revision");
+        let snapshot = snapshot_of(&plan);
+        assert_eq!(snapshot.nodes[0].status, PlanNodeStatus::Completed);
+        assert_eq!(snapshot.nodes[0].evidence.len(), 1);
+    }
+
+    #[test]
+    fn test_on_job_completed_on_a_ready_node_attaches_nothing() {
+        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)]);
+
+        match PlanJobBridge::on_job_completed(
+            &plan,
+            &TaskId::new("t-1"),
+            "work-x",
+            "fertig",
+            "runtime",
+            OffsetDateTime::UNIX_EPOCH,
+        ) {
+            Err(PlanBridgeError::Plan(PlanError::BatchActionRejected { index, .. })) => {
+                assert_eq!(index, 1, "der Statuswechsel muss scheitern");
+            }
+            other => panic!("erwartet BatchActionRejected, bekommen: {other:?}"),
+        }
+        let snapshot = snapshot_of(&plan);
+        assert!(snapshot.nodes[0].evidence.is_empty(), "Evidenz trotz Abbruch angehängt");
+        assert_eq!(snapshot.nodes[0].status, PlanNodeStatus::Ready);
+    }
+
+    #[test]
+    fn test_on_job_failed_twice_is_a_noop() {
+        let plan = seeded_plan_store(vec![coding_node("t-1", PlanNodeStatus::Ready)]);
+        for round in 0..2 {
+            if let Err(error) = PlanJobBridge::on_job_failed(
+                &plan,
+                &TaskId::new("t-1"),
+                "work-x",
+                "rot",
+                "runtime",
+            ) {
+                panic!("on_job_failed Runde {round}: {error}");
+            }
+        }
+        assert_eq!(snapshot_of(&plan).nodes[0].status, PlanNodeStatus::Invalidated);
     }
 }

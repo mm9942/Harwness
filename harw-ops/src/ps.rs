@@ -89,7 +89,7 @@ pub struct PsArgs {
     model_tool(readonly, approval = "none"),
     // Web-Fläche übernimmt dieselbe Achse wie das ModelTool: reines
     // Auflisten laufender Jobs, keine Mutation, keine Bestätigung nötig.
-    web(path = "/api/ps", readonly, approval = "none")
+    web(path = "/api/ps", method = "get", approval = "none")
 )]
 async fn ps(ctx: &OpContext, args: PsArgs) -> Result<OpOutput, OpError> {
     let states = args.status.as_deref().map(parse_state).transpose()?;
@@ -103,9 +103,7 @@ async fn ps(ctx: &OpContext, args: PsArgs) -> Result<OpOutput, OpError> {
         })
         .map_err(|error| OpError::Execution(format!("could not list durable jobs: {error}")))?;
     if page.jobs.is_empty() {
-        return Ok(OpOutput {
-            text: "No jobs.".to_owned(),
-        });
+        return Ok(OpOutput::from("No jobs.".to_owned()));
     }
     let text = page
         .jobs
@@ -118,7 +116,7 @@ async fn ps(ctx: &OpContext, args: PsArgs) -> Result<OpOutput, OpError> {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    Ok(OpOutput { text })
+    Ok(OpOutput::from(text))
 }
 
 fn parse_state(value: &str) -> Result<JobState, OpError> {

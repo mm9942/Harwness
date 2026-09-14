@@ -115,7 +115,7 @@ use crate::finding_store::offset_from_timestamp;
 fn security_finding_locator(finding: &Finding<Triaged>) -> String {
     format!(
         "security-finding:{}:{}",
-        finding.rule_id,
+        finding.rule_id(),
         finding.id().as_str()
     )
 }
@@ -164,7 +164,7 @@ pub fn evidence_for_security_finding(
     EvidenceRef {
         kind: EvidenceKind::Other,
         locator: security_finding_locator(finding),
-        attached_at: offset_from_timestamp(finding.observed_at),
+        attached_at: offset_from_timestamp(finding.observed_at()),
         actor: actor.to_owned(),
         digest: Some(security_evidence.digest),
     }
@@ -292,6 +292,28 @@ mod tests {
     use harw_types::SensorId;
 
     fn triaged_finding(severity: Severity, hardness: Hardness, verdict: Verdict) -> Finding<Triaged> {
+        triaged_finding_at(severity, hardness, verdict, jiff::Timestamp::UNIX_EPOCH)
+    }
+
+    /// Wie [`triaged_finding`], aber mit injizierbarem `observed_at`
+    /// (`RuleContext::now` — siehe `EgressFlowRule::evaluate`, das den Befund
+    /// exakt darauf datiert). Gebraucht von den Rand-Tests der
+    /// `offset_from_timestamp`-Umrechnung: `Finding`s Felder sind read-only
+    /// (F-023, `harw-dod-rules::finding`-Moduldoku), es gibt also keinen
+    /// nachträglichen Setter — nur der Weg über `RuleContext` erreicht einen
+    /// beliebigen `observed_at`-Wert.
+    ///
+    /// `severity`/`hardness` bleiben Parameter (statt sie aus dem
+    /// `EgressFlowRule`-Ergebnis zu übernehmen), damit jeder Aufrufer explizit
+    /// dokumentiert, welche feste Kombination die Regel liefert — der
+    /// `assert_eq!` unten macht das strukturell sichtbar, falls sich die
+    /// Regel je ändert.
+    fn triaged_finding_at(
+        severity: Severity,
+        hardness: Hardness,
+        verdict: Verdict,
+        observed_at: jiff::Timestamp,
+    ) -> Finding<Triaged> {
         let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);
         let events = vec![SecurityEvent {
             sensor: SensorId::from_str("net-0"),
@@ -303,7 +325,7 @@ mod tests {
             },
         }];
         let ctx = RuleContext {
-            now: jiff::Timestamp::UNIX_EPOCH,
+            now: observed_at,
             samples: &[],
             events: &events,
             baselines: &[],
@@ -311,9 +333,17 @@ mod tests {
         };
         let rule: &dyn Rule = &EgressFlowRule;
         let checked = run_rules(&[rule], &ctx);
-        let mut finding = checked.into_iter().next().expect("EgressFlowRule löst aus");
-        finding.severity = severity;
-        finding.hardness = hardness;
+        let finding = checked.into_iter().next().expect("EgressFlowRule löst aus");
+        assert_eq!(
+            finding.severity(),
+            severity,
+            "EgressFlowRule liefert eine feste Severity"
+        );
+        assert_eq!(
+            finding.hardness(),
+            hardness,
+            "EgressFlowRule liefert eine feste Hardness"
+        );
         triage(finding, verdict)
     }
 
@@ -350,7 +380,7 @@ mod tests {
         let reference = evidence_for_security_finding(&finding, &evidence, "dod:escalate");
         assert_eq!(
             reference.attached_at,
-            offset_from_timestamp(finding.observed_at)
+            offset_from_timestamp(finding.observed_at())
         );
     }
 
@@ -361,8 +391,12 @@ mod tests {
         // prueft: `time::OffsetDateTime::from_unix_timestamp_nanos` ist der
         // zugrunde liegende Baustein, den `offset_from_timestamp` benutzt.
         let far_future = jiff::Timestamp::MAX;
-        let mut finding = triaged_finding(Severity::High, Hardness::Observed, Verdict::Confirmed);
-        finding.observed_at = far_future;
+        let finding = triaged_finding_at(
+            Severity::High,
+            Hardness::Observed,
+            Verdict::Confirmed,
+            far_future,
+        );
         let evidence = sample_security_evidence();
         let reference = evidence_for_security_finding(&finding, &evidence, "dod:escalate");
         let expected = time::OffsetDateTime::from_unix_timestamp_nanos(far_future.as_nanosecond())
@@ -376,8 +410,12 @@ mod tests {
         // `Timestamp::MIN`) — derselbe unabhaengige Abgleich wie oben, nur am
         // anderen Rand.
         let before_begin = jiff::Timestamp::MIN;
-        let mut finding = triaged_finding(Severity::High, Hardness::Observed, Verdict::Confirmed);
-        finding.observed_at = before_begin;
+        let finding = triaged_finding_at(
+            Severity::High,
+            Hardness::Observed,
+            Verdict::Confirmed,
+            before_begin,
+        );
         let evidence = sample_security_evidence();
         let reference = evidence_for_security_finding(&finding, &evidence, "dod:escalate");
         let expected =

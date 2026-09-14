@@ -55,12 +55,14 @@ use std::sync::Arc;
 
 use harw_config::ResolvedConfig;
 use harw_core::{ManagedAgentSpawner, StateStore};
+use harw_extension_api::allow_rules::AllowRuleSet;
 use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_memory::Memory;
 use harw_operations::registry::OperationRegistry;
 use harw_operations::{ServiceMap, SharedSessionController};
 use harw_plan::{GoalStore, PlanStore, PlanToolConfig};
 use harw_plan_bridge::{FindingStore, register_plan_services};
+use harw_sandbox::ExtraRootsCell;
 use harw_session_store::JobStore;
 use harw_types::Principal;
 
@@ -251,6 +253,17 @@ pub struct RuntimeServicesParts {
     /// Freigabemodus dieser Sitzung. Kein `Option`: `/permissions` meldet ohne
     /// Zelle `NotAvailable` (W2A-05), darum trägt jede Fläche eine.
     pub approval_mode: ApprovalModeCell,
+    /// Geteilte Freigaberegeln dieser Sitzung (Contract §2/§4). Kein
+    /// `Option`, aus demselben Grund wie [`Self::approval_mode`]: `/permissions`
+    /// und `/add-workdir` müssen die Regelmenge über `ctx.service::<AllowRuleSet>()`
+    /// unabhängig davon finden, ob überhaupt eine Regel gesät wurde — eine
+    /// leere [`AllowRuleSet`] ist ein gültiger, „noch nichts gemerkt"-Zustand,
+    /// keine Abwesenheit des Dienstes.
+    pub allow_rules: AllowRuleSet,
+    /// Zusätzliche Workspace-Wurzeln dieser Sitzung (`/add-workdir`, Contract
+    /// §5 Slice A8). Kein `Option`, aus demselben Grund wie
+    /// [`Self::allow_rules`].
+    pub extra_roots: ExtraRootsCell,
     /// Das an der Eingangsgrenze authentifizierte Subjekt.
     pub principal: Principal,
     /// Sitzungs-Controller einer laufenden interaktiven Sitzung; `None` außerhalb.
@@ -330,6 +343,29 @@ impl RuntimeServices {
         &self.parts.approval_mode
     }
 
+    /// Die geteilten Freigaberegeln dieser Komposition (Contract §2/§4).
+    ///
+    /// # Beschreibung
+    /// Alle Flächen bekommen **Klone derselben** [`AllowRuleSet`] — eine über
+    /// `/permissions` „nicht mehr fragen“ angelegte Regel gilt damit sofort
+    /// auch für das nächste Modell-Werkzeug derselben Sitzung.
+    ///
+    /// # Rückgabe
+    /// Referenz auf die geteilte [`AllowRuleSet`].
+    #[must_use]
+    pub fn allow_rules(&self) -> &AllowRuleSet {
+        &self.parts.allow_rules
+    }
+
+    /// Die zusätzlichen Workspace-Wurzeln dieser Komposition (`/add-workdir`).
+    ///
+    /// # Rückgabe
+    /// Referenz auf die geteilte [`ExtraRootsCell`].
+    #[must_use]
+    pub fn extra_roots(&self) -> &ExtraRootsCell {
+        &self.parts.extra_roots
+    }
+
     /// Die geöffnete Planungsfläche dieser Komposition.
     ///
     /// # Beschreibung
@@ -378,6 +414,8 @@ impl RuntimeServices {
     /// | `Arc<dyn StateStore>` | ✓ | ✓ | ✓ | ✓ |
     /// | `Arc<ResolvedConfig>` | ✓ | ✓ | ✓ | ✓ |
     /// | [`ApprovalModeCell`] | ✓ | ✓ | ✓ | ✓ |
+    /// | [`AllowRuleSet`] | ✓ | ✓ | ✓ | ✓ |
+    /// | [`ExtraRootsCell`] | ✓ | ✓ | ✓ | ✓ |
     /// | [`Principal`] | ✓ | ✓ | ✓ | ✓ |
     /// | `Arc<dyn Memory>` (falls vorhanden) | ✓ | ✓ | ✓ | ✓ |
     /// | `Arc<JobStore>` (falls vorhanden) | ✓ | ✓ | ✓ | ✓ |
@@ -398,6 +436,14 @@ impl RuntimeServices {
     /// der Spawner im Slash-Pfad (G-061, `/agent` war dort `NotAvailable`), die
     /// Plan-Dienste in Slash und Modell-Werkzeug der TUI (G-024/G-098) und der
     /// `JobStore` samt `StateStore` auf der Web-Fläche (G-060).
+    ///
+    /// [`AllowRuleSet`] und [`ExtraRootsCell`] sind neu (Contract §2/§4/§5,
+    /// Plan Schritt 4/6): sie stehen genau wie [`ApprovalModeCell`]
+    /// unbedingt auf jeder Fläche, damit `/permissions` und `/add-workdir`
+    /// (beide `Surface::Command` auf der Slash-Fläche) sie über
+    /// `ctx.service::<AllowRuleSet>()` bzw. `ctx.service::<ExtraRootsCell>()`
+    /// finden — ohne Rücksicht darauf, ob ein Lauf überhaupt schon Regeln
+    /// oder Extra-Roots gesät hat.
     ///
     /// # Argumente
     /// - `surface` ([`ServiceSurface`]): die Fläche, für die montiert wird.
@@ -460,6 +506,8 @@ impl RuntimeServices {
         insert_service(&mut map, &mut names, Arc::clone(&self.parts.state_store));
         insert_service(&mut map, &mut names, Arc::clone(&self.parts.config));
         insert_service(&mut map, &mut names, self.parts.approval_mode.clone());
+        insert_service(&mut map, &mut names, self.parts.allow_rules.clone());
+        insert_service(&mut map, &mut names, self.parts.extra_roots.clone());
         insert_service(&mut map, &mut names, self.parts.principal.clone());
 
         if let Some(memory) = &self.parts.memory {
@@ -514,6 +562,7 @@ mod tests {
     };
     use harw_config::ResolvedConfig;
     use harw_core::{ChildLimits, InMemoryStateStore, ManagedAgentSpawner, SessionManager};
+    use harw_extension_api::allow_rules::AllowRuleSet;
     use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
     use harw_memory::{Entry, MaintenanceReport, Memory, MemoryResult, RecallQuery, Signal, Stats};
     use harw_operations::registry::OperationRegistry;
@@ -521,6 +570,7 @@ mod tests {
     use harw_operations::{ServiceMap, SharedSessionController};
     use harw_plan::{GoalStore, InMemoryGoalStore, InMemoryPlanStore, PlanStore, PlanToolConfig};
     use harw_plan_bridge::FindingStore;
+    use harw_sandbox::ExtraRootsCell;
     use harw_session_store::JobStore;
     use harw_types::{IngressSurface, PermissionTier, Principal, PrincipalKind};
     use std::any::type_name;
@@ -591,6 +641,8 @@ mod tests {
             config: Arc::new(ResolvedConfig::default()),
             plan: Some(test_plan_services()),
             approval_mode: ApprovalModeCell::new(ApprovalMode::AlwaysAsk),
+            allow_rules: AllowRuleSet::new(),
+            extra_roots: ExtraRootsCell::new(),
             principal: test_principal(),
             session_controller: Some(Arc::new(NullSessionController::new())),
         }
@@ -607,18 +659,22 @@ mod tests {
             config: Arc::new(ResolvedConfig::default()),
             plan: None,
             approval_mode: ApprovalModeCell::new(ApprovalMode::AlwaysAsk),
+            allow_rules: AllowRuleSet::new(),
+            extra_roots: ExtraRootsCell::new(),
             principal: test_principal(),
             session_controller: None,
         }
     }
 
-    /// Die Namen der fünf immer vorhandenen Dienste.
+    /// Die Namen der sieben immer vorhandenen Dienste.
     fn always_present() -> Vec<&'static str> {
         vec![
             type_name::<OperationRegistry>(),
             type_name::<Arc<dyn harw_core::StateStore>>(),
             type_name::<Arc<ResolvedConfig>>(),
             type_name::<ApprovalModeCell>(),
+            type_name::<AllowRuleSet>(),
+            type_name::<ExtraRootsCell>(),
             type_name::<Principal>(),
         ]
     }
@@ -802,6 +858,30 @@ mod tests {
         }
     }
 
+    /// Contract §2/§4/§5: `/permissions` und `/add-workdir` müssen die
+    /// Freigaberegeln bzw. Extra-Roots auf jeder Fläche finden — dieselbe
+    /// Zusicherung wie [`cell_and_principal_are_present_on_every_surface`]
+    /// für die [`ApprovalModeCell`].
+    #[test]
+    fn allow_rules_and_extra_roots_are_present_on_every_surface() {
+        for parts in [full_parts(), minimal_parts()] {
+            let services = RuntimeServices::new(parts);
+            for surface in ServiceSurface::ALL {
+                let map = services.service_map(surface);
+                assert!(
+                    map.get::<AllowRuleSet>().is_some(),
+                    "/permissions braucht die AllowRuleSet auf {}",
+                    surface.as_str()
+                );
+                assert!(
+                    map.get::<ExtraRootsCell>().is_some(),
+                    "/add-workdir braucht die ExtraRootsCell auf {}",
+                    surface.as_str()
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_cell_is_shared_across_surfaces() {
         let services = RuntimeServices::new(full_parts());
@@ -822,8 +902,38 @@ mod tests {
         assert_eq!(services.approval_mode().get(), ApprovalMode::FullAccess);
     }
 
+    /// Wie [`the_cell_is_shared_across_surfaces`], für die geteilte
+    /// [`AllowRuleSet`]: eine über `/permissions` (Slash) angelegte Regel
+    /// muss dem nächsten Modell-Werkzeug derselben Sitzung sofort vorliegen.
     #[test]
-    fn minimal_parts_register_only_the_mandatory_five() {
+    fn the_allow_rule_set_is_shared_across_surfaces() {
+        use harw_extension_api::allow_rules::{ApprovalRule, RuleDecision, RuleScope};
+
+        let services = RuntimeServices::new(full_parts());
+        let slash = services.service_map(ServiceSurface::Slash);
+        let model_tool = services.service_map(ServiceSurface::ModelTool);
+        let Some(rules) = slash.get::<AllowRuleSet>() else {
+            panic!("Slash-Fläche ohne AllowRuleSet");
+        };
+        rules.add(ApprovalRule {
+            tool: "shell.exec".to_owned(),
+            pattern: Some("git status".to_owned()),
+            decision: RuleDecision::Allow,
+            scope: RuleScope::Session,
+        });
+        let Some(other) = model_tool.get::<AllowRuleSet>() else {
+            panic!("ModelTool-Fläche ohne AllowRuleSet");
+        };
+        assert_eq!(
+            other.snapshot().len(),
+            1,
+            "/permissions im Slash-Pfad muss für das nächste Modell-Werkzeug gelten"
+        );
+        assert_eq!(services.allow_rules().snapshot().len(), 1);
+    }
+
+    #[test]
+    fn minimal_parts_register_only_the_mandatory_seven() {
         let services = RuntimeServices::new(minimal_parts());
         for surface in ServiceSurface::ALL {
             assert_eq!(

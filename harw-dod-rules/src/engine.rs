@@ -9,6 +9,15 @@
 //! [`crate::finding`]-Moduldoku), sondern indem es das Ergebnis dieser
 //! Funktion entgegennimmt.
 //!
+//! Ein so zertifizierter Befund verlässt den Sammelprozess nicht als
+//! `Finding<RuleChecked>`, sondern über
+//! [`crate::finding::Finding::record`] als [`crate::finding::FindingRecord`]
+//! (Spool, W3/C-FIND); triagiert wird er am Zielort über
+//! [`crate::finding::triage_record`], das ein Verdikt nur gegen einen selbst
+//! neu berechneten Record-Digest akzeptiert. Die zweite Prägestelle dieser
+//! Crate ist `crate::advisory::correlate_advisories` (ebenfalls hinter
+//! `Finding::check`, siehe dortige Moduldoku).
+//!
 //! # Warum die Identitätsvergabe hier liegt und nicht in `Rule::evaluate`
 //! [`harw_types::FindingId::new`] erzeugt eine zufällige UUID. Läge diese
 //! Vergabe in einer [`crate::rule::Rule::evaluate`]-Implementierung, wäre die

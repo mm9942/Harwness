@@ -14,7 +14,7 @@
 //! durch `#[operation]`-Makro).
 //!
 //! # Fehlertypen
-//! Diese Operation erzeugt keine Fehler; `Ok(OpOutput { text })` wird immer zurückgegeben.
+//! Diese Operation erzeugt keine Fehler; `Ok(OpOutput::from(text))` wird immer zurückgegeben.
 //!
 //! # Beispiel
 //! ```rust,no_run
@@ -51,7 +51,7 @@ pub struct StatusArgs {}
 /// - `_args` (`StatusArgs`): Leer — keine Parameter.
 ///
 /// # Rückgabe
-/// `Ok(OpOutput { text })` mit mehrzeiligem Statustext.
+/// `Ok(OpOutput::from(text))` mit mehrzeiligem Statustext.
 ///
 /// # Fehler
 /// Diese Funktion gibt niemals `Err` zurück.
@@ -71,10 +71,10 @@ pub struct StatusArgs {}
     command(path = "/status", visibility = "channel_parity"),
     model_tool(readonly, approval = "none"),
     // Web-Fläche übernimmt exakt dieselbe Achse wie das ModelTool oben:
-    // readonly, weil die Operation nur `ctx.session_id()`/`ctx.turn_id()`
+    // `method = "get"`, weil die Operation nur `ctx.session_id()`/`ctx.turn_id()`
     // liest, approval "none", weil ein reiner Statusabruf keine Bestätigung
     // erfordert.
-    web(path = "/api/status", readonly, approval = "none")
+    web(path = "/api/status", method = "get", approval = "none")
 )]
 async fn status(ctx: &OpContext, _args: StatusArgs) -> Result<OpOutput, OpError> {
     let session_id = ctx.session_id();
@@ -89,7 +89,7 @@ async fn status(ctx: &OpContext, _args: StatusArgs) -> Result<OpOutput, OpError>
         "Session: {session_id}\nTurn:    {turn_id}\nSandbox: {workspace_id} ({tenant_id})\nPermissions: {permission_count} aktiv",
     );
 
-    Ok(OpOutput { text })
+    Ok(OpOutput::from(text))
 }
 
 #[cfg(test)]

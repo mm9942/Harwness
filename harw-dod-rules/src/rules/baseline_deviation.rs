@@ -72,7 +72,7 @@
 //!
 //! let findings = BaselineDeviationRule.evaluate(&ctx);
 //! assert_eq!(findings.len(), 1);
-//! assert_eq!(findings[0].kind, FindingKind::Anomaly);
+//! assert_eq!(findings[0].kind(), FindingKind::Anomaly);
 //! ```
 
 use harw_dod_signals::Hardness;

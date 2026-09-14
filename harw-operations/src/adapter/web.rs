@@ -10,15 +10,28 @@
 //! `invoke` unverändert an [`Operation::run`].
 //!
 //! # Warum keine dritte Autorisierungslogik entsteht
-//! `WebAdapter` erschöpft sich in genau denselben zwei Achsen, die
-//! [`ModelToolAdapter`] bereits kennt: `readonly` (steuert in `harw-web` die
-//! zulässige HTTP-Methode, `GET` vs. `POST`) und [`ApprovalPolicy`]
-//! (steuert, ob `harw-web` eine Operation direkt ausführen darf oder an eine
-//! Genehmigung weiterreichen muss). Es gibt bewusst **keinen** eigenen
+//! `WebAdapter` erschöpft sich in genau zwei Achsen: `method` — die
+//! **explizite** HTTP-Methode der Route (F-031, siehe
+//! [`crate::operation::WebMethod`]; nicht mehr aus einem `readonly`-Flag
+//! abgeleitet, siehe unten) — und [`ApprovalPolicy`] (steuert, ob `harw-web`
+//! eine Operation direkt ausführen darf oder an eine Genehmigung
+//! weiterreichen muss). Es gibt bewusst **keinen** eigenen
 //! `WebAdapter`-Genehmigungspfad — das ist die in `harw-web`s Moduldoku
 //! geforderte Eigenschaft „kein zweiter Autoritätspfad", hier auf
 //! Typ-Ebene erzwungen: `WebAdapter::approval()` liest exakt das Feld, das
 //! `Surface::Web` von `Surface::ModelTool` übernimmt.
+//!
+//! # F-031: keine Methode mehr aus `readonly` abgeleitet
+//! Vor dieser Welle leitete `harw-web` die zulässige HTTP-Methode aus einem
+//! `readonly`-Flag ab (`GET` für `readonly = true`, sonst `POST`). Das ließ
+//! eine Operation, die sich fälschlich als `readonly` deklarierte, über eine
+//! `GET`-Route erreichbar sein, obwohl sie dauerhafte Seiteneffekte hatte —
+//! `GET` gilt HTTP-semantisch als sicher/idempotent und wird von Browsern
+//! ohne Benutzerinteraktion ausgelöst (Prefetch, `<img src>`, CSRF). Jede
+//! `Surface::Web`-Deklaration muss die Methode seither explizit nennen; es
+//! gibt keinen impliziten Default mehr. [`WebAdapter::readonly`] bleibt als
+//! Bequemlichkeits-Accessor erhalten, ist aber nur noch eine **Ableitung**
+//! aus `method == WebMethod::Get` — kein eigenes Feld mehr.
 //!
 //! # Kardinalität
 //! Wie [`crate::adapter::CommandAdapter`] erzeugt [`WebAdapter::from_operation`]
@@ -37,7 +50,7 @@
 //!
 //! # Nebenläufigkeit
 //! `WebAdapter` ist `Send + Sync`: enthält `Arc<dyn Operation>` (selbst
-//! `Send + Sync`), `&'static str`, `bool` und `Copy`-Enums ohne inneren
+//! `Send + Sync`), `&'static str` und `Copy`-Enums ohne inneren
 //! Zustand — identisch zur Nebenläufigkeitsbegründung von
 //! [`crate::adapter::CommandAdapter`].
 //!
@@ -51,7 +64,7 @@
 //! use harw_operations::adapter::WebAdapter;
 //! use harw_operations::operation::{
 //!     ApprovalPolicy, OpFuture, OpInput, OpOutput, Operation, OperationCategory,
-//!     OperationDomain, OperationMeta, PermissionTier, Surface,
+//!     OperationDomain, OperationMeta, PermissionTier, Surface, WebMethod,
 //! };
 //! use harw_operations::context::OpContext;
 //!
@@ -66,16 +79,17 @@
 //!             permission: PermissionTier::Observer,
 //!             surfaces: vec![Surface::Web {
 //!                 path: "/api/my",
-//!                 readonly: true,
+//!                 method: WebMethod::Get,
 //!                 approval: ApprovalPolicy::None,
 //!             }],
 //!             aliases: &[],
 //!             category: OperationCategory::Misc,
 //!             args_schema: None,
+//!             output_schema: None,
 //!         })
 //!     }
 //!     fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
-//!         Box::pin(async { Ok(OpOutput { text: "ok".to_owned() }) })
+//!         Box::pin(async { Ok(OpOutput::from("ok".to_owned())) })
 //!     }
 //! }
 //!
@@ -90,6 +104,7 @@ use crate::context::OpContext;
 use crate::error::OpError;
 use crate::operation::{
     ApprovalPolicy, OpInput, OpOutput, Operation, OperationMeta, PermissionTier, Surface,
+    WebMethod,
 };
 
 /// Adapter, der eine [`Operation`] als HTTP-Route für `harw-web` exponiert.
@@ -105,7 +120,7 @@ use crate::operation::{
 ///
 /// # Nebenläufigkeit
 /// `WebAdapter` ist `Send + Sync`: enthält `Arc<dyn Operation>` (selbst
-/// `Send + Sync`), `&'static str`, `bool` und `Copy`-Enums ohne inneren
+/// `Send + Sync`), `&'static str` und `Copy`-Enums ohne inneren
 /// Zustand.
 ///
 /// # Fehlertypen
@@ -121,7 +136,7 @@ use crate::operation::{
 pub struct WebAdapter {
     op: Arc<dyn Operation>,
     path: &'static str,
-    readonly: bool,
+    method: WebMethod,
     approval: ApprovalPolicy,
     permission: PermissionTier,
     operation_name: &'static str,
@@ -134,7 +149,7 @@ impl std::fmt::Debug for WebAdapter {
         f.debug_struct("WebAdapter")
             .field("operation_name", &self.operation_name)
             .field("path", &self.path)
-            .field("readonly", &self.readonly)
+            .field("method", &self.method)
             .field("approval", &self.approval)
             .field("permission", &self.permission)
             .finish()
@@ -146,7 +161,7 @@ impl WebAdapter {
     ///
     /// # Description
     /// Iteriert über [`OperationMeta::surfaces`] und erzeugt für jeden
-    /// `Surface::Web { path, readonly, approval }`-Eintrag einen Adapter. Die
+    /// `Surface::Web { path, method, approval }`-Eintrag einen Adapter. Die
     /// Berechtigung wird einmalig aus [`OperationMeta::permission`]
     /// übernommen und gilt für alle erzeugten Adapter dieser Operation.
     /// Andere Surface-Varianten (`Command`, `ModelTool`, `AgentTool`) werden
@@ -190,14 +205,14 @@ impl WebAdapter {
             .filter_map(|surface| {
                 if let Surface::Web {
                     path,
-                    readonly,
+                    method,
                     approval,
                 } = surface
                 {
                     Some(Self {
                         op: Arc::clone(&op),
                         path,
-                        readonly: *readonly,
+                        method: *method,
                         approval: *approval,
                         permission,
                         operation_name,
@@ -231,17 +246,45 @@ impl WebAdapter {
         self.path
     }
 
-    /// Gibt `true` zurück, wenn die Operation keine Nebeneffekte hat.
+    /// Gibt die explizite HTTP-Methode dieser Route zurück.
     ///
     /// # Description
-    /// Spiegelt das `readonly`-Flag aus der `Surface::Web`-Deklaration
-    /// wider. `harw-web` verwendet dieses Flag, um die zulässige
-    /// HTTP-Methode zu bestimmen (`GET` für `readonly`, sonst `POST`) —
-    /// dieselbe Bedeutung wie bei [`crate::adapter::ModelToolAdapter::readonly`].
+    /// Liefert das `method`-Feld aus der `Surface::Web`-Deklaration
+    /// unverändert (F-031, siehe [`crate::operation::WebMethod`]). `harw-web`
+    /// verwendet diesen Wert **direkt** als zulässige HTTP-Methode — es gibt
+    /// keine Ableitung mehr aus einem `readonly`-Flag.
     ///
     /// # Returns
-    /// `bool` — `true` = ausschließlich lesend, `false` = Nebeneffekte
-    /// möglich.
+    /// [`WebMethod`] — `Copy`, keine Allokation.
+    ///
+    /// # Concurrency
+    /// Reentrant; kein Locking erforderlich.
+    ///
+    /// # Examples
+    /// ```rust,no_run
+    /// use harw_operations::operation::WebMethod;
+    /// # let adapter: harw_operations::adapter::WebAdapter = todo!();
+    /// let m = adapter.method();
+    /// assert_eq!(m, WebMethod::Get);
+    /// ```
+    #[must_use]
+    pub fn method(&self) -> WebMethod {
+        self.method
+    }
+
+    /// Gibt `true` zurück, wenn diese Route `GET` verwendet.
+    ///
+    /// # Description
+    /// Bequemlichkeits-Accessor, **abgeleitet** aus
+    /// `method == WebMethod::Get` — kein eigenes Feld mehr (F-031). Anders
+    /// als vor dieser Welle bedeutet `true` hier ausschließlich „HTTP-Methode
+    /// ist `GET`", **nicht** „die Operation hat keine Nebeneffekte": eine
+    /// Operation kann sich fälschlich als `GET` deklarieren und trotzdem
+    /// schreiben — dieser Accessor prüft das nicht und kann es nicht prüfen,
+    /// er liest nur die deklarierte Methode.
+    ///
+    /// # Returns
+    /// `bool` — `true` = `method == WebMethod::Get`, `false` sonst.
     ///
     /// # Concurrency
     /// Reentrant; kein Locking erforderlich.
@@ -253,7 +296,7 @@ impl WebAdapter {
     /// ```
     #[must_use]
     pub fn readonly(&self) -> bool {
-        self.readonly
+        self.method == WebMethod::Get
     }
 
     /// Gibt die Approval-Politik dieser Route zurück.
@@ -339,7 +382,7 @@ impl WebAdapter {
     /// außerhalb des Schreibbereichs dieses Knotens und würde den Contract
     /// erweitern, ohne dass ein belegter Bedarf dafür bestünde). Für eine
     /// Operation ist ein automatisiert-initiierter JSON-Aufruf mit
-    /// `readonly`/`approval`-Achse identisch, gleich ob er vom Modell oder
+    /// `method`/`approval`-Achse identisch, gleich ob er vom Modell oder
     /// über `harw-web` kommt — die Unterscheidung „wer hat aufgerufen"
     /// bleibt in der Adapter-Wahl (`WebAdapter` vs. `ModelToolAdapter`), nicht
     /// im `OpInvocation`-Typ.
@@ -390,7 +433,7 @@ impl WebAdapter {
             "operation.web",
             op = self.operation_name,
             path = self.path,
-            readonly = self.readonly,
+            method = ?self.method,
             json_bytes,
         );
         async move {
@@ -450,7 +493,7 @@ mod tests {
     use crate::error::OpError;
     use crate::operation::{
         ApprovalPolicy, CommandVisibility, OpFuture, OpInput, OpOutput, Operation,
-        OperationCategory, OperationDomain, OperationMeta, PermissionTier, Surface,
+        OperationCategory, OperationDomain, OperationMeta, PermissionTier, Surface, WebMethod,
     };
 
     /// Erstellt einen minimalen [`OpContext`] für Tests.
@@ -499,14 +542,11 @@ mod tests {
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
         fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
-            Box::pin(async {
-                Ok(OpOutput {
-                    text: "noop".to_owned(),
-                })
-            })
+            Box::pin(async { Ok(OpOutput::from("noop".to_owned())) })
         }
     }
 
@@ -521,20 +561,17 @@ mod tests {
                 permission: PermissionTier::Operator,
                 surfaces: vec![Surface::Web {
                     path: "/api/single",
-                    readonly: true,
+                    method: WebMethod::Get,
                     approval: ApprovalPolicy::None,
                 }],
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
         fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
-            Box::pin(async {
-                Ok(OpOutput {
-                    text: "single".to_owned(),
-                })
-            })
+            Box::pin(async { Ok(OpOutput::from("single".to_owned())) })
         }
     }
 
@@ -550,26 +587,23 @@ mod tests {
                 surfaces: vec![
                     Surface::Web {
                         path: "/api/alpha",
-                        readonly: true,
+                        method: WebMethod::Get,
                         approval: ApprovalPolicy::None,
                     },
                     Surface::Web {
                         path: "/api/beta",
-                        readonly: false,
+                        method: WebMethod::Post,
                         approval: ApprovalPolicy::Always,
                     },
                 ],
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
         fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
-            Box::pin(async {
-                Ok(OpOutput {
-                    text: "two".to_owned(),
-                })
-            })
+            Box::pin(async { Ok(OpOutput::from("two".to_owned())) })
         }
     }
 
@@ -589,21 +623,18 @@ mod tests {
                     },
                     Surface::Web {
                         path: "/api/mixed",
-                        readonly: true,
+                        method: WebMethod::Get,
                         approval: ApprovalPolicy::None,
                     },
                 ],
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
         fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
-            Box::pin(async {
-                Ok(OpOutput {
-                    text: "mixed".to_owned(),
-                })
-            })
+            Box::pin(async { Ok(OpOutput::from("mixed".to_owned())) })
         }
     }
 
@@ -618,12 +649,13 @@ mod tests {
                 permission: PermissionTier::Observer,
                 surfaces: vec![Surface::Web {
                     path: "/api/echo-x",
-                    readonly: false,
+                    method: WebMethod::Post,
                     approval: ApprovalPolicy::None,
                 }],
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
         fn run<'a>(&'a self, _ctx: &'a OpContext, input: OpInput) -> OpFuture<'a> {
@@ -634,7 +666,7 @@ mod tests {
                     .get("x")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                Ok(OpOutput { text: x.to_owned() })
+                Ok(OpOutput::from(x.to_owned()))
             })
         }
     }
@@ -650,12 +682,13 @@ mod tests {
                 permission: PermissionTier::Observer,
                 surfaces: vec![Surface::Web {
                     path: "/api/always-err",
-                    readonly: false,
+                    method: WebMethod::Post,
                     approval: ApprovalPolicy::Always,
                 }],
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
         fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
@@ -679,6 +712,7 @@ mod tests {
         let adapters = WebAdapter::from_operation(op);
         assert_eq!(adapters.len(), 1, "Genau ein Adapter erwartet");
         assert_eq!(adapters[0].path(), "/api/single");
+        assert_eq!(adapters[0].method(), WebMethod::Get);
         assert!(adapters[0].readonly());
         assert_eq!(adapters[0].approval(), ApprovalPolicy::None);
         assert_eq!(adapters[0].permission(), PermissionTier::Operator);
@@ -690,8 +724,10 @@ mod tests {
         let adapters = WebAdapter::from_operation(op);
         assert_eq!(adapters.len(), 2, "Zwei Adapter erwartet");
         assert_eq!(adapters[0].path(), "/api/alpha");
+        assert_eq!(adapters[0].method(), WebMethod::Get);
         assert!(adapters[0].readonly());
         assert_eq!(adapters[1].path(), "/api/beta");
+        assert_eq!(adapters[1].method(), WebMethod::Post);
         assert!(!adapters[1].readonly());
         assert_eq!(adapters[1].approval(), ApprovalPolicy::Always);
     }

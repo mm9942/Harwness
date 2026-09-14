@@ -49,7 +49,9 @@
 //! ```rust,no_run
 //! use harw_browser::error::Result;
 //! use harw_browser::host::BrowserHost;
-//! use harw_browser::policy::{BiDiRequirement, OpenBrowserRequest, OriginPolicy, ProfilePolicy};
+//! use harw_browser::policy::{
+//!     BiDiRequirement, BrowserLimits, OpenBrowserRequest, OriginPolicy, ProfilePolicy,
+//! };
 //!
 //! async fn open_example(host: &dyn BrowserHost) -> Result<()> {
 //!     let request = OpenBrowserRequest {
@@ -57,8 +59,10 @@
 //!         headless: true,
 //!         profile: ProfilePolicy::Ephemeral,
 //!         bidi: BiDiRequirement::Preferred,
-//!         allowed_origins: OriginPolicy::new(vec!["example.com".to_owned()], true),
+//!         allowed_origins: OriginPolicy::from_origins(["https://example.com"], true)?,
+//!         authentication_origins: OriginPolicy::default(),
 //!         viewport: None,
+//!         limits: BrowserLimits::default(),
 //!     };
 //!     let _session = host.open(request).await?;
 //!     Ok(())

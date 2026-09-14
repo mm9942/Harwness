@@ -10,6 +10,7 @@ harw-core = { path = "../harw-core" }
 # W1-06b: `file:`/`file-json:`-Credentials nur symlinkfrei unter `<home>/secrets/`
 # (`open_dir_nofollow` + `open_beneath` + `ensure_private_regular`).
 harw-fsutil = { path = "../harw-fsutil" }
+harw-protocol = { path = "../harw-protocol" }
 harw-provider = { path = "../harw-provider" }
 # W1-06b: Endpoint-Prüfung über `EgressUrl` (https-Pflicht, http nur Loopback).
 harw-sandbox = { path = "../harw-sandbox" }

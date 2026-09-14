@@ -84,11 +84,22 @@ impl JobEntry {
 /// Baut den Principal eines Jobs an der Eingangsgrenze des Job-Workers.
 ///
 /// # Description
-/// `Channel` × `JobWorker` × `Operator` (CONTRACTS.md §principal). Die Kennung
-/// ist die id des authentifizierten Einreichers aus dem gespeicherten Job-Scope,
-/// nie ein Wert aus der Job-Eingabe. Auf `JobWorker` liefert
+/// `Channel` × `JobWorker` × `Observer` (CONTRACTS.md §principal, R7). Die
+/// Kennung ist die id des authentifizierten Einreichers aus dem gespeicherten
+/// Job-Scope, nie ein Wert aus der Job-Eingabe. Auf `JobWorker` liefert
 /// [`Principal::approval_actor`] bewusst `None`: ein Job beantwortet keine
 /// Freigaben selbst.
+///
+/// Der Tier ist auf `Observer` gesetzt, nicht weil ein Job nur lesen dürfte,
+/// sondern weil er auf `JobWorker`-Einstiegen (`EntryKind::JobPrompt`,
+/// `EntryKind::JobPlanNode`) wirkungslos ist: keiner der beiden Bau-Pfade ruft
+/// `harw_runtime::permissions_for_tier`, das nur der Web-Einstieg nutzt
+/// (`harw-cli/src/runtime_web.rs`), und `RuntimeAssembly::build` liest
+/// `principal.tier()` an keiner Stelle. Rechte kommen für Job-Einstiege
+/// ausschließlich aus der Profiltabelle bzw. `RuntimeNarrowing::permissions`
+/// (R0-F). Der niedrigste Tier macht die Absicht sichtbar: ein Job-Principal
+/// trägt selbst keine Mutationsbefugnis, die Mutation kommt aus der
+/// Vertragsableitung.
 ///
 /// # Arguments
 /// - `submitter_id`: Operator-id des Einreichers (`ApprovalActor::Operator { id }`).
@@ -98,7 +109,7 @@ pub(crate) fn job_principal(submitter_id: &str) -> Principal {
         PrincipalKind::Channel,
         submitter_id,
         IngressSurface::JobWorker,
-        PermissionTier::Operator,
+        PermissionTier::Observer,
     )
 }
 
@@ -268,12 +279,12 @@ mod tests {
     }
 
     #[test]
-    fn test_job_principal_is_channel_jobworker_operator() {
+    fn test_job_principal_uses_observer_tier() {
         let principal = job_principal("client-7");
         assert_eq!(principal.kind(), PrincipalKind::Channel);
         assert_eq!(principal.id(), "client-7");
         assert_eq!(principal.surface(), IngressSurface::JobWorker);
-        assert_eq!(principal.tier(), PermissionTier::Operator);
+        assert_eq!(principal.tier(), PermissionTier::Observer);
         assert_eq!(principal.approval_actor(), None);
     }
 
@@ -340,5 +351,9 @@ mod tests {
         assert_eq!(assembly.sandbox().permissions().iter().count(), 0);
         assert!(assembly.job_store().is_some());
         assert_eq!(assembly.spawn_context().approval_actor, None);
+        // R7: a `JobPrompt` assembly has no operations surface, so the
+        // principal's `PermissionTier` (now `Observer`, see `job_principal`)
+        // has nothing to gate here.
+        assert_eq!(assembly.operations().iter().count(), 0);
     }
 }

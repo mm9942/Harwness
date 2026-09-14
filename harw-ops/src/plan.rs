@@ -37,16 +37,41 @@
 //! Tool-Zweig erreicht wird). Das ist keine Heuristik über Feldinhalte, sondern
 //! die Umkehrung des Makro-Dispatchs.
 //!
-//! # Akteur
-//! Der `actor` für [`PlanStore::apply`] ist die Session-Identität mit dem
-//! Flächen-Präfix: `"human:<session>"` für die Command-Fläche,
-//! `"model:<session>"` für Modell- und Agent-Tool. Das Präfix ist nicht Kosmetik
-//! — `harw_plan::goal::validate_goal_action` entscheidet an genau diesem Präfix,
-//! ob ein Akteur ein Ziel für erreicht erklären darf (siehe
-//! [`crate::goal`]).
+//! # Akteur (W4a/A-OPSPLAN, F-049, G-031)
+//! Der `actor` jeder Plan-/Goal-Mutation entsteht **ausschließlich** aus dem
+//! an der Eingangsgrenze authentifizierten [`Principal`] im [`OpContext`]
+//! (`ctx.service::<Principal>()`, siehe [`require_principal`]) zusammen mit der
+//! Aufruf-Fläche ([`CallSurface::actor_for_principal`]):
+//!
+//! | Fläche | `Principal::kind()` | Akteur |
+//! |---|---|---|
+//! | [`CallSurface::Command`] | `Human` | `human:<principal-id>@<session>` |
+//! | [`CallSurface::Command`] | `Model`/`Operation`/`Channel` | `model:<kind>/<principal-id>@<session>` |
+//! | [`CallSurface::Model`] | beliebig | `model:<kind>/<principal-id>@<session>` |
+//!
+//! `human:` gibt es also nur, wenn **beide** Quellen übereinstimmen: ein
+//! menschlicher Principal **und** die Command-Fläche. Jede andere Kombination
+//! bekommt fail-closed das Präfix `model:`, an dem
+//! `harw_plan::goal::validate_goal_action` `Achieved`/`Abandoned` sperrt. Fehlt
+//! der Principal, endet die Operation mit [`OpError::NotAvailable`] — es gibt
+//! **keinen** Default-Akteur mehr (vorher `human:<session>`/`model:<session>`
+//! allein aus dem Parse-Pfad).
+//!
+//! Die Fläche selbst stammt weiterhin aus dem Parse-Pfad des Makros (Tabelle
+//! oben); das bleibt eine Makro-Eigenschaft, die ein Principal allein nicht
+//! ersetzen kann, weil die Runtime auf Slash- und ModelTool-Fläche denselben
+//! Principal ablegt (`harw-runtime/src/services.rs`, Tabelle in
+//! `service_map`). Der Principal verhindert aber, dass eine falsch erkannte
+//! Fläche einem Nicht-Menschen `human:` verschafft. Der generische
+//! [`SurfaceCall`] trägt dieselbe Ableitung für `explore`, `research_*` und
+//! `analyze`.
 //!
 //! # Approval-Politik
-//! Deklariert ist `model_tool(approval = "always")`. **Gewollt** wäre
+//! Deklariert ist `model_tool(approval = "always")`. Weil `plan` nicht in
+//! `harw_registry_defaults::AUTO_APPROVED_TOOLS` steht (W1-05), liefert die
+//! `DefaultApprovalPolicy` für jeden Modell-Aufruf im Modus `Delegated`
+//! `ApprovalDecision::AskUser` — geprüft in
+//! `harw-ops/tests/plan_authority.rs`. **Gewollt** wäre
 //! [`harw_operations::ApprovalPolicy::RequireForScope`]: die Lesezugriffe
 //! `inspect`, `ready`, `waves` und `reconcile` verändern den Plan nicht (auch
 //! `reconcile` wendet nur Runtime-Schritte an und gibt jede Entscheidung als
@@ -56,7 +81,8 @@
 //!
 //! Das `#[operation]`-Makro kann das derzeit nicht ausdrücken: `map_approval`
 //! in `harw-macros/src/operation.rs` akzeptiert ausschließlich `"none"` und
-//! `"always"`. Deshalb steht hier fail-closed `"always"`.
+//! `"always"`. Deshalb steht hier `"always"` — auch lesende Subcommands fragen
+//! auf der Modell-Fläche nach.
 //!
 //! **Nötige Erweiterung** (eine Zeile pro Variante in `map_approval`):
 //! ```text
@@ -78,9 +104,10 @@
 //! Die Serialisierung der Mutationen liegt beim `PlanStore` (`RwLock`).
 //!
 //! # Fehler
-//! - [`OpError::NotAvailable`] — kein Plan-Store registriert oder Tool deaktiviert.
+//! - [`OpError::NotAvailable`] — kein Plan-Store registriert, Tool deaktiviert
+//!   oder kein [`Principal`] im Kontext.
 //! - [`OpError::InvalidArguments`] — Argumentgrammatik verletzt, unbekannte
-//!   Knotenart/Status/Nachweisart.
+//!   Knotenart/Status/Nachweisart, Plan-ID verletzt die `PlanId`-Grammatik.
 //! - [`OpError::Execution`] — der Plan-Store oder die Bridge lehnt ab.
 //!
 //! # Beispiel
@@ -107,7 +134,7 @@ use harw_plan::{PlanStore, PlanToolConfig};
 use harw_plan_bridge::{
     OpContextPlanExt, PlanBridgeError, PlanController, ReconcileInput, ReconcileStep,
 };
-use harw_types::SessionId;
+use harw_types::{Principal, PrincipalKind, SessionId};
 use time::OffsetDateTime;
 
 // ── Aufruf-Fläche ────────────────────────────────────────────────────────────
@@ -144,14 +171,22 @@ pub enum CallSurface {
     Model,
 }
 
+/// Fehlertext, wenn der [`OpContext`] keinen [`Principal`] trägt.
+///
+/// Öffentlich, damit Tests und Aufrufer den Fall eindeutig erkennen, statt
+/// ihn mit „kein Plan-Store" zu verwechseln.
+pub const MISSING_PRINCIPAL: &str = "kein authentifizierter Principal im Kontext; \
+     Plan-, Ziel- und Recherche-Mutationen brauchen einen an der Eingangsgrenze \
+     ermittelten Aufrufer (kein Default-Akteur)";
+
 impl CallSurface {
-    /// Gibt das Akteur-Präfix dieser Fläche zurück.
+    /// Gibt das Flächen-Präfix zurück (ohne Principal).
     ///
     /// # Beschreibung
-    /// `"human"` für [`Self::Command`], `"model"` für [`Self::Model`]. Das
-    /// Präfix ist die Grundlage der Autoritätsprüfung in
-    /// `harw_plan::goal::validate_goal_action`, die jeden Akteur mit
-    /// `"model:"`-Präfix von `Achieved`/`Abandoned` ausschließt.
+    /// `"human"` für [`Self::Command`], `"model"` für [`Self::Model`]. Das ist
+    /// nur die **Obergrenze** dieser Fläche; der tatsächliche Akteur entsteht
+    /// in [`Self::actor_for_principal`] und bekommt `human` nur zusätzlich mit
+    /// einem menschlichen Principal.
     ///
     /// # Rückgabe
     /// Ein statischer String ohne Doppelpunkt.
@@ -163,31 +198,207 @@ impl CallSurface {
         }
     }
 
-    /// Baut den vollständigen Akteur-Bezeichner für einen Store-Aufruf.
+    /// Baut den Akteur-Bezeichner aus Principal, Fläche und Session.
     ///
-    /// # Argumente
-    /// - `session` (`&SessionId`): Identität der aktuellen Session (aus dem
-    ///   [`OpContext`], nie aus Modell-Argumenten).
+    /// # Description
+    /// `human:<id>@<session>` genau dann, wenn die Fläche [`Self::Command`]
+    /// **und** `principal.kind()` [`PrincipalKind::Human`] ist; sonst
+    /// `model:<kind>/<id>@<session>`. Das Präfix `model:` ist der Schalter, an
+    /// dem `harw_plan::goal::validate_goal_action` `Achieved`/`Abandoned`
+    /// verweigert — ein Nicht-Mensch kann es über keine Fläche verlieren.
     ///
-    /// # Rückgabe
-    /// `"human:<session>"` bzw. `"model:<session>"`.
+    /// # Arguments
+    /// - `principal` (`&Principal`): der authentifizierte Aufrufer aus dem
+    ///   [`OpContext`], nie aus Modell-Argumenten.
+    /// - `session` (`&SessionId`): Session des Kontexts (Audit-Zuordnung).
     ///
-    /// # Beispiel
-    /// ```rust,no_run
-    /// # use harw_ops::plan::CallSurface;
-    /// # use harw_types::SessionId;
-    /// let actor = CallSurface::Command.actor_for(&SessionId::new());
-    /// assert!(actor.starts_with("human:"));
+    /// # Returns
+    /// Der Akteur als `String`.
+    ///
+    /// # Concurrency
+    /// Reine Funktion.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_ops::plan::CallSurface;
+    /// use harw_types::{IngressSurface, PermissionTier, Principal, PrincipalKind, SessionId};
+    ///
+    /// let human = Principal::trusted_ingress(
+    ///     PrincipalKind::Human,
+    ///     "uid:1000",
+    ///     IngressSurface::Cli,
+    ///     PermissionTier::Operator,
+    /// );
+    /// let session = SessionId::new();
+    /// assert!(CallSurface::Command.actor_for_principal(&human, &session).starts_with("human:"));
+    /// assert!(CallSurface::Model.actor_for_principal(&human, &session).starts_with("model:"));
     /// ```
     #[must_use]
-    pub fn actor_for(self, session: &SessionId) -> String {
-        format!("{}:{session}", self.actor_prefix())
+    pub fn actor_for_principal(self, principal: &Principal, session: &SessionId) -> String {
+        match (self, principal.kind()) {
+            (Self::Command, PrincipalKind::Human) => {
+                format!("human:{}@{session}", principal.id())
+            }
+            (Self::Command | Self::Model, kind) => {
+                format!("model:{}/{}@{session}", principal_kind_label(kind), principal.id())
+            }
+        }
     }
 
     /// `true`, wenn der Aufruf von einem Modell (Model-Tool oder Agent-Tool) kam.
     #[must_use]
     pub fn is_model(self) -> bool {
         matches!(self, Self::Model)
+    }
+}
+
+/// Kleinschreibiges Etikett einer [`PrincipalKind`] für Akteur-Bezeichner.
+///
+/// Heißt bewusst nicht `kind_label`: weiter unten gibt es dasselbe Etikett für
+/// [`PlanNodeKind`], und zwei gleichnamige Funktionen im selben Modul sind ein
+/// Fehler, kein Überladen.
+fn principal_kind_label(kind: PrincipalKind) -> &'static str {
+    match kind {
+        PrincipalKind::Human => "human",
+        PrincipalKind::Model => "model",
+        PrincipalKind::Operation => "operation",
+        PrincipalKind::Channel => "channel",
+    }
+}
+
+/// Liest den authentifizierten [`Principal`] aus dem Kontext.
+///
+/// # Description
+/// Die Runtime legt den Principal als Dienst in jede Service-Map
+/// (`harw-runtime/src/services.rs`, `insert_service(.., principal.clone())`;
+/// Web überschreibt ihn je Peer in `harw-cli/src/web.rs`). Diese Funktion ist
+/// der einzige Zugriffspunkt der Planungsfläche — fehlt er, gibt es keinen
+/// Rückfall.
+///
+/// # Arguments
+/// - `ctx` (`&OpContext`): Ausführungskontext.
+///
+/// # Returns
+/// Referenz auf den Principal.
+///
+/// # Errors
+/// - [`OpError::NotAvailable`] mit [`MISSING_PRINCIPAL`]: kein Principal im Kontext.
+///
+/// # Concurrency
+/// Reiner Lesezugriff auf die unveränderliche Service-Map.
+///
+/// # Examples
+/// ```rust,no_run
+/// # fn run(ctx: &harw_operations::OpContext) -> Result<(), harw_operations::OpError> {
+/// let principal = harw_ops::plan::require_principal(ctx)?;
+/// # let _ = principal;
+/// # Ok(())
+/// # }
+/// ```
+pub fn require_principal(ctx: &OpContext) -> Result<&Principal, OpError> {
+    ctx.service::<Principal>()
+        .ok_or_else(|| OpError::NotAvailable(MISSING_PRINCIPAL.to_owned()))
+}
+
+/// Liest den Principal und bildet den Akteur für eine Fläche.
+///
+/// # Errors
+/// - [`OpError::NotAvailable`]: kein Principal im Kontext.
+pub(crate) fn require_actor(ctx: &OpContext, surface: CallSurface) -> Result<String, OpError> {
+    let principal = require_principal(ctx)?;
+    Ok(surface.actor_for_principal(principal, ctx.session_id()))
+}
+
+/// Parst eine vom Aufrufer gelieferte Plan-ID gegen die `PlanId`-Grammatik.
+///
+/// # Description
+/// Die Fehlermeldung wiederholt den Rohwert bewusst **nicht** und nennt keinen
+/// Speicherpfad: eine Traversal-Eingabe (`../..`) soll weder im Chat-Verlauf
+/// noch im Log als Pfad erscheinen.
+///
+/// # Errors
+/// - [`OpError::InvalidArguments`]: Grammatik verletzt.
+pub(crate) fn parse_plan_id(raw: &str) -> Result<PlanId, OpError> {
+    PlanId::parse(raw.trim()).map_err(|_| {
+        OpError::InvalidArguments(
+            "ungültige Plan-ID: erlaubt sind 1 bis 64 Zeichen aus a-z, 0-9 und '-', \
+             beginnend mit einem Buchstaben oder einer Ziffer"
+                .to_owned(),
+        )
+    })
+}
+
+/// Argument-Hülle mit Aufruf-Fläche für Operationen ohne eigene Hülle.
+///
+/// # Description
+/// Dieselbe Ableitung wie [`PlanCall`], generisch für `explore`, `research_*`
+/// und `analyze`: [`harw_operations::FromRawArgs`] ⇒ [`CallSurface::Command`],
+/// `Deserialize` und `Default` ⇒ [`CallSurface::Model`]. Das Schema der
+/// Modell-Fläche ist das von `A`.
+///
+/// # Concurrency
+/// `Send + Sync`, wenn `A` es ist.
+///
+/// # Examples
+/// ```rust
+/// use harw_ops::plan::{CallSurface, SurfaceCall};
+///
+/// let call = SurfaceCall::from_model(harw_ops::explore::ExploreArgs::default());
+/// assert_eq!(call.surface, CallSurface::Model);
+/// ```
+#[derive(Debug)]
+pub struct SurfaceCall<A> {
+    /// Fläche, über die der Aufruf kam.
+    pub surface: CallSurface,
+    /// Die eigentlichen Argumente.
+    pub args: A,
+}
+
+impl<A> SurfaceCall<A> {
+    /// Baut einen Aufruf der Command-Fläche.
+    #[must_use]
+    pub fn from_command(args: A) -> Self {
+        Self {
+            surface: CallSurface::Command,
+            args,
+        }
+    }
+
+    /// Baut einen Aufruf der Modell-Tool-Fläche.
+    #[must_use]
+    pub fn from_model(args: A) -> Self {
+        Self {
+            surface: CallSurface::Model,
+            args,
+        }
+    }
+}
+
+impl<A: Default> Default for SurfaceCall<A> {
+    /// Nur im Tool-Zweig des Makros erreicht (`Null`-Argumente) ⇒ Modell.
+    fn default() -> Self {
+        Self::from_model(A::default())
+    }
+}
+
+impl<'de, A: serde::Deserialize<'de>> serde::Deserialize<'de> for SurfaceCall<A> {
+    /// Serde-Pfad: nur `ModelTool`/`AgentTool` ⇒ Modell.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        A::deserialize(deserializer).map(Self::from_model)
+    }
+}
+
+impl<A: harw_operations::FromRawArgs> harw_operations::FromRawArgs for SurfaceCall<A> {
+    /// Command-Pfad ⇒ Command-Fläche.
+    fn from_raw_args(tokens: &[String]) -> Result<Self, OpError> {
+        A::from_raw_args(tokens).map(Self::from_command)
+    }
+}
+
+impl<A: harw_operations::OpArgsSchema> harw_operations::OpArgsSchema for SurfaceCall<A> {
+    /// Reicht das Schema von `A` durch; die Hülle ist auf der Modell-Fläche unsichtbar.
+    fn json_schema() -> harw_tools::JsonSchema {
+        A::json_schema()
     }
 }
 
@@ -456,10 +667,11 @@ impl harw_operations::OpArgsSchema for PlanCall {
 /// - `call` (`PlanCall`): Subcommand plus Aufruf-Fläche.
 ///
 /// # Rückgabe
-/// `Ok(OpOutput { text })` mit kompaktem, für ein Modell lesbarem Text.
+/// `Ok(OpOutput::from(text))` mit kompaktem, für ein Modell lesbarem Text.
 ///
 /// # Fehler
-/// - [`OpError::NotAvailable`]: kein Plan-Store bzw. Werkzeug deaktiviert.
+/// - [`OpError::NotAvailable`]: kein Plan-Store, Werkzeug deaktiviert oder kein
+///   [`Principal`] im Kontext ([`MISSING_PRINCIPAL`]).
 /// - [`OpError::InvalidArguments`]: fehlende oder unverständliche Argumente.
 /// - [`OpError::Execution`]: `harw-plan` oder `harw-plan-bridge` lehnt ab.
 ///
@@ -483,7 +695,7 @@ impl harw_operations::OpArgsSchema for PlanCall {
     // denselben Aufrufpfad ab — `approval = "always"` behandelt jeden
     // Aufruf konservativ als bestätigungspflichtig, statt eine neue,
     // sub-kommando-genaue Autoritätsachse zu erfinden.
-    web(path = "/api/plan", approval = "always")
+    web(path = "/api/plan", method = "post", approval = "always")
 )]
 async fn plan(ctx: &OpContext, call: PlanCall) -> Result<OpOutput, OpError> {
     let config = require_service!(ctx.plan_config(), "Plan-Store");
@@ -492,9 +704,10 @@ async fn plan(ctx: &OpContext, call: PlanCall) -> Result<OpOutput, OpError> {
             "Plan-Werkzeug ist nicht nutzbar ({error}); aktiviere es über `[tools.plan] enabled = true`"
         ))
     })?;
+    // Autorität vor jedem Store-Zugriff: ohne Principal kein Akteur, ohne
+    // Akteur keine Aktion (auch keine lesende — fail-closed, F-049).
+    let actor = require_actor(ctx, call.surface)?;
     let store_handle = require_service!(ctx.plan_store(), "Plan-Store");
-
-    let actor = call.surface.actor_for(ctx.session_id());
     let store: &dyn PlanStore = store_handle.as_ref();
 
     let text = match call.args {
@@ -504,12 +717,12 @@ async fn plan(ctx: &OpContext, call: PlanCall) -> Result<OpOutput, OpError> {
         PlanArgs::Reconcile => run_reconcile(ctx, store, &config, &actor)?,
 
         PlanArgs::Create { id, goal } => {
-            let plan_id = require_arg(id, "plan create <plan-id> <ziel…>")?;
+            let plan_id = parse_plan_id(&require_arg(id, "plan create <plan-id> <ziel…>")?)?;
             let goal = require_arg(goal, "plan create <plan-id> <ziel…>")?;
             let event = apply(
                 store,
                 PlanAction::Create {
-                    plan_id: PlanId::new(plan_id.as_str()),
+                    plan_id: plan_id.clone(),
                     goal,
                 },
                 &actor,
@@ -740,7 +953,7 @@ async fn plan(ctx: &OpContext, call: PlanCall) -> Result<OpOutput, OpError> {
         }
     };
 
-    Ok(OpOutput { text })
+    Ok(OpOutput::from(text))
 }
 
 // ── Store-Zugriff ────────────────────────────────────────────────────────────
@@ -1348,14 +1561,36 @@ mod tests {
     use harw_plan::types::{PlanNodeKind, PlanNodeStatus};
     use harw_plan::{InMemoryPlanStore, PlanStore, PlanToolConfig};
     use harw_sandbox::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
-    use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
+    use harw_types::{
+        IngressSurface, PermissionTier, Principal, PrincipalKind, SessionId, TenantId, TurnId,
+        WorkspaceId,
+    };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     // ── Fixtures ─────────────────────────────────────────────────────────────
 
-    /// Baut einen `OpContext` mit temporärem Workspace und den übergebenen Diensten.
-    fn context_with(services: ServiceMap) -> (OpContext, std::path::PathBuf) {
+    /// Menschlicher Test-Principal, wie ihn `local_principal(Cli)` baut.
+    fn human_principal() -> Principal {
+        Principal::trusted_ingress(
+            PrincipalKind::Human,
+            "uid:1000",
+            IngressSurface::Cli,
+            PermissionTier::Operator,
+        )
+    }
+
+    /// Baut einen `OpContext` mit temporärem Workspace und den übergebenen
+    /// Diensten; ergänzt einen menschlichen Principal, falls keiner darin liegt.
+    fn context_with(mut services: ServiceMap) -> (OpContext, std::path::PathBuf) {
+        if services.get::<Principal>().is_none() {
+            services.insert(human_principal());
+        }
+        bare_context(services)
+    }
+
+    /// Wie [`context_with`], aber ohne den Principal zu ergänzen.
+    fn bare_context(services: ServiceMap) -> (OpContext, std::path::PathBuf) {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!("harw-plan-op-{}-{id}", std::process::id()));
@@ -1610,14 +1845,99 @@ mod tests {
     }
 
     #[test]
-    fn actor_prefix_reflects_the_calling_surface() {
+    fn test_actor_for_principal_human_needs_command_surface_and_human_principal() {
         let session = SessionId::new();
-        assert!(
-            CallSurface::Command
-                .actor_for(&session)
-                .starts_with("human:")
+        let human = human_principal();
+        let command = CallSurface::Command.actor_for_principal(&human, &session);
+        assert_eq!(command, format!("human:uid:1000@{session}"));
+        let model = CallSurface::Model.actor_for_principal(&human, &session);
+        assert_eq!(model, format!("model:human/uid:1000@{session}"));
+    }
+
+    #[test]
+    fn test_actor_for_principal_non_human_principal_never_gets_human_prefix() {
+        let session = SessionId::new();
+        for kind in [
+            PrincipalKind::Model,
+            PrincipalKind::Operation,
+            PrincipalKind::Channel,
+        ] {
+            let principal = Principal::trusted_ingress(
+                kind,
+                "client-7",
+                IngressSurface::Mcp,
+                PermissionTier::Owner,
+            );
+            for surface in [CallSurface::Command, CallSurface::Model] {
+                let actor = surface.actor_for_principal(&principal, &session);
+                assert!(
+                    actor.starts_with("model:"),
+                    "{kind:?} über {surface:?} muss 'model:' tragen, war: {actor}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_plan_without_principal_is_not_available_and_writes_nothing() {
+        let store: Arc<dyn PlanStore> = Arc::new(InMemoryPlanStore::new());
+        let mut services = ServiceMap::new();
+        services.insert(Arc::clone(&store));
+        services.insert(PlanToolConfig::enabled_defaults());
+        let (ctx, root) = bare_context(services);
+
+        let result = run_command(&ctx, &["create", "p-1", "ohne", "Principal"]).await;
+        let plan = store.current();
+        cleanup(root);
+
+        match result {
+            Err(OpError::NotAvailable(message)) => {
+                assert_eq!(message, super::MISSING_PRINCIPAL);
+            }
+            other => panic!("erwartet NotAvailable, war: {other:?}"),
+        }
+        assert!(plan.is_err(), "ohne Principal darf kein Plan entstehen");
+    }
+
+    #[tokio::test]
+    async fn test_plan_create_rejects_invalid_plan_id_without_echoing_it() {
+        let (ctx, store, root) = context_with_store();
+        let traversal = run_command(&ctx, &["create", "../../etc", "Ziel"]).await;
+        let upper = run_command(&ctx, &["create", "My_Plan", "Ziel"]).await;
+        let plan = store.current();
+        cleanup(root);
+
+        for result in [traversal, upper] {
+            match result {
+                Err(OpError::InvalidArguments(message)) => {
+                    assert!(message.contains("ungültige Plan-ID"), "war: {message}");
+                    assert!(!message.contains(".."), "Rohwert/Pfad im Fehlertext: {message}");
+                    assert!(!message.contains("My_Plan"), "Rohwert im Fehlertext: {message}");
+                }
+                other => panic!("erwartet InvalidArguments, war: {other:?}"),
+            }
+        }
+        assert!(plan.is_err(), "eine abgelehnte ID darf keinen Plan anlegen");
+    }
+
+    #[test]
+    fn test_surface_call_derives_surface_from_parse_path() {
+        use crate::explore::ExploreArgs;
+        let command = match super::SurfaceCall::<ExploreArgs>::from_raw_args(&toks(&["frage"])) {
+            Ok(call) => call,
+            Err(error) => panic!("Command-Parse schlug fehl: {error}"),
+        };
+        assert_eq!(command.surface, CallSurface::Command);
+        let model: super::SurfaceCall<ExploreArgs> =
+            match serde_json::from_value(serde_json::json!({ "question": "frage" })) {
+                Ok(call) => call,
+                Err(error) => panic!("JSON-Parse schlug fehl: {error}"),
+            };
+        assert_eq!(model.surface, CallSurface::Model);
+        assert_eq!(
+            super::SurfaceCall::<ExploreArgs>::default().surface,
+            CallSurface::Model
         );
-        assert!(CallSurface::Model.actor_for(&session).starts_with("model:"));
     }
 
     // ── Verfügbarkeit ────────────────────────────────────────────────────────
@@ -1682,7 +2002,7 @@ mod tests {
 
         match plan {
             Ok(plan) => {
-                assert_eq!(plan.id, PlanId::new("p-1"));
+                assert_eq!(plan.id, PlanId::parse("p-1").expect("gültige Test-ID"));
                 assert_eq!(plan.nodes.len(), 2);
                 let second = plan
                     .nodes
@@ -1763,7 +2083,7 @@ mod tests {
         let seeded = store
             .apply(
                 PlanAction::Create {
-                    plan_id: PlanId::new("p-waves"),
+                    plan_id: PlanId::parse("p-waves").expect("gültige Test-ID"),
                     goal: "Wellen".to_owned(),
                 },
                 "test",
@@ -1827,7 +2147,7 @@ mod tests {
         let seeded = store
             .apply(
                 PlanAction::Create {
-                    plan_id: PlanId::new("p-rec"),
+                    plan_id: PlanId::parse("p-rec").expect("gültige Test-ID"),
                     goal: "Abgleich".to_owned(),
                 },
                 "test",

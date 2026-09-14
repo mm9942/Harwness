@@ -145,9 +145,7 @@ async fn agent(ctx: &OpContext, args: AgentArgs) -> Result<OpOutput, OpError> {
         "list" => {
             let children = spawner.list_children_for(ctx.session_id());
             if children.is_empty() {
-                return Ok(OpOutput {
-                    text: "Keine aktiven Child-Agents.".to_owned(),
-                });
+                return Ok(OpOutput::from("Keine aktiven Child-Agents.".to_owned()));
             }
             let mut lines = vec![format!("{} aktive(r) Child-Agent(s):", children.len())];
             for record in &children {
@@ -156,10 +154,8 @@ async fn agent(ctx: &OpContext, args: AgentArgs) -> Result<OpOutput, OpError> {
                     record.child, record.role, record.depth, record.lease_expires_at
                 ));
             }
-            Ok(OpOutput {
-                text: lines.join("
-"),
-            })
+            Ok(OpOutput::from(lines.join("
+")))
         }
         "stop" => {
             let Some(target) = args.target.as_deref() else {
@@ -169,9 +165,9 @@ async fn agent(ctx: &OpContext, args: AgentArgs) -> Result<OpOutput, OpError> {
             };
             let child_id = harw_types::SessionId::from_str(target.to_owned());
             if spawner.request_cancellation(&child_id) {
-                Ok(OpOutput {
-                    text: format!("Cancellation für Child-Agent {target} angefordert."),
-                })
+                Ok(OpOutput::from(format!(
+                    "Cancellation für Child-Agent {target} angefordert."
+                )))
             } else {
                 Err(OpError::InvalidArguments(format!(
                     "no admitted child agent found for target '{target}'"

@@ -4,6 +4,15 @@
 //! the request crosses a concrete HTTP-provider boundary.  It never rewrites
 //! a [`ModelRequest`]: in particular, `model_id` remains available to the
 //! selected backend.
+//!
+//! ## No silent fallback (G-048, W4a / A-OAI)
+//! Routing never substitutes a different backend (and never an echo
+//! provider): a request naming an unknown provider, or carrying an empty
+//! provider id, fails with [`ModelError::RequestFailed`] before any backend
+//! is called. Only a request *without* a provider id uses the configured
+//! default. A backend whose construction failed stays registered as an
+//! explicit error backend (see `build_provider`), so its requests fail
+//! loudly instead of reaching another provider.
 
 use crate::error::{HttpProviderError, HttpProviderResult};
 use harw_core::{ModelError, ModelFuture, ModelProvider, ModelRequest};
@@ -48,29 +57,45 @@ impl RoutingModelProvider {
         })
     }
 
-    fn selected_provider_id<'a>(&'a self, request: &'a ModelRequest) -> &'a str {
-        request
-            .provider_id
-            .as_ref()
-            .map(|provider_id| provider_id.as_str())
-            .filter(|provider_id| !provider_id.is_empty())
-            .unwrap_or(&self.default_provider_id)
+    /// Returns the ids of all registered backends in deterministic order.
+    pub fn provider_ids(&self) -> impl Iterator<Item = &str> {
+        self.providers.keys().map(String::as_str)
+    }
+
+    /// Resolves the backend for `request` without any fallback.
+    ///
+    /// # Errors
+    /// [`ModelError::RequestFailed`] for an empty provider id or an id that is
+    /// not registered (G-048: never routed to the default instead).
+    fn select(&self, request: &ModelRequest) -> Result<&dyn ModelProvider, ModelError> {
+        let provider_id = match request.provider_id.as_ref() {
+            None => self.default_provider_id.as_str(),
+            Some(provider_id) if provider_id.as_str().trim().is_empty() => {
+                return Err(ModelError::RequestFailed(
+                    "requested model provider id is empty; refusing to fall back to the default provider"
+                        .to_owned(),
+                ));
+            }
+            Some(provider_id) => provider_id.as_str(),
+        };
+        self.providers
+            .get(provider_id)
+            .map(|provider| &**provider)
+            .ok_or_else(|| {
+                tracing::warn!(provider = provider_id, "model request for unconfigured provider");
+                ModelError::RequestFailed(format!(
+                    "requested model provider '{provider_id}' is not configured"
+                ))
+            })
     }
 }
 
 impl ModelProvider for RoutingModelProvider {
     fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
-        let provider_id = self.selected_provider_id(&request);
-        let Some(provider) = self.providers.get(provider_id) else {
-            let provider_id = provider_id.to_owned();
-            return Box::pin(async move {
-                Err(ModelError::RequestFailed(format!(
-                    "requested model provider '{provider_id}' is not configured"
-                )))
-            });
-        };
-
-        provider.respond(request)
+        match self.select(&request) {
+            Ok(provider) => provider.respond(request),
+            Err(error) => Box::pin(async move { Err(error) }),
+        }
     }
 }
 
@@ -118,6 +143,9 @@ mod tests {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         }
     }
 
@@ -219,6 +247,52 @@ mod tests {
 
         assert!(matches!(error, ModelError::RequestFailed(_)));
         assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_respond_empty_provider_id_is_error_not_default_fallback() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let router = RoutingModelProvider::new(
+            registry([(
+                "default",
+                Box::new(RecordingProvider::new("default", Arc::clone(&requests)))
+                    as Box<dyn ModelProvider>,
+            )]),
+            "default",
+        )
+        .unwrap();
+
+        let error = router
+            .respond(request().with_provider_id(Some(ProviderId::from(""))))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, ModelError::RequestFailed(message) if message.contains("empty")),
+            "unexpected error: {error}"
+        );
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_provider_ids_lists_registered_backends_in_order() {
+        let router = RoutingModelProvider::new(
+            registry([
+                (
+                    "zeta",
+                    Box::new(RecordingProvider::new("z", Arc::new(Mutex::new(Vec::new()))))
+                        as Box<dyn ModelProvider>,
+                ),
+                (
+                    "alpha",
+                    Box::new(RecordingProvider::new("a", Arc::new(Mutex::new(Vec::new()))))
+                        as Box<dyn ModelProvider>,
+                ),
+            ]),
+            "zeta",
+        )
+        .unwrap();
+        assert_eq!(router.provider_ids().collect::<Vec<_>>(), vec!["alpha", "zeta"]);
     }
 
     #[test]

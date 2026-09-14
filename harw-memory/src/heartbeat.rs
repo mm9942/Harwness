@@ -1,27 +1,52 @@
 //! Continuous Improvement — Heartbeat-Tick für die Memory-Promotion-Pipeline.
 //!
 //! # Verantwortungsbereich
-//! Implementiert §6 der `docs/design/memory-v2.md`. Wertet [`crate::store::Memory::stats()`]
-//! aus und leitet daraus einen deterministischen [`HeartbeatReport`] ab — ohne direkten
-//! State-Eingriff. Die tatsächliche HOT-Kürzung obliegt dem Store; dieser Modul meldet
-//! nur das erwartete Delta.
+//! Implementiert §6 der `docs/design/memory-v2.md` sowie §5.4 (Verdrängung)
+//! und §6 (Bedienung) der `docs/design/memory-v3-ltm.md`. Wertet
+//! [`crate::store::Memory::stats()`] aus und leitet daraus einen
+//! deterministischen [`HeartbeatReport`] ab — ohne direkten State-Eingriff.
+//! Die tatsächliche HOT-Kürzung obliegt dem Store; dieser Modul meldet nur
+//! das erwartete Delta.
+//!
+//! Zusätzlich erweitert dieses Modul den Wartungslauf um den
+//! Fakten-Verfall aus §5.4: [`decay_facts`] ruft
+//! [`crate::facts::FactStore::decay`] für eine oder mehrere Fakten-Wurzeln
+//! (Projekt und/oder Global) auf und fasst das Ergebnis in einem
+//! [`FactDecayReport`] zusammen; [`tick_with_fact_decay`] kombiniert dies mit
+//! [`tick()`] zu einem vollständigen Wartungslauf-Ergebnis.
 //!
 //! # Schlüsseltypen
-//! - [`HeartbeatConfig`] — Schwellwerte, per `Default` vorbelegt gemäß Design-Doc §6.
-//! - [`HeartbeatReport`] — Zählwerte einer `tick()`-Auswertung.
-//! - [`tick()`] — idempotente Auswertungs-Funktion.
+//! - [`HeartbeatConfig`] — Schwellwerte, per `Default` vorbelegt gemäß Design-Doc §6,
+//!   inklusive `max_unused_days` (Fakten-Verfall, memory-v3-ltm.md §5.4).
+//! - [`HeartbeatReport`] — Zählwerte einer `tick()`-Auswertung (HOT/WARM/COLD, unverändert).
+//! - [`FactDecayReport`] — Zählwerte des Fakten-Verfalls über eine oder mehrere Wurzeln.
+//! - [`tick()`] — idempotente Auswertungs-Funktion für HOT/WARM/COLD (unverändert).
+//! - [`decay_facts()`] — Fakten-Verfall über gegebene [`crate::facts::FactStore`]-Wurzeln.
+//! - [`tick_with_fact_decay()`] — kombiniert beides für einen vollständigen Wartungslauf.
 //!
 //! # Nebenläufigkeit
-//! `tick()` ist zustandslos und damit thread-safe, sofern der übergebene Store es ist.
+//! `tick()` und `decay_facts()` sind für sich zustandslos und damit thread-safe,
+//! sofern der übergebene Store bzw. `FactStore` es ist. `decay_facts()` liest
+//! `usage.json` je Fakt einmal zur Vorab-Zählung und ruft dann `decay()` auf —
+//! zwischen beiden Schritten ist kein Lock gehalten; bei nebenläufigen
+//! Schreibern auf dieselbe Wurzel kann `facts_decayed` daher geringfügig von
+//! der tatsächlich von `decay()` mutierten Menge abweichen. Aufrufer, die das
+//! ausschließen müssen, serialisieren `decay_facts()` extern (wie
+//! `FileMemoryStore::maintain()` es für HOT/WARM/COLD bereits tut).
 //!
 //! # Fehler
-//! Ausschließlich [`crate::error::MemoryError`]-Varianten aus dem Store-Aufruf.
+//! Ausschließlich [`crate::error::MemoryError`]-Varianten aus dem Store- bzw.
+//! `FactStore`-Aufruf.
 //!
 //! # Bezug zu philosophy.md
 //! Invariante 8: „Memory ist eine Promotion-Pipeline, kein unkontrolliertes
 //! Langzeit-Transcript."
 
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+
+use crate::error::MemoryResult;
+use crate::facts::FactStore;
 
 /// Ergebnis eines [`tick()`]-Aufrufes.
 ///
@@ -91,6 +116,12 @@ pub struct HeartbeatConfig {
     ///
     /// Default: `100` (Invariante: `Tier::Hot.max_lines() == Some(100)`).
     pub hot_max_lines: usize,
+    /// Fenster in Tagen, ab dem ein ungenutzter Fakt verfällt
+    /// (`memory-v3-ltm.md` §5.4): `last_used`/`updated` älter als dieser Wert
+    /// und `usage_count == 0` → `confidence *= 0.5`.
+    ///
+    /// Default: `90` (Design §5.4, §6 Config-Feld `max_unused_days`).
+    pub max_unused_days: i64,
 }
 
 impl Default for HeartbeatConfig {
@@ -106,6 +137,7 @@ impl Default for HeartbeatConfig {
             demote_hot_days: 30,
             archive_warm_days: 90,
             hot_max_lines: 100,
+            max_unused_days: 90,
         }
     }
 }
@@ -187,15 +219,190 @@ pub fn tick<M: crate::store::Memory>(
     })
 }
 
+// ─── Fakten-Verfall (memory-v3-ltm.md §5.4) ────────────────────────────────────
+
+/// Ergebnis des Fakten-Verfalls über eine oder mehrere [`FactStore`]-Wurzeln.
+///
+/// # Beschreibung
+/// Von [`decay_facts`] erzeugt. Fasst zusammen, wie viele Fakten in diesem
+/// Lauf verfallen sind (Confidence halbiert) und welche davon unter die
+/// Löschschwelle `0.2` gefallen sind — Letztere werden laut Design §5.4
+/// gemeldet, nicht automatisch gelöscht.
+///
+/// # Serialisierung
+/// Vollständig JSON-roundtrip-fähig (`serde_json`).
+///
+/// # Beispiel
+/// ```rust
+/// use harw_memory::heartbeat::FactDecayReport;
+/// let r = FactDecayReport::default();
+/// assert_eq!(r.facts_decayed, 0);
+/// assert!(r.facts_below_threshold.is_empty());
+/// ```
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FactDecayReport {
+    /// Anzahl Fakten, deren `confidence` in diesem Lauf halbiert wurde.
+    pub facts_decayed: usize,
+    /// Namen der Fakten, deren `confidence` nach dem Verfall unter `0.2`
+    /// gefallen ist (über alle übergebenen Wurzeln hinweg).
+    pub facts_below_threshold: Vec<String>,
+}
+
+/// Zählt, wie viele Fakten in `store` beim nächsten [`FactStore::decay`]-Aufruf
+/// mit denselben Parametern verfallen würden.
+///
+/// # Beschreibung
+/// Spiegelt exakt das Prädikat aus [`FactStore::decay`]: ein Fakt zählt, wenn
+/// sein Nutzungszähler `0` ist (kein `usage.json`-Eintrag oder Zähler `0`) und
+/// sein Alter — gemessen ab `last_used`, ersatzweise ab `fact.updated` —
+/// mindestens `max_unused_days` beträgt. Reine Vorab-Zählung ohne Mutation;
+/// [`decay_facts`] ruft direkt danach `store.decay(...)` auf, das dieselbe
+/// Menge tatsächlich mutiert.
+///
+/// # Fehler
+/// Fehler von [`FactStore::list`].
+fn count_decay_candidates(
+    store: &FactStore,
+    max_unused_days: i64,
+    now: OffsetDateTime,
+) -> MemoryResult<usize> {
+    let facts = store.list()?;
+    let mut count = 0usize;
+    for fact in &facts {
+        let (used_count, last_used) = store.usage(&fact.name).unwrap_or((0, fact.updated));
+        if used_count != 0 {
+            continue;
+        }
+        let age_days = (now - last_used).whole_days();
+        if age_days >= max_unused_days {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Wendet den Fakten-Verfall aus Design §5.4 auf eine oder mehrere
+/// [`FactStore`]-Wurzeln an (typischerweise Projekt- und Global-Wurzel).
+///
+/// # Beschreibung
+/// Ruft für jede Wurzel [`FactStore::decay`] auf — ungenutzte Fakten
+/// (`usage_count == 0`), die seit mindestens `max_unused_days` nicht genutzt
+/// wurden, bekommen ihre `confidence` halbiert; Fakten, deren neue
+/// `confidence` unter `0.2` fällt, werden **nicht** gelöscht, sondern nur in
+/// [`FactDecayReport::facts_below_threshold`] gemeldet. Bestehendes
+/// HOT/WARM/COLD-Verhalten aus [`tick`] bleibt davon unberührt — diese
+/// Funktion rührt ausschließlich Fakten-Wurzeln an.
+///
+/// # Argumente
+/// - `fact_stores` (`&[&FactStore]`): die zu verfallenden Wurzeln, z. B.
+///   `&[&project_store, &global_store]`.
+/// - `max_unused_days` (`i64`): Fenster aus [`HeartbeatConfig::max_unused_days`].
+/// - `now` (`OffsetDateTime`): Zeitstempel des Laufs.
+///
+/// # Rückgabe
+/// `Ok(FactDecayReport)` mit der Summe aller verfallenen Fakten und den
+/// Namen aller Fakten, die dabei unter `0.2` gefallen sind.
+///
+/// # Fehler
+/// Fehler von [`FactStore::list`]/[`FactStore::decay`] (I/O, Serde,
+/// Frontmatter) werden durchgereicht; der Lauf bricht dann für die
+/// verbleibenden Wurzeln ab.
+///
+/// # Concurrency
+/// Siehe Moduldoku: kein Lock zwischen Vorab-Zählung und `decay()`-Aufruf je
+/// Wurzel. Aufrufer mit mehreren Schreibern serialisieren extern.
+///
+/// # Beispiel
+/// ```rust,no_run
+/// use harw_memory::facts::{FactScope, FactStore};
+/// use harw_memory::heartbeat::decay_facts;
+/// use time::OffsetDateTime;
+///
+/// let project = FactStore::open("/tmp/harw-decay-example/project", FactScope::Project).unwrap();
+/// let report = decay_facts(&[&project], 90, OffsetDateTime::now_utc()).unwrap();
+/// assert_eq!(report.facts_decayed, 0);
+/// ```
+pub fn decay_facts(
+    fact_stores: &[&FactStore],
+    max_unused_days: i64,
+    now: OffsetDateTime,
+) -> MemoryResult<FactDecayReport> {
+    let mut facts_decayed = 0usize;
+    let mut facts_below_threshold = Vec::new();
+    for store in fact_stores {
+        facts_decayed += count_decay_candidates(store, max_unused_days, now)?;
+        let below = store.decay(max_unused_days, now)?;
+        facts_below_threshold.extend(below);
+    }
+    Ok(FactDecayReport {
+        facts_decayed,
+        facts_below_threshold,
+    })
+}
+
+/// Kombiniert [`tick`] (HOT/WARM/COLD, unverändert) mit [`decay_facts`]
+/// (Fakten-Verfall, memory-v3-ltm.md §5.4) zu einem vollständigen
+/// Wartungslauf-Ergebnis.
+///
+/// # Beschreibung
+/// Ruft zuerst [`tick`] mit `cfg` auf, danach [`decay_facts`] mit
+/// `cfg.max_unused_days` über `fact_stores`. Ändert nichts am bestehenden
+/// HOT/WARM/COLD-Verhalten von [`tick`] — beide Teilergebnisse werden nur
+/// zusammen zurückgegeben, nicht vermischt. Ein Aufrufer, der
+/// [`crate::types::MaintenanceReport`] befüllt, überträgt
+/// `FactDecayReport::facts_decayed`/`facts_below_threshold` in dessen
+/// gleichnamige Felder.
+///
+/// # Argumente
+/// - `store` (`&M`): beliebige Memory-Implementierung für [`tick`].
+/// - `now` (`OffsetDateTime`): Zeitstempel des Laufs, für beide Teilschritte identisch.
+/// - `cfg` (`HeartbeatConfig`): Schwellwerte inklusive `max_unused_days`.
+/// - `fact_stores` (`&[&FactStore]`): Fakten-Wurzeln für den Verfall.
+///
+/// # Rückgabe
+/// `Ok((HeartbeatReport, FactDecayReport))`.
+///
+/// # Fehler
+/// Fehler von [`tick`] oder [`decay_facts`] werden durchgereicht.
+///
+/// # Beispiel
+/// ```rust,no_run
+/// use harw_memory::facts::{FactScope, FactStore};
+/// use harw_memory::file_store::FileMemoryStore;
+/// use harw_memory::heartbeat::{tick_with_fact_decay, HeartbeatConfig};
+/// use time::OffsetDateTime;
+///
+/// let store = FileMemoryStore::open("/tmp/harw-tick-facts-example").unwrap();
+/// let project = FactStore::open("/tmp/harw-tick-facts-example/facts-root", FactScope::Project).unwrap();
+/// let (heartbeat, decay) = tick_with_fact_decay(
+///     &store,
+///     OffsetDateTime::now_utc(),
+///     HeartbeatConfig::default(),
+///     &[&project],
+/// )
+/// .unwrap();
+/// assert!(heartbeat.hot_lines_after <= 100);
+/// assert_eq!(decay.facts_decayed, 0);
+/// ```
+pub fn tick_with_fact_decay<M: crate::store::Memory>(
+    store: &M,
+    now: OffsetDateTime,
+    cfg: HeartbeatConfig,
+    fact_stores: &[&FactStore],
+) -> MemoryResult<(HeartbeatReport, FactDecayReport)> {
+    let max_unused_days = cfg.max_unused_days;
+    let heartbeat_report = tick(store, now, cfg)?;
+    let decay_report = decay_facts(fact_stores, max_unused_days, now)?;
+    Ok((heartbeat_report, decay_report))
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::MemoryResult;
     use crate::store::Memory;
     use crate::types::{Entry, MaintenanceReport, RecallQuery, Signal, Stats};
-    use time::OffsetDateTime;
 
     // ── MockStore ──────────────────────────────────────────────────────────────
 
@@ -320,6 +527,7 @@ mod tests {
         assert_eq!(cfg.demote_hot_days, 30);
         assert_eq!(cfg.archive_warm_days, 90);
         assert_eq!(cfg.hot_max_lines, 100);
+        assert_eq!(cfg.max_unused_days, 90);
     }
 
     // ── Test 6: HeartbeatReport serde roundtrip ───────────────────────────────
@@ -399,5 +607,181 @@ mod tests {
         });
         let report = tick(&store, now(), HeartbeatConfig::default()).unwrap();
         assert_eq!(report.archived, 0, "Cold-Sweep reserved for future fanout");
+    }
+
+    // ── Fakten-Verfall (memory-v3-ltm.md §5.4) ────────────────────────────────
+
+    use crate::facts::{Fact, FactScope, FactType};
+    use time::Duration;
+
+    /// Erzeugt eine frische, isolierte `FactStore`-Wurzel für einen Test.
+    fn tmp_fact_store(tag: &str) -> (std::path::PathBuf, FactStore) {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "harw-heartbeat-facts-{tag}-{}-{id}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = FactStore::open(&root, FactScope::Project).unwrap();
+        (root, store)
+    }
+
+    fn sample_decay_fact(name: &str, confidence: f32) -> Fact {
+        let now = OffsetDateTime::now_utc();
+        Fact {
+            name: name.to_owned(),
+            description: "Testfakt für Verfall".to_owned(),
+            fact_type: FactType::Fact,
+            scope: FactScope::Project,
+            created: now,
+            updated: now,
+            confidence,
+            sources: Vec::new(),
+            tags: Vec::new(),
+            body: "Testinhalt.\n".to_owned(),
+        }
+    }
+
+    /// Design §5.4: Verfall halbiert `confidence` erst, nachdem das Fenster
+    /// `max_unused_days` vollständig abgelaufen ist — davor bleibt der Fakt
+    /// unverändert.
+    #[test]
+    fn decay_facts_halves_confidence_only_after_window_elapses() {
+        let (root, store) = tmp_fact_store("window");
+        store.write(&sample_decay_fact("alte-entscheidung", 0.8)).unwrap();
+        let written = store.read("alte-entscheidung").unwrap().unwrap();
+
+        // Knapp unter dem Fenster: keine Änderung.
+        let before_window = written.updated + Duration::days(89);
+        let report = decay_facts(&[&store], 90, before_window).unwrap();
+        assert_eq!(report.facts_decayed, 0, "89 Tage < 90 Tage Fenster");
+        let unchanged = store.read("alte-entscheidung").unwrap().unwrap();
+        assert!(
+            (unchanged.confidence - 0.8).abs() < f32::EPSILON,
+            "confidence darf vor Fensterablauf nicht sinken, war {}",
+            unchanged.confidence
+        );
+
+        // Fenster genau erreicht: Verfall greift.
+        let at_window = written.updated + Duration::days(90);
+        let report = decay_facts(&[&store], 90, at_window).unwrap();
+        assert_eq!(report.facts_decayed, 1, "90 Tage == Fenster muss verfallen");
+        let decayed = store.read("alte-entscheidung").unwrap().unwrap();
+        assert!(
+            (decayed.confidence - 0.4).abs() < f32::EPSILON,
+            "confidence muss halbiert sein (0.8 -> 0.4), war {}",
+            decayed.confidence
+        );
+        assert!(report.facts_below_threshold.is_empty(), "0.4 liegt über 0.2");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Design §5.4: ein Fakt mit `usage_count > 0` verfällt nicht, egal wie
+    /// alt sein letzter Zugriff liegt.
+    #[test]
+    fn decay_facts_skips_used_facts() {
+        let (root, store) = tmp_fact_store("used");
+        store.write(&sample_decay_fact("oft-genutzt", 0.9)).unwrap();
+        store.record_usage(&["oft-genutzt"]).unwrap();
+        let (count, last_used) = store.usage("oft-genutzt").unwrap();
+        assert_eq!(count, 1);
+
+        let far_future = last_used + Duration::days(10_000);
+        let report = decay_facts(&[&store], 90, far_future).unwrap();
+
+        assert_eq!(report.facts_decayed, 0, "benutzte Fakten dürfen nicht verfallen");
+        let unchanged = store.read("oft-genutzt").unwrap().unwrap();
+        assert!(
+            (unchanged.confidence - 0.9).abs() < f32::EPSILON,
+            "confidence eines genutzten Fakts darf sich nicht ändern"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Design §5.4: `facts_decayed` zählt alle verfallenen Fakten,
+    /// `facts_below_threshold` nennt nur die, deren neue `confidence` unter
+    /// `0.2` fällt — beide Felder müssen exakt stimmen, über mehrere Wurzeln
+    /// hinweg aufsummiert.
+    #[test]
+    fn decay_facts_report_fields_are_exact() {
+        let (root_a, store_a) = tmp_fact_store("report-a");
+        let (root_b, store_b) = tmp_fact_store("report-b");
+
+        // Fällt nach Halbierung nicht unter 0.2 (0.8 -> 0.4).
+        store_a.write(&sample_decay_fact("bleibt-drueber", 0.8)).unwrap();
+        // Fällt nach Halbierung unter 0.2 (0.3 -> 0.15).
+        store_b.write(&sample_decay_fact("faellt-drunter", 0.3)).unwrap();
+
+        let old_a = store_a.read("bleibt-drueber").unwrap().unwrap();
+        let old_b = store_b.read("faellt-drunter").unwrap().unwrap();
+        let now = old_a.updated.max(old_b.updated) + Duration::days(200);
+
+        let report = decay_facts(&[&store_a, &store_b], 90, now).unwrap();
+
+        assert_eq!(report.facts_decayed, 2, "beide Fakten müssen verfallen sein");
+        assert_eq!(
+            report.facts_below_threshold,
+            vec!["faellt-drunter".to_owned()],
+            "nur der zweite Fakt darf unter 0.2 gemeldet werden"
+        );
+        let still_present = store_b.read("faellt-drunter").unwrap();
+        assert!(
+            still_present.is_some(),
+            "Fakten unter der Schwelle werden gemeldet, nicht gelöscht (§5.4)"
+        );
+
+        let _ = std::fs::remove_dir_all(&root_a);
+        let _ = std::fs::remove_dir_all(&root_b);
+    }
+
+    /// `tick_with_fact_decay` liefert unverändertes HOT/WARM/COLD-Verhalten
+    /// (identisch zu [`tick`]) zusammen mit dem Fakten-Verfall-Report.
+    #[test]
+    fn tick_with_fact_decay_combines_both_reports_without_changing_hot_behaviour() {
+        let (root, fact_store) = tmp_fact_store("combined");
+        fact_store.write(&sample_decay_fact("kombi-fakt", 0.6)).unwrap();
+        let written = fact_store.read("kombi-fakt").unwrap().unwrap();
+        let far_future = written.updated + Duration::days(365);
+
+        let mem_store = MockStore::new(Stats {
+            hot_lines: 120,
+            pending_signals: 9,
+            ..Stats::default()
+        });
+        let cfg = HeartbeatConfig::default();
+
+        let (heartbeat_report, decay_report) =
+            tick_with_fact_decay(&mem_store, far_future, cfg.clone(), &[&fact_store]).unwrap();
+
+        let plain_tick = tick(&mem_store, far_future, cfg).unwrap();
+        assert_eq!(
+            heartbeat_report, plain_tick,
+            "tick_with_fact_decay darf das HOT/WARM/COLD-Ergebnis nicht verändern"
+        );
+        assert_eq!(decay_report.facts_decayed, 1);
+        assert!(decay_report.facts_below_threshold.is_empty(), "0.3 liegt über 0.2");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `FactDecayReport::default()` und JSON-Roundtrip verhalten sich wie
+    /// `HeartbeatReport` — leer bzw. verlustfrei.
+    #[test]
+    fn fact_decay_report_default_and_serde_roundtrip() {
+        let default = FactDecayReport::default();
+        assert_eq!(default.facts_decayed, 0);
+        assert!(default.facts_below_threshold.is_empty());
+
+        let original = FactDecayReport {
+            facts_decayed: 3,
+            facts_below_threshold: vec!["a".to_owned(), "b".to_owned()],
+        };
+        let json = serde_json::to_string(&original).expect("serialize should not fail");
+        let restored: FactDecayReport =
+            serde_json::from_str(&json).expect("deserialize should not fail");
+        assert_eq!(original, restored);
     }
 }

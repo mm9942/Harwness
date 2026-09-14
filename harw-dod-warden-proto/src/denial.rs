@@ -36,12 +36,12 @@ use serde::{Deserialize, Serialize};
 /// *was* genau nicht passte.
 ///
 /// # Description
-/// Zwei Kategorien, je eine pro Prüfung, die [`crate::proof::AuthorizationProof`]
-/// durchläuft: die Bindungsprüfung (Befund/Aktion passen nicht zum Beleg) und
-/// die Zulässigkeitsprüfung (die Aktion ist ab der belegten Stufe nicht
-/// erlaubt). Beide sind feldlos — es gibt keine dritte Kategorie, die
-/// zusätzliche Werte tragen könnte, ohne die Positivliste dieses Enums zu
-/// erweitern (und damit sichtbar zu machen).
+/// Ursprünglich zwei Kategorien (Bindung, Zulässigkeit); seit Proof v2
+/// (C-WPROTO, F-088) zusätzlich Versions-, Dekodier-, Nicht-unterstützt-,
+/// Ausführungs- und Verfügbarkeitskategorien, damit der Warden jede
+/// Ablehnung beantworten kann, statt die Verbindung kommentarlos zu schließen.
+/// Alle Varianten bleiben feldlos — ein zusätzlicher Wert wäre nur über eine
+/// sichtbare Erweiterung dieser Positivliste möglich.
 ///
 /// # Wire-Format
 /// Kebab-case-String, keine weiteren Felder.
@@ -65,6 +65,19 @@ pub enum Denial {
     /// Die Aktion ist ab der im Beleg genannten Eskalationsstufe nicht
     /// zulässig (siehe [`crate::action::WardenAction::is_admissible_from`]).
     NotAdmissibleAtStage,
+    /// Die Anfrage nennt eine nicht (mehr) unterstützte Protokoll-/Proof-Version
+    /// (F-088; v1 wird nicht akzeptiert).
+    UnsupportedVersion,
+    /// Die Anfrage war nicht dekodierbar oder zu groß (F-088).
+    Malformed,
+    /// Die Aktion ist in dieser Warden-Ausprägung nicht implementiert
+    /// (z. B. `IsolateNetwork`, Plan Teil B Annahme A2).
+    Unsupported,
+    /// Die Prüfung war erfolgreich, die Durchsetzung selbst ist fehlgeschlagen (F-088).
+    ExecutionFailed,
+    /// Der Warden kann gerade nicht sicher prüfen (z. B. Nonce-Ledger nicht
+    /// schreibbar) — fail closed.
+    Unavailable,
 }
 
 /// Formatiert die Ablehnung als feste, inhaltsfreie Meldung.
@@ -89,6 +102,11 @@ impl fmt::Display for Denial {
             Self::NotAdmissibleAtStage => {
                 "action is not admissible at the proof's escalation stage"
             }
+            Self::UnsupportedVersion => "unsupported warden protocol version",
+            Self::Malformed => "malformed warden request",
+            Self::Unsupported => "action is not supported by this warden",
+            Self::ExecutionFailed => "action could not be executed",
+            Self::Unavailable => "warden is temporarily unable to verify requests",
         };
         f.write_str(text)
     }
@@ -98,6 +116,16 @@ impl fmt::Display for Denial {
 mod tests {
     use super::Denial;
 
+    const ALL: [Denial; 7] = [
+        Denial::ProofMismatch,
+        Denial::NotAdmissibleAtStage,
+        Denial::UnsupportedVersion,
+        Denial::Malformed,
+        Denial::Unsupported,
+        Denial::ExecutionFailed,
+        Denial::Unavailable,
+    ];
+
     #[test]
     fn test_display_contains_no_embedded_identifiers() {
         // "Inhaltsfrei" heißt hier konkret: die Meldung ist eine der zwei
@@ -105,7 +133,7 @@ mod tests {
         // Kennungs-Präfixe, die andere Wire-Typen dieser Crate verwenden
         // (`finding-`, `cgroup-`), und keine Ziffern (eine ID-artige
         // Zeichenkette hier wäre ein Leck).
-        for denial in [Denial::ProofMismatch, Denial::NotAdmissibleAtStage] {
+        for denial in ALL {
             let text = denial.to_string();
             assert!(!text.chars().any(|c| c.is_ascii_digit()));
             assert!(!text.contains("finding-"));
@@ -115,7 +143,7 @@ mod tests {
 
     #[test]
     fn test_serde_roundtrip_for_each_variant() {
-        for denial in [Denial::ProofMismatch, Denial::NotAdmissibleAtStage] {
+        for denial in ALL {
             let json = serde_json::to_string(&denial).expect("serializes");
             let round_tripped: Denial = serde_json::from_str(&json).expect("deserializes");
             assert_eq!(round_tripped, denial);
@@ -131,6 +159,14 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Denial::NotAdmissibleAtStage).unwrap(),
             "\"not-admissible-at-stage\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Denial::UnsupportedVersion).unwrap(),
+            "\"unsupported-version\""
+        );
+        assert_eq!(
+            serde_json::to_string(&Denial::ExecutionFailed).unwrap(),
+            "\"execution-failed\""
         );
     }
 }

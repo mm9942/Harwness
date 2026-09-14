@@ -43,6 +43,7 @@
 
 pub mod error;
 pub mod paths;
+pub mod project;
 pub mod scaffold;
 pub mod trust;
 
@@ -51,6 +52,7 @@ pub use paths::{
     LayerReport, active_profile_name, active_profile_path, auth_path, config_layers,
     config_layers_report, config_layers_report_at, home_dir, profile_dir,
 };
+pub use project::{ProjectHome, ProjectKind, ProjectRoot, discover_project, project_key, project_settings_dir};
 pub use scaffold::{Scaffolded, ensure_home};
 pub use trust::{
     TrustRecord, TrustStatus, TrustStore, project_trust_status, trust_project, untrust_project,

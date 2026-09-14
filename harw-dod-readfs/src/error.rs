@@ -28,8 +28,9 @@
 //! # Inhaltsfreiheit
 //! Keine Variante nennt einen aufgelösten Dateisystempfad, einen
 //! Dateiinhalt oder eine gelesene Zeile. Die einzige Ausnahme:
-//! [`ReadFsError::GlobPatternAbsolute`] und
-//! [`ReadFsError::GlobPatternTraversal`] nennen das Glob-Muster — das ist
+//! [`ReadFsError::GlobPatternAbsolute`],
+//! [`ReadFsError::GlobPatternTraversal`] und
+//! [`ReadFsError::GlobLimitExceeded`] nennen das Glob-Muster — das ist
 //! kein aufgelöster Pfad, sondern ein Literal, das der Aufrufer selbst im
 //! eigenen Quellcode getippt hat, bevor irgendein Dateisystemzugriff
 //! stattfand. Es verrät nichts über den Host, das der Aufrufer nicht schon
@@ -111,6 +112,24 @@ pub enum ReadFsError {
         /// „Inhaltsfreiheit").
         pattern: String,
     },
+
+    /// Ein Glob-Abgleich hat eine seiner Grenzen überschritten
+    /// ([`crate::glob::MAX_GLOB_COMPONENTS`] für die Musterlänge,
+    /// [`crate::glob::MAX_GLOB_CANDIDATES`] für gleichzeitig verfolgte
+    /// Kandidaten). Schützt vor unbegrenzter Arbeit über sysfs-Schleifen
+    /// (`…/subsystem/…`) oder riesige Verzeichnisse.
+    #[msg("Glob-Muster '{pattern}' überschreitet die Grenze für {limit_name} ({limit})")]
+    GlobLimitExceeded {
+        /// Das Muster, unverändert wie übergeben (vom Aufrufer getipptes
+        /// Literal, siehe Modul-Dokumentation, Abschnitt „Inhaltsfreiheit").
+        pattern: String,
+        /// Welche Grenze griff: `"components"` oder `"candidates"`.
+        limit_name: &'static str,
+        /// Der Wert der überschrittenen Grenze. Die tatsächliche Anzahl wird
+        /// bewusst nicht genannt: sie würde die Größe eines Host-Verzeichnisses
+        /// preisgeben.
+        limit: usize,
+    },
 }
 
 #[cfg(test)]
@@ -148,6 +167,20 @@ mod tests {
         assert!(
             message.contains("sub/../etc/passwd"),
             "unerwartet: {message}"
+        );
+    }
+
+    /// Die Grenzverletzung nennt Muster, Grenzname und Grenzwert.
+    #[test]
+    fn test_glob_limit_exceeded_message_contains_pattern_and_limit() {
+        let err = ReadFsError::GlobLimitExceeded {
+            pattern: "sys/block/*/stat".to_owned(),
+            limit_name: "candidates",
+            limit: 4096,
+        };
+        assert_eq!(
+            err.to_string(),
+            "Glob-Muster 'sys/block/*/stat' überschreitet die Grenze für candidates (4096)"
         );
     }
 

@@ -53,6 +53,21 @@ pub enum HomeError {
         /// Menschenlesbare Ursache.
         reason: String,
     },
+    /// Ein Projekt-Schlüssel (`project_key`) enthält unzulässige Zeichen (nur
+    /// `[A-Za-z0-9_-]+`), z. B. beim Auflösen von
+    /// [`crate::project::project_settings_dir`].
+    InvalidProjectKey {
+        /// Der abgelehnte Rohschlüssel.
+        key: String,
+    },
+    /// Ein Projekt-Home (`<root>/.harw`) wurde für einen nicht unterstützten
+    /// Root abgelehnt: das Dateisystem-Root (`/`) oder das Home-Verzeichnis
+    /// des Benutzers selbst dürfen kein Projekt-Home bekommen
+    /// ([`crate::project::ProjectHome::ensure`]).
+    UnsupportedProjectHomeRoot {
+        /// Der abgelehnte, kanonische Root.
+        root: PathBuf,
+    },
     /// Ein Dateisystem-Zugriff schlug fehl; `path` benennt das Ziel.
     Io {
         /// Pfad, an dem der I/O-Fehler auftrat.
@@ -91,6 +106,15 @@ impl fmt::Display for HomeError {
                 f,
                 "project configuration at {} cannot be trusted: {reason}",
                 path.display()
+            ),
+            Self::InvalidProjectKey { key } => write!(
+                f,
+                "invalid project key {key:?}; use only ASCII letters, digits, '-' or '_'"
+            ),
+            Self::UnsupportedProjectHomeRoot { root } => write!(
+                f,
+                "refusing to create a project home at {}: this is the filesystem root or the user's home directory",
+                root.display()
             ),
             Self::Io { path, source } => {
                 write!(f, "filesystem error at {}: {source}", path.display())

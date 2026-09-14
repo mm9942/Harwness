@@ -210,20 +210,20 @@ pub fn report_findings(sink: &dyn TelemetrySink, evidence: &SecurityEvidence, no
 
     for finding in &findings {
         tracing::warn!(
-            rule_id = finding.rule_id,
-            kind = finding_kind_label(finding.kind),
-            severity = ?finding.severity,
-            hardness = ?finding.hardness,
+            rule_id = finding.rule_id(),
+            kind = finding_kind_label(finding.kind()),
+            severity = ?finding.severity(),
+            hardness = ?finding.hardness(),
             id = %finding.id().as_str(),
-            summary = %finding.summary,
+            summary = %finding.summary(),
             "security rule finding"
         );
         sink.record(
             &SECURITY_FINDING_TOTAL,
             MetricValue::Count(1),
             &[
-                (RULE_LABEL, FieldValue::Str(finding.rule_id)),
-                (KIND_LABEL, FieldValue::Str(finding_kind_label(finding.kind))),
+                (RULE_LABEL, FieldValue::Str(finding.rule_id())),
+                (KIND_LABEL, FieldValue::Str(finding_kind_label(finding.kind()))),
             ],
         );
     }

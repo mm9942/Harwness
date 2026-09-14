@@ -9,9 +9,16 @@
 //! erzeugt den Ziel-Code — einschließlich `OperationMeta::args_schema`, das
 //! über `harw_operations::operation::ArgsSchemaProbe` **bedingt** an
 //! `<ArgsType as OpArgsSchema>::json_schema` gebunden wird (siehe
-//! `expand_operation`). `map_domain`, `map_permission`, `map_visibility` und
-//! `map_approval` übersetzen die jeweiligen String-Literale in
-//! `::harw_operations`-Enum-Varianten. Diese Funktionen sind die
+//! `expand_operation`), sowie `OperationMeta::output_schema`, das derzeit
+//! unbedingt auf `None` gesetzt wird (kein Attribut-Schlüssel dafür, Stand
+//! W3/C-OPS). `map_domain`, `map_permission`, `map_visibility`, `map_approval`
+//! und `map_web_method` übersetzen die jeweiligen String-Literale in
+//! `::harw_operations`-Enum-Varianten — `map_web_method` mappt den
+//! verpflichtenden `method`-Schlüssel von `web(...)` auf
+//! `harw_operations::operation::WebMethod` (W3/C-OPS, F-031: die HTTP-Methode
+//! einer `Surface::Web`-Route wurde zuvor aus `model_tool(readonly)`
+//! abgeleitet; `method` macht sie zu einer eigenständigen Pflichtangabe, ein
+//! fehlender Schlüssel ist ein Compile-Fehler). Diese Funktionen sind die
 //! Einstiegspunkte, die die `#[proc_macro_attribute] operation`-Funktion im
 //! Crate-Root (`lib.rs`) aufruft.
 
@@ -33,7 +40,7 @@ use syn::{FnArg, ItemFn, LitStr, Type, spanned::Spanned};
 /// zurückfallen; einer, der nur dort steht, ist gar nicht deklarierbar — das
 /// Makro weist ihn ab. Beide Richtungen scheitern also sichtbar, sobald jemand
 /// den Reducer tatsächlich benutzt.
-const KNOWN_AUTHORITY_REDUCERS: &[&str] = &["reduce_to_read_only", "reduce_to_read_execute"];
+const KNOWN_AUTHORITY_REDUCERS: &[&str] = &["reduce_to_read_only", "reduce_to_read_execute", "reduce_to_read_registry", "reduce_to_read_network"];
 
 /// All parsed attribute arguments for `#[operation]`, collected into a single struct
 /// so that `expand_operation` does not exceed Clippy's argument-count limit.
@@ -60,16 +67,26 @@ pub(crate) struct OperationArgs {
     /// # Design-doc reference
     /// `harw-ops`/`harw-operations` UI-05 node: `Surface::Web` existed since
     /// UI-00 but no `#[operation(...)]` invocation could ever declare it — this
-    /// is the grammar half of closing that gap. `readonly` and `approval` reuse
-    /// exactly the same two fields as `model_tool(...)` (same meaning, same
-    /// enum) — deliberately no third authority axis.
+    /// is the grammar half of closing that gap. `approval` reuses exactly the
+    /// same field as `model_tool(...)` (same meaning, same enum) — deliberately
+    /// no third authority axis. `method` (W3/C-OPS, F-031) is `Surface::Web`'s
+    /// own mandatory field — it does not exist on `model_tool(...)` and is
+    /// never derived from `model_tool(...)`'s `readonly`.
     has_web: bool,
     /// `path = "..."` sub-key of `web(...)` → `path` field of `Surface::Web`.
     /// Mandatory when `web(...)` is present, exactly like `command(...)`'s `path`.
     web_path: Option<LitStr>,
-    /// `readonly` sub-key of `web(...)` — presence-flag, identical parsing to
-    /// `model_tool(...)`'s `readonly`.
-    web_readonly: bool,
+    /// `method = "get"` / `method = "post"` sub-key of `web(...)` →
+    /// `method` field of `Surface::Web` (`WebMethod::Get` / `WebMethod::Post`).
+    ///
+    /// # Design-doc reference
+    /// W3/C-OPS, F-031 (`x-findings-register-w1-w3.md`): the HTTP method of a
+    /// `Surface::Web` route used to be derived from `model_tool(readonly)`,
+    /// which let `analyze` (`harw-ops/src/analyze.rs:879`) expose a mutating
+    /// operation on a `GET` route because it declared itself `readonly`.
+    /// `method` is now mandatory and independent of `readonly`;
+    /// [`expand_operation`] rejects `web(...)` without it at compile time.
+    web_method: Option<LitStr>,
     /// `approval = "..."` sub-key of `web(...)` → `approval` field of
     /// `Surface::Web`. Defaults to `ApprovalPolicy::None` when absent, exactly
     /// like `model_tool(...)`.
@@ -116,7 +133,7 @@ pub(crate) fn parse_operation_args(
     // web(...) fields
     let mut has_web = false;
     let mut web_path: Option<LitStr> = None;
-    let mut web_readonly = false;
+    let mut web_method: Option<LitStr> = None;
     let mut web_approval: Option<LitStr> = None;
     // agent_tool(...) fields
     let mut at_child: Option<LitStr> = None;
@@ -184,8 +201,9 @@ pub(crate) fn parse_operation_args(
                     let lit: LitStr = nested.value()?.parse()?;
                     web_path = Some(lit);
                     Ok(())
-                } else if nested.path.is_ident("readonly") {
-                    web_readonly = true;
+                } else if nested.path.is_ident("method") {
+                    let lit: LitStr = nested.value()?.parse()?;
+                    web_method = Some(lit);
                     Ok(())
                 } else if nested.path.is_ident("approval") {
                     let lit: LitStr = nested.value()?.parse()?;
@@ -193,7 +211,7 @@ pub(crate) fn parse_operation_args(
                     Ok(())
                 } else {
                     Err(nested.error(
-                        "unsupported `operation` `web` key (expected `path`, `readonly`, or `approval`)",
+                        "unsupported `operation` `web` key (expected `path`, `method`, or `approval`)",
                     ))
                 }
             })
@@ -263,7 +281,7 @@ pub(crate) fn parse_operation_args(
         mt_approval,
         has_web,
         web_path,
-        web_readonly,
+        web_method,
         web_approval,
         has_agent_tool,
         at_child,
@@ -279,9 +297,10 @@ pub(crate) fn parse_operation_args(
 /// Builds one `Surface` token per declared sub-attribute (`command`, `model_tool`,
 /// `web`, `agent_tool`) — an operation may declare any combination of them; each
 /// sub-attribute contributes independently to the `surfaces` vec, none replaces
-/// another. For `web`, `path` is mandatory (mirrors `command`'s `path`); for
-/// `agent_tool`, all three sub-keys (`child`, `authority`, `budget`) are
-/// mandatory; missing keys produce a `syn::Error` at compile time.
+/// another. For `web`, both `path` and `method` are mandatory (`method` since
+/// W3/C-OPS, F-031 — see [`map_web_method`]); for `agent_tool`, all three
+/// sub-keys (`child`, `authority`, `budget`) are mandatory; missing keys
+/// produce a `syn::Error` at compile time.
 ///
 /// # Argument schema
 /// `OperationMeta::args_schema` is filled from the operation's arguments type
@@ -310,7 +329,7 @@ pub(crate) fn expand_operation(
         mt_approval,
         has_web,
         web_path,
-        web_readonly,
+        web_method,
         web_approval,
         has_agent_tool,
         at_child,
@@ -505,17 +524,28 @@ pub(crate) fn expand_operation(
                 "`web(...)` requires a `path = \"...\"` key",
             )
         })?;
+        // `method` is mandatory (W3/C-OPS, F-031): the HTTP method used to be
+        // derived from `model_tool(readonly)`, which let a mutating operation
+        // ("analyze", `harw-ops/src/analyze.rs:879`) expose itself on a `GET`
+        // route just because it declared `readonly`. There is no default —
+        // every `web(...)` declaration must name its method explicitly.
+        let method_lit = web_method.ok_or_else(|| {
+            syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "`web(...)` requires a `method = \"get\"` or `method = \"post\"` key",
+            )
+        })?;
+        let method_tokens = map_web_method(&method_lit)?;
         let approval_tokens = web_approval
             .as_ref()
             .map(map_approval)
             .transpose()?
             .unwrap_or_else(|| quote! { ::harw_operations::ApprovalPolicy::None });
         let path_str = path_lit.value();
-        let readonly_val = web_readonly;
         surface_tokens.push(quote! {
             ::harw_operations::Surface::Web {
                 path: #path_str,
-                readonly: #readonly_val,
+                method: #method_tokens,
                 approval: #approval_tokens,
             }
         });
@@ -611,6 +641,12 @@ pub(crate) fn expand_operation(
                     aliases: #aliases_tokens,
                     category: #category_tokens,
                     args_schema: #args_schema_tokens,
+                    // W3/C-OPS: there is (yet) no `#[operation(...)]` sub-key
+                    // through which an operation declares the shape of its
+                    // structured `OpOutput::data`; a future wave can bind
+                    // this the same way `args_schema` is bound above, without
+                    // breaking this contract again.
+                    output_schema: ::core::option::Option::None,
                 })
             }
 
@@ -732,6 +768,32 @@ fn map_approval(lit: &LitStr) -> syn::Result<proc_macro2::TokenStream> {
         other => Err(syn::Error::new_spanned(
             lit,
             format!("unknown `approval` value `{other}`; expected one of: none, always"),
+        )),
+    }
+}
+
+/// Map a `web(...)` `method` string literal to its
+/// `::harw_operations::operation::WebMethod` variant tokens.
+///
+/// `WebMethod` is not re-exported at the `harw_operations` crate root (as
+/// `ApprovalPolicy`/`Surface` are), so the emitted tokens qualify through the
+/// `operation` module — the same pattern this file already uses for
+/// `ArgsSchemaProbe`.
+///
+/// # Errors
+/// Returns `syn::Error` when the string does not match a known variant.
+///
+/// # Design-doc reference
+/// W3/C-OPS, F-031 (`x-findings-register-w1-w3.md`): `method` replaces the
+/// former derivation of a `Surface::Web` route's HTTP method from
+/// `model_tool(readonly)`.
+fn map_web_method(lit: &LitStr) -> syn::Result<proc_macro2::TokenStream> {
+    match lit.value().as_str() {
+        "get" => Ok(quote! { ::harw_operations::operation::WebMethod::Get }),
+        "post" => Ok(quote! { ::harw_operations::operation::WebMethod::Post }),
+        other => Err(syn::Error::new_spanned(
+            lit,
+            format!("unknown `method` value `{other}`; expected one of: get, post"),
         )),
     }
 }
@@ -877,35 +939,77 @@ mod operation_tests {
     }
 
     #[test]
-    fn expand_operation_web_with_path_only_defaults_readonly_false_and_approval_none() {
-        let flat = expand_with_attr(quote! {
+    fn expand_operation_web_with_path_only_fails_missing_method() {
+        // W3/C-OPS, F-031: `method` no longer defaults from `readonly` — a
+        // `web(...)` without it must fail to expand with a clear message.
+        let attr = quote! {
             name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
             web(path = "/api/demo")
-        });
-
-        assert!(
-            flat.contains("::harw_operations::Surface::Web{path:\"/api/demo\""),
-            "Surface::Web mit dem angegebenen Pfad muss erzeugt werden: {flat}"
-        );
-        assert!(
-            flat.contains("readonly:false"),
-            "ohne `readonly`-Schlüssel muss der Wert `false` sein: {flat}"
-        );
-        assert!(
-            flat.contains("approval:::harw_operations::ApprovalPolicy::None"),
-            "ohne `approval`-Schlüssel muss `ApprovalPolicy::None` gelten: {flat}"
+        };
+        let Ok(args) = parse_operation_args(attr) else {
+            panic!("`web(path = ...)` ohne `method` muss beim Parsen noch durchgehen");
+        };
+        let func: ItemFn = syn::parse_quote! {
+            async fn demo_op(ctx: &OpContext, args: DemoArgs) -> Result<OpOutput, OpError> {
+                let _ = (ctx, args);
+                Ok(OpOutput { text: String::new() })
+            }
+        };
+        let Err(error) = expand_operation(func, args) else {
+            panic!("`web(...)` ohne `method` muss beim Expandieren fehlschlagen");
+        };
+        assert_eq!(
+            error.to_string(),
+            "`web(...)` requires a `method = \"get\"` or `method = \"post\"` key"
         );
     }
 
     #[test]
-    fn expand_operation_web_readonly_and_approval_always_are_honored() {
+    fn expand_operation_web_method_and_approval_are_honored() {
         let flat = expand_with_attr(quote! {
             name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
-            web(path = "/api/demo", readonly, approval = "always")
+            web(path = "/api/demo", method = "post", approval = "always")
         });
 
-        assert!(flat.contains("readonly:true"));
+        assert!(flat.contains("method:::harw_operations::operation::WebMethod::Post"));
         assert!(flat.contains("approval:::harw_operations::ApprovalPolicy::Always"));
+    }
+
+    #[test]
+    fn expand_operation_web_method_get_is_honored() {
+        let flat = expand_with_attr(quote! {
+            name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
+            web(path = "/api/demo", method = "get")
+        });
+
+        assert!(flat.contains("method:::harw_operations::operation::WebMethod::Get"));
+        assert!(flat.contains("approval:::harw_operations::ApprovalPolicy::None"));
+    }
+
+    #[test]
+    fn expand_operation_web_rejects_unknown_method_value() {
+        let attr = quote! {
+            name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
+            web(path = "/api/demo", method = "put")
+        };
+        let Ok(args) = parse_operation_args(attr) else {
+            panic!("`method = \"put\"` muss beim Parsen noch durchgehen");
+        };
+        let func: ItemFn = syn::parse_quote! {
+            async fn demo_op(ctx: &OpContext, args: DemoArgs) -> Result<OpOutput, OpError> {
+                let _ = (ctx, args);
+                Ok(OpOutput { text: String::new() })
+            }
+        };
+        let Err(error) = expand_operation(func, args) else {
+            panic!("ein unbekannter `method`-Wert muss beim Expandieren fehlschlagen");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("unknown `method` value `put`"),
+            "unerwartete Fehlermeldung: {error}"
+        );
     }
 
     #[test]
@@ -914,7 +1018,7 @@ mod operation_tests {
             name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
             command(path = "/demo", visibility = "tui_only"),
             model_tool(readonly, approval = "none"),
-            web(path = "/api/demo", readonly, approval = "none")
+            web(path = "/api/demo", method = "get", approval = "none")
         });
 
         // Alle drei Flächen müssen nebeneinander im `surfaces`-Vec landen — keine
@@ -922,16 +1026,17 @@ mod operation_tests {
         assert!(flat.contains("::harw_operations::Surface::Command{path:\"/demo\""));
         assert!(flat.contains("::harw_operations::Surface::ModelTool{readonly:true"));
         assert!(flat.contains("::harw_operations::Surface::Web{path:\"/api/demo\""));
+        assert!(flat.contains("method:::harw_operations::operation::WebMethod::Get"));
     }
 
     #[test]
     fn parse_operation_args_web_requires_path_at_expand_time() {
         let attr = quote! {
             name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
-            web(readonly)
+            web(method = "get")
         };
         let Ok(args) = parse_operation_args(attr) else {
-            panic!("`web(readonly)` ohne `path` muss beim Parsen noch durchgehen");
+            panic!("`web(method = ...)` ohne `path` muss beim Parsen noch durchgehen");
         };
         let func: ItemFn = syn::parse_quote! {
             async fn demo_op(ctx: &OpContext, args: DemoArgs) -> Result<OpOutput, OpError> {
@@ -943,6 +1048,30 @@ mod operation_tests {
             panic!("`web(...)` ohne `path` muss beim Expandieren fehlschlagen");
         };
         assert_eq!(error.to_string(), "`web(...)` requires a `path = \"...\"` key");
+    }
+
+    #[test]
+    fn parse_operation_args_web_requires_method_at_expand_time() {
+        let attr = quote! {
+            name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
+            web(path = "/api/demo")
+        };
+        let Ok(args) = parse_operation_args(attr) else {
+            panic!("`web(path = ...)` ohne `method` muss beim Parsen noch durchgehen");
+        };
+        let func: ItemFn = syn::parse_quote! {
+            async fn demo_op(ctx: &OpContext, args: DemoArgs) -> Result<OpOutput, OpError> {
+                let _ = (ctx, args);
+                Ok(OpOutput { text: String::new() })
+            }
+        };
+        let Err(error) = expand_operation(func, args) else {
+            panic!("`web(...)` ohne `method` muss beim Expandieren fehlschlagen");
+        };
+        assert_eq!(
+            error.to_string(),
+            "`web(...)` requires a `method = \"get\"` or `method = \"post\"` key"
+        );
     }
 
     #[test]
@@ -958,6 +1087,25 @@ mod operation_tests {
             error
                 .to_string()
                 .contains("unsupported `operation` `web` key")
+        );
+    }
+
+    #[test]
+    fn parse_operation_args_web_rejects_readonly_key() {
+        // W3/C-OPS, F-031: `readonly` was removed from `web(...)`'s grammar —
+        // the HTTP method is no longer derivable from a readonly flag.
+        let Err(error) = parse_operation_args(quote! {
+            name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
+            web(path = "/api/demo", readonly)
+        }) else {
+            panic!("`web(readonly)` muss seit F-031 abgewiesen werden");
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported `operation` `web` key"),
+            "unerwartete Fehlermeldung: {error}"
         );
     }
 

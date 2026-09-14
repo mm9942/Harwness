@@ -14,8 +14,8 @@ pub mod wire;
 pub use approvals::{ApprovalRequest, ApprovalResponse};
 pub use events::{SessionEvent, TurnEvent};
 pub use items::{
-    AssistantMessageItem, ContentPart, ErrorItem, ReasoningItem, ToolCallItem, ToolCallResult,
-    ToolResultItem, TurnItem, UserMessageItem,
+    AssistantMessageItem, ContentPart, ErrorItem, OpaqueReasoning, ReasoningItem, ResultTrust,
+    ToolCallItem, ToolCallResult, ToolResultItem, TurnItem, UserMessageItem,
 };
 pub use wire::{
     NotificationEnvelope, ProtocolVersion, RequestEnvelope, ResponseEnvelope, WireError,

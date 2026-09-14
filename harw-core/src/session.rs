@@ -3,6 +3,24 @@
 //! Gültige Übergänge werden über `match` erzwungen. Ausgabe geht
 //! ausschließlich über `SessionEvent`s, nie direkt an ein Terminal.
 //!
+//! # Zustandsautomat und Persistenz (W4a/A-SESS)
+//! - `Idle --try_start_turn--> Running`; `Running --begin_approval/begin_handoff-->
+//!   WaitingForApproval/WaitingForChild` und zurück.
+//! - [`AgentSession::complete_turn`] akzeptiert nur den **aktiven** Turn
+//!   (`turn_id == current_turn`, eigene `session_id`) aus `Running`,
+//!   `WaitingForApproval` oder `WaitingForChild` (F-151).
+//! - [`AgentSession::fail`] führt nach `Failed`; [`AgentSession::recover`] ist
+//!   der einzige Weg zurück nach `Idle` und repariert dabei offene Tool-Calls
+//!   im Live-Verlauf (F-152, F-150).
+//! - [`AgentSession::hydrate_from_store`] lädt Verlauf (mit reparierten
+//!   offenen Calls) und Sitzungszustand; [`AgentSession::persist_state`]
+//!   schreibt Modus, Nutzung und Aktivierung (F-157). Beim Laden wird die
+//!   Basis-Aktivierung nie erweitert: geladene Aktivierung ∩ aktuelle Basis.
+//!
+//! # Fehler
+//! [`crate::error::CoreError::TurnRejected`] für unzulässige Übergänge,
+//! [`crate::state_store::StateStoreError`] für Persistenz.
+//!
 //! Session-level tool/instructions/context filtering is controlled via
 //! [`crate::activation::SessionActivation`]. See that module for details.
 //!
@@ -98,6 +116,10 @@ use crate::context_budget::ContextBudget;
 use crate::error::{CoreError, CoreResult};
 use crate::history::ConversationHistory;
 use crate::mode::InteractionMode;
+use crate::state_store::{
+    ActivationSnapshot, SESSION_STATE_VERSION, SessionStateSnapshot, StateStore,
+    StateStoreResult, repair_open_tool_calls,
+};
 use harw_agent_dsl::ExecutableAgentIr;
 use harw_agent_dsl::executable::{ContextProgram, SnapshotId};
 use harw_agent_dsl::roles::AgentRoleId;
@@ -111,8 +133,9 @@ use harw_sandbox::SandboxSpec;
 use harw_tools::{ToolCall, ToolName};
 use harw_types::{
     AgentRole, ApprovalActor, ItemId, ModelId, ProviderId, ReasoningEffort, SessionId, TokenUsage,
-    TurnId,
+    ToolCallId, TurnId,
 };
+use std::collections::BTreeSet;
 use tokio::sync::mpsc;
 
 /// Session-State FSM — ungültige Übergänge sind über `match` abgesichert.
@@ -319,6 +342,24 @@ impl std::fmt::Display for TurnRejection {
     }
 }
 impl std::error::Error for TurnRejection {}
+
+/// Ergebnis von [`AgentSession::hydrate_from_store`].
+///
+/// # Description
+/// Beschreibt, was beim Hydrieren einer frischen Session tatsächlich geladen
+/// wurde — für Tracing, Anzeige und Tests.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionHydration {
+    /// `true`, wenn die Session bereits einen Verlauf hatte und deshalb
+    /// nichts geladen wurde.
+    pub skipped: bool,
+    /// Anzahl geladener Verlaufs-Items (inklusive synthetischer Ergebnisse).
+    pub history_items: usize,
+    /// Tool-Calls, die beim Laden ein synthetisches Fehler-Ergebnis bekamen.
+    pub repaired_tool_calls: Vec<ToolCallId>,
+    /// `true`, wenn ein persistierter Sitzungszustand angewandt wurde.
+    pub state_restored: bool,
+}
 
 // Baut die Modus-Decke (Tool-Profil + Positivliste) für `mode`, unabhängig
 // von jeder konkreten Session — eine reine Funktion von `InteractionMode`
@@ -910,7 +951,6 @@ impl AgentSession {
         }
     }
 
-    /// Turn erfolgreich abschließen.
     /// Aufsummierte Token-Nutzung aller bisherigen Turns dieser Session.
     ///
     /// # Beschreibung
@@ -925,7 +965,57 @@ impl AgentSession {
         &self.total_usage
     }
 
-    pub fn complete_turn(&mut self, handle: TurnHandle, usage: TokenUsage) {
+    /// Schließt den **aktiven** Turn ab und kehrt nach `Idle` zurück.
+    ///
+    /// # Description
+    /// Prüft vor jeder Mutation (F-151):
+    /// 1. `handle.session_id` ist diese Session,
+    /// 2. der Zustand ist `Running`, `WaitingForApproval` oder
+    ///    `WaitingForChild` (nie `Idle`, nie `Failed` — aus `Failed` führt nur
+    ///    [`Self::recover`] heraus),
+    /// 3. `handle.turn_id` ist [`Self::current_turn`].
+    ///
+    /// Erst dann wird `usage` auf [`Self::total_usage`] addiert, Pending-Zustand
+    /// geleert und `SessionEvent::TurnCompleted` gesendet.
+    ///
+    /// # Arguments
+    /// - `handle` (`TurnHandle`): Handle aus [`Self::try_start_turn`] (Ownership).
+    /// - `usage` (`TokenUsage`): Nutzung dieses Turns.
+    ///
+    /// # Errors
+    /// - [`CoreError::TurnRejected`]: fremde Session, unzulässiger Zustand oder
+    ///   nicht der aktive Turn. Die Session bleibt dann unverändert.
+    ///
+    /// # Concurrency
+    /// Verlangt `&mut self`; sendet best-effort über den Event-Kanal.
+    pub fn complete_turn(&mut self, handle: TurnHandle, usage: TokenUsage) -> CoreResult<()> {
+        if handle.session_id != self.id {
+            return Err(CoreError::TurnRejected(format!(
+                "turn {} belongs to session {}, not to session {}",
+                handle.turn_id, handle.session_id, self.id
+            )));
+        }
+        match &self.state {
+            SessionState::Running
+            | SessionState::WaitingForApproval
+            | SessionState::WaitingForChild => {}
+            other => {
+                return Err(CoreError::TurnRejected(format!(
+                    "session {} cannot complete turn {} from state {other}",
+                    self.id, handle.turn_id
+                )));
+            }
+        }
+        if self.current_turn.as_ref() != Some(&handle.turn_id) {
+            return Err(CoreError::TurnRejected(format!(
+                "turn {} is not the active turn of session {} (active: {})",
+                handle.turn_id,
+                self.id,
+                self.current_turn
+                    .as_ref()
+                    .map_or_else(|| "none".to_owned(), ToString::to_string)
+            )));
+        }
         self.total_usage.add(&usage);
         self.state = SessionState::Idle;
         self.current_turn = None;
@@ -936,6 +1026,7 @@ impl AgentSession {
             turn_id: handle.turn_id,
             usage,
         });
+        Ok(())
     }
 
     /// In `WaitingForChild` wechseln (Handoff).
@@ -1036,6 +1127,226 @@ impl AgentSession {
                 state: other.to_string(),
             }),
         }
+    }
+
+    /// Holt eine Session aus `Failed` zurück in den bedienbaren Zustand `Idle`.
+    ///
+    /// # Description
+    /// Einziger Übergang aus `Failed` (F-152). Leert `current_turn`,
+    /// `pending_approval` und `pending_handoff` und repariert offene Tool-Calls
+    /// des Live-Verlaufs über
+    /// [`crate::state_store::repair_open_tool_calls`] (synthetisches
+    /// Fehler-Ergebnis, `ResultTrust::Runtime`), damit der nächste Turn einen
+    /// providergültigen Verlauf sendet. Die synthetischen Ergebnisse werden
+    /// hier nicht persistiert; ein späteres Hydrieren erzeugt sie
+    /// deterministisch erneut. Modus, Aktivierung, Sandbox und
+    /// [`Self::total_usage`] bleiben unverändert — ein Recovery erweitert nie
+    /// Autorität.
+    ///
+    /// # Returns
+    /// Die `call_id`s der reparierten Tool-Calls.
+    ///
+    /// # Errors
+    /// - [`CoreError::TurnRejected`]: die Session ist nicht in `Failed`
+    ///   (unverändert).
+    ///
+    /// # Concurrency
+    /// Verlangt `&mut self`, hält keine Sperre, sendet kein Event.
+    pub fn recover(&mut self) -> CoreResult<Vec<ToolCallId>> {
+        if !matches!(self.state, SessionState::Failed(_)) {
+            return Err(CoreError::TurnRejected(format!(
+                "session {} cannot recover from state {}; only Failed is recoverable",
+                self.id, self.state
+            )));
+        }
+        self.state = SessionState::Idle;
+        self.current_turn = None;
+        self.pending_approval = None;
+        self.pending_handoff = None;
+        let repaired = repair_open_tool_calls(&mut self.history);
+        tracing::info!(
+            session_id = %self.id,
+            repaired_tool_calls = repaired.len(),
+            "session.recovered"
+        );
+        Ok(repaired)
+    }
+
+    /// Ersetzt den Verlauf durch einen geladenen und repariert offene Calls.
+    ///
+    /// # Arguments
+    /// - `history` (`ConversationHistory`): geladener Verlauf (Ownership).
+    ///
+    /// # Returns
+    /// Die `call_id`s der reparierten Tool-Calls.
+    ///
+    /// # Concurrency
+    /// Verlangt `&mut self`.
+    pub fn hydrate_history(&mut self, mut history: ConversationHistory) -> Vec<ToolCallId> {
+        let repaired = repair_open_tool_calls(&mut history);
+        self.history = history;
+        repaired
+    }
+
+    /// Erzeugt den persistierbaren Sitzungszustand (F-157).
+    ///
+    /// # Description
+    /// Modus, [`Self::total_usage`], IR-Snapshot-ID sowie Basis- und wirksame
+    /// Aktivierung. Aktivierungen werden über die Namen aller im Registry
+    /// registrierten Werkzeuge abgetastet
+    /// ([`crate::state_store::ActivationSnapshot::capture`]).
+    ///
+    /// # Returns
+    /// Einen [`SessionStateSnapshot`] mit Version [`SESSION_STATE_VERSION`].
+    ///
+    /// # Concurrency
+    /// Nur lesend; ruft `ToolProvider::tools()` jedes Providers einmal auf.
+    #[must_use]
+    pub fn state_snapshot(&self) -> SessionStateSnapshot {
+        let tool_names: BTreeSet<String> = self
+            .registry
+            .tool_providers()
+            .iter()
+            .flat_map(|provider| provider.tools())
+            .map(|spec| spec.name().to_owned())
+            .collect();
+        SessionStateSnapshot {
+            version: SESSION_STATE_VERSION,
+            mode: self.mode,
+            total_usage: self.total_usage.clone(),
+            executable_snapshot_id: self.executable_snapshot_id.as_ref().map(ToString::to_string),
+            base_activation: ActivationSnapshot::capture(
+                &self.base_activation,
+                tool_names.iter().map(String::as_str),
+            ),
+            activation: ActivationSnapshot::capture(
+                &self.activation,
+                tool_names.iter().map(String::as_str),
+            ),
+        }
+    }
+
+    /// Wendet einen persistierten Sitzungszustand an, ohne Autorität zu erweitern.
+    ///
+    /// # Description
+    /// Reihenfolge:
+    /// 1. Unbekannte `version` → nichts wird angewandt (`false`).
+    /// 2. Stimmt `executable_snapshot_id` mit der aktuellen IR überein, wird die
+    ///    aktuelle Basis mit der geladenen Basis **geschnitten** (bewahrt z. B.
+    ///    eine Verengung aus `narrow_base_activation`); bei abweichender IR
+    ///    gilt allein die aktuelle Basis.
+    /// 3. Modus setzen und anwenden (Tool-Decke und Sandbox aus der Basis, ohne
+    ///    `ModeChanged`-Event).
+    /// 4. Wirksame Aktivierung = geladene Aktivierung ∩ [`Self::mode_ceiling`]
+    ///    — nie mehr als die aktuelle Basis.
+    /// 5. Geladene Nutzung wird auf [`Self::total_usage`] **addiert** (für eine
+    ///    frische Session identisch mit Ersetzen; nie Unterzählung).
+    ///
+    /// # Arguments
+    /// - `snapshot` (`&SessionStateSnapshot`): der geladene Zustand.
+    ///
+    /// # Returns
+    /// `true`, wenn der Zustand angewandt wurde.
+    ///
+    /// # Concurrency
+    /// Verlangt `&mut self`; sendet kein Event.
+    pub fn restore_state(&mut self, snapshot: &SessionStateSnapshot) -> bool {
+        if snapshot.version != SESSION_STATE_VERSION {
+            tracing::warn!(
+                session_id = %self.id,
+                version = snapshot.version,
+                supported = SESSION_STATE_VERSION,
+                "session.state_restore_skipped_unknown_version"
+            );
+            return false;
+        }
+        let current_snapshot_id = self.executable_snapshot_id.as_ref().map(ToString::to_string);
+        if snapshot.executable_snapshot_id == current_snapshot_id {
+            self.base_activation = self
+                .base_activation
+                .intersect(&snapshot.base_activation.to_activation());
+        } else {
+            tracing::warn!(
+                session_id = %self.id,
+                "session.state_restore_base_ignored_executable_changed"
+            );
+        }
+        self.mode = snapshot.mode;
+        self.apply_mode();
+        self.activation = snapshot
+            .activation
+            .to_activation()
+            .intersect(&self.mode_ceiling());
+        self.total_usage.add(&snapshot.total_usage);
+        true
+    }
+
+    /// Persistiert den Sitzungszustand über `store` (F-157).
+    ///
+    /// # Arguments
+    /// - `store` (`&dyn StateStore`): Ziel-Store.
+    ///
+    /// # Errors
+    /// Durchgereichter [`crate::state_store::StateStoreError`].
+    ///
+    /// # Concurrency
+    /// `async`; der Snapshot wird vor dem ersten `.await` gebaut.
+    pub async fn persist_state(&self, store: &dyn StateStore) -> StateStoreResult<()> {
+        let snapshot = self.state_snapshot();
+        store.save_session_state(&self.id, &snapshot).await
+    }
+
+    /// Hydriert eine frische Session aus `store`: Verlauf und Sitzungszustand.
+    ///
+    /// # Description
+    /// Hat die Session bereits einen Verlauf, geschieht nichts
+    /// (`skipped = true`). Sonst: Verlauf laden, offene Tool-Calls reparieren
+    /// ([`Self::hydrate_history`]), dann den jüngsten Sitzungszustand über
+    /// [`Self::restore_state`] anwenden. Der Session-Zustand (`Idle`/`Running`)
+    /// wird nicht berührt.
+    ///
+    /// # Arguments
+    /// - `store` (`&dyn StateStore`): Quelle.
+    ///
+    /// # Returns
+    /// Einen [`SessionHydration`]-Bericht.
+    ///
+    /// # Errors
+    /// Durchgereichter [`crate::state_store::StateStoreError`]; die Session
+    /// bleibt dann unverändert, sofern der Verlauf nicht bereits geladen war
+    /// (Zustand wird erst nach erfolgreichem Laden beider Teile angewandt).
+    ///
+    /// # Concurrency
+    /// `async`, verlangt `&mut self` über die `.await`-Punkte.
+    pub async fn hydrate_from_store(
+        &mut self,
+        store: &dyn StateStore,
+    ) -> StateStoreResult<SessionHydration> {
+        if !self.history.is_empty() {
+            return Ok(SessionHydration {
+                skipped: true,
+                ..SessionHydration::default()
+            });
+        }
+        let history = store.load_history(&self.id).await?;
+        let state = store.load_session_state(&self.id).await?;
+        let repaired_tool_calls = self.hydrate_history(history);
+        let state_restored = state
+            .as_ref()
+            .is_some_and(|snapshot| self.restore_state(snapshot));
+        tracing::info!(
+            session_id = %self.id,
+            history_items = self.history.len(),
+            repaired_tool_calls = repaired_tool_calls.len(),
+            state_restored,
+            "session.hydrated"
+        );
+        Ok(SessionHydration {
+            skipped: false,
+            history_items: self.history.len(),
+            repaired_tool_calls,
+            state_restored,
+        })
     }
 
     /// Terminaler Fehler.
@@ -1786,5 +2097,91 @@ forbidden = [{forbidden}]
                 "activation() muss nach set_mode exakt mode_ceiling() entsprechen für {name}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Zustandsautomat (W4a/A-SESS: F-151, F-152)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_complete_turn_accepts_the_active_turn() {
+        let mut session = test_session();
+        let handle = session.try_start_turn().expect("turn starts from Idle");
+
+        session
+            .complete_turn(handle, TokenUsage::default())
+            .expect("the active turn completes");
+
+        assert_eq!(session.state(), &SessionState::Idle);
+        assert!(session.current_turn().is_none());
+    }
+
+    #[test]
+    fn test_complete_turn_rejects_a_foreign_turn_id_without_mutation() {
+        let mut session = test_session();
+        let active = session.try_start_turn().expect("turn starts from Idle");
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 5,
+            reasoning_tokens: None,
+            cached_tokens: None,
+        };
+
+        let error = session
+            .complete_turn(
+                TurnHandle {
+                    turn_id: TurnId::new(),
+                    session_id: session.id().clone(),
+                },
+                usage,
+            )
+            .expect_err("a stale turn id must be rejected");
+
+        assert!(matches!(error, CoreError::TurnRejected(_)));
+        assert_eq!(session.state(), &SessionState::Running);
+        assert_eq!(session.current_turn(), Some(&active.turn_id));
+        assert_eq!(session.total_usage(), &TokenUsage::default());
+    }
+
+    #[test]
+    fn test_complete_turn_from_failed_is_rejected() {
+        let mut session = test_session();
+        let handle = session.try_start_turn().expect("turn starts from Idle");
+        session.fail("provider timeout".to_owned());
+
+        let error = session
+            .complete_turn(handle, TokenUsage::default())
+            .expect_err("Failed is left only through recover");
+
+        assert!(matches!(error, CoreError::TurnRejected(_)));
+        assert!(matches!(session.state(), SessionState::Failed(_)));
+    }
+
+    #[test]
+    fn test_recover_returns_failed_session_to_idle_and_allows_a_new_turn() {
+        let mut session = test_session();
+        let _handle = session.try_start_turn().expect("turn starts from Idle");
+        session
+            .history_mut()
+            .push_tool_call(ToolCallId::from_str("crashed"), "fs.read", serde_json::json!({}));
+        session.fail("provider 5xx".to_owned());
+
+        let repaired = session.recover().expect("Failed is recoverable");
+
+        assert_eq!(repaired, vec![ToolCallId::from_str("crashed")]);
+        assert_eq!(session.state(), &SessionState::Idle);
+        assert!(session.current_turn().is_none());
+        assert_eq!(session.history().len(), 2);
+        assert!(session.try_start_turn().is_ok());
+    }
+
+    #[test]
+    fn test_recover_from_idle_is_rejected() {
+        let mut session = test_session();
+
+        let error = session.recover().expect_err("only Failed is recoverable");
+
+        assert!(matches!(error, CoreError::TurnRejected(_)));
+        assert_eq!(session.state(), &SessionState::Idle);
     }
 }

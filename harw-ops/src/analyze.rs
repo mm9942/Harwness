@@ -874,9 +874,14 @@ fn cell_json(cell: Option<(&RawClanSpec, &RawCellSpec)>) -> Value {
     permission = "operator",
     command(path = "/analyze", visibility = "tui_only"),
     model_tool(readonly, approval = "none"),
-    // Web-Fläche übernimmt dieselbe Achse wie das ModelTool: bottom-up-Analyse
-    // über read-only Analyst-Kindagenten, keine Mutation.
-    web(path = "/api/analyze", readonly, approval = "none")
+    // F-031: `analyze` schreibt dauerhaft in den Plan-Store und startet einen
+    // Analyst-Kindagenten-Fan-out (siehe unten, Persistenz-/Spawn-Pfad) — das
+    // ist eine Mutation, auch wenn der ModelTool-Zweig bewusst `readonly`
+    // bleibt (Kindagenten laufen dort mit reduzierter, lesender Autorität).
+    // Die Web-Fläche muss diese Mutation als `POST` deklarieren, sonst würde
+    // eine GET-Route Nebenwirkungen auslösen dürfen (die Schwachstelle, die
+    // dieser Vertragswechsel schließt).
+    web(path = "/api/analyze", method = "post", approval = "none")
 )]
 async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError> {
     let bottom_up = args.bottom_up.unwrap_or(true);
@@ -1102,7 +1107,7 @@ async fn analyze(ctx: &OpContext, args: AnalyzeArgs) -> Result<OpOutput, OpError
 fn render(report: &Value) -> Result<OpOutput, OpError> {
     let text = serde_json::to_string_pretty(report)
         .map_err(|error| OpError::Execution(format!("Bericht nicht serialisierbar: {error}")))?;
-    Ok(OpOutput { text })
+    Ok(OpOutput::from(text))
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

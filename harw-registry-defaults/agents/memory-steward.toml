@@ -1,0 +1,120 @@
+# Eingebauter Memory-Steward (M5, Design `docs/design/memory-v3-ltm.md` §5.3)
+# — Phase-2-Konsolidierungsagent des Langzeitgedächtnisses (LTM v3).
+#
+# Bekommt laut §5.3 vom Aufrufer bereits zusammengestellt: den aktuellen
+# `MEMORY.md`-Index, die betroffenen bestehenden Fakten und alle Kandidaten
+# aus `facts/_incoming/` (siehe `harw_memory::consolidation::steward_prompt`
+# — reine Textzusammenstellung, kein Modellaufruf dort). Der Steward selbst
+# entscheidet danach über Löschen/Vertrauen-Senken veralteter Fakten (eine
+# Ermessensfrage, die `harw_memory::consolidation::plan_consolidation` bewusst
+# nicht automatisiert, siehe dessen Moduldoku) und schreibt das Ergebnis
+# unterhalb der Memory-Wurzel — Fakten, `MEMORY.md`, ggf. Löschungen.
+#
+# ── Werkzeugoberfläche: read-only plus genau ein Schreibwerkzeug ───────────
+# Anders als die fünf ursprünglichen read-only Rollen (`explorer`,
+# `researcher-deps`, `researcher-web`, `planner`, `analyst`) braucht dieser
+# Worker `fs.write`, um Fakten und den Index tatsächlich zu schreiben — sonst
+# bliebe jede Konsolidierung ein reiner Vorschlag. `fs.write` ist trotzdem das
+# EINZIGE Schreibwerkzeug: kein `shell.exec` (kein Subprozess, kein
+# `git commit` durch den Agenten selbst — die git-Baseline aus §5.3 setzt laut
+# Design die Composition-Root, nicht dieser Agent) und ausdrücklich KEIN
+# Netzzugang (`web.*` vollständig in `forbidden`).
+#
+# WICHTIG — Pfadbegrenzung ist Sache der Sandbox, nicht dieser Datei:
+# Diese Rollen-Definition kann den Schreibzugriff nicht selbst auf die
+# Memory-Wurzel (`<projekt>/.harw/memories/` bzw.
+# `~/.harw/profiles/<p>/memories/`) einschränken — Rechte und Workdirs liegen
+# laut `harw-scopes-contract.md` §2 außerhalb einer Agent-Definition, in der
+# Session-/Workdir-Konfiguration der Composition-Root. `fs.write` in
+# `admitted` ist nur die Werkzeugoberfläche; dass ein Aufruf dieses Kindes
+# tatsächlich nur unterhalb der ihm zugewiesenen Memory-Wurzel schreiben kann,
+# erzwingt die Sandbox (Workdir-Grenze plus Freigabekette des Elternteils,
+# `harw-core/src/session.rs`), nicht dieses TOML.
+#
+# ── Bekannte Abhängigkeit für die Registrierung (nicht Teil dieser Datei) ──
+# `RegistryProfile::Full` ist heute laut `executor.toml` das einzige Profil,
+# das `fs.write` überhaupt registriert — und es registriert zusammen damit
+# auch `shell.exec` (sieben Werkzeuge insgesamt). Der Coverage-Test
+# `tests/tool_admission_coverage.rs::
+# every_profile_registered_tool_is_admitted_by_its_role` verlangt, dass eine
+# Rolle GENAU die Werkzeuge ihres zugeordneten Profils admittiert. Würde
+# `memory-steward` einfach auf `RegistryProfile::Full` abgebildet, müsste sie
+# auch `shell.exec` admittieren — das widerspräche der hier gewollten
+# Beschränkung. Wer diese Rolle an `harw-registry-defaults/src/profile.rs`
+# anbindet (`profile_for_role`), muss deshalb entweder ein neues, engeres
+# Profil (`fs.read`/`fs.list`/`fs.search`/`fs.glob`/`fs.grep`/`fs.write`, ohne
+# `shell.exec`) einführen oder diesen Konflikt anderweitig auflösen — dieser
+# Knoten besitzt `profile.rs` nicht und ändert es deshalb nicht.
+#
+# ── Keine Unter-Agenten, kein Netz ──────────────────────────────────────────
+# `max_depth = 0`: eine Konsolidierung ist ein einzelner, in sich
+# geschlossener Lauf über bereits gelieferten Kontext — dieselbe Begründung
+# wie bei `context-steward`. `forbidden` benennt `web.*`, `shell.exec`,
+# `deps.*`, `lens.ask` und `browser.*` ausdrücklich, damit eine Ablehnung
+# nachvollziehbar ist statt nur "nicht in admitted".
+#
+# ── Rückgabevertrag ─────────────────────────────────────────────────────────
+# `harwness.return.execution-summary@1` (wiederverwendet von `executor.toml`):
+# eine kurze, für den Aufrufer lesbare Zusammenfassung dessen, was
+# konsolidiert wurde (Merges, Löschungen, verbliebene Widersprüche) — keine
+# Rohausgaben, kein vollständiger Dateiinhalt.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.memory-steward@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "memory-steward"
+
+name = "Memory Steward"
+description = "Konsolidiert Langzeitgedächtnis-Fakten (Phase 2 nach memory-v3-ltm.md §5.3): verschmilzt Duplikate, löst Widersprüche auf, senkt oder löscht veraltete Fakten, schreibt MEMORY.md neu."
+
+[work]
+mode = "memory-consolidation"
+may_write_code = false
+may_research_web = false
+
+# Die zugelassene Werkzeugoberflaeche. `forbidden` benennt die verweigerten
+# Werkzeuge ausdruecklich, damit ein Konsument die Ablehnung begruenden kann,
+# statt nur "nicht in admitted" zu melden.
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "fs.write",
+]
+forbidden = [
+  "shell.exec",
+  "web.fetch",
+  "web.docs_rs",
+  "web.crates_io",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+  "lens.ask",
+  "browser.open",
+  "browser.observe",
+  "browser.find",
+  "browser.act",
+  "browser.wait",
+  "browser.events",
+  "browser.close",
+]
+
+# Reine, in sich geschlossene Konsolidierung ohne Kind-Agenten — dieselbe
+# Begruendung wie bei `context-steward`.
+[spawn]
+max_depth = 0
+
+[spawn.budget]
+max_tokens = 60000
+max_tool_calls = 40
+max_wall_secs = 180
+
+[return]
+contract = "harwness.return.execution-summary@1"

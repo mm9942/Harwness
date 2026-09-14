@@ -211,12 +211,13 @@ impl FsSearchExecutor {
             Ok(rel) => rel,
             Err(reason) => return Ok(ToolOutput::error(format!("fs.search: {reason}"))),
         };
+        // Erst gegen die Obergrenze dieses Werkzeugs kappen, dann in die
+        // harten Grenzen klemmen (mindestens ein Treffer).
         let cap = args
             .max_matches
             .unwrap_or(self.max_matches)
             .min(self.max_matches)
-            .min(HARD_MAX_RESULTS)
-            .max(1);
+            .clamp(1, HARD_MAX_RESULTS);
 
         let opened = Workspace::open(ctx.sandbox().workspace().canonical_root()).and_then(
             |workspace| {

@@ -48,8 +48,8 @@ pub struct WorkArgs {}
     permission = "observer",
     command(path = "/work", visibility = "channel_parity"),
     // Web-Fläche: laut Moduldoku "schreibgeschützte Übersicht" — liest nur
-    // den `JobStore`, keine Mutation. `readonly`, `approval = "none"`.
-    web(path = "/api/work", readonly, approval = "none")
+    // den `JobStore`, keine Mutation. `method = "get"`, `approval = "none"`.
+    web(path = "/api/work", method = "get", approval = "none")
 )]
 async fn work(ctx: &OpContext, _args: WorkArgs) -> Result<OpOutput, OpError> {
     let store = ctx
@@ -57,9 +57,7 @@ async fn work(ctx: &OpContext, _args: WorkArgs) -> Result<OpOutput, OpError> {
         .ok_or_else(|| OpError::NotAvailable("durable job store is not configured".to_owned()))?;
     let counts = list_state_counts(store.as_ref())?;
 
-    Ok(OpOutput {
-        text: render_work_panel(&counts),
-    })
+    Ok(OpOutput::from(render_work_panel(&counts)))
 }
 
 fn list_state_counts(store: &JobStore) -> Result<[usize; 7], OpError> {

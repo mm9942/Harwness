@@ -9,6 +9,8 @@ rust-version.workspace = true
 # `AuthorizationProof::authorized_by` bereits verlangt, statt eine zweite
 # Identitätsdarstellung zu erfinden.
 harw-types = { path = "../harw-types" }
+# `TriageSubmission` (W3 C-WPROTO) ist serialisierbar.
+serde = { workspace = true }
 # `#[derive(harw_macros::HarwError)]` für `error.rs`. Kein `warden_actions!` —
 # diese Crate erzeugt keine Aktionstypen, sie autorisiert nur bereits von
 # `harw-dod-warden-proto` deklarierte.
@@ -42,6 +44,12 @@ serde_json = { workspace = true }
 # statt einen privaten Konstruktor zu umgehen — `harw-dod-rules` selbst
 # verwendet dieselbe Crate für dasselbe Muster in seinen eigenen Doctests.
 harw-sandbox = { path = "../harw-sandbox" }
+# Nur für Tests: schaltet `triaged_finding_for_test` frei — die
+# `Ladder`-Testfixtures brauchen `Severity`/`Hardness`-Kombinationen (z. B.
+# `Severity::Critical`), die keine echte Regel erzeugt. Wegen `resolver = "2"`
+# (Workspace-Root) nur für Testziele dieser Crate aktiv, nie im produktiven
+# Build (siehe `harw-dod-rules`' `Cargo.toml` und `src/finding.rs`-Moduldoku).
+harw-dod-rules = { path = "../harw-dod-rules", features = ["test-support"] }
 # Nur für Tests: ein `FreezeStore` braucht ein Wurzelverzeichnis; `tempfile`
 # ist dieselbe Crate, die `harw-session-store` selbst für seine `FreezeStore`-
 # Doctests/Tests verwendet.

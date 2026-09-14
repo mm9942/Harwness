@@ -13,7 +13,7 @@ use std::sync::{Arc, OnceLock};
 use harw_operations::{
     ApprovalPolicy, CommandVisibility, OpContext, OpError, OpFuture, OpInput, OpInvocation,
     OpOutput, Operation, OperationCategory, OperationDomain, OperationMeta, PermissionTier,
-    ServiceMap, Surface,
+    ServiceMap, Surface, WebMethod,
 };
 use harw_operations::adapter::WebAdapter;
 use harw_operations::registry::OperationRegistry;
@@ -47,13 +47,14 @@ impl Operation for EchoOp {
             aliases: &[],
             category: OperationCategory::Misc,
             args_schema: None,
+            output_schema: None,
         })
     }
 
     fn run<'a>(&'a self, _ctx: &'a OpContext, input: OpInput) -> OpFuture<'a> {
         Box::pin(async move {
             let joined = input.invocation.raw_args().join(" ");
-            Ok(OpOutput { text: joined })
+            Ok(OpOutput::from(joined))
         })
     }
 }
@@ -81,6 +82,7 @@ impl Operation for FailingOp {
             aliases: &[],
             category: OperationCategory::Misc,
             args_schema: None,
+            output_schema: None,
         })
     }
 
@@ -397,9 +399,11 @@ fn test_op_invocation_agent_tool_via_public_reexport() {
 fn test_op_output_equality_via_public_reexport() {
     let a = OpOutput {
         text: "same".to_owned(),
+        data: None,
     };
     let b = OpOutput {
         text: "same".to_owned(),
+        data: None,
     };
     assert_eq!(a, b);
 }
@@ -408,9 +412,11 @@ fn test_op_output_equality_via_public_reexport() {
 fn test_op_output_inequality_via_public_reexport() {
     let a = OpOutput {
         text: "a".to_owned(),
+        data: None,
     };
     let b = OpOutput {
         text: "b".to_owned(),
+        data: None,
     };
     assert_ne!(a, b);
 }
@@ -504,12 +510,13 @@ impl Operation for WebOp {
             permission: PermissionTier::Observer,
             surfaces: vec![Surface::Web {
                 path: "/api/web-op",
-                readonly: true,
+                method: WebMethod::Get,
                 approval: ApprovalPolicy::None,
             }],
             aliases: &[],
             category: OperationCategory::Misc,
             args_schema: None,
+            output_schema: None,
         })
     }
 
@@ -521,9 +528,7 @@ impl Operation for WebOp {
                 .get("q")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            Ok(OpOutput {
-                text: echoed.to_owned(),
-            })
+            Ok(OpOutput::from(echoed.to_owned()))
         })
     }
 }
@@ -535,11 +540,11 @@ fn test_web_op_meta_surface_is_web() {
     match &op.meta().surfaces[0] {
         Surface::Web {
             path,
-            readonly,
+            method,
             approval,
         } => {
             assert_eq!(*path, "/api/web-op");
-            assert!(*readonly);
+            assert_eq!(*method, WebMethod::Get);
             assert_eq!(*approval, ApprovalPolicy::None);
         }
         other => panic!("Erwartet Web, war: {other:?}"),

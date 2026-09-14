@@ -12,8 +12,7 @@ fn firefox_host_satisfies_the_browser_host_concurrency_contract() {
 #[test]
 fn browser_host_implementation_preserves_constructor_and_config_access() {
     let config = FirefoxHostConfig::new()
-        .with_firefox_binary(PathBuf::from("/opt/firefox/firefox"))
-        .with_managed_driver(true);
+        .with_firefox_binary(PathBuf::from("/opt/firefox/firefox"));
     let host = match FirefoxHost::new(config) {
         Ok(host) => host,
         Err(error) => panic!("deterministic host construction failed: {error}"),
@@ -23,7 +22,7 @@ fn browser_host_implementation_preserves_constructor_and_config_access() {
         host.config().firefox_binary(),
         Some(Path::new("/opt/firefox/firefox"))
     );
-    assert!(host.config().managed_driver());
+    assert!(host.config().geckodriver_pin().is_none());
     assert_eq!(
         FirefoxHost::binding_metadata().binding_id,
         FIREFOX_BIDI_BINDING_ID

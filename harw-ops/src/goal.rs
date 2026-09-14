@@ -22,7 +22,7 @@
 //!    prüft `harw_plan::goal::validate_goal_action` das `actor`-Präfix und
 //!    weist jeden Akteur mit `"model:"` mit `PlanError::ActorNotAuthorized`
 //!    zurück. Das Präfix stammt aus derselben Fläche
-//!    ([`CallSurface::actor_for`]), wird aber in einer anderen Crate, an einer
+//!    ([`crate::plan::require_actor`]), wird aber in einer anderen Crate, an einer
 //!    anderen Stelle und mit einem anderen Mechanismus geprüft.
 //!
 //! Bewusst **nicht** gewählt wurde der bequeme Weg, die Modell-Tool-Fläche
@@ -296,7 +296,7 @@ impl harw_operations::OpArgsSchema for GoalCall {
 /// - `call` (`GoalCall`): Subcommand plus Aufruf-Fläche.
 ///
 /// # Rückgabe
-/// `Ok(OpOutput { text })` mit kompaktem, für ein Modell lesbarem Text.
+/// `Ok(OpOutput::from(text))` mit kompaktem, für ein Modell lesbarem Text.
 ///
 /// # Fehler
 /// - [`OpError::NotAvailable`]: kein Goal-Store, Werkzeug deaktiviert, oder ein
@@ -323,7 +323,7 @@ impl harw_operations::OpArgsSchema for GoalCall {
     // Grund wie `/plan` (siehe dortiger Kommentar) — gemischte Lese-/
     // Schreib-Sub-Kommandos über einen Aufrufpfad, `approval = "always"`
     // behandelt jeden Aufruf konservativ als bestätigungspflichtig.
-    web(path = "/api/goal", approval = "always")
+    web(path = "/api/goal", method = "post", approval = "always")
 )]
 async fn goal(ctx: &OpContext, call: GoalCall) -> Result<OpOutput, OpError> {
     let config = require_service!(ctx.plan_config(), "Goal-Store");
@@ -347,7 +347,7 @@ async fn goal(ctx: &OpContext, call: GoalCall) -> Result<OpOutput, OpError> {
 
     let store_handle = require_service!(ctx.goal_store(), "Goal-Store");
     let store: &dyn GoalStore = store_handle.as_ref();
-    let actor = call.surface.actor_for(ctx.session_id());
+    let actor = crate::plan::require_actor(ctx, call.surface)?;
 
     let text = match call.args {
         GoalArgs::Show => render_show(store, ctx)?,
@@ -486,7 +486,7 @@ async fn goal(ctx: &OpContext, call: GoalCall) -> Result<OpOutput, OpError> {
         }
     };
 
-    Ok(OpOutput { text })
+    Ok(OpOutput::from(text))
 }
 
 // ── Store-Zugriff ────────────────────────────────────────────────────────────

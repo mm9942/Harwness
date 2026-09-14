@@ -8,10 +8,11 @@
 //! # Schlüsseltypen
 //! - [`OperationDomain`] — thematische Gruppierung für Hilfe/Discovery
 //! - [`PermissionTier`] — geordnete Berechtigungsstufen
-//! - [`Surface`] — deklarierte Expositionsfläche (Command / ModelTool)
+//! - [`Surface`] — deklarierte Expositionsfläche (Command / ModelTool / Web / AgentTool)
+//! - [`WebMethod`] — explizite HTTP-Methode einer `Surface::Web`-Route (F-031)
 //! - [`OperationMeta`] — statische Metadaten einer Operation
 //! - [`OpInput`] — fläche-neutrale Eingabe
-//! - [`OpOutput`] — fläche-neutrales Ergebnis
+//! - [`OpOutput`] — fläche-neutrales Ergebnis (Text plus optionale strukturierte Nutzlast, F-222)
 //! - [`Operation`] — ausführbarer Kern-Trait
 //! - [`ArgsSchemaFn`] — Zeiger auf das Argument-Schema einer Operation
 //! - [`ArgsSchemaProbe`] — Typ-Sonde, mit der `#[operation]` das Schema bedingt bindet
@@ -229,12 +230,16 @@ pub enum Surface {
     /// - `path`: HTTP-Pfad, z. B. `"/api/session/list"` (statisch, beginnt
     ///   mit `/`) — die einzige Angabe, die `harw-web` laut Auftrag
     ///   mindestens braucht, exakt wie `Command::path`.
-    /// - `readonly`: Übernimmt absichtlich **dieselbe Bedeutung** wie
-    ///   `ModelTool::readonly`, statt eine eigene Lesbarkeits-Achse
-    ///   einzuführen: `true` verbietet Zustandsänderungen und bestimmt in
-    ///   `harw-web` zugleich die HTTP-Methode (`GET` für `readonly`,
-    ///   sonst `POST`) — eine Operation braucht dafür kein zusätzliches
-    ///   Feld, weil `readonly` die Methode bereits eindeutig festlegt.
+    /// - `method`: **Explizite** HTTP-Methode (F-031, `x-findings-register-w1-w3.md`).
+    ///   Früher wurde die Methode aus einem `readonly`-Flag abgeleitet
+    ///   (`GET` für `readonly = true`, sonst `POST`) — das erlaubte
+    ///   `analyze` (`harw-ops/src/analyze.rs:879`), sich trotz dauerhafter
+    ///   Schreibwirkung als `readonly` zu deklarieren und dadurch eine
+    ///   mutierende Operation über eine per Browser-Prefetch/`<img src>`/CSRF
+    ///   auslösbare `GET`-Route zu exponieren. `method` entkoppelt die
+    ///   HTTP-Semantik vollständig von jeder Lesbarkeits-Einschätzung der
+    ///   Operation: jede `#[operation(web(...))]`-Deklaration muss die
+    ///   Methode nennen, es gibt keinen impliziten Default.
     /// - `approval`: Wiederverwendet [`ApprovalPolicy`] — denselben Enum wie
     ///   `ModelTool::approval` — statt eine eigene Web-Genehmigungsachse zu
     ///   erfinden. Das ist keine Bequemlichkeit, sondern die Auflage „kein
@@ -250,13 +255,45 @@ pub enum Surface {
     Web {
         /// HTTP-Pfad (statisch; beginnt mit `/`, keine Leerzeichen).
         path: &'static str,
-        /// Gibt an, ob die Operation ausschließlich lesend ist; bestimmt in
-        /// `harw-web` zugleich `GET` (readonly) vs. `POST` (sonst).
-        readonly: bool,
+        /// Explizite HTTP-Methode dieser Route; siehe [`WebMethod`] und die
+        /// Feldbegründung oben (F-031).
+        method: WebMethod,
         /// Approval-Politik vor jeder Ausführung — identisch zur
         /// Modell-Tool-Achse, keine eigene Web-Genehmigungsachse.
         approval: ApprovalPolicy,
     },
+}
+
+/// Explizite HTTP-Methode einer [`Surface::Web`]-Route.
+///
+/// # Beschreibung
+/// Vor dieser Welle (C-OPS, F-031) leitete `harw-web` die HTTP-Methode einer
+/// Route aus `Surface::Web`s `readonly`-Flag ab (`GET` für `readonly = true`,
+/// sonst `POST`). Das ließ eine Operation, die sich fälschlich als `readonly`
+/// deklariert — `analyze` in `harw-ops/src/analyze.rs:879` schreibt trotz
+/// `readonly, web(...)` dauerhaft in den Plan-Store und startet Fan-out
+/// (`harw-ops/src/analyze.rs:953-973`) —, über eine `GET`-Route erreichbar
+/// sein, die ein Browser ohne jede Benutzerinteraktion auslöst (Prefetch,
+/// `<img src>`, CSRF: `GET` gilt HTTP-semantisch als sicher/idempotent).
+/// `WebMethod` macht die Methode zu einer eigenständigen, verpflichtenden
+/// Angabe jeder `#[operation(web(...))]`-Deklaration, unabhängig von jeder
+/// `readonly`-Einschätzung.
+///
+/// # Beispiel
+/// ```rust
+/// use harw_operations::operation::WebMethod;
+///
+/// assert_ne!(WebMethod::Get, WebMethod::Post);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WebMethod {
+    /// HTTP `GET` — nur für tatsächlich sichere, idempotente Operationen ohne
+    /// Seiteneffekt zulässig.
+    Get,
+    /// HTTP `POST` — für jede Operation mit Seiteneffekt, unabhängig davon,
+    /// ob ihr `model_tool`-`readonly`-Flag gesetzt ist.
+    Post,
 }
 
 // ── Argument-Schema ──────────────────────────────────────────────────────────
@@ -446,6 +483,15 @@ impl<T> NoArgsSchema for &ArgsSchemaProbe<T> {
 /// Für neue Konstruktionsstellen steht [`OperationMeta::default`] als
 /// Auffüllwert bereit (`..OperationMeta::default()`).
 ///
+/// # Ausgabe-Schema
+/// [`OperationMeta::output_schema`] ist das spiegelbildliche Gegenstück zu
+/// [`OperationMeta::args_schema`] für die strukturierte Nutzlast in
+/// [`OpOutput::data`] (F-222, `x-findings-register-w1-w3.md`). Das `#[operation]`-Makro
+/// setzt es derzeit unbedingt auf `None` — es gibt (Stand W3/C-OPS) noch keine
+/// Attribut-Syntax, mit der eine Operation ihren Ausgabetyp deklariert; das
+/// Feld liegt bereit, damit eine spätere Welle es füllen kann, ohne den
+/// Vertrag erneut zu brechen.
+///
 /// # Beispiel
 /// ```rust
 /// use harw_operations::operation::{
@@ -463,6 +509,7 @@ impl<T> NoArgsSchema for &ArgsSchemaProbe<T> {
 ///     aliases: &[],
 ///     category: OperationCategory::Misc,
 ///     args_schema: None,
+///     output_schema: None,
 /// };
 /// assert_eq!(meta.name, "session.list");
 /// ```
@@ -495,6 +542,15 @@ pub struct OperationMeta {
     /// Objekt-Schema zurück (siehe
     /// [`crate::adapter::model_tool::model_tool_schema_for`]).
     pub args_schema: Option<ArgsSchemaFn>,
+    /// Bauroutine des Ausgabe-Schemas für [`OpOutput::data`] (F-222).
+    ///
+    /// Derselbe Zeigertyp wie [`OperationMeta::args_schema`]
+    /// (`fn() -> JsonSchema`), aber für die Struktur der optionalen
+    /// strukturierten Nutzlast statt für die Eingabeargumente. `None` — der
+    /// Normalfall, solange keine Operation ihr Ausgabeschema deklariert —
+    /// bedeutet, dass eine strukturierte Web-Ansicht `data` ungetypt behandeln
+    /// muss (Rohtext bleibt in [`OpOutput::text`] immer verfügbar).
+    pub output_schema: Option<ArgsSchemaFn>,
 }
 
 impl Default for OperationMeta {
@@ -510,7 +566,7 @@ impl Default for OperationMeta {
     ///
     /// # Rückgabe
     /// Ein `OperationMeta` ohne Name, ohne Flächen, ohne Aliase und ohne
-    /// Argument-Schema.
+    /// Argument- oder Ausgabe-Schema.
     ///
     /// # Nebenläufigkeit
     /// Rein; aus beliebig vielen Threads aufrufbar.
@@ -524,6 +580,7 @@ impl Default for OperationMeta {
             aliases: &[],
             category: OperationCategory::Misc,
             args_schema: None,
+            output_schema: None,
         }
     }
 }
@@ -690,19 +747,71 @@ pub trait FromRawArgs: Sized {
 /// # Beschreibung
 /// `OpOutput` enthält einen menschenlesbaren Text, den Adapter flächenspezifisch
 /// rendern (z. B. als TUI-Zeile, als Markdown in einem Channel, als `content`
-/// in einem Tool-Call-Ergebnis).
+/// in einem Tool-Call-Ergebnis), sowie eine optionale strukturierte Nutzlast
+/// (F-222, `x-findings-register-w1-w3.md`): vor dieser Welle musste jede
+/// strukturierte Web-Ansicht raten, ob `text` JSON enthält — `data` macht die
+/// strukturierte Nutzlast explizit, ohne `text` als menschenlesbaren Bericht
+/// zu ersetzen. [`OperationMeta::output_schema`] beschreibt optional die
+/// Form von `data`.
+///
+/// # Migration
+/// Bestehende handgeschriebene Operationen konstruieren `OpOutput` bislang als
+/// `OpOutput { text }` (ohne `data`) — dieses Literal kompiliert mit dem neuen
+/// Feld nicht mehr. Der `From<String>`-Impl unten liefert den mechanischen
+/// Ersatz: `OpOutput::from(text)` bzw. `text.into()` liefert exakt dasselbe
+/// Verhalten wie zuvor (`data: None`), ohne dass jede Konstruktionsstelle
+/// einzeln um `data: None` ergänzt werden muss.
 ///
 /// # Beispiel
 /// ```rust
 /// use harw_operations::operation::OpOutput;
 ///
-/// let out = OpOutput { text: "3 Sessions aktiv.".to_owned() };
+/// let out = OpOutput { text: "3 Sessions aktiv.".to_owned(), data: None };
 /// assert_eq!(out.text, "3 Sessions aktiv.");
+///
+/// // Migrationspfad für bestehende `OpOutput { text }`-Konstruktionsstellen:
+/// let out2: OpOutput = "3 Sessions aktiv.".to_owned().into();
+/// assert_eq!(out, out2);
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpOutput {
     /// Menschenlesbarer Ausgabetext (ggf. mehrzeilig via `\n`).
     pub text: String,
+    /// Optionale strukturierte Nutzlast (F-222). `None`, solange die
+    /// Operation keine strukturierte Ansicht unterstützt oder das Ergebnis
+    /// rein im menschenlesbaren `text` liegt.
+    pub data: Option<serde_json::Value>,
+}
+
+impl From<String> for OpOutput {
+    /// Baut ein `OpOutput` aus reinem Text, ohne strukturierte Nutzlast.
+    ///
+    /// # Beschreibung
+    /// Migrationshilfe (F-222): ersetzt mechanisch jedes bisherige
+    /// `OpOutput { text }`-Literal durch `OpOutput::from(text)` bzw.
+    /// `text.into()`, ohne dass jede Konstruktionsstelle das neue `data`-Feld
+    /// einzeln nennen muss.
+    ///
+    /// # Argumente
+    /// - `text` (`String`): der menschenlesbare Ausgabetext.
+    ///
+    /// # Rückgabe
+    /// `OpOutput { text, data: None }`.
+    ///
+    /// # Nebenläufigkeit
+    /// Rein; aus beliebig vielen Threads aufrufbar.
+    ///
+    /// # Beispiele
+    /// ```rust
+    /// use harw_operations::operation::OpOutput;
+    ///
+    /// let out: OpOutput = "ok".to_owned().into();
+    /// assert_eq!(out.text, "ok");
+    /// assert!(out.data.is_none());
+    /// ```
+    fn from(text: String) -> Self {
+        Self { text, data: None }
+    }
 }
 
 // ── Future-Typ & Trait ────────────────────────────────────────────────────────
@@ -750,11 +859,12 @@ pub type OpFuture<'a> =
 ///             aliases: &[],
 ///             category: OperationCategory::Misc,
 ///             args_schema: None,
+///             output_schema: None,
 ///         })
 ///     }
 ///
 ///     fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
-///         Box::pin(async { Ok(OpOutput { text: String::new() }) })
+///         Box::pin(async { Ok(OpOutput { text: String::new(), data: None }) })
 ///     }
 /// }
 /// ```
@@ -795,7 +905,7 @@ mod tests {
     use super::{
         ApprovalPolicy, ArgsSchemaProbe, CommandVisibility, DerivedArgsSchema as _,
         NoArgsSchema as _, OpInput, OpOutput, Operation, OperationCategory, OperationDomain,
-        OperationMeta, PermissionTier, Surface,
+        OperationMeta, PermissionTier, Surface, WebMethod,
     };
     use crate::context::{OpContext, ServiceMap};
     use crate::error::OpError;
@@ -824,6 +934,7 @@ mod tests {
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
 
@@ -831,6 +942,7 @@ mod tests {
             Box::pin(async {
                 Ok(OpOutput {
                     text: "ok".to_owned(),
+                    data: None,
                 })
             })
         }
@@ -851,6 +963,7 @@ mod tests {
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
 
@@ -878,6 +991,7 @@ mod tests {
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
 
@@ -901,6 +1015,7 @@ mod tests {
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
 
@@ -933,6 +1048,7 @@ mod tests {
                 aliases: &[],
                 category: OperationCategory::Session,
                 args_schema: None,
+                output_schema: None,
             })
         }
 
@@ -940,6 +1056,7 @@ mod tests {
             Box::pin(async move {
                 Ok(OpOutput {
                     text: format!("args={}", input.invocation.raw_args().len()),
+                    data: None,
                 })
             })
         }
@@ -1212,12 +1329,12 @@ mod tests {
     fn test_surface_web_equality() {
         let a = Surface::Web {
             path: "/api/session/list",
-            readonly: true,
+            method: WebMethod::Get,
             approval: ApprovalPolicy::None,
         };
         let b = Surface::Web {
             path: "/api/session/list",
-            readonly: true,
+            method: WebMethod::Get,
             approval: ApprovalPolicy::None,
         };
         assert_eq!(a, b);
@@ -1227,27 +1344,27 @@ mod tests {
     fn test_surface_web_different_paths_not_equal() {
         let a = Surface::Web {
             path: "/api/a",
-            readonly: true,
+            method: WebMethod::Get,
             approval: ApprovalPolicy::None,
         };
         let b = Surface::Web {
             path: "/api/b",
-            readonly: true,
+            method: WebMethod::Get,
             approval: ApprovalPolicy::None,
         };
         assert_ne!(a, b);
     }
 
     #[test]
-    fn test_surface_web_readonly_flag_differs() {
+    fn test_surface_web_method_differs() {
         let a = Surface::Web {
             path: "/api/x",
-            readonly: true,
+            method: WebMethod::Get,
             approval: ApprovalPolicy::None,
         };
         let b = Surface::Web {
             path: "/api/x",
-            readonly: false,
+            method: WebMethod::Post,
             approval: ApprovalPolicy::None,
         };
         assert_ne!(a, b);
@@ -1257,12 +1374,12 @@ mod tests {
     fn test_surface_web_approval_differs() {
         let a = Surface::Web {
             path: "/api/x",
-            readonly: false,
+            method: WebMethod::Post,
             approval: ApprovalPolicy::None,
         };
         let b = Surface::Web {
             path: "/api/x",
-            readonly: false,
+            method: WebMethod::Post,
             approval: ApprovalPolicy::Always,
         };
         assert_ne!(a, b);
@@ -1272,7 +1389,7 @@ mod tests {
     fn test_surface_web_vs_other_surfaces_not_equal() {
         let web = Surface::Web {
             path: "/api/x",
-            readonly: true,
+            method: WebMethod::Get,
             approval: ApprovalPolicy::None,
         };
         let cmd = Surface::Command {
@@ -1297,10 +1414,58 @@ mod tests {
     fn test_surface_web_clone_produces_equal_value() {
         let s = Surface::Web {
             path: "/api/clone-test",
-            readonly: false,
+            method: WebMethod::Post,
             approval: ApprovalPolicy::RequireForEffect,
         };
         assert_eq!(s.clone(), s);
+    }
+
+    // ── WebMethod ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_web_method_equality() {
+        assert_eq!(WebMethod::Get, WebMethod::Get);
+        assert_eq!(WebMethod::Post, WebMethod::Post);
+    }
+
+    #[test]
+    fn test_web_method_inequality() {
+        assert_ne!(WebMethod::Get, WebMethod::Post);
+    }
+
+    #[test]
+    fn test_web_method_is_copy() {
+        let m = WebMethod::Get;
+        let m2 = m;
+        assert_eq!(m, m2);
+    }
+
+    #[test]
+    fn test_web_method_serde_roundtrip_get() {
+        let json = serde_json::to_string(&WebMethod::Get).expect("Serialisierung darf nicht fehlschlagen");
+        let back: WebMethod =
+            serde_json::from_str(&json).expect("Deserialisierung darf nicht fehlschlagen");
+        assert_eq!(back, WebMethod::Get);
+    }
+
+    #[test]
+    fn test_web_method_serde_roundtrip_post() {
+        let json = serde_json::to_string(&WebMethod::Post).expect("Serialisierung darf nicht fehlschlagen");
+        let back: WebMethod =
+            serde_json::from_str(&json).expect("Deserialisierung darf nicht fehlschlagen");
+        assert_eq!(back, WebMethod::Post);
+    }
+
+    #[test]
+    fn test_web_method_serde_uses_screaming_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&WebMethod::Get).expect("Serialisierung darf nicht fehlschlagen"),
+            "\"GET\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WebMethod::Post).expect("Serialisierung darf nicht fehlschlagen"),
+            "\"POST\""
+        );
     }
 
     // ── OperationMeta ─────────────────────────────────────────────────────────
@@ -1319,6 +1484,7 @@ mod tests {
             aliases: &[],
             category: OperationCategory::Misc,
             args_schema: None,
+            output_schema: None,
         };
         assert_eq!(meta.name, "test.op");
         assert_eq!(meta.summary, "Eine Testoperation.");
@@ -1338,6 +1504,7 @@ mod tests {
             aliases: &[],
             category: OperationCategory::Misc,
             args_schema: None,
+            output_schema: None,
         };
         assert!(meta.surfaces.is_empty());
     }
@@ -1353,6 +1520,7 @@ mod tests {
             aliases: &[],
             category: OperationCategory::Misc,
             args_schema: None,
+            output_schema: None,
         };
         let cloned = meta.clone();
         assert_eq!(cloned.name, meta.name);
@@ -1452,6 +1620,7 @@ mod tests {
     fn test_op_output_text_field() {
         let out = OpOutput {
             text: "3 Sessions aktiv.".to_owned(),
+            data: None,
         };
         assert_eq!(out.text, "3 Sessions aktiv.");
     }
@@ -1460,6 +1629,7 @@ mod tests {
     fn test_op_output_empty_text() {
         let out = OpOutput {
             text: String::new(),
+            data: None,
         };
         assert!(out.text.is_empty());
     }
@@ -1468,9 +1638,11 @@ mod tests {
     fn test_op_output_equality() {
         let a = OpOutput {
             text: "gleich".to_owned(),
+            data: None,
         };
         let b = OpOutput {
             text: "gleich".to_owned(),
+            data: None,
         };
         assert_eq!(a, b);
     }
@@ -1479,9 +1651,11 @@ mod tests {
     fn test_op_output_inequality() {
         let a = OpOutput {
             text: "alpha".to_owned(),
+            data: None,
         };
         let b = OpOutput {
             text: "beta".to_owned(),
+            data: None,
         };
         assert_ne!(a, b);
     }
@@ -1490,8 +1664,52 @@ mod tests {
     fn test_op_output_clone() {
         let out = OpOutput {
             text: "clone me".to_owned(),
+            data: None,
         };
         assert_eq!(out.clone(), out);
+    }
+
+    #[test]
+    fn test_op_output_data_field_accessible() {
+        let payload = serde_json::json!({ "count": 3 });
+        let out = OpOutput {
+            text: "3 Sessions aktiv.".to_owned(),
+            data: Some(payload.clone()),
+        };
+        assert_eq!(out.data, Some(payload));
+    }
+
+    #[test]
+    fn test_op_output_equality_considers_data_field() {
+        let a = OpOutput {
+            text: "gleich".to_owned(),
+            data: None,
+        };
+        let b = OpOutput {
+            text: "gleich".to_owned(),
+            data: Some(serde_json::json!({ "x": 1 })),
+        };
+        assert_ne!(
+            a, b,
+            "zwei OpOutput mit gleichem text aber unterschiedlichem data dürfen nicht gleich sein"
+        );
+    }
+
+    #[test]
+    fn test_op_output_from_string_sets_text_and_no_data() {
+        let out: OpOutput = "ok".to_owned().into();
+        assert_eq!(out.text, "ok");
+        assert!(out.data.is_none());
+    }
+
+    #[test]
+    fn test_op_output_from_string_matches_manual_construction() {
+        let via_from = OpOutput::from("3 Sessions aktiv.".to_owned());
+        let manual = OpOutput {
+            text: "3 Sessions aktiv.".to_owned(),
+            data: None,
+        };
+        assert_eq!(via_from, manual);
     }
 
     // ── Operation::meta ───────────────────────────────────────────────────────
@@ -1764,6 +1982,7 @@ mod tests {
         let meta = OperationMeta::default();
 
         assert!(meta.args_schema.is_none());
+        assert!(meta.output_schema.is_none());
         assert_eq!(meta.permission, PermissionTier::Observer);
         assert_eq!(meta.domain, OperationDomain::Misc);
         assert_eq!(meta.category, OperationCategory::Misc);
@@ -1781,6 +2000,7 @@ mod tests {
 
         assert_eq!(meta.name, "session.list");
         assert!(meta.args_schema.is_none());
+        assert!(meta.output_schema.is_none());
     }
 
     #[test]
@@ -1794,6 +2014,23 @@ mod tests {
         let cloned = meta.clone();
 
         let build = match cloned.args_schema {
+            Some(build) => build,
+            None => panic!("der Zeiger muss den Clone überleben"),
+        };
+        assert_eq!(build().required, Some(vec!["job_id".to_owned()]));
+    }
+
+    #[test]
+    fn test_operation_meta_with_output_schema_is_cloneable() {
+        let meta = OperationMeta {
+            name: "with-output-schema",
+            summary: "Trägt ein Ausgabe-Schema.",
+            output_schema: Some(<WithSchemaArgs as OpArgsSchema>::json_schema),
+            ..OperationMeta::default()
+        };
+        let cloned = meta.clone();
+
+        let build = match cloned.output_schema {
             Some(build) => build,
             None => panic!("der Zeiger muss den Clone überleben"),
         };

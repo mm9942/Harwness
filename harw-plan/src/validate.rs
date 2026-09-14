@@ -12,9 +12,11 @@
 //! 3. `SetStatus` folgt der Status-Matrix.
 //! 4. `SetStatus(Completed)` verlangt mindestens einen `EvidenceRef`.
 //! 5. `forbidden_scope ∩ write_scope == ∅`.
-//! 6. `write_scope` disjunkt zu aktiven (`Ready`/`InProgress`) Knoten.
+//! 6. `write_scope` disjunkt zu aktiven (`Ready`/`InProgress`) Knoten — beim
+//!    Einfügen **und** beim Übergang nach `Ready`/`InProgress`.
 //! 7. `Supersede` erhöht die Revision streng monoton.
-//! 8. `Invalidate` nur für Knoten ≠ `Completed`.
+//! 8. `Invalidate` nur entlang der Status-Matrix (`Completed` → eigener
+//!    Fehler; `Superseded`/`Invalidated` sind nicht invalidierbar).
 //! 9. `AttachEvidence` ist idempotent (Duplikate sind kein Fehler).
 //! 10. `Expand`: Kind-`write_scope` liegt im Parent-`write_scope`, Parent ist
 //!     nicht versiegelt, Kind-IDs sind frei, Kinder untereinander disjunkt,
@@ -34,11 +36,28 @@
 //!     `Research`/`Explore`/`Analysis`-Knoten in einen neuen
 //!     `Contract`-Knoten.
 //!
+//! # Schließungen aus F-013 §5.1 (W3/C-PLAN)
+//! - Einfügende Aktionen (`AddNode`, `Expand`-Kinder, `Condense`-Ersatz)
+//!   akzeptieren nur `Draft` — kein `Completed` ohne Evidenz, kein
+//!   eingeschleuster Terminalzustand.
+//! - `Superseded` ist terminal: `Invalidate` folgt der Matrix.
+//! - Nachweise mit Zukunfts-Zeitstempel gelten nicht als frisch (die Mutation
+//!   kappt Payload-Zeitstempel zusätzlich auf `now`).
+//! - `AddDependency` und `UpdateNode.dependencies` prüfen Siegel und Status:
+//!   kein versiegelter Kind-Knoten, kein abgelöster Parent, und ein aktiver
+//!   Kind-Knoten bekommt nur abgeschlossene Dependencies.
+//! - `SetStatus → Ready|InProgress` prüft Regel 6.
+//! - Regel 12 wird beim Eintritt nach `Ready` geprüft; `Ready → InProgress`
+//!   prüft sie nicht erneut, weil ein bereits zugelassener Knoten sonst nach
+//!   Fristablauf unerreichbar festhinge (die Graph-Abfrage
+//!   `graph::missing_explorations` meldet nur `Draft`/`Blocked`-Knoten).
+//! - `Create` prüft die `PlanId`-Grammatik (Pfad-Traversal, F-013/G-032).
+//!
 //! # Status-Matrix
 //! Legale Übergänge (siehe [`STATUS_MATRIX`]):
 //!
 //! ```text
-//! Draft       → Ready | Blocked | Superseded
+//! Draft       → Ready | Blocked | Invalidated | Superseded
 //! Ready       → InProgress | Blocked | Invalidated | Superseded
 //! InProgress  → Completed | Blocked | Invalidated | Superseded
 //! Blocked     → Ready | Invalidated | Superseded
@@ -82,6 +101,9 @@ use crate::types::{EvidenceKind, EvidenceRef, Plan, PlanNode, PlanNodeKind, Plan
 const STATUS_MATRIX: &[(PlanNodeStatus, PlanNodeStatus)] = &[
     (PlanNodeStatus::Draft, PlanNodeStatus::Ready),
     (PlanNodeStatus::Draft, PlanNodeStatus::Blocked),
+    // `Invalidate` auf einem Entwurf (z. B. Vertragsänderung vor dem Start)
+    // ist legitim und steht deshalb explizit in der Matrix (F-013 §5.1 Punkt 2).
+    (PlanNodeStatus::Draft, PlanNodeStatus::Invalidated),
     (PlanNodeStatus::Ready, PlanNodeStatus::InProgress),
     (PlanNodeStatus::Ready, PlanNodeStatus::Blocked),
     (PlanNodeStatus::Ready, PlanNodeStatus::Invalidated),
@@ -119,7 +141,11 @@ const SEALED_STATUSES: &[PlanNodeStatus] = &[
 const ACTIVE_STATUSES: &[PlanNodeStatus] = &[PlanNodeStatus::Ready, PlanNodeStatus::InProgress];
 
 /// Knotenarten, die eine frische Exploration erbringen können (Regel 12).
-const EXPLORATION_KINDS: &[PlanNodeKind] = &[PlanNodeKind::Explore, PlanNodeKind::Research];
+///
+/// Crate-weit geteilt mit `graph::missing_explorations` (F-130: beide Module
+/// zählen `Explore` **und** `Research`).
+pub(crate) const EXPLORATION_KINDS: &[PlanNodeKind] =
+    &[PlanNodeKind::Explore, PlanNodeKind::Research];
 
 /// Knotenarten, die per `Condense` verdichtet werden dürfen (Regel 16).
 const CONDENSABLE_KINDS: &[PlanNodeKind] = &[
@@ -345,19 +371,74 @@ fn children_of<'a>(plan: &'a Plan, id: &TaskId) -> Vec<&'a PlanNode> {
 /// Prüft, ob ein Evidenz-Nachweis eine frische Exploration belegt (Regel 12).
 ///
 /// # Description
-/// Frisch ist ein `EvidenceKind::Finding`, dessen `attached_at` höchstens
-/// `ttl_secs` vor `now` liegt. Nachweise mit einem Zeitstempel in der Zukunft
-/// (negatives Alter, z. B. durch Uhrendrift zwischen Worker und Store) gelten
-/// als frisch — die Validierung darf an Zeitversatz nicht härter sein als an
-/// echtem Verfall.
-fn is_fresh_finding(evidence: &EvidenceRef, now: OffsetDateTime, ttl_secs: u64) -> bool {
-    if evidence.kind != EvidenceKind::Finding {
+/// Frisch ist ein `EvidenceKind::Finding`, dessen `attached_at` im Intervall
+/// `[now - ttl_secs, now]` liegt. Ein Zeitstempel in der **Zukunft** gilt als
+/// nicht frisch (F-013 §5.1 Punkt 3): sonst bliebe ein Nachweis dauerhaft
+/// frisch. Der Store setzt `attached_at` selbst (`AttachEvidence`) bzw. kappt
+/// Payload-Zeitstempel auf `now` (`AddNode`/`Expand`/`Condense`), legitime
+/// Nachweise liegen deshalb nie in der Zukunft.
+///
+/// Crate-weit geteilt mit `graph::missing_explorations` (eine Frist-Semantik).
+pub(crate) fn is_fresh_finding(
+    evidence: &EvidenceRef,
+    now: OffsetDateTime,
+    ttl_secs: u64,
+) -> bool {
+    if evidence.kind != EvidenceKind::Finding || evidence.attached_at > now {
         return false;
     }
     // `u64` → `i64` kann nur bei absurd großen TTLs überlaufen; dann gilt der
     // Nachweis unbegrenzt als frisch, was der TTL-Intention entspricht.
     let ttl = i64::try_from(ttl_secs).unwrap_or(i64::MAX);
     (now - evidence.attached_at).whole_seconds() <= ttl
+}
+
+/// Einfügende Aktionen akzeptieren ausschließlich `Draft` (F-013 §5.1 Punkt 1).
+///
+/// # Errors
+/// - [`PlanError::IllegalTransition`]: der Payload-Knoten trägt einen anderen
+///   Status als `Draft`.
+fn ensure_inserted_as_draft(node: &PlanNode) -> PlanResult<()> {
+    if node.status != PlanNodeStatus::Draft {
+        return Err(PlanError::IllegalTransition {
+            id: node.id.clone(),
+            from: "(neu)".to_owned(),
+            to: format!("{:?} (neue Knoten beginnen als Draft)", node.status),
+        });
+    }
+    Ok(())
+}
+
+/// Siegel- und Statusprüfung einer neuen Kante `child → parent`
+/// (F-013 §5.1 Punkt 5).
+///
+/// # Errors
+/// - [`PlanError::NodeSealed`]: `child` ist versiegelt.
+/// - [`PlanError::IllegalTransition`]: `parent` ist `Superseded` und kann nie
+///   abschließen.
+/// - [`PlanError::DependencyNotCompleted`]: `child` ist aktiv
+///   (`Ready`/`InProgress`), `parent` aber nicht `Completed`.
+fn ensure_edge_allowed(child: &PlanNode, parent: &PlanNode) -> PlanResult<()> {
+    if SEALED_STATUSES.contains(&child.status) {
+        return Err(PlanError::NodeSealed {
+            id: child.id.clone(),
+        });
+    }
+    if parent.status == PlanNodeStatus::Superseded {
+        return Err(PlanError::IllegalTransition {
+            id: parent.id.clone(),
+            from: format!("{:?}", parent.status),
+            to: format!("Dependency von '{}'", child.id),
+        });
+    }
+    if ACTIVE_STATUSES.contains(&child.status) && parent.status != PlanNodeStatus::Completed {
+        return Err(PlanError::DependencyNotCompleted {
+            id: child.id.clone(),
+            dependency: parent.id.clone(),
+            status: format!("{:?}", parent.status),
+        });
+    }
+    Ok(())
 }
 
 /// Regel 12: Explore-before-implement.
@@ -489,7 +570,10 @@ fn compat_config() -> PlanToolConfig {
 /// # Errors
 /// - [`PlanError::NodeMissing`]: referenzierter Knoten fehlt (Regel 1).
 /// - [`PlanError::DuplicateNode`]: ID bereits vergeben (Regeln 1, 10, 16).
-/// - [`PlanError::InvalidId`]: leerer/whitespace-only Pflichtwert.
+/// - [`PlanError::InvalidId`]: leerer/whitespace-only Pflichtwert oder
+///   `Create` mit einer `PlanId`, die die Grammatik verletzt.
+/// - [`PlanError::NodeSealed`]: `AddDependency`/Patch-Dependency auf einem
+///   versiegelten Knoten.
 /// - [`PlanError::CycleDetected`]: Kante würde einen Zyklus schließen (Regeln 2, 14).
 /// - [`PlanError::IllegalTransition`]: Statuswechsel, Expand-Tiefe oder
 ///   Knotenart nicht erlaubt (Regeln 3, 10, 15, 16).
@@ -527,7 +611,7 @@ pub fn validate_with(
     match action {
         PlanAction::Create { plan_id, .. } => validate_create(plan_id),
 
-        PlanAction::AddNode { node } => validate_add_node(plan, node, cfg, now),
+        PlanAction::AddNode { node } => validate_add_node(plan, node),
 
         PlanAction::UpdateNode { id, patch } => validate_update_node(plan, id, patch),
 
@@ -568,16 +652,14 @@ pub fn validate_with(
 /// Validiert [`PlanAction::Create`].
 fn validate_create(plan_id: &PlanId) -> PlanResult<()> {
     // Regel 1: eine leere Plan-ID ist keine Identität.
-    ensure_not_blank("plan_id", plan_id.as_str())
+    ensure_not_blank("plan_id", plan_id.as_str())?;
+    // F-013/G-032: die ID wird Pfadsegment — Grammatik auch für per
+    // `PlanId::new` erzeugte Werte erzwingen.
+    PlanId::parse(plan_id.as_str()).map(|_| ())
 }
 
-/// Validiert [`PlanAction::AddNode`] (Regeln 1, 5, 6, 12).
-fn validate_add_node(
-    plan: &Plan,
-    node: &PlanNode,
-    cfg: &PlanToolConfig,
-    now: OffsetDateTime,
-) -> PlanResult<()> {
+/// Validiert [`PlanAction::AddNode`] (Regeln 1, 5, 6; nur `Draft`).
+fn validate_add_node(plan: &Plan, node: &PlanNode) -> PlanResult<()> {
     // Regel 1: eine leere Task-ID ist keine Identität.
     ensure_not_blank("node.id", node.id.as_str())?;
 
@@ -588,19 +670,22 @@ fn validate_add_node(
         });
     }
 
+    // F-013 §5.1 Punkt 1: neue Knoten beginnen als Draft. Damit entfallen
+    // Completed ohne Evidenz, eingeschleuste Terminalzustände und die
+    // Umgehung von Dependency-/Explorationsregeln beim Einfügen — alle
+    // weiteren Zustände führen über `SetStatus`.
+    ensure_inserted_as_draft(node)?;
+
     // Regel 1: neue Knoten dürfen keine nicht vorhandenen Dependencies referenzieren.
     for dependency_id in &node.dependencies {
-        ensure_node_exists(plan, dependency_id)?;
+        let dependency = find_node(plan, dependency_id).ok_or_else(|| PlanError::NodeMissing {
+            id: dependency_id.clone(),
+        })?;
+        ensure_edge_allowed(node, dependency)?;
     }
 
-    if ACTIVE_STATUSES.contains(&node.status) {
-        // Ready und InProgress dürfen nur mit vollständig abgeschlossenen
-        // Dependencies in den Plan aufgenommen werden.
-        ensure_dependencies_completed(plan, node)?;
-
-        // Regel 12: Explore-before-implement.
-        ensure_exploration_fresh(plan, node, cfg, now)?;
-    }
+    // Draft-Knoten brauchen weder abgeschlossene Dependencies noch
+    // Exploration (Regel 12 greift beim Übergang nach `Ready`).
 
     // Regel 5: forbidden_scope ∩ write_scope == ∅
     ensure_forbidden_disjoint(&node.write_scope, &node.forbidden_scope)?;
@@ -644,10 +729,15 @@ fn validate_update_node(plan: &Plan, id: &TaskId, patch: &NodePatch) -> PlanResu
     }
 
     // Regel 14: neue Dependencies müssen existieren (Regel 1) und dürfen
-    // keinen Zyklus erzeugen (Regel 2).
+    // keinen Zyklus erzeugen (Regel 2). F-013 §5.1 Punkt 5: ein aktiver
+    // Knoten bekommt nur abgeschlossene, keine abgelösten Dependencies.
     if let Some(dependencies) = patch.dependencies.as_deref() {
         for dependency_id in dependencies {
-            ensure_node_exists(plan, dependency_id)?;
+            let dependency =
+                find_node(plan, dependency_id).ok_or_else(|| PlanError::NodeMissing {
+                    id: dependency_id.clone(),
+                })?;
+            ensure_edge_allowed(node, dependency)?;
 
             // Die neue Kante lautet id→dependency_id. Ein Zyklus entsteht,
             // wenn `id` von `dependency_id` aus bereits erreichbar ist. Der
@@ -664,11 +754,18 @@ fn validate_update_node(plan: &Plan, id: &TaskId, patch: &NodePatch) -> PlanResu
     Ok(())
 }
 
-/// Validiert [`PlanAction::AddDependency`] (Regeln 1, 2).
+/// Validiert [`PlanAction::AddDependency`] (Regeln 1, 2; Siegel/Status).
 fn validate_add_dependency(plan: &Plan, child: &TaskId, parent: &TaskId) -> PlanResult<()> {
     // Regel 1: beide Knoten müssen existieren
-    ensure_node_exists(plan, child)?;
-    ensure_node_exists(plan, parent)?;
+    let child_node =
+        find_node(plan, child).ok_or_else(|| PlanError::NodeMissing { id: child.clone() })?;
+    let parent_node =
+        find_node(plan, parent).ok_or_else(|| PlanError::NodeMissing { id: parent.clone() })?;
+
+    // F-013 §5.1 Punkt 5: Siegel- und Statusprüfung der neuen Kante. Sonst
+    // bräche die Invariante „Ready/InProgress ⇒ Dependencies Completed“
+    // nachträglich.
+    ensure_edge_allowed(child_node, parent_node)?;
 
     // Regel 2: Zyklus-Erkennung via DFS
     // Die neue Kante lautet child→parent (child hängt zukünftig von parent ab).
@@ -730,7 +827,15 @@ fn validate_set_status(
     if ACTIVE_STATUSES.contains(&status) {
         ensure_dependencies_completed(plan, node)?;
 
-        // Regel 12: Explore-before-implement.
+        // Regel 6 auch beim Übergang (F-013 §5.1 Punkt 4): zwei Draft-Knoten
+        // mit gleichem `write_scope` dürfen nicht beide aktiv werden. Der
+        // Knoten selbst ist ausgenommen (`Ready → InProgress`).
+        ensure_write_scope_free(plan, &node.write_scope, Some(id))?;
+    }
+
+    // Regel 12: Explore-before-implement beim Eintritt nach `Ready`.
+    // `InProgress` ist nur aus `Ready` erreichbar und wurde dort geprüft.
+    if status == PlanNodeStatus::Ready {
         ensure_exploration_fresh(plan, node, cfg, now)?;
     }
 
@@ -786,7 +891,14 @@ fn validate_attach_evidence(plan: &Plan, id: &TaskId, evidence: &EvidenceRef) ->
     Ok(())
 }
 
-/// Validiert [`PlanAction::Invalidate`] (Regeln 1, 8).
+/// Validiert [`PlanAction::Invalidate`] (Regeln 1, 3, 8).
+///
+/// # Errors
+/// - [`PlanError::NodeMissing`]: Knoten fehlt.
+/// - [`PlanError::InvalidateCompleted`]: Knoten ist `Completed`.
+/// - [`PlanError::IllegalTransition`]: Knoten ist `Superseded` oder bereits
+///   `Invalidated` (F-013 §5.1 Punkt 2 — sonst wäre `Superseded` über
+///   `Invalidate → Reopen` wiederbelebbar).
 fn validate_invalidate(plan: &Plan, ids: &[TaskId]) -> PlanResult<()> {
     for id in ids {
         // Regel 1: Knoten muss existieren
@@ -795,6 +907,15 @@ fn validate_invalidate(plan: &Plan, ids: &[TaskId]) -> PlanResult<()> {
         // Regel 8: Completed-Knoten dürfen nicht invalidiert werden
         if node.status == PlanNodeStatus::Completed {
             return Err(PlanError::InvalidateCompleted { id: id.clone() });
+        }
+
+        // Regel 3: Invalidierung folgt der Status-Matrix.
+        if !is_legal_transition(node.status, PlanNodeStatus::Invalidated) {
+            return Err(PlanError::IllegalTransition {
+                id: id.clone(),
+                from: format!("{:?}", node.status),
+                to: format!("{:?}", PlanNodeStatus::Invalidated),
+            });
         }
     }
     Ok(())
@@ -882,6 +1003,9 @@ fn validate_expand(
     for child in children {
         // Regel 1: eine leere Task-ID ist keine Identität.
         ensure_not_blank("child.id", child.id.as_str())?;
+
+        // F-013 §5.1 Punkt 1: Kinder beginnen als Draft.
+        ensure_inserted_as_draft(child)?;
 
         // Regel 10: Kind-IDs dürfen weder im Plan noch unter den Geschwistern
         // bereits vergeben sein.
@@ -986,6 +1110,8 @@ fn validate_condense(
 
     // Regel 16: der Ersatzknoten ist neu.
     ensure_not_blank("replacement.id", replacement.id.as_str())?;
+    // F-013 §5.1 Punkt 1: der Ersatzknoten beginnt als Draft.
+    ensure_inserted_as_draft(replacement)?;
     if find_node(plan, &replacement.id).is_some() {
         return Err(PlanError::DuplicateNode {
             id: replacement.id.clone(),
@@ -1358,8 +1484,10 @@ mod tests {
         );
     }
 
+    /// F-013 §5.1 Punkt 1: ein direkt als `Ready` eingefügter Knoten würde
+    /// Dependency- und Explorationsregeln umgehen — er wird abgewiesen.
     #[test]
-    fn test_add_ready_node_rejects_incomplete_dependency() {
+    fn test_add_ready_node_is_rejected_as_non_draft() {
         let dependency = make_node("dep", PlanNodeStatus::Draft);
         let plan = make_plan(vec![dependency]);
         let mut node = make_node("t1", PlanNodeStatus::Ready);
@@ -1369,9 +1497,9 @@ mod tests {
         assert!(
             matches!(
                 validate(&plan, &action),
-                Err(PlanError::DependencyNotCompleted { .. })
+                Err(PlanError::IllegalTransition { .. })
             ),
-            "Ready-AddNode verlangt abgeschlossene Dependencies"
+            "AddNode akzeptiert nur Draft"
         );
     }
 
@@ -1935,14 +2063,14 @@ mod tests {
     }
 
     #[test]
-    fn test_add_ready_coding_node_requires_exploration() {
+    fn test_add_ready_coding_node_is_rejected_before_exploration_check() {
         let plan = make_plan(vec![]);
         let action = PlanAction::AddNode {
             node: make_node("t1", PlanNodeStatus::Ready),
         };
         assert!(matches!(
             validate_with(&plan, &action, &exploration_cfg(), now()),
-            Err(PlanError::ExplorationRequired { .. })
+            Err(PlanError::IllegalTransition { .. })
         ));
     }
 
@@ -2437,5 +2565,255 @@ mod tests {
             ),
             "Condense darf die Scope-Prüfung nicht umgehen"
         );
+    }
+
+    // ── F-013 §5.1: geschlossene Validierungslücken (W3/C-PLAN) ─────────────
+
+    /// Punkt 1: `Completed` ohne Evidenz lässt sich nicht einfügen.
+    #[test]
+    fn test_gap1_add_node_completed_without_evidence_is_rejected() {
+        for status in [
+            PlanNodeStatus::Completed,
+            PlanNodeStatus::Superseded,
+            PlanNodeStatus::Invalidated,
+            PlanNodeStatus::InProgress,
+            PlanNodeStatus::Blocked,
+        ] {
+            let result = check(
+                &make_plan(vec![]),
+                &PlanAction::AddNode {
+                    node: make_node("t1", status),
+                },
+            );
+            assert!(
+                matches!(result, Err(PlanError::IllegalTransition { .. })),
+                "{status:?} darf nicht eingefügt werden, war: {result:?}"
+            );
+        }
+    }
+
+    /// Punkt 1: auch `Expand`-Kinder und `Condense`-Ersatz beginnen als Draft.
+    #[test]
+    fn test_gap1_expand_child_and_condense_replacement_must_be_draft() {
+        let plan = make_plan(vec![expand_parent()]);
+        let mut child = expand_child("c1", "src/feature/a.rs");
+        child.status = PlanNodeStatus::Completed;
+        let expand = PlanAction::Expand {
+            parent: TaskId::new("parent"),
+            children: vec![child],
+        };
+        assert!(matches!(
+            check(&plan, &expand),
+            Err(PlanError::IllegalTransition { .. })
+        ));
+
+        let mut research = make_kind_node("r1", PlanNodeStatus::Completed, PlanNodeKind::Research);
+        research.evidence = vec![make_evidence()];
+        let plan = make_plan(vec![research]);
+        let mut replacement =
+            make_kind_node("c1", PlanNodeStatus::Completed, PlanNodeKind::Contract);
+        replacement.evidence = vec![make_evidence()];
+        let condense = PlanAction::Condense {
+            superseded: vec![TaskId::new("r1")],
+            replacement,
+            summary: "Ergebnis".to_owned(),
+        };
+        assert!(matches!(
+            check(&plan, &condense),
+            Err(PlanError::IllegalTransition { .. })
+        ));
+    }
+
+    /// Punkt 2: `Superseded` ist terminal — kein `Invalidate` (und damit kein
+    /// `Reopen`) mehr; ebenso keine doppelte Invalidierung.
+    #[test]
+    fn test_gap2_invalidate_superseded_and_invalidated_is_rejected() {
+        for status in [PlanNodeStatus::Superseded, PlanNodeStatus::Invalidated] {
+            let plan = make_plan(vec![make_node("t1", status)]);
+            let result = check(
+                &plan,
+                &PlanAction::Invalidate {
+                    ids: vec![TaskId::new("t1")],
+                    condition: InvalidationCondition::ManualInvalidate,
+                },
+            );
+            assert!(
+                matches!(result, Err(PlanError::IllegalTransition { .. })),
+                "{status:?} darf nicht invalidiert werden, war: {result:?}"
+            );
+        }
+    }
+
+    /// Punkt 2: `Draft → Invalidated` steht jetzt explizit in der Matrix.
+    #[test]
+    fn test_gap2_invalidate_draft_follows_matrix() {
+        assert!(is_legal_transition(
+            PlanNodeStatus::Draft,
+            PlanNodeStatus::Invalidated
+        ));
+        let plan = make_plan(vec![make_node("t1", PlanNodeStatus::Draft)]);
+        assert!(check(
+            &plan,
+            &PlanAction::Invalidate {
+                ids: vec![TaskId::new("t1")],
+                condition: InvalidationCondition::ManualInvalidate,
+            }
+        )
+        .is_ok());
+    }
+
+    /// Punkt 3: ein Finding mit Zukunfts-Zeitstempel ist keine frische
+    /// Exploration.
+    #[test]
+    fn test_gap3_future_finding_is_not_fresh() {
+        let mut node = make_node("t1", PlanNodeStatus::Draft);
+        node.evidence = vec![make_finding(now() + Duration::days(3650))];
+        let plan = make_plan(vec![node]);
+        let action = PlanAction::SetStatus {
+            id: TaskId::new("t1"),
+            status: PlanNodeStatus::Ready,
+            reason: None,
+        };
+        assert!(matches!(
+            validate_with(&plan, &action, &exploration_cfg(), now()),
+            Err(PlanError::ExplorationRequired { .. })
+        ));
+        assert!(!is_fresh_finding(
+            &make_finding(now() + Duration::seconds(1)),
+            now(),
+            3_600
+        ));
+        assert!(is_fresh_finding(&make_finding(now()), now(), 3_600));
+    }
+
+    /// Regel 12 greift beim Eintritt nach `Ready`, nicht erneut bei
+    /// `Ready → InProgress` (sonst hinge ein zugelassener Knoten nach
+    /// Fristablauf fest).
+    #[test]
+    fn test_rule12_in_progress_after_ready_does_not_recheck_freshness() {
+        let mut node = make_node("t1", PlanNodeStatus::Ready);
+        node.evidence = vec![make_finding(now() - Duration::days(2))];
+        let plan = make_plan(vec![node]);
+        let action = PlanAction::SetStatus {
+            id: TaskId::new("t1"),
+            status: PlanNodeStatus::InProgress,
+            reason: None,
+        };
+        assert!(validate_with(&plan, &action, &exploration_cfg(), now()).is_ok());
+    }
+
+    /// Punkt 4: `SetStatus → Ready` prüft Regel 6 gegen aktive Knoten.
+    #[test]
+    fn test_gap4_set_status_ready_checks_write_scope_conflict() {
+        let mut active = make_node("a", PlanNodeStatus::Ready);
+        active.write_scope = vec![PathOrSymbol::new("src/shared.rs")];
+        let mut draft = make_node("b", PlanNodeStatus::Draft);
+        draft.write_scope = vec![PathOrSymbol::new("src/shared.rs")];
+        let plan = make_plan(vec![active, draft]);
+
+        let result = check(
+            &plan,
+            &PlanAction::SetStatus {
+                id: TaskId::new("b"),
+                status: PlanNodeStatus::Ready,
+                reason: None,
+            },
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(PlanError::ScopeConflict { existing_node, .. })
+                    if existing_node == &TaskId::new("a")
+            ),
+            "war: {result:?}"
+        );
+
+        // Der Knoten kollidiert nicht mit sich selbst.
+        let result = check(
+            &plan,
+            &PlanAction::SetStatus {
+                id: TaskId::new("a"),
+                status: PlanNodeStatus::InProgress,
+                reason: None,
+            },
+        );
+        assert!(result.is_ok(), "war: {result:?}");
+    }
+
+    /// Punkt 5: `AddDependency` prüft Siegel und Status.
+    #[test]
+    fn test_gap5_add_dependency_checks_seal_and_status() {
+        let mut completed = make_node("done", PlanNodeStatus::Completed);
+        completed.evidence = vec![make_evidence()];
+        let plan = make_plan(vec![
+            completed,
+            make_node("draft", PlanNodeStatus::Draft),
+            make_node("ready", PlanNodeStatus::Ready),
+            make_node("old", PlanNodeStatus::Superseded),
+        ]);
+        let edge = |child: &str, parent: &str| PlanAction::AddDependency {
+            child: TaskId::new(child),
+            parent: TaskId::new(parent),
+        };
+
+        assert!(
+            matches!(check(&plan, &edge("done", "draft")), Err(PlanError::NodeSealed { .. })),
+            "versiegelter Kind-Knoten"
+        );
+        assert!(
+            matches!(
+                check(&plan, &edge("ready", "draft")),
+                Err(PlanError::DependencyNotCompleted { .. })
+            ),
+            "aktiver Kind-Knoten mit offener Dependency"
+        );
+        assert!(
+            matches!(
+                check(&plan, &edge("draft", "old")),
+                Err(PlanError::IllegalTransition { .. })
+            ),
+            "abgelöster Parent kann nie abschließen"
+        );
+        assert!(check(&plan, &edge("ready", "done")).is_ok());
+        assert!(check(&plan, &edge("draft", "ready")).is_ok());
+    }
+
+    /// Punkt 5: dieselbe Prüfung für `UpdateNode.dependencies`.
+    #[test]
+    fn test_gap5_patch_dependencies_on_active_node_requires_completed() {
+        let plan = make_plan(vec![
+            make_node("ready", PlanNodeStatus::Ready),
+            make_node("draft", PlanNodeStatus::Draft),
+        ]);
+        let action = PlanAction::UpdateNode {
+            id: TaskId::new("ready"),
+            patch: NodePatch {
+                dependencies: Some(vec![TaskId::new("draft")]),
+                ..NodePatch::default()
+            },
+        };
+        assert!(matches!(
+            check(&plan, &action),
+            Err(PlanError::DependencyNotCompleted { .. })
+        ));
+    }
+
+    /// F-013/G-032: `Create` mit Traversal-ID wird abgewiesen, auch wenn sie
+    /// über `PlanId::new` gebaut wurde.
+    #[test]
+    fn test_create_rejects_traversal_plan_id() {
+        for raw in ["../../x", "a/b", "p\u{202E}1", "P-1"] {
+            let result = check(
+                &make_plan(vec![]),
+                &PlanAction::Create {
+                    plan_id: PlanId::new(raw),
+                    goal: "Ziel".to_owned(),
+                },
+            );
+            assert!(
+                matches!(result, Err(PlanError::InvalidId { field: "PlanId", .. })),
+                "{raw:?} war: {result:?}"
+            );
+        }
     }
 }

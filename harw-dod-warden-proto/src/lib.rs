@@ -12,6 +12,22 @@
 //! `stage.rs`). Sie führt selbst keine Durchsetzung aus und trifft keine
 //! Autorisierungsentscheidung — beides ist Sache der beiden Nachbarknoten.
 //!
+//! # Proof v2 (C-WPROTO, W3) — maßgeblich
+//! Seit W3 ist die einzige akzeptierte Autorisierung
+//! [`SignedAuthorization`] (Modul [`signed`]): keyed BLAKE3 über kanonische,
+//! längenpräfixierte Bytes (Domain `harw:warden-proof:v2\0`), mit Key-ID
+//! ([`KeyRing`], Rotation), Nonce ([`NonceLedger`]), Ablauf (TTL ≤ 120 s,
+//! [`ProofPolicy`]) und cgroup-Präfix-Allowlist; Anfragehülle
+//! [`WardenRequest`], Antworthülle [`WardenReply`] (beide versioniert, F-088).
+//! Prüfreihenfolge und MAC-Eingabe: siehe [`signed`]-Moduldoku.
+//!
+//! **v1-Altlast:** [`AuthorizationProof`] und [`WardenActionRequest`] bleiben
+//! nur bestehen, damit `harw-dod-warden`, `harw-warden` und
+//! `harw-dod-escalate` bis zu ihrer Umstellung in W5 (D-WARDEN, D-ESC)
+//! kompilieren. Sie sind fälschbar (F-001) und dürfen von keinem Warden mehr
+//! akzeptiert werden. Die Abschnitte unten, die „Beleg“ sagen, beschreiben
+//! diesen v1-Stand.
+//!
 //! # Zwei Vorprüfungen, bevor hier etwas geschrieben wurde
 //!
 //! ## Prüfung 1: Nimmt `harw_macros::warden_actions!` `crate::…`-Pfade an?
@@ -133,15 +149,23 @@
 //! [`error::WardenProtoError`] — siehe dessen Moduldoku.
 
 pub mod action;
+pub mod canonical;
 pub mod denial;
 pub mod error;
 pub mod proof;
 pub mod response;
+pub mod signed;
 pub mod stage;
 
 pub use action::{ProposedAction, Reversibility, WardenAction};
 pub use denial::Denial;
-pub use error::{WardenProtoError, WardenProtoResult};
+pub use error::{ProofError, ProofResult, WardenProtoError, WardenProtoResult};
 pub use proof::AuthorizationProof;
-pub use response::{WardenActionAudit, WardenActionRequest, WardenResponse};
+pub use response::{
+    WardenActionAudit, WardenActionRequest, WardenReply, WardenRequest, WardenResponse,
+};
+pub use signed::{
+    KeyId, KeyRing, MAX_CLOCK_SKEW_SECS_CAP, MAX_TTL_SECS_CAP, MemoryNonceLedger, NonceLedger,
+    ProofKey, ProofPolicy, SignedAuthorization, VerifiedAuthorization, WARDEN_PROTOCOL_VERSION,
+};
 pub use stage::EscalationStage;

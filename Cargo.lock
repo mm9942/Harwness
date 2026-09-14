@@ -1332,27 +1332,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dirs"
-version = "6.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
-dependencies = [
- "dirs-sys",
-]
-
-[[package]]
-name = "dirs-sys"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e01a3366d27ee9890022452ee61b2b63a67e6f13f58900b651ff5665f0bb1fab"
-dependencies = [
- "libc",
- "option-ext",
- "redox_users",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "displaydoc"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1511,16 +1490,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
-name = "filetime"
-version = "0.2.29"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
-dependencies = [
- "cfg-if",
- "libc",
-]
-
-[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1532,7 +1501,6 @@ version = "1.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
- "crc32fast",
  "miniz_oxide",
  "zlib-rs",
 ]
@@ -1571,7 +1539,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5"
 dependencies = [
  "rustix 1.1.4",
- "tokio",
  "windows-sys 0.61.2",
 ]
 
@@ -1861,6 +1828,7 @@ dependencies = [
  "base64",
  "futures-util",
  "harw-browser",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1897,22 +1865,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
-]
-
-[[package]]
-name = "harw-channel-browser"
-version = "0.2.0"
-dependencies = [
- "async-trait",
- "harw-browser",
- "harw-tool-browser",
- "serde",
- "serde_json",
- "time",
- "toml 1.1.3+spec-1.1.0",
- "tracing",
- "url",
- "uuid",
 ]
 
 [[package]]
@@ -1958,7 +1910,6 @@ dependencies = [
  "clap",
  "clap_complete",
  "harw-agent-dsl",
- "harw-catalog",
  "harw-channel",
  "harw-channel-telegram",
  "harw-channel-telegram-transport",
@@ -1999,14 +1950,15 @@ dependencies = [
  "rustix 1.1.4",
  "secrecy 0.10.3",
  "secrecy 0.8.0",
+ "serde",
  "serde_json",
  "tempfile",
  "tikv-jemallocator",
  "tokio",
  "toml 1.1.3+spec-1.1.0",
+ "toml_edit 0.25.13+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]
@@ -2024,12 +1976,15 @@ name = "harw-config"
 version = "0.2.0"
 dependencies = [
  "harw-agent-dsl",
+ "harw-fsutil",
  "harw-macros",
  "harw-types",
  "serde",
  "serde_json",
+ "tempfile",
  "time",
  "toml 0.8.23",
+ "toml_edit 0.25.13+spec-1.1.0",
 ]
 
 [[package]]
@@ -2064,13 +2019,12 @@ dependencies = [
  "harw-tools",
  "harw-types",
  "jiff",
- "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tracing",
- "url",
  "uuid",
 ]
 
@@ -2212,6 +2166,7 @@ dependencies = [
  "harw-session-store",
  "harw-types",
  "jiff",
+ "serde",
  "serde_json",
  "tempfile",
 ]
@@ -2375,6 +2330,7 @@ dependencies = [
  "harw-types",
  "jiff",
  "semver",
+ "serde",
  "serde_json",
 ]
 
@@ -2400,9 +2356,12 @@ name = "harw-dod-sentinel"
 version = "0.2.0"
 dependencies = [
  "harw-dod-cap",
+ "harw-dod-rules",
  "harw-dod-signals",
+ "harw-fsutil",
  "harw-macros",
  "harw-observe",
+ "harw-sandbox",
  "harw-types",
  "jiff",
  "serde_json",
@@ -2452,6 +2411,7 @@ dependencies = [
 name = "harw-dod-warden-proto"
 version = "0.2.0"
 dependencies = [
+ "blake3",
  "harw-macros",
  "harw-types",
  "jiff",
@@ -2474,6 +2434,19 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "harw-egress"
+version = "0.2.0"
+dependencies = [
+ "blake3",
+ "harw-sandbox",
+ "reqwest 0.12.28",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -2626,6 +2599,7 @@ dependencies = [
 name = "harw-lens-index"
 version = "0.2.0"
 dependencies = [
+ "harw-lens-rank",
  "harw-lens-store",
  "harw-lens-types",
  "harw-macros",
@@ -2889,8 +2863,10 @@ dependencies = [
  "secrecy 0.8.0",
  "serde",
  "serde_json",
+ "tempfile",
  "time",
  "tokio",
+ "toml 1.1.3+spec-1.1.0",
  "tracing",
 ]
 
@@ -3020,6 +2996,7 @@ dependencies = [
  "harw-config",
  "harw-core",
  "harw-fsutil",
+ "harw-protocol",
  "harw-provider",
  "harw-sandbox",
  "harw-tools",
@@ -3040,9 +3017,12 @@ dependencies = [
  "harw-agent-dsl",
  "harw-browser",
  "harw-browser-thirtyfour",
+ "harw-config",
+ "harw-egress",
  "harw-extension-api",
  "harw-instructions",
  "harw-project-discovery",
+ "harw-sandbox",
  "harw-tool-browser",
  "harw-tool-deps",
  "harw-tool-fs",
@@ -3050,6 +3030,7 @@ dependencies = [
  "harw-tool-shell",
  "harw-tool-web",
  "include_dir",
+ "serde_json",
  "time",
  "toml 1.1.3+spec-1.1.0",
 ]
@@ -3109,6 +3090,7 @@ dependencies = [
  "harw-types",
  "ipnet",
  "serde",
+ "tracing",
  "url",
 ]
 
@@ -3181,6 +3163,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -3273,7 +3256,10 @@ dependencies = [
 name = "harw-tool-web"
 version = "0.2.0"
 dependencies = [
+ "blake3",
+ "harw-egress",
  "harw-extension-api",
+ "harw-fsutil",
  "harw-macros",
  "harw-sandbox",
  "harw-tools",
@@ -3282,7 +3268,6 @@ dependencies = [
  "scraper",
  "serde",
  "serde_json",
- "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tracing",
@@ -3315,11 +3300,11 @@ dependencies = [
  "harw-context",
  "harw-core",
  "harw-extension-api",
+ "harw-fsutil",
  "harw-home",
  "harw-lens-types",
  "harw-memory",
  "harw-model-catalog",
- "harw-observe",
  "harw-operations",
  "harw-ops",
  "harw-plan",
@@ -3339,7 +3324,6 @@ dependencies = [
  "tracing",
  "unicode-segmentation",
  "unicode-width 0.2.0",
- "uuid",
 ]
 
 [[package]]
@@ -3347,6 +3331,7 @@ name = "harw-types"
 version = "0.2.0"
 dependencies = [
  "blake3",
+ "jiff",
  "serde",
  "serde_json",
  "uuid",
@@ -4224,15 +4209,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "libredox"
-version = "0.1.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c943259e342f1e06ff2da7a83eabdfe7f92ce10262688dbf1895ff0b3e6e4652"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4595,12 +4571,6 @@ name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
-
-[[package]]
-name = "option-ext"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "ordered-stream"
@@ -5121,17 +5091,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "redox_users"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
-dependencies = [
- "getrandom 0.2.17",
- "libredox",
- "thiserror",
-]
-
-[[package]]
 name = "regex"
 version = "1.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5230,14 +5189,12 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
- "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams",
  "web-sys",
 ]
 
@@ -5969,17 +5926,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tar"
-version = "0.4.46"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
-dependencies = [
- "filetime",
- "libc",
- "xattr",
-]
-
-[[package]]
 name = "target-triple"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6030,9 +5976,6 @@ dependencies = [
  "bytes",
  "cfg-if",
  "const_format",
- "dirs",
- "flate2",
- "fs4",
  "futures-util",
  "http",
  "indexmap",
@@ -6042,7 +5985,6 @@ dependencies = [
  "serde_json",
  "serde_repr",
  "stringmatch",
- "tar",
  "thirtyfour-macros",
  "thiserror",
  "tokio",
@@ -6050,7 +5992,6 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "url",
- "zip",
 ]
 
 [[package]]
@@ -6773,19 +6714,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wasm-streams"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
-dependencies = [
- "futures-util",
- "js-sys",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
 name = "web-sys"
 version = "0.3.100"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7138,16 +7066,6 @@ dependencies = [
  "curve25519-dalek",
  "rand_core 0.6.4",
  "zeroize",
-]
-
-[[package]]
-name = "xattr"
-version = "1.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
-dependencies = [
- "libc",
- "rustix 1.1.4",
 ]
 
 [[package]]

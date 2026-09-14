@@ -265,6 +265,10 @@ fn advance_offset_past_poison_update(
 /// Outcome of [`send_event_with_backoff`]: either the event reached the
 /// bounded admission channel, or the caller asked to stop while a full sink
 /// was being retried.
+///
+/// `Debug` ist abgeleitet, damit Tests den unerwarteten Erfolgsfall benennen
+/// können (`expect_err`) und Log-Felder den Ausgang zeigen dürfen.
+#[derive(Debug)]
 enum SendOutcome {
     Sent,
     ShutdownRequested,

@@ -12,17 +12,18 @@
 
 pub mod activation;
 pub mod admission;
+pub mod cancel;
 pub mod child_controller;
 pub mod context_budget;
 pub mod durable_job_runner;
+pub mod envelope;
 pub mod error;
 pub mod execution_registry;
 pub mod history;
 pub mod history_tail;
-pub mod mcp_http;
-pub mod mcp_runtime;
 pub mod mode;
 pub mod model;
+pub mod one_shot;
 pub mod policy;
 pub mod session;
 pub mod session_manager;
@@ -48,15 +49,11 @@ pub use execution_registry::{
 pub use harw_protocol::ToolCallResult;
 pub use history::{ConversationHistory, ModelMessage};
 pub use history_tail::{render_history_tail, HistoryTailRender, HISTORY_TAIL_GUARANTEED_GROUPS, HISTORY_TAIL_SECTION};
-pub use mcp_http::{McpHttpError, McpHttpResult, StreamableHttpMcpClient};
-pub use mcp_runtime::{
-    DEFAULT_STREAMABLE_HTTP_MCP_PORT, StreamableHttpMcpPlan, plan_stdio_mcp,
-    plan_streamable_http_mcp, spawn_stdio_mcp,
-};
 pub use mode::InteractionMode;
 pub use model::{
     EchoModelProvider, ModelError, ModelFuture, ModelProvider, ModelRequest, ModelResponse,
 };
+pub use one_shot::{OneShotError, complete_text};
 pub use policy::ConfigApprovalPolicy;
 pub use session::{
     AgentSession, PendingApproval, PendingHandoff, SessionState, SpawnContext, TurnHandle,

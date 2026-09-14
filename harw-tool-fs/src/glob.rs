@@ -144,11 +144,12 @@ fn glob_blocking(root: &Path, args: &GlobArgs) -> ToolOutput {
         Ok(workspace) => workspace,
         Err(err) => return ToolOutput::error(format!("fs.glob: Workspace nicht lesbar: {err}")),
     };
+    // `clamp(1, HARD_MAX_RESULTS)`: mindestens ein Treffer, höchstens die
+    // harte Obergrenze — auch wenn der Aufrufer 0 oder etwas Riesiges angibt.
     let cap = args
         .max_results
         .unwrap_or(DEFAULT_MAX_RESULTS)
-        .min(HARD_MAX_RESULTS)
-        .max(1);
+        .clamp(1, HARD_MAX_RESULTS);
 
     let mut matches: Vec<String> = Vec::new();
     let mut output_bytes = 0usize;

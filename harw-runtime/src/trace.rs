@@ -9,7 +9,10 @@
 //! (`new_one_shot_root_trace`), `harw-tui/src/app.rs` (`new_tui_root_trace`)
 //! und `harw-cli/src/job_worker.rs` (`plan_node_spawn_trace`). Drei davon
 //! sind Zeile für Zeile identisch, die vierte unterscheidet sich im
-//! Fehlerverhalten.
+//! Fehlerverhalten. Alle vier Altstellen — `new_local_root_trace`
+//! eingeschlossen — sind seit W2d-2 entfernt: ihre Aufrufer laufen jetzt über
+//! die RuntimeAssembly-Montage (siehe [`crate::RuntimeAssembly`]), die
+//! [`new_root_trace`] hier einmal je Lauf zieht.
 //!
 //! # Der Trace-Bruch (Befund G-044)
 //! Der Wurzel-Trace entstand jeweils **innerhalb** des `SpawnContext`, also

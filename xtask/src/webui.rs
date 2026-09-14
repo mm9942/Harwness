@@ -104,7 +104,7 @@ const HEADER: &str = "\
 /// Fläche-neutrale Zwischendarstellung zwischen dem Rust-Quelltext-Scanner
 /// und dem TypeScript-Renderer. Trägt bewusst nur, was
 /// `harw_operations::adapter::WebAdapter` selbst kennt — siehe dessen
-/// Moduldoku (`path`, `readonly`, `approval`, `permission`,
+/// Moduldoku (`path`, `method`, `approval`, `permission`,
 /// `operation_name`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WebRouteDescriptor {
@@ -115,8 +115,10 @@ pub struct WebRouteDescriptor {
     pub summary: Option<String>,
     /// HTTP-Pfad aus `Surface::Web { path, .. }`.
     pub path: String,
-    /// `Surface::Web { readonly, .. }` — bestimmt `GET` (true) vs. `POST`.
-    pub readonly: bool,
+    /// `Surface::Web { method, .. }` — bereits normalisiert auf `"GET"` oder
+    /// `"POST"` (aus `WebMethod::Get`/`WebMethod::Post`, siehe
+    /// [`normalize_web_method`]).
+    pub method: String,
     /// Variantenname aus `PermissionTier::<Name>` (`OperationMeta::permission`).
     pub permission: String,
     /// Variantenname aus `ApprovalPolicy::<Name>` (`Surface::Web { approval, .. }`).
@@ -346,9 +348,9 @@ fn extract_routes_from_source(source: &str) -> Vec<WebRouteDescriptor> {
             let Some(path) = field_str(web_block, "path") else {
                 continue;
             };
-            let readonly = field_str(web_block, "readonly")
-                .map(|raw| raw.trim() == "true")
-                .unwrap_or(false);
+            let method = field_str(web_block, "method")
+                .map(|raw| normalize_web_method(&raw))
+                .unwrap_or_else(|| "POST".to_owned());
             let approval = field_str(web_block, "approval")
                 .map(|raw| strip_path_prefix(&raw, "ApprovalPolicy"))
                 .unwrap_or_else(|| "None".to_owned());
@@ -357,7 +359,7 @@ fn extract_routes_from_source(source: &str) -> Vec<WebRouteDescriptor> {
                 operation: name.clone(),
                 summary: summary.clone(),
                 path,
-                readonly,
+                method,
                 permission: permission.clone(),
                 approval,
             });
@@ -384,6 +386,35 @@ fn strip_path_prefix(raw: &str, prefix: &str) -> String {
         .unwrap_or(trimmed)
         .trim()
         .to_owned()
+}
+
+/// Normalisiert ein rohes `Surface::Web { method, .. }`-Token auf `"GET"`
+/// oder `"POST"`.
+///
+/// # Description
+/// Erwartet ein Token wie `WebMethod::Get`, `WebMethod::Post` oder — bei
+/// vollqualifiziertem Pfad — `harw_operations::operation::WebMethod::Get`;
+/// liest nur das letzte `::`-Segment (den Variantennamen) und bildet ihn auf
+/// die per Serde (`SCREAMING_SNAKE_CASE`) definierte Draht-Form ab (siehe
+/// `harw-operations/src/operation.rs`, `WebMethod`). Ein unbekannter oder
+/// nicht auflösbarer Variantenname fällt auf `"POST"` zurück — dieselbe
+/// fail-closed-Konvention wie zuvor bei `readonly` (`unwrap_or(false)` →
+/// `POST`): ein Scan-Fehler soll nie fälschlich eine sichere `GET`-Route
+/// vortäuschen.
+///
+/// # Arguments
+/// - `raw` (`&str`): rohes Token aus [`field_str`].
+///
+/// # Returns
+/// `"GET"` für die Variante `Get`, sonst `"POST"`.
+fn normalize_web_method(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let variant = trimmed.rsplit("::").next().unwrap_or(trimmed).trim();
+    if variant == "Get" {
+        "GET".to_owned()
+    } else {
+        "POST".to_owned()
+    }
 }
 
 /// `true`, wenn `c` Teil eines Rust-Bezeichners sein kann.
@@ -894,11 +925,11 @@ fn render_typescript(routes: &[WebRouteDescriptor]) -> String {
         if let Some(summary) = &route.summary {
             out.push_str(&format!("  // {}\n", summary.replace('\n', " ")));
         }
-        let method = if route.readonly { "GET" } else { "POST" };
         out.push_str(&format!(
             "  {{ operation: {op}, path: {path}, method: \"{method}\", permission: \"{perm}\", approval: \"{appr}\" }},\n",
             op = ts_string(&route.operation),
             path = ts_string(&route.path),
+            method = route.method,
             perm = route.permission,
             appr = route.approval,
         ));
@@ -927,7 +958,7 @@ mod tests {
     /// Eine Beispiel-Quelldatei mit genau einer produktiven `Surface::Web`-Route.
     const GOLDEN_SOURCE: &str = r#"
 use harw_operations::operation::{
-    ApprovalPolicy, OperationMeta, PermissionTier, Surface,
+    ApprovalPolicy, OperationMeta, PermissionTier, Surface, WebMethod,
 };
 
 impl Operation for SessionListOp {
@@ -940,7 +971,7 @@ impl Operation for SessionListOp {
             permission: PermissionTier::Operator,
             surfaces: vec![Surface::Web {
                 path: "/api/session/list",
-                readonly: true,
+                method: WebMethod::Get,
                 approval: ApprovalPolicy::None,
             }],
             aliases: &[],
@@ -956,7 +987,7 @@ impl Operation for SessionListOp {
             operation: "session.list".to_owned(),
             summary: Some("Listet alle Sessions.".to_owned()),
             path: "/api/session/list".to_owned(),
-            readonly: true,
+            method: "GET".to_owned(),
             permission: "Operator".to_owned(),
             approval: "None".to_owned(),
         }
@@ -988,7 +1019,7 @@ impl Operation for SessionListOp {
     #[test]
     fn test_extract_routes_skips_mod_tests_block() {
         let source = format!(
-            "{GOLDEN_SOURCE}\n#[cfg(test)]\nmod tests {{\n    struct FakeOp;\n    impl FakeOp {{\n        fn meta() -> OperationMeta {{\n            OperationMeta {{\n                name: \"fake-test-op\",\n                summary: \"nur ein Test\",\n                permission: PermissionTier::Owner,\n                surfaces: vec![Surface::Web {{ path: \"/api/fake-test\", readonly: true, approval: ApprovalPolicy::None }}],\n            }}\n        }}\n    }}\n}}\n"
+            "{GOLDEN_SOURCE}\n#[cfg(test)]\nmod tests {{\n    struct FakeOp;\n    impl FakeOp {{\n        fn meta() -> OperationMeta {{\n            OperationMeta {{\n                name: \"fake-test-op\",\n                summary: \"nur ein Test\",\n                permission: PermissionTier::Owner,\n                surfaces: vec![Surface::Web {{ path: \"/api/fake-test\", method: WebMethod::Get, approval: ApprovalPolicy::None }}],\n            }}\n        }}\n    }}\n}}\n"
         );
         let routes = extract_routes_from_source(&source);
         assert_eq!(
@@ -1004,7 +1035,7 @@ impl Operation for SessionListOp {
         // Beispiele mit erfundenen Pfaden (z. B. "/api/my") — diese dürfen
         // nicht als Routen erscheinen, nur die tatsächliche Deklaration.
         let source = format!(
-            "//! ```rust,no_run\n//! OperationMeta {{\n//!     name: \"doc-example\",\n//!     permission: PermissionTier::Owner,\n//!     surfaces: vec![Surface::Web {{ path: \"/api/doc-example\", readonly: true, approval: ApprovalPolicy::None }}],\n//! }}\n//! ```\n{GOLDEN_SOURCE}"
+            "//! ```rust,no_run\n//! OperationMeta {{\n//!     name: \"doc-example\",\n//!     permission: PermissionTier::Owner,\n//!     surfaces: vec![Surface::Web {{ path: \"/api/doc-example\", method: WebMethod::Get, approval: ApprovalPolicy::None }}],\n//! }}\n//! ```\n{GOLDEN_SOURCE}"
         );
         let routes = extract_routes_from_source(&source);
         assert_eq!(
@@ -1050,18 +1081,18 @@ impl Operation for SessionListOp {
                 name: "two-web",
                 permission: PermissionTier::Maintainer,
                 surfaces: vec![
-                    Surface::Web { path: "/api/alpha", readonly: true, approval: ApprovalPolicy::None },
-                    Surface::Web { path: "/api/beta", readonly: false, approval: ApprovalPolicy::Always },
+                    Surface::Web { path: "/api/alpha", method: WebMethod::Get, approval: ApprovalPolicy::None },
+                    Surface::Web { path: "/api/beta", method: WebMethod::Post, approval: ApprovalPolicy::Always },
                 ],
             }
         "#;
         let routes = extract_routes_from_source(source);
         assert_eq!(routes.len(), 2);
         assert_eq!(routes[0].path, "/api/alpha");
-        assert!(routes[0].readonly);
+        assert_eq!(routes[0].method, "GET");
         assert_eq!(routes[0].approval, "None");
         assert_eq!(routes[1].path, "/api/beta");
-        assert!(!routes[1].readonly);
+        assert_eq!(routes[1].method, "POST");
         assert_eq!(routes[1].approval, "Always");
     }
 

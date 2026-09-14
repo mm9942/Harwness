@@ -23,10 +23,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use harw_core::{ChildRegistryFactory, EchoModelProvider, InMemoryStateStore, StateStore};
+use harw_extension_api::allow_rules::AllowRuleSet;
 use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_extension_api::contributors::ApprovalHandlerKind;
 use harw_extension_api::{ApprovalDecision, ApprovalHandler, ExtFuture, ToolCall};
-use harw_operations::operation::{Operation, Surface};
+use harw_operations::operation::Surface;
 use harw_registry_defaults::profile::role_names;
 use harw_runtime::approval::{ApprovalChain, AskResolutionPolicy, DEFAULT_POLICY_LABEL};
 use harw_runtime::assembly::{RuntimeAssembly, RuntimeStores, SessionLifecycleHook};
@@ -359,14 +360,20 @@ fn the_child_factory_refuses_an_unknown_role() {
             AskResolution::Interactive,
             ApprovalModeCell::default(),
             None,
+            AllowRuleSet::new(),
         ),
     )
     .expect("Fabrik");
 
     let input = spawn_input();
-    let error = factory
-        .build_registry("definitely-not-a-role", &input, None)
-        .expect_err("unbekannte Rolle muss fehlschlagen");
+    // Kein `.expect_err(...)`: das verlangte `Result::Ok`-Typ `Debug`, den
+    // `ExtensionRegistry` absichtlich nicht trägt (Werkzeug-Registries gehören
+    // nicht ins Log). Die Eigenschaft, um die es hier geht — die Kette scheitert
+    // an der unbekannten Rolle —, prüfen wir direkt über den `Err`-Zweig.
+    let error = match factory.build_registry("definitely-not-a-role", &input, None) {
+        Ok(_) => panic!("unbekannte Rolle muss fehlschlagen"),
+        Err(error) => error,
+    };
     assert!(
         error.message.contains("unknown role"),
         "die Meldung nennt den Grund: {}",
@@ -390,6 +397,7 @@ fn the_child_registry_inherits_the_config_approval_policy() {
         AskResolution::Interactive,
         ApprovalModeCell::default(),
         None,
+        AllowRuleSet::new(),
     );
     // Die Kette, die das Kind führen muss: dieselbe wie die des Elternteils,
     // nur über der gelösten Modus-Zelle des Kindes.
@@ -461,6 +469,7 @@ fn discovery_runs_exactly_once_per_assembly() {
             AskResolution::Interactive,
             ApprovalModeCell::default(),
             None,
+            AllowRuleSet::new(),
         ),
     )
     .expect("Fabrik");
@@ -693,6 +702,21 @@ fn the_operation_surface_reaches_the_assembled_run() {
     }
 }
 
+/// Die Namen der Plan-Werkzeuge, die `register_plan_tools`
+/// (`harw-ops/src/lib.rs`) unter das volle Werkzeugprofil mischt:
+/// `PlanOperation`, `GoalOperation`, `ExploreOperation`,
+/// `ResearchDepsOperation`, `ResearchWebOperation`, `AnalyzeOperation`
+/// (`OperationMeta::name` je Datei in `harw-ops/src/{plan,goal,explore,
+/// research,analyze}.rs`).
+const PLAN_TOOL_NAMES: &[&str] = &[
+    "plan",
+    "goal",
+    "explore",
+    "research_deps",
+    "research_web",
+    "analyze",
+];
+
 /// Z2c-01, zweite Hälfte: **nur** [`OperationSurface::AllWithModelTools`]
 /// legt die Operationen dem Modell als Werkzeuge vor. Vor W2c bekamen
 /// `Analyze` und `Web` — Vertrag „nur Commands" — dieselbe volle
@@ -707,10 +731,35 @@ fn only_the_full_surface_offers_operations_to_the_model() {
         "die Vorbedingung des Tests: es gibt Modell-Tool-Operationen"
     );
 
+    // Bewusste, benannte Ausnahme (siehe `resolve_plan_services` in
+    // `harw-runtime/src/assembly.rs`): Seit dieser Welle bekommt **nur**
+    // `Tui` die Plan-Werkzeuge (`PLAN_TOOL_NAMES`) automatisch dazu, sobald
+    // `[tools.plan]` unangetastet ist (`default_tui_plan_services`).
+    // `OneShot` bringt (wie zuvor, z. B. `harw-cli/src/chat.rs`) keinen
+    // eigenen Plan-Speicher über den Builder mit und bleibt ohne eingebaute
+    // Vorgabe geschlossen — Präzedenzregel 2 in `resolve_plan_services`:
+    // „Nicht-`Tui`-Einstiege ohne Builder-Wert bleiben ohne eingebaute
+    // Vorgabe geschlossen". Das weicht die eigentliche Zusicherung dieses
+    // Tests nicht auf: Die volle Modell-Tool-Fläche
+    // (`OperationSurface::AllWithModelTools`) bleibt die einzige Fläche, die
+    // dem Modell überhaupt Operationen anbietet — `Analyze`/`Web`
+    // (`OperationSurface::CommandsOnly`) bieten weiterhin keine einzige an
+    // (siehe unten). Nur *innerhalb* der vollen Fläche unterscheiden sich
+    // `Tui` und `OneShot` jetzt um genau die dokumentierten Plan-Werkzeuge.
     for entry in [EntryKind::Tui, EntryKind::OneShot] {
         let assembled = assemble(entry, &fixture).expect("montiert");
         let tools = assembled.assembly.rights_snapshot().tools;
         for name in &exposed {
+            let is_plan_tool = PLAN_TOOL_NAMES.contains(&name.as_str());
+            if is_plan_tool && entry != EntryKind::Tui {
+                assert!(
+                    !tools.contains(name),
+                    "{entry:?} darf das Plan-Werkzeug '{name}' nicht anbieten \
+                     (dokumentierte Ausnahme, nur `Tui` bekommt die \
+                     Plan-Werkzeuge standardmäßig): {tools:?}"
+                );
+                continue;
+            }
             assert!(
                 tools.contains(name),
                 "{entry:?} muss '{name}' dem Modell anbieten: {tools:?}"

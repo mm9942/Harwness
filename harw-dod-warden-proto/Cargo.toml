@@ -47,6 +47,10 @@ jiff = { workspace = true }
 # Kein zusätzliches Gewicht für das Warden-Abhängigkeitsbudget (Prüfung 2):
 # `harw-types` zieht `serde_json` bereits ein.
 serde_json = { workspace = true }
+# Proof v2 (C-WPROTO): keyed BLAKE3 für den MAC, `blake3::Hash`-Vergleich in
+# konstanter Zeit. Bereits über `harw-types` im Baum — kein zusätzliches
+# Gewicht für das Warden-Abhängigkeitsbudget.
+blake3 = { workspace = true }
 
 [lints]
 workspace = true

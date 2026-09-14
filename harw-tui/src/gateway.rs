@@ -21,7 +21,7 @@
 //! # Nächste Etappe
 //! Ein `RemoteGateway` kann `LocalGateway` ersetzen, indem er intern zu einem
 //! Gateway-Prozess spricht (RPC/HTTP/tokio-tcp). Solange er dieselben
-//! `session_mut()`/`store()`/`model()`-Getter liefert, muss `run_chat_tui`
+//! `session_mut()`/`store()`/`model()`-Getter liefert, muss `crate::runtime_root::run_tui`
 //! nichts anderes wissen. Dann verschieben wir schrittweise die Turn-Logik
 //! ebenfalls hinter den Trait, sobald das Streaming-Protokoll klarer wird.
 
@@ -65,7 +65,7 @@ pub trait ChatGateway: Send {
 ///
 /// # Beschreibung
 /// Bündelt `AgentSession`, einen injizierten State-Store und einen Box'd
-/// `ModelProvider`, sodass `run_chat_tui` nur noch **einen** Konstruktor
+/// `ModelProvider`, sodass `crate::runtime_root::run_tui` nur noch **einen** Konstruktor
 /// aufruft statt drei separate Werte zusammenzufügen. Die konkreten Felder
 /// bleiben privat; nur die Getter des [`ChatGateway`]-Trait sind öffentlich.
 pub struct LocalGateway {

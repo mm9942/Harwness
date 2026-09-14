@@ -138,16 +138,19 @@ pub enum PlanError {
     #[msg("Plan-Knoten '{id}' ist bereits vergeben")]
     DuplicateNode { id: TaskId },
 
-    /// Eine übergebene ID ist leer oder besteht nur aus Leerraum.
+    /// Eine übergebene ID ist leer, besteht nur aus Leerraum oder verletzt
+    /// eine feste ID-Grammatik.
     ///
     /// # Auslöser
     /// Validierung einer neuen `TaskId`/`PlanId` (oder eines anderen
-    /// ID-artigen Feldes), deren Rohwert nach dem Trimmen leer ist.
+    /// ID-artigen Feldes), deren Rohwert nach dem Trimmen leer ist — oder bei
+    /// [`PlanId`] nicht der Grammatik `^[a-z0-9][a-z0-9-]{0,63}$` entspricht
+    /// (Pfad-Traversal-Schutz, F-013).
     ///
     /// # Arguments
     /// - `field` (`&'static str`): Name des betroffenen Feldes.
     /// - `value` (`String`): der ungültige Rohwert.
-    #[msg("Ungültiger Wert für '{field}': '{value}' (leer oder nur Leerzeichen)")]
+    #[msg("Ungültiger Wert für '{field}': {value:?} (leer, nur Leerzeichen oder unzulässige Zeichen)")]
     InvalidId {
         field: &'static str,
         value: String,
@@ -231,7 +234,7 @@ pub enum PlanError {
     ///
     /// # Arguments
     /// - `id` (`TaskId`): der versiegelte Knoten.
-    #[msg("Knoten '{id}' ist bereits Completed und kann nicht mehr verändert werden (Patch verboten)")]
+    #[msg("Knoten '{id}' ist versiegelt (Completed/Superseded/Invalidated) und kann nicht mehr verändert werden")]
     NodeSealed { id: TaskId },
 
     /// Ein Akteur versucht eine Aktion, für die er nicht autorisiert ist.
@@ -264,6 +267,57 @@ pub enum PlanError {
     /// - `status` (`String`): der angeforderte, reservierte Zielstatus.
     #[msg("Statusübergang zu '{status}' ist ausschließlich per Owner-Command erlaubt")]
     GoalTransitionReserved { status: String },
+
+    /// Optimistische Revisionsprüfung eines Batches ist gescheitert.
+    ///
+    /// # Auslöser
+    /// `PlanStore::apply_batch` mit `expected_rev`, das nicht der aktuellen
+    /// Revision des Plans entspricht — ein anderer Akteur hat den Plan
+    /// zwischenzeitlich verändert. Es wurde nichts angewendet.
+    ///
+    /// # Arguments
+    /// - `plan` (`PlanId`): betroffener Plan.
+    /// - `expected` (`RevisionId`): vom Aufrufer erwartete Revision.
+    /// - `actual` (`RevisionId`): tatsächliche aktuelle Revision.
+    #[msg("Revisionskonflikt für Plan '{plan}': erwartet={expected}, aktuell={actual}")]
+    RevisionConflict {
+        plan: PlanId,
+        expected: RevisionId,
+        actual: RevisionId,
+    },
+
+    /// Eine Aktion innerhalb eines Batches wurde abgewiesen; der gesamte
+    /// Batch wurde verworfen (alles oder nichts).
+    ///
+    /// # Arguments
+    /// - `index` (`usize`): 0-basierter Index der abgewiesenen Aktion.
+    /// - `source` (`Box<PlanError>`): der Fehler dieser Aktion.
+    #[msg("Batch verworfen: Aktion #{index} abgewiesen: {source}")]
+    BatchActionRejected {
+        index: usize,
+        source: Box<PlanError>,
+    },
+
+    /// Das Integritätssiegel eines Snapshots passt nicht zu seinem Inhalt
+    /// oder zur Siegelkette.
+    ///
+    /// # Auslöser
+    /// Laden eines `rev-<n>.json`, dessen `rev-<n>.seal` fehlt (obwohl das
+    /// Verzeichnis versiegelt ist), unlesbar ist, einen anderen Digest trägt
+    /// oder dessen Kettenwert nicht zum Vorgänger passt. Das Siegel ist
+    /// ungeschlüsselt: es erkennt Beschädigung und naive Manipulation, nicht
+    /// einen Angreifer mit Schreibrecht auf `HARW_HOME`.
+    ///
+    /// # Arguments
+    /// - `path` (`String`): betroffene Datei.
+    /// - `expected` (`String`): erwarteter Wert (laut Siegel bzw. Kette).
+    /// - `actual` (`String`): tatsächlich berechneter/gefundener Wert.
+    #[msg("Siegelprüfung fehlgeschlagen für '{path}': erwartet={expected}, gefunden={actual}")]
+    SealMismatch {
+        path: String,
+        expected: String,
+        actual: String,
+    },
 
     /// I/O-Fehler (für `FilePlanStore`).
     #[msg("I/O-Fehler: {0}")]
@@ -492,7 +546,20 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("'id'"), "msg={msg}");
-        assert!(msg.contains("'   '"), "msg={msg}");
+        assert!(msg.contains("\"   \""), "msg={msg}");
+    }
+
+    /// Steuerzeichen im Rohwert werden escaped ausgegeben (keine
+    /// Log-Injektion über eine ungültige ID).
+    #[test]
+    fn test_invalid_id_display_escapes_control_characters() {
+        let err = PlanError::InvalidId {
+            field: "PlanId",
+            value: "a\nb".to_owned(),
+        };
+        let msg = err.to_string();
+        assert!(!msg.contains('\n'), "msg={msg}");
+        assert!(msg.contains("a\\nb"), "msg={msg}");
     }
 
     #[test]
@@ -558,6 +625,45 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("t1"), "msg={msg}");
         assert!(msg.contains("Completed"), "msg={msg}");
+    }
+
+    #[test]
+    fn test_revision_conflict_display() {
+        let err = PlanError::RevisionConflict {
+            plan: PlanId::new("p-1"),
+            expected: RevisionId::new(3),
+            actual: RevisionId::new(4),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("p-1"), "msg={msg}");
+        assert!(msg.contains("erwartet=3"), "msg={msg}");
+        assert!(msg.contains("aktuell=4"), "msg={msg}");
+    }
+
+    #[test]
+    fn test_batch_action_rejected_display_names_index_and_cause() {
+        let err = PlanError::BatchActionRejected {
+            index: 2,
+            source: Box::new(PlanError::NodeMissing {
+                id: TaskId::new("t9"),
+            }),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("#2"), "msg={msg}");
+        assert!(msg.contains("t9"), "msg={msg}");
+    }
+
+    #[test]
+    fn test_seal_mismatch_display() {
+        let err = PlanError::SealMismatch {
+            path: "plans/p-1/rev-2.json".to_owned(),
+            expected: "aa".to_owned(),
+            actual: "bb".to_owned(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("rev-2.json"), "msg={msg}");
+        assert!(msg.contains("erwartet=aa"), "msg={msg}");
+        assert!(msg.contains("gefunden=bb"), "msg={msg}");
     }
 
     #[test]

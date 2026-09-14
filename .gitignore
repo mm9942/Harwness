@@ -33,3 +33,12 @@ docs/remediation/AGENT-BRIEF.md
 /project_handoff.md
 /goal.md
 /hardening-suggestive-inspiration.md
+
+# Exportierte Claude-Code-Gespräche
+/20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*.txt
+
+# Build- und Prüfprotokolle aus lokalen Läufen (make build/clippy > …)
+*.log
+
+# Lokales Auslieferungsarchiv (zu gross fuer GitHub)
+harw.zip

@@ -1,0 +1,419 @@
+//! `/add-workdir` — zusätzliche Arbeitsverzeichnisse für die Sitzung freigeben.
+//!
+//! Spec-Quelle: Contract `harw-scopes-contract.md` §2 (Slice A8,
+//! `harw_sandbox::ExtraRootsCell`) und Schritt 6 des Plans
+//! `nope-permissions-gibt-es-wild-lobster.md` (Slice B4).
+//!
+//! # Verantwortung
+//! Diese Operation validiert einen Verzeichnis-Kandidaten über
+//! [`harw_sandbox::validate_extra_root`] (via [`ExtraRootsCell::add`]) und
+//! registriert ihn in der geteilten [`ExtraRootsCell`] der Sitzung. Sie
+//! erweitert **nie** implizit eine Sandbox: die Zelle wird nur dann wirksam,
+//! wenn eine `SandboxSpec` sie ausdrücklich über `with_extra_roots` gebunden
+//! hat — das ist Sache der Kompositionswurzel (`harw-runtime`), nicht dieser
+//! Operation.
+//!
+//! # Unterkommandos
+//! - `/add-workdir` (kein Argument) — listet die aktuell registrierten
+//!   zusätzlichen Wurzeln.
+//! - `/add-workdir <pfad>` — validiert und registriert `<pfad>` für diese
+//!   Sitzung.
+//! - `/add-workdir <pfad> --save` — wie oben, und merkt `<pfad>` zusätzlich
+//!   dauerhaft im Projekt-Scope (`[permissions] extra_roots` in
+//!   `~/.harw/profiles/<profil>/projects/<schlüssel>/settings.toml`, siehe
+//!   `crate::permissions::project_config_path`). Es gibt bewusst keinen
+//!   `--global`-Scope für Arbeitsverzeichnisse — sie sind projektbezogen.
+//! - `/add-workdir --remove <pfad>` — entfernt `<pfad>` aus der Sitzungs-
+//!   Zelle und (bestes Bemühen) aus der Projekt-Datei.
+//!
+//! # Fehlermeldungen
+//! Alle Validierungsfehler ([`harw_sandbox::ExtraRootError`]) tragen bereits
+//! deutsche Klartext-Begründungen (`/` abgelehnt, `$HOME` abgelehnt, Vorfahre
+//! des Projekt-Roots, maximal 8 Wurzeln) — diese Operation reicht sie
+//! unverändert als [`OpError::InvalidArguments`] durch.
+
+use std::path::PathBuf;
+
+use harw_config::{ConfigWriter, SettingScope};
+use harw_macros::operation;
+use harw_operations::{FromRawArgs, OpContext, OpError, OpOutput};
+use harw_sandbox::ExtraRootsCell;
+
+/// Meldung für den Fall, dass keine [`ExtraRootsCell`] registriert ist.
+pub(crate) const NO_EXTRA_ROOTS_CELL: &str = crate::permissions::NO_EXTRA_ROOTS_CELL;
+
+/// Argumente für `/add-workdir`.
+///
+/// # Beschreibung
+/// Rohe Tokens; die Operation unterscheidet `--remove <pfad>`, `--save` und
+/// den positionalen Pfad selbst in ihrem Rumpf (siehe Moduldoku).
+#[derive(Default, serde::Deserialize)]
+pub struct AddWorkdirArgs {
+    /// Alle Tokens nach `/add-workdir`.
+    #[serde(default)]
+    pub tokens: Vec<String>,
+}
+
+impl FromRawArgs for AddWorkdirArgs {
+    fn from_raw_args(tokens: &[String]) -> Result<Self, OpError> {
+        Ok(Self {
+            tokens: tokens.to_vec(),
+        })
+    }
+}
+
+/// Listet, fügt hinzu oder entfernt zusätzliche Arbeitsverzeichnisse dieser
+/// Sitzung.
+#[operation(
+    name = "add-workdir",
+    summary = "Gibt ein zusätzliches Arbeitsverzeichnis für diese Sitzung frei (optional dauerhaft fürs Projekt).",
+    domain = "catalog_config",
+    permission = "operator",
+    command(path = "/add-workdir", visibility = "tui_only")
+)]
+async fn add_workdir(ctx: &OpContext, args: AddWorkdirArgs) -> Result<OpOutput, OpError> {
+    if let Some(index) = args.tokens.iter().position(|token| token == "--remove") {
+        let Some(path_str) = args.tokens.get(index + 1) else {
+            return Err(OpError::InvalidArguments(
+                "/add-workdir --remove <pfad> braucht einen Pfad".to_owned(),
+            ));
+        };
+        return remove_workdir(ctx, path_str);
+    }
+
+    let save = args.tokens.iter().any(|token| token == "--save");
+    let positional: Vec<&String> = args
+        .tokens
+        .iter()
+        .filter(|token| token.as_str() != "--save")
+        .collect();
+
+    match positional.first() {
+        None => list_workdirs(ctx),
+        Some(path_str) => add_one_workdir(ctx, path_str, save),
+    }
+}
+
+/// Listet alle aktuell registrierten zusätzlichen Wurzeln.
+fn list_workdirs(ctx: &OpContext) -> Result<OpOutput, OpError> {
+    let Some(cell) = ctx.service::<ExtraRootsCell>() else {
+        return Err(OpError::NotAvailable(NO_EXTRA_ROOTS_CELL.to_owned()));
+    };
+    let roots = cell.snapshot();
+    if roots.is_empty() {
+        return Ok(OpOutput::from(
+            "Keine zusätzlichen Arbeitsverzeichnisse registriert.".to_owned(),
+        ));
+    }
+    let mut buf = format!("{} zusätzliche(s) Arbeitsverzeichnis(se):\n", roots.len());
+    for root in &roots {
+        buf.push_str(&format!(
+            "- {}{}\n",
+            root.path.display(),
+            if root.persisted { " (gemerkt)" } else { "" }
+        ));
+    }
+    Ok(OpOutput::from(buf))
+}
+
+/// Validiert und registriert `path_str` für diese Sitzung, optional mit
+/// dauerhaftem Projekt-Merken (`--save`).
+///
+/// # Errors
+/// - [`OpError::NotAvailable`]: keine `ExtraRootsCell` registriert.
+/// - [`OpError::InvalidArguments`]: Validierung schlug fehl (siehe
+///   [`harw_sandbox::ExtraRootError`]), oder `path_str` konnte für `--save`
+///   nicht kanonisiert werden.
+/// - [`OpError::Execution`]: Projekt-Config-Pfad, -Öffnen oder -Speichern
+///   schlug bei `--save` fehl.
+fn add_one_workdir(ctx: &OpContext, path_str: &str, save: bool) -> Result<OpOutput, OpError> {
+    let Some(cell) = ctx.service::<ExtraRootsCell>() else {
+        return Err(OpError::NotAvailable(NO_EXTRA_ROOTS_CELL.to_owned()));
+    };
+    let primary_root = ctx.sandbox().workspace().canonical_root();
+    let user_home = std::env::var_os("HOME").map(PathBuf::from);
+    let candidate = PathBuf::from(path_str);
+
+    let added = cell
+        .add(&candidate, save, primary_root, user_home.as_deref())
+        .map_err(|error| OpError::InvalidArguments(format!("/add-workdir: {error}")))?;
+
+    let mut note = String::new();
+    if save {
+        let canonical = candidate.canonicalize().map_err(|error| {
+            OpError::InvalidArguments(format!(
+                "/add-workdir: '{}' konnte für --save nicht kanonisiert werden: {error}",
+                candidate.display()
+            ))
+        })?;
+        let path = crate::permissions::scope_path(ctx, SettingScope::Project)?;
+        let mut writer = ConfigWriter::open(&path)
+            .map_err(|error| OpError::Execution(format!("Config öffnen fehlgeschlagen: {error}")))?;
+        let newly_persisted = writer.append_extra_root(&canonical);
+        writer
+            .save()
+            .map_err(|error| OpError::Execution(format!("Config speichern fehlgeschlagen: {error}")))?;
+        note = format!(
+            " Dauerhaft in {} gemerkt{}.",
+            path.display(),
+            if newly_persisted { "" } else { " (war bereits vorhanden)" }
+        );
+    }
+
+    let verb = if added { "hinzugefügt" } else { "bereits registriert" };
+    Ok(OpOutput::from(format!(
+        "Arbeitsverzeichnis {} {}.{note}",
+        candidate.display(),
+        verb
+    )))
+}
+
+/// Entfernt `path_str` aus der Sitzungs-Zelle und, bestes Bemühen, aus der
+/// Projekt-Datei.
+///
+/// # Errors
+/// - [`OpError::NotAvailable`]: keine `ExtraRootsCell` registriert.
+/// - [`OpError::InvalidArguments`]: `path_str` war nicht registriert.
+fn remove_workdir(ctx: &OpContext, path_str: &str) -> Result<OpOutput, OpError> {
+    let Some(cell) = ctx.service::<ExtraRootsCell>() else {
+        return Err(OpError::NotAvailable(NO_EXTRA_ROOTS_CELL.to_owned()));
+    };
+    let candidate = PathBuf::from(path_str);
+    let canonical = candidate.canonicalize().unwrap_or_else(|_| candidate.clone());
+
+    if !cell.remove(&canonical) {
+        return Err(OpError::InvalidArguments(format!(
+            "/add-workdir --remove: '{}' war nicht registriert",
+            candidate.display()
+        )));
+    }
+
+    let mut note = String::new();
+    if let Ok(path) = crate::permissions::scope_path(ctx, SettingScope::Project) {
+        if let Ok(mut writer) = ConfigWriter::open(&path) {
+            if writer.remove_extra_root(&canonical) && writer.save().is_ok() {
+                note = format!(" Auch dauerhaft aus {} entfernt.", path.display());
+            }
+        }
+    }
+
+    Ok(OpOutput::from(format!(
+        "Arbeitsverzeichnis {} entfernt.{note}",
+        canonical.display()
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AddWorkdirArgs, add_workdir};
+    use crate::testutil::toks;
+    use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
+    use harw_sandbox::{
+        ExtraRootsCell, Permission, PermissionSet, SandboxSpec, WorkspaceRegistration,
+        WorkspaceRegistry,
+    };
+    use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Baut einen [`OpContext`] dessen Sandbox-Root ein frisches temporäres
+    /// Verzeichnis ist, optional mit registrierter [`ExtraRootsCell`].
+    fn test_context(with_cell: bool) -> (OpContext, PathBuf) {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("harw-add-workdir-test-{}-{id}", std::process::id()));
+        std::fs::create_dir_all(root.join("workspace")).expect("create test workspace");
+        let registry = WorkspaceRegistry::build(
+            &root,
+            [WorkspaceRegistration {
+                tenant: TenantId::from_str("test-tenant"),
+                workspace: WorkspaceId::from_str("workspace"),
+                root: PathBuf::from("workspace"),
+            }],
+        )
+        .expect("build workspace registry");
+        let binding = registry
+            .resolve(
+                &TenantId::from_str("test-tenant"),
+                &WorkspaceId::from_str("workspace"),
+            )
+            .expect("resolve workspace binding");
+        let mut services = ServiceMap::new();
+        if with_cell {
+            services.insert(ExtraRootsCell::new());
+        }
+        let ctx = OpContext::new(
+            SessionId::new(),
+            TurnId::new(),
+            SandboxSpec::from_resolved(
+                binding,
+                PermissionSet::from_policy([Permission::WriteWorkspace, Permission::ReadWorkspace]),
+            ),
+            services,
+        );
+        (ctx, root)
+    }
+
+    #[test]
+    fn test_add_workdir_args_from_raw_args_captures_all_tokens() {
+        let args = AddWorkdirArgs::from_raw_args(&toks(&["/tmp/x", "--save"])).expect("parse");
+        assert_eq!(args.tokens, vec!["/tmp/x".to_owned(), "--save".to_owned()]);
+    }
+
+    #[test]
+    fn test_add_workdir_args_from_raw_args_empty_is_empty() {
+        let args = AddWorkdirArgs::from_raw_args(&toks(&[])).expect("parse");
+        assert!(args.tokens.is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_workdir_without_a_cell_is_not_available() {
+        let (ctx, root) = test_context(false);
+        let result = add_workdir(&ctx, AddWorkdirArgs { tokens: Vec::new() }).await;
+        std::fs::remove_dir_all(&root).ok();
+        match result {
+            Err(OpError::NotAvailable(message)) => assert!(message.contains("ExtraRootsCell")),
+            other => panic!("expected NotAvailable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_workdir_without_args_lists_empty_state() {
+        let (ctx, root) = test_context(true);
+        let result = add_workdir(&ctx, AddWorkdirArgs { tokens: Vec::new() })
+            .await
+            .expect("list");
+        std::fs::remove_dir_all(&root).ok();
+        assert!(result.text.contains("Keine zusätzlichen"));
+    }
+
+    #[tokio::test]
+    async fn add_workdir_registers_a_valid_directory_for_the_session() {
+        let (ctx, root) = test_context(true);
+        let extra = root.join("extra");
+        std::fs::create_dir_all(&extra).expect("create extra dir");
+
+        let output = add_workdir(
+            &ctx,
+            AddWorkdirArgs {
+                tokens: vec![extra.to_string_lossy().into_owned()],
+            },
+        )
+        .await
+        .expect("add workdir");
+        assert!(output.text.contains("hinzugefügt"));
+
+        let listed = add_workdir(&ctx, AddWorkdirArgs { tokens: Vec::new() })
+            .await
+            .expect("list after add");
+        std::fs::remove_dir_all(&root).ok();
+        assert!(listed.text.contains("1 zusätzliche"));
+    }
+
+    #[tokio::test]
+    async fn add_workdir_rejects_root_directory() {
+        let (ctx, root) = test_context(true);
+        let result = add_workdir(
+            &ctx,
+            AddWorkdirArgs {
+                tokens: vec!["/".to_owned()],
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(&root).ok();
+        match result {
+            Err(OpError::InvalidArguments(message)) => {
+                assert!(message.contains('/'), "message should mention '/': {message}");
+            }
+            other => panic!("expected invalid arguments, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_workdir_rejects_user_home() {
+        let (ctx, root) = test_context(true);
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        std::fs::remove_dir_all(&root).ok();
+        let Some(home) = home else {
+            // Kein $HOME in dieser Umgebung gesetzt — Test übersprungen statt fälschlich zu bestehen.
+            return;
+        };
+        let result = add_workdir(
+            &ctx,
+            AddWorkdirArgs {
+                tokens: vec![home.to_string_lossy().into_owned()],
+            },
+        )
+        .await;
+        match result {
+            Err(OpError::InvalidArguments(message)) => {
+                assert!(message.contains("Home-Verzeichnis"));
+            }
+            other => panic!("expected invalid arguments, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_workdir_remove_without_path_is_invalid() {
+        let (ctx, root) = test_context(true);
+        let result = add_workdir(
+            &ctx,
+            AddWorkdirArgs {
+                tokens: vec!["--remove".to_owned()],
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(&root).ok();
+        assert!(matches!(result, Err(OpError::InvalidArguments(_))));
+    }
+
+    #[tokio::test]
+    async fn add_workdir_remove_round_trips_a_registered_directory() {
+        let (ctx, root) = test_context(true);
+        let extra = root.join("extra");
+        std::fs::create_dir_all(&extra).expect("create extra dir");
+        let extra_str = extra.to_string_lossy().into_owned();
+
+        add_workdir(
+            &ctx,
+            AddWorkdirArgs {
+                tokens: vec![extra_str.clone()],
+            },
+        )
+        .await
+        .expect("add");
+
+        let removed = add_workdir(
+            &ctx,
+            AddWorkdirArgs {
+                tokens: vec!["--remove".to_owned(), extra_str],
+            },
+        )
+        .await
+        .expect("remove");
+        assert!(removed.text.contains("entfernt"));
+
+        let listed = add_workdir(&ctx, AddWorkdirArgs { tokens: Vec::new() })
+            .await
+            .expect("list after remove");
+        std::fs::remove_dir_all(&root).ok();
+        assert!(listed.text.contains("Keine zusätzlichen"));
+    }
+
+    #[tokio::test]
+    async fn add_workdir_remove_of_unregistered_path_is_invalid() {
+        let (ctx, root) = test_context(true);
+        let extra = root.join("never-added");
+        std::fs::create_dir_all(&extra).expect("create dir");
+        let result = add_workdir(
+            &ctx,
+            AddWorkdirArgs {
+                tokens: vec!["--remove".to_owned(), extra.to_string_lossy().into_owned()],
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(&root).ok();
+        assert!(matches!(result, Err(OpError::InvalidArguments(_))));
+    }
+}

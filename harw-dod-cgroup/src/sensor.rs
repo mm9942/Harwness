@@ -38,6 +38,14 @@ const MEMORY_MAX_FILE: &str = "memory.max";
 const PIDS_CURRENT_FILE: &str = "pids.current";
 /// Dateiname: schlüsselwertartige CPU-Zeitstatistik dieser cgroup.
 const CPU_STAT_FILE: &str = "cpu.stat";
+/// Attribut, das laut cgroup-v2-Kernel-Kontrakt **jede** cgroup trägt — die
+/// Wurzel und jede Kind-cgroup, unabhängig davon, welche Controller aktiv
+/// sind (siehe `Documentation/admin-guide/cgroup-v2.rst`: „cgroup.controllers“
+/// existiert in jedem cgroup-Verzeichnis). Dient als struktureller Marker,
+/// um echte Kind-cgroup-Verzeichnisse von den eigenen Kontrolldateien der
+/// Bereichswurzel zu unterscheiden (siehe [`is_child_cgroup_dir`], F-095) —
+/// eine kernel-garantierte Eigenschaft, keine Namensheuristik.
+const CGROUP_CONTROLLERS_MARKER_FILE: &str = "cgroup.controllers";
 /// Schlüssel in `cpu.stat`, dessen Wert diese Crate meldet — kumulierte
 /// CPU-Zeit in Mikrosekunden seit Erzeugung der cgroup.
 const CPU_STAT_USAGE_KEY: &str = "usage_usec";
@@ -189,17 +197,27 @@ impl Sensor for CgroupSensor {
     /// Liest alle sichtbaren Kind-cgroups der Bereichswurzel einmal aus.
     ///
     /// # Description
-    /// Ermittelt zuerst die Kind-Verzeichnisse direkt unterhalb der ersten
+    /// Ermittelt zuerst die Kandidaten direkt unterhalb der ersten
     /// Bereichswurzel (`*`, siehe `crate`-Moduldoku, Abschnitt „Welche
-    /// Ebene"), sortiert sie nach Namen und kürzt auf [`MAX_CGROUPS`]
-    /// (siehe [`cap_and_sort_cgroups`]). Liest je verbleibender cgroup bis zu
-    /// vier Kontrolldateien (siehe `crate`-Moduldoku, Abschnitt „Welche
-    /// Kontrolldateien") und meldet jede erfolgreich gelesene als ein
-    /// `HostSample`, dessen `metric` den festen Namen der Kennzahl plus das
-    /// sanitisierte cgroup-Label trägt (siehe [`sanitize_label`]). Fehlt eine
-    /// Kontrolldatei (Controller nicht aktiviert, oder der Kandidat ist gar
-    /// kein Verzeichnis), wird nur diese eine Metrik ausgelassen — siehe
-    /// `crate`-Moduldoku, Entscheidung 3.
+    /// Ebene"), filtert sie auf echte Kind-cgroup-Verzeichnisse
+    /// ([`filter_child_cgroups`], F-095 — **vor** jeder Kürzung, damit die
+    /// eigenen Kontrolldateien der Bereichswurzel nicht alphabetisch früh
+    /// die Plätze realer cgroups wie `system.slice`/`user.slice`
+    /// belegen), sortiert die verbleibenden nach Namen und kürzt auf
+    /// [`MAX_CGROUPS`] (siehe [`cap_and_sort_cgroups`]). Liest je
+    /// verbleibender cgroup bis zu vier Kontrolldateien (siehe
+    /// `crate`-Moduldoku, Abschnitt „Welche Kontrolldateien") und meldet
+    /// jede erfolgreich gelesene als ein `HostSample`, dessen `metric` den
+    /// festen Namen der Kennzahl plus das sanitisierte cgroup-Label trägt
+    /// (siehe [`sanitize_label`]). Fehlt eine Kontrolldatei (Controller
+    /// nicht aktiviert), wird nur diese eine Metrik ausgelassen — siehe
+    /// `crate`-Moduldoku, Entscheidung 3. **Teilergebnis statt
+    /// Totalausfall** (F-095-Register): ein Lesefehler auf einer einzelnen
+    /// (cgroup, Kennzahl)-Kombination — z. B. eine vorhandene, aber
+    /// fehlerhaft geformte Kontrolldatei bei nur einer von mehreren cgroups
+    /// — lässt nur diese eine Probe aus und bricht **nicht** den gesamten
+    /// Abruf ab; alle gesammelten Fehler werden nur dann propagiert, wenn am
+    /// Ende keine einzige Probe zustande kam (siehe unten, `# Errors`).
     ///
     /// # Arguments
     /// - `now` (`jiff::Timestamp`): injizierte Zeit für
@@ -214,23 +232,28 @@ impl Sensor for CgroupSensor {
     ///
     /// # Errors
     /// - [`SensorError::SourceUnavailable`]: der Lesebereich hat keine
-    ///   Wurzel, oder die Bereichswurzel enthält **keinen einzigen**
-    ///   sichtbaren Eintrag. Jeder von `systemd` verwaltete Linux-Host trägt
-    ///   unter `/sys/fs/cgroup` mindestens `system.slice`, `user.slice` und
-    ///   `init.scope` — eine vollständig leere Bereichswurzel ist deshalb,
-    ///   wie bei `harw-dod-thermal` und `harw-dod-cpu`, ein Anzeichen für
-    ///   einen falsch konfigurierten oder falsch gerichteten Bereich, nicht
-    ///   der gesunde Normalfall (anders als bei `harw-dod-gpu`, wo die
+    ///   Wurzel, die Bereichswurzel enthält **keinen einzigen** sichtbaren
+    ///   Eintrag, oder keiner der sichtbaren Einträge ist eine echte
+    ///   Kind-cgroup ([`filter_child_cgroups`]). Jeder von `systemd`
+    ///   verwaltete Linux-Host trägt unter `/sys/fs/cgroup` mindestens
+    ///   `system.slice`, `user.slice` und `init.scope` — eine vollständig
+    ///   leere oder cgroup-freie Bereichswurzel ist deshalb, wie bei
+    ///   `harw-dod-thermal` und `harw-dod-cpu`, ein Anzeichen für einen
+    ///   falsch konfigurierten oder falsch gerichteten Bereich, nicht der
+    ///   gesunde Normalfall (anders als bei `harw-dod-gpu`, wo die
     ///   *Hardware* selbst auf vielen Hosts fehlt).
-    /// - [`SensorError::MalformedSource`]: eine gefundene cgroup trägt eine
-    ///   der vier Kontrolldateien, aber mit unerwartetem Inhalt (leer, nicht
-    ///   numerisch, `cpu.stat` ohne `usage_usec`-Zeile) — siehe `crate`-
-    ///   Moduldoku, Entscheidung 3. Bricht den gesamten Abruf ab.
-    /// - [`SensorError::OutsideScope`] / [`SensorError::Io`]: unverändert
-    ///   durchgereicht, falls eine Lesefunktion einen Bereichsverstoß meldet.
-    ///   Ein gewöhnlicher „Datei nicht gefunden"/„kein Verzeichnis"-Fehler
-    ///   führt dagegen zu `None` für die betroffene Metrik, nicht zu diesem
-    ///   Fehler (siehe [`read_optional_u64`]).
+    /// - [`SensorError::MalformedSource`]: **nur wenn am Ende gar keine
+    ///   Probe zustande kam** — jede gefundene cgroup trug ausschließlich
+    ///   Kontrolldateien mit unerwartetem Inhalt (leer, nicht numerisch,
+    ///   `cpu.stat` ohne `usage_usec`-Zeile). Solange mindestens eine Probe
+    ///   gelingt, wird ein solcher Fehler auf einer *anderen* cgroup/Metrik
+    ///   nur ausgelassen, nicht propagiert (Teilergebnis-Semantik oben).
+    /// - [`SensorError::OutsideScope`] / [`SensorError::Io`]: dieselbe
+    ///   Teilergebnis-Semantik — nur propagiert, wenn am Ende keine Probe
+    ///   zustande kam. Ein gewöhnliches „Datei nicht gefunden"/„kein
+    ///   Verzeichnis"-Fehler führt ohnehin zu `None` für die betroffene
+    ///   Metrik, nicht zu einem gesammelten Fehler (siehe
+    ///   [`read_optional_u64`]).
     ///
     /// # Examples
     /// Siehe die Crate-Moduldoku für ein vollständiges Beispiel.
@@ -241,47 +264,76 @@ impl Sensor for CgroupSensor {
             return Err(SensorError::SourceUnavailable);
         }
 
-        let kept = cap_and_sort_cgroups(candidates);
+        // F-095: erst auf echte Kind-cgroups filtern, dann auf MAX_CGROUPS
+        // kürzen — nicht umgekehrt (siehe [`filter_child_cgroups`]).
+        let children = filter_child_cgroups(scope, candidates);
+        if children.is_empty() {
+            return Err(SensorError::SourceUnavailable);
+        }
 
+        let kept = cap_and_sort_cgroups(children);
+
+        // Teilergebnis statt Totalausfall: ein Lesefehler auf einer
+        // einzelnen (cgroup, Kennzahl)-Kombination lässt nur diese eine
+        // Probe aus, statt den gesamten Abruf abzubrechen — Fehler werden
+        // gesammelt und nur dann propagiert, wenn am Ende **keine einzige**
+        // Probe zustande kam (F-095-Register: „Teilergebnisse statt
+        // Totalausfall bei einzelnen Lesefehlern“).
         let mut samples = Vec::with_capacity(kept.len() * FIELD_COUNT);
+        let mut errors: Vec<SensorError> = Vec::new();
+
         for dir in &kept {
             let label = sanitize_label(cgroup_name(dir));
 
-            if let Some(value) = read_optional_u64(scope, &dir.join(MEMORY_CURRENT_FILE))? {
-                samples.push(build_sample(
+            match read_optional_u64(scope, &dir.join(MEMORY_CURRENT_FILE)) {
+                Ok(Some(value)) => samples.push(build_sample(
                     self.handle.id(),
                     now,
                     METRIC_MEMORY_CURRENT,
                     &label,
                     value as f64,
-                ));
+                )),
+                Ok(None) => {}
+                Err(err) => errors.push(err),
             }
-            if let Some(value) = read_memory_max(scope, &dir.join(MEMORY_MAX_FILE))? {
-                samples.push(build_sample(
+            match read_memory_max(scope, &dir.join(MEMORY_MAX_FILE)) {
+                Ok(Some(value)) => samples.push(build_sample(
                     self.handle.id(),
                     now,
                     METRIC_MEMORY_MAX,
                     &label,
                     value as f64,
-                ));
+                )),
+                Ok(None) => {}
+                Err(err) => errors.push(err),
             }
-            if let Some(value) = read_optional_u64(scope, &dir.join(PIDS_CURRENT_FILE))? {
-                samples.push(build_sample(
+            match read_optional_u64(scope, &dir.join(PIDS_CURRENT_FILE)) {
+                Ok(Some(value)) => samples.push(build_sample(
                     self.handle.id(),
                     now,
                     METRIC_PIDS_CURRENT,
                     &label,
                     value as f64,
-                ));
+                )),
+                Ok(None) => {}
+                Err(err) => errors.push(err),
             }
-            if let Some(value) = read_cpu_usage_usec(scope, &dir.join(CPU_STAT_FILE))? {
-                samples.push(build_sample(
+            match read_cpu_usage_usec(scope, &dir.join(CPU_STAT_FILE)) {
+                Ok(Some(value)) => samples.push(build_sample(
                     self.handle.id(),
                     now,
                     METRIC_CPU_USAGE_USEC,
                     &label,
                     value as f64,
-                ));
+                )),
+                Ok(None) => {}
+                Err(err) => errors.push(err),
+            }
+        }
+
+        if samples.is_empty() {
+            if let Some(first_error) = errors.into_iter().next() {
+                return Err(first_error);
             }
         }
 
@@ -318,12 +370,14 @@ fn relative_pattern(root: &Path, suffix: &str) -> Option<String> {
 // Findet alle Einträge direkt unterhalb der ersten Bereichswurzel von
 // `scope`, sortiert (siehe `glob::glob`s eigene Garantie). Kann sowohl echte
 // Kind-cgroups (Verzeichnisse) als auch die Kontrolldateien der
-// Bereichswurzel selbst enthalten (beide passen gleichermaßen auf `*`) — ein
-// solcher Kandidat liefert beim späteren Lesen für jede der vier
-// Kontrolldateien `ENOTDIR` und damit `None`, erzeugt also nie einen
-// `HostSample` (siehe `crate`-Moduldoku, Abschnitt „Welche Ebene"). Ein
-// `scope` ohne Wurzeln oder mit nicht-absoluter Wurzel liefert eine leere
-// Liste statt eines Fehlers — `poll` bildet das auf
+// Bereichswurzel selbst enthalten (beide passen gleichermaßen auf `*`) — der
+// Aufrufer (`poll`) muss [`filter_child_cgroups`] **vor** jeder Kürzung auf
+// diesem Ergebnis anwenden (F-095: eine Kontrolldatei würde beim späteren
+// Lesen zwar nur zu `ENOTDIR`/`None` je Metrik führen statt zu einem
+// `HostSample`, aber sie hätte dann bereits fälschlich einen der begrenzten
+// [`MAX_CGROUPS`]-Plätze belegt — siehe `crate`-Moduldoku, Abschnitt „Welche
+// Ebene"). Ein `scope` ohne Wurzeln oder mit nicht-absoluter Wurzel liefert
+// eine leere Liste statt eines Fehlers — `poll` bildet das auf
 // `SensorError::SourceUnavailable` ab.
 fn cgroup_dirs(scope: &ReadScope) -> Result<Vec<PathBuf>, SensorError> {
     let Some(root) = scope.roots().next() else {
@@ -333,6 +387,66 @@ fn cgroup_dirs(scope: &ReadScope) -> Result<Vec<PathBuf>, SensorError> {
         return Ok(Vec::new());
     };
     harw_dod_readfs::glob::glob(scope, &pattern).map_err(map_readfs_err)
+}
+
+/// Ist `candidate` eine echte Kind-cgroup (ein Verzeichnis), keine
+/// Kontrolldatei der Bereichswurzel?
+///
+/// # Description
+/// `*` (Ebene direkt unterhalb der Bereichswurzel) matcht gleichermaßen
+/// echte Kind-cgroups **und** die eigenen Kontrolldateien der Wurzel selbst
+/// (`cgroup.controllers`, `cpu.stat`, `memory.stat`, …) — beide liegen auf
+/// derselben Verzeichnisebene. Diese Funktion prüft, ob `candidate` selbst
+/// ein cgroup-Verzeichnis ist, indem sie versucht,
+/// [`CGROUP_CONTROLLERS_MARKER_FILE`] darunter zu lesen: existiert
+/// `candidate` nicht als Verzeichnis (ist also eine Kontrolldatei der
+/// Wurzel), scheitert bereits die Pfadauflösung mit `ENOTDIR`/„nicht
+/// gefunden“; jede echte cgroup — Wurzel oder Kind, unabhängig von
+/// aktivierten Controllern — trägt dieses Attribut laut cgroup-v2-Kontrakt
+/// immer.
+///
+/// # Arguments
+/// - `scope` (`&ReadScope`): der Lesebereich.
+/// - `candidate` (`&Path`): ein von [`cgroup_dirs`] gefundener Kandidatenpfad.
+///
+/// # Returns
+/// `true`, wenn `candidate` ein echtes cgroup-Verzeichnis ist.
+///
+/// # Errors
+/// Keine — jeder Lesefehler (fehlt, kein Verzeichnis, keine Berechtigung)
+/// zählt konservativ als „kein cgroup-Verzeichnis“.
+fn is_child_cgroup_dir(scope: &ReadScope, candidate: &Path) -> bool {
+    harw_dod_readfs::read_to_string(scope, &candidate.join(CGROUP_CONTROLLERS_MARKER_FILE)).is_ok()
+}
+
+/// Filtert `candidates` auf echte Kind-cgroup-Verzeichnisse, **vor** jeder
+/// Kürzung auf [`MAX_CGROUPS`] (F-095).
+///
+/// # Description
+/// Muss vor [`cap_and_sort_cgroups`] laufen, nicht danach: die
+/// Kontrolldateien der Bereichswurzel (`cgroup.controllers`, `cgroup.procs`,
+/// `cpu.stat`, …) sortieren alphabetisch früh und würden bei einer
+/// Kürzung vor dieser Filterung reale Kind-cgroups wie `system.slice`/
+/// `user.slice` aus den ersten [`MAX_CGROUPS`] Plätzen verdrängen, ohne dass
+/// je wieder Platz für sie entsteht (siehe [`is_child_cgroup_dir`] für die
+/// Unterscheidung, F-095-Register).
+///
+/// # Arguments
+/// - `scope` (`&ReadScope`): der Lesebereich, zur Prüfung jedes Kandidaten.
+/// - `candidates` (`Vec<PathBuf>`): das rohe, ungefilterte Ergebnis von
+///   [`cgroup_dirs`].
+///
+/// # Returns
+/// Nur die Einträge aus `candidates`, die [`is_child_cgroup_dir`] als echtes
+/// cgroup-Verzeichnis erkennt, in unveränderter Reihenfolge.
+///
+/// # Errors
+/// Keine — eine totale Funktion.
+fn filter_child_cgroups(scope: &ReadScope, candidates: Vec<PathBuf>) -> Vec<PathBuf> {
+    candidates
+        .into_iter()
+        .filter(|candidate| is_child_cgroup_dir(scope, candidate))
+        .collect()
 }
 
 /// Sortiert gefundene cgroup-Kandidaten nach Namen und kürzt sie auf
@@ -448,7 +562,11 @@ fn read_optional_u64(scope: &ReadScope, path: &Path) -> Result<Option<u64>, Sens
         Err(ReadFsError::Scope(SensorError::Io(_))) => Ok(None),
         Err(ReadFsError::Scope(inner)) => Err(inner),
         Err(ReadFsError::TooLarge { .. }) => Err(SensorError::MalformedSource),
-        Err(ReadFsError::GlobPatternAbsolute { .. } | ReadFsError::GlobPatternTraversal { .. }) => {
+        Err(
+            ReadFsError::GlobPatternAbsolute { .. }
+            | ReadFsError::GlobPatternTraversal { .. }
+            | ReadFsError::GlobLimitExceeded { .. },
+        ) => {
             // parse_u64 ruft nie glob() auf; unerreichbar, aber erschöpfend
             // abgedeckt, damit eine künftige ReadFsError-Variante hier nicht
             // still verworfen wird.
@@ -478,9 +596,11 @@ fn read_memory_max(scope: &ReadScope, path: &Path) -> Result<Option<u64>, Sensor
         Err(ReadFsError::Scope(SensorError::Io(_))) => Ok(None),
         Err(ReadFsError::Scope(inner)) => Err(inner),
         Err(ReadFsError::TooLarge { .. }) => Err(SensorError::MalformedSource),
-        Err(ReadFsError::GlobPatternAbsolute { .. } | ReadFsError::GlobPatternTraversal { .. }) => {
-            Err(SensorError::MalformedSource)
-        }
+        Err(
+            ReadFsError::GlobPatternAbsolute { .. }
+            | ReadFsError::GlobPatternTraversal { .. }
+            | ReadFsError::GlobLimitExceeded { .. },
+        ) => Err(SensorError::MalformedSource),
     }
 }
 
@@ -505,9 +625,11 @@ fn read_cpu_usage_usec(scope: &ReadScope, path: &Path) -> Result<Option<u64>, Se
         Err(ReadFsError::Scope(SensorError::Io(_))) => Ok(None),
         Err(ReadFsError::Scope(inner)) => Err(inner),
         Err(ReadFsError::TooLarge { .. }) => Err(SensorError::MalformedSource),
-        Err(ReadFsError::GlobPatternAbsolute { .. } | ReadFsError::GlobPatternTraversal { .. }) => {
-            Err(SensorError::MalformedSource)
-        }
+        Err(
+            ReadFsError::GlobPatternAbsolute { .. }
+            | ReadFsError::GlobPatternTraversal { .. }
+            | ReadFsError::GlobLimitExceeded { .. },
+        ) => Err(SensorError::MalformedSource),
     }
 }
 
@@ -534,7 +656,8 @@ fn map_readfs_err(err: ReadFsError) -> SensorError {
         ReadFsError::Scope(inner) => inner,
         ReadFsError::TooLarge { .. }
         | ReadFsError::GlobPatternAbsolute { .. }
-        | ReadFsError::GlobPatternTraversal { .. } => SensorError::MalformedSource,
+        | ReadFsError::GlobPatternTraversal { .. }
+        | ReadFsError::GlobLimitExceeded { .. } => SensorError::MalformedSource,
     }
 }
 
@@ -547,7 +670,10 @@ mod tests {
     use harw_types::SensorId;
     use jiff::Timestamp;
 
-    use super::{CgroupSensor, MAX_CARDINALITY, MAX_CGROUPS, cap_and_sort_cgroups, sanitize_label};
+    use super::{
+        CgroupSensor, MAX_CARDINALITY, MAX_CGROUPS, cap_and_sort_cgroups, is_child_cgroup_dir,
+        sanitize_label,
+    };
 
     /// Das `fixtures/`-Wurzelverzeichnis dieser Crate.
     fn fixtures_root() -> PathBuf {
@@ -670,6 +796,62 @@ mod tests {
             "many-cgroups-Fixture trägt nur memory.current je cgroup"
         );
         assert_eq!(reading.samples.len(), MAX_CGROUPS);
+    }
+
+    #[test]
+    fn test_is_child_cgroup_dir_true_for_directory_false_for_control_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("system.slice")).expect("system.slice");
+        std::fs::write(
+            dir.path().join("system.slice/cgroup.controllers"),
+            "cpu memory pids\n",
+        )
+        .expect("cgroup.controllers schreiben");
+        std::fs::write(dir.path().join("cpu.stat"), "usage_usec 1\n")
+            .expect("cpu.stat der Wurzel schreiben");
+
+        let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
+        assert!(is_child_cgroup_dir(
+            &scope,
+            &dir.path().join("system.slice")
+        ));
+        assert!(!is_child_cgroup_dir(&scope, &dir.path().join("cpu.stat")));
+    }
+
+    #[test]
+    fn test_poll_finds_real_slices_despite_root_control_files_regression_f095() {
+        // Regressionstest für F-095: `fixtures/root-control-files-crowd-out-
+        // children/tree` enthält 17 echte cgroup-v2-Kontrolldateien der
+        // Bereichswurzel (alle alphabetisch vor "s"/"u") neben genau zwei
+        // echten Kind-cgroups (`system.slice`, `user.slice`). Vor der F-095-
+        // Korrektur hätte `cap_and_sort_cgroups` allein auf den
+        // unbereinigten Kandidaten die ersten `MAX_CGROUPS` (16) alphabetisch
+        // gewählt — ausschließlich Kontrolldateien der Wurzel, `system.slice`/
+        // `user.slice` wären nie erreicht worden.
+        let sensor = build_sensor(
+            fixtures_root().join("root-control-files-crowd-out-children/tree"),
+        );
+        let reading = sensor
+            .poll(Timestamp::UNIX_EPOCH)
+            .expect("echte Kind-cgroups müssen trotz vieler Wurzel-Kontrolldateien gefunden werden");
+
+        assert_eq!(reading.samples.len(), 2, "genau je eine memory_current_bytes-Probe pro echter cgroup: {:?}", reading.samples);
+        assert!(
+            reading
+                .samples
+                .iter()
+                .any(|s| s.metric == "memory_current_bytes_system_slice"),
+            "system.slice darf nicht von Wurzel-Kontrolldateien verdrängt werden: {:?}",
+            reading.samples
+        );
+        assert!(
+            reading
+                .samples
+                .iter()
+                .any(|s| s.metric == "memory_current_bytes_user_slice"),
+            "user.slice darf nicht von Wurzel-Kontrolldateien verdrängt werden: {:?}",
+            reading.samples
+        );
     }
 
     harw_dod_fixtures::sensor_suite! {

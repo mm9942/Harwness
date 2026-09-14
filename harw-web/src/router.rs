@@ -31,57 +31,82 @@
 use std::sync::Arc;
 
 use harw_operations::adapter::WebAdapter;
-use harw_operations::operation::{ApprovalPolicy, PermissionTier};
+use harw_operations::operation::{ApprovalPolicy, Operation, PermissionTier, Surface};
 use harw_operations::registry::OperationRegistry;
 
 use crate::authz::{PeerAuthorizer, tier_permits};
 use crate::error::WebError;
 use crate::peer::PeerCredentials;
 
-/// Die für eine `harw-web`-Route zulässige HTTP-Methode.
+/// Die für eine `harw-web`-Route zulässige HTTP-Methode — der kanonische
+/// Vertragstyp aus `harw-operations` (F-031), hier nur re-exportiert.
 ///
 /// # Description
-/// Wird ausschließlich aus [`harw_operations::adapter::WebAdapter::readonly`]
-/// abgeleitet ([`WebMethod::expected_for`]) — es gibt kein zusätzliches
-/// Methodenfeld an der Operation, weil `readonly` die Methode bereits
-/// eindeutig festlegt (siehe `Surface::Web`-Feldbegründung in
-/// `harw-operations`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WebMethod {
-    /// Zulässig für `readonly == true`.
-    Get,
-    /// Zulässig für `readonly == false`.
-    Post,
+/// Es gibt in `harw-web` **keinen** eigenen Methoden-Enum und **keine**
+/// Ableitung aus einem `readonly`-Flag mehr. Die Methode einer Route ist
+/// genau das, was ihre Operation in `Surface::Web { method, .. }` deklariert
+/// ([`WebRouteTable::from_registry`] übernimmt sie unverändert).
+pub use harw_operations::operation::WebMethod;
+
+/// Der HTTP-Methodenname einer [`WebMethod`] (`"GET"`/`"POST"`).
+///
+/// # Arguments
+/// - `method` (`WebMethod`): die deklarierte Methode.
+///
+/// # Returns
+/// Den großgeschriebenen Methodennamen als `&'static str` — derselbe Wert,
+/// den `Allow`-Header und Serde-Form (`SCREAMING_SNAKE_CASE`) tragen.
+///
+/// # Concurrency
+/// Rein.
+///
+/// # Examples
+/// ```rust
+/// use harw_web::router::{WebMethod, method_name};
+///
+/// assert_eq!(method_name(WebMethod::Get), "GET");
+/// assert_eq!(method_name(WebMethod::Post), "POST");
+/// ```
+#[must_use]
+pub const fn method_name(method: WebMethod) -> &'static str {
+    match method {
+        WebMethod::Get => "GET",
+        WebMethod::Post => "POST",
+    }
 }
 
-impl WebMethod {
-    /// Liefert die für eine Route mit gegebenem `readonly`-Flag erwartete Methode.
-    ///
-    /// # Arguments
-    /// - `readonly` (`bool`): [`WebAdapter::readonly`] der Route.
-    ///
-    /// # Returns
-    /// [`WebMethod::Get`] für `readonly == true`, sonst [`WebMethod::Post`].
-    ///
-    /// # Examples
-    /// ```rust
-    /// use harw_web::router::WebMethod;
-    ///
-    /// assert_eq!(WebMethod::expected_for(true), WebMethod::Get);
-    /// assert_eq!(WebMethod::expected_for(false), WebMethod::Post);
-    /// ```
-    #[must_use]
-    pub fn expected_for(readonly: bool) -> Self {
-        if readonly { Self::Get } else { Self::Post }
-    }
-
-    /// Der HTTP-Methodenname als `&'static str` (`"GET"`/`"POST"`).
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Get => "GET",
-            Self::Post => "POST",
-        }
+/// Übersetzt einen HTTP-Methodennamen in eine [`WebMethod`].
+///
+/// # Description
+/// Nur exakt `"GET"` und `"POST"` werden abgebildet (HTTP-Methodennamen sind
+/// nach RFC 9110 §9.1 case-sensitiv). Insbesondere werden `HEAD` und
+/// `OPTIONS` **nicht** implizit auf `GET` abgebildet: sie liefern `None` und
+/// damit in [`decide_route`] immer [`RouteDecision::MethodNotAllowed`] — auch
+/// auf `GET`-Routen, sodass keine Methode außer der deklarierten je eine
+/// Operation erreicht (F-031).
+///
+/// # Arguments
+/// - `name` (`&str`): der Methodenname aus der Anfragezeile.
+///
+/// # Returns
+/// `Some(WebMethod)` für `GET`/`POST`, sonst `None`.
+///
+/// # Concurrency
+/// Rein.
+///
+/// # Examples
+/// ```rust
+/// use harw_web::router::{WebMethod, parse_web_method};
+///
+/// assert_eq!(parse_web_method("POST"), Some(WebMethod::Post));
+/// assert_eq!(parse_web_method("HEAD"), None);
+/// ```
+#[must_use]
+pub fn parse_web_method(name: &str) -> Option<WebMethod> {
+    match name {
+        "GET" => Some(WebMethod::Get),
+        "POST" => Some(WebMethod::Post),
+        _ => None,
     }
 }
 
@@ -101,10 +126,12 @@ pub enum ForbiddenReason {
 pub enum RouteDecision<'a> {
     /// Kein registrierter `Surface::Web`-Pfad passt zu `path`.
     NotFound,
-    /// Der Pfad existiert, aber `method` passt nicht zu
-    /// [`WebMethod::expected_for`].
+    /// Der Pfad existiert, aber `method` ist nicht die in
+    /// `Surface::Web { method, .. }` deklarierte Methode (oder gar keine
+    /// unterstützte, z. B. `HEAD`/`OPTIONS`/`DELETE`).
     MethodNotAllowed {
-        /// Die für diese Route tatsächlich erwartete Methode.
+        /// Die für diese Route deklarierte (einzig zulässige) Methode —
+        /// Quelle des `Allow`-Headers.
         expected: WebMethod,
     },
     /// Der Aufrufer darf diese Route nicht erreichen.
@@ -142,7 +169,15 @@ pub enum RouteDecision<'a> {
 /// - `peer` (`&PeerCredentials`): die über `SO_PEERCRED` gelesene Identität.
 /// - `path` (`&str`): der angefragte HTTP-Pfad.
 /// - `method` (`Option<WebMethod>`): die angefragte Methode, `None` für jede
-///   nicht unterstützte HTTP-Methode (z. B. `DELETE`).
+///   nicht unterstützte HTTP-Methode (z. B. `HEAD`, `OPTIONS`, `DELETE`; siehe
+///   [`parse_web_method`]).
+///
+/// # Security (F-031)
+/// Die Methodenprüfung vergleicht ausschließlich mit der **deklarierten**
+/// Methode der Route ([`WebRouteTable::method_for`]); sie steht vor jeder
+/// Autorisierungs- und Ausführungsentscheidung. Ein `GET` erreicht damit nie
+/// eine Operation, deren `Surface::Web` `method: WebMethod::Post` trägt —
+/// Prefetch, `<img src>` oder Cross-Site-Navigation lösen keine Mutation aus.
 ///
 /// # Returns
 /// Ein [`RouteDecision`] mit exakt einem Ausgang.
@@ -178,11 +213,12 @@ pub fn decide_route<'a>(
     path: &str,
     method: Option<WebMethod>,
 ) -> RouteDecision<'a> {
-    let Some(route) = routes.find(path) else {
+    let Some(entry) = routes.find_entry(path) else {
         return RouteDecision::NotFound;
     };
+    let route = &entry.adapter;
 
-    let expected = WebMethod::expected_for(route.readonly());
+    let expected = entry.method;
     if method != Some(expected) {
         return RouteDecision::MethodNotAllowed { expected };
     }
@@ -213,10 +249,32 @@ pub fn decide_route<'a>(
 ///
 /// # Description
 /// Enthält genau einen Eintrag pro `Surface::Web`-Deklaration jeder
-/// registrierten Operation. Siehe Moduldoku für die Begründung, warum eine
-/// Route ohne `OperationMeta` nicht konstruierbar ist.
+/// registrierten Operation, jeweils mit der dort deklarierten
+/// [`WebMethod`]. Siehe Moduldoku für die Begründung, warum eine Route ohne
+/// `OperationMeta` nicht konstruierbar ist.
 pub struct WebRouteTable {
-    routes: Vec<WebAdapter>,
+    routes: Vec<WebRoute>,
+}
+
+// Ein Tabelleneintrag: der Adapter plus die aus `Surface::Web { method, .. }`
+// übernommene Methode. Privat — von außen nur über `from_registry` befüllbar.
+struct WebRoute {
+    adapter: WebAdapter,
+    method: WebMethod,
+}
+
+// Liest die in `op` für `path` deklarierte `Surface::Web`-Methode.
+// `None` nur, wenn der Adapter einen Pfad trägt, den die Operation nicht (mehr)
+// deklariert — dann wird die Tabelle fail-closed nicht gebaut.
+fn declared_method(op: &dyn Operation, path: &str) -> Option<WebMethod> {
+    op.meta().surfaces.iter().find_map(|surface| match surface {
+        Surface::Web {
+            path: declared,
+            method,
+            ..
+        } if *declared == path => Some(*method),
+        _ => None,
+    })
 }
 
 impl WebRouteTable {
@@ -229,9 +287,17 @@ impl WebRouteTable {
     /// # Returns
     /// Eine `WebRouteTable` mit einem Eintrag pro `Surface::Web`-Deklaration.
     ///
+    /// # Description
+    /// Die HTTP-Methode jedes Eintrags wird **unverändert** aus
+    /// `Surface::Web { method, .. }` der Operation übernommen — keine
+    /// Ableitung aus `readonly`, `approval` oder dem Pfad (F-031).
+    ///
     /// # Errors
-    /// [`WebError::DuplicateRoute`], wenn zwei Operationen denselben Pfad
-    /// beanspruchen.
+    /// - [`WebError::DuplicateRoute`], wenn zwei Operationen denselben Pfad
+    ///   beanspruchen.
+    /// - [`WebError::RouteMethodUndeclared`], wenn sich für einen Adapter keine
+    ///   `Surface::Web`-Deklaration mit dessen Pfad finden lässt (fail-closed:
+    ///   eine Route ohne deklarierte Methode wird nie bedient).
     ///
     /// # Concurrency
     /// Erfordert nur einen shared borrow von `registry`.
@@ -246,26 +312,68 @@ impl WebRouteTable {
     /// assert!(routes.is_empty());
     /// ```
     pub fn from_registry(registry: &OperationRegistry) -> Result<Self, WebError> {
-        let mut routes: Vec<WebAdapter> = Vec::new();
+        let mut routes: Vec<WebRoute> = Vec::new();
         for op in registry.iter() {
             for adapter in WebAdapter::from_operation(Arc::clone(op)) {
-                if let Some(existing) = routes.iter().find(|r| r.path() == adapter.path()) {
+                if let Some(existing) = routes.iter().find(|r| r.adapter.path() == adapter.path()) {
                     return Err(WebError::DuplicateRoute {
                         path: adapter.path().to_owned(),
-                        first_owner: existing.operation_name().to_owned(),
+                        first_owner: existing.adapter.operation_name().to_owned(),
                         second_owner: adapter.operation_name().to_owned(),
                     });
                 }
-                routes.push(adapter);
+                let method = declared_method(op.as_ref(), adapter.path()).ok_or_else(|| {
+                    WebError::RouteMethodUndeclared {
+                        path: adapter.path().to_owned(),
+                        operation: adapter.operation_name().to_owned(),
+                    }
+                })?;
+                tracing::debug!(
+                    path = adapter.path(),
+                    operation = adapter.operation_name(),
+                    method = method_name(method),
+                    "web route registered"
+                );
+                routes.push(WebRoute { adapter, method });
             }
         }
         Ok(Self { routes })
     }
 
+    // Sucht den vollständigen Eintrag (Adapter + deklarierte Methode).
+    fn find_entry(&self, path: &str) -> Option<&WebRoute> {
+        self.routes.iter().find(|route| route.adapter.path() == path)
+    }
+
     /// Sucht eine Route über ihren exakten Pfad.
     #[must_use]
     pub fn find(&self, path: &str) -> Option<&WebAdapter> {
-        self.routes.iter().find(|route| route.path() == path)
+        self.find_entry(path).map(|route| &route.adapter)
+    }
+
+    /// Liefert die deklarierte HTTP-Methode der Route unter `path`.
+    ///
+    /// # Arguments
+    /// - `path` (`&str`): der exakte Routenpfad.
+    ///
+    /// # Returns
+    /// `Some(method)` aus `Surface::Web { method, .. }`, `None` für einen
+    /// unbekannten Pfad.
+    ///
+    /// # Concurrency
+    /// Nur lesend; beliebig nebenläufig nutzbar.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_operations::registry::OperationRegistry;
+    /// use harw_web::router::WebRouteTable;
+    ///
+    /// let routes = WebRouteTable::from_registry(&OperationRegistry::new()).unwrap();
+    /// assert_eq!(routes.method_for("/api/unknown"), None);
+    /// ```
+    #[must_use]
+    pub fn method_for(&self, path: &str) -> Option<WebMethod> {
+        self.find_entry(path).map(|route| route.method)
     }
 
     /// Anzahl registrierter Routen.
@@ -282,7 +390,13 @@ impl WebRouteTable {
 
     /// Iteriert über alle Routen in Registrierungsreihenfolge.
     pub fn iter(&self) -> impl Iterator<Item = &WebAdapter> {
-        self.routes.iter()
+        self.routes.iter().map(|route| &route.adapter)
+    }
+
+    /// Iteriert über alle Routen samt deklarierter Methode in
+    /// Registrierungsreihenfolge.
+    pub fn iter_with_methods(&self) -> impl Iterator<Item = (&WebAdapter, WebMethod)> {
+        self.routes.iter().map(|route| (&route.adapter, route.method))
     }
 }
 
@@ -296,7 +410,10 @@ mod tests {
     };
     use harw_operations::registry::OperationRegistry;
 
-    use super::{ForbiddenReason, RouteDecision, WebMethod, WebRouteTable, decide_route};
+    use super::{
+        ForbiddenReason, RouteDecision, WebMethod, WebRouteTable, decide_route, method_name,
+        parse_web_method,
+    };
     use crate::authz::StaticUidTierMap;
     use crate::peer::PeerCredentials;
 
@@ -305,7 +422,7 @@ mod tests {
         name: &'static str,
         path: &'static str,
         permission: PermissionTier,
-        readonly: bool,
+        method: WebMethod,
         approval: harw_operations::operation::ApprovalPolicy,
     }
 
@@ -318,17 +435,18 @@ mod tests {
                 permission: self.permission,
                 surfaces: vec![Surface::Web {
                     path: self.path,
-                    readonly: self.readonly,
+                    method: self.method,
                     approval: self.approval,
                 }],
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             }))
         }
 
         fn run<'a>(&'a self, _ctx: &'a harw_operations::context::OpContext, _input: OpInput) -> OpFuture<'a> {
-            Box::pin(async { Ok(OpOutput { text: "ok".to_owned() }) })
+            Box::pin(async { Ok(OpOutput { text: "ok".to_owned(), data: None }) })
         }
     }
 
@@ -345,10 +463,11 @@ mod tests {
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             })
         }
         fn run<'a>(&'a self, _ctx: &'a harw_operations::context::OpContext, _input: OpInput) -> OpFuture<'a> {
-            Box::pin(async { Ok(OpOutput { text: "noop".to_owned() }) })
+            Box::pin(async { Ok(OpOutput { text: "noop".to_owned(), data: None }) })
         }
     }
 
@@ -361,9 +480,28 @@ mod tests {
             name,
             path,
             permission,
-            readonly: true,
+            method: WebMethod::Get,
             approval: harw_operations::operation::ApprovalPolicy::None,
         })
+    }
+
+    /// Wie [`tier_op`], aber mit frei wählbarer deklarierter Methode.
+    fn method_op(name: &'static str, path: &'static str, method: WebMethod) -> std::sync::Arc<dyn Operation> {
+        std::sync::Arc::new(TierOp {
+            name,
+            path,
+            permission: PermissionTier::Observer,
+            method,
+            approval: harw_operations::operation::ApprovalPolicy::None,
+        })
+    }
+
+    /// Registry mit einer `GET`- und einer `POST`-Route (beide Observer, ohne Approval).
+    fn get_and_post_registry() -> OperationRegistry {
+        let mut registry = OperationRegistry::new();
+        registry.register(method_op("read-op", "/api/read", WebMethod::Get));
+        registry.register(method_op("write-op", "/api/write", WebMethod::Post));
+        registry
     }
 
     /// Baut eine Registry mit je einer Route pro Berechtigungsstufe.
@@ -607,7 +745,7 @@ mod tests {
         let registry = four_tier_registry();
         let routes = WebRouteTable::from_registry(&registry).unwrap();
         let authz = StaticUidTierMap::with_default(vec![], PermissionTier::Owner);
-        // /api/observer ist readonly => GET erwartet; POST muss abgelehnt werden.
+        // /api/observer deklariert method: Get; POST muss abgelehnt werden.
         let decision = decide_route(
             &routes,
             &authz,
@@ -639,7 +777,7 @@ mod tests {
             name: "irreversible",
             path: "/api/irreversible",
             permission: PermissionTier::Operator,
-            readonly: false,
+            method: WebMethod::Post,
             approval: harw_operations::operation::ApprovalPolicy::Always,
         }));
         let routes = WebRouteTable::from_registry(&registry).unwrap();
@@ -657,11 +795,117 @@ mod tests {
         );
     }
 
+    // ── F-031: deklarierte Methode, keine Ableitung ───────────────────────────
+
     #[test]
-    fn test_web_method_expected_for_matches_readonly_flag() {
-        assert_eq!(WebMethod::expected_for(true), WebMethod::Get);
-        assert_eq!(WebMethod::expected_for(false), WebMethod::Post);
-        assert_eq!(WebMethod::Get.as_str(), "GET");
-        assert_eq!(WebMethod::Post.as_str(), "POST");
+    fn test_decide_route_get_on_post_route_yields_method_not_allowed() {
+        let registry = get_and_post_registry();
+        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let authz = StaticUidTierMap::with_default(vec![], PermissionTier::Owner);
+        let decision = decide_route(&routes, &authz, &peer_with_tier(), "/api/write", Some(WebMethod::Get));
+        assert!(
+            matches!(decision, RouteDecision::MethodNotAllowed { expected: WebMethod::Post }),
+            "GET darf eine POST-Operation nie erreichen (F-031), erhalten: {decision:?}"
+        );
+    }
+
+    #[test]
+    fn test_decide_route_post_on_get_route_yields_method_not_allowed() {
+        let registry = get_and_post_registry();
+        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let authz = StaticUidTierMap::with_default(vec![], PermissionTier::Owner);
+        let decision = decide_route(&routes, &authz, &peer_with_tier(), "/api/read", Some(WebMethod::Post));
+        assert!(matches!(
+            decision,
+            RouteDecision::MethodNotAllowed { expected: WebMethod::Get }
+        ));
+    }
+
+    #[test]
+    fn test_decide_route_correct_method_dispatches_to_declaring_operation() {
+        let registry = get_and_post_registry();
+        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        let authz = StaticUidTierMap::with_default(vec![], PermissionTier::Observer);
+
+        let post = decide_route(&routes, &authz, &peer_with_tier(), "/api/write", Some(WebMethod::Post));
+        match post {
+            RouteDecision::Execute { route, caller_tier } => {
+                assert_eq!(route.operation_name(), "write-op");
+                assert_eq!(caller_tier, PermissionTier::Observer);
+            }
+            other => panic!("POST auf POST-Route muss Execute liefern, erhalten: {other:?}"),
+        }
+
+        let get = decide_route(&routes, &authz, &peer_with_tier(), "/api/read", Some(WebMethod::Get));
+        match get {
+            RouteDecision::Execute { route, .. } => assert_eq!(route.operation_name(), "read-op"),
+            other => panic!("GET auf GET-Route muss Execute liefern, erhalten: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decide_route_unsupported_method_on_post_route_is_rejected_before_authorization() {
+        let registry = get_and_post_registry();
+        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        // Unbekannter Peer: die Methodenprüfung muss trotzdem vorher greifen.
+        let authz = StaticUidTierMap::new(vec![]);
+        let decision = decide_route(&routes, &authz, &peer_with_tier(), "/api/write", None);
+        assert!(matches!(
+            decision,
+            RouteDecision::MethodNotAllowed { expected: WebMethod::Post }
+        ));
+    }
+
+    #[test]
+    fn test_from_registry_takes_method_from_surface_web_declaration() {
+        let registry = get_and_post_registry();
+        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes.method_for("/api/read"), Some(WebMethod::Get));
+        assert_eq!(routes.method_for("/api/write"), Some(WebMethod::Post));
+        assert_eq!(routes.method_for("/api/unknown"), None);
+        let collected: Vec<(&str, WebMethod)> = routes
+            .iter_with_methods()
+            .map(|(adapter, method)| (adapter.path(), method))
+            .collect();
+        assert_eq!(
+            collected,
+            vec![("/api/read", WebMethod::Get), ("/api/write", WebMethod::Post)]
+        );
+    }
+
+    /// Eine mutierende Route mit `approval = None` und `method = Post` ist genau
+    /// der F-031-Fall (`/api/analyze`): die Methode kommt aus der Deklaration,
+    /// nicht aus einer `readonly`-Heuristik oder dem Approval-Wert.
+    #[test]
+    fn test_from_registry_post_without_approval_stays_post() {
+        let mut registry = OperationRegistry::new();
+        registry.register(method_op("analyze-like", "/api/analyze", WebMethod::Post));
+        let routes = WebRouteTable::from_registry(&registry).unwrap();
+        assert_eq!(routes.method_for("/api/analyze"), Some(WebMethod::Post));
+        assert_eq!(routes.find("/api/analyze").map(|r| r.operation_name()), Some("analyze-like"));
+    }
+
+    #[test]
+    fn test_parse_web_method_maps_only_exact_get_and_post() {
+        assert_eq!(parse_web_method("GET"), Some(WebMethod::Get));
+        assert_eq!(parse_web_method("POST"), Some(WebMethod::Post));
+        assert_eq!(parse_web_method("HEAD"), None);
+        assert_eq!(parse_web_method("OPTIONS"), None);
+        assert_eq!(parse_web_method("DELETE"), None);
+        assert_eq!(parse_web_method("get"), None);
+        assert_eq!(parse_web_method("post"), None);
+        assert_eq!(parse_web_method(""), None);
+    }
+
+    #[test]
+    fn test_method_name_matches_http_and_serde_form() {
+        assert_eq!(method_name(WebMethod::Get), "GET");
+        assert_eq!(method_name(WebMethod::Post), "POST");
+        for method in [WebMethod::Get, WebMethod::Post] {
+            let serialized = serde_json::to_string(&method).unwrap();
+            assert_eq!(serialized, format!("\"{}\"", method_name(method)));
+            assert_eq!(parse_web_method(method_name(method)), Some(method));
+        }
     }
 }

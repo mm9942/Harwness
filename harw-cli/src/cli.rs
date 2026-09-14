@@ -65,6 +65,21 @@ pub struct ChatArgs {
     /// werden.
     #[arg(long, global = true, default_value_t = false)]
     pub log_sensitive: bool,
+    /// Zeigt jeden Tool-Aufruf samt Argumenten in der TUI/Konsole an, statt
+    /// nur die verdichtete `ToolCell`-Vorschau.
+    #[arg(long, global = true, default_value_t = false)]
+    pub verbose: bool,
+    /// Zusätzliche Arbeitswurzel, unter der Datei-Werkzeuge ohne erneute
+    /// Rückfrage lesen/schreiben dürfen (mehrfach angebbar). Nur für diesen
+    /// Prozess gültig — dauerhaftes Merken läuft über `/add-workdir merken`
+    /// bzw. `harw settings`.
+    #[arg(long = "add-dir", global = true, value_name = "PFAD")]
+    pub add_dir: Vec<PathBuf>,
+    /// Zeigt bei `-r` die Sessions **aller** Projekte statt nur die des
+    /// aktuellen Projekts (Projekt = nächster Ordner mit `.git`, sonst das
+    /// Arbeitsverzeichnis selbst).
+    #[arg(long, global = true, default_value_t = false)]
+    pub all: bool,
 }
 
 /// Zusätzliche Telemetrie-Exportziele für `harw gateway`.
@@ -187,6 +202,15 @@ pub enum Command {
         #[command(subcommand)]
         action: AuthAction,
     },
+    /// Provider, Modelle, Freigaben und einzelne Konfigurationswerte
+    /// verwalten. Ohne Unterbefehl startet ein zeilenbasiertes Menü
+    /// (siehe `crate::settings`).
+    Settings {
+        /// Auszuführende Settings-Aktion; ohne Angabe startet das
+        /// interaktive Menü.
+        #[command(subcommand)]
+        action: Option<SettingsAction>,
+    },
     /// Harwness deinstallieren (Bereiche wählbar, Dry-Run möglich).
     Uninstall {
         /// Zu entfernende Bereiche: service, state, workspace, binary.
@@ -298,6 +322,186 @@ pub enum ProjectAction {
         /// Projekt-Root; ohne Angabe das aktuelle Arbeitsverzeichnis.
         #[arg(value_name = "DIR")]
         path: Option<PathBuf>,
+    },
+}
+
+/// Auszuführende Aktion unter `harw settings`.
+///
+/// Ohne diesen Subcommand (`Cli::command == Some(Command::Settings { action:
+/// None })`) startet [`crate::settings::run`] das interaktive Menü.
+#[derive(Debug, Subcommand)]
+pub enum SettingsAction {
+    /// Provider verwalten (`providers/<name>.toml` im aktiven Profil).
+    Provider {
+        #[command(subcommand)]
+        action: SettingsProviderAction,
+    },
+    /// Standardmodell verwalten.
+    Model {
+        #[command(subcommand)]
+        action: SettingsModelAction,
+    },
+    /// Freigabe-Standardmodus und Allow-/Deny-Regeln — derselbe Schreibpfad
+    /// wie das `/permissions`-Panel der TUI.
+    Permissions {
+        #[command(subcommand)]
+        action: SettingsPermissionsAction,
+    },
+    /// Liest einen einzelnen, punktgetrennten Konfigurationsschlüssel.
+    Get {
+        /// Punktgetrennter Schlüsselpfad, z. B. `permissions.default_mode`.
+        key: String,
+        #[command(flatten)]
+        scope: SettingsScopeArgs,
+    },
+    /// Setzt einen einzelnen, punktgetrennten Konfigurationsschlüssel.
+    Set {
+        /// Punktgetrennter Schlüsselpfad, z. B. `permissions.default_mode`.
+        key: String,
+        /// Neuer Wert als Text; wird als TOML-String geschrieben (siehe
+        /// `crate::settings`). Ohne Wert wird der Schlüssel gelöscht.
+        value: Option<String>,
+        #[command(flatten)]
+        scope: SettingsScopeArgs,
+    },
+}
+
+/// Ziel-Ebene (`SettingScope`) eines `get`/`set`/`permissions`-Aufrufs.
+///
+/// `--global` ist die Vorgabe, wenn keines der beiden Flags gesetzt ist;
+/// `--global` und `--project` schließen sich gegenseitig aus, unabhängig von
+/// der Reihenfolge (siehe `AnalyzeArgs::bottom_up`/`top_down` für dasselbe
+/// Muster).
+#[derive(Debug, Clone, Copy, Args)]
+pub struct SettingsScopeArgs {
+    /// Schreibt/liest die dauerhafte User-Ebene (`~/.harw/…`). Vorgabe.
+    #[arg(long, conflicts_with = "project")]
+    pub global: bool,
+    /// Schreibt/liest die dauerhafte Projekt-Ebene
+    /// (`~/.harw/profiles/<p>/projects/<key>/settings.toml`).
+    #[arg(long)]
+    pub project: bool,
+}
+
+impl SettingsScopeArgs {
+    /// Löst die Flags in einen [`harw_config::SettingScope`] auf.
+    ///
+    /// # Returns
+    /// [`harw_config::SettingScope::Project`], wenn `--project` gesetzt ist,
+    /// sonst [`harw_config::SettingScope::Global`] (Vorgabe). Nie `Session`
+    /// — die CLI-Grammatik kennt keinen Weg, eine reine Speicher-Ebene
+    /// anzusprechen.
+    #[must_use]
+    pub fn resolve(self) -> harw_config::SettingScope {
+        if self.project {
+            harw_config::SettingScope::Project
+        } else {
+            harw_config::SettingScope::Global
+        }
+    }
+}
+
+/// Aktionen des `harw settings provider`-Subcommands.
+#[derive(Debug, Subcommand)]
+pub enum SettingsProviderAction {
+    /// Listet alle Provider des aktiven Profils.
+    List,
+    /// Legt einen neuen Provider an (oder überschreibt einen gleichnamigen).
+    Add {
+        /// Provider-Name (Dateiname `providers/<name>.toml`).
+        name: String,
+        /// API-Dialekt, z. B. `openai-chat`, `openai-responses`,
+        /// `anthropic-messages`, `ollama`.
+        #[arg(long)]
+        api: String,
+        /// Basis-URL des Providers.
+        #[arg(long = "base-url", value_name = "URL")]
+        base_url: String,
+        /// Secret-Referenz (`env:VAR` oder `secrets:NAME`); ein Klartext-Key
+        /// wird abgelehnt.
+        #[arg(long)]
+        auth: Option<String>,
+        /// Modell-IDs dieses Providers, kommagetrennt.
+        #[arg(long, value_delimiter = ',')]
+        models: Vec<String>,
+    },
+    /// Entfernt einen Provider.
+    Remove {
+        /// Provider-Name.
+        name: String,
+    },
+    /// Aktiviert einen zuvor deaktivierten Provider.
+    Enable {
+        /// Provider-Name.
+        name: String,
+    },
+    /// Deaktiviert einen Provider, ohne ihn zu löschen.
+    Disable {
+        /// Provider-Name.
+        name: String,
+    },
+}
+
+/// Aktionen des `harw settings model`-Subcommands.
+#[derive(Debug, Subcommand)]
+pub enum SettingsModelAction {
+    /// Setzt das Standardmodell (`default_model`) der globalen Ebene.
+    Default {
+        /// Modell-ID, wie in `models/<id>.toml` deklariert.
+        id: String,
+    },
+}
+
+/// Aktionen des `harw settings permissions`-Subcommands — derselbe
+/// Schreibpfad wie das `/permissions`-Panel (Contract §2/§5 Zeile A2).
+#[derive(Debug, Subcommand)]
+pub enum SettingsPermissionsAction {
+    /// Zeigt Standardmodus, Timeout und Allow-/Deny-Regeln der gewählten
+    /// Ebene.
+    Get {
+        #[command(flatten)]
+        scope: SettingsScopeArgs,
+    },
+    /// Setzt den Standard-Freigabemodus (`ask`, `auto` oder `full`).
+    SetMode {
+        /// `ask`, `auto` oder `full`.
+        mode: String,
+        #[command(flatten)]
+        scope: SettingsScopeArgs,
+    },
+    /// Hängt eine Allow-Regel an.
+    Allow {
+        /// Werkzeugname, z. B. `shell.exec`.
+        tool: String,
+        /// Optionales Muster (Shell-Präfix bzw. Pfad-Glob).
+        #[arg(long)]
+        pattern: Option<String>,
+        #[command(flatten)]
+        scope: SettingsScopeArgs,
+    },
+    /// Hängt eine Deny-Regel an.
+    Deny {
+        /// Werkzeugname, z. B. `fs.write`.
+        tool: String,
+        /// Optionales Muster (Shell-Präfix bzw. Pfad-Glob).
+        #[arg(long)]
+        pattern: Option<String>,
+        #[command(flatten)]
+        scope: SettingsScopeArgs,
+    },
+    /// Entfernt eine Allow-Regel per Index (siehe `permissions get`).
+    Unallow {
+        /// Index in der Allow-Liste, 0-basiert.
+        index: usize,
+        #[command(flatten)]
+        scope: SettingsScopeArgs,
+    },
+    /// Entfernt eine Deny-Regel per Index (siehe `permissions get`).
+    Undeny {
+        /// Index in der Deny-Liste, 0-basiert.
+        index: usize,
+        #[command(flatten)]
+        scope: SettingsScopeArgs,
     },
 }
 
@@ -474,6 +678,207 @@ mod tests {
             );
         };
         assert_eq!(path, Some(PathBuf::from(".")));
+    }
+
+    #[test]
+    fn test_verbose_and_add_dir_flags_parse_and_repeat() {
+        let cli = match Cli::try_parse_from([
+            "harw",
+            "--verbose",
+            "--add-dir",
+            "/tmp/a",
+            "--add-dir",
+            "/tmp/b",
+        ]) {
+            Ok(cli) => cli,
+            Err(err) => panic!("`--verbose --add-dir ...` sollte parsen: {err}"),
+        };
+
+        assert!(cli.chat.verbose);
+        assert_eq!(
+            cli.chat.add_dir,
+            vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
+        );
+    }
+
+    #[test]
+    fn test_verbose_and_add_dir_default_to_empty() {
+        let cli = Cli::try_parse_from(["harw"]).expect("bare harw parses");
+
+        assert!(!cli.chat.verbose);
+        assert!(cli.chat.add_dir.is_empty());
+    }
+
+    #[test]
+    fn test_settings_without_action_parses_for_interactive_menu() {
+        let cli = match Cli::try_parse_from(["harw", "settings"]) {
+            Ok(cli) => cli,
+            Err(err) => panic!("`harw settings` sollte parsen: {err}"),
+        };
+
+        assert!(matches!(
+            cli.command,
+            Some(Command::Settings { action: None })
+        ));
+    }
+
+    #[test]
+    fn test_settings_provider_add_parses_all_flags() {
+        let cli = match Cli::try_parse_from([
+            "harw",
+            "settings",
+            "provider",
+            "add",
+            "test",
+            "--api",
+            "openai-chat",
+            "--base-url",
+            "http://localhost:1",
+            "--auth",
+            "env:X",
+            "--models",
+            "a,b",
+        ]) {
+            Ok(cli) => cli,
+            Err(err) => panic!("`harw settings provider add ...` sollte parsen: {err}"),
+        };
+
+        let Some(Command::Settings {
+            action:
+                Some(SettingsAction::Provider {
+                    action: SettingsProviderAction::Add {
+                        name,
+                        api,
+                        base_url,
+                        auth,
+                        models,
+                    },
+                }),
+        }) = cli.command
+        else {
+            panic!("erwartete Settings(Provider(Add)), bekam {:?}", cli.command);
+        };
+        assert_eq!(name, "test");
+        assert_eq!(api, "openai-chat");
+        assert_eq!(base_url, "http://localhost:1");
+        assert_eq!(auth.as_deref(), Some("env:X"));
+        assert_eq!(models, vec!["a".to_owned(), "b".to_owned()]);
+    }
+
+    #[test]
+    fn test_settings_model_default_parses() {
+        let cli = match Cli::try_parse_from(["harw", "settings", "model", "default", "gpt-5.4"]) {
+            Ok(cli) => cli,
+            Err(err) => panic!("`harw settings model default ...` sollte parsen: {err}"),
+        };
+
+        let Some(Command::Settings {
+            action:
+                Some(SettingsAction::Model {
+                    action: SettingsModelAction::Default { id },
+                }),
+        }) = cli.command
+        else {
+            panic!("erwartete Settings(Model(Default)), bekam {:?}", cli.command);
+        };
+        assert_eq!(id, "gpt-5.4");
+    }
+
+    #[test]
+    fn test_settings_get_set_default_to_global_scope() {
+        let get = match Cli::try_parse_from(["harw", "settings", "get", "default_model"]) {
+            Ok(cli) => cli,
+            Err(err) => panic!("`harw settings get ...` sollte parsen: {err}"),
+        };
+        let Some(Command::Settings {
+            action: Some(SettingsAction::Get { key, scope }),
+        }) = get.command
+        else {
+            panic!("erwartete Settings(Get), bekam {:?}", get.command);
+        };
+        assert_eq!(key, "default_model");
+        assert!(!scope.global);
+        assert!(!scope.project);
+
+        let set = match Cli::try_parse_from([
+            "harw",
+            "settings",
+            "set",
+            "default_model",
+            "gpt-5.4",
+            "--project",
+        ]) {
+            Ok(cli) => cli,
+            Err(err) => panic!("`harw settings set ... --project` sollte parsen: {err}"),
+        };
+        let Some(Command::Settings {
+            action: Some(SettingsAction::Set { key, value, scope }),
+        }) = set.command
+        else {
+            panic!("erwartete Settings(Set), bekam {:?}", set.command);
+        };
+        assert_eq!(key, "default_model");
+        assert_eq!(value.as_deref(), Some("gpt-5.4"));
+        assert!(scope.project);
+        assert!(!scope.global);
+    }
+
+    #[test]
+    fn test_settings_scope_flags_conflict_in_both_orders() {
+        let forward = Cli::try_parse_from([
+            "harw", "settings", "get", "default_model", "--global", "--project",
+        ]);
+        let backward = Cli::try_parse_from([
+            "harw", "settings", "get", "default_model", "--project", "--global",
+        ]);
+
+        match (forward, backward) {
+            (Err(a), Err(b)) => assert_eq!(a.kind(), b.kind()),
+            (a, b) => panic!("beide Reihenfolgen müssen gleich scheitern, bekam {a:?} / {b:?}"),
+        }
+    }
+
+    #[test]
+    fn test_settings_permissions_allow_and_deny_parse() {
+        let allow = match Cli::try_parse_from([
+            "harw",
+            "settings",
+            "permissions",
+            "allow",
+            "shell.exec",
+            "--pattern",
+            "cargo check",
+        ]) {
+            Ok(cli) => cli,
+            Err(err) => panic!("`harw settings permissions allow ...` sollte parsen: {err}"),
+        };
+        assert!(matches!(
+            allow.command,
+            Some(Command::Settings {
+                action: Some(SettingsAction::Permissions {
+                    action: SettingsPermissionsAction::Allow { .. },
+                }),
+            })
+        ));
+
+        let deny = match Cli::try_parse_from([
+            "harw",
+            "settings",
+            "permissions",
+            "deny",
+            "fs.write",
+        ]) {
+            Ok(cli) => cli,
+            Err(err) => panic!("`harw settings permissions deny ...` sollte parsen: {err}"),
+        };
+        assert!(matches!(
+            deny.command,
+            Some(Command::Settings {
+                action: Some(SettingsAction::Permissions {
+                    action: SettingsPermissionsAction::Deny { .. },
+                }),
+            })
+        ));
     }
 
     #[test]

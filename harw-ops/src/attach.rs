@@ -94,9 +94,9 @@ pub struct AttachArgs {
     command(path = "/attach", visibility = "tui_only"),
     // Web-Fläche: laut Moduldoku "öffnet keine interaktive Session und
     // verändert den Job nicht" — reine Inspektion über den `JobStore`, daher
-    // `readonly`. `approval = "none"`, weil ein Lesevorgang keine Bestätigung
-    // braucht.
-    web(path = "/api/attach", readonly, approval = "none")
+    // `method = "get"`. `approval = "none"`, weil ein Lesevorgang keine
+    // Bestätigung braucht.
+    web(path = "/api/attach", method = "get", approval = "none")
 )]
 async fn attach(ctx: &OpContext, args: AttachArgs) -> Result<OpOutput, OpError> {
     let job = args
@@ -110,12 +110,10 @@ async fn attach(ctx: &OpContext, args: AttachArgs) -> Result<OpOutput, OpError> 
     let record = store.get(&work_id).map_err(|error| {
         OpError::Execution(format!("could not attach to durable job `{job}`: {error}"))
     })?;
-    Ok(OpOutput {
-        text: format!(
-            "Job {}\nState: {:?}\nRevision: {}",
-            record.job.id, record.job.state, record.revision
-        ),
-    })
+    Ok(OpOutput::from(format!(
+        "Job {}\nState: {:?}\nRevision: {}",
+        record.job.id, record.job.state, record.revision
+    )))
 }
 
 #[cfg(test)]

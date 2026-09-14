@@ -175,12 +175,19 @@ impl From<SensorHandle<Bound>> for GpuSensor {
     ///
     /// # Examples
     /// ```rust
+    /// use harw_dod_cap::scope::AliasRoot;
     /// use harw_dod_cap::{Capability, ReadScope, SensorHandle};
     /// use harw_dod_gpu::GpuSensor;
     /// use harw_types::SensorId;
     /// use std::path::PathBuf;
     ///
-    /// let scope = ReadScope::from_roots([PathBuf::from("/sys/class/drm")]);
+    /// // `/sys/class/drm/*`-Einträge sind Symlinks nach `/sys/devices/...`
+    /// // (F-005) — `AliasRoot::sysfs_class` baut den Bereich, der das
+    /// // zulässt, statt der für sysfs-Klassenwurzeln unsicheren
+    /// // `ReadScope::from_roots`.
+    /// let alias =
+    ///     AliasRoot::sysfs_class(PathBuf::from("/sys/class/drm")).expect("gültige sysfs-Klassenwurzel");
+    /// let scope = ReadScope::from_roots_and_aliases(Vec::new(), [alias]);
     /// let handle = SensorHandle::new(SensorId::from_str("gpu-0"), Capability::ReadSysfsDrm)
     ///     .bind(scope);
     /// let _sensor = GpuSensor::from(handle);
@@ -213,10 +220,12 @@ impl Sensor for GpuSensor {
     /// # Description
     /// Ermittelt zuerst die Kartengeräteverzeichnisse unterhalb der ersten
     /// Bereichswurzel (`card*/device`, siehe [`relative_pattern`] für die
-    /// Begründung, warum das Muster zur Laufzeit gebaut wird). **Kein**
-    /// gefundenes Kartenverzeichnis ist der Normalfall „keine GPU auf diesem
-    /// Host" (siehe `lib.rs`-Moduldoku) und ergibt ein leeres,
-    /// erfolgreiches `SensorReading` — keinen Fehler.
+    /// Begründung, warum das Muster zur Laufzeit gebaut wird), verwirft
+    /// dabei DRM-Connector-Verzeichnisse wie `card1-HDMI-A-1`
+    /// ([`is_card_root_name`], F-203) und kürzt auf [`MAX_CARDS`] echte
+    /// Karten. **Kein** gefundenes Kartenverzeichnis ist der Normalfall
+    /// „keine GPU auf diesem Host" (siehe `lib.rs`-Moduldoku) und ergibt ein
+    /// leeres, erfolgreiches `SensorReading` — keinen Fehler.
     ///
     /// Für jede gefundene Karte liest diese Funktion die vier optionalen
     /// Rohwerte (siehe [`read_card_metrics`]): eine fehlende Datei wird
@@ -254,13 +263,16 @@ impl Sensor for GpuSensor {
     ///
     /// # Examples
     /// ```rust,no_run
+    /// use harw_dod_cap::scope::AliasRoot;
     /// use harw_dod_cap::{Capability, ReadScope, SensorHandle};
     /// use harw_dod_gpu::GpuSensor;
     /// use harw_dod_signals::Sensor;
     /// use harw_types::SensorId;
     /// use std::path::PathBuf;
     ///
-    /// let scope = ReadScope::from_roots([PathBuf::from("/sys/class/drm")]);
+    /// let alias =
+    ///     AliasRoot::sysfs_class(PathBuf::from("/sys/class/drm")).expect("gültige sysfs-Klassenwurzel");
+    /// let scope = ReadScope::from_roots_and_aliases(Vec::new(), [alias]);
     /// let handle = SensorHandle::new(SensorId::from_str("gpu-0"), Capability::ReadSysfsDrm)
     ///     .bind(scope);
     /// let sensor = GpuSensor::from(handle);
@@ -349,6 +361,17 @@ fn relative_pattern(base: &Path, suffix: &str) -> Option<String> {
 // ohne Wurzeln, mit nicht-absoluter Wurzel, oder ohne sichtbare Karten
 // liefert eine leere Liste — **kein** Fehler, siehe `lib.rs`-Moduldoku,
 // Abschnitt „Ein Host ohne GPU ist der Normalfall".
+//
+// F-203: `card*` matcht auch Connector-Verzeichnisse (`card1-HDMI-A-1`, die
+// DRM für jeden Anschluss einer Karte zusätzlich unter `/sys/class/drm`
+// anlegt, ebenfalls mit einem eigenen `device`-Symlink zurück zur Karte).
+// Ohne Filterung würde ein Multi-Monitor-Host dieselbe physische Karte
+// mehrfach unter verschiedenen Labels melden. Echte Kartenverzeichnisse
+// heißen ausschließlich `card` gefolgt von Ziffern (`card0`, `card1`, …) —
+// [`is_card_root_name`] verwirft alles mit einem weiteren Suffix. Zusätzlich
+// wird hier — anders als zuvor, wo die Konstante nur deklariert, aber nie
+// durchgesetzt wurde — auf [`MAX_CARDS`] gekürzt (Ergebnis bleibt
+// alphabetisch sortiert, siehe `glob::glob`s eigene Garantie).
 fn card_device_dirs(scope: &ReadScope) -> Result<Vec<PathBuf>, SensorError> {
     let Some(root) = scope.roots().next() else {
         return Ok(Vec::new());
@@ -356,7 +379,49 @@ fn card_device_dirs(scope: &ReadScope) -> Result<Vec<PathBuf>, SensorError> {
     let Some(pattern) = relative_pattern(root, CARD_DEVICE_GLOB_SUFFIX) else {
         return Ok(Vec::new());
     };
-    harw_dod_readfs::glob::glob(scope, &pattern).map_err(map_readfs_err)
+    let mut matches = harw_dod_readfs::glob::glob(scope, &pattern).map_err(map_readfs_err)?;
+    matches.retain(|device_dir| {
+        device_dir
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(std::ffi::OsStr::to_str)
+            .is_some_and(is_card_root_name)
+    });
+    matches.truncate(MAX_CARDS);
+    Ok(matches)
+}
+
+/// Ist `name` der Name eines echten Kartenverzeichnisses (`card0`, `card12`,
+/// …) und nicht eines DRM-Connector-Verzeichnisses (`card1-HDMI-A-1`)?
+///
+/// # Description
+/// Ein echtes Kartenverzeichnis heißt exakt `card` gefolgt von mindestens
+/// einer ASCII-Ziffer, ohne weiteres Suffix (F-203). Ein
+/// Connector-Verzeichnis trägt nach der Kartennummer stets einen
+/// Bindestrich, gefolgt vom Anschlussnamen (`-HDMI-A-1`, `-DP-1`, …) — genau
+/// dieses zusätzliche, nicht rein numerische Suffix verwirft diese Funktion.
+///
+/// # Arguments
+/// - `name` (`&str`): der zu prüfende Verzeichnisname (der Elternteil eines
+///   `card*/device`-Treffers).
+///
+/// # Returns
+/// `true`, wenn `name` ausschließlich aus `"card"` plus Ziffern besteht.
+///
+/// # Examples
+/// ```rust
+/// use harw_dod_gpu::sensor::is_card_root_name;
+///
+/// assert!(is_card_root_name("card0"));
+/// assert!(is_card_root_name("card12"));
+/// assert!(!is_card_root_name("card1-HDMI-A-1"));
+/// assert!(!is_card_root_name("card"));
+/// assert!(!is_card_root_name("cardX"));
+/// ```
+#[must_use]
+pub fn is_card_root_name(name: &str) -> bool {
+    name.strip_prefix("card")
+        .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
 }
 
 // Liest die vier optionalen Rohwerte einer Karte. Jede einzelne Datei ist
@@ -445,6 +510,10 @@ fn classify_read_error(err: ReadFsError) -> Option<SensorError> {
         ReadFsError::GlobPatternAbsolute { .. } | ReadFsError::GlobPatternTraversal { .. } => {
             Some(SensorError::MalformedSource)
         }
+        // Wie `TooLarge`: eine überschrittene Glob-Grenze beschreibt eine
+        // Quelle mit unerwarteter Form, nicht einen Fehler dieses Werkzeugs
+        // (C-SCOPE-Nachfolge, F-005-Register).
+        ReadFsError::GlobLimitExceeded { .. } => Some(SensorError::MalformedSource),
     }
 }
 
@@ -458,7 +527,8 @@ fn map_readfs_err(err: ReadFsError) -> SensorError {
         ReadFsError::Scope(inner) => inner,
         ReadFsError::TooLarge { .. }
         | ReadFsError::GlobPatternAbsolute { .. }
-        | ReadFsError::GlobPatternTraversal { .. } => SensorError::MalformedSource,
+        | ReadFsError::GlobPatternTraversal { .. }
+        | ReadFsError::GlobLimitExceeded { .. } => SensorError::MalformedSource,
     }
 }
 
@@ -505,7 +575,7 @@ mod tests {
     use harw_types::SensorId;
     use jiff::Timestamp;
 
-    use super::GpuSensor;
+    use super::{card_device_dirs, is_card_root_name, GpuSensor, MAX_CARDS};
 
     /// Das `fixtures/`-Wurzelverzeichnis dieser Crate.
     fn fixtures_root() -> PathBuf {
@@ -656,6 +726,117 @@ mod tests {
             first, second,
             "zwei Polls mit demselben injizierten now müssen dasselbe Ergebnis liefern"
         );
+    }
+
+    #[test]
+    fn test_is_card_root_name_accepts_only_card_plus_digits() {
+        assert!(is_card_root_name("card0"));
+        assert!(is_card_root_name("card12"));
+        assert!(!is_card_root_name("card1-HDMI-A-1"));
+        assert!(!is_card_root_name("card"));
+        assert!(!is_card_root_name("cardX"));
+    }
+
+    #[test]
+    fn test_card_device_dirs_excludes_connector_directories_regression_f203() {
+        // Ein Multi-Monitor-Host: `card0` ist die echte Karte, `card0-HDMI-A-1`
+        // ist DRMs zusätzliches Connector-Verzeichnis für denselben Anschluss
+        // — beide tragen ein `device`-Symlink und würden ohne Filterung als
+        // zwei Karten gezählt.
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("card0/device")).expect("card0/device");
+        std::fs::write(dir.path().join("card0/device/gpu_busy_percent"), "5\n")
+            .expect("gpu_busy_percent schreiben");
+        std::fs::create_dir_all(dir.path().join("card0-HDMI-A-1/device"))
+            .expect("card0-HDMI-A-1/device");
+        std::fs::write(
+            dir.path().join("card0-HDMI-A-1/device/gpu_busy_percent"),
+            "5\n",
+        )
+        .expect("gpu_busy_percent im Connector-Verzeichnis schreiben");
+
+        let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
+        let device_dirs = card_device_dirs(&scope).expect("card_device_dirs darf nicht scheitern");
+
+        assert_eq!(
+            device_dirs.len(),
+            1,
+            "das Connector-Verzeichnis darf nicht als eigene Karte gezählt werden: {device_dirs:?}"
+        );
+    }
+
+    #[test]
+    fn test_card_device_dirs_truncates_to_max_cards_regression_f203() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for i in 0..(MAX_CARDS + 4) {
+            let card_dir = dir.path().join(format!("card{i}/device"));
+            std::fs::create_dir_all(&card_dir).expect("card device dir");
+            std::fs::write(card_dir.join("gpu_busy_percent"), "1\n")
+                .expect("gpu_busy_percent schreiben");
+        }
+
+        let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
+        let device_dirs = card_device_dirs(&scope).expect("card_device_dirs darf nicht scheitern");
+
+        assert_eq!(
+            device_dirs.len(),
+            MAX_CARDS,
+            "MAX_CARDS muss durchgesetzt werden, nicht nur deklariert sein"
+        );
+    }
+
+    /// Der Ordner der echten Pi-Captures (`C-FIXT`, `harw-dod-fixtures`),
+    /// über den Workspace-Geschwisterpfad erreicht.
+    fn rpi5_captures_dir() -> PathBuf {
+        PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../harw-dod-fixtures/captures/rpi5-6.18"
+        ))
+    }
+
+    /// Regressionstest für F-005/F-202 mit einer echten, auf diesem
+    /// Raspberry Pi 5 erhobenen Capture (`gpu.json`): `card0` erscheint dort
+    /// als echter Symlink nach `/sys/devices/platform/axi/1002000000.v3d/drm/card0`.
+    /// Die Capture trägt nur `device/uevent` (keinen der vier von diesem
+    /// Sensor gelesenen Rohwerte) — der Test belegt deshalb, dass die
+    /// Alias-Auflösung die echte Karte überhaupt erst findet (vorher:
+    /// `SensorError::SourceUnavailable`-artiges Verhalten durch F-005, hier
+    /// stattdessen ein leeres, aber erfolgreiches Ergebnis für genau eine
+    /// gefundene Karte), nicht die konkreten Metrikwerte.
+    #[test]
+    fn test_poll_reads_real_pi_capture_through_alias_scope_regression_f005() {
+        let manifest_path = rpi5_captures_dir().join("gpu.json");
+        let manifest = harw_dod_fixtures::capture_manifest::load(&manifest_path)
+            .expect("captures/rpi5-6.18/gpu.json muss ladbar sein");
+
+        let tmp = tempfile::tempdir().expect("tempdir für die Materialisierung");
+        harw_dod_fixtures::capture_manifest::materialize(&manifest, tmp.path())
+            .expect("materialize muss die echte Symlink-Struktur anlegen");
+
+        let declared = tmp.path().join("sys/class/drm");
+        let resolved_prefix = tmp.path().join("sys/devices");
+        let alias = harw_dod_cap::scope::AliasRoot::new(declared, resolved_prefix)
+            .expect("AliasRoot::new mit Tempdir-Wurzeln");
+        let scope = ReadScope::from_roots_and_aliases(Vec::new(), [alias]);
+
+        let device_dirs =
+            card_device_dirs(&scope).expect("Alias-Scope muss die reale Karte über den Symlink finden");
+        assert_eq!(
+            device_dirs.len(),
+            1,
+            "genau eine echte Karte muss über den Symlink gefunden werden: {device_dirs:?}"
+        );
+
+        let handle = SensorHandle::new(
+            SensorId::from_str("gpu-alias-capture-test"),
+            Capability::ReadSysfsDrm,
+        )
+        .bind(scope);
+        let sensor = GpuSensor::from(handle);
+        let reading = sensor
+            .poll(Timestamp::UNIX_EPOCH)
+            .expect("ein Host mit einer Karte ohne bekannte Metrikdateien darf nicht scheitern");
+        assert!(reading.samples.is_empty());
     }
 
     harw_dod_fixtures::sensor_suite! {

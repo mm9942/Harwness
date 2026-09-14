@@ -1,0 +1,20 @@
+{
+  "kernel": "6.18.34+rpt-rpi-2712",
+  "captured_at": "2026-09-13T18:33:35Z",
+  "entries": [
+    {
+      "path": "/sys/class/block/mmcblk0",
+      "kind": {
+        "type": "symlink",
+        "target": "../../devices/platform/soc@107c000000/1000fff000.mmc/mmc_host/mmc0/mmc0:aaaa/block/mmcblk0"
+      }
+    },
+    {
+      "path": "/sys/class/block/mmcblk0/stat",
+      "kind": {
+        "type": "file",
+        "content": "  116087    27775  7161334   359209    85815   162538 11041881  2293389        0   250812  2661706        0        0        0        0    40639     9106\n"
+      }
+    }
+  ]
+}

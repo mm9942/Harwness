@@ -2,25 +2,42 @@
 # der eingebauten Default-Organisation.
 #
 # ══════════════════════════════════════════════════════════════════════════════
-# WICHTIG — es gibt heute keine eingebaute Rolle, die Code schreibt.
+# Seit Slice B7: `executor` ist die erste eingebaute Rolle mit Schreib-/
+# Ausführungsrechten — es gibt aber weiterhin keine eingebaute Rolle, die
+# selbst Code ENTWIRFT.
 # ══════════════════════════════════════════════════════════════════════════════
-# `harw_registry_defaults::profile::role_names::ALL` enthält genau fünf Rollen:
-# `explorer`, `researcher-deps`, `researcher-web`, `planner`, `analyst`. Alle
-# fünf sind read-only: jede führt `fs.write` und `shell.exec` in `forbidden`,
-# und `planner`/`explorer`/`analyst` tragen zusätzlich `may_write_code = false`
-# in ihrer eigenen Definition.
+# `harw_registry_defaults::profile::role_names::ALL` enthält heute zehn Rollen,
+# darunter die fünf ursprünglichen `explorer`, `researcher-deps`,
+# `researcher-web`, `planner`, `analyst` — alle fünf read-only: jede führt
+# `fs.write` und `shell.exec` in `forbidden`, und `planner`/`explorer`/
+# `analyst` tragen zusätzlich `may_write_code = false` in ihrer eigenen
+# Definition. `executor` ist die ausdrückliche, dokumentierte Ausnahme
+# (`RegistryProfile::Full`, siehe `agents/executor.toml` und
+# `harw-registry-defaults/src/profile.rs::profile_for_role`): er admittiert
+# `fs.write`/`shell.exec` und führt damit Befehls- und Dateioperationen im
+# Auftrag des Haupt-Agenten aus — er trifft dabei aber keine eigene
+# Entwurfsentscheidung, sondern führt bereits entschiedene Operationen aus und
+# liefert eine Zusammenfassung statt Rohausgaben zurück.
 #
-# Dieses Roster nennt deshalb die Rollen, die die Coding-Spur heute *bedienen*,
-# nicht die, die sie ausführen: `planner` erzeugt den Planvorschlag, aus dem
-# Coding-Knoten entstehen, `explorer` belegt den Ist-Zustand des Codes, den ein
-# Coding-Knoten verändern soll. Sobald eine schreibende Rolle in `role_names`
-# aufgenommen wird, gehört ihre `harwness.agent.<rolle>@1`-ID hierher — und der
-# Test `test_coding_family_lists_only_roles_that_exist_in_role_names` bricht
-# nicht, weil er gegen `role_names::ALL` prüft, nicht gegen eine feste Liste.
+# Dieses Roster nennt deshalb sowohl die Rollen, die die Coding-Spur heute
+# *vorbereiten*, als auch die eine Rolle, die Befehls-/Dateioperationen für sie
+# *ausführt*: `planner` erzeugt den Planvorschlag, aus dem Coding-Knoten
+# entstehen, `explorer` belegt den Ist-Zustand des Codes, den ein Coding-Knoten
+# verändern soll, `executor` führt die vom Haupt-Agenten beschlossenen
+# Befehlsfolgen aus, damit im Hauptfenster nur eine kompakte Fortschrittszeile
+# erscheint statt vieler einzelner Tool-Aufrufe. Sobald eine weitere
+# schreibende Rolle in `role_names` aufgenommen wird, gehört ihre
+# `harwness.agent.<rolle>@1`-ID ebenfalls hierher — und der Test
+# `test_coding_family_lists_only_roles_that_exist_in_role_names` bricht nicht,
+# weil er gegen `role_names::ALL` prüft, nicht gegen eine feste Liste.
 #
 # Frei erfundene IDs stehen hier bewusst *nicht*: eine Family, die eine
 # nicht existierende Rolle erlaubt, verspricht eine Fähigkeit, die die Runtime
 # beim Spawn nicht einlösen kann.
+#
+# Der Haupt-Agent verliert durch `executor` nichts: er behält alle eigenen
+# Werkzeugrechte unverändert und delegiert nur optional — `transfer_to_executor`
+# kommt als zusätzliche Möglichkeit hinzu, ersetzt keine bestehende.
 #
 # TOML-Reihenfolge wie in `research.toml`: `invariants` steht vor der ersten
 # Tabellenüberschrift, sonst landet es in `[orchestrators]`.
@@ -49,12 +66,17 @@ invariants = [
 [orchestrators]
 allowed = ["harwness.agent.planner@1"]
 
-# Siehe den Block oben: beides sind read-only Rollen. Sie sind hier, weil sie
-# die Coding-Spur vorbereiten — nicht, weil sie Code schreiben.
+# `planner` und `explorer` sind read-only Rollen. Sie sind hier, weil sie die
+# Coding-Spur vorbereiten — nicht, weil sie Code schreiben. `executor` ist die
+# einzige schreibende Rolle im Roster (siehe Kopfkommentar): sie ist hier,
+# damit der Haupt-Agent `transfer_to_executor` anbieten und Befehlsfolgen an
+# sie delegieren kann, statt sie selbst als viele einzelne Tool-Aufrufe im
+# Hauptfenster zu zeigen.
 [workers]
 allowed = [
   "harwness.agent.planner@1",
   "harwness.agent.explorer@1",
+  "harwness.agent.executor@1",
 ]
 
 # `write_partition` wiederholt hier die Politik der Zelle als Familien-Vorgabe:

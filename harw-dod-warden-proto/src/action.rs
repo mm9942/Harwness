@@ -299,6 +299,99 @@ impl WardenAction {
         let bytes = serde_json::to_vec(self)?;
         Ok(ContentDigest::of(&bytes))
     }
+
+    /// Returns the wire name of this action's variant (`"freeze-cgroup"`, …).
+    ///
+    /// # Description
+    /// Identisch mit dem serde-Tag `kind` (kebab-case). Fester, zur
+    /// Compile-Zeit gewählter Wert; Grundlage der kanonischen Aktionsbindung
+    /// in [`Self::binding_digest`].
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_dod_warden_proto::WardenAction;
+    /// use harw_types::CgroupId;
+    ///
+    /// let action = WardenAction::KillProcessTree {
+    ///     cgroup: CgroupId::try_from_str("harw.slice/job-1").unwrap(),
+    /// };
+    /// assert_eq!(action.kind_name(), "kill-process-tree");
+    /// ```
+    #[must_use]
+    pub const fn kind_name(&self) -> &'static str {
+        match self {
+            Self::FreezeCgroup { .. } => "freeze-cgroup",
+            Self::ReleaseCgroup { .. } => "release-cgroup",
+            Self::IsolateNetwork { .. } => "isolate-network",
+            Self::KillProcessTree { .. } => "kill-process-tree",
+        }
+    }
+
+    /// Returns the target cgroup of this action.
+    ///
+    /// # Description
+    /// Jede Variante trägt genau eine Ziel-cgroup; Proof v2 bindet sie
+    /// zusätzlich separat (siehe [`crate::signed::SignedAuthorization::verify`],
+    /// Schritt „cgroup-Präfix“).
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_dod_warden_proto::WardenAction;
+    /// use harw_types::CgroupId;
+    ///
+    /// let cgroup = CgroupId::try_from_str("harw.slice/job-1").unwrap();
+    /// let action = WardenAction::FreezeCgroup { cgroup: cgroup.clone() };
+    /// assert_eq!(action.cgroup(), &cgroup);
+    /// ```
+    #[must_use]
+    pub const fn cgroup(&self) -> &CgroupId {
+        match self {
+            Self::FreezeCgroup { cgroup }
+            | Self::ReleaseCgroup { cgroup }
+            | Self::IsolateNetwork { cgroup }
+            | Self::KillProcessTree { cgroup } => cgroup,
+        }
+    }
+
+    /// Computes the canonical, serde-independent binding digest used by Proof v2.
+    ///
+    /// # Description
+    /// BLAKE3 (unkeyed, über [`ContentDigest::of`]) über
+    /// [`crate::canonical::ACTION_DOMAIN`] gefolgt von den längenpräfixierten
+    /// Feldern `kind_name` und `cgroup` (siehe `canonical.rs`). Anders als
+    /// [`Self::content_digest`] (v1, JSON-basiert) hängt dieser Wert nicht
+    /// von einer Serialisierungsbibliothek ab und ist unfehlbar.
+    ///
+    /// # Returns
+    /// Den Bindungsdigest; strukturell gleiche Aktionen ergeben denselben Wert,
+    /// jede Abweichung in Variante oder cgroup einen anderen.
+    ///
+    /// # Concurrency
+    /// Reine Funktion.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_dod_warden_proto::WardenAction;
+    /// use harw_types::CgroupId;
+    ///
+    /// let freeze = WardenAction::FreezeCgroup {
+    ///     cgroup: CgroupId::try_from_str("harw.slice/job-1").unwrap(),
+    /// };
+    /// let release = WardenAction::ReleaseCgroup {
+    ///     cgroup: CgroupId::try_from_str("harw.slice/job-1").unwrap(),
+    /// };
+    /// assert_ne!(freeze.binding_digest(), release.binding_digest());
+    /// ```
+    #[must_use]
+    pub fn binding_digest(&self) -> ContentDigest {
+        let cgroup = self.cgroup().as_str().as_bytes();
+        let kind = self.kind_name().as_bytes();
+        let mut buf = Vec::with_capacity(crate::canonical::ACTION_DOMAIN.len() + 16 + kind.len() + cgroup.len());
+        buf.extend_from_slice(crate::canonical::ACTION_DOMAIN);
+        crate::canonical::put_field(&mut buf, kind);
+        crate::canonical::put_field(&mut buf, cgroup);
+        ContentDigest::of(&buf)
+    }
 }
 
 #[cfg(test)]
@@ -509,5 +602,44 @@ mod tests {
             freeze.content_digest().unwrap(),
             release.content_digest().unwrap()
         );
+    }
+
+    // -- v2: kind_name / cgroup / binding_digest -----------------------------
+
+    #[test]
+    fn test_kind_name_matches_serde_tag_for_every_variant() {
+        for action in [
+            WardenAction::FreezeCgroup { cgroup: cgroup("c") },
+            WardenAction::ReleaseCgroup { cgroup: cgroup("c") },
+            WardenAction::IsolateNetwork { cgroup: cgroup("c") },
+            WardenAction::KillProcessTree { cgroup: cgroup("c") },
+        ] {
+            let value = serde_json::to_value(&action).expect("serializes");
+            assert_eq!(value["kind"], action.kind_name());
+        }
+    }
+
+    #[test]
+    fn test_cgroup_returns_target_of_every_variant() {
+        let target = cgroup("harw.slice/job-7");
+        for action in [
+            WardenAction::FreezeCgroup { cgroup: target.clone() },
+            WardenAction::ReleaseCgroup { cgroup: target.clone() },
+            WardenAction::IsolateNetwork { cgroup: target.clone() },
+            WardenAction::KillProcessTree { cgroup: target.clone() },
+        ] {
+            assert_eq!(action.cgroup(), &target);
+        }
+    }
+
+    #[test]
+    fn test_binding_digest_is_deterministic_and_field_sensitive() {
+        let a = WardenAction::FreezeCgroup { cgroup: cgroup("harw.slice/job-1") };
+        let same = WardenAction::FreezeCgroup { cgroup: cgroup("harw.slice/job-1") };
+        let other_cgroup = WardenAction::FreezeCgroup { cgroup: cgroup("harw.slice/job-2") };
+        let other_kind = WardenAction::KillProcessTree { cgroup: cgroup("harw.slice/job-1") };
+        assert_eq!(a.binding_digest(), same.binding_digest());
+        assert_ne!(a.binding_digest(), other_cgroup.binding_digest());
+        assert_ne!(a.binding_digest(), other_kind.binding_digest());
     }
 }

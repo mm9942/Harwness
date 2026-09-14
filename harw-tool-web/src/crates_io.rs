@@ -41,7 +41,7 @@
 //! ```
 
 use crate::error::WebToolResult;
-use crate::fetch::{OutputFormat, scoped_fetcher};
+use crate::fetch::{run_blocking, scoped_fetcher};
 use harw_macros::Tool;
 use harw_tools::{ToolExecutionContext, ToolOutput, ToolsError};
 use serde::{Deserialize, Serialize};
@@ -288,13 +288,16 @@ async fn web_crates_io(
         Err(err) => return Ok(ToolOutput::error(err.to_string())),
     };
 
-    // `Raw`: die Antwort ist JSON und darf nicht durch einen HTML-Pfad laufen.
-    let document = match fetcher.fetch(&url, OutputFormat::Raw).await {
+    // Rohkörper: die Antwort ist JSON und darf nicht durch einen HTML-Pfad
+    // laufen; die Verdichtung begrenzt die Ausgabegröße.
+    let document = match fetcher.fetch_source(&url).await {
         Ok(document) => document,
         Err(err) => return Ok(ToolOutput::error(err.to_string())),
     };
 
-    let summary = match summarize(&document.body) {
+    // JSON bis zum Byte-Limit zu parsen ist CPU-gebunden (F-169).
+    let body = document.body;
+    let summary = match run_blocking("crates-io-summary", move || summarize(&body)).await {
         Ok(summary) => summary,
         Err(err) => return Ok(ToolOutput::error(err.to_string())),
     };

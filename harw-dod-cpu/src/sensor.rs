@@ -230,7 +230,11 @@ impl Sensor for CpuSensor {
             }
             Err(ReadFsError::Scope(inner)) => return Err(inner),
             Err(ReadFsError::TooLarge { .. }) => return Err(SensorError::MalformedSource),
-            Err(ReadFsError::GlobPatternAbsolute { .. } | ReadFsError::GlobPatternTraversal { .. }) => {
+            Err(
+                ReadFsError::GlobPatternAbsolute { .. }
+                | ReadFsError::GlobPatternTraversal { .. }
+                | ReadFsError::GlobLimitExceeded { .. },
+            ) => {
                 // read_line_fields ruft nie glob() auf; unerreichbar, aber
                 // erschöpfend abgedeckt, damit eine künftige ReadFsError-
                 // Variante hier nicht still verworfen wird.

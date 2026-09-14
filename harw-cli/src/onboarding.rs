@@ -583,6 +583,11 @@ mod tests {
                     reasoning_effort: None,
                     model_id: None,
                     provider_id: Some("foundry".into()),
+                    // Reiner Verbindungstest beim Onboarding: kein Datenblock,
+                    // kein Token-Limit, keine Sonderbegrenzung für Tool-Ergebnisse.
+                    data_block: None,
+                    max_output_tokens: None,
+                    tool_result_max_bytes: None,
                 })
                 .await
                 .unwrap();

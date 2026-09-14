@@ -384,9 +384,9 @@ async fn model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError> {
             .set_active_model(configured_id.clone())
             .map_err(|e| OpError::Execution(e.to_string()))?;
 
-        return Ok(OpOutput {
-            text: format!("model switched to {configured_id}; next turn will use it"),
-        });
+        return Ok(OpOutput::from(format!(
+            "model switched to {configured_id}; next turn will use it"
+        )));
     }
 
     // ── TASK A/B: show + list read live state then fall back to config ────────
@@ -403,7 +403,7 @@ async fn model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError> {
         format_show(&snap, &config)
     };
 
-    Ok(OpOutput { text })
+    Ok(OpOutput::from(text))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

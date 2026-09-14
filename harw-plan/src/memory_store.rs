@@ -18,11 +18,9 @@ use tracing::{debug, info};
 use crate::actions::{PlanAction, PlanEvent};
 use crate::config::PlanToolConfig;
 use crate::error::{PlanError, PlanResult};
-use crate::ids::RevisionId;
-use crate::mutation::apply_mutation;
-use crate::store::PlanStore;
+use crate::ids::{PlanId, RevisionId};
+use crate::store::{PlanRevision, PlanStore, check_batch_target, stage_actions};
 use crate::types::Plan;
-use crate::validate::validate_with;
 
 /// Interner Zustand des In-Memory-Stores.
 struct Inner {
@@ -71,8 +69,22 @@ impl InMemoryPlanStore {
     /// Standardwerte. Neue Aufrufer sollen [`Self::with_config`] verwenden,
     /// damit ihre Tool-Konfiguration an der Store-Grenze erzwungen wird.
     pub fn new() -> Self {
-        Self::with_config(PlanToolConfig::enabled_defaults())
-            .expect("enabled defaults must construct an in-memory plan store")
+        // `enabled_defaults()` ist aktiviert und hat `max_nodes > 0`; die
+        // Prüfung aus `with_config` kann hier nicht scheitern und wird deshalb
+        // ohne `expect()` übersprungen.
+        Self::from_parts(PlanToolConfig::enabled_defaults())
+    }
+
+    // Baut den leeren Store ohne erneute Konfigurationsprüfung.
+    fn from_parts(config: PlanToolConfig) -> Self {
+        Self {
+            inner: RwLock::new(Inner {
+                plan: None,
+                history: Vec::new(),
+                next_revision: RevisionId::new(1),
+            }),
+            config,
+        }
     }
 
     /// Erstellt einen neuen, leeren `InMemoryPlanStore` und erzwingt die
@@ -82,15 +94,7 @@ impl InMemoryPlanStore {
     /// - [`PlanError::Config`] wenn die Konfiguration deaktiviert oder ungültig ist.
     pub fn with_config(config: PlanToolConfig) -> PlanResult<Self> {
         config.require_enabled().map_err(PlanError::Config)?;
-
-        Ok(Self {
-            inner: RwLock::new(Inner {
-                plan: None,
-                history: Vec::new(),
-                next_revision: RevisionId::new(1),
-            }),
-            config,
-        })
+        Ok(Self::from_parts(config))
     }
 }
 
@@ -123,11 +127,6 @@ impl PlanStore for InMemoryPlanStore {
             .write()
             .map_err(|_| PlanError::Io(std::io::Error::other("RwLock vergiftet")))?;
 
-        let current_node_count = inner.plan.as_ref().map_or(0, |plan| plan.nodes.len());
-        self.config
-            .validate_action(&action, current_node_count)
-            .map_err(PlanError::Config)?;
-
         let now = OffsetDateTime::now_utc();
 
         // Für Create brauchen wir keinen bestehenden Plan — aber es darf auch
@@ -137,17 +136,23 @@ impl PlanStore for InMemoryPlanStore {
             ref goal,
         } = action
         {
+            self.config
+                .validate_action(&action, 0)
+                .map_err(PlanError::Config)?;
             if let Some(existing) = inner.plan.as_ref() {
                 return Err(PlanError::PlanExists {
                     id: existing.id.clone(),
                 });
             }
+            // Grammatik an der Store-Grenze, auch für per `PlanId::new`
+            // erzeugte IDs (F-013/G-032).
+            let plan_id = PlanId::parse(plan_id.as_str())?;
 
             info!(plan_id = %plan_id, "Neuen Plan erstellen");
             let revision = inner.next_revision;
             inner.next_revision = revision.next();
             let plan = Plan {
-                id: plan_id.clone(),
+                id: plan_id,
                 revision,
                 parent_revision: None,
                 goal_statement: goal.clone(),
@@ -167,34 +172,75 @@ impl PlanStore for InMemoryPlanStore {
             return Ok(event);
         }
 
-        // Für alle anderen Aktionen brauchen wir einen Plan. Die Revision wird
-        // vor dem exklusiven Borrow gelesen und erst nach dessen Ende
-        // fortgeschrieben, damit weder `expect()` noch ein zweiter Lookup nötig ist.
         let revision = inner.next_revision;
-        let Some(plan) = inner.plan.as_mut() else {
+        let Some(plan) = inner.plan.as_ref() else {
             return Err(PlanError::PlanNotFound);
         };
 
-        // Validierung
-        validate_with(plan, &action, &self.config, now)?;
-
-        // Mutation anwenden — einzige Mutationsstelle, geteilt mit `FilePlanStore`.
-        apply_mutation(plan, &action, actor, now);
-        plan.updated_at = now;
-        plan.revision = revision;
-
-        inner.next_revision = revision.next();
-
-        debug!(revision = %revision, actor = actor, "Aktion angewendet");
-
-        let event = PlanEvent {
-            revision,
-            action,
-            actor: actor.to_owned(),
-            applied_at: now,
+        // Validierung + Mutation auf einem Kandidaten — dieselbe Mechanik wie
+        // `apply_batch` und `FilePlanStore`.
+        let (candidate, mut events) =
+            stage_actions(plan, vec![action], actor, &self.config, revision, now)
+                .map_err(|(_, error)| error)?;
+        let Some(event) = events.pop() else {
+            return Err(PlanError::PlanNotFound);
         };
+
+        inner.plan = Some(candidate);
+        inner.next_revision = revision.next();
+        debug!(revision = %revision, actor = actor, "Aktion angewendet");
         inner.history.push(event.clone());
         Ok(event)
+    }
+
+    fn apply_batch(
+        &self,
+        plan: &PlanId,
+        actions: Vec<PlanAction>,
+        actor: &str,
+        expected_rev: RevisionId,
+    ) -> PlanResult<PlanRevision> {
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|_| PlanError::Io(std::io::Error::other("RwLock vergiftet")))?;
+        self.config.require_enabled().map_err(PlanError::Config)?;
+
+        let current = check_batch_target(inner.plan.as_ref(), plan, expected_rev)?;
+        if actions.is_empty() {
+            return Ok(PlanRevision {
+                revision: current.revision,
+                events: Vec::new(),
+            });
+        }
+
+        let now = OffsetDateTime::now_utc();
+        let first_revision = inner.next_revision;
+        let (candidate, events) = stage_actions(
+            current,
+            actions,
+            actor,
+            &self.config,
+            first_revision,
+            now,
+        )
+        .map_err(|(index, source)| PlanError::BatchActionRejected {
+            index,
+            source: Box::new(source),
+        })?;
+
+        let revision = candidate.revision;
+        inner.plan = Some(candidate);
+        inner.next_revision = revision.next();
+        inner.history.extend(events.iter().cloned());
+        info!(
+            plan_id = %plan,
+            revision = %revision,
+            count = events.len(),
+            actor = actor,
+            "Batch atomar angewendet"
+        );
+        Ok(PlanRevision { revision, events })
     }
 
     fn history(&self, since: Option<RevisionId>) -> PlanResult<Vec<PlanEvent>> {
@@ -447,5 +493,239 @@ mod tests {
         assert_eq!(store.current().unwrap().nodes.len(), 1);
         assert_eq!(store.revision(), RevisionId::new(2));
         assert_eq!(store.history(None).unwrap().len(), 2);
+    }
+
+    // ── apply_batch ───────────────────────────────────────────────────────
+
+    fn set_status(id: &str, status: PlanNodeStatus) -> PlanAction {
+        PlanAction::SetStatus {
+            id: TaskId::new(id),
+            status,
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn test_apply_batch_applies_all_actions_with_sequential_revisions() {
+        let store = InMemoryPlanStore::new();
+        create_plan(&store);
+        let before = store.revision();
+
+        let result = store
+            .apply_batch(
+                &PlanId::new("p-test"),
+                vec![
+                    PlanAction::AddNode {
+                        node: make_node("explore"),
+                    },
+                    PlanAction::AddNode {
+                        node: make_node("impl"),
+                    },
+                    PlanAction::AddDependency {
+                        child: TaskId::new("impl"),
+                        parent: TaskId::new("explore"),
+                    },
+                ],
+                "controller",
+                before,
+            )
+            .unwrap();
+
+        assert_eq!(result.events.len(), 3);
+        assert_eq!(result.revision, RevisionId::new(before.value() + 3));
+        let revisions: Vec<u64> = result.events.iter().map(|e| e.revision.value()).collect();
+        assert_eq!(revisions, vec![2, 3, 4]);
+        assert_eq!(store.revision(), result.revision);
+        let plan = store.current().unwrap();
+        assert_eq!(plan.nodes.len(), 2);
+        assert_eq!(plan.nodes[1].dependencies, vec![TaskId::new("explore")]);
+        assert_eq!(store.history(None).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn test_apply_batch_failure_in_third_action_changes_nothing() {
+        let store = InMemoryPlanStore::new();
+        create_plan(&store);
+        let before = store.revision();
+
+        let result = store.apply_batch(
+            &PlanId::new("p-test"),
+            vec![
+                PlanAction::AddNode {
+                    node: make_node("t1"),
+                },
+                set_status("t1", PlanNodeStatus::Ready),
+                // Ready → Completed ist nicht in der Matrix.
+                set_status("t1", PlanNodeStatus::Completed),
+            ],
+            "controller",
+            before,
+        );
+
+        assert!(
+            matches!(
+                &result,
+                Err(PlanError::BatchActionRejected { index: 2, source })
+                    if matches!(**source, PlanError::IllegalTransition { .. })
+            ),
+            "Ergebnis: {result:?}"
+        );
+        assert!(store.current().unwrap().nodes.is_empty(), "nichts angewendet");
+        assert_eq!(store.revision(), before);
+        assert_eq!(store.history(None).unwrap().len(), 1);
+
+        // Die Revisionsvergabe ist nicht vorgerückt.
+        let event = store
+            .apply(PlanAction::AddNode { node: make_node("t1") }, "a")
+            .unwrap();
+        assert_eq!(event.revision, RevisionId::new(2));
+    }
+
+    #[test]
+    fn test_apply_batch_revision_conflict_changes_nothing() {
+        let store = InMemoryPlanStore::new();
+        create_plan(&store);
+        store
+            .apply(PlanAction::AddNode { node: make_node("t1") }, "a")
+            .unwrap();
+
+        let result = store.apply_batch(
+            &PlanId::new("p-test"),
+            vec![PlanAction::AddNode {
+                node: make_node("t2"),
+            }],
+            "controller",
+            RevisionId::new(1),
+        );
+
+        assert!(
+            matches!(
+                &result,
+                Err(PlanError::RevisionConflict { expected, actual, .. })
+                    if *expected == RevisionId::new(1) && *actual == RevisionId::new(2)
+            ),
+            "Ergebnis: {result:?}"
+        );
+        assert_eq!(store.current().unwrap().nodes.len(), 1);
+    }
+
+    #[test]
+    fn test_apply_batch_other_plan_id_is_plan_not_found() {
+        let store = InMemoryPlanStore::new();
+        create_plan(&store);
+
+        let result = store.apply_batch(
+            &PlanId::new("p-other"),
+            vec![PlanAction::Inspect],
+            "controller",
+            store.revision(),
+        );
+
+        assert!(matches!(result, Err(PlanError::PlanNotFound)));
+        assert_eq!(store.history(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_apply_batch_rejects_create_inside_batch() {
+        let store = InMemoryPlanStore::new();
+        create_plan(&store);
+
+        let result = store.apply_batch(
+            &PlanId::new("p-test"),
+            vec![PlanAction::Create {
+                plan_id: PlanId::new("p-neu"),
+                goal: "x".to_owned(),
+            }],
+            "controller",
+            store.revision(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(PlanError::BatchActionRejected { index: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn test_apply_batch_enforces_node_limit_with_running_count() {
+        let store = InMemoryPlanStore::with_config(config_with_max_nodes(1)).unwrap();
+        create_plan(&store);
+
+        let result = store.apply_batch(
+            &PlanId::new("p-test"),
+            vec![
+                PlanAction::AddNode {
+                    node: make_node("t1"),
+                },
+                PlanAction::AddNode {
+                    node: make_node("t2"),
+                },
+            ],
+            "controller",
+            store.revision(),
+        );
+
+        assert!(
+            matches!(
+                &result,
+                Err(PlanError::BatchActionRejected { index: 1, source })
+                    if matches!(
+                        **source,
+                        PlanError::Config(PlanToolConfigError::NodeLimitExceeded { .. })
+                    )
+            ),
+            "Ergebnis: {result:?}"
+        );
+        assert!(store.current().unwrap().nodes.is_empty());
+    }
+
+    #[test]
+    fn test_apply_batch_empty_is_noop() {
+        let store = InMemoryPlanStore::new();
+        create_plan(&store);
+
+        let result = store
+            .apply_batch(&PlanId::new("p-test"), Vec::new(), "c", store.revision())
+            .unwrap();
+
+        assert!(result.events.is_empty());
+        assert_eq!(result.revision, RevisionId::new(1));
+        assert_eq!(store.history(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_create_rejects_traversal_plan_id() {
+        let store = InMemoryPlanStore::new();
+
+        let result = store.apply(
+            PlanAction::Create {
+                plan_id: PlanId::new("../escape"),
+                goal: "x".to_owned(),
+            },
+            "orchestrator",
+        );
+
+        assert!(matches!(
+            result,
+            Err(PlanError::InvalidId { field: "PlanId", .. })
+        ));
+        assert!(matches!(store.current(), Err(PlanError::PlanNotFound)));
+    }
+
+    #[test]
+    fn test_bind_goal_sets_goal_id_through_store() {
+        let store = InMemoryPlanStore::new();
+        create_plan(&store);
+
+        store
+            .apply(
+                PlanAction::BindGoal {
+                    goal_id: "g-1".to_owned(),
+                },
+                "human:mia",
+            )
+            .unwrap();
+
+        assert_eq!(store.current().unwrap().goal_id.as_deref(), Some("g-1"));
     }
 }

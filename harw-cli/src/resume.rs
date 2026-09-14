@@ -11,10 +11,11 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+use harw_session_store::meta::{self, SessionMeta};
 use harw_types::SessionId;
 
 /// A durable transcript discovered beneath a sessions directory.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DiscoveredSession {
     /// Validated session ID derived from the transcript filename stem.
     pub id: SessionId,
@@ -22,6 +23,13 @@ pub struct DiscoveredSession {
     pub path: PathBuf,
     /// Filesystem modification time used for newest-first ordering.
     pub modified_at: SystemTime,
+    /// Sitzungs-Metadaten-Sidecar (Schritt 7, `harw_session_store::meta`).
+    ///
+    /// `None`, wenn weder ein gültiger Sidecar existiert noch aus dem
+    /// Transcript abgeleitet werden konnte (z. B. defekter Datensatz); die
+    /// Session wird in diesem Fall trotzdem gelistet, nur ohne Titel,
+    /// Projekt-Zuordnung oder Turn-Zahl (siehe [`discover_sessions`]).
+    pub meta: Option<SessionMeta>,
 }
 
 /// Errors produced while discovering or selecting durable transcripts.
@@ -143,10 +151,26 @@ pub fn discover_sessions(sessions_dir: &Path) -> ResumeResult<Vec<DiscoveredSess
             source,
         })?;
 
+        // Ein fehlender oder defekter Sidecar darf die Session nicht aus der
+        // Liste werfen (Schritt 7: "Fehler → warn! und Eintrag trotzdem
+        // listen") — nur Titel, Projekt-Zuordnung und Turn-Zahl fehlen dann.
+        let meta = match meta::load_or_derive(sessions_dir, &id) {
+            Ok(meta) => Some(meta),
+            Err(error) => {
+                tracing::warn!(
+                    session = %id,
+                    %error,
+                    "resume: Sitzungs-Metadaten konnten nicht geladen/abgeleitet werden"
+                );
+                None
+            }
+        };
+
         sessions.push(DiscoveredSession {
             id,
             path,
             modified_at,
+            meta,
         });
     }
 
@@ -207,6 +231,14 @@ fn discover_and_resolve_session(sessions_dir: &Path, selector: &str) -> ResumeRe
 /// A blank line and EOF both cancel cleanly (`Ok(None)`). The input-independent
 /// decision logic lives in [`resolve_interactive_selection`] for focused tests
 /// and for alternate CLI front ends.
+///
+/// # Rolle seit Schritt 7
+/// `harw -r` ohne Wert nutzt für ein vorhandenes Terminal den TUI-Picker
+/// (`harw_tui::runtime_root::session_entries` über
+/// `harw_tui::session_picker::SessionPicker`, verdrahtet in `chat.rs`).
+/// Diese Funktion bleibt nur noch der Fallback,
+/// wenn `stdin`/`stdout` kein Terminal sind (z. B. Pipes, nicht-interaktive
+/// Tests) — dort ist kein Vollbild-Picker möglich.
 pub fn prompt_for_session<R: BufRead, W: Write>(
     sessions: &[DiscoveredSession],
     input: &mut R,
@@ -271,11 +303,41 @@ pub fn resolve_interactive_selection(
 
 fn sort_sessions(sessions: &mut [DiscoveredSession]) {
     sessions.sort_by(|left, right| {
-        right
-            .modified_at
-            .cmp(&left.modified_at)
+        effective_last_active(right)
+            .cmp(&effective_last_active(left))
             .then_with(|| left.id.as_str().cmp(right.id.as_str()))
     });
+}
+
+/// Der für Sortierung und Anzeige maßgebliche "zuletzt aktiv"-Zeitpunkt: der
+/// Sidecar-Wert `meta.last_opened_at`, falls vorhanden, sonst die
+/// Transcript-`mtime` (Schritt 7: "Sortierung neu: nach
+/// `meta.last_opened_at`, Fallback mtime").
+fn effective_last_active(session: &DiscoveredSession) -> SystemTime {
+    session
+        .meta
+        .as_ref()
+        .map(|meta| SystemTime::from(meta.last_opened_at))
+        .unwrap_or(session.modified_at)
+}
+
+/// Prüft, ob eine entdeckte Session zum aktuellen Projekt gehört.
+///
+/// # Beschreibung
+/// Vergleicht `session.meta.project_key` mit `current_project_key`; beide
+/// `None` gelten als Treffer (eine Session ohne Projekt-Zuordnung erscheint
+/// dann nur, wenn auch das aktuelle Arbeitsverzeichnis keinem Projekt
+/// zugeordnet werden konnte). Wird von `ProfileResumeSelector::available_sessions`
+/// (`chat.rs`) sowie vom Non-TTY-Fallback in `chat.rs` verwendet, damit beide
+/// Auswahlwege denselben Projektfilter anwenden (Contract §4: "`harw -r`
+/// zeigt standardmäßig die Sessions des aktuellen Projekts").
+#[must_use]
+pub fn session_matches_project(session: &DiscoveredSession, current_project_key: Option<&str>) -> bool {
+    session
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.project_key.as_deref())
+        == current_project_key
 }
 
 fn output_error(source: std::io::Error) -> ResumeError {
@@ -296,6 +358,34 @@ mod tests {
             id: SessionId::try_from(id.to_owned()).expect("test session ID is valid"),
             path: PathBuf::from(format!("{id}.jsonl")),
             modified_at: SystemTime::UNIX_EPOCH + Duration::from_secs(modified_after_epoch),
+            meta: None,
+        }
+    }
+
+    fn session_with_meta(id: &str, modified_after_epoch: u64, meta: SessionMeta) -> DiscoveredSession {
+        DiscoveredSession {
+            meta: Some(meta),
+            ..session(id, modified_after_epoch)
+        }
+    }
+
+    fn fresh_meta(id: &str) -> SessionMeta {
+        meta_at(id, jiff::Timestamp::now())
+    }
+
+    fn meta_at(id: &str, last_opened_at: jiff::Timestamp) -> SessionMeta {
+        SessionMeta {
+            version: harw_session_store::meta::SESSION_META_VERSION,
+            session_id: SessionId::try_from(id.to_owned()).expect("test session ID is valid"),
+            title: None,
+            title_source: harw_session_store::meta::TitleSource::None,
+            created_at: last_opened_at,
+            last_opened_at,
+            cwd: None,
+            project_root: None,
+            project_key: None,
+            first_user_message: None,
+            turns: 0,
         }
     }
 
@@ -425,5 +515,50 @@ mod tests {
                 .expect("picker output is utf-8")
                 .contains("alpha-111")
         );
+    }
+
+    // -- Schritt 7: Sortierung nach `meta.last_opened_at` ----------------
+
+    #[test]
+    fn sort_prefers_meta_last_opened_at_over_stale_mtime() {
+        // `older` hat die neuere `mtime`, aber der Sidecar sagt, sie wurde
+        // vor langer Zeit zuletzt geöffnet — `newer` ist im Sidecar frischer,
+        // trotz älterer `mtime`. Die Sortierung muss dem Sidecar folgen.
+        let long_ago = jiff::Timestamp::UNIX_EPOCH;
+        let just_now = jiff::Timestamp::now();
+        let older = session_with_meta("older-by-meta", 1_000, meta_at("older-by-meta", long_ago));
+        let newer = session_with_meta("newer-by-meta", 10, meta_at("newer-by-meta", just_now));
+
+        let mut sessions = vec![older, newer];
+        sort_sessions(&mut sessions);
+
+        assert_eq!(sessions[0].id.as_str(), "newer-by-meta");
+        assert_eq!(sessions[1].id.as_str(), "older-by-meta");
+    }
+
+    #[test]
+    fn sort_falls_back_to_mtime_without_meta() {
+        let mut sessions = vec![session("old", 10), session("new", 20)];
+        sort_sessions(&mut sessions);
+
+        assert_eq!(sessions[0].id.as_str(), "new");
+        assert_eq!(sessions[1].id.as_str(), "old");
+    }
+
+    // -- Schritt 7: Projektfilter -----------------------------------------
+    //
+    // `session_entries`/`session_entry` samt `~`-Pfadkürzung wurden entfernt
+    // (Duplikat ohne Aufrufer, siehe Modul-Kommentar zu
+    // [`session_matches_project`]); der Projektfilter selbst bleibt, da ihn
+    // `ProfileResumeSelector::available_sessions` (`chat.rs`) weiterhin nutzt.
+
+    #[test]
+    fn session_matches_project_treats_both_none_as_a_match() {
+        let session_without_project = session_with_meta("x", 1, fresh_meta("x"));
+        assert!(session_matches_project(&session_without_project, None));
+        assert!(!session_matches_project(
+            &session_without_project,
+            Some("harwness-abc123")
+        ));
     }
 }

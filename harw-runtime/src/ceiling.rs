@@ -10,7 +10,8 @@
 //! - `harw-cli/src/root_context.rs:62-143` (`local_root_context_ceiling`):
 //!   vier Sektionen (`task.objective`, `task.read_scope`,
 //!   `new.trigger_return`, `history.tail`), `max_trust = Instruction`,
-//!   Gesamtbudget `1_000_000`.
+//!   Gesamtbudget `1_000_000`. Diese Datei ist seit W2d-2 entfernt; ihre
+//!   Wurzeldecke lebt seither ausschließlich hier in dieser Datei.
 //! - `harw-tui/src/app.rs:1364` (`local_tui_root_context_ceiling`): nur
 //!   `history.tail`, ansonsten identisch.
 //!
@@ -18,21 +19,36 @@
 //! Decken: eine TUI-Sitzung wies Kontextprogramme der eingebauten Rollen ab,
 //! die in der CLI zugelassen waren. [`root_ceiling`] ist ab W2b die eine
 //! Wurzeldecke; die weitere der beiden Fassungen (die CLI-Fassung) ist die
-//! richtige — ihre vier Sektionen sind einzeln begründet, siehe die
-//! Konstante `LOCAL_ROOT_SECTIONS` unten.
+//! richtige — ihre Sektionen sind einzeln begründet, siehe
+//! [`harw_context::ceiling::ROOT_CONTEXT_SECTIONS`].
+//!
+//! **Seit C-PROTO-RT (W3):** die Sektionsliste dieser Datei war ein
+//! crate-privates Duplikat (`LOCAL_ROOT_SECTIONS`, vier Sektionen ohne
+//! `legacy.v1`) der Liste, die `harw-context` unter
+//! [`harw_context::ceiling::ROOT_CONTEXT_SECTIONS`] als die eine Quelle
+//! führt (F-163: die v1-Brücke stempelte jedes gebrückte Fragment mit
+//! `legacy.v1`, keine Wurzeldecke enthielt diese Sektion, jedes v1-Fragment
+//! wurde in Kindsitzungen als `BelowCeiling` verworfen). [`root_ceiling`]
+//! bezieht die Sektionen jetzt aus `harw-context`; die Duplizierung ist
+//! behoben, `legacy.v1` ist ab hier Teil jeder lokal-vertrauten Wurzeldecke.
 //!
 //! # Bekannte Lücke
 //! Nur [`harw_core::HISTORY_TAIL_SECTION`] ist über Crate-Grenzen hinweg als
 //! öffentliche Konstante erreichbar; die Sektionsnamen der übrigen
 //! Kontext-Provider (`harw-memory`, `harw-plan-bridge`, …) sind crate-privat
-//! und stehen deshalb als String-Literale hier. Werden sie öffentlich,
-//! gehören sie hier ergänzt — eine dokumentierte, keine übersehene Lücke.
+//! und stehen deshalb als String-Literale in
+//! [`harw_context::ceiling::ROOT_CONTEXT_SECTIONS`]. Werden sie öffentlich,
+//! gehören sie dort ergänzt — eine dokumentierte, keine übersehene Lücke.
 //!
 //! # Fehler
-//! Keine: beide Decken entstehen aus Konstanten dieser Datei.
+//! Keine: die lokal-vertraute Decke entsteht aus
+//! [`harw_context::ceiling::ROOT_CONTEXT_SECTIONS`] und
+//! `LOCAL_ROOT_BUDGET_TOTAL`, die geschlossene Decke aus Literalen dieser
+//! Funktion.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use harw_context::ceiling::ROOT_CONTEXT_SECTIONS;
 use harw_context::{ContextBudgetSpec, ContextCeiling, SectionName, TrustClass};
 
 use crate::spec::CeilingPolicy;
@@ -40,8 +56,9 @@ use crate::spec::CeilingPolicy;
 /// Gesamtbudget der lokal-vertrauten Wurzeldecke.
 ///
 /// # Beschreibung
-/// Übernommen aus `harw-cli/src/root_context.rs` (`LOCAL_ROOT_BUDGET_TOTAL`)
-/// und `harw-tui/src/app.rs:1364`, die beide `1_000_000` führten. Kein
+/// Übernommen aus `harw-cli/src/root_context.rs` (`LOCAL_ROOT_BUDGET_TOTAL`,
+/// entfernt in W2d-2) und `harw-tui/src/app.rs:1364`, die beide `1_000_000`
+/// führten. Kein
 /// `u32::MAX`, damit nachgelagerte Summen (etwa
 /// [`ContextBudgetSpec::tighten`]) nicht überlaufen; groß genug, dass ein
 /// lokaler Lauf in der Praxis nie anschlägt.
@@ -53,41 +70,13 @@ use crate::spec::CeilingPolicy;
 /// aktiven Modells ab und ersetzt diese Konstante.
 const LOCAL_ROOT_BUDGET_TOTAL: u32 = 1_000_000;
 
-/// Die Sektionen, die eine lokal-vertraute Wurzelsitzung ihren Kindern
-/// höchstens zugänglich machen darf.
-///
-/// # Beschreibung
-/// Eine Obergrenze, keine Wunschliste (Begründungen wörtlich aus
-/// `harw-cli/src/root_context.rs`):
-///
-/// - `task.objective`: der Auftrag selbst. Eine Decke, die ihn ausschließt,
-///   schließt jedes Kind aus. Er stammt vom Elternteil, ist also keine
-///   Rechteausweitung.
-/// - `task.read_scope`: die Lesegrenze, die der Aufrufer dem Kind setzt — eine
-///   übermittelte *Einschränkung*. Ein Kind, das seine Grenze nicht kennt,
-///   kann sie nicht einhalten.
-/// - `new.trigger_return`: das Rückgabeprotokoll aus `worker-base.toml`. Ohne
-///   es endet ein Worker nur über Timeout oder Abbruch. Reine
-///   Ablaufinformation.
-/// - `history.tail`: der bisherige Bestand, unverändert (die einzige Sektion
-///   der TUI-Fassung).
-///
-/// Bewusst **nicht** enthalten: `credential.*`, `secret.*`,
-/// `full_parent_transcript`, `sibling_transcripts`, `plan.current`,
-/// `web.fetch_allowlist`, `knowledge.candidates`, `diff.changeset` und jede
-/// weitere Provider-Sektion.
-const LOCAL_ROOT_SECTIONS: [&str; 4] = [
-    "task.objective",
-    "task.read_scope",
-    "new.trigger_return",
-    harw_core::HISTORY_TAIL_SECTION,
-];
-
 /// Baut die Wurzel-Kontext-Decke einer Politik.
 ///
 /// # Beschreibung
 /// [`CeilingPolicy::LocalRoot`] liefert die eine lokal-vertraute Wurzeldecke
-/// (siehe Moduldoku): `LOCAL_ROOT_SECTIONS` (siehe dort), `max_trust` =
+/// (siehe Moduldoku): [`harw_context::ceiling::ROOT_CONTEXT_SECTIONS`]
+/// (Sektionen einzeln begründet dort, seit C-PROTO-RT die eine Quelle statt
+/// eines crate-privaten Duplikats — F-163), `max_trust` =
 /// [`TrustClass::Instruction`] (höchster Rang, damit kein Fragment allein
 /// wegen seiner Vertrauensklasse abgewiesen wird — ein lokaler Operator mit
 /// `{R, W, X}` ist nicht weniger vertrauenswürdig als das restriktivste
@@ -118,13 +107,16 @@ pub fn root_ceiling(policy: CeilingPolicy) -> ContextCeiling {
     match policy {
         CeilingPolicy::LocalRoot => ContextCeiling {
             // Ein einzelnes `expect` über alle Namen statt eines je Name: die
-            // Literale sind konstant und nicht leer, ein Fehlschlag wäre ein
-            // Tippfehler in dieser Datei, kein Laufzeitzustand.
-            sections: LOCAL_ROOT_SECTIONS
-                .into_iter()
+            // Literale sind konstant und nicht leer (harw-context prüft dies
+            // selbst in `test_root_context_sections_are_valid_unique_and_contain_legacy_v1`);
+            // ein Fehlschlag hier wäre ein Vertragsbruch von `harw-context`,
+            // kein Laufzeitzustand dieser Datei.
+            sections: ROOT_CONTEXT_SECTIONS
+                .iter()
+                .copied()
                 .map(SectionName::try_new)
                 .collect::<Result<_, _>>()
-                .expect("LOCAL_ROOT_SECTIONS are valid section names by construction"),
+                .expect("ROOT_CONTEXT_SECTIONS are valid section names by construction"),
             max_trust: TrustClass::Instruction,
             budget: ContextBudgetSpec {
                 total: harw_lens_types::BudgetSpec {
@@ -177,8 +169,16 @@ mod tests {
     }
 
     #[test]
-    fn local_root_ceiling_carries_history_tail_and_the_three_task_sections() {
+    fn local_root_ceiling_carries_exactly_root_context_sections_including_legacy_v1() {
         let ceiling = root_ceiling(CeilingPolicy::LocalRoot);
+        let expected: BTreeSet<SectionName> =
+            ROOT_CONTEXT_SECTIONS.iter().map(|name| section(name)).collect();
+        assert_eq!(ceiling.sections, expected);
+        assert!(
+            ceiling
+                .sections
+                .contains(&section(harw_context::ceiling::LEGACY_V1_SECTION))
+        );
         assert!(
             ceiling
                 .sections
@@ -187,7 +187,7 @@ mod tests {
         for name in ["task.objective", "task.read_scope", "new.trigger_return"] {
             assert!(ceiling.sections.contains(&section(name)), "{name}");
         }
-        assert_eq!(ceiling.sections.len(), LOCAL_ROOT_SECTIONS.len());
+        assert_eq!(ceiling.sections.len(), ROOT_CONTEXT_SECTIONS.len());
         assert_eq!(ceiling.max_trust, TrustClass::Instruction);
         assert_eq!(ceiling.budget.total.total, LOCAL_ROOT_BUDGET_TOTAL);
     }

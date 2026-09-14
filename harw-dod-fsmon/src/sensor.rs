@@ -19,7 +19,12 @@
 //!
 //! # Fehler
 //! [`harw_dod_cap::SensorError`], gebildet aus
-//! [`crate::error::FsMonError`] über dessen `From`-Implementierung.
+//! [`crate::error::FsMonError`] über dessen `From`-Implementierung — nur für
+//! Fehler beim Lesen der zugrunde liegenden Ereignisquelle selbst
+//! ([`crate::raw::FsEventSource::read_events`]). Ein einzelnes Ereignis mit
+//! nicht interpretierbarer Maske lässt [`FsMonSensor::poll`] seit dieser
+//! Korrektur nicht mehr scheitern — es wird übersprungen, siehe dortige
+//! Dokumentation.
 //!
 //! # Examples
 //! ```rust
@@ -131,14 +136,40 @@ impl Sensor for FsMonSensor {
         &self.handle
     }
 
+    /// Liest eine Charge roher Ereignisse und formt jedes einzeln.
+    ///
+    /// # Description
+    /// Ein einzelnes Ereignis, dessen Maske [`crate::mask::interpret_mask`]
+    /// nicht deuten kann (z. B. `FAN_ACCESS`/`FAN_OPEN` — laut
+    /// `crate::mask`-Moduldoku bewusst nicht interpretierbar, aber je nach
+    /// `fanotify`-Markierung des Bindungsteils durchaus lieferbar), lässt den
+    /// **gesamten** Abruf nicht mehr scheitern: es wird übersprungen, die
+    /// übrigen Ereignisse derselben Charge werden trotzdem geformt und
+    /// gemeldet. `shape_event` kann innerhalb dieser Schleife ausschließlich
+    /// [`crate::error::FsMonError::MalformedSource`] liefern — Lese- oder
+    /// E/A-Fehler der Quelle selbst entstehen bereits beim vorangehenden
+    /// `read_events`-Aufruf und werden dort weiterhin über `?` propagiert.
+    /// Vorher hätte ein einzelnes, gewöhnliches Lese-/Öffnen-Ereignis
+    /// irgendeines beobachteten Prozesses alle anderen, gültig geformten
+    /// Schreibereignisse desselben Abrufs mit verworfen.
+    ///
+    /// # Errors
+    /// [`SensorError`], wenn [`crate::raw::FsEventSource::read_events`]
+    /// selbst scheitert. Eine einzelne nicht interpretierbare Ereignisform
+    /// lässt diesen Abruf nicht mehr scheitern (siehe oben).
     fn poll(&self, now: Timestamp) -> Result<SensorReading, SensorError> {
         let raw_events = self.source.read_events(POLL_TIMEOUT)?;
 
         let mut events = Vec::with_capacity(raw_events.len());
         for raw in &raw_events {
-            let shaped = shape_event(raw, self.handle.scope(), &self.proc_root, self.handle.id(), now)?;
-            if let Some(event) = shaped {
-                events.push(event);
+            match shape_event(raw, self.handle.scope(), &self.proc_root, self.handle.id(), now) {
+                Ok(Some(event)) => events.push(event),
+                Ok(None) => {}
+                Err(_) => {
+                    // Nicht interpretierbare Einzelform (siehe Doku oben) —
+                    // überspringen statt den gesamten Abruf scheitern zu
+                    // lassen.
+                }
             }
         }
 
@@ -209,8 +240,11 @@ mod tests {
         assert!(reading.events.is_empty());
     }
 
+    /// Vor dieser Korrektur ließ ein einzelnes nicht interpretierbares
+    /// Ereignis den gesamten Abruf scheitern — jetzt wird es stillschweigend
+    /// übersprungen, ohne dass `poll` einen Fehler zurückgibt.
     #[test]
-    fn test_poll_propagates_malformed_source_as_sensor_error() {
+    fn test_poll_skips_unrecognized_event_shape_instead_of_failing() {
         let scope = ReadScope::from_roots([Path::new("/srv/data").to_path_buf()]);
         let source = FixtureFsEventSource::new(vec![RawFsEvent {
             mask: 0x01, // FAN_ACCESS: kein Schreibzugriff, nicht interpretierbar
@@ -220,11 +254,45 @@ mod tests {
         }]);
         let sensor = FsMonSensor::new(handle_for(scope), Box::new(source), PathBuf::from("/proc"));
 
-        let err = sensor
+        let reading = sensor
             .poll(Timestamp::UNIX_EPOCH)
-            .expect_err("unerwartete Ereignisform muss scheitern");
+            .expect("eine einzelne nicht interpretierbare Ereignisform darf den Abruf nicht scheitern lassen");
 
-        assert!(matches!(err, harw_dod_cap::SensorError::MalformedSource));
+        assert!(reading.events.is_empty());
+    }
+
+    /// Kernbeleg der Korrektur: ein nicht interpretierbares Ereignis darf
+    /// nicht auch die anderen, gültig geformten Ereignisse derselben Charge
+    /// mit verwerfen.
+    #[test]
+    fn test_poll_reports_valid_event_alongside_a_skipped_unrecognized_one() {
+        let scope = ReadScope::from_roots([Path::new("/srv/data").to_path_buf()]);
+        let source = FixtureFsEventSource::new(vec![
+            RawFsEvent {
+                mask: 0x01, // FAN_ACCESS: nicht interpretierbar, wird übersprungen
+                pid: 1,
+                uid: 0,
+                fd_target: "/srv/data/other.csv".to_owned(),
+            },
+            RawFsEvent {
+                mask: 0x08, // FAN_CLOSE_WRITE: gültig
+                pid: 2,
+                uid: 0,
+                fd_target: "/srv/data/report.csv".to_owned(),
+            },
+        ]);
+        let sensor = FsMonSensor::new(handle_for(scope), Box::new(source), PathBuf::from("/proc"));
+
+        let reading = sensor
+            .poll(Timestamp::UNIX_EPOCH)
+            .expect("das gültige Ereignis darf den Abruf nicht scheitern lassen");
+
+        assert_eq!(
+            reading.events.len(),
+            1,
+            "genau das gültige Ereignis muss ankommen, das übersprungene nicht"
+        );
+        assert!(matches!(reading.events[0].kind, EventKind::FileWrite { .. }));
     }
 
     #[test]

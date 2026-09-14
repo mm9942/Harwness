@@ -450,7 +450,7 @@ pub fn project_trust_status(home: &Path, root: &Path) -> HomeResult<TrustStatus>
 ///   oder Sondertyp, eine Einzeldatei aus [`TRUST_DIGEST_FILES`] ist keine
 ///   reguläre Datei, ein Eintrag aus [`TRUST_DIGEST_DIRS`] kein Verzeichnis,
 ///   oder Größen-/Tiefen-/Anzahl-/Zeitgrenzen sind überschritten.
-/// - [`HomeError::Io`]: Lesefehler.
+/// - [`HomeError::Io`][]: Lesefehler.
 pub fn project_digest(root: &Path) -> HomeResult<String> {
     let harw_dir = root.join(HOME_DIR_NAME);
     let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();

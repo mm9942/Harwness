@@ -246,9 +246,9 @@ fn build_grouped_help<'a>(
     command(path = "/help", visibility = "channel_parity"),
     // Web-Fläche: reine Auflistung der registrierten Commands, kein
     // Seiteneffekt möglich (die Operation liest nur `ctx.registry()` und
-    // formatiert Text) — deshalb `readonly`. `approval = "none"`, weil ein
-    // rein lesender Aufruf keine Bestätigung braucht.
-    web(path = "/api/help", readonly, approval = "none")
+    // formatiert Text) — deshalb `method = "get"`. `approval = "none"`, weil
+    // ein rein lesender Aufruf keine Bestätigung braucht.
+    web(path = "/api/help", method = "get", approval = "none")
 )]
 async fn help(ctx: &OpContext, args: HelpArgs) -> Result<OpOutput, OpError> {
     let registry = ctx
@@ -259,7 +259,7 @@ async fn help(ctx: &OpContext, args: HelpArgs) -> Result<OpOutput, OpError> {
 
     let text = build_grouped_help(registry.iter(), filter_lower.as_deref());
 
-    Ok(OpOutput { text })
+    Ok(OpOutput::from(text))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -307,15 +307,12 @@ mod tests {
                     aliases: self.aliases,
                     category: self.category,
                     args_schema: None,
+                    output_schema: None,
                 }))
             }
 
             fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
-                Box::pin(async {
-                    Ok(OpOutput {
-                        text: String::new(),
-                    })
-                })
+                Box::pin(async { Ok(OpOutput::from(String::new())) })
             }
         }
 

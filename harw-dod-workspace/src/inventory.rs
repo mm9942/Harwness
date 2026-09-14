@@ -20,12 +20,40 @@
 //!   gleich ob auf ein anderes Member oder auf eine externe Crate — ist die
 //!   architektonisch relevante Kante, nicht nur "diese Abhängigkeit existiert
 //!   irgendwo im Workspace".
-//! - `dependency_versions`: die gesperrte Version jeder Nicht-Member-
-//!   Abhängigkeit aus `Cargo.lock`. `Cargo.lock` enthält den **gesamten**
-//!   transitiven Abhängigkeitsbaum, nicht nur direkte Abhängigkeiten — genau
-//!   das macht diesen Sensor nützlich, denn laut Aufgabenstellung ist eine
-//!   neue *transitive* Abhängigkeit der häufigste Weg, auf dem fremder Code
-//!   in ein Projekt gelangt.
+//! - `dependency_versions`: **alle** gleichzeitig gesperrten Versionen jeder
+//!   Nicht-Member-Abhängigkeit aus `Cargo.lock`, je Version mit Herkunft
+//!   (`source`) und Prüfsumme (`checksum`). `Cargo.lock` enthält den
+//!   **gesamten** transitiven Abhängigkeitsbaum, nicht nur direkte
+//!   Abhängigkeiten — genau das macht diesen Sensor nützlich, denn laut
+//!   Aufgabenstellung ist eine neue *transitive* Abhängigkeit der häufigste
+//!   Weg, auf dem fremder Code in ein Projekt gelangt.
+//!
+//! # F-096/F-097: warum eine Version allein nicht reicht (Register
+//! `x-findings-register-w1-w3.md`)
+//! Vor dieser Korrektur war dieses Feld `BTreeMap<String, String>` — ein
+//! einziger Versions-String je Abhängigkeitsname. Das hatte zwei blinde
+//! Flecken:
+//! - **F-097**: `Cargo.lock` kann *mehrere* Versionen derselben Abhängigkeit
+//!   gleichzeitig sperren (unversöhnliche SemVer-Anforderungen im
+//!   Abhängigkeitsbaum sind der Normalfall, kein Fehlerzustand). Eine
+//!   `BTreeMap<name, version>` behält beim Einfügen nur die zuletzt
+//!   gesehene — jede zusätzliche, unter Umständen ältere und verwundbare
+//!   Version verschwand kommentarlos.
+//! - **F-096**: `harw_code_graph::LockedPackage` trägt `source` und
+//!   `checksum`, aber nur `version` wanderte je Eintrag ins Inventar. Ein
+//!   Wechsel der Paketquelle (Registry → Git) oder eine geänderte Prüfsumme
+//!   **bei unveränderter Versionsnummer** blieb dadurch für [`Inventory::diff`]
+//!   unsichtbar — genau die Form, in der eine kompromittierte oder
+//!   nachträglich ausgetauschte Abhängigkeit auffiele, ohne dass die
+//!   Versionszeile sich ändert.
+//!
+//! `dependency_versions` ist deshalb jetzt `BTreeMap<String,
+//! BTreeSet<LockedDependency>>`: je Abhängigkeitsname die vollständige Menge
+//! ihrer gleichzeitig gesperrten `(version, source, checksum)`-Tripel. Siehe
+//! [`diff_versions`] für die daraus abgeleiteten [`StructureChange`]-Formen
+//! ([`StructureChange::DependencyVersionAdded`],
+//! [`StructureChange::DependencyVersionRemoved`],
+//! [`StructureChange::ProvenanceChanged`]).
 //!
 //! Bewusst außerhalb des Anwendungsbereichs: `[dev-dependencies]` und
 //! `[build-dependencies]`. Sie werden nicht ausgeliefert bzw. laufen nur zur
@@ -75,6 +103,37 @@ pub struct Edge {
     pub to: String,
 }
 
+/// Ein einzelner gesperrter Versionseintrag einer Nicht-Member-Abhängigkeit,
+/// mit Herkunft und Prüfsumme (F-096, F-097).
+///
+/// # Description
+/// Entspricht 1:1 einem `harw_code_graph::LockedPackage`-Eintrag ohne dessen
+/// `name` (der Name ist bereits der Schlüssel in
+/// [`Inventory::dependency_versions`]). `Ord` sortiert zuerst nach `version`,
+/// damit [`Inventory::dependency_versions`] (`BTreeSet<LockedDependency>` je
+/// Name) versionsaufsteigend iteriert — die Reihenfolge ist rein für
+/// Determinismus gedacht, keine SemVer-Sortierung.
+///
+/// # Warum ein `BTreeSet` statt einer `BTreeMap<Version, (Source, Checksum)>`
+/// `Cargo.lock` schließt zwei Einträge mit identischem `(name, version)` aber
+/// unterschiedlicher `source`/`checksum` nicht grundsätzlich aus (z. B. ein
+/// Registry- und ein Git-Eintrag mit zufällig gleicher Versionsnummer). Ein
+/// `BTreeSet<LockedDependency>` bildet auch diesen Randfall verlustfrei ab,
+/// statt einen der beiden Einträge beim Einfügen stillschweigend zu
+/// überschreiben — exakt der Fehler, den diese Korrektur behebt.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LockedDependency {
+    /// Die gesperrte Version.
+    pub version: String,
+    /// Die Herkunft (z. B. `registry+https://...` oder ein Git-Verweis);
+    /// `None` bei Path-Abhängigkeiten. Aus `harw_code_graph::LockedPackage::source`.
+    pub source: Option<String>,
+    /// Die Prüfsumme, falls im Lockfile vorhanden. Aus
+    /// `harw_code_graph::LockedPackage::checksum`.
+    pub checksum: Option<String>,
+}
+
 /// Wie stark ein Versionssprung laut SemVer die API bricht.
 ///
 /// # Description
@@ -108,13 +167,20 @@ pub enum VersionSeverity {
 /// Eine einzelne, konkrete Abweichung zwischen zwei [`Inventory`]-Ständen.
 ///
 /// # Description
-/// Von [`Inventory::diff`] erzeugt. Jede Variante entspricht einer der vier
-/// im Aufgabenzuschnitt genannten Drift-Formen: neue Abhängigkeit,
-/// Versionssprung, neue Kante, neues Member — plus `DependencyRemoved` für
-/// den symmetrischen Fall. Es gibt bewusst **kein** `MemberRemoved` und kein
-/// `EdgeRemoved`: das Verschwinden eines Members oder einer Kante ist keine
-/// neue Angriffsfläche und damit kein Sicherheitssignal in dem Sinn, den
-/// dieser Sensor beobachtet (Verkleinerung der Fläche ist nie das Risiko).
+/// Von [`Inventory::diff`] erzeugt. Neben den ursprünglichen Drift-Formen
+/// (neue Abhängigkeit, einfacher Versionssprung, neue Kante, neues Member,
+/// entfernte Abhängigkeit) trägt dieser Typ seit F-096/F-097 drei weitere
+/// Varianten für Fälle, die eine einzelne `(name, version)`-Zeile nicht
+/// abbilden kann: [`Self::DependencyVersionAdded`]/
+/// [`Self::DependencyVersionRemoved`] für zusätzliche, gleichzeitig gesperrte
+/// Versionen derselben Abhängigkeit, und [`Self::ProvenanceChanged`] für eine
+/// geänderte Herkunft/Prüfsumme **bei unveränderter** Version. Siehe
+/// [`diff_versions`] für die genaue Abgrenzung zu [`Self::VersionChanged`].
+///
+/// Es gibt bewusst **kein** `MemberRemoved` und kein `EdgeRemoved`: das
+/// Verschwinden eines Members oder einer Kante ist keine neue Angriffsfläche
+/// und damit kein Sicherheitssignal in dem Sinn, den dieser Sensor beobachtet
+/// (Verkleinerung der Fläche ist nie das Risiko).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case", tag = "change")]
 pub enum StructureChange {
@@ -123,12 +189,21 @@ pub enum StructureChange {
         /// Name der neu aufgetauchten Abhängigkeit.
         name: String,
     },
-    /// Eine zuvor vorhandene (Nicht-Member-)Abhängigkeit ist verschwunden.
+    /// Eine zuvor vorhandene (Nicht-Member-)Abhängigkeit ist vollständig
+    /// verschwunden (keine ihrer Versionen ist mehr gesperrt).
     DependencyRemoved {
         /// Name der entfernten Abhängigkeit.
         name: String,
     },
-    /// Die gesperrte Version einer Abhängigkeit hat sich geändert.
+    /// Die einzige gesperrte Version einer bereits bekannten Abhängigkeit hat
+    /// sich geändert: genau eine Version vorher, genau eine Version danach,
+    /// beide verschieden. Der häufigste, "einfache" Fall eines
+    /// Versions-Bumps.
+    ///
+    /// Trägt bewusst keine `source`/`checksum`-Felder — ein gleichzeitiger
+    /// Wechsel von Version **und** Herkunft bei ansonsten unverändertem
+    /// Bestand ist eine offene Annahme dieser Korrektur, siehe Ledger
+    /// `docs/remediation/ledger/W5/D-SEC.md`, Abschnitt „Offene Annahmen".
     VersionChanged {
         /// Name der betroffenen Abhängigkeit.
         name: String,
@@ -138,6 +213,53 @@ pub enum StructureChange {
         to: String,
         /// Schwere des Sprungs, siehe [`VersionSeverity`].
         severity: VersionSeverity,
+    },
+    /// Eine zusätzliche Version einer bereits bekannten Abhängigkeit ist
+    /// **gleichzeitig** mit mindestens einer weiteren Version dieser
+    /// Abhängigkeit gesperrt (F-097) — z. B. eine ältere, potenziell
+    /// verwundbare Version, die neben der aktuell genutzten im
+    /// Abhängigkeitsbaum verbleibt. Auch der Fall, in dem eine von mehreren
+    /// bereits gleichzeitig gesperrten Versionen durch eine andere ersetzt
+    /// wird, erzeugt dies (statt [`Self::VersionChanged`]) — siehe
+    /// [`diff_versions`] für die exakte Abgrenzung.
+    DependencyVersionAdded {
+        /// Name der betroffenen Abhängigkeit.
+        name: String,
+        /// Die neu aufgetauchte, zusätzlich gesperrte Version.
+        version: String,
+        /// Herkunft dieser Version, siehe [`LockedDependency::source`].
+        source: Option<String>,
+        /// Prüfsumme dieser Version, siehe [`LockedDependency::checksum`].
+        checksum: Option<String>,
+    },
+    /// Eine von mehreren gleichzeitig gesperrten Versionen einer
+    /// Abhängigkeit ist verschwunden, während mindestens eine andere Version
+    /// derselben Abhängigkeit weiterhin gesperrt bleibt (symmetrisch zu
+    /// [`Self::DependencyVersionAdded`]).
+    DependencyVersionRemoved {
+        /// Name der betroffenen Abhängigkeit.
+        name: String,
+        /// Die verschwundene Version.
+        version: String,
+    },
+    /// Herkunft und/oder Prüfsumme einer Abhängigkeit haben sich geändert,
+    /// **ohne** dass sich ihre Versionsnummer geändert hat (F-096) — z. B.
+    /// ein Wechsel der Paketquelle von Registry auf Git, oder eine geänderte
+    /// Prüfsumme bei einer nachträglich ausgetauschten Version.
+    ProvenanceChanged {
+        /// Name der betroffenen Abhängigkeit.
+        name: String,
+        /// Die unverändert gebliebene Version, bei der sich Herkunft
+        /// und/oder Prüfsumme geändert haben.
+        version: String,
+        /// Vorherige Herkunft.
+        from_source: Option<String>,
+        /// Neue Herkunft.
+        to_source: Option<String>,
+        /// Vorherige Prüfsumme.
+        from_checksum: Option<String>,
+        /// Neue Prüfsumme.
+        to_checksum: Option<String>,
     },
     /// Ein Crate hat eine neue direkte Abhängigkeitskante zu einem anderen
     /// Crate (Member oder extern).
@@ -171,8 +293,11 @@ pub struct Inventory {
     pub members: BTreeSet<String>,
     /// Direkte Abhängigkeitskanten: konsumierendes Member → Abhängigkeitsname.
     pub edges: BTreeSet<Edge>,
-    /// Gesperrte Version je Nicht-Member-Abhängigkeit, aus `Cargo.lock`.
-    pub dependency_versions: BTreeMap<String, String>,
+    /// Alle gleichzeitig gesperrten Versionen je Nicht-Member-Abhängigkeit,
+    /// aus `Cargo.lock` (F-096, F-097). Siehe Moduldoku, Abschnitt
+    /// „F-096/F-097" für die Begründung, warum eine einzelne Version je Name
+    /// nicht ausreicht.
+    pub dependency_versions: BTreeMap<String, BTreeSet<LockedDependency>>,
 }
 
 /// Ordnet jede `harw_code_graph::CodeGraphError`-Variante einzeln einer
@@ -310,10 +435,23 @@ impl Inventory {
             }
         }
 
-        let mut dependency_versions = BTreeMap::new();
+        // F-096/F-097: `.entry(..).or_default().insert(..)` statt
+        // `.insert(name, version)` — jede gleichzeitig gesperrte Version
+        // derselben Abhängigkeit bleibt erhalten (BTreeSet dedupliziert nur
+        // exakt gleiche `(version, source, checksum)`-Tripel), und Herkunft
+        // sowie Prüfsumme wandern mit ins Inventar statt verworfen zu werden.
+        let mut dependency_versions: BTreeMap<String, BTreeSet<LockedDependency>> =
+            BTreeMap::new();
         for package in &locked {
             if !members.contains(&package.name) {
-                dependency_versions.insert(package.name.clone(), package.version.clone());
+                dependency_versions
+                    .entry(package.name.clone())
+                    .or_default()
+                    .insert(LockedDependency {
+                        version: package.version.clone(),
+                        source: package.source.clone(),
+                        checksum: package.checksum.clone(),
+                    });
             }
         }
 
@@ -386,21 +524,145 @@ impl Inventory {
             }
         }
 
-        for (name, to_version) in &self.dependency_versions {
-            if let Some(from_version) = previous.dependency_versions.get(name) {
-                if from_version != to_version {
-                    changes.push(StructureChange::VersionChanged {
-                        name: name.clone(),
-                        from: from_version.clone(),
-                        to: to_version.clone(),
-                        severity: classify_version_change(from_version, to_version),
-                    });
-                }
+        // Nur Namen, die in **beiden** Ständen vorkommen — ein komplett
+        // neuer oder komplett verschwundener Name ist bereits oben als
+        // `DependencyAdded`/`DependencyRemoved` gemeldet; `diff_versions`
+        // würde für ihn nur redundante `DependencyVersionAdded`/`-Removed`
+        // je Einzelversion erzeugen.
+        for (name, current_versions) in &self.dependency_versions {
+            if let Some(previous_versions) = previous.dependency_versions.get(name) {
+                changes.extend(diff_versions(name, previous_versions, current_versions));
             }
         }
 
         changes
     }
+}
+
+/// Vergleicht die Menge der gleichzeitig gesperrten Versionen **einer**
+/// Abhängigkeit zwischen zwei [`Inventory`]-Ständen (F-096, F-097).
+///
+/// # Description
+/// Drei sich gegenseitig ausschließende Fälle, in dieser Prüfreihenfolge:
+///
+/// 1. **Identisch** (`previous == current`): keine Meldung.
+/// 2. **Einfacher Ersatz**: vorher genau eine Version, nachher genau eine
+///    andere Version — der Normalfall eines Versions-Bumps. Erzeugt genau
+///    ein [`StructureChange::VersionChanged`] mit der aus
+///    [`classify_version_change`] abgeleiteten Schwere.
+/// 3. **Alles andere** (mehr als eine Version gleichzeitig gesperrt, auf
+///    einer der beiden Seiten oder beiden): je verschwundener Version ein
+///    [`StructureChange::DependencyVersionRemoved`], je neu aufgetauchter
+///    Version ein [`StructureChange::DependencyVersionAdded`]. Das deckt
+///    sowohl F-097 (eine zusätzliche, weiterhin gleichzeitig gesperrte
+///    Version) als auch den Ersatz einer von mehreren Versionen ab.
+///
+/// Unabhängig davon: für jede Version, die in **beiden** Ständen mit
+/// identischer Versionsnummer, aber unterschiedlicher `source` und/oder
+/// `checksum` vorkommt, wird zusätzlich ein
+/// [`StructureChange::ProvenanceChanged`] erzeugt (F-096). Das ist
+/// orthogonal zu den drei Fällen oben, da eine Provenienzänderung auch bei
+/// unverändertem Versionsbestand auftreten kann.
+///
+/// # Arguments
+/// - `name` (`&str`): Name der verglichenen Abhängigkeit.
+/// - `previous` (`&BTreeSet<LockedDependency>`): ihre Versionen im
+///   Vorgänger-Inventar.
+/// - `current` (`&BTreeSet<LockedDependency>`): ihre Versionen im aktuellen
+///   Inventar.
+///
+/// # Returns
+/// Die abgeleiteten [`StructureChange`]s, in der oben genannten Reihenfolge
+/// (Fall 2 oder 3, dann Provenienzänderungen). Leer, wenn `previous ==
+/// current`.
+fn diff_versions(
+    name: &str,
+    previous: &BTreeSet<LockedDependency>,
+    current: &BTreeSet<LockedDependency>,
+) -> Vec<StructureChange> {
+    if previous == current {
+        return Vec::new();
+    }
+
+    let previous_by_version: BTreeMap<&str, &LockedDependency> = previous
+        .iter()
+        .map(|dep| (dep.version.as_str(), dep))
+        .collect();
+    let current_by_version: BTreeMap<&str, &LockedDependency> = current
+        .iter()
+        .map(|dep| (dep.version.as_str(), dep))
+        .collect();
+
+    let added_versions: Vec<&str> = current_by_version
+        .keys()
+        .filter(|version| !previous_by_version.contains_key(*version))
+        .copied()
+        .collect();
+    let removed_versions: Vec<&str> = previous_by_version
+        .keys()
+        .filter(|version| !current_by_version.contains_key(*version))
+        .copied()
+        .collect();
+
+    let mut changes = Vec::new();
+
+    let is_simple_replace = previous_by_version.len() == 1
+        && current_by_version.len() == 1
+        && added_versions.len() == 1
+        && removed_versions.len() == 1;
+
+    if is_simple_replace {
+        let from = removed_versions[0];
+        let to = added_versions[0];
+        changes.push(StructureChange::VersionChanged {
+            name: name.to_owned(),
+            from: from.to_owned(),
+            to: to.to_owned(),
+            severity: classify_version_change(from, to),
+        });
+    } else {
+        for version in &removed_versions {
+            changes.push(StructureChange::DependencyVersionRemoved {
+                name: name.to_owned(),
+                version: (*version).to_owned(),
+            });
+        }
+        // Über `current` selbst statt über den Index `current_by_version[..]`
+        // gesucht — keine Panik möglich, falls das Invariant "jede
+        // `added_versions`-Version steht in `current_by_version`" je verletzt
+        // würde (siehe Projektregel: keine `unwrap()`/`expect()`/Index-Panik
+        // in Produktionspfaden).
+        for dep in current
+            .iter()
+            .filter(|dep| added_versions.contains(&dep.version.as_str()))
+        {
+            changes.push(StructureChange::DependencyVersionAdded {
+                name: name.to_owned(),
+                version: dep.version.clone(),
+                source: dep.source.clone(),
+                checksum: dep.checksum.clone(),
+            });
+        }
+    }
+
+    for (version, current_dep) in &current_by_version {
+        if let Some(previous_dep) = previous_by_version.get(version) {
+            if previous_dep.source != current_dep.source
+                || previous_dep.checksum != current_dep.checksum
+            {
+                changes.push(StructureChange::ProvenanceChanged {
+                    name: name.to_owned(),
+                    version: (*version).to_owned(),
+                    from_source: previous_dep.source.clone(),
+                    to_source: current_dep.source.clone(),
+                    from_checksum: previous_dep.checksum.clone(),
+                    to_checksum: current_dep.checksum.clone(),
+                });
+            }
+        }
+    }
+
+    changes
 }
 
 /// Klassifiziert einen Versionssprung nach SemVer- bzw. Cargos
@@ -465,11 +727,25 @@ pub fn classify_version_change(from: &str, to: &str) -> VersionSeverity {
 
 #[cfg(test)]
 mod tests {
-    use super::{Edge, Inventory, StructureChange, VersionSeverity, classify_version_change};
-    use crate::test_support::{write_lockfile, write_member, write_root};
+    use super::{
+        Edge, Inventory, LockedDependency, StructureChange, VersionSeverity,
+        classify_version_change,
+    };
+    use crate::test_support::{write_lockfile, write_lockfile_with_metadata, write_member, write_root};
     use harw_dod_cap::ReadScope;
+    use std::collections::BTreeSet;
     use std::fs;
     use std::path::PathBuf;
+
+    /// Baut einen einzelnen, quellenlosen `LockedDependency`-Eintrag — der
+    /// häufigste Testfall (nur die Versionsnummer ist relevant).
+    fn single_version(version: &str) -> BTreeSet<LockedDependency> {
+        BTreeSet::from([LockedDependency {
+            version: version.to_owned(),
+            source: None,
+            checksum: None,
+        }])
+    }
 
     fn scratch_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -543,12 +819,12 @@ mod tests {
         let mut previous = Inventory::default();
         previous
             .dependency_versions
-            .insert("serde".to_owned(), "1.0.228".to_owned());
+            .insert("serde".to_owned(), single_version("1.0.228"));
 
         let mut current = Inventory::default();
         current
             .dependency_versions
-            .insert("serde".to_owned(), "1.0.229".to_owned());
+            .insert("serde".to_owned(), single_version("1.0.229"));
 
         let changes = current.diff(&previous);
         assert_eq!(
@@ -567,12 +843,12 @@ mod tests {
         let mut previous = Inventory::default();
         previous
             .dependency_versions
-            .insert("some-crate".to_owned(), "0.2.28".to_owned());
+            .insert("some-crate".to_owned(), single_version("0.2.28"));
 
         let mut current = Inventory::default();
         current
             .dependency_versions
-            .insert("some-crate".to_owned(), "0.3.0".to_owned());
+            .insert("some-crate".to_owned(), single_version("0.3.0"));
 
         let changes = current.diff(&previous);
         assert_eq!(
@@ -633,9 +909,14 @@ mod tests {
             from: "harw-dod-workspace".to_owned(),
             to: "harw-code-graph".to_owned(),
         });
-        inventory
-            .dependency_versions
-            .insert("serde".to_owned(), "1.0.228".to_owned());
+        inventory.dependency_versions.insert(
+            "serde".to_owned(),
+            BTreeSet::from([LockedDependency {
+                version: "1.0.228".to_owned(),
+                source: Some("registry+https://github.com/rust-lang/crates.io-index".to_owned()),
+                checksum: Some("abc123".to_owned()),
+            }]),
+        );
 
         let json = serde_json::to_string(&inventory).expect("Inventory serialisiert");
         let round_tripped: Inventory =
@@ -838,5 +1119,288 @@ mod tests {
             classify_version_change("not-a-version", "1.0.0"),
             VersionSeverity::Unparseable
         );
+    }
+
+    // --- F-096/F-097: mehrere gleichzeitig gesperrte Versionen + Herkunft/Prüfsumme ---
+
+    /// F-097, Kernbeleg: `Cargo.lock` sperrt `libc` gleichzeitig in zwei
+    /// Versionen (unversöhnliche SemVer-Anforderungen im Baum) — vor dieser
+    /// Korrektur hätte `BTreeMap<name, version>` eine davon stillschweigend
+    /// überschrieben.
+    #[test]
+    fn test_read_keeps_all_simultaneously_locked_versions_of_same_dependency_f097() {
+        let root = scratch_dir("multi-version");
+        write_root(&root, &["a"]);
+        write_member(&root, "a", &[], &["libc"]);
+        write_lockfile_with_metadata(
+            &root,
+            &[
+                ("a", "0.1.0", None, None),
+                (
+                    "libc",
+                    "0.2.150",
+                    Some("registry+https://github.com/rust-lang/crates.io-index"),
+                    Some("aaa"),
+                ),
+                (
+                    "libc",
+                    "0.2.140",
+                    Some("registry+https://github.com/rust-lang/crates.io-index"),
+                    Some("bbb"),
+                ),
+            ],
+        );
+        let scope = ReadScope::from_roots([root.clone()]);
+
+        let inventory = Inventory::read(&scope, &root).expect("Inventar lesen");
+
+        let libc_versions = inventory
+            .dependency_versions
+            .get("libc")
+            .expect("libc muss im Inventar auftauchen");
+        assert_eq!(
+            libc_versions.len(),
+            2,
+            "beide gleichzeitig gesperrten Versionen müssen erhalten bleiben, keine darf verschwinden"
+        );
+        let version_strings: BTreeSet<&str> =
+            libc_versions.iter().map(|dep| dep.version.as_str()).collect();
+        assert!(version_strings.contains("0.2.150"));
+        assert!(version_strings.contains("0.2.140"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// F-096, Kernbeleg: `source` und `checksum` aus `Cargo.lock` landen im
+    /// Inventar, statt wie vor dieser Korrektur verworfen zu werden.
+    #[test]
+    fn test_read_captures_source_and_checksum_f096() {
+        let root = scratch_dir("source-checksum");
+        write_root(&root, &["a"]);
+        write_member(&root, "a", &[], &["serde"]);
+        write_lockfile_with_metadata(
+            &root,
+            &[
+                ("a", "0.1.0", None, None),
+                (
+                    "serde",
+                    "1.0.228",
+                    Some("registry+https://github.com/rust-lang/crates.io-index"),
+                    Some("deadbeef"),
+                ),
+            ],
+        );
+        let scope = ReadScope::from_roots([root.clone()]);
+
+        let inventory = Inventory::read(&scope, &root).expect("Inventar lesen");
+
+        let serde_versions = inventory
+            .dependency_versions
+            .get("serde")
+            .expect("serde muss im Inventar auftauchen");
+        let entry = serde_versions.iter().next().expect("genau ein Eintrag erwartet");
+        assert_eq!(
+            entry.source.as_deref(),
+            Some("registry+https://github.com/rust-lang/crates.io-index")
+        );
+        assert_eq!(entry.checksum.as_deref(), Some("deadbeef"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// F-097: eine zusätzliche, gleichzeitig gesperrte Version einer bereits
+    /// bekannten Abhängigkeit erzeugt `DependencyVersionAdded`, **nicht**
+    /// `VersionChanged` (das würde implizieren, die alte Version sei
+    /// verschwunden — sie ist es nicht).
+    #[test]
+    fn test_diff_reports_dependency_version_added_when_additional_version_appears_f097() {
+        let mut previous = Inventory::default();
+        previous
+            .dependency_versions
+            .insert("libc".to_owned(), single_version("0.2.150"));
+
+        let mut current = Inventory::default();
+        current.dependency_versions.insert(
+            "libc".to_owned(),
+            BTreeSet::from([
+                LockedDependency {
+                    version: "0.2.150".to_owned(),
+                    source: None,
+                    checksum: None,
+                },
+                LockedDependency {
+                    version: "0.2.140".to_owned(),
+                    source: None,
+                    checksum: None,
+                },
+            ]),
+        );
+
+        let changes = current.diff(&previous);
+        assert_eq!(
+            changes,
+            vec![StructureChange::DependencyVersionAdded {
+                name: "libc".to_owned(),
+                version: "0.2.140".to_owned(),
+                source: None,
+                checksum: None,
+            }]
+        );
+    }
+
+    /// Symmetrischer Fall: eine von mehreren gleichzeitig gesperrten
+    /// Versionen verschwindet, mindestens eine andere bleibt — das ist
+    /// `DependencyVersionRemoved`, nicht das vollständige `DependencyRemoved`
+    /// (die Abhängigkeit selbst ist ja weiterhin vorhanden).
+    #[test]
+    fn test_diff_reports_dependency_version_removed_when_one_of_several_versions_disappears() {
+        let mut previous = Inventory::default();
+        previous.dependency_versions.insert(
+            "libc".to_owned(),
+            BTreeSet::from([
+                LockedDependency {
+                    version: "0.2.150".to_owned(),
+                    source: None,
+                    checksum: None,
+                },
+                LockedDependency {
+                    version: "0.2.140".to_owned(),
+                    source: None,
+                    checksum: None,
+                },
+            ]),
+        );
+
+        let mut current = Inventory::default();
+        current
+            .dependency_versions
+            .insert("libc".to_owned(), single_version("0.2.150"));
+
+        let changes = current.diff(&previous);
+        assert_eq!(
+            changes,
+            vec![StructureChange::DependencyVersionRemoved {
+                name: "libc".to_owned(),
+                version: "0.2.140".to_owned(),
+            }]
+        );
+    }
+
+    /// F-096, Diff-Seite: eine geänderte Prüfsumme **bei unveränderter
+    /// Version** erzeugt `ProvenanceChanged` — vor dieser Korrektur gab es
+    /// dafür keine Meldung, weil `checksum` gar nicht erst gespeichert wurde.
+    #[test]
+    fn test_diff_reports_provenance_changed_for_same_version_different_checksum_f096() {
+        let mut previous = Inventory::default();
+        previous.dependency_versions.insert(
+            "serde".to_owned(),
+            BTreeSet::from([LockedDependency {
+                version: "1.0.228".to_owned(),
+                source: Some("registry+https://github.com/rust-lang/crates.io-index".to_owned()),
+                checksum: Some("aaa".to_owned()),
+            }]),
+        );
+
+        let mut current = Inventory::default();
+        current.dependency_versions.insert(
+            "serde".to_owned(),
+            BTreeSet::from([LockedDependency {
+                version: "1.0.228".to_owned(),
+                source: Some("registry+https://github.com/rust-lang/crates.io-index".to_owned()),
+                checksum: Some("bbb".to_owned()),
+            }]),
+        );
+
+        let changes = current.diff(&previous);
+        assert_eq!(
+            changes,
+            vec![StructureChange::ProvenanceChanged {
+                name: "serde".to_owned(),
+                version: "1.0.228".to_owned(),
+                from_source: Some(
+                    "registry+https://github.com/rust-lang/crates.io-index".to_owned()
+                ),
+                to_source: Some("registry+https://github.com/rust-lang/crates.io-index".to_owned()),
+                from_checksum: Some("aaa".to_owned()),
+                to_checksum: Some("bbb".to_owned()),
+            }]
+        );
+    }
+
+    /// F-096, Kernszenario aus dem Register: Wechsel der Paketquelle von
+    /// Registry auf Git bei unveränderter Versionsnummer.
+    #[test]
+    fn test_diff_reports_provenance_changed_for_registry_to_git_source_swap_f096() {
+        let mut previous = Inventory::default();
+        previous.dependency_versions.insert(
+            "some-crate".to_owned(),
+            BTreeSet::from([LockedDependency {
+                version: "1.0.0".to_owned(),
+                source: Some("registry+https://github.com/rust-lang/crates.io-index".to_owned()),
+                checksum: Some("aaa".to_owned()),
+            }]),
+        );
+
+        let mut current = Inventory::default();
+        current.dependency_versions.insert(
+            "some-crate".to_owned(),
+            BTreeSet::from([LockedDependency {
+                version: "1.0.0".to_owned(),
+                source: Some("git+https://example.com/some-crate".to_owned()),
+                checksum: None,
+            }]),
+        );
+
+        let changes = current.diff(&previous);
+        assert_eq!(changes.len(), 1, "genau ein Provenienz-Ereignis erwartet");
+        assert!(matches!(
+            &changes[0],
+            StructureChange::ProvenanceChanged { name, version, .. }
+                if name == "some-crate" && version == "1.0.0"
+        ));
+    }
+
+    /// End-to-End über `Inventory::read` (statt handgebauter Inventare):
+    /// eine zweite, zusätzliche Version derselben Abhängigkeit taucht im
+    /// realen `Cargo.lock` auf und wird über `diff` sichtbar.
+    #[test]
+    fn test_read_and_diff_reports_additional_locked_version_end_to_end_f097() {
+        let root = scratch_dir("additional-version-e2e");
+        write_root(&root, &["a"]);
+        write_member(&root, "a", &[], &["libc"]);
+        write_lockfile_with_metadata(
+            &root,
+            &[
+                ("a", "0.1.0", None, None),
+                ("libc", "0.2.150", None, None),
+            ],
+        );
+        let scope = ReadScope::from_roots([root.clone()]);
+
+        let previous = Inventory::read(&scope, &root).expect("erstes Inventar lesen");
+
+        write_lockfile_with_metadata(
+            &root,
+            &[
+                ("a", "0.1.0", None, None),
+                ("libc", "0.2.150", None, None),
+                ("libc", "0.2.140", None, None),
+            ],
+        );
+
+        let current = Inventory::read(&scope, &root).expect("zweites Inventar lesen");
+        let changes = current.diff(&previous);
+
+        assert_eq!(
+            changes,
+            vec![StructureChange::DependencyVersionAdded {
+                name: "libc".to_owned(),
+                version: "0.2.140".to_owned(),
+                source: None,
+                checksum: None,
+            }]
+        );
+
+        fs::remove_dir_all(&root).ok();
     }
 }

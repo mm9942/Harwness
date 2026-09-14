@@ -264,7 +264,11 @@ impl Sensor for MemorySensor {
             }
             Err(ReadFsError::Scope(inner)) => return Err(inner),
             Err(ReadFsError::TooLarge { .. }) => return Err(SensorError::MalformedSource),
-            Err(ReadFsError::GlobPatternAbsolute { .. } | ReadFsError::GlobPatternTraversal { .. }) => {
+            Err(
+                ReadFsError::GlobPatternAbsolute { .. }
+                | ReadFsError::GlobPatternTraversal { .. }
+                | ReadFsError::GlobLimitExceeded { .. },
+            ) => {
                 // read_key_values ruft nie glob() auf; unerreichbar, aber
                 // erschöpfend abgedeckt, damit eine künftige ReadFsError-
                 // Variante hier nicht still verworfen wird.

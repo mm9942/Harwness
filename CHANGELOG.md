@@ -6,8 +6,168 @@ Semantic Versioning within the 0.x pre-release range.
 
 ## [Unreleased]
 
+### Added
+
+- **`harw project` subcommand**: `harw project trust [DIR]`, `harw project untrust [DIR]`,
+  and `harw project status [DIR]` manage a project's trust record explicitly (`DIR`
+  defaults to the current directory). A project's repo-local `.harw` configuration
+  layer is now loaded only for projects that have been explicitly trusted this way.
+
+**Freigaben, Regeln und Lebensdauern (Scopes)**
+- Neuer `SettingScope`-Typ (`harw-config/src/scope.rs`) für die drei Lebensdauern
+  einer Einstellung: `Session` (nur im Speicher), `Project` (dauerhaft pro Projekt,
+  autoritätsgewährend außerhalb des Repos unter
+  `~/.harw/profiles/<profil>/projects/<schlüssel>/`) und `Global` (dauerhaft für
+  den User, `~/.harw/config.toml`). Bei einem Modus-Konflikt gewinnt die höhere
+  Präzedenz (`Session > Project > Global`).
+- `PermissionsSection`/`RuleToml` (`harw-config/src/permissions_toml.rs`) und ein
+  neuer `ConfigWriter` (`harw-config/src/writer.rs`, `toml_edit`, atomares
+  Schreiben, `.bak.<n>`-Backup-Rotation) zum dauerhaften Setzen von
+  Freigabemodus, Freigabe-Timeout, Allow-/Deny-Regeln und zusätzlichen
+  Arbeitswurzeln, ohne bestehende Kommentare oder Formatierung der Datei zu
+  verlieren. `ConfigWriter::save` validiert vor dem Schreiben und lässt die
+  Datei bei einem ungültigen Wert unangetastet.
+- `AllowRuleSet`/`ApprovalRule` (`harw-extension-api/src/allow_rules.rs`):
+  Allow-/Deny-Regeln je Werkzeug mit `RuleScope` (Session/Project/Global). Eine
+  passende Deny-Regel gewinnt scope-übergreifend immer über jede Allow-Regel.
+  Regeln für `shell.exec` vergleichen ganze Befehls-Tokens als Präfix und
+  greifen als Allow-Regel nie bei einem zusammengesetzten Befehl (`;`, `&&`,
+  `||`, `|`, Backtick, `$(`, Umleitung, Zeilenumbruch, Hintergrundjob); Regeln
+  für `fs.*`-Werkzeuge werten ein Pfad-Glob aus und greifen als Allow-Regel nie
+  bei einer `..`-Pfadkomponente. `derive_shell_rule` leitet aus einem
+  tatsächlich ausgeführten Befehl einen konservativen Regel-Vorschlag ab und
+  verweigert das für eine feste Liste breiter Interpreter/Wrapper (`bash`,
+  `python3`, `sudo`, `xargs`, `eval` u. a.).
+- Diese Regeln sind in die tatsächliche Freigabeentscheidung verdrahtet:
+  `DefaultApprovalPolicy::review` (`harw-registry-defaults/src/lib.rs`) befragt
+  die geteilte `AllowRuleSet` vor der Modus-Logik; eine Deny-Regel fragt immer
+  nach, auch im `full`-Modus. `RuntimeAssembly` sät Modus, Allow-/Deny-Regeln
+  und zusätzliche Arbeitswurzeln beim Start aus der Global- und der
+  Projekt-Konfiguration (`harw-runtime/src/assembly.rs`).
+- `/permissions` (`harw-ops/src/permissions.rs`) mit den Unterbefehlen `show`
+  (Default), `mode`/`set <ask|auto|full>`, `allow`/`deny <tool> [muster]` und
+  `remove <nr>`, jeweils wahlweise mit `--session`, `--project` oder
+  `--global`. Jede Änderung wirkt sofort auf die laufende Session und wird
+  zusätzlich in der jeweiligen Konfigurationsebene persistiert.
+- `/add-workdir` (`harw-ops/src/add_workdir.rs`) sowie `ExtraRootsCell`
+  (`harw-sandbox/src/extra_roots.rs`): zusätzliche, sitzungsweite
+  Arbeitsverzeichnis-Wurzeln, mit `--save` dauerhaft im Projekt gemerkt.
+  Kandidaten werden symlink-frei kanonisiert; abgelehnt werden das
+  Wurzelverzeichnis `/`, das Home-Verzeichnis des Nutzers, jeder Vorfahre der
+  primären Arbeitswurzel sowie mehr als 8 zusätzliche Wurzeln.
+
+**Projekt-Erkennung und Projekt-Home**
+- `harw-home/src/project.rs`: `discover_project` erkennt den Projekt-Root
+  anhand konfigurierbarer Marker (Default `.git`, `project_root_markers` in
+  der Konfiguration), unterscheidet gewöhnliche Git-Repositories,
+  Git-Worktrees (der Trust-Anker zeigt dabei auf das Haupt-Repository) und
+  markerlose Verzeichnisse. `project_key` liefert einen stabilen,
+  dateisystemsicheren Schlüssel je Projekt-Root. `ProjectHome` legt
+  `<root>/.harw/{memories,plans,goals,state}` mit Rechten `0700` an, schreibt
+  ein `.gitignore` für `state/` und verweigert dies für `/` und `$HOME`.
+  `RuntimeAssembly` legt dieses Projekt-Home bei jedem Start an.
+
+**Session-Metadaten und Auswahl**
+- `SessionMeta`-Sidecar (`harw-session-store/src/meta.rs`,
+  `<session-id>.meta.json`): Titel samt Herkunft (`model`/`manual`/`fallback`/
+  `none`), Erstellungs- und letzter-Öffnen-Zeitpunkt, Arbeitsverzeichnis,
+  Projekt-Zuordnung, gekürzte erste Nutzernachricht und Turn-Zahl. Fehlt der
+  Sidecar (ältere Sessions), wird er beim ersten Zugriff aus dem Transcript
+  abgeleitet und danach persistiert.
+- Neue TUI-Bausteine: `harw-tui/src/session_picker.rs` (Navigation per
+  Pfeiltasten/PageUp/PageDown/Home/End, Tippfilter auf Titel/Projekt,
+  Umschalten aller Projekte) und `harw-tui/src/relative_time.rs`
+  (`gerade eben`, `vor 5 min`, `vor 3 h`, `vor 2 d`, sonst Datum).
+
+**Freigabe-Dialog und Bedienbausteine (TUI)**
+- `harw-tui/src/approval_dialog.rs`: Freigabe-Dialog-Widget mit vier Optionen
+  (Ja / Ja und nicht mehr fragen für diesen Befehl / Ja und in den
+  Auto-Modus wechseln / Nein mit optionaler Freitext-Begründung).
+  Tastendrücke wirken erst nach einer Arming-Verzögerung, Esc gilt als Nein,
+  ein Countdown wechselt unter einer Minute die Warnfarbe.
+- `harw-tui/src/choice_dialog.rs`: generisches Auswahl-Dialog-Widget (u. a.
+  für `/export`: Zwischenablage kopieren / als Datei speichern / abbrechen).
+- `harw-tui/src/clipboard.rs`: Kopieren in die Zwischenablage über
+  `wl-copy`/`xclip`/`xsel`/`pbcopy` je nach erkannter Umgebung, mit
+  OSC-52-Fallback für Terminals ohne lokalen Zugriff.
+- `harw-tui/src/export.rs`: rendert einen Chat-Verlauf als Markdown
+  (Metadaten, Nutzer-/Assistenz-/Systemzeilen) und schreibt ihn atomar in
+  eine Datei, kollisionssicher und ohne bestehende Dateien zu überschreiben.
+- `harw-tui/src/history_cell.rs`: neue `ToolCell`/`ToolGroupCell`-Zelltypen
+  mit einstellbarer Ausführlichkeit (`ToolVerbosity`), die die kompakte
+  Darstellung von Werkzeugaufrufen tragen sollen.
+- Neuer Befehl `/export` (`harw-ops/src/export.rs`) und erweitertes `/memory`
+  (`harw-ops/src/memory.rs`) um `recall <stichwort>`,
+  `record <text> [--project|--global]` und `forget <name>`.
+
+**Langzeitgedächtnis v3 (Fakten)**
+- `harw-memory/src/facts.rs`: adressierbare Fakten als einzelne
+  Markdown-Dateien (`facts/<name>.md`) mit Frontmatter (`type`, `scope`,
+  `confidence`, `sources`, `tags`) und `FactStore` zum Lesen, Schreiben,
+  Löschen und Durchsuchen. Ein generierter Index (`MEMORY.md`), Nutzungszähler
+  (`usage.json`) und ein Verfallsmechanismus (`decay`: unbenutzte Fakten
+  verlieren nach einer konfigurierbaren Frist die Hälfte ihrer `confidence`)
+  gehören dazu. Vor jedem Schreiben werden gängige Geheimnis-Muster
+  (API-Schlüssel, GitHub-/AWS-/Slack-Tokens, PEM-Blöcke, `Bearer`-Header,
+  `key=`/`token=`/`secret=`-Werte) redigiert.
+
+### Fixed
+
+- **Kontextbudget verdrängt die auslösende Nutzernachricht nicht mehr.** Eine
+  lange Werkzeug-Runde (viele `fs.read`/`shell.exec`-Ergebnisse im selben
+  Turn) konnte zuvor die zuletzt gesendete Nutzernachricht aus dem an das
+  Modell geschickten Verlauf verdrängen, weil die Byte-Budget-Auswahl allein
+  nach Alter der Gruppen entschied. `TurnHistory::tail_preserving_current_turn`
+  (`harw-core/src/history.rs`) hält die auslösende Nutzernachricht jetzt in
+  jedem Fall im Budget: übergroße Einzelergebnisse werden zuerst gekappt,
+  danach werden ältere Tool-Ergebnispaare des offenen Turns gekürzt oder
+  ausgelassen, bevor die Nutzernachricht selbst gefährdet wäre.
+
+### Changed
+
+- `harw web` no longer accepts `--config-dir`; the root space is resolved exclusively
+  from `--home`/`HARW_HOME`, which is now required. The web surface's permission
+  ceiling remains `ReadWorkspace` for every caller tier — no tier can gain write
+  access through the web API.
+- `harw serve`: job submission is now restricted to configured submitter principals,
+  and both prompt jobs and plan-node jobs require a resolvable HARW home; a job
+  submitted without one now completes as `Blocked` instead of running with an
+  implicit, looser context.
+- One-shot prompts (non-interactive chat) now apply the resolved interaction mode
+  and the configured approval policy; a tool call that would need an interactive
+  approval prompt is now rejected outright instead of being left pending.
+- `harw run` (local echo) now executes under a real local principal (`uid:<n>`,
+  operator tier) instead of a fixed placeholder identity.
+- `harw doctor` now reports the actual assembled runtime's permissions, tool count,
+  and approval chain alongside the existing configuration summary.
+- `harw analyze` without `--dry-run` now requires a fully configured model provider
+  up front, instead of failing only once the operation actually needed one.
+
+### Removed
+
+- `harw web --config-dir` flag.
+- `harw-channel-browser`.
+- The embedded MCP client in the core runtime library.
+
 ### Security
 
+- `harw serve` now refuses to start if the configuration lists the same MCP
+  principal ID more than once, instead of silently disabling the duplicate and
+  continuing.
+- TUI `/tools`: runtime overrides (`on`, `reset`, `profile`) can never enable a tool
+  beyond the intersection of the base tool set and the active mode's tool set;
+  previously a runtime toggle could re-enable a tool the active mode had disabled.
+- TUI: `!`-prefixed shell commands are rejected outright — the TUI surface does not
+  grant shell-execute capability.
+- TUI: child roles configured under the `[agents]` config section cannot currently
+  be spawned from the TUI (temporary regression; tracked for a follow-up wave).
+- Gateway: the echo-model fallback has been removed, and sealed `secrets:`-provider
+  credentials are now resolved when mounting the gateway, instead of the mount
+  silently proceeding without a real provider.
+- Plan-node jobs: the session sandbox is now bound exactly to the derived workspace
+  root; a workspace nested under a parent directory that carries a project marker
+  no longer inherits that parent's broader filesystem access.
+- Prompt jobs run without any project documents injected into context.
 - `harw-agent-dsl::roles::can_spawn` (the closed UIA/Root/Child/Worker spawn
   matrix, §3 of the DSL spec) was documented as "enforced by the runtime" but
   was never actually called anywhere outside `harw-agent-dsl` itself —

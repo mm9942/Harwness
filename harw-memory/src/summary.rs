@@ -1,12 +1,19 @@
-//! Rollout-Summary-Extraktion — Komprimierung von STM-Sequenzen zu promotablen Reflexionen.
+//! Rollout-Summary-Extraktion und `/memory stats`-Aggregation.
 //!
 //! # Verantwortungsbereich
-//! Transformiert [`crate::short_term::StmEntry`]-Sequenzen in kompakte
-//! [`crate::types::Signal::Reflection`]-Einträge, die in die Memory-Promotion-Pipeline
-//! eingespeist werden. Reine Datentransformation — kein I/O außer dem abschließenden
-//! `store.record`-Aufruf in [`extract_and_record`].
+//! Zwei unabhängige Verantwortungsbereiche in einem Modul:
 //!
-//! Folgt `docs/design/memory-v2.md` §3 (STM) und §5 (Signals) sowie
+//! 1. Transformiert [`crate::short_term::StmEntry`]-Sequenzen in kompakte
+//!    [`crate::types::Signal::Reflection`]-Einträge, die in die
+//!    Memory-Promotion-Pipeline eingespeist werden ([`RolloutSummary`],
+//!    [`extract_summary`], [`extract_and_record`]). Reine Datentransformation
+//!    — kein I/O außer dem abschließenden `store.record`-Aufruf.
+//! 2. Aggregiert die Zahlen für den Befehl `/memory stats` aus
+//!    `docs/design/memory-v3-ltm.md` §6 ([`MemoryStatsSummary`],
+//!    [`summarize_memory_stats`], [`count_incoming_candidates`]).
+//!
+//! Folgt `docs/design/memory-v2.md` §3 (STM) und §5 (Signals),
+//! `docs/design/memory-v3-ltm.md` §5.4 (Verfall) und §6 (Bedienung) sowie
 //! `philosophy.md` §4 („Memory-Konsolidierung ist ein langlebiger Workflow") und
 //! §16 Invariante 8 („Memory ist Promotion-Pipeline").
 //!
@@ -15,15 +22,25 @@
 //! - [`SummaryConfig`] — Schwellenwerte für Mindest-Einträge, Mindest-Salience und Lesson-Länge.
 //! - [`extract_summary`] — reine, infallible Datentransformation.
 //! - [`extract_and_record`] — Extraktion + Persistenz als `Signal::Reflection`.
+//! - [`MemoryStatsSummary`] — Zahlen für `/memory stats` (Design §6), `Display`-fähig
+//!   für die deutsche Textausgabe.
+//! - [`summarize_memory_stats`] — reine Aggregationsfunktion, die
+//!   [`MemoryStatsSummary`] aus bereits geladenen Daten baut (kein I/O).
+//! - [`count_incoming_candidates`] — kleiner I/O-Helfer, zählt `.md`-Dateien
+//!   unter `facts/_incoming/` (Design §5.2/§6).
 //!
 //! # Nebenläufigkeit
-//! `extract_summary` ist rein funktional und threadunsicher nur durch Mut-Borrow auf
-//! der internen Sortiertabelle — nach außen hin unproblematisch. `extract_and_record`
-//! delegiert I/O an die [`crate::store::Memory`]-Implementierung, die `Send + Sync` ist.
+//! `extract_summary` und `summarize_memory_stats` sind rein funktional und
+//! threadunsicher nur durch Mut-Borrow auf internen Sortiertabellen — nach
+//! außen hin unproblematisch. `extract_and_record` und
+//! `count_incoming_candidates` delegieren I/O an [`crate::store::Memory`]
+//! bzw. das Dateisystem.
 //!
 //! # Fehler
-//! `extract_summary` ist infallibel. `extract_and_record` propagiert
-//! [`crate::error::MemoryError`] aus `store.record()`.
+//! `extract_summary` und `summarize_memory_stats` sind infallibel.
+//! `extract_and_record` propagiert [`crate::error::MemoryError`] aus
+//! `store.record()`; `count_incoming_candidates` propagiert
+//! [`crate::error::MemoryError::Io`].
 //!
 //! # Beispiel
 //! ```rust,no_run
@@ -40,8 +57,15 @@
 //! assert!(summary.is_some());
 //! ```
 
-use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::fmt;
+use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+
+use crate::error::{MemoryError, MemoryResult};
+use crate::facts::{Fact, FactScope, FactType};
 use crate::short_term::{StmEntry, StmRole};
 
 // ── Typen ────────────────────────────────────────────────────────────────────
@@ -286,6 +310,238 @@ pub fn extract_and_record<M: crate::store::Memory>(
     }
 }
 
+// ── `/memory stats` (memory-v3-ltm.md §6) ───────────────────────────────────
+
+/// Zahlen für den Befehl `/memory stats` aus Design §6.
+///
+/// # Beschreibung
+/// Reiner Datencontainer, erzeugt von [`summarize_memory_stats`]. Implementiert
+/// [`fmt::Display`] als die deutsche Textform, die `/memory stats` direkt
+/// ausgeben kann.
+///
+/// # Felder
+/// - `total_facts`: Anzahl aller geladenen Fakten (beide Scopes zusammen).
+/// - `by_scope`: Anzahl je [`FactScope`], stabil in Reihenfolge `Project, Global`.
+/// - `by_type`: Anzahl je [`FactType`], in [`FactType::ALL`]-Reihenfolge.
+/// - `top_used`: die bis zu fünf meistgenutzten Fakten (`usage_count > 0`),
+///   absteigend nach Zähler, bei Gleichstand aufsteigend nach Name.
+/// - `incoming_candidates`: Anzahl Kandidaten unter `facts/_incoming/`.
+/// - `last_maintenance`: Zeitpunkt des letzten Wartungslaufs, `None` wenn noch
+///   keiner gelaufen ist.
+/// - `facts_decayed`: Anzahl der Fakten, die beim letzten Wartungslauf laut
+///   [`crate::heartbeat::FactDecayReport`] verfallen sind.
+///
+/// # Beispiel
+/// ```rust
+/// use harw_memory::summary::MemoryStatsSummary;
+///
+/// let s = MemoryStatsSummary {
+///     total_facts: 0,
+///     by_scope: Vec::new(),
+///     by_type: Vec::new(),
+///     top_used: Vec::new(),
+///     incoming_candidates: 0,
+///     last_maintenance: None,
+///     facts_decayed: 0,
+/// };
+/// assert_eq!(s.total_facts, 0);
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryStatsSummary {
+    /// Anzahl aller geladenen Fakten (beide Scopes zusammen).
+    pub total_facts: usize,
+    /// Anzahl je [`FactScope`], stabil in Reihenfolge `Project, Global`.
+    pub by_scope: Vec<(FactScope, usize)>,
+    /// Anzahl je [`FactType`], in [`FactType::ALL`]-Reihenfolge.
+    pub by_type: Vec<(FactType, usize)>,
+    /// Bis zu fünf meistgenutzte Fakten (Name, Zähler), absteigend sortiert.
+    pub top_used: Vec<(String, u64)>,
+    /// Anzahl Kandidaten unter `facts/_incoming/`.
+    pub incoming_candidates: usize,
+    /// Zeitpunkt des letzten Wartungslaufs, `None` wenn noch keiner gelaufen ist.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub last_maintenance: Option<OffsetDateTime>,
+    /// Anzahl beim letzten Wartungslauf verfallener Fakten.
+    pub facts_decayed: usize,
+}
+
+/// Formatiert `ts` als `yyyy-mm-dd HH:MM` UTC; fällt auf den Unix-Zeitstempel
+/// zurück, falls die Formatierung scheitert (kein Panic in `Display`).
+fn format_maintenance_ts(ts: OffsetDateTime) -> String {
+    let format = time::macros::format_description!("[year]-[month]-[day] [hour]:[minute] UTC");
+    ts.format(&format)
+        .unwrap_or_else(|_| ts.unix_timestamp().to_string())
+}
+
+impl fmt::Display for MemoryStatsSummary {
+    /// Deutsche Textform für `/memory stats` (Design §6: „Nutzung, Verfall,
+    /// Kandidaten").
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Gedächtnis-Statistik")?;
+        writeln!(f, "Fakten gesamt: {}", self.total_facts)?;
+        writeln!(f, "Nach Scope:")?;
+        for (scope, count) in &self.by_scope {
+            writeln!(f, "  {}: {count}", scope.as_str())?;
+        }
+        writeln!(f, "Nach Typ:")?;
+        for (fact_type, count) in &self.by_type {
+            writeln!(f, "  {}: {count}", fact_type.as_str())?;
+        }
+        if self.top_used.is_empty() {
+            writeln!(f, "Meistgenutzte Fakten: keine")?;
+        } else {
+            writeln!(f, "Meistgenutzte Fakten:")?;
+            for (name, count) in &self.top_used {
+                writeln!(f, "  {name}: {count}×")?;
+            }
+        }
+        writeln!(
+            f,
+            "Kandidaten in facts/_incoming/: {}",
+            self.incoming_candidates
+        )?;
+        match self.last_maintenance {
+            Some(ts) => writeln!(f, "Letzter Wartungslauf: {}", format_maintenance_ts(ts))?,
+            None => writeln!(f, "Letzter Wartungslauf: noch nicht gelaufen")?,
+        }
+        write!(f, "Verfallene Fakten: {}", self.facts_decayed)
+    }
+}
+
+/// Baut eine [`MemoryStatsSummary`] aus bereits geladenen Daten — reine
+/// Funktion, kein I/O (Design §6).
+///
+/// # Beschreibung
+/// Der Aufrufer (typischerweise der `/memory stats`-Kommando-Handler) lädt
+/// `facts` über [`crate::facts::FactStore::list`] (beide Scopes
+/// zusammengeführt), `usage` über [`crate::facts::FactStore::usage`] je Fakt
+/// oder eine äquivalente Zählerquelle, `incoming_candidates` über
+/// [`count_incoming_candidates`] und `last_maintenance`/`facts_decayed` aus
+/// dem zuletzt persistierten Wartungslauf-Zustand
+/// ([`crate::types::MaintenanceReport`]).
+///
+/// # Argumente
+/// - `facts` (`&[Fact]`): alle geladenen Fakten, projektübergreifend zusammengeführt.
+/// - `usage` (`&HashMap<String, u64>`): Nutzungszähler je Faktname; fehlende
+///   Einträge zählen als `0`.
+/// - `incoming_candidates` (`usize`): Anzahl Kandidaten unter `facts/_incoming/`.
+/// - `last_maintenance` (`Option<OffsetDateTime>`): Zeitpunkt des letzten
+///   Wartungslaufs.
+/// - `facts_decayed` (`usize`): Anzahl beim letzten Wartungslauf verfallener Fakten.
+///
+/// # Rückgabe
+/// Eine vollständig befüllte [`MemoryStatsSummary`].
+///
+/// # Panics
+/// Keine.
+///
+/// # Beispiel
+/// ```rust
+/// use harw_memory::summary::summarize_memory_stats;
+/// use std::collections::HashMap;
+///
+/// let summary = summarize_memory_stats(&[], &HashMap::new(), 0, None, 0);
+/// assert_eq!(summary.total_facts, 0);
+/// assert_eq!(summary.by_scope.len(), 2);
+/// ```
+#[must_use]
+pub fn summarize_memory_stats(
+    facts: &[Fact],
+    usage: &HashMap<String, u64>,
+    incoming_candidates: usize,
+    last_maintenance: Option<OffsetDateTime>,
+    facts_decayed: usize,
+) -> MemoryStatsSummary {
+    let mut by_scope_counts: HashMap<FactScope, usize> = HashMap::new();
+    let mut by_type_counts: HashMap<FactType, usize> = HashMap::new();
+    for fact in facts {
+        *by_scope_counts.entry(fact.scope).or_insert(0) += 1;
+        *by_type_counts.entry(fact.fact_type).or_insert(0) += 1;
+    }
+
+    let by_scope = [FactScope::Project, FactScope::Global]
+        .into_iter()
+        .map(|scope| (scope, *by_scope_counts.get(&scope).unwrap_or(&0)))
+        .collect();
+
+    let by_type = FactType::ALL
+        .into_iter()
+        .map(|fact_type| (fact_type, *by_type_counts.get(&fact_type).unwrap_or(&0)))
+        .collect();
+
+    let mut top_used: Vec<(String, u64)> = facts
+        .iter()
+        .filter_map(|fact| {
+            let count = *usage.get(&fact.name).unwrap_or(&0);
+            (count > 0).then(|| (fact.name.clone(), count))
+        })
+        .collect();
+    top_used.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    top_used.truncate(5);
+
+    MemoryStatsSummary {
+        total_facts: facts.len(),
+        by_scope,
+        by_type,
+        top_used,
+        incoming_candidates,
+        last_maintenance,
+        facts_decayed,
+    }
+}
+
+/// Zählt Kandidaten-Dateien (`*.md`) unter `<root>/facts/_incoming/`
+/// (Design §5.2 „Kandidat", §6 „Kandidaten").
+///
+/// # Beschreibung
+/// Ein fehlendes `_incoming/`-Verzeichnis (noch keine Extraktion gelaufen)
+/// liefert `Ok(0)` statt eines Fehlers — das ist der Normalzustand vor der
+/// ersten Phase-1-Extraktion (Design §5.2).
+///
+/// # Argumente
+/// - `root` (`impl AsRef<Path>`): Wurzel eines [`crate::facts::FactStore`]
+///   (Projekt oder Global).
+///
+/// # Rückgabe
+/// Anzahl der `.md`-Dateien direkt unter `<root>/facts/_incoming/`.
+///
+/// # Fehler
+/// [`MemoryError::Io`], wenn das Verzeichnis existiert, aber nicht gelesen
+/// werden kann (z. B. Rechteproblem).
+///
+/// # Beispiel
+/// ```rust,no_run
+/// use harw_memory::summary::count_incoming_candidates;
+///
+/// let n = count_incoming_candidates("/tmp/harw-memory-example").unwrap();
+/// assert_eq!(n, 0);
+/// ```
+pub fn count_incoming_candidates(root: impl AsRef<Path>) -> MemoryResult<usize> {
+    let dir = root.as_ref().join("facts").join("_incoming");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => {
+            return Err(MemoryError::Io {
+                path: dir,
+                source: e,
+            });
+        }
+    };
+    let mut count = 0usize;
+    for entry in entries {
+        let entry = entry.map_err(|e| MemoryError::Io {
+            path: dir.clone(),
+            source: e,
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("md") {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -496,5 +752,172 @@ mod tests {
             "min_total_salience muss 60 sein"
         );
         assert_eq!(cfg.max_lesson_chars, 400, "max_lesson_chars muss 400 sein");
+    }
+
+    // ── `/memory stats` (memory-v3-ltm.md §6) ─────────────────────────────────
+
+    fn stats_fact(name: &str, scope: FactScope, fact_type: FactType) -> Fact {
+        let now = OffsetDateTime::now_utc();
+        Fact {
+            name: name.to_owned(),
+            description: "Teststatistik-Fakt".to_owned(),
+            fact_type,
+            scope,
+            created: now,
+            updated: now,
+            confidence: 0.8,
+            sources: Vec::new(),
+            tags: Vec::new(),
+            body: "Inhalt.\n".to_owned(),
+        }
+    }
+
+    // ── Test 9 ───────────────────────────────────────────────────────────────
+
+    /// Zählt Fakten korrekt je Scope und Typ — auch Scopes/Typen ohne
+    /// Vorkommen erscheinen mit Zähler `0` (deterministische Reihenfolge).
+    #[test]
+    fn summarize_memory_stats_counts_by_scope_and_type() {
+        let facts = vec![
+            stats_fact("a", FactScope::Project, FactType::Decision),
+            stats_fact("b", FactScope::Project, FactType::Decision),
+            stats_fact("c", FactScope::Project, FactType::Preference),
+            stats_fact("d", FactScope::Global, FactType::Fact),
+        ];
+        let summary = summarize_memory_stats(&facts, &HashMap::new(), 0, None, 0);
+
+        assert_eq!(summary.total_facts, 4);
+        assert_eq!(
+            summary.by_scope,
+            vec![(FactScope::Project, 3), (FactScope::Global, 1)],
+            "by_scope muss in Reihenfolge Project, Global stehen"
+        );
+        let decision_count = summary
+            .by_type
+            .iter()
+            .find(|(t, _)| *t == FactType::Decision)
+            .map(|(_, c)| *c);
+        assert_eq!(decision_count, Some(2));
+        let pitfall_count = summary
+            .by_type
+            .iter()
+            .find(|(t, _)| *t == FactType::Pitfall)
+            .map(|(_, c)| *c);
+        assert_eq!(
+            pitfall_count,
+            Some(0),
+            "Typen ohne Vorkommen müssen mit 0 erscheinen"
+        );
+        assert_eq!(summary.by_type.len(), FactType::ALL.len());
+    }
+
+    // ── Test 10 ──────────────────────────────────────────────────────────────
+
+    /// Meistgenutzte Fakten: absteigend nach Zähler, bei Gleichstand
+    /// aufsteigend nach Name, höchstens fünf, Zähler `0` fällt heraus.
+    #[test]
+    fn summarize_memory_stats_ranks_top_used_facts() {
+        let facts: Vec<Fact> = (0..7)
+            .map(|i| stats_fact(&format!("fakt-{i}"), FactScope::Project, FactType::Fact))
+            .collect();
+        let mut usage = HashMap::new();
+        usage.insert("fakt-0".to_owned(), 10u64);
+        usage.insert("fakt-1".to_owned(), 30u64);
+        usage.insert("fakt-2".to_owned(), 30u64);
+        usage.insert("fakt-3".to_owned(), 5u64);
+        usage.insert("fakt-4".to_owned(), 20u64);
+        usage.insert("fakt-5".to_owned(), 1u64);
+        // fakt-6 bleibt ungenutzt (kein Eintrag) → fällt heraus.
+
+        let summary = summarize_memory_stats(&facts, &usage, 0, None, 0);
+
+        assert_eq!(summary.top_used.len(), 5, "höchstens fünf Einträge");
+        assert_eq!(
+            summary.top_used,
+            vec![
+                ("fakt-1".to_owned(), 30),
+                ("fakt-2".to_owned(), 30),
+                ("fakt-4".to_owned(), 20),
+                ("fakt-0".to_owned(), 10),
+                ("fakt-3".to_owned(), 5),
+            ],
+            "absteigend nach Zähler, bei Gleichstand aufsteigend nach Name"
+        );
+        assert!(
+            summary.top_used.iter().all(|(name, _)| name != "fakt-6"),
+            "ungenutzte Fakten dürfen nicht erscheinen"
+        );
+    }
+
+    // ── Test 11 ──────────────────────────────────────────────────────────────
+
+    /// `incoming_candidates`, `last_maintenance` und `facts_decayed` werden
+    /// unverändert durchgereicht (reine Aggregation, kein I/O).
+    #[test]
+    fn summarize_memory_stats_passes_through_scalar_fields() {
+        let now = OffsetDateTime::now_utc();
+        let summary = summarize_memory_stats(&[], &HashMap::new(), 3, Some(now), 7);
+        assert_eq!(summary.incoming_candidates, 3);
+        assert_eq!(summary.last_maintenance, Some(now));
+        assert_eq!(summary.facts_decayed, 7);
+        assert_eq!(summary.total_facts, 0);
+        assert_eq!(summary.by_scope, vec![(FactScope::Project, 0), (FactScope::Global, 0)]);
+    }
+
+    // ── Test 12 ──────────────────────────────────────────────────────────────
+
+    /// Die deutsche `Display`-Textform enthält alle Kernzahlen.
+    #[test]
+    fn memory_stats_summary_display_contains_all_sections() {
+        let facts = vec![stats_fact("tui-fix", FactScope::Project, FactType::Decision)];
+        let mut usage = HashMap::new();
+        usage.insert("tui-fix".to_owned(), 4u64);
+        let now = OffsetDateTime::now_utc();
+        let summary = summarize_memory_stats(&facts, &usage, 2, Some(now), 1);
+
+        let text = summary.to_string();
+        assert!(text.contains("Fakten gesamt: 1"));
+        assert!(text.contains("tui-fix: 4×"));
+        assert!(text.contains("Kandidaten in facts/_incoming/: 2"));
+        assert!(text.contains("Letzter Wartungslauf:"));
+        assert!(text.contains("Verfallene Fakten: 1"));
+    }
+
+    /// Ohne Wartungslauf und ohne Nutzung meldet die Textform das explizit,
+    /// statt leere Abschnitte zu zeigen.
+    #[test]
+    fn memory_stats_summary_display_handles_empty_state() {
+        let summary = summarize_memory_stats(&[], &HashMap::new(), 0, None, 0);
+        let text = summary.to_string();
+        assert!(text.contains("Meistgenutzte Fakten: keine"));
+        assert!(text.contains("Letzter Wartungslauf: noch nicht gelaufen"));
+    }
+
+    // ── Test 13 ──────────────────────────────────────────────────────────────
+
+    /// `count_incoming_candidates` zählt nur `.md`-Dateien und liefert `0`
+    /// statt eines Fehlers, wenn `_incoming/` noch nicht existiert.
+    #[test]
+    fn count_incoming_candidates_counts_md_files_and_defaults_to_zero() {
+        let root = tmp_root("incoming");
+        assert_eq!(
+            count_incoming_candidates(&root).unwrap(),
+            0,
+            "fehlendes Verzeichnis muss Ok(0) liefern"
+        );
+
+        let incoming = root.join("facts").join("_incoming");
+        std::fs::create_dir_all(&incoming).unwrap();
+        std::fs::write(incoming.join("kandidat-a.md"), "---\n---\n").unwrap();
+        std::fs::write(incoming.join("kandidat-b.md"), "---\n---\n").unwrap();
+        std::fs::write(incoming.join("notiz.txt"), "kein Kandidat").unwrap();
+
+        assert_eq!(
+            count_incoming_candidates(&root).unwrap(),
+            2,
+            "nur .md-Dateien zaehlen als Kandidaten"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

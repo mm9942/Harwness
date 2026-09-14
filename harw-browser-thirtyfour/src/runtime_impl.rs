@@ -1,6 +1,11 @@
+//! `BrowserRuntime` implementation: request validation, action budget and
+//! post-effect origin enforcement around the family-specific helpers (F-009).
+
 use crate::runtime::FirefoxRuntime;
 use async_trait::async_trait;
-use harw_browser::action::{ActionOutcome, ActionRequest, BrowserAction};
+use harw_browser::action::{
+    ActionOutcome, ActionRequest, BrowserAction, validate_selector, validate_target,
+};
 use harw_browser::capability::{BrowserCapabilityProbe, CapabilityStatus};
 use harw_browser::event::EventEnvelope;
 use harw_browser::host::BrowserRuntime;
@@ -28,7 +33,12 @@ impl BrowserRuntime for FirefoxRuntime {
         mode: ObservationMode,
     ) -> harw_browser::Result<BrowserObservation> {
         self.ensure_open()?;
-        crate::observe::observe(self, context_id, mode).await
+        if let ObservationMode::DomSelection { selector } = &mode {
+            validate_selector(selector, &self.request().limits)?;
+        }
+        let observation = crate::observe::observe(self, context_id, mode).await;
+        self.enforce_location_policy().await?;
+        observation
     }
 
     async fn find(
@@ -38,12 +48,20 @@ impl BrowserRuntime for FirefoxRuntime {
         revision: BrowserObservationRevision,
     ) -> harw_browser::Result<ObservedElement> {
         self.ensure_open()?;
-        crate::observe::find(self, context_id, target, revision).await
+        validate_target(target, &self.request().limits)?;
+        let found = crate::observe::find(self, context_id, target, revision).await;
+        self.enforce_location_policy().await?;
+        found
     }
 
     async fn act(&self, request: ActionRequest) -> harw_browser::Result<ActionOutcome> {
         self.ensure_open()?;
-        match &request.action {
+        request.validate(&self.request().limits)?;
+        if let Some(target) = request.action.navigation_target() {
+            self.request().check_navigation_target(target)?;
+        }
+        self.consume_action_budget().await?;
+        let outcome = match &request.action {
             BrowserAction::Navigate { .. }
             | BrowserAction::Back
             | BrowserAction::Forward
@@ -52,7 +70,6 @@ impl BrowserRuntime for FirefoxRuntime {
             | BrowserAction::Type { .. }
             | BrowserAction::Clear { .. }
             | BrowserAction::Focus { .. }
-            | BrowserAction::Upload { .. }
             | BrowserAction::Select { .. } => self.execute_element_action(request).await,
             BrowserAction::Hover { .. }
             | BrowserAction::Scroll { .. }
@@ -61,7 +78,11 @@ impl BrowserRuntime for FirefoxRuntime {
                 crate::gesture_actions::execute_gesture_action(self, request).await
             }
             BrowserAction::Submit { .. } => self.execute_submit_action(request).await,
-        }
+        };
+        // Runs even when the action failed: a partially applied effect may
+        // still have navigated.
+        self.enforce_location_policy().await?;
+        outcome
     }
 
     async fn wait(
@@ -71,19 +92,17 @@ impl BrowserRuntime for FirefoxRuntime {
         timeout: WaitTimeout,
     ) -> harw_browser::Result<WaitOutcome> {
         self.ensure_open()?;
-        self.wait_condition(context_id, condition, timeout).await
+        let limits = &self.request().limits;
+        condition.validate(limits)?;
+        timeout.validate(limits)?;
+        let outcome = self.wait_condition(context_id, condition, timeout).await;
+        self.enforce_location_policy().await?;
+        outcome
     }
 
     async fn events(&self, since: BrowserEventCursor) -> harw_browser::Result<Vec<EventEnvelope>> {
         self.ensure_open()?;
-        Ok(self
-            .events()
-            .lock()
-            .await
-            .iter()
-            .filter(|event| event.cursor.value() > since.value())
-            .cloned()
-            .collect())
+        Ok(self.events_since(since).await)
     }
 
     async fn capability_probe(&self) -> harw_browser::Result<BrowserCapabilityProbe> {

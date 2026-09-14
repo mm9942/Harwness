@@ -39,10 +39,15 @@ use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 mod bwrap;
-pub use bwrap::{BwrapCommandPlan, BwrapLauncher};
+pub use bwrap::{
+    BwrapCommandPlan, BwrapLauncher, SANDBOX_PROXY_SOCKET_PATH, SANDBOX_RELAY_PATH, SandboxChild,
+};
 
 pub mod egress;
 pub use egress::{EgressHost, EgressUrl, EgressUrlError, host_matches_suffix};
+
+mod extra_roots;
+pub use extra_roots::{ExtraRoot, ExtraRootError, ExtraRootsCell, MAX_EXTRA_ROOTS, validate_extra_root};
 
 /// Operationsklassen, die eine Sandbox autorisieren kann.
 ///
@@ -132,6 +137,73 @@ impl Default for PermissionSet {
     fn default() -> Self {
         Self::empty()
     }
+}
+
+/// Netzmodus eines Prozess-Sandkastens (W5 N-SBX, F-003/F-120).
+///
+/// # Description
+/// Bestimmt, wie ein Bubblewrap-Backend Netz bereitstellt. Es gibt bewusst
+/// **keinen** Modus, der den Host-Netz-Namespace teilt (`--share-net`): jeder
+/// Modus erzeugt eine eigene, leere netns (`--unshare-net`).
+///
+/// - [`NetworkMode::None`] (Default): keine Netzverbindung, nur `lo`.
+/// - [`NetworkMode::ProxyOnly`]: in derselben netns läuft `harw-netns-relay`
+///   auf `127.0.0.1:<listen_port>` und leitet an den Unix-Socket des
+///   Egress-Proxys im Harness weiter; der Kindprozess erhält
+///   `ALL_PROXY=socks5h://127.0.0.1:<listen_port>`. Erfordert zusätzlich
+///   [`Permission::NetworkAccess`].
+///
+/// # Concurrency
+/// Reiner Wert (`Send + Sync`), keine Seiteneffekte.
+///
+/// # Examples
+/// ```rust
+/// use harw_sandbox::NetworkMode;
+///
+/// assert_eq!(NetworkMode::default(), NetworkMode::None);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum NetworkMode {
+    /// Eigene netns ohne Außenverbindung.
+    #[default]
+    None,
+    /// Eigene netns; Ausgang nur über Relay → Egress-Proxy.
+    ProxyOnly(RelaySpec),
+}
+
+/// Aufrufkonfiguration des netns-Relays für [`NetworkMode::ProxyOnly`].
+///
+/// # Description
+/// Das Backend bindet `binary` nur lesend an einen festen Pfad in der Sandbox
+/// und `proxy_socket` read-write an einen festen Socket-Pfad; Host-Pfade sind
+/// in der Sandbox nicht sichtbar. Aufruf in der Sandbox:
+/// `<relay> <listen_port> <socket> -- <cmd…>` (Exec-Modus, N-EGRESS).
+///
+/// # Invariants (geprüft beim Planen)
+/// - `binary` und `proxy_socket` sind absolut und enthalten nur normale
+///   Komponenten (kein `.`/`..`).
+/// - `listen_port` ist nicht `0`.
+///
+/// # Examples
+/// ```rust
+/// use std::path::PathBuf;
+/// use harw_sandbox::{NetworkMode, RelaySpec};
+///
+/// let mode = NetworkMode::ProxyOnly(RelaySpec {
+///     binary: PathBuf::from("/usr/libexec/harw/harw-netns-relay"),
+///     listen_port: 1080,
+///     proxy_socket: PathBuf::from("/run/user/1000/harw/egress.sock"),
+/// });
+/// assert_ne!(mode, NetworkMode::None);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelaySpec {
+    /// Absoluter Host-Pfad des Relay-Binaries `harw-netns-relay`.
+    pub binary: PathBuf,
+    /// TCP-Port, auf dem das Relay in der Sandbox an `127.0.0.1` lauscht.
+    pub listen_port: u16,
+    /// Absoluter Host-Pfad des Unix-Sockets des Egress-Proxys.
+    pub proxy_socket: PathBuf,
 }
 
 /// Ein Ziel, das ein Sandkasten erreichen darf.
@@ -731,6 +803,97 @@ impl WorkspaceBinding {
             })
         }
     }
+
+    /// Wie [`Self::resolve_existing`], aber zusätzlich gegen registrierte
+    /// Extra-Roots geprüft (`/add-workdir`, Slice A8).
+    ///
+    /// # Beschreibung
+    /// [`WorkspaceBinding`] kennt die [`SandboxSpec`] nicht, die die
+    /// Extra-Roots trägt; deshalb übergibt der Aufrufer die zugehörige
+    /// [`ExtraRootsCell`] ausdrücklich, statt sie über globalen Zustand zu
+    /// beziehen (typischerweise `spec.extra_roots()`). Ein absoluter
+    /// `input`-Pfad wird direkt kanonisiert — `canonicalize` löst dabei auch
+    /// `..`-Komponenten und Symlinks anhand des tatsächlichen Dateisystems
+    /// auf, genau wie bei der primären Auflösung — und muss anschließend
+    /// unter der primären Wurzel **oder** einer der `extra_roots` liegen. Ein
+    /// relativer Pfad verhält sich unverändert wie [`Self::resolve_existing`]
+    /// und wird ausschließlich gegen die primäre Wurzel aufgelöst: sonst
+    /// könnten zwei Wurzeln um denselben relativen Namen konkurrieren.
+    ///
+    /// # Arguments
+    /// - `input` (`&Path`): absoluter oder workspace-relativer Zielpfad.
+    /// - `extra_roots` (`&ExtraRootsCell`): zusätzlich zulässige Wurzeln.
+    ///
+    /// # Errors
+    /// [`SandboxError::Io`], wenn `input` nicht existiert; ansonsten wie
+    /// [`Self::resolve_existing`], insbesondere
+    /// [`SandboxError::PathEscapesWorkspace`], wenn keine Wurzel passt.
+    pub fn resolve_existing_with_extra_roots(
+        &self,
+        input: &Path,
+        extra_roots: &ExtraRootsCell,
+    ) -> SandboxResult<PathBuf> {
+        if !input.is_absolute() {
+            return self.resolve_existing(input);
+        }
+        let canonical = input.canonicalize().map_err(|error| SandboxError::Io {
+            path: input.to_path_buf(),
+            reason: error.to_string(),
+        })?;
+        self.ensure_contained_with_extra(canonical, extra_roots)
+    }
+
+    /// Wie [`Self::resolve_for_create`], erweitert um Extra-Roots. Siehe
+    /// [`Self::resolve_existing_with_extra_roots`] für die Begründung des
+    /// zusätzlichen Parameters und das Verhalten bei relativen Pfaden.
+    ///
+    /// # Errors
+    /// [`SandboxError::Io`], [`SandboxError::InvalidRelativePath`],
+    /// [`SandboxError::PathEscapesWorkspace`] — siehe
+    /// [`Self::resolve_for_create`] und [`Self::resolve_existing_with_extra_roots`].
+    pub fn resolve_for_create_with_extra_roots(
+        &self,
+        input: &Path,
+        extra_roots: &ExtraRootsCell,
+    ) -> SandboxResult<PathBuf> {
+        if !input.is_absolute() {
+            return self.resolve_for_create(input);
+        }
+        let parent = input
+            .parent()
+            .ok_or_else(|| SandboxError::InvalidRelativePath {
+                path: input.to_path_buf(),
+            })?;
+        let canonical_parent = parent.canonicalize().map_err(|error| SandboxError::Io {
+            path: parent.to_path_buf(),
+            reason: error.to_string(),
+        })?;
+        let contained_parent = self.ensure_contained_with_extra(canonical_parent, extra_roots)?;
+        let name = input
+            .file_name()
+            .ok_or_else(|| SandboxError::InvalidRelativePath {
+                path: input.to_path_buf(),
+            })?;
+        Ok(contained_parent.join(name))
+    }
+
+    // Wie `ensure_contained`, zusätzlich gegen jede registrierte Extra-Root
+    // geprüft. Passt keine Wurzel, bleibt es fail-closed bei
+    // `PathEscapesWorkspace`.
+    fn ensure_contained_with_extra(
+        &self,
+        canonical: PathBuf,
+        extra_roots: &ExtraRootsCell,
+    ) -> SandboxResult<PathBuf> {
+        if canonical.starts_with(&self.canonical_root) || extra_roots.contains_path(&canonical) {
+            Ok(canonical)
+        } else {
+            Err(SandboxError::PathEscapesWorkspace {
+                path: canonical,
+                workspace: self.workspace.clone(),
+            })
+        }
+    }
 }
 
 /// Configuration-derived registration, deliberately separate from the
@@ -831,6 +994,19 @@ pub struct SandboxSpec {
     /// ablehnenden Scope.
     #[serde(default)]
     network_scope: NetworkScope,
+    /// Zusätzliche Workspace-Wurzeln (`/add-workdir`, Slice A8). Wird nie
+    /// (de-)serialisiert: Extra-Roots sind reiner Sitzungszustand, sonst
+    /// könnte eine über das Netz übertragene Spezifikation heimlich erweitert
+    /// werden. `#[serde(default)]` hält ältere, feldlose Payloads lesbar.
+    ///
+    /// Jobs und Kindprozesse erhalten grundsätzlich eine **leere** Zelle
+    /// (siehe [`Self::restrict`], [`Self::restrict_network`],
+    /// [`Self::restrict_with`]) — es findet nur Verengung statt, nie
+    /// implizite Erweiterung. Wer Extra-Roots an eine abgeleitete Sandbox
+    /// weitergeben will, muss das ausdrücklich über [`Self::with_extra_roots`]
+    /// tun.
+    #[serde(skip, default)]
+    extra_roots: ExtraRootsCell,
 }
 
 impl SandboxSpec {
@@ -841,15 +1017,18 @@ impl SandboxSpec {
     /// - `permissions` (`PermissionSet`): Ergebnis der Policy-Auswertung.
     ///
     /// # Returns
-    /// Die Spezifikation mit leerem [`NetworkScope`]. Netzziele müssen
-    /// anschließend ausdrücklich über [`Self::with_network_scope`] gesetzt
-    /// werden — der Standard erlaubt keinen Host.
+    /// Die Spezifikation mit leerem [`NetworkScope`] und ohne Extra-Roots.
+    /// Netzziele müssen anschließend ausdrücklich über
+    /// [`Self::with_network_scope`] gesetzt werden — der Standard erlaubt
+    /// keinen Host. Extra-Roots werden entsprechend nur über
+    /// [`Self::with_extra_roots`] ergänzt.
     #[must_use]
     pub fn from_resolved(workspace: WorkspaceBinding, permissions: PermissionSet) -> Self {
         Self {
             workspace,
             permissions,
             network_scope: NetworkScope::empty(),
+            extra_roots: ExtraRootsCell::new(),
         }
     }
 
@@ -886,6 +1065,35 @@ impl SandboxSpec {
         &self.network_scope
     }
 
+    /// Liefert die zusätzlichen Workspace-Wurzeln dieser Sandbox
+    /// (`/add-workdir`, Slice A8).
+    #[must_use]
+    pub fn extra_roots(&self) -> &ExtraRootsCell {
+        &self.extra_roots
+    }
+
+    /// Setzt die zusätzlichen Workspace-Wurzeln beim Aufbau der
+    /// Spezifikation.
+    ///
+    /// # Beschreibung
+    /// Nur für den ausdrücklichen, expliziten Aufbau gedacht — etwa eine
+    /// TUI-Sitzung, die ihre eigene, per `/add-workdir` gefüllte
+    /// [`ExtraRootsCell`] an ihre Sandbox bindet. Kind-Sandboxen aus
+    /// [`Self::restrict`], [`Self::restrict_network`] und
+    /// [`Self::restrict_with`] erhalten *nie* automatisch die Extra-Roots
+    /// des Elternteils, weil das eine implizite Erweiterung wäre, keine
+    /// Verengung. Wer sie an ein Kind weiterreichen will, ruft diese Methode
+    /// nach dem `restrict*`-Aufruf erneut ausdrücklich auf.
+    ///
+    /// # Arguments
+    /// - `cell` (`ExtraRootsCell`): die neuen Extra-Roots, ersetzt die
+    ///   bisherigen vollständig.
+    #[must_use]
+    pub fn with_extra_roots(mut self, cell: ExtraRootsCell) -> Self {
+        self.extra_roots = cell;
+        self
+    }
+
     /// Liefert eine Kind-Sandbox mit identischem Workspace und geschnittenem
     /// Permission-Set. Die Operation kann Autorität nie erweitern.
     ///
@@ -893,18 +1101,23 @@ impl SandboxSpec {
     /// Der [`NetworkScope`] bleibt unverändert: eine Permission-Obergrenze sagt
     /// nichts über einzelne Hosts aus, und stillschweigend geleerte Host-Listen
     /// wären ebenso irreführend wie stillschweigend übernommene. Wer beide
-    /// Achsen verengen will, nutzt [`Self::restrict_with`].
+    /// Achsen verengen will, nutzt [`Self::restrict_with`]. Die Extra-Roots
+    /// werden **nicht** übernommen (siehe [`Self::with_extra_roots`]): das
+    /// Kind startet mit einer leeren Zelle.
     #[must_use]
     pub fn restrict(&self, ceiling: &PermissionSet) -> Self {
         Self {
             workspace: self.workspace.clone(),
             permissions: self.permissions.intersection(ceiling),
             network_scope: self.network_scope.clone(),
+            extra_roots: ExtraRootsCell::new(),
         }
     }
 
     /// Liefert eine Kind-Sandbox mit unverändertem Permission-Set und
-    /// geschnittenen Ziel-Hosts.
+    /// geschnittenen Ziel-Hosts. Die Extra-Roots werden **nicht** übernommen
+    /// (siehe [`Self::with_extra_roots`]): das Kind startet mit einer leeren
+    /// Zelle.
     ///
     /// # Arguments
     /// - `scope` (`&NetworkScope`): Obergrenze der erlaubten Hosts.
@@ -914,10 +1127,13 @@ impl SandboxSpec {
             workspace: self.workspace.clone(),
             permissions: self.permissions.clone(),
             network_scope: self.network_scope.intersection(scope),
+            extra_roots: ExtraRootsCell::new(),
         }
     }
 
-    /// Verengt beide Autoritätsachsen in einem Schritt.
+    /// Verengt beide Autoritätsachsen in einem Schritt. Die Extra-Roots
+    /// werden **nicht** übernommen (siehe [`Self::with_extra_roots`]): das
+    /// Kind startet mit einer leeren Zelle.
     ///
     /// # Arguments
     /// - `ceiling` (`&PermissionSet`): Obergrenze der Operationsklassen.
@@ -932,25 +1148,31 @@ impl SandboxSpec {
             workspace: self.workspace.clone(),
             permissions: self.permissions.intersection(ceiling),
             network_scope: self.network_scope.intersection(scope),
+            extra_roots: ExtraRootsCell::new(),
         }
     }
 
     /// Prüft, dass diese Sandbox eine zulässige Verengung von `parent` ist.
     ///
     /// # Beschreibung
-    /// Geprüft werden drei Bedingungen: identischer Workspace, Permission-Set
-    /// als Teilmenge und [`NetworkScope`] als Teilmenge. Die dritte Bedingung
+    /// Geprüft werden vier Bedingungen: identischer Workspace, Permission-Set
+    /// als Teilmenge, [`NetworkScope`] als Teilmenge und die Extra-Roots als
+    /// Teilmenge ([`ExtraRootsCell::is_subset_of`]). Die dritte Bedingung
     /// verhindert, dass ein Kind bei gleichem [`Permission::NetworkAccess`] ein
-    /// Ziel erreicht, das dem Elternteil verwehrt ist.
+    /// Ziel erreicht, das dem Elternteil verwehrt ist; die vierte verhindert,
+    /// dass ein Kind über eine explizit gesetzte [`ExtraRootsCell`]
+    /// (siehe [`Self::with_extra_roots`]) Zugriff auf eine Wurzel bekommt, die
+    /// der Elternteil nicht selbst trägt.
     ///
     /// # Errors
     /// - [`SandboxError::ChildSandboxEscalation`]: der Workspace weicht ab, das
-    ///   Permission-Set enthält eine nicht ererbte Permission, oder der
-    ///   `NetworkScope` enthält einen nicht ererbten Host.
+    ///   Permission-Set oder der `NetworkScope` enthält etwas nicht Ererbtes,
+    ///   oder eine Extra-Root liegt außerhalb aller Extra-Roots des Elternteils.
     pub fn ensure_child_of(&self, parent: &Self) -> SandboxResult<()> {
         if self.workspace != parent.workspace
             || !self.permissions.is_subset_of(&parent.permissions)
             || !self.network_scope.is_subset_of(&parent.network_scope)
+            || !self.extra_roots.is_subset_of(&parent.extra_roots)
         {
             return Err(SandboxError::ChildSandboxEscalation);
         }
@@ -993,6 +1215,14 @@ pub enum SandboxError {
     },
     SandboxProcessSpawn {
         executable: PathBuf,
+        reason: String,
+    },
+    /// [`NetworkMode::ProxyOnly`] angefordert, aber die Sandbox trägt
+    /// [`Permission::NetworkAccess`] nicht (fail-closed).
+    NetworkModeNotGranted,
+    /// [`RelaySpec`] verletzt eine Invariante; `field` benennt das Feld.
+    InvalidRelaySpec {
+        field: &'static str,
         reason: String,
     },
 }
@@ -1042,6 +1272,13 @@ impl fmt::Display for SandboxError {
                 "could not launch sandbox executable '{}': {reason}",
                 executable.display()
             ),
+            Self::NetworkModeNotGranted => write!(
+                f,
+                "proxy-only network mode requires the network access permission"
+            ),
+            Self::InvalidRelaySpec { field, reason } => {
+                write!(f, "invalid egress relay configuration ({field}): {reason}")
+            }
         }
     }
 }
@@ -1151,6 +1388,114 @@ mod tests {
         let child = parent.restrict(&PermissionSet::from_policy([Permission::ReadWorkspace]));
 
         assert!(child.ensure_child_of(&parent).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restricted_children_never_inherit_extra_roots() {
+        let root = temp_directory("children-extra-roots");
+        let binding = registry(&root)
+            .resolve(
+                &TenantId::from_str("acme"),
+                &WorkspaceId::from_str("project"),
+            )
+            .unwrap();
+        let extra_dir = root.join("extra");
+        fs::create_dir_all(&extra_dir).unwrap();
+        let extra_roots = ExtraRootsCell::new();
+        extra_roots
+            .add(&extra_dir, false, binding.canonical_root(), None)
+            .unwrap();
+
+        let parent = SandboxSpec::from_resolved(
+            binding,
+            PermissionSet::from_policy([Permission::ReadWorkspace]),
+        )
+        .with_extra_roots(extra_roots);
+        let child = parent.restrict(&PermissionSet::from_policy([Permission::ReadWorkspace]));
+
+        assert!(child.extra_roots().snapshot().is_empty());
+        assert!(child.ensure_child_of(&parent).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_existing_with_extra_roots_accepts_absolute_path_inside_extra_root() {
+        let root = temp_directory("extra-accept");
+        let binding = bound_workspace(&root);
+        let extra_dir = root.join("extra");
+        fs::create_dir_all(extra_dir.join("sub")).unwrap();
+        fs::write(extra_dir.join("sub/file.txt"), b"x").unwrap();
+        let extra_roots = ExtraRootsCell::new();
+        extra_roots
+            .add(&extra_dir, false, binding.canonical_root(), None)
+            .unwrap();
+
+        let resolved = binding
+            .resolve_existing_with_extra_roots(&extra_dir.join("sub/file.txt"), &extra_roots)
+            .unwrap();
+        assert_eq!(
+            resolved,
+            extra_dir.canonicalize().unwrap().join("sub/file.txt")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_existing_with_extra_roots_rejects_path_outside_every_root() {
+        let root = temp_directory("extra-reject");
+        let binding = bound_workspace(&root);
+        let outside = temp_directory("extra-reject-outside");
+        let extra_roots = ExtraRootsCell::new();
+
+        let result = binding.resolve_existing_with_extra_roots(&outside, &extra_roots);
+        assert!(matches!(
+            result,
+            Err(SandboxError::PathEscapesWorkspace { .. })
+        ));
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn resolve_existing_with_extra_roots_rejects_parent_dir_escape() {
+        let root = temp_directory("extra-escape");
+        let binding = bound_workspace(&root);
+        let extra_dir = root.join("extra");
+        fs::create_dir_all(&extra_dir).unwrap();
+        let outside = root.join("sibling");
+        fs::create_dir_all(&outside).unwrap();
+        let extra_roots = ExtraRootsCell::new();
+        extra_roots
+            .add(&extra_dir, false, binding.canonical_root(), None)
+            .unwrap();
+
+        // `..` verlässt die Extra-Root lexikalisch; `canonicalize` löst das
+        // anhand des tatsächlichen Dateisystems auf und muss das Ergebnis
+        // trotzdem als Escape erkennen.
+        let escape = extra_dir.join("../sibling");
+        let result = binding.resolve_existing_with_extra_roots(&escape, &extra_roots);
+        assert!(matches!(
+            result,
+            Err(SandboxError::PathEscapesWorkspace { .. })
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn resolve_existing_with_extra_roots_still_resolves_relative_paths_against_primary() {
+        let root = temp_directory("extra-relative");
+        let binding = bound_workspace(&root);
+        fs::write(binding.canonical_root().join("src/lib.rs"), b"//").unwrap();
+        let extra_roots = ExtraRootsCell::new();
+
+        let resolved = binding
+            .resolve_existing_with_extra_roots(Path::new("src/lib.rs"), &extra_roots)
+            .unwrap();
+        assert_eq!(
+            resolved,
+            binding.canonical_root().join("src/lib.rs")
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

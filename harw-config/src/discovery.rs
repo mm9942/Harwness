@@ -1,14 +1,18 @@
 use crate::agent_toml::AgentToml;
 use crate::auth_toml::{AuthConfig, SecretRef};
+use crate::browser_toml::BrowserSection;
 use crate::channel_toml::{ChannelFileToml, ChannelToml, flatten_channel_file};
+use crate::dod_toml::DodSection;
 use crate::dotenv::load_env_layer;
 use crate::error::{ConfigError, ConfigResult};
 use crate::harness_config::HarnessConfig;
 use crate::mcp_toml::McpServerToml;
 use crate::model_toml::ModelToml;
+use crate::network_toml::NetworkSection;
 use crate::plugin_toml::PluginToml;
 use crate::provider_toml::ProviderToml;
 use crate::skill_toml::SkillToml;
+use crate::web_toml::WebSection;
 use harw_agent_dsl::layers::DefinitionLayer;
 use harw_agent_dsl::parse::parse_toml as parse_agent_definition_toml;
 use harw_agent_dsl::raw::RawAgentDefinition;
@@ -43,6 +47,22 @@ pub struct ResolvedConfig {
     /// konsultiert, wenn die Variable in der Prozess-Umgebung nicht gesetzt ist.
     /// Nie in `std::env` geschrieben; verbleibt ausschließlich in dieser Map.
     pub env_layer: BTreeMap<String, String>,
+    /// `[network]` — Netz-Policy für egress-fähige Werkzeuge/Rollen (W3
+    /// `C-CFG`, siehe `network_toml`). Geparst unabhängig von
+    /// [`HarnessConfig`] (siehe [`extract_section`]/[`strip_new_sections`]),
+    /// da `harness_config.rs` diese Sektion (noch) nicht als eigenes Feld
+    /// kennt — Folgearbeit, siehe `docs/remediation/ledger/W3/C-CFG.md`.
+    pub network: NetworkSection,
+    /// `[browser]` — Aktivierungs- und Limits-Policy für das Browser-Werkzeug
+    /// (W3 `C-CFG`, siehe `browser_toml`).
+    pub browser: BrowserSection,
+    /// `[dod]` — Eskalations-Policy für die DoD-Kette (W3 `C-CFG`, siehe
+    /// `dod_toml`).
+    pub dod: DodSection,
+    /// `[web]` — Bind- und Token-Policy für die eingebettete Web-UI (W3
+    /// `C-CFG`, siehe `web_toml`). Wird von einem nicht vertrauten Repo-Layer
+    /// **nie** beeinflusst (siehe [`apply_restricted_layer`]).
+    pub web: WebSection,
 }
 
 impl ResolvedConfig {
@@ -454,12 +474,35 @@ pub fn discover_config_with_restricted(
         let config_path = base.join("config.toml");
         if config_path.exists() {
             let content = read_file(&config_path)?;
-            let mut cfg: HarnessConfig =
-                toml::from_str(&content).map_err(|e| ConfigError::TomlParse(e.to_string()))?;
             // A repository config must not erase profile setup merely by
             // omitting these fields. Explicit values still override the profile.
             let fields: toml::Value =
                 toml::from_str(&content).map_err(|e| ConfigError::TomlParse(e.to_string()))?;
+
+            // [network]/[browser]/[dod]/[web]: parsed independently of
+            // `HarnessConfig` (see `extract_section`/`strip_new_sections`)
+            // and replaced wholesale per trusted layer when the key is
+            // present — a later trusted layer (e.g. the active profile) that
+            // omits the section keeps the previous trusted layer's value
+            // instead of resetting to defaults ("Home-Layer setzt").
+            if let Some(section) = extract_section::<NetworkSection>(&fields, "network")? {
+                resolved.network = section;
+            }
+            if let Some(section) = extract_section::<BrowserSection>(&fields, "browser")? {
+                resolved.browser = section;
+            }
+            if let Some(section) = extract_section::<DodSection>(&fields, "dod")? {
+                resolved.dod = section;
+            }
+            if let Some(section) = extract_section::<WebSection>(&fields, "web")? {
+                resolved.web = section;
+            }
+
+            let mut harness_fields = fields.clone();
+            strip_new_sections(&mut harness_fields);
+            let mut cfg: HarnessConfig = harness_fields
+                .try_into()
+                .map_err(|e: toml::de::Error| ConfigError::TomlParse(e.to_string()))?;
             if cfg.default_provider.is_none() {
                 cfg.default_provider = resolved.harness.default_provider.clone();
             }
@@ -543,7 +586,7 @@ pub fn discover_config_with_restricted(
 
     if let Some(repo) = restricted_repo {
         if !layers.iter().any(|layer| layer == repo) {
-            apply_restricted_layer(repo, &mut resolved.harness)?;
+            apply_restricted_layer(repo, &mut resolved)?;
         }
     }
 
@@ -556,8 +599,11 @@ pub fn discover_config_with_restricted(
 const MAX_RESTRICTED_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// Liest `config.toml` eines nicht vertrauten Layers und mischt nur
-/// verengende Schlüssel in `harness` (siehe [`discover_config_with_restricted`]).
-fn apply_restricted_layer(base: &Path, harness: &mut HarnessConfig) -> ConfigResult<()> {
+/// verengende Schlüssel in `resolved` (siehe
+/// [`discover_config_with_restricted`]). `[web]` wird dabei **nie**
+/// berücksichtigt ("Web-Bind nicht vom Repo", W3 `C-CFG`): weder verengend
+/// noch erweiternd, unabhängig davon, ob es im Repo-Layer vorkommt.
+fn apply_restricted_layer(base: &Path, resolved: &mut ResolvedConfig) -> ConfigResult<()> {
     match std::fs::symlink_metadata(base) {
         Ok(meta) if meta.file_type().is_dir() => {}
         Ok(_) => return Ok(()),
@@ -574,12 +620,145 @@ fn apply_restricted_layer(base: &Path, harness: &mut HarnessConfig) -> ConfigRes
     };
     // Typprüfung (deny_unknown_fields) plus Präsenzprüfung: nur ausdrücklich
     // gesetzte Schlüssel wirken, Serde-Defaults des Repo-Layers nie.
-    let restricted: HarnessConfig =
-        toml::from_str(&content).map_err(|e| ConfigError::TomlParse(e.to_string()))?;
     let fields: toml::Value =
         toml::from_str(&content).map_err(|e| ConfigError::TomlParse(e.to_string()))?;
-    merge_restricted_harness(harness, &restricted, &fields);
+    let mut harness_fields = fields.clone();
+    strip_new_sections(&mut harness_fields);
+    let restricted: HarnessConfig = harness_fields
+        .try_into()
+        .map_err(|e: toml::de::Error| ConfigError::TomlParse(e.to_string()))?;
+    merge_restricted_harness(&mut resolved.harness, &restricted, &fields);
+
+    // [network]/[browser]/[dod]: nur verengend, nie erweiternd (siehe je
+    // Merge-Funktion). `geckodriver_path`/`geckodriver_sha256`/`proof_key_dir`
+    // werden nie aus dem Repo-Layer übernommen (Umlenkung auf fremde
+    // Binaries/Schlüssel wäre Rechteausweitung, kein Verengen).
+    if let Some(section) = extract_section::<NetworkSection>(&fields, "network")? {
+        merge_restricted_network(&mut resolved.network, &section, &fields);
+    }
+    if let Some(section) = extract_section::<BrowserSection>(&fields, "browser")? {
+        merge_restricted_browser(&mut resolved.browser, &section, &fields);
+    }
+    if let Some(section) = extract_section::<DodSection>(&fields, "dod")? {
+        merge_restricted_dod(&mut resolved.dod, &section, &fields);
+    }
     Ok(())
+}
+
+/// Keys, die dieses Modul unabhängig von [`HarnessConfig`] parst (siehe
+/// [`extract_section`]). `harness_config.rs` kennt diese vier Tabellen
+/// (noch) nicht als eigene Felder — Folgearbeit, siehe
+/// `docs/remediation/ledger/W3/C-CFG.md`. Ohne das Entfernen dieser Keys vor
+/// der `HarnessConfig`-Deserialisierung würde
+/// `#[serde(deny_unknown_fields)]` jede `config.toml` ablehnen, die eine
+/// dieser Sektionen enthält.
+const NEW_SECTION_KEYS: [&str; 4] = ["network", "browser", "dod", "web"];
+
+/// Entfernt die in [`NEW_SECTION_KEYS`] gelisteten Top-Level-Tabellen aus
+/// `value`, damit der Rest wie zuvor als [`HarnessConfig`] deserialisiert
+/// werden kann. Kein Effekt, wenn `value` keine Tabelle ist oder die Keys
+/// fehlen.
+fn strip_new_sections(value: &mut toml::Value) {
+    if let toml::Value::Table(table) = value {
+        for key in NEW_SECTION_KEYS {
+            table.remove(key);
+        }
+    }
+}
+
+/// Deserialisiert die Top-Level-Tabelle `key` aus `fields` (falls vorhanden)
+/// unabhängig von [`HarnessConfig`] in `T` (siehe [`NEW_SECTION_KEYS`]).
+/// `Ok(None)`, wenn `key` in `fields` fehlt.
+///
+/// # Errors
+/// [`ConfigError::TomlParse`], wenn die Tabelle vorhanden, aber gegen `T`
+/// nicht deserialisierbar ist (z. B. unbekanntes Feld dank
+/// `deny_unknown_fields`).
+fn extract_section<T: serde::de::DeserializeOwned>(
+    fields: &toml::Value,
+    key: &str,
+) -> ConfigResult<Option<T>> {
+    match fields.get(key) {
+        None => Ok(None),
+        Some(value) => value
+            .clone()
+            .try_into::<T>()
+            .map(Some)
+            .map_err(|e| ConfigError::TomlParse(format!("[{key}]: {e}"))),
+    }
+}
+
+/// Ob `path` (Kette verschachtelter Tabellen-Keys) im geparsten Dokument
+/// `fields` ausdrücklich gesetzt ist. Gemeinsame Präsenzprüfung für alle
+/// `merge_restricted_*`-Funktionen dieses Moduls (gleiche Logik wie die
+/// lokale `present`-Closure in [`merge_restricted_harness`]).
+fn field_present(fields: &toml::Value, path: &[&str]) -> bool {
+    let mut value = Some(fields);
+    for key in path {
+        value = value.and_then(|table| table.get(*key));
+    }
+    value.is_some()
+}
+
+/// Monotone Übernahme für `[network]`: Hostlisten nur als Schnittmenge mit
+/// dem vertrauten Stand, `allow_private` nur in Richtung `false` (die sichere
+/// Voreinstellung).
+fn merge_restricted_network(
+    trusted: &mut NetworkSection,
+    restricted: &NetworkSection,
+    fields: &toml::Value,
+) {
+    if field_present(fields, &["network", "allow_hosts"]) {
+        trusted
+            .allow_hosts
+            .retain(|host| restricted.allow_hosts.contains(host));
+    }
+    if field_present(fields, &["network", "researcher_web_hosts"]) {
+        trusted
+            .researcher_web_hosts
+            .retain(|host| restricted.researcher_web_hosts.contains(host));
+    }
+    if field_present(fields, &["network", "allow_private"]) {
+        trusted.allow_private &= restricted.allow_private;
+    }
+}
+
+/// Monotone Übernahme für `[browser]`: `enabled` nur `true` → `false`,
+/// `allowed_origins` nur als Schnittmenge, `max_actions` nur als kleineres
+/// Limit (`0` aus dem Repo-Layer nie übernommen, siehe [`min_positive`]).
+/// `geckodriver_path`/`geckodriver_sha256` werden nie übernommen.
+fn merge_restricted_browser(
+    trusted: &mut BrowserSection,
+    restricted: &BrowserSection,
+    fields: &toml::Value,
+) {
+    if field_present(fields, &["browser", "enabled"]) {
+        trusted.enabled &= restricted.enabled;
+    }
+    if field_present(fields, &["browser", "allowed_origins"]) {
+        trusted
+            .allowed_origins
+            .retain(|origin| restricted.allowed_origins.contains(origin));
+    }
+    if field_present(fields, &["browser", "max_actions"]) {
+        trusted.max_actions = min_positive(trusted.max_actions, restricted.max_actions);
+    }
+}
+
+/// Monotone Übernahme für `[dod]`: `auto_freeze` nur in Richtung `true` (die
+/// sichere Voreinstellung, siehe `dod_toml`-Moduldoku), `allowed_cgroup_prefixes`
+/// nur als Schnittmenge. `kill_requires_human` wird nie aus dem Repo-Layer
+/// übernommen (bleibt beim vertrauten, bereits validierten Wert `true`) und
+/// `proof_key_dir` wird nie übernommen.
+fn merge_restricted_dod(trusted: &mut DodSection, restricted: &DodSection, fields: &toml::Value) {
+    if field_present(fields, &["dod", "auto_freeze"]) {
+        trusted.auto_freeze |= restricted.auto_freeze;
+    }
+    if field_present(fields, &["dod", "allowed_cgroup_prefixes"]) {
+        trusted
+            .allowed_cgroup_prefixes
+            .retain(|prefix| restricted.allowed_cgroup_prefixes.contains(prefix));
+    }
 }
 
 /// Monotone Übernahme: jede Zeile kann den vertrauten Stand nur verengen.
@@ -1963,5 +2142,200 @@ pinned_identities = [123456789]
 
         assert_eq!(catalog["local"].base_url, "http://zeta");
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn trusted_layer_sets_new_sections_and_a_later_layer_without_them_carries_forward() {
+        let home = test_directory("new-sections-home");
+        let profile = test_directory("new-sections-profile");
+        write_layer_file(
+            &home,
+            "config.toml",
+            r#"
+[network]
+allow_hosts = ["docs.rs"]
+allow_private = true
+researcher_web_hosts = ["search.example.test"]
+
+[browser]
+enabled = true
+allowed_origins = ["https://intranet.example.test"]
+max_actions = 5
+
+[dod]
+auto_freeze = false
+allowed_cgroup_prefixes = ["/sys/fs/cgroup/harw.slice/"]
+
+[web]
+bind = "::1"
+port = 8899
+token_ttl_secs = 60
+"#,
+        );
+        // Profile layer touches unrelated config only; the new sections must
+        // carry forward from home ("Home-Layer setzt"), not reset to defaults.
+        write_layer_file(&profile, "config.toml", "[logging]\nlevel = \"debug\"\n");
+
+        let config = discover_config(&[home.clone(), profile.clone()]).unwrap();
+
+        assert_eq!(config.network.allow_hosts, ["docs.rs"]);
+        assert!(config.network.allow_private);
+        assert_eq!(config.network.researcher_web_hosts, ["search.example.test"]);
+        assert!(config.browser.enabled);
+        assert_eq!(config.browser.allowed_origins, ["https://intranet.example.test"]);
+        assert_eq!(config.browser.max_actions, 5);
+        assert!(!config.dod.auto_freeze);
+        assert!(config.dod.kill_requires_human);
+        assert_eq!(
+            config.dod.allowed_cgroup_prefixes,
+            ["/sys/fs/cgroup/harw.slice/"]
+        );
+        assert_eq!(config.web.bind, "::1");
+        assert_eq!(config.web.port, 8899);
+        assert_eq!(config.web.token_ttl_secs, 60);
+        assert_eq!(config.harness.logging.level, "debug");
+
+        std::fs::remove_dir_all(home).unwrap();
+        std::fs::remove_dir_all(profile).unwrap();
+    }
+
+    #[test]
+    fn restricted_repo_narrows_network_browser_and_dod_but_never_web() {
+        let home = test_directory("restricted-new-sections-home");
+        let repo = test_directory("restricted-new-sections-repo");
+        write_layer_file(
+            &home,
+            "config.toml",
+            r#"
+[network]
+allow_hosts = ["docs.rs", "crates.io"]
+allow_private = true
+researcher_web_hosts = ["search.example.test", "wiki.example.test"]
+
+[browser]
+enabled = true
+allowed_origins = ["https://intranet.example.test", "https://docs.example.test"]
+max_actions = 50
+
+[dod]
+auto_freeze = false
+allowed_cgroup_prefixes = ["/sys/fs/cgroup/harw.slice/", "/sys/fs/cgroup/other.slice/"]
+
+[web]
+bind = "127.0.0.1"
+port = 1234
+token_ttl_secs = 900
+"#,
+        );
+        write_layer_file(
+            &repo,
+            "config.toml",
+            r#"
+[network]
+allow_hosts = ["docs.rs", "evil.example"]
+allow_private = false
+researcher_web_hosts = ["search.example.test", "evil.example"]
+
+[browser]
+enabled = false
+allowed_origins = ["https://intranet.example.test", "https://evil.example"]
+max_actions = 3
+
+[dod]
+auto_freeze = true
+allowed_cgroup_prefixes = ["/sys/fs/cgroup/harw.slice/", "/sys/fs/cgroup/evil.slice/"]
+
+[web]
+bind = "0.0.0.0"
+port = 80
+token_ttl_secs = 999999
+"#,
+        );
+
+        let config =
+            discover_config_with_restricted(std::slice::from_ref(&home), Some(repo.as_path()))
+                .unwrap();
+
+        // [network]: Hostlisten nur Schnittmenge, allow_private nur -> false.
+        assert_eq!(config.network.allow_hosts, ["docs.rs"]);
+        assert!(!config.network.allow_private);
+        assert_eq!(config.network.researcher_web_hosts, ["search.example.test"]);
+
+        // [browser]: enabled nur true->false, allowed_origins Schnittmenge,
+        // max_actions nur kleineres Limit.
+        assert!(!config.browser.enabled);
+        assert_eq!(
+            config.browser.allowed_origins,
+            ["https://intranet.example.test"]
+        );
+        assert_eq!(config.browser.max_actions, 3);
+
+        // [dod]: auto_freeze nur Richtung true (Repo versucht true -> bleibt
+        // true, das ist die sichere Richtung, kein Erweitern), Präfixe
+        // Schnittmenge; kill_requires_human unveraendert vom Repo.
+        assert!(config.dod.auto_freeze);
+        assert!(config.dod.kill_requires_human);
+        assert_eq!(
+            config.dod.allowed_cgroup_prefixes,
+            ["/sys/fs/cgroup/harw.slice/"]
+        );
+
+        // [web]: "Web-Bind nicht vom Repo" -- unveraendert, trotz abweichender
+        // Werte im Repo-Layer (0.0.0.0, Port 80, riesiges TTL).
+        assert_eq!(config.web.bind, "127.0.0.1");
+        assert_eq!(config.web.port, 1234);
+        assert_eq!(config.web.token_ttl_secs, 900);
+
+        assert!(config.network.validate().is_ok());
+        assert!(config.browser.validate().is_ok());
+        assert!(config.dod.validate().is_ok());
+        assert!(config.web.validate().is_ok());
+
+        std::fs::remove_dir_all(home).unwrap();
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn restricted_repo_cannot_widen_network_browser_or_dod() {
+        let home = test_directory("restricted-widen-home");
+        let repo = test_directory("restricted-widen-repo");
+        // Trusted home stays maximally restrictive (safe defaults); the repo
+        // layer tries to widen every direction.
+        write_layer_file(&home, "config.toml", "");
+        write_layer_file(
+            &repo,
+            "config.toml",
+            r#"
+[network]
+allow_hosts = ["evil.example"]
+allow_private = true
+researcher_web_hosts = ["evil.example"]
+
+[browser]
+enabled = true
+allowed_origins = ["https://evil.example"]
+max_actions = 999
+
+[dod]
+auto_freeze = false
+allowed_cgroup_prefixes = ["/sys/fs/cgroup/evil.slice/"]
+"#,
+        );
+
+        let config =
+            discover_config_with_restricted(std::slice::from_ref(&home), Some(repo.as_path()))
+                .unwrap();
+
+        assert!(config.network.allow_hosts.is_empty());
+        assert!(!config.network.allow_private);
+        assert!(config.network.researcher_web_hosts.is_empty());
+        assert!(!config.browser.enabled);
+        assert!(config.browser.allowed_origins.is_empty());
+        assert_eq!(config.browser.max_actions, 20);
+        assert!(config.dod.auto_freeze);
+        assert!(config.dod.allowed_cgroup_prefixes.is_empty());
+
+        std::fs::remove_dir_all(home).unwrap();
+        std::fs::remove_dir_all(repo).unwrap();
     }
 }

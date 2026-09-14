@@ -88,6 +88,19 @@ const MISSING_PLAN_SERVICES: &str =
 /// (CONTRACTS-W2d2.md E3): without a home there is no runtime assembly.
 const MISSING_RUNTIME_ROOT: &str = "job runtime requires a HARW home";
 
+/// Reason recorded when [`RuntimeAssembly::builder`]`.build()` fails while
+/// assembling a job's runtime (R3). The real `RuntimeError` can name
+/// configuration paths, project roots or trust details; only this fixed
+/// literal ever becomes the job's `Failed{reason}`, which returns to the MCP
+/// client verbatim via the `harw_job_status` tool. The full detail is logged
+/// with `tracing::error!` at the failure site instead.
+const RUNTIME_ASSEMBLY_FAILED_REASON: &str = "could not assemble the job runtime";
+
+/// Reason recorded when [`RuntimeAssembly::new_root_session`] fails after a
+/// successful assembly (R3). Same externalisation rule as
+/// [`RUNTIME_ASSEMBLY_FAILED_REASON`].
+const RUNTIME_SESSION_FAILED_REASON: &str = "could not create the job root session";
+
 /// Home and working directory every job runtime is assembled from.
 ///
 /// # Description
@@ -848,6 +861,24 @@ impl ModelProvider for BudgetedModelProvider {
     }
 }
 
+// Operator id used to build a plan-node job's own trust principal (R7).
+// `PlanNodeServices::actor()` is a mutation *label* recorded on plan changes
+// (see its doc comment), never a trust identity, so it must not become the
+// job's `Principal::id`. The trust identity instead comes from the job's own
+// `JobClaim::scope` — exactly as a prompt job's identity comes from its scope
+// (`check_prompt_claim_scope`). A plan node is admitted internally by
+// `harw_plan_bridge::PlanJobBridge::admit_ready_nodes`, not by an
+// authenticated MCP operator, so its scope carries no meaningful submitter in
+// practice: the fixed literal names that plainly instead of smuggling a
+// mutation label into an identity field.
+fn plan_node_submitter_id(claim: &JobClaim) -> String {
+    match claim.scope.submitter() {
+        harw_types::ApprovalActor::Operator { id } if is_scope_identifier(id) => id.to_owned(),
+        harw_types::ApprovalActor::Operator { .. }
+        | harw_types::ApprovalActor::ChannelPeer { .. } => "plan-controller".to_owned(),
+    }
+}
+
 // The plan-node path: typed payload, contract-derived permissions, role-derived
 // registry profile (both applied as a `RuntimeNarrowing` of
 // `EntryKind::JobPlanNode`), and a mandatory report back into the plan.
@@ -943,7 +974,7 @@ async fn execute_plan_node_claim(
             entry,
             home: &runtime_root.home,
             cwd: sandbox.workspace().canonical_root(),
-            principal: job_principal(services.actor()),
+            principal: job_principal(&plan_node_submitter_id(&claim)),
             session_id: durable_session_id(&claim),
             state_store: job_state_store(&context.transcript_root),
             job_store,
@@ -1085,6 +1116,13 @@ fn job_state_store(transcript_root: &Path) -> Arc<dyn StateStore> {
 //
 // Returns the turn setup and the assembly's model, or the sanitized `Failed`
 // reason of a failed assembly, workspace-root check or root session.
+//
+// R3: the assembly and root-session failure reasons below are fixed literals,
+// never the `RuntimeError`/`Display` text itself. That text can name paths,
+// config files or trust details (the reason this job worker returns is a
+// `JobOutcome::Failed{reason}` that goes back to the MCP client verbatim via
+// the `harw_job_status` tool — see `check_prompt_claim_scope`'s comment on
+// scope values for the same rule). The full detail is logged locally instead.
 fn assemble_job_turn(
     inputs: JobAssemblyInputs<'_>,
     pause: PauseDisposition,
@@ -1093,10 +1131,12 @@ fn assemble_job_turn(
     let session_id = inputs.session_id.clone();
     let state_store = Arc::clone(&inputs.state_store);
     let assembly: RuntimeAssembly = job_assembly(inputs).map_err(|error| {
-        format!(
-            "could not assemble the job runtime: {}",
-            sanitize_failure(&error)
-        )
+        tracing::error!(
+            job_id = %session_id.as_str(),
+            error = %error,
+            "job runtime assembly failed"
+        );
+        RUNTIME_ASSEMBLY_FAILED_REASON.to_owned()
     })?;
     if let Some(required) = required_sandbox {
         ensure_same_workspace_root(assembly.sandbox(), required)
@@ -1106,12 +1146,14 @@ fn assemble_job_turn(
     let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
     let (turn_tx, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
     let root = assembly
-        .new_root_session(session_id, event_tx, turn_tx, None)
+        .new_root_session(session_id.clone(), event_tx, turn_tx, None)
         .map_err(|error| {
-            format!(
-                "could not create the job root session: {}",
-                sanitize_failure(&error.to_string())
-            )
+            tracing::error!(
+                job_id = %session_id.as_str(),
+                error = %error,
+                "job root session creation failed"
+            );
+            RUNTIME_SESSION_FAILED_REASON.to_owned()
         })?;
     Ok((
         TurnSetup {
@@ -1201,6 +1243,15 @@ fn paused_turn_outcome(outcome: &TurnOutcome, disposition: PauseDisposition) -> 
         TurnOutcome::AwaitingChild { child, role, .. } => format!(
             "turn handed off to child session '{child}' in role '{role}'; the job worker cannot resume a child"
         ),
+        // Terminale Ausgänge sind keine Pause, landen hier aber im selben
+        // Bericht: der Job endet, und der Grund steht im Klartext darin.
+        TurnOutcome::Cancelled { reason } => format!("job turn was cancelled: {reason:?}"),
+        TurnOutcome::Truncated => "job turn stopped: model output was truncated".to_owned(),
+        TurnOutcome::Refused { detail } => match detail {
+            Some(detail) => format!("job turn was refused: {detail}"),
+            None => "job turn was refused".to_owned(),
+        },
+        TurnOutcome::Failed { reason } => format!("job turn failed: {reason}"),
     };
     match disposition {
         PauseDisposition::Blocked => JobOutcome::Blocked { reason },
@@ -2722,6 +2773,12 @@ mod tests {
         assert!(permissions.contains(Permission::ReadWorkspace));
         assert!(!permissions.contains(Permission::WriteWorkspace));
         assert!(!permissions.contains(Permission::ExecuteProcess));
+        // R7: `EntryKind::JobPlanNode` has `OperationSurface::None`
+        // (harw-runtime/src/spec.rs) regardless of registry profile, so a
+        // plan-node assembly never has an operations surface for the
+        // principal's `PermissionTier` (now `Observer`, see `job_principal`)
+        // to gate.
+        assert_eq!(assembly.operations().iter().count(), 0);
     }
 
     // ── Workspace-root check (W2d-2 J1-F) ─────────────────────────────────
@@ -2800,6 +2857,49 @@ mod tests {
         assert_eq!(ensure_same_workspace_root(&assembled, &derived), Ok(()));
     }
 
+    // ── Assembly failure reasons never leak paths (R3) ─────────────────────
+
+    #[test]
+    fn test_assemble_job_turn_prompt_assembly_failure_reason_is_fixed_and_path_free() {
+        let temp = temp_dir();
+        let runtime = runtime_root_under(temp.path());
+        // A cwd that does not exist fails project discovery
+        // (`harw_project_discovery::DiscoveryError::InvalidCwd`), whose
+        // `Display` names the offending path verbatim — exactly the detail
+        // that must never reach the job's `Failed{reason}`.
+        let missing_cwd = temp.path().join("does-not-exist");
+
+        let result = assemble_job_turn(
+            JobAssemblyInputs {
+                entry: JobEntry::Prompt,
+                home: &runtime.home,
+                cwd: &missing_cwd,
+                principal: job_principal("operator"),
+                session_id: SessionId::from_str("durable-job-missing-cwd"),
+                state_store: job_state_store(temp.path()),
+                job_store: Arc::new(JobStore::new(temp.path())),
+                model: Arc::new(EchoModelProvider::new("x")),
+                narrowing: None,
+            },
+            PauseDisposition::Blocked,
+            None,
+        );
+
+        let reason = match result {
+            Ok(_) => panic!("assembly against a missing cwd must fail"),
+            Err(reason) => reason,
+        };
+        assert_eq!(reason, RUNTIME_ASSEMBLY_FAILED_REASON);
+        assert!(
+            !reason.contains(&missing_cwd.display().to_string()),
+            "the reason must not name the cwd path: {reason}"
+        );
+        assert!(
+            !reason.contains("does-not-exist"),
+            "the reason must not name the cwd path: {reason}"
+        );
+    }
+
     #[tokio::test]
     async fn test_plan_node_under_a_marked_parent_directory_binds_the_workspace_root() {
         let temp = temp_dir();
@@ -2829,10 +2929,28 @@ mod tests {
         ) {
             panic!("create plan: {error}");
         }
+        // C-PLAN: `AddNode` now accepts only `Draft` nodes
+        // (`harw-plan/src/validate.rs::validate_add_node`). Insert the node as
+        // `Draft` (the fixture default) and move it to `Ready` via the
+        // allowed `Draft -> Ready` transition, atomically in one batch against
+        // the store's current revision.
         let mut node = harw_plan::testing::base_node("t-1");
         node.kind = PlanNodeKind::Research;
-        node.status = PlanNodeStatus::Ready;
-        if let Err(error) = plan.apply(PlanAction::AddNode { node }, "test") {
+        let node_id = node.id.clone();
+        let expected_rev = plan.revision();
+        if let Err(error) = plan.apply_batch(
+            &PlanId::new("p-test"),
+            vec![
+                PlanAction::AddNode { node },
+                PlanAction::SetStatus {
+                    id: node_id,
+                    status: PlanNodeStatus::Ready,
+                    reason: None,
+                },
+            ],
+            "test",
+            expected_rev,
+        ) {
             panic!("add node: {error}");
         }
         let plan: Arc<dyn PlanStore> = Arc::new(plan);

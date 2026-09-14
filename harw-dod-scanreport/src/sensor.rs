@@ -3,10 +3,21 @@
 //! # Verantwortungsbereich
 //! Implementiert `trait` [`harw_dod_signals::Sensor`] für genau eine Quelle:
 //! ein Verzeichnis mit Berichtsdateien fremder Scanner (typischerweise
-//! [`harw_home::paths::scan_reports_dir`]). Jeder Dateizugriff läuft über
-//! `harw_dod_readfs` — [`harw_dod_readfs::glob::glob`] zum Auffinden der
+//! [`harw_home::paths::scan_reports_dir`]). Jeder **Inhaltszugriff** läuft
+//! über `harw_dod_readfs` — [`harw_dod_readfs::glob::glob`] zum Auffinden der
 //! Berichtsdateien, [`harw_dod_readfs::read_to_string`] zum Lesen ihres
-//! Inhalts. Diese Datei ruft **niemals** `std::fs` direkt auf.
+//! Inhalts.
+//!
+//! **Eine bewusste, eng begrenzte Ausnahme seit F-064:**
+//! [`open_if_regular_file`] ruft `std::fs::OpenOptions` mit `O_NONBLOCK`
+//! direkt auf, um vor jedem Inhaltszugriff zu prüfen, dass ein Glob-Treffer
+//! tatsächlich eine reguläre Datei ist — eine FIFO ohne Schreiber ließ
+//! `File::open` (wie es `harw_dod_readfs::read_to_string` innen ausführt)
+//! zuvor unbegrenzt blockieren. Diese eine Funktion liest nie Inhalt aus dem
+//! geöffneten Deskriptor und trifft keine Bereichsentscheidung (das bleibt
+//! Sache von `harw_dod_cap::ReadScope`, wie gehabt über `harw_dod_readfs`)
+//! — sie beantwortet ausschließlich „ist das eine reguläre Datei?", siehe
+//! deren Dokumentation für die Begründung und das verbleibende Restrisiko.
 //!
 //! # Warum genau zwei Dateiendungen
 //! [`glob_patterns_for_root`] baut Muster für `*.json` und `*.sarif` —
@@ -167,7 +178,11 @@ impl Sensor for ScanReportSensor {
     /// [`SensorError::OutsideScope`]/[`SensorError::Io`], wenn das Lesen
     /// selbst scheitert ([`harw_dod_readfs::read_to_string`]). Ein leerer
     /// oder (noch) nicht existierender Berichtsordner liefert ein leeres
-    /// [`SensorReading`], **keinen** Fehler.
+    /// [`SensorReading`], **keinen** Fehler. Ein Kandidat, der sich beim
+    /// Öffnen nicht als reguläre Datei erweist (FIFO, Gerätedatei oder ein
+    /// Verzeichnis, dessen Name zufällig auf `.json`/`.sarif` endet — F-064),
+    /// wird stillschweigend übersprungen statt den Abruf scheitern zu
+    /// lassen oder unbegrenzt zu blockieren; siehe [`open_if_regular_file`].
     fn poll(&self, now: Timestamp) -> Result<SensorReading, SensorError> {
         let scope = self.handle.scope();
 
@@ -182,6 +197,17 @@ impl Sensor for ScanReportSensor {
 
         let mut events = Vec::new();
         for path in paths {
+            // F-064: vor jedem Lesen erst per nicht-blockierendem Öffnen +
+            // `fstat` sicherstellen, dass der Kandidat tatsächlich eine
+            // reguläre Datei ist. Ein `File::open` (wie es
+            // `harw_dod_readfs::read_to_string` unten ausführt) blockiert
+            // sonst unbegrenzt auf einer FIFO ohne Schreiber — ein
+            // unprivilegierter Nutzer könnte damit gezielt jeden künftigen
+            // Abruf dieses Sensors dauerhaft einfrieren.
+            if open_if_regular_file(&path).is_none() {
+                continue;
+            }
+
             let content =
                 harw_dod_readfs::read_to_string(scope, &path).map_err(map_read_fs_error)?;
             let mut parsed = parse_report(&content, self.handle.id(), now)?;
@@ -192,6 +218,86 @@ impl Sensor for ScanReportSensor {
             samples: Vec::new(),
             events,
         })
+    }
+}
+
+/// Öffnet `path` nicht-blockierend und liefert `Some`, nur wenn `fstat` auf
+/// dem bereits offenen Deskriptor bestätigt, dass es sich um eine reguläre
+/// Datei handelt — sonst `None`, ohne dass das zugrunde liegende `open()`
+/// jemals auf einer FIFO ohne Schreiber blockieren konnte (F-064).
+///
+/// # Warum `O_NONBLOCK` statt einer vorherigen `stat`/`symlink_metadata`-Prüfung
+/// Eine Typprüfung **vor** dem Öffnen hätte eine TOCTOU-Lücke: der Dateityp
+/// könnte sich zwischen Prüfung und `open()` ändern (dieselbe Lücke bliebe
+/// zwischen einem `stat` hier und dem späteren, tatsächlichen Lesen über
+/// [`harw_dod_readfs::read_to_string`] ohnehin bestehen — siehe „Restrisiko"
+/// unten). `O_NONBLOCK` lässt `open()` dagegen auf **jedem** Dateityp sofort
+/// zurückkehren: bei einer FIFO ohne Schreiber liefert es sofort einen
+/// Deskriptor, der (noch) keine Daten trägt, statt zu blockieren, bis ein
+/// Schreiber verbindet. Das anschließende `fstat` prüft den Typ der
+/// tatsächlich geöffneten Datei anhand ihres Deskriptors — kein erneuter
+/// Pfadzugriff, also keine zusätzliche TOCTOU-Lücke zwischen Typprüfung und
+/// diesem einen `open()`-Aufruf.
+///
+/// Kein `harw-fsutil`-`O_NOFOLLOW`-Pfad: `harw-fsutil` ist zum Zeitpunkt
+/// dieser Korrektur keine Abhängigkeit dieser Crate (siehe Ledger
+/// `docs/remediation/ledger/W5/D-SEC.md`); Symlink-Auflösung ist ohnehin
+/// bereits Aufgabe von `harw_dod_cap::ReadScope` (über
+/// [`harw_dod_readfs::glob::glob`]/[`harw_dod_readfs::read_to_string`]) —
+/// diese Funktion prüft ausschließlich den Dateityp, nicht die
+/// Bereichszugehörigkeit.
+///
+/// # Warum das Literal `0o4000` statt einer `libc`/`rustix`-Abhängigkeit
+/// `O_NONBLOCK` ist auf Linux ABI-stabil `0o4000` (`<fcntl.h>`, `asm-generic`);
+/// dieser Workspace baut ausschließlich für Linux (x86_64/aarch64 — siehe
+/// Ledger `docs/remediation/ledger/W3/C-FIXT.md`, Abschnitt API-Nachweis).
+/// Eine neue Abhängigkeit nur für diese eine, plattformweit garantierte
+/// Konstante wäre eine unnötige `dep-request`.
+///
+/// # Restrisiko (TOCTOU)
+/// Dieser Aufruf öffnet, prüft den Typ und schließt den Deskriptor sofort
+/// wieder (er liest nie Inhalt aus ihm); die eigentliche Leseoperation
+/// öffnet `path` danach über [`harw_dod_readfs::read_to_string`] ein
+/// zweites Mal. Zwischen beiden Aufrufen könnte ein Angreifer mit
+/// Schreibzugriff auf dasselbe Verzeichnis den Pfad erneut gegen eine FIFO
+/// austauschen — dieselbe Restlücke, die auch `harw-dod-cap`s
+/// `ReadScope::open` zwischen Kanonisierung und `File::open` trägt (siehe
+/// Ledger `docs/remediation/ledger/W3/C-SCOPE.md`, Abschnitt „Offene
+/// Annahmen"). Ein vollständiger Fix bräuchte eine `openat2`-gestützte
+/// Grundfunktion in `harw-dod-cap`/`harw-dod-readfs` (außerhalb dieser
+/// Zuständigkeit) statt eines zweiten, unabhängigen `open()`-Aufrufs hier.
+/// Diese Korrektur schließt den **unbedingten** Block auf einer dauerhaft
+/// unbeschriebenen FIFO vollständig — das war die eigentliche Störung
+/// („alle 10 Sensoren stehen"), nicht das theoretische Wettlauffenster.
+///
+/// # Arguments
+/// - `path` (`&Path`): der zu prüfende Kandidat, unverändert wie von
+///   [`harw_dod_readfs::glob::glob`] geliefert.
+///
+/// # Returns
+/// `Some(File)` (bereits geöffnet, aber ungenutzt — der Aufrufer verwirft
+/// ihn und liest über [`harw_dod_readfs::read_to_string`] neu) für eine
+/// reguläre Datei; `None`, wenn `path` nicht existiert, sich nicht öffnen
+/// lässt, oder etwas anderes als eine reguläre Datei ist (FIFO,
+/// Gerätedatei, Socket, Verzeichnis).
+fn open_if_regular_file(path: &Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    /// `O_NONBLOCK`, siehe Funktionsdokumentation für die Begründung des
+    /// Literals.
+    const O_NONBLOCK: i32 = 0o4000;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK)
+        .open(path)
+        .ok()?;
+
+    let metadata = file.metadata().ok()?;
+    if metadata.file_type().is_file() {
+        Some(file)
+    } else {
+        None
     }
 }
 
@@ -223,18 +329,23 @@ fn glob_patterns_for_root(root: &Path) -> Vec<String> {
 ///
 /// `Scope` reicht den bereits inhaltsfreien inneren [`SensorError`]
 /// unverändert durch. `TooLarge` (die Datei überschreitet
-/// `harw_dod_readfs::MAX_READ_BYTES`) wird als
-/// [`SensorError::MalformedSource`] gewertet — eine Berichtsdatei dieser
-/// Größe hat für diesen Sensor keine erwartbare Form. Die beiden
-/// Glob-Musterfehler betreffen ausschließlich von dieser Crate selbst
-/// gebaute Muster ([`glob_patterns_for_root`]), nie einen vom Bericht
-/// gelieferten Wert; ihr Auftreten wäre ein interner Konstruktionsfehler
-/// dieser Crate, kein Aussagefehler über die Quelle — sie werden konservativ
-/// als [`SensorError::SourceUnavailable`] gemeldet.
+/// `harw_dod_readfs::MAX_READ_BYTES`) und `GlobLimitExceeded` (das
+/// Berichtsverzeichnis überschreitet `harw_dod_readfs::glob`s Kandidaten-
+/// oder Mustergrenze — z. B. mehr als `MAX_GLOB_CANDIDATES` Dateien) werden
+/// beide als [`SensorError::MalformedSource`] gewertet: eine Quelle dieser
+/// Größe hat für diesen Sensor keine erwartbare Form, unabhängig davon, ob
+/// die Grenze am Dateiinhalt oder an der Verzeichnisgröße greift. Die beiden
+/// Glob-Musterfehler (`GlobPatternAbsolute`, `GlobPatternTraversal`)
+/// betreffen ausschließlich von dieser Crate selbst gebaute Muster
+/// ([`glob_patterns_for_root`]), nie einen vom Bericht gelieferten Wert;
+/// ihr Auftreten wäre ein interner Konstruktionsfehler dieser Crate, kein
+/// Aussagefehler über die Quelle — sie werden konservativ als
+/// [`SensorError::SourceUnavailable`] gemeldet.
 fn map_read_fs_error(err: harw_dod_readfs::ReadFsError) -> SensorError {
     match err {
         harw_dod_readfs::ReadFsError::Scope(inner) => inner,
-        harw_dod_readfs::ReadFsError::TooLarge { .. } => SensorError::MalformedSource,
+        harw_dod_readfs::ReadFsError::TooLarge { .. }
+        | harw_dod_readfs::ReadFsError::GlobLimitExceeded { .. } => SensorError::MalformedSource,
         harw_dod_readfs::ReadFsError::GlobPatternAbsolute { .. }
         | harw_dod_readfs::ReadFsError::GlobPatternTraversal { .. } => {
             SensorError::SourceUnavailable
@@ -524,5 +635,79 @@ mod tests {
             .poll(Timestamp::UNIX_EPOCH)
             .expect_err("unbekannte Form muss scheitern");
         assert!(matches!(err, SensorError::MalformedSource));
+    }
+
+    // --- F-064: reguläre-Datei-Prüfung vor jedem Lesezugriff ---------------
+
+    #[test]
+    fn test_open_if_regular_file_accepts_regular_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("report.json");
+        fs::write(&file, "{}").expect("write fixture");
+
+        assert!(
+            open_if_regular_file(&file).is_some(),
+            "eine reguläre Datei muss als solche erkannt werden"
+        );
+    }
+
+    /// F-064, Kernbeleg: ein Verzeichnis, dessen Name auf `.json` endet
+    /// (deshalb ein Glob-Treffer), ist keine reguläre Datei.
+    #[test]
+    fn test_open_if_regular_file_rejects_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake_report_dir = dir.path().join("looks-like-a-report.json");
+        fs::create_dir(&fake_report_dir).expect("Verzeichnis anlegen");
+
+        assert!(
+            open_if_regular_file(&fake_report_dir).is_none(),
+            "ein Verzeichnis darf nicht als reguläre Datei durchgehen"
+        );
+    }
+
+    #[test]
+    fn test_open_if_regular_file_rejects_missing_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("fehlt.json");
+
+        assert!(open_if_regular_file(&missing).is_none());
+    }
+
+    /// F-064, Abrufebene: ein Verzeichnis, das wie ein Bericht benannt ist,
+    /// darf weder den Abruf scheitern lassen noch einen Treffer für seinen
+    /// eigenen Inhalt erzeugen — die Treffer eines echten Nachbarn müssen
+    /// trotzdem ankommen. Steht stellvertretend für die FIFO-Variante aus dem
+    /// Befund (siehe `open_if_regular_file`-Unit-Tests oben und Ledger
+    /// `docs/remediation/ledger/W5/D-SEC.md` für die Begründung, warum eine
+    /// echte FIFO ohne neue Testabhängigkeit hier nicht angelegt werden
+    /// kann).
+    #[test]
+    fn test_poll_skips_directory_shaped_like_a_report_but_still_reports_sibling_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::create_dir(dir.path().join("looks-like-a-report.json")).expect("Verzeichnis anlegen");
+        fs::write(dir.path().join("real-report.sarif"), VALID_SARIF).expect("write fixture");
+
+        let sensor = sensor_for(dir.path());
+        let reading = sensor
+            .poll(Timestamp::UNIX_EPOCH)
+            .expect("ein gleichnamiges Verzeichnis darf den Abruf nicht scheitern lassen");
+
+        assert_eq!(
+            reading.events.len(),
+            2,
+            "die zwei Treffer aus der echten Nachbardatei müssen trotzdem ankommen"
+        );
+    }
+
+    // --- F-064: `GlobLimitExceeded` ist erschöpfend behandelt --------------
+
+    #[test]
+    fn test_map_read_fs_error_glob_limit_exceeded_maps_to_malformed_source() {
+        let err = harw_dod_readfs::ReadFsError::GlobLimitExceeded {
+            pattern: "scan_reports/*.json".to_owned(),
+            limit_name: "candidates",
+            limit: 4096,
+        };
+        assert!(matches!(map_read_fs_error(err), SensorError::MalformedSource));
     }
 }

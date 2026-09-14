@@ -1,11 +1,18 @@
-//! Firefox host construction and pre-I/O request validation.
+//! Firefox host construction, pre-I/O request validation and session start (B-ADAPT).
+//!
+//! # Description
+//! `open` validates the request (`OpenBrowserRequest::validate`), requires a
+//! pinned geckodriver and a sandbox launcher from host configuration, starts
+//! the driver through [`crate::launcher::launch_pinned_driver`], navigates to
+//! the start URL and verifies the observed location before the session is
+//! handed out. There is no managed driver fallback.
 
 use crate::bidi_pump::BidiPump;
 use crate::capabilities::FirefoxCapabilityFactory;
 use crate::config::FirefoxHostConfig;
 use crate::driver::FirefoxDriver;
 use crate::error::{AdapterError, DriverOperation};
-use crate::journal::EventJournalPolicy;
+use crate::launcher::launch_pinned_driver;
 use crate::runtime::FirefoxRuntime;
 use async_trait::async_trait;
 use harw_browser::capability::CapabilityStatus;
@@ -35,7 +42,8 @@ pub struct FirefoxBindingMetadata {
     pub capability_id: &'static str,
     pub browser_name: &'static str,
     pub webdriver_bidi: bool,
-    pub managed_driver_available: bool,
+    /// Always `true`: geckodriver must be pinned by path and SHA-256 and runs sandboxed.
+    pub pinned_driver_required: bool,
 }
 
 static FIREFOX_BINDING_METADATA: FirefoxBindingMetadata = FirefoxBindingMetadata {
@@ -43,7 +51,7 @@ static FIREFOX_BINDING_METADATA: FirefoxBindingMetadata = FirefoxBindingMetadata
     capability_id: FIREFOX_CAPABILITY_ID,
     browser_name: "firefox",
     webdriver_bidi: true,
-    managed_driver_available: true,
+    pinned_driver_required: true,
 };
 
 /// Owns configuration for Firefox sessions provided by this adapter.
@@ -71,7 +79,8 @@ impl FirefoxHost {
     pub fn new(config: FirefoxHostConfig) -> Result<Self, AdapterError> {
         tracing::debug!(
             binding_id = FIREFOX_BIDI_BINDING_ID,
-            managed_driver = config.managed_driver(),
+            geckodriver_pinned = config.geckodriver_pin().is_some(),
+            launcher_configured = config.launcher().is_some(),
             explicit_firefox_binary = config.firefox_binary().is_some(),
             "constructed Firefox browser host"
         );
@@ -98,33 +107,10 @@ impl FirefoxHost {
         fields(binding_id = FIREFOX_BIDI_BINDING_ID, start_url = %request.start_url)
     )]
     pub fn validate_open_request(&self, request: &OpenBrowserRequest) -> harw_browser::Result<()> {
-        if !request.allowed_origins.is_allowed(&request.start_url) {
-            let origin = request.start_url.origin().ascii_serialization();
-            tracing::warn!(origin, "rejected browser start URL outside origin policy");
-            return Err(BrowserError::OriginNotAllowed { origin });
+        if let Err(error) = request.validate() {
+            tracing::warn!(%error, "rejected browser open request before driver start");
+            return Err(error);
         }
-
-        if let Some(viewport) = request.viewport {
-            if viewport.width == 0 {
-                tracing::warn!(
-                    height = viewport.height,
-                    "rejected zero-width browser viewport"
-                );
-                return Err(BrowserError::InvalidArgument {
-                    detail: "viewport width must be greater than zero".to_owned(),
-                });
-            }
-            if viewport.height == 0 {
-                tracing::warn!(
-                    width = viewport.width,
-                    "rejected zero-height browser viewport"
-                );
-                return Err(BrowserError::InvalidArgument {
-                    detail: "viewport height must be greater than zero".to_owned(),
-                });
-            }
-        }
-
         tracing::debug!("browser open request passed pre-driver validation");
         Ok(())
     }
@@ -137,15 +123,24 @@ impl BrowserHost for FirefoxHost {
         request: OpenBrowserRequest,
     ) -> harw_browser::Result<BrowserSessionHandle> {
         self.validate_open_request(&request)?;
-        if !self.config.managed_driver() {
-            return Err(BrowserError::CapabilityUnavailable {
-                detail: "the Firefox adapter currently requires managed geckodriver lifecycle"
+        let pin = self.config.geckodriver_pin().ok_or_else(|| {
+            BrowserError::CapabilityUnavailable {
+                detail: "no pinned geckodriver (path + SHA-256) is configured for the Firefox adapter"
                     .to_owned(),
-            });
-        }
+            }
+        })?;
+        let launcher = self.config.launcher().ok_or_else(|| {
+            BrowserError::CapabilityUnavailable {
+                detail: "no sandbox launcher is configured for the Firefox adapter".to_owned(),
+            }
+        })?;
 
         let plan = FirefoxCapabilityFactory::new(&self.config).plan(&request)?;
-        let driver = FirefoxDriver::start(plan)
+        let event_policy = self.config.journal_policy()?;
+        let launched = launch_pinned_driver(launcher.as_ref(), pin)
+            .await
+            .map_err(BrowserError::from)?;
+        let mut driver = FirefoxDriver::start(plan, launched)
             .await
             .map_err(BrowserError::from)?;
 
@@ -156,7 +151,7 @@ impl BrowserHost for FirefoxHost {
                 Ok(_) => CapabilityStatus::Native,
                 Err(error) if matches!(request.bidi, BiDiRequirement::Required) => {
                     let detail = error.to_string();
-                    let _ = driver.quit().await;
+                    quit_after_failed_open(&mut driver).await;
                     return Err(BrowserError::CapabilityUnavailable {
                         detail: format!(
                             "Firefox WebDriver BiDi was required but connection failed: {detail}"
@@ -179,18 +174,35 @@ impl BrowserHost for FirefoxHost {
                 .set_window_rect(0, 0, viewport.width, viewport.height)
                 .await
             {
-                let _ = driver.quit().await;
+                quit_after_failed_open(&mut driver).await;
                 return Err(driver_error("set initial Firefox viewport", error));
             }
         }
         if let Err(error) = driver.webdriver().goto(request.start_url.as_str()).await {
-            let _ = driver.quit().await;
+            quit_after_failed_open(&mut driver).await;
             return Err(driver_error("navigate to Firefox start URL", error));
+        }
+        // The start URL may redirect; the landed location must satisfy the policy (F-009).
+        match driver.webdriver().current_url().await {
+            Ok(landed) => {
+                if let Err(error) = request.check_observed_location(&landed) {
+                    tracing::error!(
+                        origin = %landed.origin().ascii_serialization(),
+                        "Firefox start URL landed outside the origin policy"
+                    );
+                    quit_after_failed_open(&mut driver).await;
+                    return Err(error);
+                }
+            }
+            Err(error) => {
+                quit_after_failed_open(&mut driver).await;
+                return Err(driver_error("read Firefox start location", error));
+            }
         }
         let primary_window = match driver.webdriver().window().await {
             Ok(window) => window,
             Err(error) => {
-                let _ = driver.quit().await;
+                quit_after_failed_open(&mut driver).await;
                 return Err(driver_error("read primary Firefox window", error));
             }
         };
@@ -198,11 +210,10 @@ impl BrowserHost for FirefoxHost {
         let session_id = BrowserSessionId::new();
         let primary_context_id = BrowserContextId::new();
         let bidi_requirement = request.bidi;
-        let event_policy = EventJournalPolicy::bounded(1_024)?;
         let runtime = Arc::new(FirefoxRuntime::new(
             driver,
             session_id,
-            request.allowed_origins,
+            request,
             bidi_status,
             primary_context_id,
             primary_window,
@@ -232,7 +243,9 @@ impl BrowserHost for FirefoxHost {
             };
             if let Err(detail) = mapping {
                 if matches!(bidi_requirement, BiDiRequirement::Required) {
-                    let _ = <FirefoxRuntime as BrowserRuntime>::close(runtime.as_ref()).await;
+                    if let Err(error) = <FirefoxRuntime as BrowserRuntime>::close(runtime.as_ref()).await {
+                    tracing::warn!(%error, "Firefox runtime close failed after an aborted open");
+                }
                     return Err(BrowserError::CapabilityUnavailable {
                         detail: format!(
                             "required Firefox BiDi primary-context mapping failed: {detail}"
@@ -277,7 +290,9 @@ impl BrowserHost for FirefoxHost {
             .into_iter()
             .any(|status| status == CapabilityStatus::Native);
             if matches!(bidi_requirement, BiDiRequirement::Required) && !any_native {
-                let _ = <FirefoxRuntime as BrowserRuntime>::close(runtime.as_ref()).await;
+                if let Err(error) = <FirefoxRuntime as BrowserRuntime>::close(runtime.as_ref()).await {
+                    tracing::warn!(%error, "Firefox runtime close failed after an aborted open");
+                }
                 return Err(BrowserError::CapabilityUnavailable {
                     detail: "required Firefox BiDi connected but no event domain subscription became available"
                         .to_owned(),
@@ -318,6 +333,12 @@ impl BrowserHost for FirefoxHost {
             .remove(id)
             .ok_or(BrowserError::SessionNotFound { session_id: *id })?;
         <FirefoxRuntime as BrowserRuntime>::close(entry.runtime.as_ref()).await
+    }
+}
+
+async fn quit_after_failed_open(driver: &mut FirefoxDriver) {
+    if let Err(error) = driver.quit().await {
+        tracing::warn!(%error, "Firefox driver quit failed after an aborted open");
     }
 }
 

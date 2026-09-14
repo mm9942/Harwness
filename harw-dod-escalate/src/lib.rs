@@ -52,6 +52,14 @@
 //! Historie — reine Funktion der Befundfelder. Siehe [`ladder`]-Moduldoku
 //! für die vollständige Begründung.
 //!
+//! # Triage-Einreichung und Proof v2 (C-WPROTO, W3)
+//! [`submission::TriageSubmission`] ist das eingefrorene Format, in dem ein
+//! modellnaher Triage-Prozess nur ein Urteil plus gebundenen Finding-Digest
+//! an den Escalator liefert (F-023); der Escalator liest den Record selbst und
+//! signiert anschließend eine `harw_dod_warden_proto::SignedAuthorization`
+//! (F-001). Die Umstellung von [`action`]/[`freeze_ops`] vom fälschbaren
+//! v1-`AuthorizationProof` auf Proof v2 ist Folgearbeit W5 D-ESC.
+//!
 //! # Audit vor Fehlerpfad
 //! Was protokolliert werden soll, wird protokolliert, **bevor** eine Aktion
 //! versucht wird — [`freeze_ops::authorize_freeze`] und
@@ -76,7 +84,8 @@
 //!
 //! # Abhängigkeiten
 //! `harw-types`, `harw-macros`, `harw-dod-rules`, `harw-dod-signals`,
-//! `harw-dod-warden-proto`, `harw-session-store`, `jiff` — kein `harw-tools`,
+//! `harw-dod-warden-proto`, `harw-session-store`, `jiff`, `serde` (seit
+//! C-WPROTO, für `TriageSubmission`) — kein `harw-tools`,
 //! kein `harw-core`. Diese Crate liegt auf dem Weg zum Warden; jede
 //! vermeidbare zusätzliche Abhängigkeit wäre ein zu meldender Befund.
 //!
@@ -94,9 +103,11 @@ pub mod action;
 pub mod error;
 pub mod freeze_ops;
 pub mod ladder;
+pub mod submission;
 
 pub use action::{Action, ActionState, Authorized, Proposed};
 pub use error::{EscalateError, EscalateResult};
 pub use freeze_ops::{authorize_freeze, authorize_release, authorize_stage_gated, reconcile_expired_freezes};
 pub use harw_dod_rules::{triage, Finding, RuleChecked, Triaged, Verdict};
 pub use ladder::Ladder;
+pub use submission::{SubmissionError, SubmissionResult, TRIAGE_SUBMISSION_VERSION, TriageSubmission};

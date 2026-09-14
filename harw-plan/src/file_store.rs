@@ -1,15 +1,39 @@
 //! Persistente Datei-Implementierung des `PlanStore`-Traits.
 //!
 //! Verantwortungsbereich: `FilePlanStore` — schreibt Pläne atomar als
-//! `rev-<n>.json` und pflegt eine append-only `history.jsonl` unter
-//! `<root>/plans/<plan_id>/`.
+//! `rev-<n>.json` samt Integritätssiegel `rev-<n>.seal` und pflegt eine
+//! append-only `history.jsonl` unter `<root>/plans/<plan_id>/`.
 //!
-//! Atomares Schreiben erfolgt via Tmp-Datei + `std::fs::rename` (Design-Doc §4).
+//! Atomares Schreiben erfolgt via Tmp-Datei + `fsync` + `std::fs::rename` +
+//! Verzeichnis-`fsync` (Design-Doc §4). Veröffentlichungsreihenfolge je
+//! `apply`/`apply_batch`: Snapshot und Siegel stagen → alle History-Zeilen in
+//! **einem** Append schreiben (bei Fehler auf die alte Länge kürzen) → Siegel
+//! veröffentlichen → Snapshot veröffentlichen → RAM-Cache aktualisieren.
+//!
+//! # Pfad-Sicherheit (F-013, G-032)
+//! Jede `PlanId` wird vor dem `join` unter `<root>/plans/` gegen die Grammatik
+//! aus [`PlanId::parse`] geprüft — auch IDs, die über das ungeprüfte
+//! `PlanId::new` entstanden sind. Beim Laden werden nur Verzeichnisse
+//! berücksichtigt, deren Name eine gültige `PlanId` ist, und der geladene Plan
+//! muss dieselbe ID tragen.
+//!
+//! # Integritätssiegel
+//! Siehe [`seal`]: BLAKE3-Digest des Snapshots plus Kettenwert über die
+//! Vorgänger-Revision. Das Siegel ist **ungeschlüsselt** — es erkennt
+//! Beschädigung und naive Manipulation (Snapshot editiert, Siegel gelöscht
+//! oder vertauscht), nicht aber einen Angreifer mit Schreibrecht auf
+//! `HARW_HOME`, der Snapshot und Siegel konsistent neu berechnet.
 //!
 //! Die Mutationslogik selbst liegt **nicht** hier, sondern in
-//! `crate::mutation` — dieselbe Funktion, die auch `InMemoryPlanStore`
-//! aufruft. Dieses Modul verantwortet ausschließlich Persistenz, Reload,
-//! Locking, Revisionsvergabe und Konfigurationsdurchsetzung.
+//! `crate::mutation` (über `crate::store::stage_actions`) — dieselbe Funktion,
+//! die auch `InMemoryPlanStore` aufruft.
+//!
+//! # Concurrency
+//! `Send + Sync` über `RwLock`; synchronisiert Threads, nicht Prozesse.
+//!
+//! # Errors
+//! [`PlanError::Io`], [`PlanError::Serde`], [`PlanError::SealMismatch`],
+//! [`PlanError::InvalidId`] sowie alle Validierungs- und Batch-Fehler.
 //!
 //! Exportierte Typen: [`FilePlanStore`].
 
@@ -19,16 +43,307 @@ use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use time::OffsetDateTime;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::actions::{PlanAction, PlanEvent};
 use crate::config::PlanToolConfig;
 use crate::error::{PlanError, PlanResult};
 use crate::ids::{PlanId, RevisionId};
-use crate::mutation::apply_mutation;
-use crate::store::PlanStore;
+use crate::store::{PlanRevision, PlanStore, check_batch_target, stage_actions};
 use crate::types::Plan;
-use crate::validate::validate_with;
+
+/// Integritätssiegel für Snapshot-Dateien (crate-privat, geteilt mit
+/// `goal_store::FileGoalStore`).
+///
+/// # Format
+/// `rev-<n>.seal` neben `rev-<n>.json`, JSON-Objekt [`SnapshotSeal`]:
+/// - `digest` = BLAKE3 (`harw_types::ContentDigest`) der exakten Snapshot-Bytes,
+/// - `chain` = BLAKE3 über `"harw-plan-seal:v1\0" ‖ prev_chain ‖ "\0" ‖ n ‖
+///   "\0" ‖ digest`,
+/// - `prev_revision`/`prev_chain` = letztes Kettenglied vor dieser Revision
+///   (`None` beim ersten versiegelten Stand, z. B. nach einem Legacy-Plan).
+///
+/// # Prüfung beim Laden
+/// Digest, Revision, Kettenwert und — falls vorhanden — der Kettenwert des
+/// Vorgängersiegels müssen stimmen. Fehlt das Siegel in einem Verzeichnis, das
+/// bereits Siegel enthält, ist das eine Manipulation. Ein Verzeichnis ganz ohne
+/// Siegel gilt als Legacy-Stand: einmal `warn!`, der nächste Schreibvorgang
+/// versiegelt.
+///
+/// # Grenzen
+/// Ungeschlüsselt: erkennt Beschädigung und naive Manipulation, nicht einen
+/// Angreifer mit Schreibrecht auf `HARW_HOME`.
+pub(crate) mod seal {
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use serde::{Deserialize, Serialize};
+    use tracing::warn;
+
+    use crate::error::{PlanError, PlanResult};
+
+    /// Aktuelle Formatversion.
+    pub(crate) const SEAL_VERSION: u32 = 1;
+
+    /// Domänentrenner des Kettenwerts.
+    const CHAIN_DOMAIN: &str = "harw-plan-seal:v1";
+
+    // Zähler für eindeutige Temp-Namen innerhalb eines Prozesses.
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Inhalt einer `rev-<n>.seal`-Datei.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub(crate) struct SnapshotSeal {
+        /// Formatversion ([`SEAL_VERSION`]).
+        pub(crate) version: u32,
+        /// Revision des versiegelten Snapshots.
+        pub(crate) revision: u64,
+        /// Hex-Digest der Snapshot-Bytes.
+        pub(crate) digest: String,
+        /// Revision des vorherigen Kettenglieds.
+        #[serde(default)]
+        pub(crate) prev_revision: Option<u64>,
+        /// Kettenwert des vorherigen Kettenglieds.
+        #[serde(default)]
+        pub(crate) prev_chain: Option<String>,
+        /// Kettenwert dieses Siegels.
+        pub(crate) chain: String,
+    }
+
+    /// Letztes Kettenglied eines Stores.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct SealLink {
+        /// Revision des zuletzt versiegelten Snapshots.
+        pub(crate) revision: u64,
+        /// Dessen Kettenwert.
+        pub(crate) chain: String,
+    }
+
+    /// Pfad des Siegels zu einem Snapshot (`rev-<n>.json` → `rev-<n>.seal`).
+    pub(crate) fn seal_path(snapshot: &Path) -> PathBuf {
+        snapshot.with_extension("seal")
+    }
+
+    /// Berechnet den Kettenwert.
+    pub(crate) fn chain_value(prev_chain: Option<&str>, revision: u64, digest: &str) -> String {
+        let material = format!(
+            "{CHAIN_DOMAIN}\0{}\0{revision}\0{digest}",
+            prev_chain.unwrap_or("")
+        );
+        harw_types::ContentDigest::of(material.as_bytes()).to_string()
+    }
+
+    /// Erzeugt Siegel-Bytes und neues Kettenglied für einen Snapshot.
+    ///
+    /// # Errors
+    /// - [`PlanError::Serde`] wenn das Siegel nicht serialisiert werden kann.
+    pub(crate) fn build(
+        prev: Option<&SealLink>,
+        revision: u64,
+        snapshot: &[u8],
+    ) -> PlanResult<(Vec<u8>, SealLink)> {
+        let digest = harw_types::ContentDigest::of(snapshot).to_string();
+        let prev_chain = prev.map(|link| link.chain.as_str());
+        let chain = chain_value(prev_chain, revision, &digest);
+        let seal = SnapshotSeal {
+            version: SEAL_VERSION,
+            revision,
+            digest,
+            prev_revision: prev.map(|link| link.revision),
+            prev_chain: prev_chain.map(str::to_owned),
+            chain: chain.clone(),
+        };
+        let bytes = serde_json::to_vec_pretty(&seal)?;
+        Ok((bytes, SealLink { revision, chain }))
+    }
+
+    /// Prüft, ob `dir` mindestens ein Siegel enthält.
+    ///
+    /// # Errors
+    /// - [`PlanError::Io`] bei Lesefehler.
+    pub(crate) fn directory_is_sealed(dir: &Path) -> PlanResult<bool> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file()
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("rev-") && name.ends_with(".seal"))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    // Baut den Fehler für eine Siegelverletzung.
+    fn mismatch(path: &Path, expected: impl Into<String>, actual: impl Into<String>) -> PlanError {
+        PlanError::SealMismatch {
+            path: path.display().to_string(),
+            expected: expected.into(),
+            actual: actual.into(),
+        }
+    }
+
+    // Liest und parst ein Siegel; jede Unlesbarkeit ist eine Siegelverletzung.
+    fn read_seal(path: &Path) -> PlanResult<SnapshotSeal> {
+        let bytes = std::fs::read(path)
+            .map_err(|error| mismatch(path, "lesbares Siegel", error.to_string()))?;
+        let seal: SnapshotSeal = serde_json::from_slice(&bytes)
+            .map_err(|error| mismatch(path, "gültiges Siegel-JSON", error.to_string()))?;
+        if seal.version != SEAL_VERSION {
+            return Err(mismatch(
+                path,
+                format!("version {SEAL_VERSION}"),
+                format!("version {}", seal.version),
+            ));
+        }
+        Ok(seal)
+    }
+
+    /// Prüft das Siegel eines geladenen Snapshots.
+    ///
+    /// # Arguments
+    /// - `snapshot_path` (`&Path`): Pfad des `rev-<n>.json`.
+    /// - `revision` (`u64`): Revision laut Dateiname.
+    /// - `bytes` (`&[u8]`): exakt die gelesenen Snapshot-Bytes.
+    /// - `dir_sealed` (`bool`): enthält das Verzeichnis bereits Siegel?
+    ///
+    /// # Returns
+    /// `Some(SealLink)` bei gültigem Siegel, `None` bei einem Legacy-Stand
+    /// (Verzeichnis ohne jedes Siegel; es wird einmal gewarnt).
+    ///
+    /// # Errors
+    /// - [`PlanError::SealMismatch`]: Siegel fehlt (in versiegeltem
+    ///   Verzeichnis), ist unlesbar, trägt eine andere Revision, einen anderen
+    ///   Digest oder Kettenwert, oder das Vorgängersiegel passt nicht.
+    pub(crate) fn verify(
+        snapshot_path: &Path,
+        revision: u64,
+        bytes: &[u8],
+        dir_sealed: bool,
+    ) -> PlanResult<Option<SealLink>> {
+        let path = seal_path(snapshot_path);
+        if !path.exists() {
+            if dir_sealed {
+                return Err(mismatch(&path, "Siegeldatei vorhanden", "fehlt"));
+            }
+            warn!(
+                path = %snapshot_path.display(),
+                "Legacy-Snapshot ohne Siegel; der nächste Schreibvorgang versiegelt"
+            );
+            return Ok(None);
+        }
+
+        let seal = read_seal(&path)?;
+        if seal.revision != revision {
+            return Err(mismatch(
+                &path,
+                format!("revision {revision}"),
+                format!("revision {}", seal.revision),
+            ));
+        }
+        let digest = harw_types::ContentDigest::of(bytes).to_string();
+        if seal.digest != digest {
+            return Err(mismatch(&path, seal.digest, digest));
+        }
+        let chain = chain_value(seal.prev_chain.as_deref(), revision, &seal.digest);
+        if seal.chain != chain {
+            return Err(mismatch(&path, seal.chain, chain));
+        }
+        match (seal.prev_revision, seal.prev_chain.as_deref()) {
+            (None, None) => {}
+            (Some(prev_revision), Some(prev_chain)) => {
+                let prev_path = path.with_file_name(format!("rev-{prev_revision}.seal"));
+                let prev = read_seal(&prev_path)?;
+                if prev.chain != prev_chain {
+                    return Err(mismatch(&prev_path, prev_chain, prev.chain));
+                }
+            }
+            _ => {
+                return Err(mismatch(
+                    &path,
+                    "prev_revision und prev_chain gemeinsam gesetzt",
+                    "nur eines gesetzt",
+                ));
+            }
+        }
+        Ok(Some(SealLink { revision, chain }))
+    }
+
+    /// Synchronisierter, noch nicht sichtbarer Siegel-Write.
+    pub(crate) struct StagedSeal {
+        target: PathBuf,
+        temporary: PathBuf,
+    }
+
+    impl StagedSeal {
+        /// Veröffentlicht das Siegel per `rename` und synchronisiert das
+        /// Verzeichnis.
+        ///
+        /// # Errors
+        /// - [`PlanError::Io`] bei Fehlschlag (Temp-Datei wird entfernt).
+        pub(crate) fn commit(self) -> PlanResult<()> {
+            if let Err(error) = std::fs::rename(&self.temporary, &self.target) {
+                // Best effort: das Aufräumen darf den eigentlichen Fehler nicht überdecken.
+                let _ = std::fs::remove_file(&self.temporary);
+                return Err(error.into());
+            }
+            if let Some(parent) = self.target.parent() {
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(())
+        }
+
+        /// Verwirft das gestagte Siegel.
+        pub(crate) fn discard(self) {
+            // Best effort: eine verwaiste Temp-Datei ist harmlos (`.tmp-`).
+            let _ = std::fs::remove_file(self.temporary);
+        }
+    }
+
+    /// Schreibt Siegel-Bytes synchronisiert in eine eindeutige Temp-Datei
+    /// neben dem Ziel (`<name>.tmp-<pid>-<nanos>-<zähler>`).
+    ///
+    /// # Errors
+    /// - [`PlanError::Io`] bei Schreibfehler.
+    pub(crate) fn stage(target: &Path, bytes: &[u8]) -> PlanResult<StagedSeal> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let name = target
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("seal");
+        let temporary = target.with_file_name(format!(
+            "{name}.tmp-{}-{nonce}-{counter}",
+            std::process::id()
+        ));
+        let result = (|| -> PlanResult<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            file.write_all(bytes)?;
+            file.flush()?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            // Best effort: der Schreibfehler ist die relevante Meldung.
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+        Ok(StagedSeal {
+            target: target.to_path_buf(),
+            temporary,
+        })
+    }
+}
 
 /// Interner Zustand des File-Stores.
 struct Inner {
@@ -40,6 +355,8 @@ struct Inner {
     plan_id: Option<PlanId>,
     /// Nächste Revisionsnummer.
     next_revision: RevisionId,
+    /// Letztes Glied der Siegelkette (`None` vor dem ersten Siegel).
+    seal: Option<seal::SealLink>,
     /// Wurzelverzeichnis.
     root: PathBuf,
 }
@@ -55,6 +372,7 @@ impl StagedWrite {
     /// History-Append und synchronisiert danach den Verzeichniseintrag.
     fn commit(self) -> PlanResult<()> {
         if let Err(error) = std::fs::rename(&self.temporary, &self.target) {
+            // Best effort: der Rename-Fehler ist die relevante Meldung.
             let _ = std::fs::remove_file(&self.temporary);
             return Err(error.into());
         }
@@ -64,6 +382,7 @@ impl StagedWrite {
     /// Verwirft den noch nicht sichtbaren Snapshot nach einem fehlgeschlagenen
     /// History-Append.
     fn discard(self) {
+        // Best effort: eine verwaiste Temp-Datei ist harmlos.
         let _ = std::fs::remove_file(self.temporary);
     }
 }
@@ -71,13 +390,14 @@ impl StagedWrite {
 /// Persistenter `PlanStore`, der Pläne und History im Dateisystem ablegt.
 ///
 /// # Description
-/// Schreibt jeden Plan-Zustand als `<root>/plans/<plan_id>/rev-<n>.json`.
-/// Events werden append-only in `<root>/plans/<plan_id>/history.jsonl` geschrieben.
-/// Atomares Schreiben via Tmp-Datei + `std::fs::rename` verhindert partielle Writes.
+/// Schreibt jeden Plan-Zustand als `<root>/plans/<plan_id>/rev-<n>.json` mit
+/// Siegel `rev-<n>.seal`. Events werden append-only in
+/// `<root>/plans/<plan_id>/history.jsonl` geschrieben. Ein Batch erzeugt einen
+/// Snapshot (Revision der letzten Aktion) und N History-Zeilen in einem Append.
 ///
 /// # Concurrency
 /// `Send + Sync` durch `RwLock<Inner>`. Lese-Operationen halten Lese-Lock;
-/// `apply` hält Schreib-Lock.
+/// `apply`/`apply_batch` halten den Schreib-Lock.
 ///
 /// # Examples
 /// ```rust,no_run
@@ -88,7 +408,7 @@ impl StagedWrite {
 ///
 /// let store = FilePlanStore::new("/tmp/myplans").unwrap();
 /// store.apply(PlanAction::Create {
-///     plan_id: PlanId::new("p-1"),
+///     plan_id: PlanId::parse("p-1").unwrap(),
 ///     goal: "Ziel".to_owned(),
 /// }, "orchestrator").unwrap();
 /// ```
@@ -98,13 +418,27 @@ pub struct FilePlanStore {
 }
 
 /// Ergebnis von [`FilePlanStore::load`]: der aus `<root>/plans/` rekonstruierte
-/// Store-Zustand als `(Plan, History, Plan-ID, nächste Revision)`.
-///
-/// - `Option<Plan>`: der neueste vollständige Planstand, falls einer existiert.
-/// - `Vec<PlanEvent>`: die zugehörige, gecachte Event-History.
-/// - `Option<PlanId>`: die ID des geladenen Plans, falls einer existiert.
-/// - `RevisionId`: die nächste zu vergebende Revision.
-type LoadedPlanState = (Option<Plan>, Vec<PlanEvent>, Option<PlanId>, RevisionId);
+/// Store-Zustand.
+struct LoadedPlanState {
+    plan: Option<Plan>,
+    history: Vec<PlanEvent>,
+    plan_id: Option<PlanId>,
+    next_revision: RevisionId,
+    seal: Option<seal::SealLink>,
+}
+
+impl LoadedPlanState {
+    // Leerer Store ohne Plan.
+    fn empty() -> Self {
+        Self {
+            plan: None,
+            history: Vec::new(),
+            plan_id: None,
+            next_revision: RevisionId::new(1),
+            seal: None,
+        }
+    }
+}
 
 impl FilePlanStore {
     /// Erstellt einen neuen `FilePlanStore` mit dem angegebenen Wurzelverzeichnis.
@@ -114,6 +448,7 @@ impl FilePlanStore {
     ///
     /// # Errors
     /// - [`PlanError::Io`] wenn das Verzeichnis nicht erstellt werden kann.
+    /// - [`PlanError::SealMismatch`] wenn der neueste Snapshot manipuliert ist.
     ///
     /// Dieser Kompatibilitätspfad verwendet explizit die aktivierten
     /// Standardwerte. Neue Aufrufer sollen [`Self::with_config`] verwenden,
@@ -125,27 +460,31 @@ impl FilePlanStore {
     /// Erstellt einen neuen `FilePlanStore` und erzwingt die Plan-Tool-Konfiguration.
     ///
     /// Die Konfiguration wird vor dem Anlegen des Wurzelverzeichnisses geprüft.
-    /// Ein bereits vorhandener Plan wird ebenfalls vor dem Exponieren des Stores
-    /// gegen das Knotenlimit validiert.
+    /// Ein bereits vorhandener Plan wird vor dem Exponieren des Stores gegen
+    /// sein Integritätssiegel und das Knotenlimit validiert.
     ///
     /// # Errors
     /// - [`PlanError::Config`] wenn die Konfiguration deaktiviert oder ungültig ist.
-    /// - [`PlanError::Io`] wenn das Verzeichnis nicht erstellt werden kann oder
-    ///   Plandateien nicht lesbar sind.
+    /// - [`PlanError::Io`] / [`PlanError::Serde`] wenn Plandateien nicht lesbar sind.
+    /// - [`PlanError::SealMismatch`] wenn das Siegel des neuesten Snapshots
+    ///   nicht passt.
+    /// - [`PlanError::InvalidId`] wenn der Snapshot eine andere ID trägt als
+    ///   sein Verzeichnis.
     pub fn with_config(root: impl AsRef<Path>, config: PlanToolConfig) -> PlanResult<Self> {
         config.require_enabled().map_err(PlanError::Config)?;
         let root = root.as_ref().to_path_buf();
         std::fs::create_dir_all(&root)?;
-        let (plan, history, plan_id, next_revision) = Self::load(&root)?;
-        if let Some(plan) = &plan {
+        let loaded = Self::load(&root)?;
+        if let Some(plan) = &loaded.plan {
             config.validate_plan(plan).map_err(PlanError::Config)?;
         }
         Ok(Self {
             inner: RwLock::new(Inner {
-                plan,
-                history,
-                plan_id,
-                next_revision,
+                plan: loaded.plan,
+                history: loaded.history,
+                plan_id: loaded.plan_id,
+                next_revision: loaded.next_revision,
+                seal: loaded.seal,
                 root,
             }),
             config,
@@ -154,53 +493,73 @@ impl FilePlanStore {
 
     /// Lädt beim Start den neuesten vollständigen Planstand aus dem Dateibaum.
     ///
-    /// Die Dateinamen sind die durable Sequenzquelle. Der Snapshot wird erst
-    /// nach dem dauerhaft angehängten History-Event sichtbar; falls mehrere
-    /// Plan-IDs vorhanden sind, wird deterministisch der höchste
-    /// Revisionsstand gewählt.
+    /// Die Dateinamen sind die durable Sequenzquelle. Berücksichtigt werden
+    /// nur Verzeichnisse, deren Name eine gültige [`PlanId`] ist (andere werden
+    /// mit `warn!` übersprungen). Gewählt wird die höchste Revision
+    /// (Tie-Break: lexikografisch größere Plan-ID); nur dieser Snapshot wird
+    /// gelesen, gegen sein Siegel geprüft und muss die ID seines Verzeichnisses
+    /// tragen.
     fn load(root: &Path) -> PlanResult<LoadedPlanState> {
         let plans_root = root.join("plans");
         if !plans_root.exists() {
-            return Ok((None, Vec::new(), None, RevisionId::new(1)));
+            return Ok(LoadedPlanState::empty());
         }
 
-        let mut newest: Option<(RevisionId, Plan)> = None;
+        let mut newest: Option<(RevisionId, PlanId, PathBuf)> = None;
         for entry in std::fs::read_dir(&plans_root)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
                 continue;
             }
+            let dir_name = entry.file_name();
+            let Some(plan_id) = dir_name.to_str().and_then(|name| PlanId::parse(name).ok())
+            else {
+                warn!(
+                    dir = %entry.path().display(),
+                    "Plan-Verzeichnis mit ungültigem Namen wird ignoriert"
+                );
+                continue;
+            };
             for file in std::fs::read_dir(entry.path())? {
                 let file = file?;
                 if !file.file_type()?.is_file() {
                     continue;
                 }
-                let Some(name) = file.file_name().to_str().map(str::to_owned) else {
-                    continue;
-                };
-                let Some(number) = name
-                    .strip_prefix("rev-")
+                let Some(number) = file
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("rev-"))
                     .and_then(|n| n.strip_suffix(".json"))
                     .and_then(|n| n.parse::<u64>().ok())
                 else {
                     continue;
                 };
                 let revision = RevisionId::new(number);
-                let plan: Plan = serde_json::from_reader(std::fs::File::open(file.path())?)?;
-                if newest.as_ref().is_none_or(|(current, current_plan)| {
+                if newest.as_ref().is_none_or(|(current, current_id, _)| {
                     revision > *current
-                        || (revision == *current && plan.id.as_str() > current_plan.id.as_str())
+                        || (revision == *current && plan_id.as_str() > current_id.as_str())
                 }) {
-                    newest = Some((revision, plan));
+                    newest = Some((revision, plan_id.clone(), file.path()));
                 }
             }
         }
 
-        let Some((file_revision, plan)) = newest else {
-            return Ok((None, Vec::new(), None, RevisionId::new(1)));
+        let Some((file_revision, plan_id, snapshot_path)) = newest else {
+            return Ok(LoadedPlanState::empty());
         };
-        let plan_id = plan.id.clone();
-        let history_path = Self::history_path(root, &plan_id);
+        let bytes = std::fs::read(&snapshot_path)?;
+        let plan_dir = Self::plan_dir(root, &plan_id)?;
+        let dir_sealed = seal::directory_is_sealed(&plan_dir)?;
+        let seal_link = seal::verify(&snapshot_path, file_revision.value(), &bytes, dir_sealed)?;
+        let plan: Plan = serde_json::from_slice(&bytes)?;
+        if plan.id != plan_id {
+            return Err(PlanError::InvalidId {
+                field: "plan.id",
+                value: plan.id.into_inner(),
+            });
+        }
+
+        let history_path = Self::history_path(root, &plan_id)?;
         let history = if history_path.exists() {
             let reader = BufReader::new(std::fs::File::open(history_path)?);
             reader
@@ -221,25 +580,36 @@ impl FilePlanStore {
             .map(|event| event.revision)
             .max()
             .unwrap_or(RevisionId::new(0));
-        let next = file_revision
+        let next_revision = file_revision
             .max(plan.revision)
             .max(history_revision)
             .next();
-        Ok((Some(plan), history, Some(plan_id), next))
+        Ok(LoadedPlanState {
+            plan: Some(plan),
+            history,
+            plan_id: Some(plan_id),
+            next_revision,
+            seal: seal_link,
+        })
+    }
+
+    /// Gibt das Plan-Verzeichnis zurück — erst nach Grammatikprüfung der ID.
+    ///
+    /// # Errors
+    /// - [`PlanError::InvalidId`] wenn `plan_id` kein gültiges Pfadsegment ist.
+    fn plan_dir(root: &Path, plan_id: &PlanId) -> PlanResult<PathBuf> {
+        let checked = PlanId::parse(plan_id.as_str())?;
+        Ok(root.join("plans").join(checked.as_str()))
     }
 
     /// Gibt den Planspeicherpfad für eine gegebene Revision zurück.
-    fn plan_path(root: &Path, plan_id: &PlanId, revision: RevisionId) -> PathBuf {
-        root.join("plans")
-            .join(plan_id.as_str())
-            .join(format!("rev-{}.json", revision.value()))
+    fn plan_path(root: &Path, plan_id: &PlanId, revision: RevisionId) -> PlanResult<PathBuf> {
+        Ok(Self::plan_dir(root, plan_id)?.join(format!("rev-{}.json", revision.value())))
     }
 
     /// Gibt den History-Pfad zurück.
-    fn history_path(root: &Path, plan_id: &PlanId) -> PathBuf {
-        root.join("plans")
-            .join(plan_id.as_str())
-            .join("history.jsonl")
+    fn history_path(root: &Path, plan_id: &PlanId) -> PlanResult<PathBuf> {
+        Ok(Self::plan_dir(root, plan_id)?.join("history.jsonl"))
     }
 
     /// Bereitet `content` als synchronisierte Temp-Datei vor, ohne den
@@ -270,6 +640,7 @@ impl FilePlanStore {
             Ok(())
         })();
         if let Err(error) = write_result {
+            // Best effort: der Schreibfehler ist die relevante Meldung.
             let _ = std::fs::remove_file(&tmp_path);
             return Err(error);
         }
@@ -289,23 +660,28 @@ impl FilePlanStore {
         Ok(())
     }
 
-    /// Hängt ein Event an die `history.jsonl` an.
+    /// Hängt alle `events` in **einem** Write an die `history.jsonl` an.
     ///
     /// # Errors
-    /// - [`PlanError::Io`] / [`PlanError::Serde`] bei Schreibfehler.
-    fn append_event(root: &Path, plan_id: &PlanId, event: &PlanEvent) -> PlanResult<()> {
-        let path = Self::history_path(root, plan_id);
+    /// - [`PlanError::Io`] / [`PlanError::Serde`] bei Schreibfehler; die Datei
+    ///   wird dann auf ihre vorherige Länge gekürzt.
+    fn append_events(root: &Path, plan_id: &PlanId, events: &[PlanEvent]) -> PlanResult<()> {
+        let path = Self::history_path(root, plan_id)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let line = serde_json::to_string(event)?;
+        let mut buffer = String::new();
+        for event in events {
+            buffer.push_str(&serde_json::to_string(event)?);
+            buffer.push('\n');
+        }
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)?;
         let original_len = f.metadata()?.len();
         let append_result = (|| -> PlanResult<()> {
-            writeln!(f, "{}", line)?;
+            f.write_all(buffer.as_bytes())?;
             f.flush()?;
             f.sync_all()?;
             Self::sync_parent_directory(&path)?;
@@ -315,12 +691,51 @@ impl FilePlanStore {
             // A failed write may have appended a partial line. Restore the
             // pre-append length before exposing the error to the caller.
             if f.set_len(original_len).is_ok() {
+                // Best effort: der ursprüngliche Schreibfehler wird gemeldet.
                 let _ = f.sync_all();
                 let _ = Self::sync_parent_directory(&path);
             }
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Veröffentlicht Kandidat, Siegel und Events dauerhaft (Reihenfolge siehe
+    /// Modulkopf) und gibt das neue Kettenglied zurück.
+    ///
+    /// # Errors
+    /// - [`PlanError::Io`] / [`PlanError::Serde`] bei Persistenzfehlern.
+    /// - [`PlanError::InvalidId`] bei ungültiger Plan-ID.
+    fn publish(
+        root: &Path,
+        prev_seal: Option<&seal::SealLink>,
+        candidate: &Plan,
+        events: &[PlanEvent],
+    ) -> PlanResult<seal::SealLink> {
+        let bytes = serde_json::to_vec_pretty(candidate)?;
+        let plan_path = Self::plan_path(root, &candidate.id, candidate.revision)?;
+        let (seal_bytes, link) = seal::build(prev_seal, candidate.revision.value(), &bytes)?;
+        let staged_snapshot = Self::stage_atomic_write(&plan_path, &bytes)?;
+        let staged_seal = match seal::stage(&seal::seal_path(&plan_path), &seal_bytes) {
+            Ok(staged) => staged,
+            Err(error) => {
+                staged_snapshot.discard();
+                return Err(error);
+            }
+        };
+        if let Err(error) = Self::append_events(root, &candidate.id, events) {
+            staged_seal.discard();
+            staged_snapshot.discard();
+            return Err(error);
+        }
+        // Siegel vor dem Snapshot: ein Absturz dazwischen hinterlässt ein
+        // verwaistes Siegel, nie einen unversiegelten neuesten Snapshot.
+        if let Err(error) = staged_seal.commit() {
+            staged_snapshot.discard();
+            return Err(error);
+        }
+        staged_snapshot.commit()?;
+        Ok(link)
     }
 }
 
@@ -347,97 +762,118 @@ impl PlanStore for FilePlanStore {
             .write()
             .map_err(|_| PlanError::Io(std::io::Error::other("RwLock vergiftet")))?;
 
-        let current_node_count = inner.plan.as_ref().map_or(0, |plan| plan.nodes.len());
-        self.config
-            .validate_action(&action, current_node_count)
-            .map_err(PlanError::Config)?;
-
         let now = OffsetDateTime::now_utc();
 
         // `Create` legt an, es überschreibt nicht — auch nicht den beim Start
         // aus `<root>/plans/` geladenen Plan.
         if let PlanAction::Create { plan_id, goal } = &action {
+            self.config
+                .validate_action(&action, 0)
+                .map_err(PlanError::Config)?;
             if let Some(existing) = inner.plan.as_ref() {
                 return Err(PlanError::PlanExists {
                     id: existing.id.clone(),
                 });
             }
 
-            let plan_id = plan_id.clone();
-            let goal = goal.clone();
+            // Grammatik vor jedem Pfadzugriff (F-013/G-032).
+            let plan_id = PlanId::parse(plan_id.as_str())?;
             info!(plan_id = %plan_id, "Persistenten Plan erstellen");
             let revision = inner.next_revision;
             let plan = Plan {
                 id: plan_id.clone(),
                 revision,
                 parent_revision: None,
-                goal_statement: goal,
+                goal_statement: goal.clone(),
                 goal_id: None,
                 nodes: Vec::new(),
                 created_at: now,
                 updated_at: now,
             };
-            let bytes = serde_json::to_vec_pretty(&plan)?;
             let event = PlanEvent {
                 revision,
                 action,
                 actor: actor.to_owned(),
                 applied_at: now,
             };
-            let plan_path = Self::plan_path(&inner.root, &plan_id, revision);
-            let staged_snapshot = Self::stage_atomic_write(&plan_path, &bytes)?;
-            if let Err(error) = Self::append_event(&inner.root, &plan_id, &event) {
-                staged_snapshot.discard();
-                return Err(error);
-            }
-            staged_snapshot.commit()?;
+            let link = Self::publish(&inner.root, None, &plan, std::slice::from_ref(&event))?;
             inner.next_revision = revision.next();
             inner.plan = Some(plan);
             inner.plan_id = Some(plan_id);
+            inner.seal = Some(link);
             inner.history.push(event.clone());
             return Ok(event);
         }
 
         let plan = inner.plan.as_ref().ok_or(PlanError::PlanNotFound)?;
-
-        // Validierung
-        validate_with(plan, &action, &self.config, now)?;
-
         let revision = inner.next_revision;
-        // Mutation auf einem Kandidaten — einzige Mutationsstelle, geteilt mit
-        // `InMemoryPlanStore`. Der Kandidat wird erst nach dem dauerhaften
-        // History-Append sichtbar.
-        let mut candidate = plan.clone();
-        apply_mutation(&mut candidate, &action, actor, now);
-        candidate.updated_at = now;
-        candidate.revision = revision;
-
-        // Atomar schreiben
-        let plan_id = inner
-            .plan_id
-            .as_ref()
-            .ok_or(PlanError::PlanNotFound)?
-            .clone();
-        let bytes = serde_json::to_vec_pretty(&candidate)?;
-        let plan_path = Self::plan_path(&inner.root, &plan_id, revision);
-        let staged_snapshot = Self::stage_atomic_write(&plan_path, &bytes)?;
-
-        let event = PlanEvent {
-            revision,
-            action,
-            actor: actor.to_owned(),
-            applied_at: now,
+        // Validierung + Mutation auf einem Kandidaten — einzige Mutationsstelle,
+        // geteilt mit `InMemoryPlanStore`. Sichtbar erst nach dem dauerhaften
+        // History-Append.
+        let (candidate, events) =
+            stage_actions(plan, vec![action], actor, &self.config, revision, now)
+                .map_err(|(_, error)| error)?;
+        let link = Self::publish(&inner.root, inner.seal.as_ref(), &candidate, &events)?;
+        let Some(event) = events.into_iter().next() else {
+            return Err(PlanError::PlanNotFound);
         };
-        if let Err(error) = Self::append_event(&inner.root, &plan_id, &event) {
-            staged_snapshot.discard();
-            return Err(error);
-        }
-        staged_snapshot.commit()?;
         debug!(revision = %revision, actor = actor, "Persistente Aktion angewendet");
         inner.next_revision = revision.next();
         inner.plan = Some(candidate);
+        inner.seal = Some(link);
         inner.history.push(event.clone());
         Ok(event)
+    }
+
+    fn apply_batch(
+        &self,
+        plan: &PlanId,
+        actions: Vec<PlanAction>,
+        actor: &str,
+        expected_rev: RevisionId,
+    ) -> PlanResult<PlanRevision> {
+        let mut inner = self
+            .inner
+            .write()
+            .map_err(|_| PlanError::Io(std::io::Error::other("RwLock vergiftet")))?;
+        self.config.require_enabled().map_err(PlanError::Config)?;
+
+        let current = check_batch_target(inner.plan.as_ref(), plan, expected_rev)?;
+        if actions.is_empty() {
+            return Ok(PlanRevision {
+                revision: current.revision,
+                events: Vec::new(),
+            });
+        }
+
+        let now = OffsetDateTime::now_utc();
+        let (candidate, events) = stage_actions(
+            current,
+            actions,
+            actor,
+            &self.config,
+            inner.next_revision,
+            now,
+        )
+        .map_err(|(index, source)| PlanError::BatchActionRejected {
+            index,
+            source: Box::new(source),
+        })?;
+
+        let link = Self::publish(&inner.root, inner.seal.as_ref(), &candidate, &events)?;
+        let revision = candidate.revision;
+        inner.next_revision = revision.next();
+        inner.plan = Some(candidate);
+        inner.seal = Some(link);
+        inner.history.extend(events.iter().cloned());
+        info!(
+            plan_id = %plan,
+            revision = %revision,
+            count = events.len(),
+            actor = actor,
+            "Persistenter Batch atomar angewendet"
+        );
+        Ok(PlanRevision { revision, events })
     }
 
     fn history(&self, since: Option<RevisionId>) -> PlanResult<Vec<PlanEvent>> {
@@ -448,7 +884,7 @@ impl PlanStore for FilePlanStore {
 
         // Lese von Disk (history.jsonl) falls Plan-ID bekannt
         if let Some(plan_id) = &inner.plan_id {
-            let path = Self::history_path(&inner.root, plan_id);
+            let path = Self::history_path(&inner.root, plan_id)?;
             if !path.exists() {
                 return Ok(vec![]);
             }
@@ -897,5 +1333,260 @@ mod tests {
             "abgelehnte Aktion darf keinen Snapshot schreiben"
         );
         assert_eq!(store.history(None).unwrap().len(), 2);
+    }
+
+    // ── Pfad-Traversal (F-013, G-032) ──────────────────────────────────────
+
+    #[test]
+    fn test_create_with_traversal_id_writes_nothing_outside_store() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("store");
+        let store = FilePlanStore::new(&root).unwrap();
+
+        for raw in ["../escape", "../../etc", "a/b", "/abs", ".."] {
+            let result = store.apply(
+                PlanAction::Create {
+                    plan_id: PlanId::new(raw),
+                    goal: "Ausbruch".to_owned(),
+                },
+                "model:x",
+            );
+            assert!(
+                matches!(result, Err(PlanError::InvalidId { field: "PlanId", .. })),
+                "{raw:?} war: {result:?}"
+            );
+        }
+        assert!(!dir.path().join("escape").exists(), "kein Write außerhalb");
+        assert!(matches!(store.current(), Err(PlanError::PlanNotFound)));
+        let entries = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(entries, 1, "nur das Store-Verzeichnis existiert");
+    }
+
+    #[test]
+    fn test_load_ignores_directories_with_invalid_plan_id() {
+        let dir = TempDir::new().unwrap();
+        let bogus = dir.path().join("plans").join("Bad_Name");
+        std::fs::create_dir_all(&bogus).unwrap();
+        std::fs::write(bogus.join("rev-9.json"), b"{}").unwrap();
+
+        let store = make_store(&dir);
+
+        assert!(matches!(store.current(), Err(PlanError::PlanNotFound)));
+    }
+
+    // ── Siegel (Integrität beim Laden) ─────────────────────────────────────
+
+    fn seeded_store(dir: &TempDir, id: &str) -> FilePlanStore {
+        let store = make_store(dir);
+        store
+            .apply(
+                PlanAction::Create {
+                    plan_id: PlanId::new(id),
+                    goal: "Siegel".to_owned(),
+                },
+                "o",
+            )
+            .unwrap();
+        store
+            .apply(
+                PlanAction::AddNode {
+                    node: make_node("t1"),
+                },
+                "a",
+            )
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn test_seal_is_written_and_reload_verifies() {
+        let dir = TempDir::new().unwrap();
+        drop(seeded_store(&dir, "p-seal"));
+        let plan_dir = dir.path().join("plans").join("p-seal");
+        assert!(plan_dir.join("rev-1.seal").exists());
+        assert!(plan_dir.join("rev-2.seal").exists());
+
+        let reloaded = make_store(&dir);
+        assert_eq!(reloaded.current().unwrap().nodes.len(), 1);
+    }
+
+    #[test]
+    fn test_manipulated_snapshot_is_rejected_on_load() {
+        let dir = TempDir::new().unwrap();
+        drop(seeded_store(&dir, "p-tamper"));
+        let snapshot = dir.path().join("plans").join("p-tamper").join("rev-2.json");
+        let tampered = std::fs::read_to_string(&snapshot)
+            .unwrap()
+            .replace("\"draft\"", "\"completed\"");
+        std::fs::write(&snapshot, tampered).unwrap();
+
+        let result = FilePlanStore::new(dir.path());
+
+        assert!(
+            matches!(result, Err(PlanError::SealMismatch { .. })),
+            "manipulierter Snapshot muss abgewiesen werden"
+        );
+    }
+
+    #[test]
+    fn test_manipulated_seal_chain_is_rejected_on_load() {
+        let dir = TempDir::new().unwrap();
+        drop(seeded_store(&dir, "p-chain"));
+        let plan_dir = dir.path().join("plans").join("p-chain");
+        // Vorgängersiegel verfälschen: der Kettenwert von rev-2 passt nicht mehr.
+        let prev = plan_dir.join("rev-1.seal");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&prev).unwrap()).unwrap();
+        value["chain"] = serde_json::json!("00");
+        std::fs::write(&prev, serde_json::to_vec(&value).unwrap()).unwrap();
+
+        assert!(matches!(
+            FilePlanStore::new(dir.path()),
+            Err(PlanError::SealMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_deleted_seal_in_sealed_directory_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        drop(seeded_store(&dir, "p-gone"));
+        std::fs::remove_file(dir.path().join("plans").join("p-gone").join("rev-2.seal")).unwrap();
+
+        assert!(matches!(
+            FilePlanStore::new(dir.path()),
+            Err(PlanError::SealMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_legacy_unsealed_plan_loads_and_is_sealed_on_next_write() {
+        let dir = TempDir::new().unwrap();
+        drop(seeded_store(&dir, "p-legacy"));
+        let plan_dir = dir.path().join("plans").join("p-legacy");
+        for name in ["rev-1.seal", "rev-2.seal"] {
+            std::fs::remove_file(plan_dir.join(name)).unwrap();
+        }
+
+        let legacy = make_store(&dir);
+        assert_eq!(legacy.current().unwrap().nodes.len(), 1, "Legacy lädt");
+        legacy
+            .apply(
+                PlanAction::AddNode {
+                    node: make_node("t2"),
+                },
+                "a",
+            )
+            .unwrap();
+        assert!(plan_dir.join("rev-3.seal").exists(), "nächster Write versiegelt");
+
+        let reloaded = make_store(&dir);
+        assert_eq!(reloaded.current().unwrap().nodes.len(), 2);
+    }
+
+    // ── apply_batch (persistent) ───────────────────────────────────────────
+
+    fn history_lines(dir: &TempDir, id: &str) -> usize {
+        std::fs::read_to_string(dir.path().join("plans").join(id).join("history.jsonl"))
+            .unwrap()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count()
+    }
+
+    #[test]
+    fn test_apply_batch_persists_one_snapshot_and_all_events() {
+        let dir = TempDir::new().unwrap();
+        let store = seeded_store(&dir, "p-batch");
+
+        let result = store
+            .apply_batch(
+                &PlanId::new("p-batch"),
+                vec![
+                    PlanAction::AddNode {
+                        node: make_node("t2"),
+                    },
+                    PlanAction::AddDependency {
+                        child: TaskId::new("t2"),
+                        parent: TaskId::new("t1"),
+                    },
+                ],
+                "controller",
+                RevisionId::new(2),
+            )
+            .unwrap();
+
+        assert_eq!(result.revision, RevisionId::new(4));
+        assert_eq!(history_lines(&dir, "p-batch"), 4);
+        let plan_dir = dir.path().join("plans").join("p-batch");
+        assert!(plan_dir.join("rev-4.json").exists());
+        assert!(plan_dir.join("rev-4.seal").exists());
+        assert!(!plan_dir.join("rev-3.json").exists(), "ein Snapshot je Batch");
+
+        let reloaded = make_store(&dir);
+        let plan = reloaded.current().unwrap();
+        assert_eq!(plan.revision, RevisionId::new(4));
+        assert_eq!(plan.nodes.len(), 2);
+        assert_eq!(reloaded.history(None).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn test_apply_batch_failure_in_third_action_writes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let store = seeded_store(&dir, "p-atomic");
+
+        let result = store.apply_batch(
+            &PlanId::new("p-atomic"),
+            vec![
+                PlanAction::AddNode {
+                    node: make_node("t2"),
+                },
+                PlanAction::SetStatus {
+                    id: TaskId::new("t2"),
+                    status: PlanNodeStatus::Ready,
+                    reason: None,
+                },
+                PlanAction::AddDependency {
+                    child: TaskId::new("t2"),
+                    parent: TaskId::new("missing"),
+                },
+            ],
+            "controller",
+            RevisionId::new(2),
+        );
+
+        assert!(
+            matches!(
+                &result,
+                Err(PlanError::BatchActionRejected { index: 2, source })
+                    if matches!(**source, PlanError::NodeMissing { .. })
+            ),
+            "war: {result:?}"
+        );
+        assert_eq!(store.revision(), RevisionId::new(2));
+        assert_eq!(store.current().unwrap().nodes.len(), 1);
+        assert_eq!(history_lines(&dir, "p-atomic"), 2);
+        let plan_dir = dir.path().join("plans").join("p-atomic");
+        for name in ["rev-3.json", "rev-4.json", "rev-5.json", "rev-5.seal"] {
+            assert!(!plan_dir.join(name).exists(), "{name} darf nicht existieren");
+        }
+    }
+
+    #[test]
+    fn test_apply_batch_revision_conflict_writes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let store = seeded_store(&dir, "p-conflict");
+
+        let result = store.apply_batch(
+            &PlanId::new("p-conflict"),
+            vec![PlanAction::Inspect],
+            "controller",
+            RevisionId::new(1),
+        );
+
+        assert!(matches!(
+            result,
+            Err(PlanError::RevisionConflict { .. })
+        ));
+        assert_eq!(history_lines(&dir, "p-conflict"), 2);
     }
 }

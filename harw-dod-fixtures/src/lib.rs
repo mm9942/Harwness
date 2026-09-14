@@ -144,6 +144,7 @@
 //! ```
 
 pub mod capture;
+pub mod capture_manifest;
 pub mod error;
 pub mod harness;
 mod macros;

@@ -72,6 +72,11 @@ use async_trait::async_trait;
 /// clones share the same underlying runtime.
 ///
 /// [`BrowserSessionHandle`]: crate::session::BrowserSessionHandle
+// `async_trait` setzt auf jede erzeugte Methode ein `#[must_use]`, obwohl der
+// erzeugte Rückgabetyp (`Pin<Box<dyn Future>>`) ohnehin schon als `must_use`
+// gilt. Die Doppelung entsteht im Makro, nicht in diesem Code — deshalb hier
+// eine benannte Ausnahme statt einer Änderung an den Methodensignaturen.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait BrowserRuntime: Send + Sync {
     /// Returns the identifier of the session this runtime backs.
@@ -235,6 +240,8 @@ pub trait BrowserRuntime: Send + Sync {
 /// Requires `Send + Sync`: implementations must be safe to call from
 /// multiple threads/tasks concurrently, since multiple callers may open,
 /// look up, or close sessions at the same time.
+// Dieselbe Makro-Doppelung wie bei `BrowserRuntime` weiter oben.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait BrowserHost: Send + Sync {
     /// Opens a new browser session according to `request`.

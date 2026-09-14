@@ -199,11 +199,36 @@ mod tests {
         fs::write(net_dir.join("tcp"), content).expect("net/tcp schreiben");
     }
 
+    /// Wie [`write_tcp_table`], aber für `root/net/udp` — für den
+    /// F-065-Nachtrag (UDP-Zustandscode `07` statt `0A`).
+    fn write_udp_table(root: &Path, lines: &[String]) {
+        let net_dir = root.join("net");
+        fs::create_dir_all(&net_dir).expect("net-Verzeichnis anlegen");
+        let mut content = String::from(HEADER);
+        content.push('\n');
+        for line in lines {
+            content.push_str(line);
+            content.push('\n');
+        }
+        fs::write(net_dir.join("udp"), content).expect("net/udp schreiben");
+    }
+
     /// Eine Datenzeile mit wählbarem lokalem Port, entfernter Adresse und
-    /// Inode, immer im Zustand `0A` (Listener).
+    /// Inode, immer im Zustand `0A` (TCP-Listener).
     fn listen_line(local_port_hex: &str, rem_address: &str, inode: u64) -> String {
+        listen_line_with_state("0A", local_port_hex, rem_address, inode)
+    }
+
+    /// Wie [`listen_line`], aber mit wählbarem Zustandscode — für den
+    /// F-065-Nachtrag (UDP-Tabellen brauchen `07`, nicht `0A`).
+    fn listen_line_with_state(
+        state: &str,
+        local_port_hex: &str,
+        rem_address: &str,
+        inode: u64,
+    ) -> String {
         format!(
-            "   0: 0100007F:{local_port_hex} {rem_address} 0A 00000000:00000000 \
+            "   0: 0100007F:{local_port_hex} {rem_address} {state} 00000000:00000000 \
              00:00000000 00000000  1000        0 {inode} 1 0000000000000000 100 0 0 10 0"
         )
     }
@@ -347,6 +372,25 @@ mod tests {
         assert!(
             !materialized.contains("01BB"),
             "der entfernte Port darf im Ergebnis nicht auftauchen: {materialized}"
+        );
+    }
+
+    /// F-065-Nachtrag: ein gebundener UDP-Socket (Zustand `07`, siehe
+    /// `crate::procnet`-Moduldokumentation) muss über den vollständigen
+    /// `ListenerSensor::poll`-Pfad gemeldet werden, nicht nur über
+    /// `procnet::collect_listeners` direkt.
+    #[test]
+    fn test_poll_reports_udp_listener_with_state_07() {
+        let dir = tempdir().expect("tempdir");
+        write_udp_table(dir.path(), &[listen_line_with_state("07", "A2A9", "00000000:0000", 11029)]);
+
+        let sensor = sensor_for(dir.path());
+        let reading = sensor.poll(Timestamp::UNIX_EPOCH).expect("poll muss gelingen");
+
+        assert_eq!(reading.events.len(), 1);
+        assert_eq!(
+            reading.events[0].kind,
+            EventKind::ListenerOpened { port: 0xA2A9 }
         );
     }
 

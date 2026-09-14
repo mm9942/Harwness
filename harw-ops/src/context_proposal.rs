@@ -184,9 +184,7 @@ fn proposal_slug(id: &ArtifactId) -> ArtifactId {
 fn render_list(store: &KnowledgeStore) -> Result<OpOutput, OpError> {
     let artifacts = list_visible_artifacts(store)?;
     if artifacts.is_empty() {
-        return Ok(OpOutput {
-            text: "Keine Kontextprogramm-Vorschläge.".to_owned(),
-        });
+        return Ok(OpOutput::from("Keine Kontextprogramm-Vorschläge.".to_owned()));
     }
 
     let mut buf = format!("{} Kontextprogramm-Vorschlag/Vorschläge:\n", artifacts.len());
@@ -196,16 +194,14 @@ fn render_list(store: &KnowledgeStore) -> Result<OpOutput, OpError> {
             .unwrap_or_else(|_| "?".to_owned());
         buf.push_str(&format!("· {} [{status}]\n", artifact.id));
     }
-    Ok(OpOutput { text: buf })
+    Ok(OpOutput::from(buf))
 }
 
 fn render_view(store: &KnowledgeStore, tail: &[String]) -> Result<OpOutput, OpError> {
     let artifact = find_visible_artifact(store, tail)?;
     let proposal = ContextProposal::from_artifact(&artifact)
         .map_err(|error| OpError::Execution(format!("Vorschlag konnte nicht gelesen werden: {error}")))?;
-    Ok(OpOutput {
-        text: render_proposal(&proposal),
-    })
+    Ok(OpOutput::from(render_proposal(&proposal)))
 }
 
 /// Rendert einen Vorschlag vollständig, für `view`.
@@ -265,12 +261,10 @@ fn decide(store: &KnowledgeStore, tail: &[String], accept: bool) -> Result<OpOut
         .write_artifact(&store.context_proposal_path(&slug), &updated_artifact)
         .map_err(|error| OpError::Execution(format!("Schreiben fehlgeschlagen: {error}")))?;
 
-    Ok(OpOutput {
-        text: format!(
-            "Vorschlag {} markiert als {:?}. Kein Kontextprogramm wurde geändert.",
-            updated_artifact.id, proposal.status
-        ),
-    })
+    Ok(OpOutput::from(format!(
+        "Vorschlag {} markiert als {:?}. Kein Kontextprogramm wurde geändert.",
+        updated_artifact.id, proposal.status
+    )))
 }
 
 #[cfg(test)]

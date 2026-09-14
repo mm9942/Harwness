@@ -65,7 +65,8 @@
 //!     metric: Metric::Cosine,
 //!     source_set_digest: ContentDigest::of(b"sources"),
 //! };
-//! let index = FlatIndex::build(manifest, vec![(chunk, embedding)]);
+//! let index = FlatIndex::build(manifest, vec![(chunk, embedding)])
+//!     .expect("consistent embedding dimension");
 //!
 //! let provenance = QueryProvenance {
 //!     model: "test-model".to_owned(),
@@ -367,7 +368,7 @@ mod tests {
                 (chunk.clone(), embedding)
             })
             .collect();
-        FlatIndex::build(manifest(), entries)
+        FlatIndex::build(manifest(), entries).expect("test embeddings share a single dimension")
     }
 
     #[test]

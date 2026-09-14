@@ -19,8 +19,8 @@
 //!
 //! # Sicherheitsrelevante Varianten
 //! [`WebToolError::SchemeNotAllowed`], [`WebToolError::HostNotResolvable`],
-//! [`WebToolError::RedirectHostNotAllowed`], [`WebToolError::TooManyRedirects`],
-//! [`WebToolError::ResponseTooLarge`] und
+//! [`WebToolError::RedirectHostNotAllowed`], [`WebToolError::EgressDenied`],
+//! [`WebToolError::TooManyRedirects`], [`WebToolError::ResponseTooLarge`] und
 //! [`WebToolError::UnexpectedContentType`] sind **Ablehnungen**, keine
 //! Transportfehler. Sie dürfen nie fail-open auf einen Cache-Eintrag
 //! zurückfallen; nur [`WebToolError::Http`] und
@@ -69,14 +69,47 @@ pub enum WebToolError {
     #[msg("JSON-Fehler: {0}")]
     Json(serde_json::Error),
 
-    /// Die URL verwendet ein anderes Schema als `https://`.
+    /// Die URL verwendet ein anderes Schema als `https://` (bzw. `http://`
+    /// ohne ausdrückliche Freigabe über
+    /// [`crate::fetch::WebFetchOptions::allow_http`]).
     ///
-    /// Fail-closed: `http://`, `file://`, `data:` und alles andere werden
-    /// abgelehnt, bevor eine Verbindung aufgebaut wird.
+    /// Fail-closed: `file://`, `data:` und alles andere werden abgelehnt,
+    /// bevor eine Verbindung aufgebaut wird.
     #[msg("nur https:// ist erlaubt, abgelehnte URL: '{url}'")]
     SchemeNotAllowed {
-        /// Die abgelehnte URL, unverändert wie übergeben.
+        /// Die abgelehnte URL wie übergeben; bei Weiterleitungen nur ein
+        /// Platzhalter (`<Weiterleitung n>`), nie das Ziel des Servers.
         url: String,
+    },
+
+    /// Die Egress-Richtlinie ([`harw_egress::EgressPolicy`]) lehnt das Ziel ab:
+    /// Host nicht in der Allowlist, lokaler Name, unzulässige Adressklasse
+    /// (Loopback, privat, Link-Local, Cloud-Metadaten …) oder eine
+    /// DNS-Auflösung ohne zulässige Adresse.
+    ///
+    /// Die Begründung nennt nie eine aufgelöste oder wörtliche IP-Adresse,
+    /// nur Hostnamen und Adressklassen.
+    #[msg("Ziel durch die Egress-Richtlinie abgelehnt: {reason}")]
+    EgressDenied {
+        /// Menschenlesbare Begründung ohne Adressen.
+        reason: String,
+    },
+
+    /// Die Web-Tools wurden nicht konfiguriert (kein
+    /// [`crate::fetch::WebFetcher`] mit Egress-Policy installiert) oder die
+    /// Konfiguration ist unbrauchbar. Fail-closed: ohne Policy kein Abruf.
+    #[msg("Web-Tools sind nicht einsatzbereit: {what}")]
+    NotConfigured {
+        /// Was fehlt oder unbrauchbar ist.
+        what: &'static str,
+    },
+
+    /// Eine blockierende Hintergrundaufgabe (`spawn_blocking`: Parsen,
+    /// Cache-I/O) ist abgebrochen oder in Panik geraten.
+    #[msg("Hintergrundaufgabe '{task}' wurde abgebrochen")]
+    BlockingTask {
+        /// Name der Aufgabe.
+        task: &'static str,
     },
 
     /// Aus der URL ließ sich kein Hostname extrahieren.
@@ -95,7 +128,7 @@ pub enum WebToolError {
     /// Redirect ist damit kein Weg an der Allowlist vorbei.
     #[msg("Host '{host}' ist nicht in der erlaubten Host-Liste dieser Sandbox (URL '{url}')")]
     RedirectHostNotAllowed {
-        /// Die URL des abgelehnten Hops.
+        /// Die URL des abgelehnten Hops (bei Weiterleitungen ein Platzhalter).
         url: String,
         /// Der abgelehnte Hostname.
         host: String,
@@ -104,7 +137,7 @@ pub enum WebToolError {
     /// Die Redirect-Kette überschritt das Limit.
     #[msg("zu viele Weiterleitungen, abgebrochen bei '{url}'")]
     TooManyRedirects {
-        /// Die URL, bei der abgebrochen wurde.
+        /// Die URL bzw. der Weiterleitungs-Platzhalter, bei dem abgebrochen wurde.
         url: String,
     },
 
@@ -126,8 +159,10 @@ pub enum WebToolError {
         host: String,
     },
 
-    /// Ein Cache-Eintrag ließ sich nicht als [`crate::fetch::CacheEntry`]
+    /// Ein Cache-Eintrag ließ sich nicht als [`crate::cache::CacheEntry`]
     /// lesen. Der Aufrufer behandelt das als Cache-Miss und holt neu.
+    ///
+    /// Wird nur protokolliert, nie als Tool-Ausgabe an das Modell gegeben.
     #[msg("Cache-Eintrag '{path}' ist unlesbar oder beschädigt")]
     CacheCorrupt {
         /// Der Pfad des betroffenen Cache-Eintrags.
@@ -279,6 +314,19 @@ mod tests {
             !status.is_transport(),
             "ein 5xx ist eine Antwort, kein Transportfehler"
         );
+    }
+
+    /// Egress-Ablehnungen sind nie Transportfehler (kein Cache-Fail-open).
+    #[test]
+    fn test_is_transport_egress_denied_is_not_transport() {
+        let err = WebToolError::EgressDenied {
+            reason: "Zieladresse der Klasse loopback ist nicht erlaubt".to_owned(),
+        };
+        assert!(!err.is_transport());
+        assert!(err.to_string().contains("loopback"), "{err}");
+        let unconfigured = WebToolError::NotConfigured { what: "keine Egress-Policy" };
+        assert!(!unconfigured.is_transport());
+        assert!(unconfigured.to_string().contains("keine Egress-Policy"));
     }
 
     /// Der vom Derive erzeugte Alias existiert und ist verwendbar.

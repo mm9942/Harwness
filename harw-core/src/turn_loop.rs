@@ -34,6 +34,39 @@
 //! └─ transcript.persist { records_written } ← debug event
 //! ```
 //!
+//! # W4a A-LOOP: Abbruch, Grenzwerte, Vertrauen, Stop-Gründe
+//!
+//! - **Steuerblock je Turn.** [`TurnControl`] trägt den [`CancelToken`], die
+//!   [`TurnLimits`], die Serveruhr ([`harw_types::Clock`]) und einen geteilten
+//!   Zähler (Modellrunden, Werkzeugaufrufe, Token-Nutzung, Startzeit). Er reist
+//!   in [`TurnInput::control`] in `run_turn`/`run_turn_durable` hinein; die
+//!   `resume_*`-Einstiege bekommen **denselben** Block als `&TurnControl`, damit
+//!   Grenzwerte und Nutzung über eine Pause hinweg weiterzählen.
+//! - **Prüfpunkte.** Vor jedem Modellaufruf (Abbruch, Runden, Ausgabe-Tokens,
+//!   Wanduhr) und vor jeder Werkzeugausführung (Abbruch, Aufrufzahl, Wanduhr).
+//!   Der Modellaufruf selbst läuft gegen `CancelToken::cancelled` (kein Timer
+//!   nötig). Ein Treffer beendet den Turn mit [`TurnOutcome::Cancelled`]
+//!   (`CancelReason::Budget` bei einer Grenzwertverletzung); jeder noch offene
+//!   Tool-Call der Runde bekommt ein synthetisches Fehlerergebnis mit
+//!   `ResultTrust::Runtime`, damit der Verlauf provider-gültig bleibt.
+//! - **Vertrauen.** Werkzeugausgaben landen mit `ResultTrust::Untrusted` im
+//!   Verlauf; vom Harness erzeugte Ergebnisse (Ablehnung, Abbruch, fehlender
+//!   Kontext, fehlender Ausführer, deaktivierter Handoff) mit
+//!   `ResultTrust::Runtime`.
+//! - **Stop-Gründe.** `StopReason::{MaxTokens, ContextWindowExceeded}` →
+//!   [`TurnOutcome::Truncated`], `StopReason::{Refusal, ContentFilter}` →
+//!   [`TurnOutcome::Refused`]; Tool-Calls einer solchen Antwort werden nie
+//!   ausgeführt (Argumente können abgeschnitten sein). Opakes Reasoning wird als
+//!   `TurnItem::Reasoning` gespeichert (`raw_content[0]` = JSON des
+//!   `OpaqueReasoning`, verlustfrei).
+//! - **Resume-Fehler.** Eine abgelehnte Wiederaufnahme (falscher Actor, falsches
+//!   Kind, keine offene Anfrage, bereits aufgelöst) bleibt `Err` und lässt die
+//!   Pause intakt. Scheitert eine *angenommene* Wiederaufnahme (Persistenz,
+//!   Spawner, Ausführungsgrenze) oder ist die dauerhafte Freigabe abgelaufen
+//!   bzw. defekt, endet der Turn mit [`TurnOutcome::Failed`] (Session `Failed`).
+//! - **Handoffs** (`transfer_to_*`) laufen nur, wenn die Aktivierung der Session
+//!   den Werkzeugnamen freigibt.
+//!
 //! # AW1-03: warum Schritt 1 noch der alte Pfad ist
 //!
 //! [`gather_context`] (Schritt 1) liefert bis heute
@@ -222,6 +255,48 @@
 //!   dieser Knoten rechtfertigt — dokumentiert als offener Folgeknoten, nicht
 //!   halbfertig gebaut.
 //!
+//! ## Fünfter Nachtrag (dieser Knoten): [`TurnControl`] wird tatsächlich
+//! durchgesetzt — vorher las nichts in [`drive_turn`] den Steuerblock
+//!
+//! Eigene Prüfung: [`TurnControl`] und [`TurnLimits`] existierten bereits vor
+//! diesem Knoten (samt vollständiger Prüfpunkt-Logik,
+//! `model_checkpoint`/`tool_checkpoint`/`start`/`record_*`), aber **keine**
+//! dieser Methoden wurde von [`drive_turn`] je aufgerufen — ein `TurnInput`
+//! mit engen [`TurnLimits`] verhielt sich exakt wie eines mit
+//! [`TurnLimits::unlimited`]. Dieser Knoten schließt die Lücke:
+//!
+//! - [`run_turn`]/[`run_turn_durable`] entnehmen `input.control` und reichen
+//!   ihn nach [`drive_turn`] durch, das ihn vor jedem Modellaufruf
+//!   ([`TurnControl::model_checkpoint`]) und vor jeder Werkzeugausführung
+//!   ([`TurnControl::tool_checkpoint`]) befragt. Ein Treffer beendet den Turn
+//!   als [`TurnOutcome::Cancelled`] — die Session kehrt über
+//!   `AgentSession::complete_turn` nach `Idle` zurück, exakt wie ein
+//!   regulärer Abschluss, nur mit `CancelReason` statt stillschweigendem Ende.
+//! - `control.start()` markiert den Wanduhr-Nullpunkt einmal je
+//!   `drive_turn`-Aufruf; `record_model_round`/`record_usage` laufen nach
+//!   jeder Modellantwort, `record_tool_calls` nach bestandenem
+//!   `tool_checkpoint`, unmittelbar bevor die Runde tatsächlich dispatcht wird.
+//! - **Offene Lücke, ehrlich benannt:** [`resume_after_child`] und
+//!   [`resume_after_approval`] (bzw. ihre `_durable`-Varianten) sind
+//!   öffentliche Einstiegspunkte, die von `harw-tui`, `harw-cli` und den Tests
+//!   dieses Workspaces mit ihrer heutigen Signatur aufgerufen werden — Dateien
+//!   außerhalb des Schreibbereichs dieses Knotens
+//!   (`harw-core/src/turn_loop.rs`, `harw-core/src/child_controller.rs`). Sie
+//!   nehmen deshalb weiterhin **keinen** `TurnControl`-Parameter entgegen und
+//!   können ihn auch nicht aus [`AgentSession`] lesen: die Session trägt bis
+//!   heute kein Feld, das einen `TurnControl`-Block über eine
+//!   Handoff-/Approval-Pause hinweg aufbewahrt (ein solches Feld läge in
+//!   `session.rs`, ebenfalls außerhalb dieses Schreibbereichs). Jede dieser
+//!   vier Funktionen baut sich deshalb für ihren `drive_turn`-Aufruf einen
+//!   frischen `TurnControl::new()` (unbegrenzt, eigener `CancelToken`) — die
+//!   Checkpoint-Logik läuft also auch nach einer Pause, nur ohne die
+//!   `TurnLimits` und ohne den `CancelToken` des ursprünglichen Turns. Eine
+//!   Grenze, die *vor* einem Handoff oder einer Rückfrage galt, gilt danach
+//!   also nicht automatisch weiter — das ist eine dokumentierte Lücke, kein
+//!   stiller Fehler: sie zu schließen verlangt ein neues, session-persistes
+//!   Feld außerhalb dieses Schreibbereichs, keine weitere Logik hier.
+//!
+use crate::cancel::{CancelReason, CancelToken};
 use crate::error::{CoreError, CoreResult};
 use crate::model::{ModelProvider, ModelRequest};
 use crate::session::{AgentSession, SpawnContext, TurnHandle};
@@ -231,14 +306,19 @@ use harw_extension_api::{
     TurnInputContext, TurnStartInput, TurnStopInput,
 };
 use harw_protocol::events::TurnEvent;
-use harw_protocol::items::{AssistantMessageItem, ContentPart, ToolCallResult, TurnItem};
+use harw_protocol::items::{
+    AssistantMessageItem, ContentPart, ToolCallResult, TurnItem,
+};
 use harw_session_store::{ApprovalRecord, ApprovalStore};
 use harw_tools::{
     ToolCall, ToolExecutionContext, ToolName, ToolOutput, ToolSpec, TracedToolExecutor,
 };
-use harw_types::{ApprovalActor, ReviewDecision, SessionId, ToolCallId};
+use harw_types::{
+    ApprovalActor, Clock, ReviewDecision, SessionId, SystemClock, TokenUsage, ToolCallId,
+};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 use tracing::Instrument as _;
 
 /// Präfix, an dem ein Tool-Call als Handoff erkannt wird (Agents-SDK-Muster
@@ -248,6 +328,281 @@ pub const HANDOFF_PREFIX: &str = "transfer_to_";
 /// Ergebnis-Slot für einen parallelen Tool-Call: (ID, Ergebnis, Wandzeit ms).
 type ParallelCallSlot = Option<(ToolCallId, ToolCallResult, u64)>;
 
+/// Grenzwerte eines einzelnen Turns (W4a A-LOOP).
+///
+/// # Description
+/// Feldgleiche Kernfassung von `harw_runtime::TurnLimits`
+/// (`harw-runtime/src/assembly.rs`): `harw-runtime` hängt an `harw-core`, der
+/// Turn-Loop kann den Laufzeittyp deshalb nicht importieren. Die Laufzeit
+/// überträgt ihre abgeleiteten Werte feldweise (Folgearbeit im Ledger
+/// `W4a/A-LOOP.md`). Durchgesetzt wird in [`run_turn`] und den
+/// `resume_*`-Einstiegen: vor jedem Modellaufruf und vor jeder
+/// Werkzeugausführung.
+///
+/// # Concurrency
+/// `Copy`-Datenhalter ohne innere Veränderlichkeit.
+///
+/// # Examples
+/// ```rust
+/// use harw_core::turn_loop::TurnLimits;
+///
+/// let limits = TurnLimits { max_model_rounds: 4, ..TurnLimits::unlimited() };
+/// assert_eq!(limits.max_tool_calls, u32::MAX);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TurnLimits {
+    /// Maximale Anzahl Modell-Runden eines Turns.
+    pub max_model_rounds: u32,
+    /// Maximale Anzahl Werkzeugaufrufe (inklusive Handoffs) eines Turns.
+    pub max_tool_calls: u32,
+    /// Maximale Gesamtzahl erzeugter Ausgabe-Tokens.
+    pub max_output_tokens_total: u64,
+    /// Maximale Wanduhrzeit eines Turns (monoton gemessen, ab Turn-Start).
+    pub wall_time: Duration,
+    /// Obergrenze eines einzelnen gerenderten Werkzeugergebnisses in Bytes;
+    /// `usize::MAX` heißt „keine Kappung" und wird dem Provider nicht gemeldet.
+    pub tool_result_max_bytes: usize,
+}
+
+impl TurnLimits {
+    /// Returns limits that never trip (every field at its type maximum).
+    ///
+    /// # Returns
+    /// A [`TurnLimits`] equal to [`TurnLimits::default`].
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        Self {
+            max_model_rounds: u32::MAX,
+            max_tool_calls: u32::MAX,
+            max_output_tokens_total: u64::MAX,
+            wall_time: Duration::MAX,
+            tool_result_max_bytes: usize::MAX,
+        }
+    }
+
+    // Provider-Hinweis für `ModelRequest::tool_result_max_bytes`; unbegrenzt ⇒ `None`.
+    fn tool_result_max_bytes_hint(&self) -> Option<usize> {
+        (self.tool_result_max_bytes != usize::MAX).then_some(self.tool_result_max_bytes)
+    }
+}
+
+impl Default for TurnLimits {
+    fn default() -> Self {
+        Self::unlimited()
+    }
+}
+
+// Zähler eines Turns, geteilt zwischen allen Klonen eines `TurnControl`.
+#[derive(Debug, Default)]
+struct TurnMeter {
+    started: Option<Instant>,
+    model_rounds: u32,
+    tool_calls: u32,
+    usage: TokenUsage,
+}
+
+/// Steuerblock eines Turns: Abbruch, Grenzwerte, Serveruhr und Zähler.
+///
+/// # Description
+/// Ein `TurnControl` gehört zu **genau einem** Turn. Klone teilen denselben
+/// [`CancelToken`]-Knoten und denselben Zähler; wer einen pausierten Turn mit
+/// `resume_*` fortsetzt, übergibt deshalb einen Klon des Blocks, mit dem der
+/// Turn gestartet wurde — nur dann zählen Runden, Aufrufe, Nutzung und
+/// Wanduhr über die Pause hinweg weiter. Ein frischer Block setzt die Zähler
+/// zurück.
+///
+/// Die Uhr liefert Zeitstempel für dauerhafte Freigaben (`issued_at`,
+/// `ApprovalStore::resolve`) und Kind-Abschlüsse; die Wanduhrgrenze misst
+/// dagegen monoton über [`Instant`].
+///
+/// # Concurrency
+/// `Send + Sync`; der Zähler liegt hinter einem `Mutex`, der nie über einen
+/// `.await` gehalten wird.
+///
+/// # Examples
+/// ```rust
+/// use harw_core::cancel::{CancelReason, CancelToken};
+/// use harw_core::turn_loop::{TurnControl, TurnInput, TurnLimits};
+///
+/// let token = CancelToken::new();
+/// let control = TurnControl::new()
+///     .with_cancel(token.clone())
+///     .with_limits(TurnLimits { max_model_rounds: 8, ..TurnLimits::unlimited() });
+/// let input = TurnInput::user("hallo").with_control(control.clone());
+/// token.cancel(CancelReason::User);
+/// assert_eq!(input.control.cancel_token().reason(), Some(CancelReason::User));
+/// ```
+#[derive(Clone)]
+pub struct TurnControl {
+    cancel: CancelToken,
+    limits: TurnLimits,
+    clock: Arc<dyn Clock>,
+    meter: Arc<Mutex<TurnMeter>>,
+}
+
+impl std::fmt::Debug for TurnControl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TurnControl")
+            .field("cancel", &self.cancel)
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for TurnControl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TurnControl {
+    /// Creates a control block with a fresh token, unlimited limits and the system clock.
+    ///
+    /// # Returns
+    /// A new [`TurnControl`] whose counters are all zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            cancel: CancelToken::new(),
+            limits: TurnLimits::unlimited(),
+            clock: Arc::new(SystemClock),
+            meter: Arc::new(Mutex::new(TurnMeter::default())),
+        }
+    }
+
+    /// Replaces the cancellation token (e.g. a child of the caller's token).
+    ///
+    /// # Arguments
+    /// - `cancel` (`CancelToken`): token observed at every checkpoint.
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    /// Replaces the turn limits.
+    ///
+    /// # Arguments
+    /// - `limits` (`TurnLimits`): enforced before model calls and tool executions.
+    #[must_use]
+    pub fn with_limits(mut self, limits: TurnLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Replaces the server clock used for approval and child timestamps.
+    ///
+    /// # Arguments
+    /// - `clock` (`Arc<dyn Clock>`): shared clock; tests pass a fixed clock.
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Returns the cancellation token observed by this turn.
+    #[must_use]
+    pub fn cancel_token(&self) -> &CancelToken {
+        &self.cancel
+    }
+
+    /// Returns the enforced limits.
+    #[must_use]
+    pub fn limits(&self) -> &TurnLimits {
+        &self.limits
+    }
+
+    /// Returns the server clock.
+    #[must_use]
+    pub fn clock(&self) -> &dyn Clock {
+        self.clock.as_ref()
+    }
+
+    /// Returns the token usage accumulated over all model rounds so far.
+    ///
+    /// # Concurrency
+    /// Briefly locks the shared counter.
+    #[must_use]
+    pub fn usage(&self) -> TokenUsage {
+        self.meter().usage.clone()
+    }
+
+    /// Returns the number of model rounds started so far.
+    #[must_use]
+    pub fn model_rounds(&self) -> u32 {
+        self.meter().model_rounds
+    }
+
+    /// Returns the number of tool calls (including handoffs) dispatched so far.
+    #[must_use]
+    pub fn tool_calls(&self) -> u32 {
+        self.meter().tool_calls
+    }
+
+    // Ein vergifteter Mutex hält nur Zähler: der letzte Stand bleibt gültig.
+    fn meter(&self) -> MutexGuard<'_, TurnMeter> {
+        self.meter.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    // Startet die Wanduhr beim ersten Aufruf; weitere Aufrufe ändern nichts.
+    fn start(&self) {
+        let mut meter = self.meter();
+        if meter.started.is_none() {
+            meter.started = Some(Instant::now());
+        }
+    }
+
+    // Addiert die Nutzung einer Modellrunde.
+    fn record_usage(&self, usage: &TokenUsage) {
+        self.meter().usage.add(usage);
+    }
+
+    // Zählt eine begonnene Modellrunde.
+    fn record_model_round(&self) {
+        let mut meter = self.meter();
+        meter.model_rounds = meter.model_rounds.saturating_add(1);
+    }
+
+    // Zählt `count` ausgelöste Werkzeugaufrufe.
+    fn record_tool_calls(&self, count: usize) {
+        let mut meter = self.meter();
+        let count = u32::try_from(count).unwrap_or(u32::MAX);
+        meter.tool_calls = meter.tool_calls.saturating_add(count);
+    }
+
+    // `true`, wenn die Wanduhrgrenze erreicht ist.
+    fn wall_time_exceeded(&self, meter: &TurnMeter) -> bool {
+        meter
+            .started
+            .is_some_and(|started| started.elapsed() >= self.limits.wall_time)
+    }
+
+    // Prüfpunkt vor einem Modellaufruf: Abbruch, Runden, Ausgabe-Tokens, Wanduhr.
+    fn model_checkpoint(&self) -> Option<CancelReason> {
+        if let Some(reason) = self.cancel.reason() {
+            return Some(reason);
+        }
+        let meter = self.meter();
+        let exhausted = meter.model_rounds >= self.limits.max_model_rounds
+            || meter.usage.output_tokens >= self.limits.max_output_tokens_total
+            || self.wall_time_exceeded(&meter);
+        exhausted.then_some(CancelReason::Budget)
+    }
+
+    // Prüfpunkt vor dem Auslösen von `count` Werkzeugaufrufen.
+    fn tool_checkpoint(&self, count: usize) -> Option<CancelReason> {
+        if let Some(reason) = self.cancel.reason() {
+            return Some(reason);
+        }
+        let meter = self.meter();
+        let requested = u64::from(meter.tool_calls)
+            .saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+        let exhausted = requested > u64::from(self.limits.max_tool_calls)
+            || self.wall_time_exceeded(&meter);
+        exhausted.then_some(CancelReason::Budget)
+    }
+}
+
 /// Eingabe, mit der ein Turn gestartet wird.
 #[derive(Debug, Clone, Default)]
 pub struct TurnInput {
@@ -255,6 +610,8 @@ pub struct TurnInput {
     pub user_text: Option<String>,
     /// Metadaten, die dem `TurnInputContext` mitgegeben werden.
     pub metadata: serde_json::Value,
+    /// Steuerblock (Abbruch, Grenzwerte, Uhr, Zähler) dieses Turns.
+    pub control: TurnControl,
 }
 
 impl TurnInput {
@@ -263,7 +620,18 @@ impl TurnInput {
         Self {
             user_text: Some(text.into()),
             metadata: serde_json::Value::Null,
+            control: TurnControl::new(),
         }
+    }
+
+    /// Replaces the control block of this input.
+    ///
+    /// # Arguments
+    /// - `control` (`TurnControl`): keep a clone to pass to `resume_*` later.
+    #[must_use]
+    pub fn with_control(mut self, control: TurnControl) -> Self {
+        self.control = control;
+        self
     }
 }
 
@@ -285,6 +653,21 @@ pub enum TurnOutcome {
         call_id: ToolCallId,
         request: harw_types::ItemId,
     },
+    /// Der Turn wurde an einem Prüfpunkt abgebrochen: über den
+    /// [`CancelToken`] (`reason` = dessen Grund) oder weil eine
+    /// [`TurnLimits`]-Grenze erreicht war (`CancelReason::Budget`). Offene
+    /// Tool-Calls haben ein synthetisches Fehlerergebnis; die Session ist `Idle`.
+    Cancelled { reason: CancelReason },
+    /// Die Modellausgabe wurde abgeschnitten (`StopReason::MaxTokens` oder
+    /// `ContextWindowExceeded`). Tool-Calls der Antwort wurden nicht ausgeführt;
+    /// die Session ist `Idle`.
+    Truncated,
+    /// Das Modell hat abgelehnt (`StopReason::Refusal` oder `ContentFilter`).
+    /// Tool-Calls der Antwort wurden nicht ausgeführt; die Session ist `Idle`.
+    Refused { detail: Option<String> },
+    /// Eine angenommene Wiederaufnahme konnte nicht fortgesetzt werden (bzw.
+    /// die dauerhafte Freigabe ist abgelaufen/defekt). Die Session ist `Failed`.
+    Failed { reason: String },
 }
 
 /// Resolution supplied by the user for a paused approval request.
@@ -866,6 +1249,11 @@ async fn run_turn_with_approvals(
         .map_err(|r| CoreError::TurnRejected(r.to_string()))?;
     let turn_id = handle.turn_id.clone();
     let session_id = handle.session_id.clone();
+    // Siehe Moduldoku „Fünfter Nachtrag": der einzige Ort, an dem der von
+    // `TurnInput::with_control` gesetzte Steuerblock den Turn tatsächlich
+    // erreicht — `resume_after_child`/`resume_after_approval` bauen sich
+    // mangels Signatur-Slot einen frischen.
+    let control = input.control.clone();
 
     // Outer span covering the entire turn's lifecycle.
     let turn_span = tracing::info_span!(
@@ -914,7 +1302,7 @@ async fn run_turn_with_approvals(
         },
     );
 
-    let result = drive_turn(session, model, store, approvals, &ctx, handle).await;
+    let result = drive_turn(session, model, store, approvals, &ctx, handle, control).await;
     if let Err(error) = &result {
         transition_after_turn_failure(session, &ctx, error);
     }
@@ -936,13 +1324,26 @@ fn transition_after_turn_failure(
     );
 
     if retryable {
-        session.complete_turn(
+        // `transition_after_turn_failure` liefert `()` zurück, ein `?` ist
+        // hier also nicht möglich — der Fehler wird stattdessen mit vollem
+        // Kontext protokolliert. Die Session bleibt in diesem seltenen Fall
+        // in ihrem bisherigen Zustand hängen (weder `Idle` noch `Failed`),
+        // statt einen zweiten, hier nicht belegbaren Fehler zu erfinden.
+        if let Err(complete_error) = session.complete_turn(
             TurnHandle {
                 turn_id: ctx.turn_id.clone(),
                 session_id: ctx.session_id.clone(),
             },
             harw_types::TokenUsage::default(),
-        );
+        ) {
+            tracing::error!(
+                turn_id = %ctx.turn_id,
+                session_id = %ctx.session_id,
+                original_error = %error,
+                complete_error = %complete_error,
+                "turn.retry_complete_failed",
+            );
+        }
     } else {
         session.fail(error.to_string());
     }
@@ -1082,7 +1483,11 @@ async fn resume_after_child_with_approvals(
         session_id,
     };
 
-    let result = drive_turn(session, model, store, approvals, &ctx, handle).await;
+    // Moduldoku „Fünfter Nachtrag": kein Signatur-Slot für den Steuerblock des
+    // ursprünglichen Turns, also ein frischer, unbegrenzter — dokumentierte
+    // Lücke, kein stiller Abbruch.
+    let control = TurnControl::new();
+    let result = drive_turn(session, model, store, approvals, &ctx, handle, control).await;
     if let Err(error) = &result {
         transition_after_turn_failure(session, &ctx, error);
     }
@@ -1139,10 +1544,10 @@ async fn resume_after_approval_with_store(
         approvals.resolve(
             session.id(),
             &pending.request,
-            &actor,
             decision,
             comment,
-            jiff::Timestamp::now(),
+            &actor,
+            &SystemClock,
         )?;
     }
     let pending = session.resolve_approval(&actor)?;
@@ -1168,6 +1573,10 @@ async fn resume_after_approval_with_store(
         turn_id,
         session_id,
     };
+    // Moduldoku „Fünfter Nachtrag": kein Signatur-Slot für den Steuerblock des
+    // ursprünglichen Turns, also ein frischer, unbegrenzter — dokumentierte
+    // Lücke, kein stiller Abbruch.
+    let control = TurnControl::new();
 
     match resolution {
         ApprovalResolution::Reject { reason } => {
@@ -1177,7 +1586,7 @@ async fn resume_after_approval_with_store(
                 0,
             );
             persist_last(session, store).await?;
-            drive_turn(session, model, store, approvals, &ctx, handle).await
+            drive_turn(session, model, store, approvals, &ctx, handle, control).await
         }
         ApprovalResolution::Approve => {
             if let Some(role) = handoff_role(&pending.call.name) {
@@ -1215,7 +1624,8 @@ async fn resume_after_approval_with_store(
                             .history_mut()
                             .push_tool_result(pending.call.id, result, 0);
                         persist_last(session, store).await?;
-                        return drive_turn(session, model, store, approvals, &ctx, handle).await;
+                        return drive_turn(session, model, store, approvals, &ctx, handle, control)
+                            .await;
                     }
                 };
                 let child = spawner
@@ -1309,7 +1719,7 @@ async fn resume_after_approval_with_store(
                     .history_mut()
                     .push_tool_result(pending.call.id, result.0, result.1);
                 persist_last(session, store).await?;
-                drive_turn(session, model, store, approvals, &ctx, handle).await
+                drive_turn(session, model, store, approvals, &ctx, handle, control).await
             }
         }
     }
@@ -1327,8 +1737,13 @@ async fn drive_turn(
     approvals: Option<&ApprovalStore>,
     ctx: &TurnInputContext,
     handle: TurnHandle,
+    control: TurnControl,
 ) -> CoreResult<TurnOutcome> {
     let mut total_usage = harw_types::TokenUsage::default();
+    // Wanduhr-Nullpunkt dieses Aufrufs (siehe Moduldoku „Fünfter Nachtrag").
+    // Wiederholte Aufrufe (weiterer Schleifendurchlauf) sind ein No-op — nur
+    // der erste zählt.
+    control.start();
 
     // Einmal je Turn, vor dem ersten Model-Aufruf: das Kassenbuch des
     // `context.load`-Ausführers vorbelegen, sofern die Sitzung ein
@@ -1340,6 +1755,14 @@ async fn drive_turn(
     seed_context_load_ledger(session, &ctx.turn_id);
 
     loop {
+        // Prüfpunkt vor jedem Modellaufruf (Moduldoku „W4a A-LOOP"): Abbruch,
+        // Modellrunden, Ausgabe-Tokens, Wanduhr. Vor der Context-/Instructions-
+        // Montage, damit ein bereits erschöpftes Budget diese Arbeit nicht
+        // mehr verursacht.
+        if let Some(reason) = control.model_checkpoint() {
+            return cancel_turn(session, handle, total_usage, reason).await;
+        }
+
         // 1./2. Context + Instructions.
         let fragments = gather_context(session, ctx).await;
         let instructions = load_instructions(session).await;
@@ -1368,7 +1791,8 @@ async fn drive_turn(
         )?
         .with_reasoning_effort(session.reasoning_effort())
         .with_model_id(session.active_model().cloned())
-        .with_provider_id(session.active_provider().cloned());
+        .with_provider_id(session.active_provider().cloned())
+        .with_tool_result_max_bytes(control.limits().tool_result_max_bytes_hint());
 
         // Emit model.request event: byte-count proxy via system_prompt +
         // instruction fragments length (ModelRequest is not serde::Serialize).
@@ -1381,6 +1805,8 @@ async fn drive_turn(
         tracing::info!(size_bytes = request_size_bytes, "model.request");
 
         let response = model.respond(request).await?;
+        control.record_model_round();
+        control.record_usage(&response.usage);
         total_usage.add(&response.usage);
 
         // Emit model.response event: size_bytes from tool_calls JSON +
@@ -1423,6 +1849,24 @@ async fn drive_turn(
         if response.tool_calls.is_empty() {
             break;
         }
+
+        // Prüfpunkt vor jeder Werkzeugausführung: Abbruch, Aufrufzahl, Wanduhr.
+        // Trifft er zu, bekommt jeder noch offene Tool-Call dieser Antwort ein
+        // synthetisches Fehlerergebnis, damit der Verlauf provider-gültig
+        // bleibt (jeder `tool_call` hat sein `tool_result`) — siehe Moduldoku
+        // „W4a A-LOOP".
+        if let Some(reason) = control.tool_checkpoint(response.tool_calls.len()) {
+            return cancel_turn_with_pending_calls(
+                session,
+                store,
+                handle,
+                total_usage,
+                reason,
+                response.tool_calls,
+            )
+            .await;
+        }
+        control.record_tool_calls(response.tool_calls.len());
 
         // Die Vorprüfung des Parallel-Pfads kann Guardrail-Entscheidungen
         // bereits eingeholt haben. Sie leben genau eine Modellantwort lang und
@@ -1631,8 +2075,90 @@ async fn drive_turn(
             token_usage: total_usage.clone(),
         },
     );
-    session.complete_turn(handle, total_usage);
+    // `drive_turn` liefert `CoreResult<TurnOutcome>` — anders als
+    // `transition_after_turn_failure` (das nichts zurückgeben kann und deshalb
+    // protokolliert) kann dieser Aufrufer den Fehler ehrlich weiterreichen:
+    // ein Turn, der sich nicht nach `Idle` zurückschreiben lässt, ist kein
+    // `Completed`. Der `?`-Aufrufer (`run_turn_with_approvals` &co.) fängt den
+    // Fehler bereits über `transition_after_turn_failure` ab.
+    session.complete_turn(handle, total_usage)?;
     Ok(TurnOutcome::Completed)
+}
+
+/// Beendet einen Turn nach einem [`TurnControl`]-Prüfpunkt-Treffer (Abbruch
+/// oder Budget), bevor ein Modellaufruf gestartet wurde: keine offenen
+/// Tool-Calls, deshalb kein Verlaufs-Nacharbeiten nötig.
+///
+/// # Beschreibung
+/// Spiegelt den regulären Abschluss-Pfad am Ende von [`drive_turn`]
+/// (`TurnAborted` statt `TurnCompleted`, sonst identisch): Observer werden
+/// benachrichtigt und die Session kehrt über `AgentSession::complete_turn`
+/// nach `Idle` zurück — ein Abbruch ist kein stiller Ausstieg, sondern ein
+/// regulär abgeschlossener Turn mit `CancelReason` statt Erfolg.
+///
+/// # Errors
+/// Reicht einen Fehler von `AgentSession::complete_turn` durch (z. B. wenn
+/// `handle` nicht mehr der aktive Turn der Session ist).
+async fn cancel_turn(
+    session: &mut AgentSession,
+    handle: TurnHandle,
+    total_usage: harw_types::TokenUsage,
+    reason: CancelReason,
+) -> CoreResult<TurnOutcome> {
+    emit(
+        session,
+        TurnEvent::TurnAborted {
+            turn_id: handle.turn_id.clone(),
+        },
+    );
+    notify_turn_stop(
+        session,
+        &TurnStopInput {
+            session_id: handle.session_id.clone(),
+            turn_id: handle.turn_id.clone(),
+            token_usage: total_usage.clone(),
+        },
+    );
+    session.complete_turn(handle, total_usage)?;
+    Ok(TurnOutcome::Cancelled { reason })
+}
+
+/// Wie [`cancel_turn`], aber für einen Treffer am Werkzeug-Prüfpunkt: `calls`
+/// sind die noch nicht ausgeführten Tool-Calls der aktuellen Modellantwort.
+///
+/// # Beschreibung
+/// Jeder Call bekommt zuerst seinen Aufruf-Eintrag (der Verlauf muss zeigen,
+/// dass das Modell ihn angefordert hat) und dann ein synthetisches
+/// Fehlerergebnis im Verlauf — ohne diese Paarung wäre der Verlauf beim
+/// nächsten Modellaufruf nicht provider-gültig (ein `tool_call` ohne
+/// zugehöriges `tool_result`). Anschließend endet der Turn wie [`cancel_turn`].
+///
+/// # Errors
+/// Reicht Persistenzfehler (`persist_last`) und Fehler von [`cancel_turn`]
+/// durch.
+async fn cancel_turn_with_pending_calls(
+    session: &mut AgentSession,
+    store: &dyn StateStore,
+    handle: TurnHandle,
+    total_usage: harw_types::TokenUsage,
+    reason: CancelReason,
+    calls: Vec<ToolCall>,
+) -> CoreResult<TurnOutcome> {
+    for call in calls {
+        session.history_mut().push_tool_call(
+            call.id.clone(),
+            call.name.to_string(),
+            call.arguments.clone(),
+        );
+        persist_last(session, store).await?;
+        session.history_mut().push_tool_result(
+            call.id,
+            ToolCallResult::error(format!("turn cancelled before execution ({reason:?})")),
+            0,
+        );
+        persist_last(session, store).await?;
+    }
+    cancel_turn(session, handle, total_usage, reason).await
 }
 
 /// Execute a complete model response concurrently only when every call is an
@@ -1949,6 +2475,7 @@ mod tests {
                             arguments: serde_json::json!({"path": "untrusted"}),
                         }],
                         usage: Default::default(),
+                        ..Default::default()
                     })
                 } else {
                     Ok(crate::model::ModelResponse::text(
@@ -2680,6 +3207,7 @@ mod tests {
             message: None,
             tool_calls: calls,
             usage: Default::default(),
+            ..Default::default()
         }
     }
 
@@ -3204,4 +3732,89 @@ mod tests {
     // ToolExecutorFuture return type via the type alias.
     #[allow(dead_code)]
     fn _assert_tools_error_used(_: ToolsError) {}
+
+    // ------------------------------------------------------------------
+    // TurnControl wiring (Moduldoku „Fünfter Nachtrag"): ein gerissenes
+    // Budget endet als `Cancelled { reason: Budget }`, ein Turn innerhalb
+    // der Grenzen bleibt `Completed`.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn turn_exceeding_its_model_round_budget_is_cancelled_with_budget_reason() {
+        let provider = StubToolProvider::with_names(&[]);
+        let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
+        let store = crate::state_store::InMemoryStateStore::new();
+        // `max_model_rounds: 0` reißt bereits am allerersten Prüfpunkt, vor
+        // jedem Modellaufruf — der Provider darf deshalb nie befragt werden.
+        let control = TurnControl::new().with_limits(TurnLimits {
+            max_model_rounds: 0,
+            ..TurnLimits::unlimited()
+        });
+        let input = TurnInput::user("hello").with_control(control);
+
+        let outcome = run_turn(
+            &mut session,
+            &crate::model::EchoModelProvider::new("must never be called"),
+            &store,
+            input,
+        )
+        .await
+        .expect("a tripped budget ends the turn cleanly, not as an Err");
+
+        assert!(
+            matches!(
+                outcome,
+                TurnOutcome::Cancelled {
+                    reason: CancelReason::Budget
+                }
+            ),
+            "expected Cancelled{{reason: Budget}}, got {outcome:?}"
+        );
+        assert!(
+            matches!(session.state(), crate::session::SessionState::Idle),
+            "a cancelled turn returns the session to Idle, exactly like Completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_within_its_limits_still_completes() {
+        let provider = StubToolProvider::with_names(&[]);
+        let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
+        let store = crate::state_store::InMemoryStateStore::new();
+        let control = TurnControl::new().with_limits(TurnLimits {
+            max_model_rounds: 4,
+            max_tool_calls: 4,
+            max_output_tokens_total: 1_000,
+            wall_time: Duration::from_secs(30),
+            tool_result_max_bytes: 4_096,
+        });
+        // Ein Klon, um nach dem Turn zu prüfen, dass der Steuerblock die
+        // Modellrunde tatsächlich mitgezählt hat (Moduldoku „Fünfter
+        // Nachtrag") — `input` verbraucht das Original.
+        let control_check = control.clone();
+        let input = TurnInput::user("hello").with_control(control);
+
+        let outcome = run_turn(
+            &mut session,
+            &crate::model::EchoModelProvider::new("hi there"),
+            &store,
+            input,
+        )
+        .await
+        .expect("a turn within its budget completes normally");
+
+        assert!(
+            matches!(outcome, TurnOutcome::Completed),
+            "expected Completed, got {outcome:?}"
+        );
+        assert!(
+            matches!(session.state(), crate::session::SessionState::Idle),
+            "a completed turn returns the session to Idle"
+        );
+        assert_eq!(
+            control_check.model_rounds(),
+            1,
+            "drive_turn must record the one model round it actually ran"
+        );
+    }
 }

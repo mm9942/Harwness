@@ -9,6 +9,9 @@
 //! Alle Typen sind `Send + Sync`: Newtypes über `String` / `u64`, dazu
 //! [`PathOrSymbol`] als zweivariantiges Enum über `String`-Feldern.
 //!
+//! `PlanId` trägt eine feste Grammatik (Pfadsegment-sicher, F-013/G-032);
+//! Fehler: [`PlanError::InvalidId`].
+//!
 //! Exportierte Typen: [`PlanId`], [`TaskId`], [`RevisionId`], [`PathOrSymbol`], [`ContractRef`].
 
 use std::fmt;
@@ -16,29 +19,184 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::PlanError;
+
+/// Maximale Länge einer [`PlanId`] in Bytes (= Zeichen, da nur ASCII).
+pub const PLAN_ID_MAX_LEN: usize = 64;
+
 /// Eindeutiger Bezeichner eines Plans.
 ///
 /// # Description
-/// Newtype über `String`. Formatierungskonvention empfiehlt UUID v4 oder
-/// monotone Kurz-ID, wird aber nicht erzwungen.
+/// Newtype über `String` mit fester Grammatik `^[a-z0-9][a-z0-9-]{0,63}$`
+/// (F-013, G-032). Die ID wird von [`crate::file_store::FilePlanStore`] als
+/// Pfadsegment unter `<root>/plans/` verwendet; die Grammatik schließt deshalb
+/// `/`, `\`, `.`/`..`, Steuerzeichen, Leerraum und jedes Nicht-ASCII-Zeichen
+/// (Unicode-Homoglyphen, Bidi-Steuerzeichen) aus.
+///
+/// Durchgesetzt wird die Grammatik von [`PlanId::parse`], [`PlanId::try_new`],
+/// [`FromStr`], `Deserialize` (über `#[serde(try_from = "String")]`),
+/// `validate::validate_with` (`Create`) und `FilePlanStore` vor jedem
+/// Pfad-`join`. [`PlanId::new`] prüft **nicht** (siehe dort).
+///
+/// # Concurrency
+/// `Send + Sync` (Newtype über `String`).
 ///
 /// # Examples
 /// ```rust,no_run
 /// use harw_plan::ids::PlanId;
-/// let id: PlanId = "plan-001".parse().unwrap();
+/// let id = PlanId::parse("plan-001").unwrap();
 /// assert_eq!(id.as_str(), "plan-001");
+/// assert!(PlanId::parse("../etc").is_err());
 /// ```
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, harw_macros::HarwId,
-)]
-// `infallible` erhaelt den unvalidierten `new(impl Into<String>)`, den der
-// Bestand ueberall benutzt. `try_new` kommt zusaetzlich dazu und weist leere
-// oder nur aus Steuerzeichen bestehende Bezeichner ab — das Derive liefert
-// damit mehr als die abgeloeste Handschrift, ohne bestehende Aufrufer zu
-// brechen.
-#[harw_id(infallible, error = "crate::error::PlanError", ctor = "empty_id")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub struct PlanId(String);
 
+impl PlanId {
+    /// Parst und validiert eine Plan-ID gegen die feste Grammatik.
+    ///
+    /// # Description
+    /// Erlaubt sind 1 bis [`PLAN_ID_MAX_LEN`] Zeichen aus `a-z`, `0-9` und `-`;
+    /// das erste Zeichen ist kein `-`. Damit sind Pfadtrenner, `.`/`..`,
+    /// Steuerzeichen, Leerraum, Großbuchstaben und Nicht-ASCII ausgeschlossen.
+    ///
+    /// # Arguments
+    /// - `raw` (`&str`): der ungeprüfte Rohwert.
+    ///
+    /// # Returns
+    /// Die validierte `PlanId`.
+    ///
+    /// # Errors
+    /// - [`PlanError::InvalidId`] mit `field = "PlanId"` und dem Rohwert, wenn
+    ///   die Grammatik verletzt ist.
+    ///
+    /// # Concurrency
+    /// Rein, keine Sperren.
+    ///
+    /// # Examples
+    /// ```rust,no_run
+    /// use harw_plan::ids::PlanId;
+    /// assert!(PlanId::parse("p-1").is_ok());
+    /// assert!(PlanId::parse("a/b").is_err());
+    /// ```
+    pub fn parse(raw: &str) -> Result<PlanId, PlanError> {
+        if is_valid_plan_id(raw) {
+            Ok(Self(raw.to_owned()))
+        } else {
+            Err(PlanError::InvalidId {
+                field: "PlanId",
+                value: raw.to_owned(),
+            })
+        }
+    }
+
+    /// Fallibler Konstruktor; identisch zu [`PlanId::parse`].
+    ///
+    /// # Errors
+    /// - [`PlanError::InvalidId`] bei Grammatikverletzung.
+    pub fn try_new(value: impl Into<String>) -> Result<PlanId, PlanError> {
+        let value = value.into();
+        Self::parse(&value)
+    }
+
+    /// Ungeprüfter Kompatibilitätskonstruktor.
+    ///
+    /// # Description
+    /// **Unchecked — nur für vertrauenswürdige Konstanten und Tests.** Der Wert
+    /// wird nicht gegen die Grammatik geprüft. Die Store-Grenze
+    /// (`validate_with` bei `Create`, `FilePlanStore` vor jedem Pfad-`join`)
+    /// weist ungültige IDs trotzdem ab. Entfernung geplant in W12; neue
+    /// Aufrufer verwenden [`PlanId::parse`].
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Borrowt den inneren String-Slice.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Gibt den inneren `String` konsumierend zurück.
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+
+    /// Prüft, ob diese ID die Grammatik erfüllt (relevant für über
+    /// [`PlanId::new`] erzeugte Werte).
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        is_valid_plan_id(&self.0)
+    }
+}
+
+/// Grammatik `^[a-z0-9][a-z0-9-]{0,63}$` (siehe [`PlanId`]).
+fn is_valid_plan_id(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let Some(first) = bytes.first() else {
+        return false;
+    };
+    bytes.len() <= PLAN_ID_MAX_LEN
+        && (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+}
+
+impl TryFrom<String> for PlanId {
+    type Error = PlanError;
+
+    /// Validierende Konvertierung; Grundlage von `Deserialize`.
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(&value)
+    }
+}
+
+impl fmt::Display for PlanId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for PlanId {
+    type Err = PlanError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
+impl AsRef<str> for PlanId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<str> for PlanId {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for PlanId {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for PlanId {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<String> for PlanId {
+    fn eq(&self, other: &String) -> bool {
+        &self.0 == other
+    }
+}
 
 /// Eindeutiger Bezeichner eines Plan-Knotens (Task).
 ///
@@ -497,5 +655,71 @@ mod tests {
             PathOrSymbol::Path("src/lib.rs::PlanStore".to_owned()),
             "`::` darf nicht als Symbol-Trenner gedeutet werden"
         );
+    }
+
+    // ── PlanId-Grammatik (F-013, G-032) ─────────────────────────────────────
+
+    #[test]
+    fn test_plan_id_parse_accepts_existing_ids() {
+        for raw in [
+            "p-1", "plan-abc", "p-test", "restart", "update-rollback", "plan-cli",
+            "plan-analyze", "0", "a",
+        ] {
+            let id = ok_or_panic(PlanId::parse(raw), raw);
+            assert_eq!(id.as_str(), raw);
+            assert!(id.is_valid());
+        }
+        let max = "a".repeat(PLAN_ID_MAX_LEN);
+        assert!(PlanId::parse(&max).is_ok(), "64 Zeichen sind erlaubt");
+    }
+
+    #[test]
+    fn test_plan_id_parse_rejects_traversal_and_separators() {
+        for raw in [
+            "", "..", ".", "../x", "../../etc", "a/b", "/abs", "a\\b", "a.b", "-lead",
+            "a b", "a\tb", "a\nb", "a\0b", "p_1", "P-1",
+        ] {
+            let result = PlanId::parse(raw);
+            assert!(
+                matches!(
+                    &result,
+                    Err(PlanError::InvalidId { field: "PlanId", value }) if value == raw
+                ),
+                "{raw:?} muss abgewiesen werden, war: {result:?}"
+            );
+        }
+        let too_long = "a".repeat(PLAN_ID_MAX_LEN + 1);
+        assert!(PlanId::parse(&too_long).is_err(), "65 Zeichen sind zu lang");
+    }
+
+    #[test]
+    fn test_plan_id_parse_rejects_unicode() {
+        // Kyrillisches а (Homoglyph), Bidi-Override, Zeilentrenner, Umlaut,
+        // Fullwidth-Solidus.
+        for raw in ["p-\u{0430}", "p\u{202E}1", "p\u{2028}1", "plän", "a\u{FF0F}b"] {
+            assert!(PlanId::parse(raw).is_err(), "{raw:?} muss abgewiesen werden");
+        }
+    }
+
+    #[test]
+    fn test_plan_id_deserialize_enforces_grammar() {
+        let ok: Result<PlanId, _> = serde_json::from_str("\"p-ok\"");
+        assert!(ok.is_ok());
+        let bad: Result<PlanId, _> = serde_json::from_str("\"../escape\"");
+        assert!(bad.is_err(), "Deserialize muss Traversal abweisen");
+    }
+
+    #[test]
+    fn test_plan_id_from_str_and_try_new_enforce_grammar() {
+        assert!("a/b".parse::<PlanId>().is_err());
+        assert!(PlanId::try_new("..").is_err());
+        assert!(PlanId::try_new("p-2").is_ok());
+    }
+
+    #[test]
+    fn test_plan_id_new_is_unchecked() {
+        let unchecked = PlanId::new("../x");
+        assert_eq!(unchecked.as_str(), "../x");
+        assert!(!unchecked.is_valid(), "new prüft nicht, is_valid meldet es");
     }
 }

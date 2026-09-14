@@ -31,7 +31,10 @@
 //!    Spawner: Wurzel-Turn und Kinder hängen an derselben `trace_id`.
 //! 6. [`ApprovalChain::for_root`] — Config-Politik ohne Nebenschalter, plus
 //!    die [`crate::spec::AskResolution`] des Einstiegs.
-//! 7. [`assemble_registry_for_project`] → [`ApprovalChain::install_over_default`].
+//! 7. [`assemble_registry_for_project`] → [`ApprovalChain::install_over_default`];
+//!    der Projektkontext der Registry folgt [`EntryProfile::project_context`]
+//!    (ohne ihn: keine Doku, Platzhalter statt Host-Pfaden) und bei
+//!    [`RuntimeNarrowing::workspace_root`] nur Doku unterhalb des gebundenen Roots.
 //! 8. Operations-Registry nach [`OperationSurface`].
 //! 9. Wurzel-Modell, dann Spawner nach [`SpawnerPolicy`].
 //! 10. [`AssemblyContributor`]s in Registrierungsreihenfolge.
@@ -52,6 +55,7 @@
 //! Modell → Spawner → Contributors → Services ist deshalb die einzige
 //! Ordnung, in der jeder Schritt auf fertigen Eingaben steht.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -59,20 +63,28 @@ use std::time::Duration;
 
 use harw_agent_dsl::ExecutableAgentIr;
 use harw_agent_dsl::roles::AgentRoleId;
-use harw_config::ResolvedConfig;
+use harw_config::{PermissionsSection, PlanSection, ResolvedConfig, discover_config};
 use harw_context::ContextCeiling;
 use harw_core::{
     AgentSession, ChildRegistryFactory, ManagedAgentSpawner, ModelProvider, SessionActivation,
     SessionManager, SpawnContext, StateStore, ToolProfile,
 };
+use harw_extension_api::allow_rules::{AllowRuleSet, ApprovalRule, RuleDecision, RuleScope};
 use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
 use harw_extension_api::contributors::ApprovalHandlerKind;
 use harw_extension_api::{ApprovalHandler, ExtensionRegistry, ExtensionRegistryBuilder, ToolName};
+use harw_home::paths::active_profile_name;
+use harw_home::project::{
+    ProjectHome, ProjectRoot, discover_project as discover_home_project, project_key,
+    project_settings_dir,
+};
 use harw_memory::Memory;
 use harw_operations::adapter::ModelToolProvider;
 use harw_operations::operation::{Operation, Surface};
 use harw_operations::registry::OperationRegistry;
 use harw_operations::{OpContext, SharedSessionController};
+use harw_plan::{InMemoryGoalStore, InMemoryPlanStore, PlanNodeKind, PlanToolConfig};
+use harw_plan_bridge::FindingStore;
 use harw_project_discovery::{DiscoveryConfig, ProjectContext, discover_project};
 use harw_protocol::events::{SessionEvent, TurnEvent};
 use harw_provider_http::SecretResolver;
@@ -81,7 +93,8 @@ use harw_registry_defaults::profile::{
     IdentityOverrides, RegistryProfile, assemble_registry_for_project, role_names,
 };
 use harw_sandbox::{
-    NetworkScope, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    ExtraRootsCell, NetworkScope, PermissionSet, SandboxSpec, WorkspaceRegistration,
+    WorkspaceRegistry,
 };
 use harw_session_store::{ApprovalStore, JobStore};
 use harw_types::{AgentRole, Principal, SessionId, TenantId, TurnId, WorkspaceId};
@@ -118,6 +131,11 @@ const TOOL_CALLS_PER_ROUND: u32 = 8;
 /// W3-Signatur): groß genug für eine gelesene Quelldatei, klein genug, dass
 /// ein einzelnes Ergebnis das Kontextfenster nicht allein füllt.
 const TOOL_RESULT_MAX_BYTES: usize = 64 * 1024;
+
+/// Vorgabe-Timeout einer offenen Freigabeanfrage in Sekunden, wenn weder
+/// Projekt- noch globale Konfiguration `[permissions] approval_timeout_secs`
+/// setzen (Plan Schritt 3: 1800 s statt der bisherigen 300 s).
+const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 1800;
 
 /// Grenzwerte eines einzelnen Turns, abgeleitet aus dem [`RootBudget`].
 ///
@@ -267,6 +285,366 @@ pub const fn default_approval_mode(entry: EntryKind) -> ApprovalMode {
     }
 }
 
+/// Das Home-Verzeichnis des Betriebssystem-Nutzers, roh aus `$HOME` gelesen.
+///
+/// # Beschreibung
+/// Wird ausschließlich als Ausschlussregel für `/add-workdir`-Kandidaten
+/// gebraucht ([`harw_sandbox::validate_extra_root`]) — dieselbe Quelle wie
+/// `harw_home::project::refuse_unsupported_root` (privat dort, deshalb hier
+/// dupliziert statt importiert). Ein leerer oder fehlender Wert liefert
+/// `None`; der Aufrufer überspringt die Home-Prüfung dann statt sie
+/// abzulehnen.
+fn os_user_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Lädt die projekt-scoped `[permissions]`-Sektion (Contract §2, Zeile A2).
+///
+/// # Beschreibung
+/// Der autoritätsgewährende Speicherort eines Projekts ist
+/// `~/.harw/profiles/<profil>/projects/<project-key>` — außerhalb jedes
+/// Repos, damit ein geklontes Projekt sich keine Rechte selbst geben kann.
+/// Dieses Verzeichnis wird wie jeder andere Config-Layer über
+/// [`harw_config::discover_config`] gelesen (eine `config.toml` darunter);
+/// fehlt das Verzeichnis oder die Datei, liefert `discover_config` bereits
+/// eine leere [`ResolvedConfig`] — das ist der normale „noch nichts
+/// gemerkt“-Zustand eines Projekts, kein Fehler.
+///
+/// Jeder andere Fehler (ungültiger Profilname, kaputtes TOML) wird
+/// **nicht** weitergereicht: die Wurzel-Montage darf an einer beschädigten
+/// Projekt-Einstellungsdatei nicht scheitern. Es bleibt bei einem `warn!`
+/// und der leeren Sektion.
+///
+/// # Arguments
+/// - `home` (`&Path`): aufgelöster Root-Space.
+/// - `profile` (`&str`): aktives Profil ([`active_profile_name`]).
+/// - `key` (`&str`): Projekt-Schlüssel ([`project_key`]).
+///
+/// # Returns
+/// Die geladene [`PermissionsSection`]; leer, wenn nichts gemerkt wurde oder
+/// das Lesen fehlschlug.
+fn load_project_permissions(home: &Path, profile: &str, key: &str) -> PermissionsSection {
+    let dir = match project_settings_dir(home, profile, key) {
+        Ok(dir) => dir,
+        Err(error) => {
+            tracing::warn!(
+                profile,
+                key,
+                error = %error,
+                "runtime.project_settings.path_invalid"
+            );
+            return PermissionsSection::default();
+        }
+    };
+    match discover_config(std::slice::from_ref(&dir)) {
+        Ok(config) => config.harness.permissions,
+        Err(error) => {
+            tracing::warn!(
+                dir = %dir.display(),
+                error = %error,
+                "runtime.project_settings.load_failed"
+            );
+            PermissionsSection::default()
+        }
+    }
+}
+
+/// Der effektive Vorgabe-Freigabemodus eines Laufs (Contract §2).
+///
+/// # Beschreibung
+/// Präzedenz Projekt > Global > [`default_approval_mode`]: die Projekt-Ebene
+/// gewinnt gegen die globale, diese gegen die eingebaute Vorgabe des
+/// Einstiegs. Ein Sitzungs-Override liegt außerhalb dieser Funktion — er
+/// lebt ausschließlich in der zurückgegebenen [`ApprovalModeCell`] und
+/// überschreibt beide Ebenen zur Laufzeit (`/permissions set` bzw.
+/// Shift+Tab), ohne dass die Montage erneut liefe.
+///
+/// Ein nicht auflösbarer Modus-String (weder `ask`, `auto` noch `full`) wird
+/// wie „nicht gesetzt“ behandelt und übersprungen — die Montage lehnt eine
+/// ungültige Konfiguration hier nicht ab, das übernimmt
+/// [`PermissionsSection::validate`] vor dem Speichern.
+///
+/// # Arguments
+/// - `entry` ([`EntryKind`]): der Einstieg, dessen eingebaute Vorgabe die
+///   unterste Stufe bildet.
+/// - `global` (`&PermissionsSection`): `[permissions]` aus der globalen
+///   Konfiguration (`config.harness.permissions`).
+/// - `project` (`&PermissionsSection`): `[permissions]` aus der
+///   Projekt-Einstellungsdatei ([`load_project_permissions`]).
+///
+/// # Returns
+/// Den effektiven [`ApprovalMode`].
+fn effective_approval_mode(
+    entry: EntryKind,
+    global: &PermissionsSection,
+    project: &PermissionsSection,
+) -> ApprovalMode {
+    project
+        .default_mode
+        .as_deref()
+        .and_then(ApprovalMode::parse)
+        .or_else(|| global.default_mode.as_deref().and_then(ApprovalMode::parse))
+        .unwrap_or_else(|| default_approval_mode(entry))
+}
+
+/// Das effektive Freigabe-Timeout eines Laufs (Plan Schritt 3), dieselbe
+/// Präzedenz wie [`effective_approval_mode`]: Projekt > Global >
+/// [`DEFAULT_APPROVAL_TIMEOUT_SECS`].
+///
+/// # Returns
+/// Eine [`Duration`] in Sekunden; die TUI liest sie über
+/// [`RuntimeAssembly::approval_timeout`] für den Countdown im Freigabe-Panel.
+fn effective_approval_timeout(global: &PermissionsSection, project: &PermissionsSection) -> Duration {
+    let secs = project
+        .approval_timeout_secs
+        .or(global.approval_timeout_secs)
+        .unwrap_or(DEFAULT_APPROVAL_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// Übersetzt eine geladene `[[permissions.allow]]`/`[[permissions.deny]]`-Liste
+/// in [`ApprovalRule`]n eines festen [`RuleScope`].
+fn rules_from_section(section: &PermissionsSection, scope: RuleScope, out: &mut Vec<ApprovalRule>) {
+    for rule in &section.allow {
+        out.push(ApprovalRule {
+            tool: rule.tool.clone(),
+            pattern: rule.pattern.clone(),
+            decision: RuleDecision::Allow,
+            scope,
+        });
+    }
+    for rule in &section.deny {
+        out.push(ApprovalRule {
+            tool: rule.tool.clone(),
+            pattern: rule.pattern.clone(),
+            decision: RuleDecision::Deny,
+            scope,
+        });
+    }
+}
+
+/// Sät die geteilte [`AllowRuleSet`] eines Laufs aus globaler und
+/// Projekt-Konfiguration (Contract §2/§4).
+///
+/// # Beschreibung
+/// Global-Regeln zuerst, dann Projekt-Regeln — die Reihenfolge ist reine
+/// Diagnose (`AllowRuleSet::evaluate` gewichtet keinen Scope höher als
+/// einen anderen). `deny`-Einträge werden **immer** übernommen, ohne
+/// Sonderbehandlung: es gibt keinen Schalter, der eine Deny-Regel
+/// unterdrücken könnte — genau das macht „Deny gewinnt über alle Scopes
+/// hinweg“ aus.
+///
+/// # Returns
+/// Eine neue [`AllowRuleSet`] mit allen geladenen Regeln.
+fn seed_allow_rule_set(global: &PermissionsSection, project: &PermissionsSection) -> AllowRuleSet {
+    let mut rules = Vec::with_capacity(
+        global.allow.len() + global.deny.len() + project.allow.len() + project.deny.len(),
+    );
+    rules_from_section(global, RuleScope::Global, &mut rules);
+    rules_from_section(project, RuleScope::Project, &mut rules);
+    AllowRuleSet::from_rules(rules)
+}
+
+/// Sät die geteilte [`ExtraRootsCell`] eines Laufs aus globaler und
+/// Projekt-Konfiguration (Contract §5, Slice A8, Plan Schritt 6).
+///
+/// # Beschreibung
+/// Jeder Eintrag wird über [`harw_sandbox::validate_extra_root`] gegen die primäre
+/// Workspace-Wurzel geprüft. Ein ungültiger Eintrag (nicht existent, `/`,
+/// `$HOME`, Vorfahre oder bereits Teil der primären Wurzel) wird **nicht**
+/// abgelehnt, sondern mit `warn!` übersprungen — eine kaputte oder veraltete
+/// Konfigurationszeile darf die Montage nicht zu Fall bringen. Alle geladenen
+/// Einträge gelten als bereits dauerhaft gemerkt (`persisted = true`), weil
+/// sie aus einer gespeicherten Konfigurationsdatei stammen.
+///
+/// # Arguments
+/// - `global` / `project` (`&PermissionsSection`): siehe
+///   [`seed_allow_rule_set`].
+/// - `primary_root` (`&Path`): die bereits kanonische primäre Workspace-Wurzel
+///   dieses Laufs (siehe [`sandbox_root`]).
+/// - `user_home` (`Option<&Path>`): siehe [`harw_sandbox::validate_extra_root`].
+///
+/// # Returns
+/// Eine neue [`ExtraRootsCell`] mit allen gültigen Einträgen.
+fn seed_extra_roots(
+    global: &PermissionsSection,
+    project: &PermissionsSection,
+    primary_root: &Path,
+    user_home: Option<&Path>,
+) -> ExtraRootsCell {
+    let cell = ExtraRootsCell::new();
+    for candidate in global.extra_roots.iter().chain(project.extra_roots.iter()) {
+        if let Err(error) = cell.add(candidate, true, primary_root, user_home) {
+            tracing::warn!(
+                path = %candidate.display(),
+                error = %error,
+                "runtime.extra_roots.seed_skipped"
+            );
+        }
+    }
+    cell
+}
+
+/// Baut die eingebauten Plan-Dienste, mit denen die TUI ohne jede
+/// Konfiguration startet (Plan Schritt 1, `[tools.plan] enabled` Default
+/// `true` für interaktive TUI-Einstiege).
+///
+/// # Beschreibung
+/// `plan`/`goal` sind reine In-Memory-Speicher — bewusst nicht persistent,
+/// solange niemand `[tools.plan] persist = true` setzt (derselbe Vorgabewert
+/// wie [`PlanToolConfig::enabled_defaults`]). Der [`FindingStore`] wurzelt
+/// auf [`ProjectHome::plans_dir`]: er legt sein Verzeichnis erst beim ersten
+/// Schreiben an, ein unbenutztes Projekt bleibt also ohne Spur auf der
+/// Platte.
+///
+/// # Arguments
+/// - `project_home` (`&ProjectHome`): das Projekt-Home dieses Laufs.
+///
+/// # Returns
+/// [`PlanServices`] mit aktivierter [`PlanToolConfig`].
+fn default_tui_plan_services(project_home: &ProjectHome) -> PlanServices {
+    PlanServices {
+        plan: Arc::new(InMemoryPlanStore::new()),
+        goal: Arc::new(InMemoryGoalStore::new()),
+        findings: Arc::new(FindingStore::new(project_home.plans_dir())),
+        plan_config: PlanToolConfig::enabled_defaults(),
+    }
+}
+
+/// Ob der Aufrufer `[tools.plan]` in keiner Konfigurationsebene angefasst hat.
+///
+/// # Beschreibung
+/// `PlanSection::enabled` ist ein einfaches `bool` (kein `Option<bool>`) und
+/// kann „nie gesetzt“ nicht von „ausdrücklich auf `false` gesetzt“
+/// unterscheiden (Kopplung an `harw-config`, außerhalb dieser Welle). Als
+/// Näherung gilt die Sektion nur dann als unangetastet, wenn sie **exakt**
+/// [`PlanSection::default`] entspricht — jede andere Abweichung (auch nur
+/// `persist = true` bei weiterhin `enabled = false`) wird als bewusste
+/// Entscheidung gewertet und nicht überschrieben.
+///
+/// # Returns
+/// `true`, wenn `section == PlanSection::default()`.
+fn plan_section_is_untouched(section: &PlanSection) -> bool {
+    *section == PlanSection::default()
+}
+
+/// Übersetzt eine deklarative `[tools.plan]`-Sektion in eine [`PlanToolConfig`].
+///
+/// # Beschreibung
+/// Spiegelt `harw_cli::main::plan_tool_config_from_section` (dort
+/// `pub(crate)`, deshalb hier dupliziert statt importiert — `harw-runtime`
+/// darf keine Abhängigkeit auf `harw-cli` eingehen): [`PlanSection::validate`]
+/// läuft zuerst, damit Tippfehler in `max_nodes`, `max_expand_depth` und
+/// `require_exploration_for` vor jedem Store-Bau auffallen; danach wird jede
+/// Zeichenkette aus `require_exploration_for` in ein [`PlanNodeKind`] geparst.
+/// Ein Parse-Fehler wäre hier ein Widerspruch zu [`PlanSection::validate`]
+/// (das dieselbe Liste bereits gegen bekannte Namen prüft) und wird darum
+/// ebenfalls als `Err` gemeldet, statt verschluckt zu werden.
+///
+/// # Arguments
+/// - `section` (`&PlanSection`): die geladene `[tools.plan]`-Sektion, geliehen.
+///
+/// # Returns
+/// Die [`PlanToolConfig`], die Stores **und** Operationen gemeinsam regiert.
+///
+/// # Errors
+/// Ein `String` mit der Begründung aus [`PlanSection::validate`] oder aus dem
+/// gescheiterten `PlanNodeKind`-Parse.
+fn plan_tool_config_from_section(section: &PlanSection) -> Result<PlanToolConfig, String> {
+    section.validate()?;
+    let require_exploration_for = section
+        .require_exploration_for
+        .iter()
+        .map(|name| name.parse::<PlanNodeKind>().map_err(|error| error.to_string()))
+        .collect::<Result<Vec<PlanNodeKind>, String>>()?;
+
+    Ok(PlanToolConfig {
+        enabled: section.enabled,
+        persist: section.persist,
+        require_for_complex_work: section.require_for_complex_work,
+        validate_dependency_cycles: section.validate_dependency_cycles,
+        validate_write_conflicts: section.validate_write_conflicts,
+        max_nodes: section.max_nodes,
+        require_exploration_for,
+        exploration_ttl_secs: section.exploration_ttl_secs,
+        max_expand_depth: section.max_expand_depth,
+    })
+}
+
+/// Öffnet die Planungsfläche des Wurzel-Laufs — außer der Aufrufer hat bereits
+/// eine über [`RuntimeAssemblyBuilder::plan_services`] mitgebracht.
+///
+/// # Beschreibung
+/// Schließt G-024/G-098: `harw-tui/src/runtime_root.rs` ruft
+/// `RuntimeAssemblyBuilder::plan_services` nie auf (es liest nur
+/// [`RuntimeAssembly::plan_services`] nach dem Bau) — die TUI bekam die
+/// Planungsfläche bislang **nie**, unabhängig von `[tools.plan]`. Präzedenz:
+///
+/// 1. **Builder-Wert** (`explicit`): hat immer Vorrang. Ein Aufrufer, der
+///    eigene Speicher mitbringt (z. B. `harw-cli/src/chat.rs` für `OneShot`),
+///    wird nie überschrieben — die Gate-Semantik dieser Einstiege ändert sich
+///    durch diese Funktion nicht.
+/// 2. **Nicht-`Tui`-Einstiege ohne Builder-Wert**: bleiben ohne eingebaute
+///    Vorgabe geschlossen.
+/// 3. **Unangetastete Sektion** ([`plan_section_is_untouched`]): gilt als
+///    „noch nie entschieden“ und wird zu [`default_tui_plan_services`] —
+///    `/plan` und `/goal` funktionieren damit ohne jeden Konfigurationseintrag.
+/// 4. **Berührte Sektion, `enabled = false`**: bleibt geschlossen — eine
+///    bewusste Abschaltung wird nie überschrieben.
+/// 5. **Berührte Sektion, `enabled = true`**: [`plan_tool_config_from_section`]
+///    übersetzt die volle Konfiguration (Knotenlimits,
+///    `require_exploration_for` etc.). Schlägt die Übersetzung fehl, bleibt
+///    die Fläche geschlossen (`warn!`, fail-soft wie
+///    [`load_project_permissions`]). Die Speicher bleiben, wie im eingebauten
+///    Vorgabefall, In-Memory — das Umschalten auf `FilePlanStore`/
+///    `FileGoalStore` bei `persist = true` ist nicht Teil dieser Welle.
+///
+/// # Arguments
+/// - `entry` ([`EntryKind`]): der Einstieg des Laufs.
+/// - `explicit` (`Option<PlanServices>`): der Builder-Wert.
+/// - `section` (`&PlanSection`): `config.harness.tools.plan` des Laufs.
+/// - `project_home` (`&ProjectHome`): Wurzel des [`FindingStore`] der Vorgabe.
+///
+/// # Returns
+/// Die zu benutzende Planungsfläche, oder `None`.
+fn resolve_plan_services(
+    entry: EntryKind,
+    explicit: Option<PlanServices>,
+    section: &PlanSection,
+    project_home: &ProjectHome,
+) -> Option<PlanServices> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    if !matches!(entry, EntryKind::Tui) {
+        return None;
+    }
+    if plan_section_is_untouched(section) {
+        return Some(default_tui_plan_services(project_home));
+    }
+    if !section.enabled {
+        return None;
+    }
+    match plan_tool_config_from_section(section) {
+        Ok(plan_config) => Some(PlanServices {
+            plan: Arc::new(InMemoryPlanStore::new()),
+            goal: Arc::new(InMemoryGoalStore::new()),
+            findings: Arc::new(FindingStore::new(project_home.plans_dir())),
+            plan_config,
+        }),
+        Err(error) => {
+            tracing::warn!(
+                entry = ?entry,
+                error = %error,
+                "runtime.plan_tool_config.invalid"
+            );
+            None
+        }
+    }
+}
+
 /// Die organisatorische Rolle (§3-Spawn-Matrix) der Wurzel eines Einstiegs.
 ///
 /// # Beschreibung
@@ -368,6 +746,100 @@ pub struct RuntimeNarrowing {
 const NARROWED_ROOT_TENANT: &str = "narrowing";
 /// Workspace-Alias der Enthaltenseins-Prüfung (siehe [`NARROWED_ROOT_TENANT`]).
 const NARROWED_ROOT_WORKSPACE: &str = "workspace-root";
+
+/// Neutraler Platzhalter für `project_root`/`cwd` im Modellkontext von
+/// Einstiegen ohne [`EntryProfile::project_context`] (Befund Z2d2-R1).
+const PROJECT_CONTEXT_PLACEHOLDER: &str = "<workspace>";
+
+/// Der Projektkontext, den die Wurzel-Registry dem Modell zeigt.
+///
+/// # Beschreibung
+/// Die Registry ([`assemble_registry_for_project`]) reicht den Kontext an
+/// zwei Stellen in den Modellkontext: `ProjectContextProvider` (Fragmente
+/// `project.root` mit `project_root=`/`cwd=` und je Doku-Datei
+/// `project.doc:<name>`) und die Baseline-Identität (Systemprompt mit
+/// `cwd`/`project_root`). Beide lesen ausschließlich die öffentlichen Felder
+/// von [`ProjectContext`]; deshalb genügt hier eine Kopie:
+///
+/// - `profile.project_context == false` (z. B. `JobPrompt`, `McpServe`,
+///   Gateways, `Web`): keine Doku, `project_root`/`cwd` =
+///   [`PROJECT_CONTEXT_PLACEHOLDER`]. Ein entfernter Einreicher kann so weder
+///   `HARW.md`/`AGENTS.md`/`CLAUDE.md` noch Host-Pfade über das Ergebnis
+///   abziehen (Befund Z2d2-R1).
+/// - `narrowed_root = Some(root)` (gesetzter
+///   [`RuntimeNarrowing::workspace_root`], bereits kanonisch): nur Doku, deren
+///   Pfad unterhalb von `root` liegt ([`Path::starts_with`] vergleicht
+///   Komponenten, kein String-Präfix); `project_root` = `root`, `cwd` bleibt,
+///   falls es unter `root` liegt, sonst `root` (Befund Z2d2-R2).
+/// - sonst: der erkannte Kontext unverändert, ohne Kopie.
+///
+/// [`RuntimeAssembly::project`], Spawner und Contributors sehen weiterhin den
+/// erkannten Kontext; nur der Modellkontext der Wurzel-Registry wird verengt.
+fn registry_project_context<'a>(
+    project: &'a ProjectContext,
+    profile: &EntryProfile,
+    narrowed_root: Option<&Path>,
+) -> Cow<'a, ProjectContext> {
+    if !profile.project_context {
+        return Cow::Owned(ProjectContext {
+            cwd: PathBuf::from(PROJECT_CONTEXT_PLACEHOLDER),
+            project_root: PathBuf::from(PROJECT_CONTEXT_PLACEHOLDER),
+            docs: Vec::new(),
+        });
+    }
+    let Some(root) = narrowed_root else {
+        return Cow::Borrowed(project);
+    };
+    let cwd = if project.cwd.starts_with(root) {
+        project.cwd.clone()
+    } else {
+        root.to_path_buf()
+    };
+    Cow::Owned(ProjectContext {
+        cwd,
+        project_root: root.to_path_buf(),
+        docs: project
+            .docs
+            .iter()
+            .filter(|doc| doc.path.starts_with(root))
+            .cloned()
+            .collect(),
+    })
+}
+
+/// Lehnt eine Werkzeugverengung an Einstiegen mit Modell-Tool-Fläche ab.
+///
+/// # Beschreibung
+/// Die Operations-Modell-Tools ([`OperationSurface::AllWithModelTools`])
+/// entstehen unabhängig vom Registry-Profil (Schritt 12). Eine Verengung auf
+/// einen kleineren Werkzeugsatz ließe sie dort sichtbar und wäre damit nur
+/// scheinbar wirksam (Befund Z2d2-R8). Deshalb fail-closed: bei gesetzter
+/// Verengung mit `registry_profile != Full` und dieser Fläche bricht der Bau
+/// ab. Ohne Verengung oder mit `Full` ändert sich nichts.
+///
+/// # Fehler
+/// [`RuntimeError::Registry`] für die abgelehnte Kombination.
+fn ensure_narrowing_fits_operations(
+    entry: EntryKind,
+    profile: &EntryProfile,
+    narrowing: Option<&RuntimeNarrowing>,
+) -> RuntimeResult<()> {
+    match narrowing {
+        Some(narrowing)
+            if narrowing.registry_profile != RegistryProfile::Full
+                && profile.operations == OperationSurface::AllWithModelTools =>
+        {
+            Err(RuntimeError::Registry {
+                detail: format!(
+                    "refusing to narrow entry {entry:?} to registry profile {:?}: its operation \
+                     surface {:?} exposes operation model tools the narrowing cannot remove",
+                    narrowing.registry_profile, profile.operations
+                ),
+            })
+        }
+        _ => Ok(()),
+    }
+}
 
 /// Das Verzeichnis, an das die Wurzel-Sandbox gebunden wird.
 ///
@@ -736,8 +1208,10 @@ impl RuntimeAssemblyBuilder {
     ///   [`RuntimeNarrowing::workspace_root`] relativ ist, nicht existiert oder
     ///   außerhalb des erkannten Projekt-Roots liegt.
     /// - [`RuntimeError::Registry`], wenn die Registry nicht montiert, ein
-    ///   benannter Agent nicht aufgelöst werden kann oder eine
-    ///   [`Self::narrowing`] einen nicht zugelassenen Werkzeugsatz verlangt.
+    ///   benannter Agent nicht aufgelöst werden kann, eine
+    ///   [`Self::narrowing`] einen nicht zugelassenen Werkzeugsatz verlangt
+    ///   oder einen Werkzeugsatz außer `Full` an einem Einstieg mit
+    ///   [`OperationSurface::AllWithModelTools`] verlangt.
     /// - [`RuntimeError::Sandbox`] auch, wenn die verengte Sandbox die
     ///   Profilrechte überschritte (konstruktionsbedingt unerreichbar, aber
     ///   geprüft).
@@ -778,6 +1252,7 @@ impl RuntimeAssemblyBuilder {
             )?,
             None => profile.registry_profile,
         };
+        ensure_narrowing_fits_operations(spec.entry, &profile, narrowing.as_ref())?;
 
         // 1. Konfiguration mit Vertrauensbericht.
         let (config, trust_report) = load_config(&spec)?;
@@ -789,6 +1264,38 @@ impl RuntimeAssemblyBuilder {
                 detail: format!("could not discover the project below the cwd: {error}"),
             }
         })?;
+
+        // 2b. Projekt-Home nach Contract §3 (`harw_home::project`) —
+        //     eigenständig von der Projekterkennung oben: jene speist den
+        //     Modellkontext, diese die Scope-Architektur (Trust-Anker,
+        //     `.harw`, Projekt-Einstellungsdatei). Ein Fehler beim Anlegen
+        //     der Home-Verzeichnisse ist nie fatal (z. B. `$HOME` selbst).
+        let markers = config
+            .harness
+            .project_root_markers
+            .clone()
+            .unwrap_or_default();
+        let home_project_root =
+            discover_home_project(&spec.cwd, &markers).map_err(|error| RuntimeError::Discovery {
+                detail: format!("could not discover the project home below the cwd: {error}"),
+            })?;
+        let home_project = ProjectHome::at(&home_project_root);
+        if let Err(error) = home_project.ensure() {
+            tracing::warn!(
+                root = %home_project_root.root.display(),
+                error = %error,
+                "runtime.project_home.ensure_failed"
+            );
+        }
+
+        // Freigaben-Konfiguration: Projekt schlägt Global schlägt eingebaute
+        // Vorgabe (Contract §2). Die Projekt-Einstellungsdatei liegt
+        // autoritätsgewährend außerhalb des Repos.
+        let profile_name = active_profile_name(&spec.home);
+        let project_settings_key = project_key(&home_project_root.root);
+        let project_permissions =
+            load_project_permissions(&spec.home, &profile_name, &project_settings_key);
+        let global_permissions = config.harness.permissions.clone();
 
         // 3./4. Sandbox und Decke aus dem Einstiegsprofil.
         //      Eine Verengung schneidet die Sandbox, sie ersetzt sie nie; ein
@@ -804,6 +1311,18 @@ impl RuntimeAssemblyBuilder {
         let sandbox = narrowed_sandbox(unrestricted, &profile, narrowing.as_ref())?;
         let ceiling = root_ceiling(profile.ceiling);
 
+        // Zusätzliche Workspace-Wurzeln (`/add-workdir`, Contract §5) aus
+        // Global- und Projekt-Konfiguration, gegen die bereits gebundene
+        // primäre Wurzel validiert; ungültige Einträge werden übersprungen,
+        // nicht abgelehnt.
+        let extra_roots = seed_extra_roots(
+            &global_permissions,
+            &project_permissions,
+            &bound_root,
+            os_user_home().as_deref(),
+        );
+        let sandbox = sandbox.with_extra_roots(extra_roots.clone());
+
         // 5. Ein Trace, ein Spawn-Kontext.
         let trace = new_root_trace(spec.entry);
         let spawn_context = SpawnContext {
@@ -818,11 +1337,30 @@ impl RuntimeAssemblyBuilder {
 
         // 6. Freigabekette. Der Responder kommt erst mit `new_root_session`:
         //    er gehört zur Oberfläche, nicht zur Montage.
-        let approval_mode = ApprovalModeCell::new(default_approval_mode(spec.entry));
+        let approval_mode = ApprovalModeCell::new(effective_approval_mode(
+            spec.entry,
+            &global_permissions,
+            &project_permissions,
+        ));
+        let allow_rules = seed_allow_rule_set(&global_permissions, &project_permissions);
+        let approval_timeout = effective_approval_timeout(&global_permissions, &project_permissions);
+        tracing::info!(
+            rules = allow_rules.snapshot().len(),
+            roots = extra_roots.snapshot().len(),
+            mode = %approval_mode.get(),
+            project = %home_project_root.root.display(),
+            "Freigaben geladen"
+        );
         // `profile.ask` ist ab hier durchgesetzt, nicht nur deklariert: alles
         // außer `Interactive` hängt eine `AskResolutionPolicy` in die Kette
         // (Befund Z2c-02).
-        let chain = ApprovalChain::for_root(&config, profile.ask, approval_mode.clone(), None);
+        let chain = ApprovalChain::for_root(
+            &config,
+            profile.ask,
+            approval_mode.clone(),
+            None,
+            allow_rules.clone(),
+        );
 
         // Die eingebauten Rollen werden **einmal** gesenkt und danach sowohl
         // für `--agent` als auch für die Kind-Fabrik benutzt (Befund Z2c-07).
@@ -840,11 +1378,16 @@ impl RuntimeAssemblyBuilder {
             resolve_active_agent(spec.active_agent.as_deref(), &config, &agent_definitions)?;
         let activation = root_activation(agent_ir.as_ref());
 
-        // 7. Registry: ein Projektkontext, eine Kette.
+        // 7. Registry: ein Projektkontext, eine Kette. Der Modellkontext folgt
+        //    `profile.project_context` und einem gebundenen `workspace_root`.
         let overrides = root_identity(&spec, narrowing.as_ref());
+        let narrowed_root = narrowing
+            .as_ref()
+            .and_then(|narrowing| narrowing.workspace_root.as_ref())
+            .map(|_| bound_root.as_path());
         let assembled = assemble_registry_for_project(
             registry_profile,
-            &project,
+            &registry_project_context(&project, &profile, narrowed_root),
             overrides,
             chain.mode().clone(),
         )
@@ -856,6 +1399,17 @@ impl RuntimeAssemblyBuilder {
         // (harw-registry-defaults/src/profile.rs:921-922) — eine zweite wäre
         // eine Dublette (Befund Z2c-06).
         let registry_builder = chain.install_over_default(assembled.registry);
+
+        // 7b. Plan-Dienste: expliziter Builder-Wert gewinnt; sonst eingebaute
+        //     Vorgabe für interaktive TUI-Einstiege, sofern `[tools.plan]`
+        //     nicht ausdrücklich abweicht (Plan Schritt 1, G-010/F-154,
+        //     G-024/G-098).
+        let plan_services = resolve_plan_services(
+            spec.entry,
+            plan_services,
+            &config.harness.tools.plan,
+            &home_project,
+        );
 
         // 8. Operationen nach der Fläche des Einstiegs.
         let operations = build_operations(profile.operations, plan_services.as_ref());
@@ -935,6 +1489,8 @@ impl RuntimeAssemblyBuilder {
             config: Arc::clone(&config),
             plan: plan_services,
             approval_mode: approval_mode.clone(),
+            allow_rules: allow_rules.clone(),
+            extra_roots: extra_roots.clone(),
             principal: spec.principal.clone(),
             session_controller,
         }));
@@ -957,6 +1513,8 @@ impl RuntimeAssemblyBuilder {
             config,
             trust_report,
             project,
+            home_project_root,
+            home_project,
             sandbox,
             ceiling,
             spawn_context,
@@ -965,6 +1523,9 @@ impl RuntimeAssemblyBuilder {
             network_scope,
             chain,
             approval_mode,
+            allow_rules,
+            extra_roots,
+            approval_timeout,
             agent_ir,
             activation,
             operations,
@@ -1287,6 +1848,12 @@ pub struct RuntimeAssembly {
     config: Arc<ResolvedConfig>,
     trust_report: ConfigTrustReport,
     project: ProjectContext,
+    /// Projekt-Root und Trust-Anker nach Contract §3 (`harw_home::project`) —
+    /// eigenständig von [`Self::project`] (Modellkontext): dieser hier trägt
+    /// die Scope-Architektur (Projekt-Home, Projekt-Einstellungsdatei).
+    home_project_root: ProjectRoot,
+    /// Projekt-lokaler Zustand (`<root>/.harw`) desselben Projekts.
+    home_project: ProjectHome,
     sandbox: SandboxSpec,
     ceiling: ContextCeiling,
     spawn_context: SpawnContext,
@@ -1295,6 +1862,14 @@ pub struct RuntimeAssembly {
     network_scope: NetworkScope,
     chain: ApprovalChain,
     approval_mode: ApprovalModeCell,
+    /// Geteilte Freigaberegeln dieses Laufs (Contract §2/§4); dieselbe Zelle
+    /// wie in [`ApprovalChain`] und in jeder [`crate::services::ServiceMap`].
+    allow_rules: AllowRuleSet,
+    /// Zusätzliche Workspace-Wurzeln dieses Laufs (`/add-workdir`); dieselbe
+    /// Zelle wie in [`Self::sandbox`] (via `SandboxSpec::with_extra_roots`).
+    extra_roots: ExtraRootsCell,
+    /// Effektives Freigabe-Timeout (Projekt > Global > Vorgabe), für die TUI.
+    approval_timeout: Duration,
     agent_ir: Option<ExecutableAgentIr>,
     activation: SessionActivation,
     operations: Arc<OperationRegistry>,
@@ -1379,6 +1954,28 @@ impl RuntimeAssembly {
     #[must_use]
     pub const fn project(&self) -> &ProjectContext {
         &self.project
+    }
+
+    /// Der über `harw_home::project` erkannte Projekt-Root samt Trust-Anker
+    /// (Contract §3), eigenständig von [`Self::project`] (Modellkontext):
+    /// dieser hier trägt die Scope-Architektur (Trust-Anker, `.harw`,
+    /// Projekt-Einstellungsdatei). Marker sind `config.project_root_markers`,
+    /// leer bedeutet `[".git"]` ([`harw_home::project::discover_project`]).
+    #[must_use]
+    pub const fn home_project_root(&self) -> &ProjectRoot {
+        &self.home_project_root
+    }
+
+    /// Das Projekt-lokale Home (`<root>/.harw`) dieses Laufs (Contract §3).
+    ///
+    /// # Beschreibung
+    /// [`RuntimeAssemblyBuilder::build`] hat [`ProjectHome::ensure`] bereits
+    /// best-effort aufgerufen (ein Fehler dort bleibt ein `warn!`, ohne den
+    /// Bau abzubrechen); dieser Zugriff liefert dasselbe Objekt zum
+    /// wiederholten Gebrauch, etwa für weitere `.harw`-Unterverzeichnisse.
+    #[must_use]
+    pub const fn home_project(&self) -> &ProjectHome {
+        &self.home_project
     }
 
     /// Der vertrauenswürdig ermittelte Aufrufer.
@@ -1488,6 +2085,42 @@ impl RuntimeAssembly {
     #[must_use]
     pub const fn approval_mode(&self) -> &ApprovalModeCell {
         &self.approval_mode
+    }
+
+    /// Die geteilten Freigaberegeln dieses Laufs (Contract §2/§4).
+    ///
+    /// # Beschreibung
+    /// Dieselbe Zelle, die in der Freigabekette dieses Laufs
+    /// ([`ApprovalChain::rules`]) und in jeder [`crate::services::ServiceMap`]
+    /// liegt (über [`RuntimeServices::allow_rules`]) — eine über
+    /// `/permissions` angelegte Regel gilt damit sofort überall.
+    #[must_use]
+    pub const fn allow_rules(&self) -> &AllowRuleSet {
+        &self.allow_rules
+    }
+
+    /// Die zusätzlichen Workspace-Wurzeln dieses Laufs (`/add-workdir`,
+    /// Contract §5 Slice A8).
+    ///
+    /// # Beschreibung
+    /// Dieselbe Zelle wie in [`Self::sandbox`] (via
+    /// `SandboxSpec::with_extra_roots`) und in jeder Service-Map (über
+    /// [`RuntimeServices::extra_roots`]).
+    #[must_use]
+    pub const fn extra_roots(&self) -> &ExtraRootsCell {
+        &self.extra_roots
+    }
+
+    /// Das effektive Freigabe-Timeout dieses Laufs (Präzedenz Projekt >
+    /// Global > [`DEFAULT_APPROVAL_TIMEOUT_SECS`], siehe
+    /// [`effective_approval_timeout`]).
+    ///
+    /// # Beschreibung
+    /// Für die TUI, deren Freigabe-Panel damit einen Countdown zeigen kann,
+    /// bevor eine offene Rückfrage automatisch abgelehnt wird.
+    #[must_use]
+    pub const fn approval_timeout(&self) -> Duration {
+        self.approval_timeout
     }
 
     /// Der Wurzel-Modellanbieter.
@@ -2391,5 +3024,444 @@ mod tests {
                 .expect_err("Symlink nach außen");
             assert!(matches!(error, RuntimeError::Sandbox { .. }), "{error}");
         }
+    }
+
+    // ── Projektkontext im Modellkontext (Befunde Z2d2-R1/R2/R8) ─────────────
+
+    /// Liest ein [`harw_extension_api::ExtFuture`] synchron aus. Die Provider
+    /// der Registry (`ProjectContextProvider`, `BaselineInstructionsProvider`)
+    /// haben keinen `.await`-Punkt und sind beim ersten `poll` fertig.
+    fn ready<T>(mut future: harw_extension_api::ExtFuture<'_, T>) -> T {
+        use std::task::{Context, Poll, Waker};
+        let mut cx = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(value) => value,
+            Poll::Pending => panic!("der Provider wurde beim ersten poll nicht fertig"),
+        }
+    }
+
+    /// Alles, was die Wurzel-Registry dem Modell als Kontext zeigt:
+    /// Systemprompt und Fragmente der Instruktions-Provider sowie jedes
+    /// Kontextfragment als `label\ncontent`. Nimmt die Registry aus der
+    /// Montage (danach ist sie für `new_root_session` verbraucht).
+    fn registry_model_context(assembly: &RuntimeAssembly) -> Vec<String> {
+        use harw_extension_api::{ContextProvider as _, InstructionsProvider as _};
+        let registry = assembly
+            .registry
+            .lock()
+            .expect("registry lock")
+            .take()
+            .expect("die Registry wurde noch nicht herausgegeben");
+        let turn = harw_extension_api::TurnInputContext::default();
+        let mut out = Vec::new();
+        for provider in registry.instructions_providers() {
+            let loaded = ready(provider.load());
+            out.push(loaded.system_prompt);
+            out.extend(loaded.fragments);
+        }
+        for provider in registry.context_providers() {
+            for fragment in ready(provider.contribute(&turn)) {
+                out.push(format!("{}\n{}", fragment.label, fragment.content));
+            }
+        }
+        out
+    }
+
+    const AGENTS_MARKER: &str = "R1-MARKER-agents-doc-must-not-leak";
+
+    #[test]
+    fn test_job_prompt_assembly_has_no_project_docs() {
+        let fixture = build_fixture();
+        std::fs::write(
+            fixture.project.join("AGENTS.md"),
+            format!("# Geheim\n{AGENTS_MARKER}\n"),
+        )
+        .expect("AGENTS.md");
+        let canonical_project = fixture.project.canonicalize().expect("canonical project");
+
+        for entry in [
+            EntryKind::JobPrompt,
+            EntryKind::McpServe,
+            EntryKind::GatewayTelegram,
+            EntryKind::GatewayDream,
+            EntryKind::Web,
+        ] {
+            assert!(!entry.profile().project_context, "{entry:?}");
+            let assembly = fixture_builder(entry, &fixture)
+                .build()
+                .unwrap_or_else(|error| panic!("{entry:?} montiert nicht: {error}"));
+            assert!(
+                assembly
+                    .project()
+                    .docs
+                    .iter()
+                    .any(|doc| doc.content.contains(AGENTS_MARKER)),
+                "{entry:?}: die Erkennung selbst hat AGENTS.md gefunden (Test ist aussagekräftig)"
+            );
+
+            let context = registry_model_context(&assembly);
+            assert!(!context.is_empty(), "{entry:?}");
+            for text in &context {
+                assert!(!text.contains(AGENTS_MARKER), "{entry:?}: AGENTS.md im Kontext: {text}");
+                assert!(!text.contains("project.doc:"), "{entry:?}: Doku-Fragment: {text}");
+                assert!(
+                    !text.contains(canonical_project.to_string_lossy().as_ref()),
+                    "{entry:?}: Host-Pfad im Kontext: {text}"
+                );
+                assert!(
+                    !text.contains(fixture.project.to_string_lossy().as_ref()),
+                    "{entry:?}: Host-Pfad im Kontext: {text}"
+                );
+            }
+            let placeholder = PROJECT_CONTEXT_PLACEHOLDER;
+            let expected_root =
+                format!("project.root\nproject_root={placeholder}\ncwd={placeholder}");
+            assert!(
+                context.iter().any(|text| *text == expected_root),
+                "{entry:?}: neutraler Platzhalter statt Host-Pfad: {context:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tui_assembly_keeps_project_docs() {
+        let fixture = build_fixture();
+        std::fs::write(
+            fixture.project.join("AGENTS.md"),
+            format!("# Projekt\n{AGENTS_MARKER}\n"),
+        )
+        .expect("AGENTS.md");
+        let canonical_project = fixture.project.canonicalize().expect("canonical project");
+        assert!(EntryKind::Tui.profile().project_context);
+
+        // `Tui` spawnt (`BuiltinRoles`) und braucht deshalb einen Ereigniskanal.
+        let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+        let assembly = fixture_builder(EntryKind::Tui, &fixture)
+            .session_events(events)
+            .build()
+            .expect("Tui montiert");
+
+        let context = registry_model_context(&assembly);
+        let shows_agents_doc = |text: &String| {
+            text.starts_with("project.doc:AGENTS.md\n") && text.contains(AGENTS_MARKER)
+        };
+        assert!(context.iter().any(shows_agents_doc), "Tui zeigt AGENTS.md: {context:?}");
+        let expected_root = format!(
+            "project.root\nproject_root={}\ncwd={}",
+            canonical_project.display(),
+            canonical_project.display()
+        );
+        assert!(
+            context.iter().any(|text| *text == expected_root),
+            "Tui zeigt den erkannten Projekt-Root: {context:?}"
+        );
+    }
+
+    #[test]
+    fn test_narrowing_workspace_root_filters_docs_above_root() {
+        const ABOVE: &str = "R2-MARKER-doc-above-bound-root";
+        const INSIDE: &str = "R2-MARKER-doc-inside-bound-root";
+
+        let fixture = build_fixture();
+        let workspace = fixture.project.join("nested").join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        std::fs::write(fixture.project.join("AGENTS.md"), ABOVE).expect("oberes AGENTS.md");
+        std::fs::write(workspace.join("AGENTS.md"), INSIDE).expect("inneres AGENTS.md");
+        let canonical_workspace = workspace.canonicalize().expect("canonical workspace");
+
+        let mut builder = fixture_builder(EntryKind::JobPlanNode, &fixture);
+        builder.spec.cwd.clone_from(&workspace);
+        let assembly = builder
+            .narrowing(RuntimeNarrowing {
+                registry_profile: RegistryProfile::ReadOnlyExplore,
+                identity: IdentityOverrides::default(),
+                permissions: PermissionSet::from_policy([harw_sandbox::Permission::ReadWorkspace]),
+                workspace_root: Some(workspace.clone()),
+            })
+            .build()
+            .expect("Plan-Knoten mit gebundenem Workspace montiert");
+        assert_eq!(
+            assembly.project().docs.len(),
+            2,
+            "die Erkennung findet beide Dateien; gefiltert wird nur der Modellkontext"
+        );
+
+        let context = registry_model_context(&assembly);
+        assert!(
+            context.iter().all(|text| !text.contains(ABOVE)),
+            "Doku oberhalb des gebundenen Roots darf nicht erscheinen: {context:?}"
+        );
+        assert!(
+            context.iter().any(|text| text.contains(INSIDE)),
+            "Doku im gebundenen Root bleibt: {context:?}"
+        );
+        let expected_root = format!(
+            "project.root\nproject_root={}\ncwd={}",
+            canonical_workspace.display(),
+            canonical_workspace.display()
+        );
+        assert!(
+            context.iter().any(|text| *text == expected_root),
+            "project_root im Kontext ist der gebundene Root: {context:?}"
+        );
+
+        // Komponenten- statt String-Vergleich, an der reinen Entscheidung.
+        let doc = |path: &str| harw_project_discovery::DiscoveredDoc {
+            path: PathBuf::from(path),
+            filename: "AGENTS.md".to_owned(),
+            content: path.to_owned(),
+        };
+        let project = ProjectContext {
+            cwd: PathBuf::from("/work/space/sub"),
+            project_root: PathBuf::from("/work"),
+            docs: vec![
+                doc("/work/AGENTS.md"),
+                doc("/work/space-evil/AGENTS.md"),
+                doc("/work/space/AGENTS.md"),
+                doc("/work/space/sub/AGENTS.md"),
+            ],
+        };
+        let profile = EntryKind::JobPlanNode.profile();
+        let narrowed =
+            registry_project_context(&project, &profile, Some(Path::new("/work/space")));
+        let kept: Vec<&str> = narrowed.docs.iter().map(|doc| doc.content.as_str()).collect();
+        assert_eq!(kept, ["/work/space/AGENTS.md", "/work/space/sub/AGENTS.md"]);
+        assert_eq!(narrowed.project_root, PathBuf::from("/work/space"));
+        assert_eq!(narrowed.cwd, PathBuf::from("/work/space/sub"));
+
+        // Ohne gebundenen Root bleibt der erkannte Kontext unverändert (keine Kopie).
+        let unchanged = registry_project_context(&project, &profile, None);
+        assert!(matches!(unchanged, Cow::Borrowed(_)));
+
+        // Ohne Projektkontext gewinnt die Schwärzung auch gegen einen gebundenen Root.
+        let redacted = registry_project_context(
+            &project,
+            &EntryKind::JobPrompt.profile(),
+            Some(Path::new("/work/space")),
+        );
+        assert!(redacted.docs.is_empty());
+        assert_eq!(redacted.project_root, PathBuf::from(PROJECT_CONTEXT_PLACEHOLDER));
+        assert_eq!(redacted.cwd, PathBuf::from(PROJECT_CONTEXT_PLACEHOLDER));
+    }
+
+    #[test]
+    fn test_narrowing_rejects_restricted_profile_with_model_tool_operations() {
+        let fixture = build_fixture();
+        assert_eq!(
+            EntryKind::Doctor.profile().operations,
+            OperationSurface::AllWithModelTools
+        );
+        let narrowing_to = |registry_profile: RegistryProfile| RuntimeNarrowing {
+            registry_profile,
+            identity: IdentityOverrides::default(),
+            permissions: every_permission(),
+            workspace_root: None,
+        };
+
+        for requested in [RegistryProfile::ReadOnlyExplore, RegistryProfile::NoTools] {
+            let error = fixture_builder(EntryKind::Doctor, &fixture)
+                .narrowing(narrowing_to(requested))
+                .build()
+                .expect_err("Werkzeugverengung an AllWithModelTools muss abgelehnt werden");
+            assert!(
+                matches!(error, RuntimeError::Registry { .. }),
+                "{requested:?}: {error}"
+            );
+        }
+
+        // `Full` bleibt zugelassen, ebenso eine Verengung ohne Modell-Tool-Fläche.
+        fixture_builder(EntryKind::Doctor, &fixture)
+            .narrowing(narrowing_to(RegistryProfile::Full))
+            .build()
+            .expect("Doctor mit Full montiert");
+        fixture_builder(EntryKind::LocalEcho, &fixture)
+            .narrowing(narrowing_to(RegistryProfile::ReadOnlyExplore))
+            .build()
+            .expect("LocalEcho (OperationSurface::None) mit ReadOnlyExplore montiert");
+
+        // Reine Entscheidung für alle Einstiege mit Modell-Tool-Fläche.
+        for entry in [EntryKind::Tui, EntryKind::OneShot, EntryKind::Doctor] {
+            let profile = entry.profile();
+            assert!(ensure_narrowing_fits_operations(entry, &profile, None).is_ok());
+            assert!(
+                ensure_narrowing_fits_operations(
+                    entry,
+                    &profile,
+                    Some(&narrowing_to(RegistryProfile::Full))
+                )
+                .is_ok()
+            );
+            for requested in [RegistryProfile::ReadOnlyExplore, RegistryProfile::NoTools] {
+                assert!(
+                    matches!(
+                        ensure_narrowing_fits_operations(
+                            entry,
+                            &profile,
+                            Some(&narrowing_to(requested))
+                        ),
+                        Err(RuntimeError::Registry { .. })
+                    ),
+                    "{entry:?} → {requested:?}"
+                );
+            }
+        }
+    }
+
+    // ── Freigaben: Präzedenz und Fail-Soft (Contract §2/§4/§5) ───────────────
+
+    /// Präzedenz Projekt > Global > eingebaute Vorgabe des Einstiegs.
+    #[test]
+    fn test_effective_approval_mode_precedence_project_over_global_over_default() {
+        let mut global = PermissionsSection::default();
+        let mut project = PermissionsSection::default();
+
+        // Keine Ebene gesetzt: die eingebaute Vorgabe des Einstiegs gewinnt.
+        assert_eq!(
+            effective_approval_mode(EntryKind::Tui, &global, &project),
+            default_approval_mode(EntryKind::Tui)
+        );
+
+        // Nur global gesetzt: global schlägt die eingebaute Vorgabe.
+        global.default_mode = Some("full".to_owned());
+        assert_eq!(
+            effective_approval_mode(EntryKind::Tui, &global, &project),
+            ApprovalMode::FullAccess
+        );
+
+        // Projekt zusätzlich gesetzt: Projekt schlägt global.
+        project.default_mode = Some("ask".to_owned());
+        assert_eq!(
+            effective_approval_mode(EntryKind::Tui, &global, &project),
+            ApprovalMode::AlwaysAsk
+        );
+    }
+
+    /// Dieselbe Präzedenz gilt für das Freigabe-Timeout (Plan Schritt 3).
+    #[test]
+    fn test_effective_approval_timeout_precedence_project_over_global_over_default() {
+        let mut global = PermissionsSection::default();
+        let mut project = PermissionsSection::default();
+
+        assert_eq!(
+            effective_approval_timeout(&global, &project),
+            Duration::from_secs(DEFAULT_APPROVAL_TIMEOUT_SECS)
+        );
+
+        global.approval_timeout_secs = Some(60);
+        assert_eq!(effective_approval_timeout(&global, &project), Duration::from_secs(60));
+
+        project.approval_timeout_secs = Some(30);
+        assert_eq!(effective_approval_timeout(&global, &project), Duration::from_secs(30));
+    }
+
+    /// Eine ungültige Extra-Root (hier: nicht existent) wird übersprungen,
+    /// nicht abgelehnt — nur der gültige Eintrag landet in der Zelle.
+    #[test]
+    fn test_seed_extra_roots_skips_invalid_entries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = dir.path().join("primary");
+        std::fs::create_dir_all(&primary).expect("primary");
+        let valid = primary.join("valid");
+        std::fs::create_dir_all(&valid).expect("valid");
+        let missing = primary.join("does-not-exist");
+
+        let mut global = PermissionsSection::default();
+        global.extra_roots = vec![valid, missing];
+
+        let cell = seed_extra_roots(&global, &PermissionsSection::default(), &primary, None);
+        let snapshot = cell.snapshot();
+        assert_eq!(snapshot.len(), 1, "nur der gültige Eintrag bleibt: {snapshot:?}");
+    }
+
+    // ── Plan-Dienste: Default an, außer ausdrücklich abgeschaltet (G-024) ────
+
+    /// Ein interaktiver TUI-Lauf ohne jeden Konfigurationseintrag bekommt die
+    /// eingebaute Plan-Vorgabe — `/plan` und `/goal` funktionieren ohne
+    /// `[tools.plan]` (G-024/G-098). Andere Einstiege bleiben unverändert
+    /// ohne eingebaute Vorgabe.
+    #[test]
+    fn test_resolve_plan_services_defaults_on_for_tui_when_untouched() {
+        let fixture = build_fixture();
+        let home_project_root =
+            discover_home_project(&fixture.project, &[]).expect("Projekt-Home erkannt");
+        let project_home = ProjectHome::at(&home_project_root);
+
+        let resolved =
+            resolve_plan_services(EntryKind::Tui, None, &PlanSection::default(), &project_home);
+        let Some(plan) = resolved else {
+            panic!("Tui ohne Config-Eintrag muss die eingebaute Plan-Vorgabe bekommen");
+        };
+        assert!(plan.plan_config.enabled);
+
+        assert!(
+            resolve_plan_services(
+                EntryKind::OneShot,
+                None,
+                &PlanSection::default(),
+                &project_home
+            )
+            .is_none(),
+            "die Gate-Semantik anderer Einstiege bleibt unverändert"
+        );
+    }
+
+    /// Eine berührte Sektion mit `enabled = false` bleibt geschlossen — eine
+    /// bewusste Abschaltung wird nie überschrieben. Ein expliziter
+    /// Builder-Wert gewinnt dagegen immer, unabhängig von der Konfiguration.
+    #[test]
+    fn test_resolve_plan_services_stays_off_when_touched_and_disabled() {
+        let fixture = build_fixture();
+        let home_project_root =
+            discover_home_project(&fixture.project, &[]).expect("Projekt-Home erkannt");
+        let project_home = ProjectHome::at(&home_project_root);
+
+        let mut section = PlanSection::default();
+        section.persist = true;
+        assert!(!plan_section_is_untouched(&section));
+
+        assert!(
+            resolve_plan_services(EntryKind::Tui, None, &section, &project_home).is_none(),
+            "eine berührte, weiterhin `enabled = false`-Sektion bleibt geschlossen"
+        );
+
+        let explicit = default_tui_plan_services(&project_home);
+        let findings = Arc::clone(&explicit.findings);
+        let resolved = resolve_plan_services(EntryKind::Tui, Some(explicit), &section, &project_home)
+            .expect("ein expliziter Builder-Wert bleibt erhalten");
+        assert!(Arc::ptr_eq(&resolved.findings, &findings));
+    }
+
+    /// Eine berührte, ausdrücklich aktivierte Sektion wird vollständig
+    /// übersetzt (Knotenlimits, Exploration-Vorgaben).
+    #[test]
+    fn test_plan_tool_config_from_section_translates_fields() {
+        let mut section = PlanSection::default();
+        section.enabled = true;
+        section.max_nodes = 12;
+        section.require_exploration_for = vec!["coding".to_owned()];
+
+        let config = plan_tool_config_from_section(&section).expect("gültige Sektion übersetzt");
+        assert!(config.enabled);
+        assert_eq!(config.max_nodes, 12);
+        assert_eq!(config.require_exploration_for, vec![PlanNodeKind::Coding]);
+    }
+
+    /// Eine ungültige Sektion (`max_nodes = 0`) übersetzt nicht — dieselbe
+    /// Prüfung, die [`resolve_plan_services`] fail-soft in `None` auflöst.
+    #[test]
+    fn test_plan_tool_config_from_section_rejects_zero_max_nodes() {
+        let mut section = PlanSection::default();
+        section.enabled = true;
+        section.max_nodes = 0;
+        assert!(plan_tool_config_from_section(&section).is_err());
+
+        let fixture = build_fixture();
+        let home_project_root =
+            discover_home_project(&fixture.project, &[]).expect("Projekt-Home erkannt");
+        let project_home = ProjectHome::at(&home_project_root);
+        assert!(
+            resolve_plan_services(EntryKind::Tui, None, &section, &project_home).is_none(),
+            "eine ungültige, berührte Sektion bleibt fail-soft geschlossen"
+        );
     }
 }

@@ -1,14 +1,23 @@
-//! Per-session state owned by the Firefox adapter.
+//! Per-session state owned by the Firefox adapter (B-ADAPT, F-009).
+//!
+//! # Description
+//! Holds the authorized `OpenBrowserRequest` (origin policies and limits), the
+//! per-session `ActionBudget`, the bounded event journal and the raw driver.
+//! After every effect the runtime validates all window locations through
+//! [`crate::location_guard`] and aborts the session on a breach.
 
 use crate::driver::FirefoxDriver;
-use crate::journal::{BackpressureDisposition, BidiEventClass, EventJournalPolicy};
+use crate::journal::{EventJournal, EventJournalPolicy};
+use crate::location_guard::LocationProbe;
+use async_trait::async_trait;
+use harw_browser::action::ActionBudget;
 use harw_browser::capability::CapabilityStatus;
-use harw_browser::event::{BackpressureStats, BrowserEvent, EventClass, EventEnvelope};
+use harw_browser::event::{BrowserEvent, EventClass, EventEnvelope};
 use harw_browser::ids::{
     BrowserContextId, BrowserEventCursor, BrowserObservationRevision, BrowserSessionId, EventId,
 };
-use harw_browser::policy::OriginPolicy;
-use std::collections::{HashMap, VecDeque};
+use harw_browser::policy::OpenBrowserRequest;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use thirtyfour::WindowHandle;
 use tokio::sync::{Mutex, MutexGuard, RwLock};
@@ -36,17 +45,16 @@ impl EventCapabilityState {
 pub(crate) struct FirefoxRuntime {
     session_id: BrowserSessionId,
     primary_context_id: BrowserContextId,
-    origin_policy: OriginPolicy,
+    request: OpenBrowserRequest,
+    action_budget: Mutex<ActionBudget>,
     bidi_status: CapabilityStatus,
     driver: Mutex<FirefoxDriver>,
     windows: RwLock<HashMap<BrowserContextId, WindowHandle>>,
     revisions: RwLock<HashMap<BrowserContextId, BrowserObservationRevision>>,
     bidi_contexts: RwLock<HashMap<String, BrowserContextId>>,
     bidi_realms: RwLock<HashMap<String, BrowserContextId>>,
-    events: Mutex<VecDeque<EventEnvelope>>,
+    journal: Mutex<EventJournal>,
     next_event_cursor: Mutex<BrowserEventCursor>,
-    backpressure_stats: Mutex<BackpressureStats>,
-    event_policy: EventJournalPolicy,
     event_capabilities: RwLock<EventCapabilityState>,
     closed: AtomicBool,
 }
@@ -55,7 +63,7 @@ impl FirefoxRuntime {
     pub(crate) fn new(
         driver: FirefoxDriver,
         session_id: BrowserSessionId,
-        origin_policy: OriginPolicy,
+        request: OpenBrowserRequest,
         bidi_status: CapabilityStatus,
         primary_context_id: BrowserContextId,
         primary_window: WindowHandle,
@@ -68,17 +76,16 @@ impl FirefoxRuntime {
         Self {
             session_id,
             primary_context_id,
-            origin_policy,
+            action_budget: Mutex::new(ActionBudget::new(&request.limits)),
+            request,
             bidi_status,
             driver: Mutex::new(driver),
             windows: RwLock::new(windows),
             revisions: RwLock::new(revisions),
             bidi_contexts: RwLock::new(HashMap::new()),
             bidi_realms: RwLock::new(HashMap::new()),
-            events: Mutex::new(VecDeque::with_capacity(event_policy.capacity())),
+            journal: Mutex::new(EventJournal::new(event_policy)),
             next_event_cursor: Mutex::new(BrowserEventCursor::zero()),
-            backpressure_stats: Mutex::new(BackpressureStats::default()),
-            event_policy,
             event_capabilities: RwLock::new(EventCapabilityState::unavailable()),
             closed: AtomicBool::new(false),
         }
@@ -92,8 +99,19 @@ impl FirefoxRuntime {
         self.primary_context_id
     }
 
-    pub(crate) fn origin_policy(&self) -> &OriginPolicy {
-        &self.origin_policy
+    /// Returns the authorized open request (origin policies and limits).
+    pub(crate) fn request(&self) -> &OpenBrowserRequest {
+        &self.request
+    }
+
+    /// Consumes one action from the per-session budget.
+    pub(crate) async fn consume_action_budget(&self) -> harw_browser::Result<()> {
+        self.action_budget.lock().await.try_consume()
+    }
+
+    /// Validates every open window location; aborts the session on a breach (F-009).
+    pub(crate) async fn enforce_location_policy(&self) -> harw_browser::Result<()> {
+        crate::location_guard::enforce_location_policy(self, &self.request).await
     }
 
     pub(crate) fn bidi_status(&self) -> CapabilityStatus {
@@ -114,8 +132,18 @@ impl FirefoxRuntime {
         &self.revisions
     }
 
-    pub(crate) fn events(&self) -> &Mutex<VecDeque<EventEnvelope>> {
-        &self.events
+    /// Returns retained events newer than `since`.
+    pub(crate) async fn events_since(&self, since: BrowserEventCursor) -> Vec<EventEnvelope> {
+        self.journal.lock().await.since(since)
+    }
+
+    /// Returns the cursor of the newest retained event, or zero.
+    pub(crate) async fn last_event_cursor(&self) -> BrowserEventCursor {
+        self.journal
+            .lock()
+            .await
+            .last_cursor()
+            .unwrap_or_else(BrowserEventCursor::zero)
     }
 
     pub(crate) async fn set_event_capabilities(
@@ -196,49 +224,8 @@ impl FirefoxRuntime {
         *next_cursor = next_cursor.next();
         let cursor = *next_cursor;
         let envelope = EventEnvelope::new(EventId::new(), cursor, self.session_id, class, event);
-        let mut journal = self.events.lock().await;
-        if journal.len() < self.event_policy.capacity() {
-            journal.push_back(envelope);
-            return Ok(cursor);
-        }
-
-        if class == EventClass::Critical {
-            if let Some(position) = journal
-                .iter()
-                .position(|entry| entry.class != EventClass::Critical)
-            {
-                journal.remove(position);
-                self.backpressure_stats.lock().await.record_drop();
-            }
-            journal.push_back(envelope);
-            tracing::warn!(
-                cursor = cursor.value(),
-                "retained critical browser event under journal pressure"
-            );
-            return Ok(cursor);
-        }
-
-        let disposition = self.event_policy.disposition(match class {
-            EventClass::Critical => BidiEventClass::CriticalControl,
-            EventClass::RequestLifecycle => BidiEventClass::RequestLifecycle,
-            EventClass::ConsoleRepetition => BidiEventClass::Console,
-            EventClass::StaticAsset => BidiEventClass::StaticAsset,
-            EventClass::Artifact => BidiEventClass::ArtifactPayload,
-        });
-        let mut stats = self.backpressure_stats.lock().await;
-        match disposition {
-            BackpressureDisposition::Retain => journal.push_back(envelope),
-            BackpressureDisposition::AggregateWhenFull => stats.record_aggregate(),
-            BackpressureDisposition::Deduplicate => stats.record_deduplicate(),
-            BackpressureDisposition::Sample | BackpressureDisposition::StoreExternally => {
-                stats.record_drop()
-            }
-        }
-        tracing::debug!(
-            cursor = cursor.value(),
-            ?disposition,
-            "applied browser event backpressure"
-        );
+        let disposition = self.journal.lock().await.push(envelope);
+        tracing::trace!(cursor = cursor.value(), ?disposition, "journaled browser event");
         Ok(cursor)
     }
 
@@ -266,10 +253,49 @@ impl FirefoxRuntime {
             return Ok(());
         }
 
-        let driver = self.driver.lock().await;
+        let mut driver = self.driver.lock().await;
         driver.quit().await.map_err(harw_browser::Error::from)?;
         tracing::info!("Firefox runtime closed");
         Ok(())
+    }
+}
+
+#[async_trait]
+impl LocationProbe for FirefoxRuntime {
+    async fn open_locations(&self) -> harw_browser::Result<Vec<url::Url>> {
+        let driver = self.driver.lock().await;
+        let webdriver = driver.webdriver();
+        let handles = webdriver
+            .windows()
+            .await
+            .map_err(|error| location_error("list browser windows", &error))?;
+        let mut locations = Vec::with_capacity(handles.len());
+        for handle in handles {
+            webdriver
+                .switch_to_window(handle)
+                .await
+                .map_err(|error| location_error("switch to browser window", &error))?;
+            locations.push(
+                webdriver
+                    .current_url()
+                    .await
+                    .map_err(|error| location_error("read browser window location", &error))?,
+            );
+        }
+        Ok(locations)
+    }
+
+    async fn abort_session(&self, reason: &str) {
+        tracing::warn!(session_id = %self.session_id, reason, "aborting Firefox session");
+        if let Err(error) = self.close_runtime().await {
+            tracing::warn!(%error, "Firefox session abort did not shut down cleanly");
+        }
+    }
+}
+
+fn location_error(operation: &str, error: &thirtyfour::error::WebDriverError) -> harw_browser::Error {
+    harw_browser::Error::CapabilityUnavailable {
+        detail: format!("could not {operation} for origin enforcement: {error}"),
     }
 }
 

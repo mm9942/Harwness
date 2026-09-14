@@ -77,6 +77,10 @@ pub enum AdapterError {
         operation: ProfileArchiveOperation,
         detail: String,
     },
+    /// The pinned geckodriver failed path, permission or SHA-256 verification.
+    DriverPin { path: PathBuf, detail: String },
+    /// The sandboxed driver launch was rejected by the audit or failed to start.
+    Launch { detail: String },
 }
 
 impl fmt::Display for AdapterError {
@@ -104,6 +108,14 @@ impl fmt::Display for AdapterError {
                 "could not {operation} at '{}': {detail}",
                 directory.display()
             ),
+            Self::DriverPin { path, detail } => write!(
+                formatter,
+                "pinned geckodriver '{}' rejected: {detail}",
+                path.display()
+            ),
+            Self::Launch { detail } => {
+                write!(formatter, "sandboxed geckodriver launch failed: {detail}")
+            }
         }
     }
 }
@@ -134,6 +146,15 @@ impl From<AdapterError> for harw_browser::Error {
                     detail: format!("{capability}: {detail}"),
                 }
             }
+            AdapterError::DriverPin { path, detail } => Self::CapabilityUnavailable {
+                detail: format!(
+                    "pinned geckodriver '{}' failed verification: {detail}",
+                    path.display()
+                ),
+            },
+            AdapterError::Launch { detail } => Self::CapabilityUnavailable {
+                detail: format!("sandboxed geckodriver launch failed: {detail}"),
+            },
             AdapterError::ProfileArchive {
                 directory,
                 operation: ProfileArchiveOperation::ReadDirectory,

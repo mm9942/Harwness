@@ -3,8 +3,11 @@
 //! # Verantwortungsbereich
 //! Besitzt den Vertrag [`VectorIndex`] und zwei Implementierungen:
 //! [`FlatIndex`] (exakte Vektorsuche ohne Näherung, die Referenz — siehe
-//! `flat.rs`) und [`Bm25Index`] (lexikalische Suche — siehe `bm25.rs`, samt
-//! der dort dokumentierten bewussten Doppelung mit `harw-knowledge`). Baut
+//! `flat.rs`) und [`Bm25Index`] (lexikalische Suche — siehe `bm25.rs`). Die
+//! BM25-Formel selbst liegt seit Knoten **W10-L1** nicht mehr hier, sondern
+//! als reine Funktion in `harw_lens_rank::bm25_scores` (Knoten W9-C4,
+//! Befund F-206: vorher eine wörtliche Kopie von
+//! `harw-knowledge::KeywordRanker`) — `bm25.rs` ruft sie nur noch auf. Baut
 //! oder liest keinen Chunk-Text selbst (das liefert `harw-lens-chunk`
 //! bereits fertig zerlegt) und tut keine eigene Persistenzmechanik (das
 //! liefert `harw-lens-store`) — dieses Crate interpretiert Chunks und
@@ -56,7 +59,8 @@
 //!     span: ByteSpan::new(0, 5).expect("valid span"),
 //!     text: "hello".to_owned(),
 //! };
-//! let index = FlatIndex::build(manifest.clone(), vec![(chunk, vec![1.0, 0.0])]);
+//! let index = FlatIndex::build(manifest.clone(), vec![(chunk, vec![1.0, 0.0])])
+//!     .expect("consistent embedding dimension");
 //!
 //! // Eine Abfrage mit abweichendem Modell wird abgelehnt, nie beantwortet.
 //! let mut wrong_model = manifest.clone();
@@ -70,7 +74,10 @@
 //!
 //! # Stand
 //! Gerüst aus Knoten AW0-00 (Workspace-Fundament). Der Inhalt entstand in
-//! Knoten **AW4-06**; Ebene **L3** im Zielgraphen.
+//! Knoten **AW4-06**; Ebene **L3** im Zielgraphen. Knoten **W10-L1** hat die
+//! BM25-Formel nach `harw-lens-rank` verschoben, [`FlatIndex::search`] auf
+//! eine Top-k-Auswahl per `BinaryHeap` (`O(n log k)`) umgestellt und eine
+//! Embedding-Dimensionsprüfung bei Einfügen und Abfrage ergänzt.
 
 mod bm25;
 mod error;

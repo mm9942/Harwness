@@ -10,6 +10,10 @@
 //! Jede Funktion nimmt `&harw_dod_cap::ReadScope` und `&std::path::Path` und
 //! öffnet ausschließlich über [`harw_dod_cap::ReadScope::open`] — Symlink-
 //! Auflösung und Bereichsprüfung passieren dort, **nicht** hier noch einmal.
+//! Das schließt Alias-Wurzeln ([`harw_dod_cap::scope::AliasRoot`]) ein: ein
+//! Bereich mit `AliasRoot::sysfs_class("/sys/class/thermal")` liest
+//! `/sys/class/thermal/thermal_zone0/temp`, obwohl der Eintrag ein Symlink
+//! nach `/sys/devices/…` ist (Befund F-005).
 //! Diese Datei ruft **niemals** `std::fs` direkt auf.
 //!
 //! # Exportierte Typen
@@ -750,5 +754,67 @@ mod tests {
                 ("b".to_owned(), "2".to_owned()),
             ]
         );
+    }
+
+    /// Nachgebauter sysfs-Ausschnitt mit echtem Symlink
+    /// `sys/class/thermal/thermal_zone0 -> ../../devices/virtual/thermal/thermal_zone0`
+    /// (strukturgleich zum RPi 5) plus einem Alias-Bereich darauf.
+    #[cfg(unix)]
+    fn alias_thermal_tree(base: &Path) -> (ReadScope, std::path::PathBuf) {
+        use harw_dod_cap::scope::AliasRoot;
+        use std::os::unix::fs::symlink;
+
+        let zone = base.join("sys/devices/virtual/thermal/thermal_zone0");
+        fs::create_dir_all(&zone).expect("create zone");
+        fs::write(zone.join("temp"), "48150\n").expect("write temp");
+        let class = base.join("sys/class/thermal");
+        fs::create_dir_all(&class).expect("create class");
+        symlink(
+            "../../devices/virtual/thermal/thermal_zone0",
+            class.join("thermal_zone0"),
+        )
+        .expect("class symlink");
+
+        let alias = AliasRoot::new(class.clone(), base.join("sys/devices")).expect("alias root");
+        let scope = ReadScope::from_roots_and_aliases(Vec::<std::path::PathBuf>::new(), [alias]);
+        (scope, class)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_i64_through_alias_root_reads_sysfs_class_symlink() {
+        let dir = tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonical tempdir");
+        let (scope, class) = alias_thermal_tree(&base);
+
+        let value = parse_i64(&scope, &class.join("thermal_zone0/temp"))
+            .expect("Alias-Wurzel muss den sysfs-Klassen-Symlink lesen");
+        assert_eq!(value, 48150);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_parse_i64_plain_class_root_rejects_sysfs_symlink() {
+        let dir = tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonical tempdir");
+        let (_, class) = alias_thermal_tree(&base);
+        let plain = scope_for(&class);
+
+        let err = parse_i64(&plain, &class.join("thermal_zone0/temp"))
+            .expect_err("ohne Alias-Wurzel bleibt das Ziel außerhalb");
+        assert!(matches!(err, ReadFsError::Scope(SensorError::OutsideScope)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_read_to_string_alias_rejects_parent_dir_escape() {
+        let dir = tempdir().expect("tempdir");
+        let base = dir.path().canonicalize().expect("canonical tempdir");
+        let (scope, class) = alias_thermal_tree(&base);
+        fs::write(base.join("secret"), "geheim\n").expect("write secret");
+
+        let err = read_to_string(&scope, &class.join("thermal_zone0/../../../../secret"))
+            .expect_err("'..' muss abgelehnt werden");
+        assert!(matches!(err, ReadFsError::Scope(SensorError::OutsideScope)));
     }
 }

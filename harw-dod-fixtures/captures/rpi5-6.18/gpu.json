@@ -1,0 +1,20 @@
+{
+  "kernel": "6.18.34+rpt-rpi-2712",
+  "captured_at": "2026-09-13T18:33:35Z",
+  "entries": [
+    {
+      "path": "/sys/class/drm/card0",
+      "kind": {
+        "type": "symlink",
+        "target": "../../devices/platform/axi/1002000000.v3d/drm/card0"
+      }
+    },
+    {
+      "path": "/sys/class/drm/card0/device/uevent",
+      "kind": {
+        "type": "file",
+        "content": "DRIVER=v3d\nOF_NAME=v3d\nOF_FULLNAME=/axi/v3d@2000000\nOF_COMPATIBLE_0=brcm,2712-v3d\nOF_COMPATIBLE_N=1\nMODALIAS=of:Nv3dT(null)Cbrcm,2712-v3d\n"
+      }
+    }
+  ]
+}

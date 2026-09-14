@@ -17,10 +17,57 @@
 //! - [`ChildRegistryFactory::executable_agent_ir`] speist die Agent-DSL-IR
 //!   ein: Tool-Aktivierung, Budget, verschärfte Tiefengrenze und die
 //!   Pause-Sperre (`allow_pause`) stammen dann aus der Definition.
+//!
+//! # Lebenszyklus und Slot-Freigabe (A-CHILD: F-072, G-016, F-182, F-183)
+//! - [`ManagedAgentSpawner::release_child`] gibt den Admission-Slot frei,
+//!   bricht den Kind-Token (und damit alle Nachkommen) ab, entfernt die
+//!   Kind-Session aus dem [`SessionManager`] und schließt einen durablen Lease.
+//! - [`ChildGuard`] ist die RAII-Form davon: `Drop` gibt den Slot frei, auch bei
+//!   Early-Return (`?`) oder Panic.
+//! - Jedes Kind trägt einen [`CancelToken`], abgeleitet über
+//!   [`CancelToken::child`] aus dem Token seines Elternteils. Ein Eltern-Abbruch
+//!   bricht so jeden laufenden Kind-Turn ab. Cancel ist **terminal**: ein
+//!   abgebrochenes Kind wird nicht wieder ausgeführt, sondern vom Reaper
+//!   freigegeben.
+//! - [`ManagedAgentSpawner::reap`] (periodisch) und die Admission (wenn der
+//!   Eltern-Deckel erreicht ist) räumen verwaiste, abgebrochene und
+//!   abgelaufene Kinder ab.
+//! - [`ChildStatus::Completed`] wird nur bei einem echten
+//!   `TurnOutcome::Completed` innerhalb des Budgets gesetzt, nie bei Fehler,
+//!   Budget-Verletzung oder Abbruch.
+//!
+//! # Nebenläufigkeit
+//! `ManagedAgentSpawner` ist `Send + Sync`. Alle Sperren sind `std::sync::Mutex`
+//! und werden **nie** über ein `.await` gehalten. [`ManagedAgentSpawner::admit`]
+//! hält `active` und `cancellations` durchgehend von der Deckel-Prüfung bis
+//! zum Eintrag des neuen Kindes — auch über Registry-Montage,
+//! Capability-Snapshot und Lease-Datei-I/O hinweg. Ein früherer, separater
+//! `reserved`-Zähler samt `SlotReservation`-Guard, der genau dieses Fenster
+//! ohne durchgehende Sperre hätte abdecken sollen, ist deshalb entfallen
+//! (siehe [`ManagedAgentSpawner::admit`]s eigene Prüfung): eine zweite
+//! Admission desselben Elternteils kann unter der durchgehend gehaltenen
+//! Sperre gar nicht erst in die Deckel-Prüfung eintreten, solange die erste
+//! noch läuft. Verschachtelt wird nur noch ein Paar, immer in dieser
+//! Richtung: `manager` ⊃ `released` (Rückgabe bzw. Verwerfen einer laufenden
+//! Session).
+//!
+//! # Fehler
+//! Alle öffentlichen Fehler sind [`AgentSpawnError`] mit lesbarer Meldung.
+//!
+//! # Examples
+//! ```rust,no_run
+//! use harw_core::child_controller::ManagedAgentSpawner;
+//! # fn demo(spawner: &ManagedAgentSpawner, child: harw_types::SessionId) {
+//! let guard = spawner.guard_child(child);
+//! // … Kind ausführen und Ergebnis auswerten …
+//! drop(guard); // Slot, Token und Session werden freigegeben
+//! # }
+//! ```
 
 use crate::ModelProvider;
 use crate::activation::SessionActivation;
-use crate::session::SpawnContext;
+use crate::cancel::{CancelReason, CancelToken};
+use crate::session::{AgentSession, SpawnContext};
 use crate::session_manager::SessionManager;
 use crate::state_store::StateStore;
 use crate::turn_loop::{TurnInput, TurnOutcome, run_turn, run_turn_durable};
@@ -36,13 +83,12 @@ use harw_sandbox::SandboxSpec;
 use harw_session_store::{ApprovalStore, ChildLeaseRecord, ChildLeaseStore};
 use harw_types::{AgentRole, ReasoningEffort, SessionId, ToolCallId};
 use jiff::{SignedDuration, Timestamp};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
-use tokio::sync::watch;
 use uuid::Uuid;
 
 /// Meldungstext für ein Geschwisterkind, das von [`JoinSemantics::AnyTerminal`]
@@ -75,14 +121,6 @@ const DEFAULT_CHILD_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Medium;
 /// sich nicht mit `tokio::spawn` in einen Task legen.
 type ChildRunFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ChildRunResult, AgentSpawnError>> + Send + 'a>>;
-
-async fn wait_for_child_cancellation(receiver: &mut watch::Receiver<bool>) {
-    while !*receiver.borrow_and_update() {
-        if receiver.changed().await.is_err() {
-            std::future::pending::<()>().await;
-        }
-    }
-}
 
 /// Erzeugt eine frische, zufällige `span_id` (16 Hexzeichen, Kleinschreibung)
 /// für ein neu admittiertes Kind.
@@ -344,6 +382,10 @@ pub struct ChildRecord {
     /// unverändert in [`Self::durable_lease`] ein — das ist der Konsument,
     /// der diesen Trace auf Platte schreibt.
     pub trace: Option<TraceContext>,
+    /// Der aktuelle Lebenszyklus-Status des Kindes (A-CHILD). Neu admittierte
+    /// Kinder starten mit [`ChildStatus::Admitted`]; nur der Controller
+    /// schreibt diesen Wert fort. Er fließt **nicht** in den durablen Lease ein.
+    pub status: ChildStatus,
 }
 
 impl ChildRecord {
@@ -384,6 +426,258 @@ pub struct ExpiredChild {
 pub struct ChildRunResult {
     pub child: SessionId,
     pub outcome: TurnOutcome,
+}
+
+/// Lebenszyklus-Status eines admittierten Kindes.
+///
+/// # Description
+/// A-CHILD (F-072, F-182). Der Controller schreibt den Status in
+/// [`ChildRecord::status`] fort:
+/// - `Admitted` → `Running` beim Start eines Turns,
+/// - `Running` → `Completed` **nur** bei `TurnOutcome::Completed` (und
+///   eingehaltenem Budget, siehe [`ManagedAgentSpawner::run_child_with_budget`]),
+/// - `Running` → `Paused` bei erlaubter Pause,
+/// - `Running` → `Failed` bei Turn-Fehler, Budget-Verletzung oder verbotener Pause,
+/// - `Running` → `Cancelled` bei Abbruch des Kind-Tokens oder gedropptem Lauf.
+///
+/// Ein abgelaufenes Kind hat keinen Record mehr (siehe [`ExpiredChild`]).
+///
+/// # Concurrency
+/// `Copy`; kein geteilter Zustand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildStatus {
+    /// Admittiert, noch nie ausgeführt.
+    Admitted,
+    /// Ein Turn läuft gerade; die Session ist aus dem Manager entnommen.
+    Running,
+    /// Der letzte Turn pausierte zulässig (Approval oder Enkel).
+    Paused,
+    /// Der letzte Turn endete terminal und im Budget.
+    Completed,
+    /// Der letzte Turn scheiterte (Fehler, Budget, verbotene Pause).
+    Failed,
+    /// Das Kind wurde abgebrochen; es wird nicht wieder ausgeführt.
+    Cancelled,
+}
+
+impl ChildStatus {
+    /// Liefert das stabile, maschinenlesbare Label dieses Status.
+    ///
+    /// # Returns
+    /// `"admitted"`, `"running"`, `"paused"`, `"completed"`, `"failed"` oder `"cancelled"`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::Running => "running",
+            Self::Paused => "paused",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    /// Gibt an, ob der Status ein Endzustand ist (`Completed`, `Failed`, `Cancelled`).
+    ///
+    /// # Returns
+    /// `true` für Endzustände.
+    #[must_use]
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+/// Ergebnis eines Reaper-Laufs ([`ManagedAgentSpawner::reap`]).
+///
+/// # Description
+/// A-CHILD. `expired` trägt die Korrelation abgelaufener Leases, die der
+/// Aufrufer an den wartenden Elternteil zustellen muss; `released` nennt jedes
+/// Kind, dessen Slot und Session der Lauf freigegeben hat (verwaist,
+/// abgebrochen oder abgelaufen und nicht mehr laufend).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ReapReport {
+    /// Abgelaufene Leases mit Eltern-/Handoff-Korrelation.
+    pub expired: Vec<ExpiredChild>,
+    /// Freigegebene Kinder.
+    pub released: Vec<SessionId>,
+}
+
+/// RAII-Halter eines admittierten Kindes: `Drop` gibt es frei.
+///
+/// # Description
+/// A-CHILD (F-072, G-016). Solange der Guard lebt, bleibt das Kind admittiert
+/// und sein Ergebnis abrufbar ([`ManagedAgentSpawner::child_final_assistant_text`]).
+/// Fällt der Guard — regulär, per `?`-Early-Return oder beim Abwickeln einer
+/// Panic —, ruft er [`ManagedAgentSpawner::release_child`]: Slot frei, Kind-Token
+/// (samt Nachkommen) abgebrochen, Session aus dem Manager entfernt. Fehler beim
+/// Freigeben werden in `Drop` nur geloggt; wer sie sehen will, ruft
+/// [`Self::release`].
+///
+/// [`Self::keep`] entschärft den Guard, wenn das Kind bewusst weiterleben soll
+/// (etwa ein pausiertes Kind, das später fortgesetzt wird).
+///
+/// # Concurrency
+/// Leiht den Spawner (`&'a ManagedAgentSpawner`), ist damit `Send` und darf in
+/// `async fn`s über `.await` gehalten werden. Für `'static`-Tasks den Spawner
+/// als `Arc` in den Task verschieben und den Guard dort erzeugen.
+///
+/// # Examples
+/// ```rust,no_run
+/// use harw_core::child_controller::ManagedAgentSpawner;
+/// # fn demo(spawner: &ManagedAgentSpawner, child: harw_types::SessionId)
+/// #     -> Result<(), harw_extension_api::AgentSpawnError> {
+/// let guard = spawner.guard_child(child);
+/// let text = spawner.child_final_assistant_text(guard.child())?; // Early-Return gibt frei
+/// let _record = guard.release()?;
+/// # let _ = text;
+/// # Ok(())
+/// # }
+/// ```
+#[must_use = "dropping a ChildGuard releases the child immediately"]
+pub struct ChildGuard<'a> {
+    spawner: &'a ManagedAgentSpawner,
+    child: SessionId,
+    armed: bool,
+}
+
+impl ChildGuard<'_> {
+    /// Liefert die ID des gehaltenen Kindes.
+    ///
+    /// # Returns
+    /// Die geliehene [`SessionId`] des Kindes.
+    #[must_use]
+    pub fn child(&self) -> &SessionId {
+        &self.child
+    }
+
+    /// Gibt das Kind jetzt frei und liefert das Ergebnis der Freigabe.
+    ///
+    /// # Returns
+    /// Den letzten [`ChildRecord`] (mit finalem [`ChildStatus`]) oder `None`,
+    /// wenn das Kind schon nicht mehr admittiert war.
+    ///
+    /// # Errors
+    /// Wie [`ManagedAgentSpawner::release_child`]; der In-Memory-Slot ist auch
+    /// im Fehlerfall bereits frei.
+    pub fn release(mut self) -> Result<Option<ChildRecord>, AgentSpawnError> {
+        self.armed = false;
+        self.spawner.release_child(&self.child)
+    }
+
+    /// Entschärft den Guard, ohne das Kind freizugeben.
+    ///
+    /// # Returns
+    /// Die ID des Kindes; der Aufrufer ist ab jetzt selbst für
+    /// [`ManagedAgentSpawner::release_child`] verantwortlich.
+    #[must_use]
+    pub fn keep(mut self) -> SessionId {
+        self.armed = false;
+        self.child.clone()
+    }
+}
+
+impl Drop for ChildGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match self.spawner.release_child(&self.child) {
+            Ok(record) => tracing::debug!(
+                child = %self.child,
+                status = record.as_ref().map(|record| record.status.as_str()),
+                "child_guard.released",
+            ),
+            Err(error) => tracing::warn!(
+                child = %self.child,
+                error = %error,
+                "child_guard.release_failed",
+            ),
+        }
+    }
+}
+
+impl std::fmt::Debug for ChildGuard<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChildGuard")
+            .field("child", &self.child)
+            .field("armed", &self.armed)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Wie eine während eines Turns entnommene Session zurückgegeben wurde.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionReturn {
+    /// Wieder im Manager.
+    Restored,
+    /// Verworfen, weil das Kind während des Laufs freigegeben wurde.
+    Discarded,
+}
+
+/// Drop-Guard um eine für einen Kind-Turn entnommene Session.
+///
+/// Wird das Lauf-Future gedroppt (Eltern-Abbruch, Op-Timeout), markiert `Drop`
+/// die Session als gescheitert, bricht den Kind-Token ab und legt sie zurück —
+/// statt sie wie früher zu verlieren.
+struct RunningSession<'a> {
+    spawner: &'a ManagedAgentSpawner,
+    child: SessionId,
+    session: Option<AgentSession>,
+}
+
+impl RunningSession<'_> {
+    fn session_mut(&mut self) -> Result<&mut AgentSession, AgentSpawnError> {
+        let child = &self.child;
+        self.session.as_mut().ok_or_else(|| {
+            ManagedAgentSpawner::reject(format!("child session {child} was already returned"))
+        })
+    }
+
+    fn fail_session(&mut self, reason: &str) {
+        if let Some(session) = self.session.as_mut() {
+            session.fail(reason.to_owned());
+        }
+    }
+
+    fn finish(mut self) -> Result<SessionReturn, AgentSpawnError> {
+        let session = self.session.take().ok_or_else(|| {
+            ManagedAgentSpawner::reject(format!(
+                "child session {} was already returned",
+                self.child
+            ))
+        })?;
+        self.spawner.return_session(session)
+    }
+}
+
+impl Drop for RunningSession<'_> {
+    fn drop(&mut self) {
+        let Some(mut session) = self.session.take() else {
+            return;
+        };
+        session.fail("child run was dropped before its turn completed".to_owned());
+        if let Some(token) = self.spawner.child_cancel_token(&self.child) {
+            token.cancel(CancelReason::Parent);
+        }
+        self.spawner.set_status(&self.child, ChildStatus::Cancelled);
+        if let Err(error) = self.spawner.return_session(session) {
+            tracing::warn!(
+                child = %self.child,
+                error = %error,
+                "child_run.drop_return_failed",
+            );
+        }
+    }
+}
+
+/// Cancel-Token eines Elternteils, der selbst kein admittiertes Kind ist.
+#[derive(Debug, Clone)]
+struct ParentToken {
+    token: CancelToken,
+    /// `true`, wenn der Aufrufer den Token ausdrücklich registriert hat
+    /// ([`ManagedAgentSpawner::register_parent_cancel_token`]); solche
+    /// Elternteile gelten für den Reaper als lebendig.
+    registered: bool,
 }
 
 /// Supplies a fresh, role-specific extension registry for an admitted child.
@@ -499,10 +793,17 @@ pub struct ManagedAgentSpawner {
     /// apparently healthy, untracked child session after its parent has been
     /// resumed with the expiry failure.
     expired: Mutex<BTreeMap<String, ExpiredChild>>,
-    /// Per-child cooperative cancellation channels. Lease reaping signals the
-    /// receiver held by `run_child`, which drops the in-flight core future and
-    /// prevents further model/tool dispatch for that child turn.
-    cancellations: Mutex<BTreeMap<String, watch::Sender<bool>>>,
+    /// Per-child hierarchical cancellation tokens (C-CANCEL). Each is derived
+    /// from its parent's token via [`CancelToken::child`]; `run_child` selects
+    /// on it, and lease reaping, budgets, `/agent stop` and parent cancellation
+    /// all cancel through it. Cancellation is terminal for the child.
+    cancellations: Mutex<BTreeMap<String, CancelToken>>,
+    /// Tokens of parents that are not themselves admitted children (roots).
+    /// Registered explicitly or created lazily at the first admission.
+    parent_tokens: Mutex<BTreeMap<String, ParentToken>>,
+    /// Children released while a turn held their session. The returning run
+    /// discards the session instead of restoring an untracked child.
+    released: Mutex<BTreeSet<String>>,
     /// Optional durable lease ledger. When present, production runtimes use
     /// `reap_expired_durable`/`reconcile_expired_leases` rather than the
     /// compatibility in-memory reaper.
@@ -520,6 +821,8 @@ impl ManagedAgentSpawner {
             active: Mutex::new(BTreeMap::new()),
             expired: Mutex::new(BTreeMap::new()),
             cancellations: Mutex::new(BTreeMap::new()),
+            parent_tokens: Mutex::new(BTreeMap::new()),
+            released: Mutex::new(BTreeSet::new()),
             lease_store: None,
         }
     }
@@ -615,24 +918,26 @@ impl ManagedAgentSpawner {
         self
     }
 
-    /// Removes an admitted child after the runtime has durably recorded and
-    /// delivered its terminal result. Unknown IDs are ignored so recovery can
-    /// reconcile an already-closed record idempotently.
+    /// Releases an admitted child in memory (compatibility entry point for
+    /// [`AgentSpawner::child_finished`]). Unknown IDs are ignored so recovery
+    /// can reconcile an already-closed record idempotently.
+    ///
+    /// Since A-CHILD this is a full in-memory release: slot, cancel token
+    /// (cancelled), tombstones and the child session in the manager. Lock
+    /// failures are logged; use [`Self::release_child`] to observe them.
     pub fn close_child(&self, child: &SessionId) {
-        if let Ok(mut active) = self.active.lock() {
-            active.remove(child.as_str());
-        }
-        if let Ok(mut expired) = self.expired.lock() {
-            expired.remove(child.as_str());
-        }
-        if let Ok(mut cancellations) = self.cancellations.lock() {
-            cancellations.remove(child.as_str());
+        if let Err(error) = self.release_in_memory(child) {
+            tracing::warn!(child = %child, error = %error, "child_close.release_failed");
         }
     }
 
     /// Marks the lease completed before releasing in-memory admission state.
     /// Call this only after the child's terminal result has been durably
     /// delivered to its parent.
+    ///
+    /// # Errors
+    /// [`AgentSpawnError`] when the durable completion fails (nothing is
+    /// released then, so a retry is possible) or an in-memory lock is poisoned.
     pub fn close_child_durable(
         &self,
         child: &SessionId,
@@ -643,8 +948,450 @@ impl ManagedAgentSpawner {
                 Self::reject(format!("could not complete child lease: {error}"))
             })?;
         }
-        self.close_child(child);
+        self.release_in_memory(child).map(|_| ())
+    }
+
+    /// Gibt ein admittiertes Kind vollständig frei.
+    ///
+    /// # Description
+    /// A-CHILD (F-072, G-016). In dieser Reihenfolge, jeweils mit kurzer,
+    /// einzeln genommener Sperre:
+    /// 1. Record aus `active` entfernen — der Slot ist ab hier frei;
+    /// 2. Lease-Tombstone entfernen;
+    /// 3. Kind-Token entfernen und abbrechen ([`CancelReason::Parent`]) — ein
+    ///    noch laufender Turn und alle Nachkommen brechen ab;
+    /// 4. Session aus dem [`SessionManager`] entfernen. Hält gerade ein Turn die
+    ///    Session, wird ein Freigabe-Tombstone gesetzt; der zurückkehrende Lauf
+    ///    verwirft die Session dann, statt sie wiederherzustellen;
+    /// 5. mit Lease-Store: den durablen Lease schließen (`complete`). Der
+    ///    Store kennt noch keinen Abschlussstatus; der finale
+    ///    [`ChildStatus`] steht im zurückgegebenen Record und im Log.
+    ///
+    /// Idempotent: ein zweiter Aufruf liefert `Ok(None)`.
+    ///
+    /// # Arguments
+    /// - `child` (`&SessionId`): das freizugebende Kind.
+    ///
+    /// # Returns
+    /// `Ok(Some(record))` mit dem letzten Record (inkl. Status), `Ok(None)`,
+    /// wenn das Kind nicht (mehr) admittiert war.
+    ///
+    /// # Errors
+    /// - [`AgentSpawnError`], wenn eine Sperre vergiftet ist (bereits
+    ///   abgeschlossene Schritte bleiben wirksam).
+    /// - [`AgentSpawnError`], wenn der durable Lease nicht geschlossen werden
+    ///   konnte; der In-Memory-Slot ist dann trotzdem frei, der Lease wird
+    ///   später vom Reconcile als abgelaufen eingesammelt.
+    ///
+    /// # Concurrency
+    /// Nimmt nie zwei Sperren außer `manager` ⊃ `released`; darf aus `Drop`
+    /// und parallel zu laufenden Turns gerufen werden.
+    ///
+    /// # Examples
+    /// ```rust,no_run
+    /// # fn demo(spawner: &harw_core::ManagedAgentSpawner, child: harw_types::SessionId) {
+    /// let released = spawner.release_child(&child);
+    /// # let _ = released;
+    /// # }
+    /// ```
+    pub fn release_child(&self, child: &SessionId) -> Result<Option<ChildRecord>, AgentSpawnError> {
+        let record = self.release_in_memory(child)?;
+        if let (Some(lease_store), Some(record)) = (&self.lease_store, record.as_ref()) {
+            lease_store.complete(child, Timestamp::now()).map_err(|error| {
+                Self::reject(format!(
+                    "child {child} was released but its durable lease could not be closed: {error}"
+                ))
+            })?;
+            tracing::info!(child = %child, status = record.status.as_str(), "child_release.lease_closed");
+        }
+        Ok(record)
+    }
+
+    /// Nimmt ein bereits admittiertes Kind in einen [`ChildGuard`].
+    ///
+    /// # Arguments
+    /// - `child` (`SessionId`): das admittierte Kind (wird verschoben).
+    ///
+    /// # Returns
+    /// Einen scharfen Guard; sein `Drop` ruft [`Self::release_child`].
+    pub fn guard_child(&self, child: SessionId) -> ChildGuard<'_> {
+        ChildGuard {
+            spawner: self,
+            child,
+            armed: true,
+        }
+    }
+
+    /// Admittiert ein Kind und liefert es direkt in einem [`ChildGuard`].
+    ///
+    /// # Description
+    /// Dieselbe Admission wie [`AgentSpawner::spawn_child`], aber ohne
+    /// Zeitfenster, in dem ein admittiertes Kind ungeschützt wäre.
+    ///
+    /// # Arguments
+    /// - `role` (`&str`): registrierter Rollenname.
+    /// - `input` (`SpawnInput`): Eltern-Korrelation und Kontextwunsch.
+    /// - `sandbox` (`SandboxSpec`): bereits reduzierte Kind-Sandbox.
+    /// - `suggestions` (`Option<AgentSuggestions>`): beratende Vorschläge.
+    ///
+    /// # Returns
+    /// Den Guard des neuen Kindes.
+    ///
+    /// # Errors
+    /// Jede Ablehnung der Admission (Rolle, Matrix, Sandbox, Decke, Tiefe,
+    /// Deckel, abgebrochener Elternteil, Registry-Fehler, Lease-Store).
+    pub fn spawn_child_guarded(
+        &self,
+        role: &str,
+        input: SpawnInput,
+        sandbox: SandboxSpec,
+        suggestions: Option<AgentSuggestions>,
+    ) -> Result<ChildGuard<'_>, AgentSpawnError> {
+        self.admit(role, input, sandbox, suggestions)
+            .map(|child| self.guard_child(child))
+    }
+
+    /// Liefert den aktuellen [`ChildStatus`] eines admittierten Kindes.
+    ///
+    /// # Returns
+    /// `Some(status)` solange das Kind admittiert ist, sonst `None`.
+    #[must_use]
+    pub fn child_status(&self, child: &SessionId) -> Option<ChildStatus> {
+        self.child_record(child).map(|record| record.status)
+    }
+
+    /// Liefert den Cancel-Token eines admittierten Kindes.
+    ///
+    /// # Description
+    /// Der Token ist bei der Admission als `parent_token.child()` entstanden.
+    /// Aufrufer können ihn z. B. an den Turn-Loop weiterreichen.
+    ///
+    /// # Returns
+    /// Einen Klon (teilt den Knoten) oder `None`, wenn das Kind nicht bekannt ist.
+    #[must_use]
+    pub fn child_cancel_token(&self, child: &SessionId) -> Option<CancelToken> {
+        self.cancellations
+            .lock()
+            .ok()
+            .and_then(|tokens| tokens.get(child.as_str()).cloned())
+    }
+
+    /// Registriert den Cancel-Token eines Elternteils, der kein admittiertes Kind ist.
+    ///
+    /// # Description
+    /// A-CHILD. Kinder, die **danach** unter `parent` admittiert werden, erhalten
+    /// `token.child()`; `token.cancel(..)` bricht sie samt Nachkommen ab. Ein
+    /// ersetzter Token wirkt nicht rückwirkend auf bereits admittierte Kinder.
+    /// Registrierte Elternteile gelten für den Reaper als lebendig, auch wenn
+    /// sie nicht im Manager liegen (TUI-/CLI-Wurzeln).
+    ///
+    /// # Arguments
+    /// - `parent` (`&SessionId`): Wurzel- oder externe Elternsitzung.
+    /// - `token` (`CancelToken`): deren Abbruch-Token.
+    ///
+    /// # Errors
+    /// [`AgentSpawnError`], wenn `parent` selbst ein admittiertes Kind ist
+    /// (dessen Token ist controller-eigen) oder eine Sperre vergiftet ist.
+    pub fn register_parent_cancel_token(
+        &self,
+        parent: &SessionId,
+        token: CancelToken,
+    ) -> Result<(), AgentSpawnError> {
+        let is_child = self
+            .cancellations
+            .lock()
+            .map_err(|_| Self::reject("child cancellation registry lock is poisoned"))?
+            .contains_key(parent.as_str());
+        if is_child {
+            return Err(Self::reject(format!(
+                "session {parent} is an admitted child; its cancel token is derived from its parent"
+            )));
+        }
+        self.parent_tokens
+            .lock()
+            .map_err(|_| Self::reject("parent cancellation registry lock is poisoned"))?
+            .insert(
+                parent.as_str().to_owned(),
+                ParentToken {
+                    token,
+                    registered: true,
+                },
+            );
         Ok(())
+    }
+
+    /// Räumt verwaiste, abgebrochene und abgelaufene Kinder ab.
+    ///
+    /// # Description
+    /// A-CHILD, für periodische Aufrufer (Runtime-Tick). Zuerst werden
+    /// abgelaufene Leases eingesammelt ([`Self::reap_expired_durable`], Kinder
+    /// werden abgebrochen und ihre Sessions als gescheitert markiert), dann
+    /// gibt der Lauf frei:
+    /// - verwaiste Kinder (Elternteil weder im Manager, noch admittiertes Kind,
+    ///   noch externe Wurzel, noch registrierter Elternteil),
+    /// - Kinder mit abgebrochenem Token, deren Turn nicht mehr läuft,
+    /// - abgelaufene Kinder, deren Session wieder im Manager liegt.
+    ///
+    /// Abgeschlossene, pausierte oder gescheiterte Kinder mit lebendem
+    /// Elternteil bleiben stehen: ihr Ergebnis kann noch ausgewertet werden;
+    /// sie gibt der [`ChildGuard`] bzw. [`Self::release_child`] frei.
+    ///
+    /// # Arguments
+    /// - `now` (`Timestamp`): Referenzzeit für den Lease-Ablauf.
+    ///
+    /// # Returns
+    /// Einen [`ReapReport`]; `expired` muss der Aufrufer an die Elternteile zustellen.
+    ///
+    /// # Errors
+    /// [`AgentSpawnError`], wenn der durable Reaper scheitert oder eine Sperre
+    /// vergiftet ist.
+    ///
+    /// # Concurrency
+    /// Nimmt nur Schnappschüsse unter kurzen Sperren; sicher parallel zu Admission und Fan-out.
+    pub fn reap(&self, now: Timestamp) -> Result<ReapReport, AgentSpawnError> {
+        let expired = self.reap_expired_durable(now)?;
+        let released = self.release_reapable()?;
+        if !expired.is_empty() || !released.is_empty() {
+            tracing::info!(
+                expired = expired.len(),
+                released = released.len(),
+                "child_reaper.pass",
+            );
+        }
+        Ok(ReapReport { expired, released })
+    }
+
+    /// Gibt alle Kinder frei, die ohne Ergebnisverlust freigegeben werden dürfen.
+    fn release_reapable(&self) -> Result<Vec<SessionId>, AgentSpawnError> {
+        let records: Vec<(SessionId, SessionId, ChildStatus)> = self
+            .active
+            .lock()
+            .map_err(|_| Self::reject("child registry lock is poisoned"))?
+            .values()
+            .map(|record| (record.child.clone(), record.parent.clone(), record.status))
+            .collect();
+        let tombstones: Vec<SessionId> = self
+            .expired
+            .lock()
+            .map_err(|_| Self::reject("expired-child registry lock is poisoned"))?
+            .values()
+            .map(|expired| expired.child.clone())
+            .collect();
+        let cancelled: BTreeSet<String> = self
+            .cancellations
+            .lock()
+            .map_err(|_| Self::reject("child cancellation registry lock is poisoned"))?
+            .iter()
+            .filter(|(_, token)| token.is_cancelled())
+            .map(|(id, _)| id.clone())
+            .collect();
+        let registered_parents: BTreeSet<String> = self
+            .parent_tokens
+            .lock()
+            .map_err(|_| Self::reject("parent cancellation registry lock is poisoned"))?
+            .iter()
+            .filter(|(_, parent)| parent.registered)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let active_ids: BTreeSet<&str> = records.iter().map(|(child, _, _)| child.as_str()).collect();
+
+        let mut candidates: Vec<SessionId> = Vec::new();
+        {
+            let manager = self
+                .manager
+                .lock()
+                .map_err(|_| Self::reject("session manager lock is poisoned"))?;
+            for (child, parent, status) in &records {
+                let parent_alive = manager.contains(parent)
+                    || active_ids.contains(parent.as_str())
+                    || registered_parents.contains(parent.as_str())
+                    || self
+                        .external_root_parent
+                        .as_ref()
+                        .is_some_and(|root| &root.session_id == parent);
+                let idle_cancelled =
+                    cancelled.contains(child.as_str()) && *status != ChildStatus::Running;
+                if !parent_alive || idle_cancelled {
+                    candidates.push(child.clone());
+                }
+            }
+            for child in tombstones {
+                if manager.contains(&child) && !active_ids.contains(child.as_str()) {
+                    candidates.push(child);
+                }
+            }
+        }
+
+        let mut released = Vec::with_capacity(candidates.len());
+        for child in candidates {
+            // Der In-Memory-Slot ist auch bei einem Fehler (etwa beim Schließen
+            // des durablen Leases) bereits frei; der Fehler wird nur gemeldet.
+            if let Err(error) = self.release_child(&child) {
+                tracing::warn!(
+                    child = %child,
+                    error = %error,
+                    "child_reaper.release_incomplete",
+                );
+            }
+            released.push(child);
+        }
+        self.prune_parent_tokens();
+        Ok(released)
+    }
+
+    /// Entfernt lazy angelegte Eltern-Tokens, unter denen nie mehr ein Kind
+    /// admittiert werden kann (Elternteil weg, keine aktiven Kinder).
+    fn prune_parent_tokens(&self) {
+        let parents_in_use: BTreeSet<String> = match self.active.lock() {
+            Ok(active) => active
+                .values()
+                .map(|record| record.parent.as_str().to_owned())
+                .collect(),
+            Err(_) => return,
+        };
+        let lazy: Vec<String> = match self.parent_tokens.lock() {
+            Ok(tokens) => tokens
+                .iter()
+                .filter(|(id, parent)| !parent.registered && !parents_in_use.contains(*id))
+                .map(|(id, _)| id.clone())
+                .collect(),
+            Err(_) => return,
+        };
+        let removable: Vec<String> = match self.manager.lock() {
+            Ok(manager) => lazy
+                .into_iter()
+                .filter(|id| {
+                    !manager.contains(&SessionId::from_str(id.as_str()))
+                        && !self
+                            .external_root_parent
+                            .as_ref()
+                            .is_some_and(|root| root.session_id.as_str() == id)
+                })
+                .collect(),
+            Err(_) => return,
+        };
+        if let Ok(mut tokens) = self.parent_tokens.lock() {
+            for id in removable {
+                tokens.remove(&id);
+            }
+        }
+    }
+
+    /// In-Memory-Teil von [`Self::release_child`].
+    fn release_in_memory(&self, child: &SessionId) -> Result<Option<ChildRecord>, AgentSpawnError> {
+        let record = self
+            .active
+            .lock()
+            .map_err(|_| Self::reject("child registry lock is poisoned"))?
+            .remove(child.as_str());
+        let tombstone = self
+            .expired
+            .lock()
+            .map_err(|_| Self::reject("expired-child registry lock is poisoned"))?
+            .remove(child.as_str());
+        let token = self
+            .cancellations
+            .lock()
+            .map_err(|_| Self::reject("child cancellation registry lock is poisoned"))?
+            .remove(child.as_str());
+        if let Some(token) = token {
+            // Ein freigegebenes Kind darf nicht weiterlaufen; Nachkommen folgen
+            // über den Token-Baum.
+            token.cancel(CancelReason::Parent);
+        }
+        let may_be_running = tombstone.is_some()
+            || record
+                .as_ref()
+                .is_some_and(|record| record.status == ChildStatus::Running);
+        {
+            let mut manager = self
+                .manager
+                .lock()
+                .map_err(|_| Self::reject("session manager lock is poisoned"))?;
+            let removed = manager.remove(child).is_some();
+            if !removed && may_be_running {
+                self.released
+                    .lock()
+                    .map_err(|_| Self::reject("released-child registry lock is poisoned"))?
+                    .insert(child.as_str().to_owned());
+            }
+        }
+        if record.is_some() || tombstone.is_some() {
+            tracing::debug!(
+                child = %child,
+                status = record.as_ref().map(|record| record.status.as_str()),
+                expired = tombstone.is_some(),
+                "child_release.in_memory",
+            );
+        }
+        Ok(record)
+    }
+
+    /// Legt eine für einen Turn entnommene Session zurück oder verwirft sie,
+    /// wenn das Kind während des Laufs freigegeben wurde (`manager` ⊃ `released`).
+    fn return_session(&self, session: AgentSession) -> Result<SessionReturn, AgentSpawnError> {
+        let child = session.id().clone();
+        let mut manager = self
+            .manager
+            .lock()
+            .map_err(|_| Self::reject("session manager lock is poisoned"))?;
+        let released = self
+            .released
+            .lock()
+            .map_err(|_| Self::reject("released-child registry lock is poisoned"))?
+            .remove(child.as_str());
+        if released {
+            drop(manager);
+            tracing::debug!(child = %child, "child_run.session_discarded_after_release");
+            return Ok(SessionReturn::Discarded);
+        }
+        manager
+            .restore(session)
+            .map_err(|error| Self::reject(error.to_string()))?;
+        Ok(SessionReturn::Restored)
+    }
+
+    /// Setzt den Status eines admittierten Kindes (No-op für unbekannte Kinder).
+    fn set_status(&self, child: &SessionId, status: ChildStatus) {
+        match self.active.lock() {
+            Ok(mut active) => {
+                if let Some(record) = active.get_mut(child.as_str()) {
+                    record.status = status;
+                }
+            }
+            Err(_) => tracing::warn!(
+                child = %child,
+                status = status.as_str(),
+                "child_status.lock_poisoned",
+            ),
+        }
+    }
+
+    /// Markiert ein Kind als laufend; lehnt einen zweiten parallelen Lauf ab.
+    fn mark_running(&self, child: &SessionId) -> Result<ChildStatus, AgentSpawnError> {
+        let mut active = self
+            .active
+            .lock()
+            .map_err(|_| Self::reject("child registry lock is poisoned"))?;
+        let record = active
+            .get_mut(child.as_str())
+            .ok_or_else(|| Self::reject(format!("child {child} is not admitted")))?;
+        match record.status {
+            ChildStatus::Running => Err(Self::reject(format!("child {child} is already running"))),
+            ChildStatus::Cancelled => Err(Self::reject(format!(
+                "child {child} was cancelled and cannot run again"
+            ))),
+            previous => {
+                record.status = ChildStatus::Running;
+                Ok(previous)
+            }
+        }
+    }
+
+    fn cancelled_error(child: &SessionId, reason: Option<CancelReason>) -> AgentSpawnError {
+        Self::reject(format!(
+            "child {child} was cancelled before its turn completed (reason: {reason:?})"
+        ))
     }
 
     #[must_use]
@@ -769,23 +1516,55 @@ impl ManagedAgentSpawner {
     /// [`Self::close_child`] to release the admission slot once the parent
     /// has consumed the cancellation result.
     ///
+    /// Since A-CHILD the signal is the child's [`CancelToken`] (reason
+    /// [`CancelReason::User`]); it also cancels every descendant. Cancellation
+    /// is terminal: the child is never run again and the reaper
+    /// ([`Self::reap`], or admission at the parent's limit) releases it once
+    /// its turn has unwound.
+    ///
     /// # Returns
     /// `true` when `child` is currently admitted and has a live cancellation
-    /// channel to signal; `false` when `child` is unknown or has already
-    /// completed, so the caller can report that no running turn was found.
+    /// token to signal; `false` when `child` is unknown or already released,
+    /// so the caller can report that no running turn was found.
     pub fn request_cancellation(&self, child: &SessionId) -> bool {
+        self.request_cancellation_with_reason(child, CancelReason::User)
+    }
+
+    /// Wie [`Self::request_cancellation`], aber mit explizitem [`CancelReason`].
+    ///
+    /// # Description
+    /// Budget-Abbrüche nutzen [`CancelReason::Budget`], die AnyTerminal-Welle
+    /// [`CancelReason::Parent`] (der Orchestrator bricht Geschwister ab). Ein
+    /// nicht laufendes, noch nicht abgeschlossenes Kind (`Admitted`/`Paused`)
+    /// wechselt sofort auf [`ChildStatus::Cancelled`]; ein laufendes Kind
+    /// bekommt den Status, sobald sein Turn den Abbruch sieht. `Completed`
+    /// bleibt `Completed` — das Ergebnis war echt.
+    ///
+    /// # Arguments
+    /// - `child` (`&SessionId`): das Kind.
+    /// - `reason` (`CancelReason`): der Abbruchgrund (erster Grund gewinnt).
+    ///
+    /// # Returns
+    /// `true`, wenn ein Token abgebrochen wurde.
+    ///
+    /// # Concurrency
+    /// Kurze, nacheinander genommene Sperren; idempotent.
+    pub fn request_cancellation_with_reason(&self, child: &SessionId, reason: CancelReason) -> bool {
         if self.child_record(child).is_none() {
             return false;
         }
-        self.cancellations
-            .lock()
-            .ok()
-            .and_then(|cancellations| cancellations.get(child.as_str()).cloned())
-            .map(|cancel| {
-                cancel.send_replace(true);
-                true
-            })
-            .unwrap_or(false)
+        let Some(token) = self.child_cancel_token(child) else {
+            return false;
+        };
+        token.cancel(reason);
+        if let Ok(mut active) = self.active.lock() {
+            if let Some(record) = active.get_mut(child.as_str()) {
+                if matches!(record.status, ChildStatus::Admitted | ChildStatus::Paused) {
+                    record.status = ChildStatus::Cancelled;
+                }
+            }
+        }
+        true
     }
 
     /// Reaps admitted children whose lease has elapsed. It releases their
@@ -870,8 +1649,8 @@ impl ManagedAgentSpawner {
         }
         if let Ok(cancellations) = self.cancellations.lock() {
             for record in expired {
-                if let Some(cancel) = cancellations.get(record.child.as_str()) {
-                    cancel.send_replace(true);
+                if let Some(token) = cancellations.get(record.child.as_str()) {
+                    token.cancel(CancelReason::LeaseLost);
                 }
             }
         }
@@ -988,13 +1767,22 @@ impl ManagedAgentSpawner {
                 match timed {
                     Ok(outcome) => outcome,
                     Err(_elapsed) => {
-                        if !self.request_cancellation(child) {
+                        if self.request_cancellation_with_reason(child, CancelReason::Budget) {
+                            // Der Turn sieht den Abbruch und legt die Session
+                            // regulär zurück; sein Ergebnis ist bedeutungslos.
+                            let _discarded = turn.await;
+                        } else {
+                            // Kein Token mehr (Kind bereits freigegeben): nicht
+                            // unbegrenzt warten. Das Droppen ist sicher, weil
+                            // der `RunningSession`-Guard die Session zurücklegt
+                            // bzw. verwirft.
                             tracing::warn!(
                                 child = %child,
-                                "child_budget.cancel_channel_missing",
+                                "child_budget.cancel_token_missing",
                             );
+                            drop(turn);
                         }
-                        let _discarded = turn.await;
+                        self.set_status(child, ChildStatus::Failed);
                         let used_ms =
                             u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                         tracing::warn!(
@@ -1019,6 +1807,7 @@ impl ManagedAgentSpawner {
         if let Some(limit) = budget.max_tool_calls {
             let used = self.child_tool_call_count(child)?;
             if used > limit {
+                self.set_status(child, ChildStatus::Failed);
                 tracing::warn!(
                     child = %child,
                     dimension = BudgetDimension::ToolCalls.as_str(),
@@ -1036,6 +1825,7 @@ impl ManagedAgentSpawner {
         if let Some(limit) = budget.max_tokens {
             let used = self.child_token_usage(child)?;
             if used > limit {
+                self.set_status(child, ChildStatus::Failed);
                 tracing::warn!(
                     child = %child,
                     dimension = BudgetDimension::Tokens.as_str(),
@@ -1083,13 +1873,20 @@ impl ManagedAgentSpawner {
     ///   Kindern.
     /// - Verschiedene Kinder berühren disjunkte `BTreeMap`-Einträge; eine
     ///   Reihenfolgeabhängigkeit zwischen ihnen existiert nicht.
-    /// - Verschachtelt gehalten werden Locks nur in `admit`
-    ///   (`manager` ⊃ `active` ⊃ `cancellations`, immer in dieser Richtung);
-    ///   alle übrigen Pfade nehmen ihre Sperren nacheinander. Damit gibt es
-    ///   keine Inversion und keinen Deadlock zwischen Fan-out und Admission.
+    /// - Verschachtelt gehalten wird nur `manager` ⊃ `released` (Rückgabe
+    ///   einer Session), immer in dieser Richtung; alle übrigen Pfade nehmen
+    ///   ihre Sperren nacheinander. `admit` selbst hält `active` und
+    ///   `cancellations` durchgehend bis zum Eintrag des Kindes (siehe die
+    ///   Moduldoku „Nebenläufigkeit"), verschachtelt sie dabei aber mit
+    ///   keiner weiteren Sperre dieser Methode. Damit gibt es keine Inversion
+    ///   und keinen Deadlock zwischen Fan-out und Admission.
+    /// - Wird ein Kind-Future gedroppt, legt ein Drop-Guard die Session als
+    ///   gescheitert zurück (A-CHILD) — sie geht nicht mehr verloren.
     ///
     /// ## Join-Semantik
-    /// - [`JoinSemantics::AnyTerminal`]: Sobald ein Kind `Ok` liefert, wird für
+    /// - [`JoinSemantics::AnyTerminal`]: Sobald ein Kind `Ok` mit
+    ///   `TurnOutcome::Completed` liefert (F-182: eine zulässige Pause gewinnt
+    ///   nicht), wird für
     ///   alle noch laufenden Geschwister [`Self::request_cancellation`]
     ///   gerufen; ihre Ergebnisse — und die noch nicht gestarteten — werden als
     ///   `Err("cancelled: sibling completed first")` markiert. Ein Geschwister,
@@ -1187,10 +1984,20 @@ impl ManagedAgentSpawner {
             } else {
                 value
             };
-            if !winner_decided && matches!(join, JoinSemantics::AnyTerminal) && value.is_ok() {
+            // F-182: nur ein echt abgeschlossenes Kind gewinnt die Welle. Ein
+            // zulässig pausiertes Ergebnis ist zwar `Ok`, aber kein Endergebnis
+            // und darf die Geschwister nicht abbrechen.
+            let completed = matches!(
+                &value,
+                Ok(ChildRunResult {
+                    outcome: TurnOutcome::Completed,
+                    ..
+                })
+            );
+            if !winner_decided && matches!(join, JoinSemantics::AnyTerminal) && completed {
                 winner_decided = true;
                 for (_, sibling, _) in &running {
-                    if !self.request_cancellation(sibling) {
+                    if !self.request_cancellation_with_reason(sibling, CancelReason::Parent) {
                         tracing::warn!(
                             child = %sibling,
                             "child_fanout.cancel_channel_missing",
@@ -1294,32 +2101,49 @@ impl ManagedAgentSpawner {
             .registry_factory
             .clone();
         let model = factory.model_for(&record.role)?;
-        let mut cancellation = self
-            .cancellations
-            .lock()
-            .map_err(|_| Self::reject("child cancellation registry lock is poisoned"))?
-            .get(child.as_str())
-            .cloned()
-            .ok_or_else(|| Self::reject(format!("child {child} has no cancellation channel")))?
-            .subscribe();
-        let mut session = self
-            .manager
-            .lock()
-            .map_err(|_| Self::reject("session manager lock is poisoned"))?
-            .remove(child)
-            .ok_or_else(|| Self::reject(format!("child session {child} is not available")))?;
+        let token = self
+            .child_cancel_token(child)
+            .ok_or_else(|| Self::reject(format!("child {child} has no cancellation token")))?;
+        // Cancel ist terminal (F-182): ein abgebrochenes Kind wird nicht erneut
+        // gestartet, sondern sofort abgewiesen und später vom Reaper freigegeben.
+        if token.is_cancelled() {
+            self.set_status(child, ChildStatus::Cancelled);
+            return Err(Self::cancelled_error(child, token.reason()));
+        }
+        // Erst `Running` markieren (unter `active`), dann die Session entnehmen:
+        // `release_in_memory` liest den Status in derselben Reihenfolge und setzt
+        // nur dann einen Freigabe-Tombstone, wenn ein Lauf die Session halten kann.
+        let previous_status = self.mark_running(child)?;
+        let session = match self.manager.lock() {
+            Ok(mut manager) => manager.remove(child),
+            Err(_) => {
+                self.set_status(child, previous_status);
+                return Err(Self::reject("session manager lock is poisoned"));
+            }
+        };
+        let Some(session) = session else {
+            self.set_status(child, previous_status);
+            return Err(Self::reject(format!("child session {child} is not available")));
+        };
+        let mut running = RunningSession {
+            spawner: self,
+            child: child.clone(),
+            session: Some(session),
+        };
 
-        let outcome = tokio::select! {
-            () = wait_for_child_cancellation(&mut cancellation) => Err(Self::reject(format!(
-                "child {child} was cancelled before its turn completed"
-            ))),
-            outcome = async {
-                match approvals {
-                    Some(approvals) => run_turn_durable(&mut session, model.as_ref(), store, approvals, input).await,
-                    None => run_turn(&mut session, model.as_ref(), store, input).await,
-                }
-                .map_err(|error| Self::reject(error.to_string()))
-            } => outcome,
+        let turn = {
+            let session = running.session_mut()?;
+            tokio::select! {
+                biased;
+                () = token.cancelled() => Err(Self::cancelled_error(child, token.reason())),
+                outcome = async {
+                    match approvals {
+                        Some(approvals) => run_turn_durable(session, model.as_ref(), store, approvals, input).await,
+                        None => run_turn(session, model.as_ref(), store, input).await,
+                    }
+                    .map_err(|error| Self::reject(error.to_string()))
+                } => outcome,
+            }
         };
         let expired = self
             .expired
@@ -1328,22 +2152,34 @@ impl ManagedAgentSpawner {
             .get(child.as_str())
             .cloned();
         if expired.is_some() {
-            session.fail("child lease expired while its turn was still running".to_owned());
+            running.fail_session("child lease expired while its turn was still running");
         }
-        let restore = self
-            .manager
-            .lock()
-            .map_err(|_| Self::reject("session manager lock is poisoned"))?
-            .restore(session)
-            .map_err(|error| Self::reject(error.to_string()));
-        restore?;
+        let returned = running.finish()?;
         if let Some(expired) = expired {
             return Err(Self::reject(format!(
                 "child {child} completed after lease expiry at {}; result discarded",
                 expired.expired_at
             )));
         }
-        let outcome = outcome?;
+        if returned == SessionReturn::Discarded {
+            return Err(Self::reject(format!(
+                "child {child} was released while its turn was running; result discarded"
+            )));
+        }
+        let outcome = match turn {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                // Nur echter Abschluss ist `Completed`: Abbruch und Fehler
+                // werden unterschieden und nie als Erfolg verbucht.
+                let status = if token.is_cancelled() {
+                    ChildStatus::Cancelled
+                } else {
+                    ChildStatus::Failed
+                };
+                self.set_status(child, status);
+                return Err(error);
+            }
+        };
         // W2-19, fail-closed: ein Kind, dessen Lebenszyklus das Pausieren
         // verbietet, hat keinen Kanal, über den eine Freigabe je eintreffen
         // könnte. Die Session ist zu diesem Zeitpunkt bereits regulär
@@ -1352,13 +2188,26 @@ impl ManagedAgentSpawner {
         // `outcome` endet, bevor der Erfolgsarm es in das Ergebnis verschiebt.
         let pause_label = Self::pause_label(&outcome);
         match pause_label {
-            Some(label) if !record.allow_pause => Err(Self::reject(format!(
-                "child paused but its lifecycle forbids pausing: {label}"
-            ))),
-            _ => Ok(ChildRunResult {
-                child: child.clone(),
-                outcome,
-            }),
+            Some(label) if !record.allow_pause => {
+                self.set_status(child, ChildStatus::Failed);
+                Err(Self::reject(format!(
+                    "child paused but its lifecycle forbids pausing: {label}"
+                )))
+            }
+            Some(_) => {
+                self.set_status(child, ChildStatus::Paused);
+                Ok(ChildRunResult {
+                    child: child.clone(),
+                    outcome,
+                })
+            }
+            None => {
+                self.set_status(child, ChildStatus::Completed);
+                Ok(ChildRunResult {
+                    child: child.clone(),
+                    outcome,
+                })
+            }
         }
     }
 
@@ -1459,6 +2308,10 @@ impl ManagedAgentSpawner {
             TurnOutcome::Completed => None,
             TurnOutcome::AwaitingChild { .. } => Some("awaiting_child"),
             TurnOutcome::AwaitingApproval { .. } => Some("awaiting_approval"),
+            TurnOutcome::Cancelled { .. } => None,
+            TurnOutcome::Truncated => None,
+            TurnOutcome::Refused { .. } => None,
+            TurnOutcome::Failed { .. } => None,
         }
     }
 
@@ -1913,6 +2766,7 @@ impl ManagedAgentSpawner {
             allow_pause,
             depth_ceiling: child_depth_ceiling,
             trace: child_trace,
+            status: ChildStatus::Admitted,
         };
         if let Some(lease_store) = &self.lease_store {
             if let Err(error) = lease_store.admit(&record.durable_lease()) {
@@ -1922,9 +2776,33 @@ impl ManagedAgentSpawner {
                 )));
             }
         }
+        // A-CHILD: das Kind erbt einen von seinem Elternteil abgeleiteten
+        // Token (`CancelToken::child`), nicht einen unabhängigen — ein
+        // Eltern-Abbruch muss das Kind samt Nachkommen erreichen (siehe
+        // Moduldoku Z. 27-28). `cancellations` ist hier schon gesperrt
+        // (oben), daher der direkte Blick in die Map statt eines erneuten
+        // `child_cancel_token`-Aufrufs (der dieselbe Sperre erneut nähme).
+        // Der Elternschlüssel wird vor dem Verschieben von `record` in
+        // `active` geklont, da `record` danach nicht mehr lesbar ist.
+        let parent_key = record.parent.as_str().to_owned();
         active.insert(child.as_str().to_owned(), record);
-        let (cancel, _receiver) = watch::channel(false);
-        cancellations.insert(child.as_str().to_owned(), cancel);
+        let child_cancel = if let Some(parent_token) = cancellations.get(&parent_key) {
+            parent_token.child()
+        } else {
+            let mut parent_tokens = self
+                .parent_tokens
+                .lock()
+                .map_err(|_| Self::reject("parent cancellation registry lock is poisoned"))?;
+            parent_tokens
+                .entry(parent_key)
+                .or_insert_with(|| ParentToken {
+                    token: CancelToken::new(),
+                    registered: false,
+                })
+                .token
+                .child()
+        };
+        cancellations.insert(child.as_str().to_owned(), child_cancel);
         Ok(child)
     }
 }
@@ -2107,6 +2985,7 @@ mod tests {
                         arguments: serde_json::Value::Null,
                     }],
                     usage: TokenUsage::default(),
+                    ..Default::default()
                 })
             })
         }
@@ -2308,6 +3187,7 @@ specialization = "child-controller-test"
             allow_pause: false,
             depth_ceiling: ChildLimits::conservative().max_depth,
             trace: None,
+            status: ChildStatus::Admitted,
         };
         if let Some(lease_store) = lease_store {
             lease_store
@@ -2622,14 +3502,14 @@ specialization = "child-controller-test"
                         allow_pause,
                         depth_ceiling: ChildLimits::conservative().max_depth,
                         trace: None,
+                        status: ChildStatus::Admitted,
                     },
                 );
-            let (cancel, _cancel_receiver) = watch::channel(false);
             spawner
                 .cancellations
                 .lock()
                 .expect("test cancellation registry lock")
-                .insert(child.as_str().to_owned(), cancel);
+                .insert(child.as_str().to_owned(), CancelToken::new());
             ids.push(child);
         }
         (spawner, ids)
@@ -4011,6 +4891,7 @@ max_trust = "instruction"
             allow_pause: false,
             depth_ceiling: ChildLimits::conservative().max_depth,
             trace: Some(trace.clone()),
+            status: ChildStatus::Admitted,
         };
 
         let lease = record.durable_lease();

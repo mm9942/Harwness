@@ -2,22 +2,36 @@
 //!
 //! # Verantwortungsbereich
 //! Liest `net/tcp`, `net/tcp6`, `net/udp` und `net/udp6` relativ zu einer
-//! `/proc`-Wurzel und liefert für jede Zeile im Zustand `0A` (siehe
-//! [`parse_listener_line`] für das Spaltenformat) einen [`ListenerRecord`]:
-//! Port und Socket-Inode. Diese Datei kennt **keine** cgroup, keine PID und
-//! keine Verbindungsziele — das ist Aufgabe von [`crate::owner`] bzw. bewusst
-//! nirgends in dieser Crate, siehe Crate-Dokumentation für die
-//! Berechtigungsgrenze.
+//! `/proc`-Wurzel und liefert für jede Zeile im jeweils passenden
+//! "lauschend"-Zustand (siehe [`TCP_LISTEN_STATE`]/[`UDP_UNCONNECTED_STATE`]
+//! und [`parse_listener_line`] für das Spaltenformat) einen
+//! [`ListenerRecord`]: Port und Socket-Inode. Diese Datei kennt **keine**
+//! cgroup, keine PID und keine Verbindungsziele — das ist Aufgabe von
+//! [`crate::owner`] bzw. bewusst nirgends in dieser Crate, siehe
+//! Crate-Dokumentation für die Berechtigungsgrenze.
 //!
-//! # Warum `st == "0A"` über alle vier Tabellen hinweg
-//! `0A` ist der TCP-Zustandscode für `TCP_LISTEN`
-//! (`include/net/tcp_states.h` im Kernel). `/proc/net/udp` und
-//! `/proc/net/udp6` benutzen dieselbe Spaltenposition für einen numerisch
-//! kompatiblen Zustandscode; ein UDP-Socket, der auf eingehenden Verkehr
-//! wartet, ohne verbunden zu sein, erscheint dort nicht immer unter `0A` in
-//! jeder Kernel-Version — diese Crate wertet dennoch einheitlich `0A` über
-//! alle vier Quellen aus, wie in der Spezifikation dieses Knotens (AW2-14)
-//! festgelegt, statt vier verschiedene Zustandsvokabulare zu pflegen.
+//! # F-065-Nachtrag: TCP und UDP brauchen **unterschiedliche** Zustandscodes
+//! Diese Datei behandelte `net/tcp`, `net/tcp6`, `net/udp` und `net/udp6`
+//! ursprünglich einheitlich: nur der Zustandscode `0A` (`TCP_LISTEN`,
+//! `include/net/tcp_states.h`) zählte als „lauschend". Für TCP stimmt das.
+//! Für UDP nicht: der Kernel (`net/ipv4/udp.c`s `udp4_seq_show` /
+//! `get_udp4_sock`) meldet für einen gebundenen, aber nicht per `connect()`
+//! auf einen Peer festgelegten UDP-Socket — **genau der Fall, den ein
+//! Administrator "dieser UDP-Port lauscht" nennen würde** — denselben
+//! numerischen Code wie `TCP_CLOSE` (`07`), **nicht** `TCP_LISTEN` (`0A`).
+//!
+//! Belegt durch eine echte Erhebung auf diesem Raspberry Pi 5
+//! (`harw-dod-fixtures/captures/rpi5-6.18/procnet.json`, Kernel
+//! `6.18.34+rpt-rpi-2712`, 2026-09-13): **jeder** dort erfasste, tatsächlich
+//! gebundene UDP-Socket (z. B. Zeile `sl 118`, Port `0xA2A9`; Zeile `sl 694`,
+//! Port `0x14E9`) trägt den Zustandscode `07`. Keine Zeile in der erfassten
+//! `/proc/net/udp`-Tabelle trägt `0A`. Vor dieser Korrektur las diese Datei
+//! `net/udp`/`net/udp6` zwar strukturell (die vier Tabellen wurden alle
+//! durchlaufen), aber der `0A`-Filter hätte **keinen einzigen** realen
+//! UDP-Listener je bestehen lassen — die UDP-Unterstützung war vorhanden,
+//! aber funktionslos. [`collect_listeners`] wertet TCP-Tabellen deshalb
+//! jetzt gegen [`TCP_LISTEN_STATE`] (`0A`) und UDP-Tabellen gegen
+//! [`UDP_UNCONNECTED_STATE`] (`07`) aus.
 //!
 //! # Nebenläufigkeit
 //! Zustandslose freie Funktionen; `Send + Sync`, von jedem Thread parallel
@@ -27,31 +41,82 @@
 //! [`harw_dod_cap::SensorError::MalformedSource`] für eine Zeile mit zu
 //! wenigen Spalten oder einer nicht hexadezimal lesbaren Adress-/Inode-Form —
 //! **nie** mit dem Zeileninhalt selbst in der Meldung, da
-//! `MalformedSource` keine Nutzdaten trägt. Fehler beim Lesen einer Tabelle
-//! selbst laufen über [`harw_dod_readfs::ReadFsError`] und werden von
-//! [`collect_listeners`] auf [`harw_dod_cap::SensorError`] abgebildet; eine
-//! auf diesem Host fehlende Tabelle (z. B. deaktiviertes IPv6) liefert dabei
-//! keine Treffer, statt den gesamten Abruf scheitern zu lassen.
+//! `MalformedSource` keine Nutzdaten trägt. [`read_table`] liest jede Tabelle
+//! zeilenweise direkt über [`harw_dod_cap::ReadScope::open`] (siehe dortige
+//! Dokumentation für den erschöpfenden Fehlervergleich); eine auf diesem
+//! Host fehlende Tabelle (z. B. deaktiviertes IPv6) liefert dabei keine
+//! Treffer, statt den gesamten Abruf scheitern zu lassen.
+//!
+//! # F-065: warum diese Datei nicht mehr über `harw_dod_readfs::read_lines` liest
+//! Vor dieser Korrektur las [`read_table`] jede Tabelle über
+//! `harw_dod_readfs::read_lines`, das den gesamten Dateiinhalt zunächst als
+//! **eine** `String` puffert, begrenzt durch dessen pauschale
+//! `harw_dod_readfs::MAX_READ_BYTES`-Grenze von 1 MiB. Laut Register-Befund
+//! F-065 reichen rund 7000 gleichzeitig offene Sockets — für einen
+//! unprivilegierten lokalen Nutzer ohne besondere Rechte leicht erreichbar
+//! (`socket()`+`bind()`+`listen()` bis zum eigenen `ulimit`) —, um
+//! `/proc/net/tcp` über diese Grenze zu treiben. Das Ergebnis war nicht
+//! „diese eine Tabelle liefert weniger Treffer", sondern
+//! `ReadFsError::TooLarge` → der **gesamte** Abruf dieses Sensors scheiterte
+//! mit `SensorError::MalformedSource`.
+//!
+//! [`read_table`] öffnet die Tabelle deshalb direkt über
+//! [`harw_dod_cap::ReadScope::open`] und liest sie zeilenweise über
+//! `std::io::BufRead`, mit zwei eigenen, deutlich großzügigeren Grenzen
+//! ([`MAX_TABLE_BYTES`], [`MAX_TABLE_LINES`]) statt der einen pauschalen
+//! 1-MiB-Grenze für beliebige sysfs-/procfs-Inhalte. Ein sehr geschäftiger,
+//! aber legitimer Host bleibt darunter; wird eine der beiden Grenzen
+//! dennoch erreicht, bricht diese Funktion **nicht** den Abruf ab, sondern
+//! wertet die bis dahin gelesenen Zeilen aus — ein Sensor, der unter Last
+//! degradiert meldet, statt vollständig zu verstummen.
 //!
 //! # Examples
 //! ```rust
-//! use harw_dod_listener::procnet::parse_listener_line;
+//! use harw_dod_listener::procnet::{parse_listener_line, TCP_LISTEN_STATE};
 //!
 //! let line = "   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 \
 //!              00000000  1000        0 12345 1 0000000000000000 100 0 0 10 0";
-//! let record = parse_listener_line(line).expect("Zeile ist wohlgeformt").expect("Zustand 0A");
+//! let record = parse_listener_line(line, TCP_LISTEN_STATE)
+//!     .expect("Zeile ist wohlgeformt")
+//!     .expect("Zustand 0A");
 //! assert_eq!(record.port, 8080);
 //! assert_eq!(record.inode, 12345);
 //! ```
 
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 use harw_dod_cap::{ReadScope, SensorError};
 
-/// Der hexadezimale Zustandscode einer `TCP_LISTEN`-Zeile (Kernel:
-/// `include/net/tcp_states.h`), einheitlich über alle vier Tabellen
-/// ausgewertet (siehe Modul-Dokumentation).
-const LISTEN_STATE: &str = "0A";
+/// Obergrenze für die **Gesamtzahl an Bytes**, die aus einer einzelnen
+/// `/proc/net/{tcp,tcp6,udp,udp6}`-Tabelle gelesen werden (F-065). Deutlich
+/// höher als die frühere pauschale 1-MiB-Grenze aus
+/// `harw_dod_readfs::read_lines`, aber weiterhin endlich: kein Sensor liest
+/// je unbegrenzt viele Bytes von einer einzelnen Quelle. 16 MiB reichen für
+/// weit über 100 000 gleichzeitig offene Sockets (eine Zeile ist rund
+/// 150 Byte lang, siehe [`parse_listener_line`]s Format-Dokumentation) — ein
+/// Vielfaches der ~7000 Sockets, mit denen F-065 den vorherigen Sensor zum
+/// vollständigen Ausfall bringen konnte.
+const MAX_TABLE_BYTES: u64 = 16 << 20;
+
+/// Obergrenze für die **Zeilenzahl**, die aus einer einzelnen Tabelle
+/// ausgewertet wird (F-065). Ergänzt [`MAX_TABLE_BYTES`]: verhindert, dass
+/// eine Tabelle mit vielen sehr kurzen Zeilen die CPU-Zeit dieses Sensors
+/// unbegrenzt beansprucht, selbst wenn die Byte-Grenze (noch) nicht erreicht
+/// ist. Wird eine der beiden Grenzen erreicht, bricht [`read_table`] nicht
+/// ab — es wertet die bis dahin gelesenen Zeilen aus.
+const MAX_TABLE_LINES: usize = 200_000;
+
+/// Der hexadezimale Zustandscode einer `TCP_LISTEN`-Zeile in
+/// `/proc/net/{tcp,tcp6}` (Kernel: `include/net/tcp_states.h`).
+pub const TCP_LISTEN_STATE: &str = "0A";
+
+/// Der hexadezimale Zustandscode eines gebundenen, nicht per `connect()`
+/// festgelegten UDP-Sockets in `/proc/net/{udp,udp6}` — des UDP-Äquivalents
+/// eines TCP-Listeners. Siehe Moduldokumentation, Abschnitt
+/// „F-065-Nachtrag", für die Kernel-Quelle und den Nachweis anhand einer
+/// echten Erhebung.
+pub const UDP_UNCONNECTED_STATE: &str = "07";
 
 /// Mindestzahl durch Leerraum getrennter Spalten, die eine Datenzeile aus
 /// `/proc/net/{tcp,tcp6,udp,udp6}` tragen muss, um `local_address` (Spalte 1),
@@ -97,15 +162,21 @@ pub struct ListenerRecord {
 /// liest (siehe Modultests).
 ///
 /// Die Kopfzeile jeder Tabelle (`  sl  local_address ...`) hat in ihrer
-/// dritten Spalte den Literal-Text `st`, der nie `"0A"` entspricht — sie
-/// durchläuft diese Funktion deshalb gefahrlos als „kein Listener" (`Ok(None)`),
-/// ohne gesondert erkannt werden zu müssen.
+/// dritten Spalte den Literal-Text `st`, der nie einem der beiden
+/// "lauschend"-Zustandscodes entspricht — sie durchläuft diese Funktion
+/// deshalb gefahrlos als „kein Listener" (`Ok(None)`), ohne gesondert
+/// erkannt werden zu müssen.
 ///
 /// # Arguments
 /// - `line` (`&str`): eine einzelne Zeile, ohne Zeilenumbruch.
+/// - `expected_state` (`&str`): der Zustandscode, der für diese Tabelle als
+///   "lauschend" zählt — [`TCP_LISTEN_STATE`] für `net/tcp`/`net/tcp6`,
+///   [`UDP_UNCONNECTED_STATE`] für `net/udp`/`net/udp6` (siehe
+///   Moduldokumentation, Abschnitt „F-065-Nachtrag", für die Begründung,
+///   warum diese beiden Tabellenpaare unterschiedliche Codes brauchen).
 ///
 /// # Returns
-/// `Ok(Some(record))`, wenn die Zeile im Zustand [`LISTEN_STATE`] ist;
+/// `Ok(Some(record))`, wenn die Zeile im Zustand `expected_state` ist;
 /// `Ok(None)`, wenn sie eine andere Zeile ist (anderer Zustand oder
 /// Kopfzeile).
 ///
@@ -117,19 +188,22 @@ pub struct ListenerRecord {
 ///
 /// # Examples
 /// ```rust
-/// use harw_dod_listener::procnet::parse_listener_line;
+/// use harw_dod_listener::procnet::{parse_listener_line, TCP_LISTEN_STATE};
 ///
 /// let established = "   1: 0100007F:0050 0100007F:C350 01 00000000:00000000 00:00000000 \
 ///                      00000000  1000        0 22222 1 0000000000000000 100 0 0 10 0";
-/// assert!(parse_listener_line(established).unwrap().is_none());
+/// assert!(parse_listener_line(established, TCP_LISTEN_STATE).unwrap().is_none());
 /// ```
-pub fn parse_listener_line(line: &str) -> Result<Option<ListenerRecord>, SensorError> {
+pub fn parse_listener_line(
+    line: &str,
+    expected_state: &str,
+) -> Result<Option<ListenerRecord>, SensorError> {
     let columns: Vec<&str> = line.split_whitespace().collect();
     if columns.len() < MIN_COLUMNS {
         return Err(SensorError::MalformedSource);
     }
 
-    if columns[3] != LISTEN_STATE {
+    if columns[3] != expected_state {
         return Ok(None);
     }
 
@@ -155,57 +229,68 @@ fn parse_local_port(local_address: &str) -> Result<u16, SensorError> {
     u16::from_str_radix(port_hex, 16).map_err(|_| SensorError::MalformedSource)
 }
 
-/// Bildet einen [`harw_dod_readfs::ReadFsError`] auf den inhaltsfreien
-/// [`SensorError`] ab, den [`harw_dod_signals::Sensor::poll`] laut Vertrag
-/// zurückgeben muss.
+/// Liest eine einzelne Listener-Tabelle, `path` relativ zu `root`, zeilenweise.
 ///
-/// [`harw_dod_readfs::ReadFsError::Scope`] entpackt den bereits inhaltsfreien
-/// `SensorError`, den es umschließt. Die drei übrigen Varianten
-/// (`TooLarge`, `GlobPatternAbsolute`, `GlobPatternTraversal`) sind für diese
-/// Crate praktisch unerreichbar — sie liest nie über
-/// [`harw_dod_readfs::MAX_READ_BYTES`] hinaus (die vier Listener-Tabellen
-/// bleiben weit darunter) und ruft `harw_dod_readfs::glob` nie auf —, bleiben
-/// aber aus Erschöpfungsgründen als defensiver Fallback auf
-/// [`SensorError::MalformedSource`] erhalten.
-fn map_readfs_err(err: harw_dod_readfs::ReadFsError) -> SensorError {
-    match err {
-        harw_dod_readfs::ReadFsError::Scope(inner) => inner,
-        harw_dod_readfs::ReadFsError::TooLarge { .. }
-        | harw_dod_readfs::ReadFsError::GlobPatternAbsolute { .. }
-        | harw_dod_readfs::ReadFsError::GlobPatternTraversal { .. } => {
-            SensorError::MalformedSource
-        }
-    }
-}
-
-/// Liest eine einzelne Listener-Tabelle, `path` relativ zu `root`.
+/// # Description
+/// Öffnet `path` über [`harw_dod_cap::ReadScope::open`] (Bereichsprüfung und
+/// Symlink-Auflösung passieren dort, nicht hier) und liest sie danach über
+/// `std::io::BufRead::lines`, begrenzt durch [`MAX_TABLE_BYTES`] (über
+/// `Read::take`) und [`MAX_TABLE_LINES`] — siehe Moduldokumentation,
+/// Abschnitt „F-065" für die Begründung, warum diese Datei dafür nicht mehr
+/// `harw_dod_readfs::read_lines` verwendet. Eine auf diesem Host fehlende
+/// Tabelle (z. B. `net/tcp6` bei deaktiviertem IPv6:
+/// `std::io::ErrorKind::NotFound`) liefert eine leere Zeilenliste statt
+/// eines Fehlers — die Abwesenheit einer Protokollfamilie ist eine
+/// Eigenschaft dieses Hosts, kein Sensorfehler. Jeder andere Fehler beim
+/// Öffnen (z. B. eine Bereichsverletzung) wird weitergereicht; ein E/A-Fehler
+/// **während** des zeilenweisen Lesens (z. B. ungültiges UTF-8 in einer
+/// Zeile) wird über [`SensorError::from`] auf [`SensorError::Io`] abgebildet.
 ///
-/// Eine auf diesem Host fehlende Tabelle (z. B. `net/tcp6` bei
-/// deaktiviertem IPv6: `std::io::ErrorKind::NotFound`) liefert eine leere
-/// Zeilenliste statt eines Fehlers — die Abwesenheit einer Protokollfamilie
-/// ist eine Eigenschaft dieses Hosts, kein Sensorfehler. Jeder andere Fehler
-/// (z. B. eine Bereichsverletzung) wird weitergereicht.
+/// # Arguments
+/// - `scope` (`&ReadScope`): der Lesebereich, gegen den `path` geprüft wird.
+/// - `path` (`&Path`): die zu lesende Tabelle.
+///
+/// # Returns
+/// Die gelesenen Zeilen, ohne Zeilenumbrüche, in Dateireihenfolge, gekappt
+/// bei [`MAX_TABLE_LINES`] Zeilen bzw. [`MAX_TABLE_BYTES`] Bytes.
+///
+/// # Errors
+/// [`SensorError`], wenn das Öffnen (außer „nicht vorhanden") oder das
+/// zeilenweise Lesen selbst scheitert.
 fn read_table(scope: &ReadScope, path: &Path) -> Result<Vec<String>, SensorError> {
-    match harw_dod_readfs::read_lines(scope, path) {
-        Ok(lines) => Ok(lines),
-        Err(harw_dod_readfs::ReadFsError::Scope(SensorError::Io(io_err)))
-            if io_err.kind() == std::io::ErrorKind::NotFound =>
-        {
-            Ok(Vec::new())
+    let file = match scope.open(path) {
+        Ok(file) => file,
+        Err(SensorError::Io(io_err)) if io_err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
         }
-        Err(other) => Err(map_readfs_err(other)),
+        Err(other) => return Err(other),
+    };
+
+    let limited = file.take(MAX_TABLE_BYTES);
+    let reader = BufReader::new(limited);
+
+    let mut lines = Vec::new();
+    for line in reader.lines() {
+        if lines.len() >= MAX_TABLE_LINES {
+            break;
+        }
+        lines.push(line.map_err(SensorError::from)?);
     }
+    Ok(lines)
 }
 
 /// Liest alle vier Listener-Tabellen unter `root` und liefert die Vereinigung
-/// ihrer `0A`-Treffer.
+/// ihrer "lauschend"-Treffer.
 ///
 /// # Description
-/// Liest `root.join("net/tcp")`, `root.join("net/tcp6")`,
-/// `root.join("net/udp")` und `root.join("net/udp6")`, in dieser Reihenfolge,
-/// über [`harw_dod_readfs::read_lines`], und parst jede Zeile über
-/// [`parse_listener_line`]. `root` ist in Produktion `/proc`; ein Test setzt
-/// hier die Wurzel eines Fixture-Baums (siehe [`crate::sensor`]-Tests).
+/// Liest `root.join("net/tcp")` und `root.join("net/tcp6")` gegen
+/// [`TCP_LISTEN_STATE`], sowie `root.join("net/udp")` und
+/// `root.join("net/udp6")` gegen [`UDP_UNCONNECTED_STATE`] (siehe
+/// Moduldokumentation, Abschnitt „F-065-Nachtrag", für die Begründung der
+/// unterschiedlichen Codes), in dieser Reihenfolge, über [`read_table`], und
+/// parst jede Zeile über [`parse_listener_line`]. `root` ist in Produktion
+/// `/proc`; ein Test setzt hier die Wurzel eines Fixture-Baums (siehe
+/// [`crate::sensor`]-Tests).
 ///
 /// # Arguments
 /// - `scope` (`&ReadScope`): der Lesebereich, gegen den jede Tabelle geprüft
@@ -225,11 +310,16 @@ fn read_table(scope: &ReadScope, path: &Path) -> Result<Vec<String>, SensorError
 /// Zustandslos; von jedem Thread parallel aufrufbar.
 pub fn collect_listeners(scope: &ReadScope, root: &Path) -> Result<Vec<ListenerRecord>, SensorError> {
     let mut records = Vec::new();
-    for relative in ["net/tcp", "net/tcp6", "net/udp", "net/udp6"] {
+    for (relative, expected_state) in [
+        ("net/tcp", TCP_LISTEN_STATE),
+        ("net/tcp6", TCP_LISTEN_STATE),
+        ("net/udp", UDP_UNCONNECTED_STATE),
+        ("net/udp6", UDP_UNCONNECTED_STATE),
+    ] {
         let path = root.join(relative);
         let lines = read_table(scope, &path)?;
         for line in &lines {
-            if let Some(record) = parse_listener_line(line)? {
+            if let Some(record) = parse_listener_line(line, expected_state)? {
                 records.push(record);
             }
         }
@@ -256,7 +346,7 @@ mod tests {
     #[test]
     fn test_parse_listener_line_state_0a_is_recognized_as_listener() {
         let line = data_line("0A", "0050", 12345);
-        let record = parse_listener_line(&line)
+        let record = parse_listener_line(&line, TCP_LISTEN_STATE)
             .expect("wohlgeformte Zeile")
             .expect("Zustand 0A muss als Listener erkannt werden");
         assert_eq!(record.port, 80);
@@ -267,9 +357,9 @@ mod tests {
     fn test_parse_listener_line_other_state_is_not_a_listener() {
         let line = data_line("01", "0050", 12345);
         assert_eq!(
-            parse_listener_line(&line).expect("wohlgeformte Zeile"),
+            parse_listener_line(&line, TCP_LISTEN_STATE).expect("wohlgeformte Zeile"),
             None,
-            "nur Zustand 0A darf als Listener zählen"
+            "nur Zustand 0A darf für eine TCP-Tabelle als Listener zählen"
         );
     }
 
@@ -279,7 +369,7 @@ mod tests {
     #[test]
     fn test_parse_listener_line_reads_port_above_255_correctly() {
         let line = data_line("0A", "1F90", 99);
-        let record = parse_listener_line(&line)
+        let record = parse_listener_line(&line, TCP_LISTEN_STATE)
             .expect("wohlgeformte Zeile")
             .expect("Zustand 0A");
         assert_eq!(record.port, 8080);
@@ -290,7 +380,7 @@ mod tests {
         let line = "   0: 00000000000000000000000000000000:1F90 \
                      00000000000000000000000000000000:0000 0A 00000000:00000000 \
                      00:00000000 00000000  1000        0 54321 1 0000000000000000 100 0 0 10 0";
-        let record = parse_listener_line(line)
+        let record = parse_listener_line(line, TCP_LISTEN_STATE)
             .expect("wohlgeformte IPv6-Zeile")
             .expect("Zustand 0A");
         assert_eq!(record.port, 8080);
@@ -300,7 +390,7 @@ mod tests {
     #[test]
     fn test_parse_listener_line_header_row_is_not_a_listener_and_not_an_error() {
         assert_eq!(
-            parse_listener_line(HEADER).expect("Kopfzeile hat genug Spalten"),
+            parse_listener_line(HEADER, TCP_LISTEN_STATE).expect("Kopfzeile hat genug Spalten"),
             None
         );
     }
@@ -308,7 +398,8 @@ mod tests {
     #[test]
     fn test_parse_listener_line_too_few_columns_is_malformed_without_line_content_in_message() {
         let short_line = "   0: 0100007F:0050 00000000:0000 0A";
-        let err = parse_listener_line(short_line).expect_err("zu wenige Spalten muss scheitern");
+        let err = parse_listener_line(short_line, TCP_LISTEN_STATE)
+            .expect_err("zu wenige Spalten muss scheitern");
         assert!(matches!(err, SensorError::MalformedSource));
         let message = err.to_string();
         assert!(
@@ -320,8 +411,133 @@ mod tests {
     #[test]
     fn test_parse_listener_line_non_hex_port_is_malformed() {
         let line = data_line("0A", "ZZZZ", 1);
-        let err = parse_listener_line(&line).expect_err("nicht-hexadezimaler Port muss scheitern");
+        let err = parse_listener_line(&line, TCP_LISTEN_STATE)
+            .expect_err("nicht-hexadezimaler Port muss scheitern");
         assert!(matches!(err, SensorError::MalformedSource));
+    }
+
+    // --- F-065-Nachtrag: UDP braucht `07`, nicht `0A` -----------------------
+
+    /// Kernbeleg des Nachtrags: dieselbe Zeilenform, die für TCP als
+    /// Listener zählt (`0A`), darf für eine UDP-Tabelle **nicht** zählen —
+    /// UDP-Tabellen werten `07` aus (siehe Moduldokumentation).
+    #[test]
+    fn test_parse_listener_line_tcp_listen_state_is_not_udp_unconnected_state() {
+        let line = data_line("0A", "0050", 1);
+        assert_eq!(
+            parse_listener_line(&line, UDP_UNCONNECTED_STATE).expect("wohlgeformte Zeile"),
+            None,
+            "der TCP-Zustandscode darf für eine UDP-Tabelle nichts treffen"
+        );
+    }
+
+    /// Der eigentliche Regressionsbeleg: ein Zustandscode `07`, wie er in
+    /// der echten Pi-Erhebung für jeden gebundenen UDP-Socket auftritt, wird
+    /// als Listener erkannt, wenn er gegen [`UDP_UNCONNECTED_STATE`] geprüft
+    /// wird.
+    #[test]
+    fn test_parse_listener_line_udp_state_07_is_recognized_as_listener() {
+        let line = data_line("07", "A2A9", 11029);
+        let record = parse_listener_line(&line, UDP_UNCONNECTED_STATE)
+            .expect("wohlgeformte Zeile")
+            .expect("Zustand 07 muss für UDP als Listener erkannt werden");
+        assert_eq!(record.port, 0xA2A9);
+        assert_eq!(record.inode, 11029);
+    }
+
+    /// End-to-End über `collect_listeners` mit den beiden realen
+    /// `/proc/net/udp`-Zeilen aus `harw-dod-fixtures/captures/rpi5-6.18/procnet.json`
+    /// (Kernel `6.18.34+rpt-rpi-2712`) — der eigentliche Regressionstest für
+    /// den F-065-Nachtrag: vor dieser Korrektur hätte keine der beiden
+    /// Zeilen je einen Treffer erzeugt.
+    #[test]
+    fn test_collect_listeners_recognizes_real_udp_capture_lines() {
+        const HEADER_UDP: &str = "   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let net_dir = dir.path().join("net");
+        std::fs::create_dir_all(&net_dir).expect("net-Verzeichnis anlegen");
+        // Wörtlich aus `harw-dod-fixtures/captures/rpi5-6.18/procnet.json`
+        // übernommen (zwei gebundene, unverbundene UDP-Sockets, Zustand `07`).
+        let content = format!(
+            "{HEADER_UDP}\n\
+               118: 00000000:A2A9 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 11029 2 00000000e611d66c 0\n\
+               694: 00000000:14E9 00000000:0000 07 00000000:00000000 00:00000000 00000000   101        0 7036 2 0000000047b7b231 0\n"
+        );
+        std::fs::write(net_dir.join("udp"), content).expect("net/udp schreiben");
+
+        let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
+        let records = collect_listeners(&scope, dir.path()).expect("poll muss gelingen");
+
+        let ports: std::collections::BTreeSet<u16> =
+            records.iter().map(|record| record.port).collect();
+        assert!(ports.contains(&0xA2A9), "Port aus `sl 118` muss erkannt werden");
+        assert!(ports.contains(&0x14E9), "Port aus `sl 694` muss erkannt werden");
+    }
+
+    // --- F-065: Zeilen-/Gesamtlimit statt Abbruch der gesamten Tabelle ------
+
+    /// Kernbeleg: eine Tabelle mit weit mehr Zeilen, als F-065s ~7000
+    /// Sockets brauchten, um die frühere 1-MiB-Grenze zu überschreiten,
+    /// lässt `read_table` nicht scheitern — sie kappt bei [`MAX_TABLE_LINES`].
+    #[test]
+    fn test_read_table_caps_at_max_lines_without_erroring_f065() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let net_dir = dir.path().join("net");
+        std::fs::create_dir_all(&net_dir).expect("net-Verzeichnis anlegen");
+        let content = "x\n".repeat(MAX_TABLE_LINES + 10);
+        std::fs::write(net_dir.join("tcp"), content).expect("net/tcp schreiben");
+        let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
+
+        let lines = read_table(&scope, &net_dir.join("tcp"))
+            .expect("eine sehr lange Tabelle darf den Abruf nicht scheitern lassen");
+
+        assert_eq!(
+            lines.len(),
+            MAX_TABLE_LINES,
+            "muss bei der Zeilengrenze kappen, nicht scheitern"
+        );
+    }
+
+    /// Symmetrischer Beleg für die Byte-Grenze: wenige, aber sehr lange
+    /// Zeilen (insgesamt deutlich über [`MAX_TABLE_BYTES`]) lassen den
+    /// Abruf ebenfalls nicht scheitern.
+    #[test]
+    fn test_read_table_caps_at_max_bytes_without_erroring_f065() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let net_dir = dir.path().join("net");
+        std::fs::create_dir_all(&net_dir).expect("net-Verzeichnis anlegen");
+        let long_line = "y".repeat(4 * 1024 * 1024); // 4 MiB je Zeile
+        let mut content = String::new();
+        for _ in 0..5 {
+            content.push_str(&long_line);
+            content.push('\n');
+        }
+        // 5 * 4 MiB = 20 MiB, deutlich über MAX_TABLE_BYTES (16 MiB).
+        std::fs::write(net_dir.join("tcp"), &content).expect("net/tcp schreiben");
+        let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
+
+        let lines = read_table(&scope, &net_dir.join("tcp"))
+            .expect("eine sehr große Tabelle darf den Abruf nicht scheitern lassen");
+
+        let total_bytes: usize = lines.iter().map(String::len).sum();
+        assert!(
+            (total_bytes as u64) <= MAX_TABLE_BYTES,
+            "gelesene Gesamtbytes dürfen die Grenze nicht überschreiten: {total_bytes}"
+        );
+        assert!(
+            lines.len() < 5,
+            "mindestens eine der fünf 4-MiB-Zeilen darf nicht mehr ankommen"
+        );
+    }
+
+    #[test]
+    fn test_read_table_missing_file_yields_empty_lines_not_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let scope = ReadScope::from_roots([dir.path().to_path_buf()]);
+
+        let lines = read_table(&scope, &dir.path().join("net").join("tcp6"))
+            .expect("eine fehlende Tabelle darf nicht scheitern");
+        assert!(lines.is_empty());
     }
 
     /// Scope-Dichtheit: `collect_listeners` liest niemals außerhalb des

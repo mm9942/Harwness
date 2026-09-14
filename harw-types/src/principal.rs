@@ -207,6 +207,45 @@ impl Principal {
         };
         Some(ApprovalActor::Operator { id })
     }
+
+    /// Returns the approval actor this principal acts as, if any.
+    ///
+    /// # Description
+    /// Einheitlicher Ableitungspunkt für Freigabe-Akteure (C-APPR, Plan Teil B).
+    /// Delegiert bewusst unverändert an [`Self::approval_actor`]: die
+    /// Actor-Namen `owner`/`local-cli`/`local-tui` bleiben bis P1.6 ungleich
+    /// (Teil-A-Hinweis). Eine Angleichung würde die in G-011 beschriebene
+    /// Selbstgenehmigung über einen Same-UID-Socket scharf schalten, solange
+    /// die Transport-Authentisierung (Web-Token, F-029) fehlt.
+    ///
+    /// # Returns
+    /// `Some(ApprovalActor)` nur für die vier Kombinationen der Tabelle in
+    /// [`Self::approval_actor`]; `None` für Modelle, Kinder, Operationen und
+    /// alle übrigen Kanäle — diese dürfen nie Freigaben beantworten.
+    ///
+    /// # Concurrency
+    /// Reine Funktion ohne Seiteneffekte.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_types::{ApprovalActor, IngressSurface, PermissionTier, Principal, PrincipalKind};
+    ///
+    /// let human = Principal::trusted_ingress(
+    ///     PrincipalKind::Human,
+    ///     "mia",
+    ///     IngressSurface::Tui,
+    ///     PermissionTier::Owner,
+    /// );
+    /// assert_eq!(
+    ///     human.actor_id(),
+    ///     Some(ApprovalActor::Operator { id: "local-tui".to_owned() })
+    /// );
+    /// assert_eq!(human.child_of("explorer").actor_id(), None);
+    /// ```
+    #[must_use]
+    pub fn actor_id(&self) -> Option<ApprovalActor> {
+        self.approval_actor()
+    }
 }
 
 #[cfg(test)]
@@ -264,6 +303,44 @@ mod tests {
                     expected,
                     "kind={kind:?} surface={surface:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn test_actor_id_table_per_principal_kind_and_surface() {
+        for kind in KINDS {
+            for surface in SURFACES {
+                for tier in TIERS {
+                    let principal = Principal::trusted_ingress(kind, "client-7", surface, tier);
+                    let expected = match (kind, surface) {
+                        (PrincipalKind::Human, IngressSurface::Tui) => operator("local-tui"),
+                        (PrincipalKind::Human, IngressSurface::Cli) => operator("local-cli"),
+                        (PrincipalKind::Human, IngressSurface::Web) => operator("owner"),
+                        (PrincipalKind::Channel, IngressSurface::Mcp) => operator("client-7"),
+                        (PrincipalKind::Human, _)
+                        | (PrincipalKind::Model, _)
+                        | (PrincipalKind::Operation, _)
+                        | (PrincipalKind::Channel, _) => None,
+                    };
+                    assert_eq!(
+                        principal.actor_id(),
+                        expected,
+                        "kind={kind:?} surface={surface:?} tier={tier:?}"
+                    );
+                    assert_eq!(principal.actor_id(), principal.approval_actor());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_actor_id_is_none_for_model_and_operation_kinds() {
+        for kind in [PrincipalKind::Model, PrincipalKind::Operation] {
+            for surface in SURFACES {
+                let principal =
+                    Principal::trusted_ingress(kind, "mia", surface, PermissionTier::Owner);
+                assert_eq!(principal.actor_id(), None, "kind={kind:?} surface={surface:?}");
             }
         }
     }

@@ -238,7 +238,7 @@ fn handle_show(ctx: &OpContext) -> Result<OpOutput, OpError> {
                      Credentials     : {auth}",
                     display_name = provider.name,
                 );
-                Ok(OpOutput { text })
+                Ok(OpOutput::from(text))
             }
             None => {
                 let text = format!(
@@ -246,7 +246,7 @@ fn handle_show(ctx: &OpContext) -> Result<OpOutput, OpError> {
                      WARNING: provider '{active_id}' is not present in the configured provider catalog. \
                      State may be stale — use `/provider list` to see configured providers."
                 );
-                Ok(OpOutput { text })
+                Ok(OpOutput::from(text))
             }
         }
     } else {
@@ -265,7 +265,7 @@ fn handle_show(ctx: &OpContext) -> Result<OpOutput, OpError> {
             ),
             None => "No default provider configured. Use `harw onboard` to set one up.".to_owned(),
         };
-        Ok(OpOutput { text })
+        Ok(OpOutput::from(text))
     }
 }
 
@@ -322,9 +322,7 @@ fn handle_list(ctx: &OpContext) -> Result<OpOutput, OpError> {
         lines.push("\nNo provider explicitly switched — using config default.".to_owned());
     }
 
-    Ok(OpOutput {
-        text: lines.join("\n"),
-    })
+    Ok(OpOutput::from(lines.join("\n")))
 }
 
 /// Implements `/provider switch <id>` — atomic, validated provider switch.
@@ -413,9 +411,9 @@ fn handle_switch(ctx: &OpContext, target: String) -> Result<OpOutput, OpError> {
         .set_active_provider(canonical_target.clone())
         .map_err(|e| OpError::Execution(e.to_string()))?;
 
-    Ok(OpOutput {
-        text: format!("provider switched to {canonical_target}; next turn will use it"),
-    })
+    Ok(OpOutput::from(format!(
+        "provider switched to {canonical_target}; next turn will use it"
+    )))
 }
 
 /// Implements `/provider test` — shows the auth-ref type for the config-default provider.
@@ -440,21 +438,19 @@ fn handle_test(ctx: &OpContext) -> Result<OpOutput, OpError> {
     let config = resolved_config(ctx)?;
 
     let Some(default_name) = &config.harness.default_provider else {
-        return Ok(OpOutput {
-            text: "No default provider configured — no test possible. \
-                   Use `harw onboard` to set one up."
+        return Ok(OpOutput::from(
+            "No default provider configured — no test possible. \
+             Use `harw onboard` to set one up."
                 .to_owned(),
-        });
+        ));
     };
 
     let Some(provider_toml) = config.providers.get(default_name) else {
-        return Ok(OpOutput {
-            text: format!(
-                "Default provider '{default_name}' is listed in harness config but \
-                 no matching provider entry was found.\n\
-                 Run `harw onboard` again or check your config layers."
-            ),
-        });
+        return Ok(OpOutput::from(format!(
+            "Default provider '{default_name}' is listed in harness config but \
+             no matching provider entry was found.\n\
+             Run `harw onboard` again or check your config layers."
+        )));
     };
 
     let auth_info = match &provider_toml.auth {
@@ -481,16 +477,14 @@ fn handle_test(ctx: &OpContext) -> Result<OpOutput, OpError> {
         "disabled"
     };
 
-    Ok(OpOutput {
-        text: format!(
-            "Default provider : {default_name}  [{status}]\n\
-             API type         : {api}\n\
-             {auth_info}\n\
-             Note: live connection test (HTTP ping) not yet wired — \
-             re-run after harw-provider-http integration.",
-            api = provider_toml.api,
-        ),
-    })
+    Ok(OpOutput::from(format!(
+        "Default provider : {default_name}  [{status}]\n\
+         API type         : {api}\n\
+         {auth_info}\n\
+         Note: live connection test (HTTP ping) not yet wired — \
+         re-run after harw-provider-http integration.",
+        api = provider_toml.api,
+    )))
 }
 
 #[cfg(test)]

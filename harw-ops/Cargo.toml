@@ -57,6 +57,10 @@ harw-knowledge = { path = "../harw-knowledge" }
 # und `ApprovalActorResolver` stammen aus `harw-web`. Kein Zyklus: `harw-web`
 # hängt nicht von `harw-ops` ab (geprüft).
 harw-web = { path = "../harw-web" }
+# Slice B4 (`/permissions`): liest `[permissions]` aus einer Projekt-/Global-
+# Datei zurück, um Herkunft und Löschziele einer Regel zu bestimmen —
+# `harw_config::ConfigWriter` selbst bietet dafür keine Enumerations-API.
+toml = { workspace = true }
 
 [features]
 # Forwards to harw-provider's ChatGPT OAuth flag so `--features chatgpt-oauth`
@@ -66,6 +70,10 @@ chatgpt-oauth = ["harw-provider/chatgpt-oauth"]
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros"] }
 secrecy = "0.8"
+# Slice B4: Persistenz-Rundlauf-Tests (`/permissions`, `/add-workdir`,
+# `/memory`) gegen ein temporäres Verzeichnis statt echter `HARW_HOME`/`HOME`-
+# Env-Mutation (nicht thread-sicher, würde parallele Tests gefährden).
+tempfile = { workspace = true }
 # AW5-09: `context_proposal.rs`-Tests bauen einen `DefinitionId`
 # (`harwness.context.base@1`) als Fixture. Kein Zyklus: `harw-agent-dsl`
 # hängt nicht von `harw-ops` ab (geprüft).

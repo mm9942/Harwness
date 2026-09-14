@@ -152,9 +152,7 @@ async fn skills(ctx: &OpContext, args: SkillsArgs) -> Result<OpOutput, OpError> 
     match args.action.as_deref().unwrap_or("list") {
         "list" => {
             if config.skills.is_empty() {
-                return Ok(OpOutput {
-                    text: "Keine Skills konfiguriert.".to_owned(),
-                });
+                return Ok(OpOutput::from("Keine Skills konfiguriert.".to_owned()));
             }
             let mut names: Vec<&String> = config.skills.keys().collect();
             names.sort();
@@ -164,9 +162,7 @@ async fn skills(ctx: &OpContext, args: SkillsArgs) -> Result<OpOutput, OpError> 
                 let status = if skill.enabled { "enabled" } else { "disabled" };
                 lines.push(format!("- {name} ({status}): {}", skill.description));
             }
-            Ok(OpOutput {
-                text: lines.join("\n"),
-            })
+            Ok(OpOutput::from(lines.join("\n")))
         }
         "show" => {
             let Some(target) = args.target.as_deref() else {
@@ -179,16 +175,14 @@ async fn skills(ctx: &OpContext, args: SkillsArgs) -> Result<OpOutput, OpError> 
                     "unknown skill '{target}'"
                 )));
             };
-            Ok(OpOutput {
-                text: format!(
-                    "{} (enabled={}): {}\ntools: {}\nmcps: {}",
-                    skill.name,
-                    skill.enabled,
-                    skill.description,
-                    skill.tools.join(", "),
-                    skill.mcps.join(", ")
-                ),
-            })
+            Ok(OpOutput::from(format!(
+                "{} (enabled={}): {}\ntools: {}\nmcps: {}",
+                skill.name,
+                skill.enabled,
+                skill.description,
+                skill.tools.join(", "),
+                skill.mcps.join(", ")
+            )))
         }
         "activate" | "deactivate" => Err(OpError::NotAvailable(
             "skill activation state changes are not available".to_owned(),

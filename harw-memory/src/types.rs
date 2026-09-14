@@ -141,6 +141,22 @@ pub struct MaintenanceReport {
     /// Ansonsten die Delta-Zahlen aus [`crate::heartbeat::tick`].
     #[serde(default)]
     pub heartbeat: Option<crate::heartbeat::HeartbeatReport>,
+    /// Anzahl Fakten, deren `confidence` in diesem Lauf per
+    /// [`crate::facts::FactStore::decay`] halbiert wurde (Design
+    /// `memory-v3-ltm.md` §5.4).
+    ///
+    /// `#[serde(default)]`, damit ältere `workflow.json`/Zustandsdateien ohne
+    /// dieses Feld weiter lesbar bleiben.
+    #[serde(default)]
+    pub facts_decayed: usize,
+    /// Namen der Fakten, deren `confidence` nach dem Verfall unter `0.2`
+    /// gefallen ist. Werden nur gemeldet, nicht automatisch gelöscht (Design
+    /// §5.4).
+    ///
+    /// `#[serde(default)]`, damit ältere Zustandsdateien ohne dieses Feld
+    /// weiter lesbar bleiben.
+    #[serde(default)]
+    pub facts_below_threshold: Vec<String>,
 }
 
 /// Kompakte Zähler-Statistik.

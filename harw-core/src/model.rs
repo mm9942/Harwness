@@ -51,6 +51,45 @@
 //! Eine Sitzung, die ein Programm, aber keine Decke trägt, bekommt deshalb
 //! den alten, byte-budgetierten Pfad — nicht schlechter als vorher, aber auch
 //! nicht die neue Trennung.
+//!
+//! # W3/C-MODEL: `data_block`, Stop-/Reasoning-/Fehlervertrag (F-016, G-023, G-015)
+//!
+//! [`ModelRequest::context`] (`Vec<ContextFragment>`) wird von keinem der drei
+//! Wire-Builder gelesen (Befund F-016/G-023, `harw-provider-http/src/lib.rs`,
+//! `anthropic.rs`) — auch nicht der Datenblock, den
+//! [`ModelRequest::with_context_program`] vor diesem Knoten dort ablegte.
+//! [`ModelRequest::data_block`] ist deshalb ein **eigenes, strukturell
+//! getrenntes Feld**: [`ModelRequest::with_context_program`] befüllt es direkt
+//! (statt einen `ContextFragment` in `context` zu verstecken), und ein
+//! künftiger Provider-Knoten (W4a/A-ANTH, A-OAI) liest genau dieses Feld, um
+//! den Datenblock nach den `tool_result`-Blöcken einzufügen. Diese Datei
+//! liefert nur den Vertrag; das tatsächliche Lesen durch einen Provider ist
+//! Folgearbeit einer benannten Welle (siehe Ledger).
+//!
+//! [`ModelRequest::max_output_tokens`] und [`ModelRequest::tool_result_max_bytes`]
+//! sind ebenfalls additive Provider-Hinweise ohne eigene Logik hier: ein
+//! Provider-Knoten übersetzt sie in sein Wire-Format (`max_tokens`,
+//! Tool-Result-Kappung), ein `None` lässt den Provider seinen eigenen Default
+//! wählen.
+//!
+//! [`StopReason`] ersetzt kein bestehendes Feld — [`ModelResponse::stop`] ist
+//! additiv und beschreibt, warum ein Modell-Aufruf endete (Werkzeugaufruf,
+//! Token-Limit, Stop-Sequenz, Ablehnung, …), statt dass Aufrufer das nur aus
+//! `tool_calls.is_empty()` erraten. [`ModelResponse::reasoning`] trägt die vom
+//! Provider zurückgegebenen, opaken Denkblöcke
+//! (`harw_protocol::OpaqueReasoning`, unverändert zurückzuspielen — G-015:
+//! Anthropic verlangt `thinking`/`redacted_thinking`-Blöcke unverändert im
+//! nächsten Tool-Loop-Turn zurück, sonst bricht der Aufruf oder verliert
+//! Qualität). Das tatsächliche Speichern/Zurückspielen dieser Blöcke über
+//! `ConversationHistory` hinweg ist Folgearbeit von W4a (A-LOOP/A-ANTH) — hier
+//! wird nur der Transporttyp eingefroren.
+//!
+//! [`ModelError`] bekommt einen erweiterten, provider-neutralen
+//! Fehlervertrag (`Refusal`, `Truncated`, `Transient`, `Auth`,
+//! `QuotaExceeded`, `ContextLength`, `Timeout`, `Cancelled`) plus
+//! [`ModelError::is_retryable`]. Nur `Transient` und `Timeout` gelten als
+//! retryable — insbesondere `QuotaExceeded` **nicht** (ein erschöpftes
+//! Kontingent behebt ein erneuter Versuch nicht).
 
 use crate::context_budget::{Assembly, ContextAssembly, ContextAssemblyError, ContextBudget, assemble};
 use crate::history::ConversationHistory;
@@ -59,8 +98,10 @@ use harw_context::{ContextCeiling, DetailMode, Fragment as ContextFragmentV2, Se
 use harw_extension_api::{ContextFragment, ExtFuture, LoadedInstructions};
 use harw_macros::HarwError;
 use harw_observe::NullSink;
+use harw_protocol::OpaqueReasoning;
 use harw_tools::{ToolCall, ToolSpec};
 use harw_types::{ModelId, ProviderId, ReasoningEffort, TokenUsage};
+use serde::{Deserialize, Serialize};
 
 /// Boxed Future, das ein [`ModelProvider`] zurückgibt.
 pub type ModelFuture<'a> = ExtFuture<'a, Result<ModelResponse, ModelError>>;
@@ -92,6 +133,20 @@ pub struct ModelRequest {
     /// Optionale Provider-ID, die für diesen Request verwendet werden soll.
     /// `None` lässt den Session-Manager seinen konfigurierten Default verwenden.
     pub provider_id: Option<ProviderId>,
+    /// Strukturell getrennter Datenblock (AW4-01), von einem Provider nach
+    /// den `tool_result`-Blöcken einzufügen. `None` heißt: kein Datenblock für
+    /// diesen Request (kein Programm/keine Decke deklariert, oder der Block
+    /// wäre leer). Ersetzt das Ablegen des Datenblocks in [`Self::context`]
+    /// (F-016/G-023: `context` wird von keinem Provider gelesen) — siehe die
+    /// Moduldoku „W3/C-MODEL: `data_block`, …".
+    pub data_block: Option<String>,
+    /// Obergrenze für die vom Provider angeforderten Ausgabe-Tokens. `None`
+    /// lässt den Provider seinen eigenen Default wählen.
+    pub max_output_tokens: Option<u32>,
+    /// Kappungsgrenze in Bytes für ein einzelnes Tool-Ergebnis, das ein
+    /// Provider in sein Wire-Format rendert (`render_tool_result`, W3/C-PROTO).
+    /// `None` lässt den Provider seine eigene Grenze wählen.
+    pub tool_result_max_bytes: Option<usize>,
 }
 
 impl ModelRequest {
@@ -136,6 +191,9 @@ impl ModelRequest {
             reasoning_effort: None,
             model_id: None,
             provider_id: None,
+            data_block: None,
+            max_output_tokens: None,
+            tool_result_max_bytes: None,
         }
     }
 
@@ -153,13 +211,11 @@ impl ModelRequest {
     /// [`crate::context_budget::ContextAssemblyV2::render_trust_blocks_with_detail`].
     /// Der Instruktionsblock wird an `instructions.system_prompt` angehängt
     /// (beide sind vertrauenswürdiger Text, aus derselben Quelle wie ein vom
-    /// Betreiber gesetzter System-Prompt); der Datenblock wird als einzelnes
-    /// `ContextFragment` mit dem Label `"context.data_block"` in
-    /// [`Self::context`] abgelegt — dasselbe Feld, das jeder Provider bereits
-    /// liest, keine neue, von Providern unbeachtete Schnittstelle. Damit
-    /// wirkt die Trennung tatsächlich auf das, was ein Provider (z. B.
-    /// `harw-provider-http`) aus diesem `ModelRequest` baut, statt in einem
-    /// zusätzlichen, nirgends gelesenen Feld zu verenden.
+    /// Betreiber gesetzter System-Prompt); der Datenblock landet in
+    /// [`Self::data_block`] — einem eigenen, strukturell getrennten Feld
+    /// (F-016/G-023: [`Self::context`] wird von keinem der drei
+    /// Wire-Builder gelesen, siehe die Moduldoku „W3/C-MODEL"). Ein leerer
+    /// Datenblock wird als `None` abgelegt, nicht als leerer `Some(String::new())`.
     ///
     /// Fehlt `program` oder `ceiling`, projiziert diese Methode jedes
     /// `harw_context::Fragment` verlustfrei zurück auf ein
@@ -226,13 +282,11 @@ impl ModelRequest {
                     system_prompt.push_str(&blocks.instruction_block);
                 }
 
-                let mut context = Vec::new();
-                if !blocks.data_block.is_empty() {
-                    context.push(ContextFragment {
-                        label: "context.data_block".to_owned(),
-                        content: blocks.data_block,
-                    });
-                }
+                let data_block = if blocks.data_block.is_empty() {
+                    None
+                } else {
+                    Some(blocks.data_block)
+                };
 
                 let included_fragment_labels = assembled
                     .sections
@@ -249,7 +303,7 @@ impl ModelRequest {
                 Ok(Self {
                     system_prompt,
                     instruction_fragments: instructions.fragments,
-                    context,
+                    context: Vec::new(),
                     history: bounded_history,
                     tools,
                     context_assembly: ContextAssembly {
@@ -262,6 +316,9 @@ impl ModelRequest {
                     reasoning_effort: None,
                     model_id: None,
                     provider_id: None,
+                    data_block,
+                    max_output_tokens: None,
+                    tool_result_max_bytes: None,
                 })
             }
             _ => {
@@ -298,6 +355,31 @@ impl ModelRequest {
     #[must_use]
     pub fn with_provider_id(mut self, provider_id: Option<ProviderId>) -> Self {
         self.provider_id = provider_id;
+        self
+    }
+
+    /// Setzt den strukturell getrennten Datenblock (siehe [`Self::data_block`]).
+    /// `None` heißt: kein Datenblock für diesen Request.
+    #[must_use]
+    pub fn with_data_block(mut self, data_block: Option<String>) -> Self {
+        self.data_block = data_block;
+        self
+    }
+
+    /// Sets the output-token cap forwarded to the provider. `None` lets the
+    /// provider pick its own default.
+    #[must_use]
+    pub fn with_max_output_tokens(mut self, max_output_tokens: Option<u32>) -> Self {
+        self.max_output_tokens = max_output_tokens;
+        self
+    }
+
+    /// Sets the per-tool-result byte cap a provider applies when rendering a
+    /// tool result into its wire format. `None` lets the provider pick its
+    /// own limit.
+    #[must_use]
+    pub fn with_tool_result_max_bytes(mut self, tool_result_max_bytes: Option<usize>) -> Self {
+        self.tool_result_max_bytes = tool_result_max_bytes;
         self
     }
 }
@@ -363,6 +445,47 @@ fn section_detail_map(program: &ContextProgram) -> std::collections::BTreeMap<Se
     map
 }
 
+/// Grund, warum ein Modell-Aufruf endete.
+///
+/// # Description
+/// Provider-neutrale Sicht auf das jeweilige `stop_reason`/`finish_reason`
+/// der Wire-Formate (Anthropic `stop_reason`, OpenAI `finish_reason`/
+/// `incomplete_details.reason`). Additiv zu [`ModelResponse::tool_calls`]:
+/// Aufrufer mussten das Ende eines Turns bisher aus `tool_calls.is_empty()`
+/// erraten (siehe [`ModelResponse::is_final`]); `stop` macht den *Grund*
+/// explizit, ohne dass `is_final`s bestehende Semantik sich ändert.
+///
+/// `#[default]` liegt auf [`Self::EndTurn`]: eine reine Text-Antwort ohne
+/// Tool-Calls (siehe [`ModelResponse::text`]) endet den Turn regulär.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StopReason {
+    /// Der Turn endete regulär (Modell hat eine finale Antwort geliefert).
+    #[default]
+    EndTurn,
+    /// Das Modell hat mindestens einen Tool-Call angefordert.
+    ToolUse,
+    /// Der Provider hat die Ausgabe wegen einer Token-Obergrenze abgeschnitten.
+    MaxTokens,
+    /// Eine konfigurierte Stop-Sequenz wurde erreicht.
+    StopSequence,
+    /// Der Provider hat den Turn pausiert (z. B. Anthropic `pause_turn` bei
+    /// serverseitigen Langläufer-Tools) — kein Fehler, kein Turn-Ende.
+    PauseTurn,
+    /// Der Provider hat den Request aus Richtlinien-/Sicherheitsgründen
+    /// abgelehnt. `detail` trägt eine optionale Provider-Begründung.
+    Refusal {
+        /// Optionale, vom Provider gelieferte Begründung der Ablehnung.
+        detail: Option<String>,
+    },
+    /// Der Request hätte das Kontextfenster des Modells überschritten.
+    ContextWindowExceeded,
+    /// Ein Content-Filter des Providers hat die Ausgabe unterbunden.
+    ContentFilter,
+    /// Ein providerspezifischer Grund ohne eigene Variante (Rohtext).
+    Other(String),
+}
+
 /// Antwort eines Modell-Aufrufs.
 #[derive(Debug, Clone, Default)]
 pub struct ModelResponse {
@@ -372,6 +495,13 @@ pub struct ModelResponse {
     pub tool_calls: Vec<ToolCall>,
     /// Token-Nutzung dieses Aufrufs.
     pub usage: TokenUsage,
+    /// Grund, warum dieser Modell-Aufruf endete.
+    pub stop: StopReason,
+    /// Opake Denkblöcke des Providers (Anthropic `thinking`/
+    /// `redacted_thinking`, OpenAI Reasoning-Items), unverändert im nächsten
+    /// Tool-Loop-Turn zurückzuspielen (G-015). `None`, wenn der Provider kein
+    /// Reasoning zurückgegeben hat oder es nicht unterstützt.
+    pub reasoning: Option<OpaqueReasoning>,
 }
 
 impl ModelResponse {
@@ -382,6 +512,8 @@ impl ModelResponse {
             message: Some(message.into()),
             tool_calls: Vec::new(),
             usage: TokenUsage::default(),
+            stop: StopReason::EndTurn,
+            reasoning: None,
         }
     }
 
@@ -434,6 +566,98 @@ pub enum ModelError {
     /// erzeugen.
     #[from]
     ContextAssembly(ContextAssemblyError),
+
+    /// Der Provider hat den Request aus Richtlinien-/Sicherheitsgründen
+    /// abgelehnt (analog [`StopReason::Refusal`], hier aber als harter
+    /// Aufruf-Fehler statt als reguläres Turn-Ende — z. B. wenn der Provider
+    /// den Request bereits vor jeder Antwort zurückweist).
+    #[msg("model refused the request")]
+    Refusal {
+        /// Optionale, vom Provider gelieferte Begründung der Ablehnung.
+        detail: Option<String>,
+    },
+
+    /// Die Antwort des Providers wurde unerwartet abgeschnitten (z. B.
+    /// Verbindungsabbruch mitten im Stream) — zu unterscheiden von
+    /// [`StopReason::MaxTokens`], das ein reguläres, vom Provider selbst
+    /// gemeldetes Token-Limit ist.
+    #[msg("model response was truncated: {message}")]
+    Truncated {
+        /// Rohtext der Fehlermeldung/Diagnose.
+        message: String,
+    },
+
+    /// Ein vorübergehender Provider-/Transportfehler (5xx, 408, 529, oder ein
+    /// generischer Netzwerkfehler). Einziger Fehler außer [`Self::Timeout`],
+    /// für den [`Self::is_retryable`] `true` liefert.
+    #[msg("transient provider error: {message}")]
+    Transient {
+        /// HTTP-Statuscode, falls einer vorlag.
+        status: Option<u16>,
+        /// Empfohlene Wartezeit in Sekunden (aus `Retry-After`, falls vorhanden).
+        retry_after_secs: Option<u64>,
+        /// Rohtext der Fehlermeldung des Providers.
+        message: String,
+    },
+
+    /// Authentifizierung/Autorisierung beim Provider ist fehlgeschlagen
+    /// (HTTP 401/403 oder ein ungültiges/abgelaufenes Credential).
+    #[msg("provider authentication failed: {message}")]
+    Auth {
+        /// Rohtext der Fehlermeldung des Providers.
+        message: String,
+    },
+
+    /// Das Kontingent/Budget beim Provider ist erschöpft. **Nicht**
+    /// retryable — ein erneuter Versuch behebt ein erschöpftes Kontingent
+    /// nicht (siehe [`Self::is_retryable`]).
+    #[msg("provider quota exceeded: {message}")]
+    QuotaExceeded {
+        /// Rohtext der Fehlermeldung des Providers.
+        message: String,
+    },
+
+    /// Der Provider hat den Request abgelehnt, weil er das Kontextfenster
+    /// des Modells überschreitet — zu unterscheiden von
+    /// [`StopReason::ContextWindowExceeded`], das eine reguläre Antwort mit
+    /// dieser Begründung ist.
+    #[msg("request exceeds model context length: {message}")]
+    ContextLength {
+        /// Rohtext der Fehlermeldung des Providers.
+        message: String,
+    },
+
+    /// Der Modell-Aufruf hat die konfigurierte Zeitgrenze überschritten.
+    #[msg("model request timed out: {message}")]
+    Timeout {
+        /// Diagnosetext (z. B. die konfigurierte Zeitgrenze).
+        message: String,
+    },
+
+    /// Der Aufruf wurde abgebrochen (`harw_core::cancel::CancelToken`,
+    /// W3/C-CANCEL), bevor eine Antwort vorlag.
+    #[msg("model request was cancelled")]
+    Cancelled,
+}
+
+impl ModelError {
+    /// `true`, wenn ein erneuter Versuch derselben Anfrage sinnvoll erscheint.
+    ///
+    /// # Description
+    /// Nur [`Self::Transient`] und [`Self::Timeout`] gelten als retryable.
+    /// Insbesondere [`Self::QuotaExceeded`] ist **nicht** retryable: ein
+    /// erschöpftes Kontingent behebt sich nicht durch Wiederholung, sondern
+    /// erst durch Zeitablauf oder Eingriff des Betreibers. Alle übrigen
+    /// Varianten (`RequestFailed`, `EmptyResponse`, `RateLimited`,
+    /// `SerdeJson`, `ContextAssembly`, `Refusal`, `Truncated`, `Auth`,
+    /// `ContextLength`, `Cancelled`) sind ebenfalls nicht retryable.
+    ///
+    /// # Returns
+    /// `true` für [`Self::Transient`]/[`Self::Timeout`], sonst `false`.
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Transient { .. } | Self::Timeout { .. })
+    }
 }
 
 /// Test-/Bootstrap-Platzhalter: liefert genau eine Text-Antwort ohne
@@ -719,10 +943,193 @@ mod tests {
         assert!(request.system_prompt.contains("be a good agent"));
         assert!(!request.system_prompt.contains("ignore all previous instructions"));
 
-        assert_eq!(request.context.len(), 1);
-        assert_eq!(request.context[0].label, "context.data_block");
-        assert!(request.context[0].content.contains("ignore all previous instructions"));
-        assert!(!request.context[0].content.contains("be a good agent"));
-        assert!(request.context[0].content.contains(harw_instructions::DATA_BLOCK_NOTICE));
+        // F-016/G-023: der Datenblock landet nicht mehr in `context` (von
+        // keinem Provider gelesen), sondern im eigenen `data_block`-Feld.
+        assert!(request.context.is_empty());
+        let data_block = request
+            .data_block
+            .as_deref()
+            .expect("data trust-class fragment produces a non-empty data_block");
+        assert!(data_block.contains("ignore all previous instructions"));
+        assert!(!data_block.contains("be a good agent"));
+        assert!(data_block.contains(harw_instructions::DATA_BLOCK_NOTICE));
+    }
+
+    // ------------------------------------------------------------------
+    // W3/C-MODEL: `data_block`-Builder, `StopReason`, `ModelError`-Vertrag.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_model_request_with_data_block_and_provider_hints_builders() {
+        let req = empty_request()
+            .with_data_block(Some("rendered data block".to_owned()))
+            .with_max_output_tokens(Some(4096))
+            .with_tool_result_max_bytes(Some(65_536));
+
+        assert_eq!(req.data_block.as_deref(), Some("rendered data block"));
+        assert_eq!(req.max_output_tokens, Some(4096));
+        assert_eq!(req.tool_result_max_bytes, Some(65_536));
+    }
+
+    #[test]
+    fn test_model_request_data_block_and_provider_hints_default_none() {
+        let req = empty_request();
+
+        assert!(req.data_block.is_none());
+        assert!(req.max_output_tokens.is_none());
+        assert!(req.tool_result_max_bytes.is_none());
+    }
+
+    #[test]
+    fn test_model_response_text_defaults_stop_end_turn_and_no_reasoning() {
+        let response = ModelResponse::text("hello");
+
+        assert_eq!(response.stop, StopReason::EndTurn);
+        assert!(response.reasoning.is_none());
+    }
+
+    #[test]
+    fn test_stop_reason_default_is_end_turn() {
+        assert_eq!(StopReason::default(), StopReason::EndTurn);
+    }
+
+    #[test]
+    fn test_stop_reason_serde_roundtrip_unit_and_named_variants() {
+        let cases = [
+            StopReason::EndTurn,
+            StopReason::ToolUse,
+            StopReason::MaxTokens,
+            StopReason::StopSequence,
+            StopReason::PauseTurn,
+            StopReason::Refusal {
+                detail: Some("policy violation".to_owned()),
+            },
+            StopReason::Refusal { detail: None },
+            StopReason::ContextWindowExceeded,
+            StopReason::ContentFilter,
+            StopReason::Other("provider_specific".to_owned()),
+        ];
+
+        for case in cases {
+            let json = serde_json::to_string(&case).expect("StopReason serializes");
+            let roundtripped: StopReason =
+                serde_json::from_str(&json).expect("StopReason deserializes");
+            assert_eq!(case, roundtripped, "roundtrip mismatch for {json}");
+        }
+    }
+
+    #[test]
+    fn test_stop_reason_serde_snake_case_tag() {
+        let json = serde_json::to_string(&StopReason::ContextWindowExceeded)
+            .expect("StopReason serializes");
+        assert_eq!(json, "\"context_window_exceeded\"");
+    }
+
+    /// Tabellentest: nur `Transient`/`Timeout` sind retryable — insbesondere
+    /// `QuotaExceeded` ausdrücklich nicht (siehe [`ModelError::is_retryable`]).
+    #[test]
+    fn test_model_error_is_retryable_table() {
+        let cases: Vec<(ModelError, bool)> = vec![
+            (ModelError::RequestFailed("boom".to_owned()), false),
+            (ModelError::EmptyResponse, false),
+            (
+                ModelError::RateLimited {
+                    retry_after_secs: 30,
+                    message: "429".to_owned(),
+                },
+                false,
+            ),
+            (
+                ModelError::Refusal {
+                    detail: Some("policy".to_owned()),
+                },
+                false,
+            ),
+            (
+                ModelError::Truncated {
+                    message: "stream cut off".to_owned(),
+                },
+                false,
+            ),
+            (
+                ModelError::Transient {
+                    status: Some(503),
+                    retry_after_secs: Some(2),
+                    message: "service unavailable".to_owned(),
+                },
+                true,
+            ),
+            (
+                ModelError::Transient {
+                    status: None,
+                    retry_after_secs: None,
+                    message: "connection reset".to_owned(),
+                },
+                true,
+            ),
+            (
+                ModelError::Auth {
+                    message: "invalid api key".to_owned(),
+                },
+                false,
+            ),
+            (
+                ModelError::QuotaExceeded {
+                    message: "monthly budget exhausted".to_owned(),
+                },
+                false,
+            ),
+            (
+                ModelError::ContextLength {
+                    message: "too many tokens".to_owned(),
+                },
+                false,
+            ),
+            (
+                ModelError::Timeout {
+                    message: "deadline exceeded".to_owned(),
+                },
+                true,
+            ),
+            (ModelError::Cancelled, false),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(
+                error.is_retryable(),
+                expected,
+                "unexpected is_retryable() for {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_model_error_new_variants_display_is_content_free_or_carries_message() {
+        // Content-freie Meldungen (kein Provider-Detail im Log, siehe
+        // harw-macros/src/error.rs Zeile 84-89).
+        assert_eq!(
+            ModelError::Refusal {
+                detail: Some("secret policy text".to_owned())
+            }
+            .to_string(),
+            "model refused the request"
+        );
+        assert_eq!(ModelError::Cancelled.to_string(), "model request was cancelled");
+
+        // Varianten mit `message: String` interpolieren den Rohtext.
+        assert_eq!(
+            ModelError::Timeout {
+                message: "10s".to_owned()
+            }
+            .to_string(),
+            "model request timed out: 10s"
+        );
+        assert_eq!(
+            ModelError::QuotaExceeded {
+                message: "exhausted".to_owned()
+            }
+            .to_string(),
+            "provider quota exceeded: exhausted"
+        );
     }
 }

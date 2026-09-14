@@ -42,7 +42,7 @@
 
 use std::sync::Arc;
 
-use crate::operation::{Operation, Surface};
+use crate::operation::{Operation, Surface, WebMethod};
 
 // ── RegistryError ─────────────────────────────────────────────────────────────
 
@@ -51,8 +51,9 @@ use crate::operation::{Operation, Surface};
 /// # Description
 /// Covers four distinct failure modes that can arise when registering a new
 /// operation against an already-populated registry. The name/alias checks are
-/// deterministic and case-insensitive; the web-path check is an exact,
-/// case-sensitive string match (HTTP paths are case-sensitive).
+/// deterministic and case-insensitive; the web-route check compares the full
+/// `(path, method)` pair — `path` as an exact, case-sensitive string match
+/// (HTTP paths are case-sensitive), `method` as an exact enum match (F-031).
 ///
 /// # Variants
 /// - [`Self::DuplicateName`]: Two ops share the same canonical name.
@@ -60,7 +61,8 @@ use crate::operation::{Operation, Surface};
 /// - [`Self::SelfCollision`]: An op declares its own name as one of its aliases, or
 ///   lists the same alias string more than once.
 /// - [`Self::WebPathCollision`]: Two ops declare a `Surface::Web` with the identical
-///   `path` — see that variant's own doc for why this check lives in the registry.
+///   `(path, method)` pair — see that variant's own doc for why this check lives in
+///   the registry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RegistryError {
     /// An operation with this canonical name is already registered.
@@ -85,7 +87,21 @@ pub enum RegistryError {
         /// Human-readable description of the inconsistency.
         reason: String,
     },
-    /// Two operations declare a `Surface::Web` entry with the identical `path`.
+    /// Two operations declare a `Surface::Web` entry with the identical `path`
+    /// **and** the identical `method` (F-031: `method` is part of route
+    /// identity, exactly like an HTTP router treats `GET /x` and `POST /x` as
+    /// two distinct, non-colliding routes).
+    ///
+    /// # Why `(path, method)`, not `path` alone
+    /// Before F-031, `Surface::Web` carried no explicit `method` — a `path`
+    /// match was the only possible collision signal. Now that `method` is
+    /// mandatory and explicit, two operations may legitimately share a `path`
+    /// as long as they answer to different methods (a read route and a write
+    /// route under the same URL, e.g. `GET /api/session` vs.
+    /// `POST /api/session`). Colliding only on the full pair keeps that
+    /// pattern possible while still rejecting two operations that would
+    /// otherwise be indistinguishable to `harw-web` (same `path` **and**
+    /// same `method`).
     ///
     /// # Why this check lives in the registry, not the macro
     /// `#[operation(...)]` (`harw-macros`) expands one operation at a time — it
@@ -93,14 +109,17 @@ pub enum RegistryError {
     /// cannot detect a cross-operation path collision at compile time. The
     /// registry is the first point that ever sees every operation together, so
     /// it is the only place this check can run. Two operations that answered
-    /// to the same HTTP path would be indistinguishable to `harw-web` — a
-    /// silent "first one wins" would hide the collision instead of failing loudly.
+    /// to the same `(path, method)` pair would be indistinguishable to
+    /// `harw-web` — a silent "first one wins" would hide the collision
+    /// instead of failing loudly.
     WebPathCollision {
         /// The colliding HTTP path.
         path: String,
-        /// Name of the operation that first claimed `path` as a `Surface::Web`.
+        /// The colliding HTTP method (identical on both sides — see above).
+        method: WebMethod,
+        /// Name of the operation that first claimed `(path, method)` as a `Surface::Web`.
         first_owner: String,
-        /// Name of the operation that tried to claim `path` again.
+        /// Name of the operation that tried to claim `(path, method)` again.
         second_owner: String,
     },
 }
@@ -126,12 +145,13 @@ impl std::fmt::Display for RegistryError {
             }
             Self::WebPathCollision {
                 path,
+                method,
                 first_owner,
                 second_owner,
             } => {
                 write!(
                     f,
-                    "web path '{path}' is claimed by both '{first_owner}' and '{second_owner}'"
+                    "web route '{method:?} {path}' is claimed by both '{first_owner}' and '{second_owner}'"
                 )
             }
         }
@@ -319,10 +339,12 @@ impl OperationRegistry {
     ///    (case-insensitive).
     /// 3. **Alias collision**: one of the new op's aliases matches either the canonical
     ///    name or any alias of an already-registered op (case-insensitive).
-    /// 4. **Web path collision**: one of the new op's `Surface::Web` paths matches a
-    ///    `Surface::Web` path already claimed by an existing op (exact string match —
-    ///    HTTP paths are case-sensitive). See [`RegistryError::WebPathCollision`] for
-    ///    why this check lives here rather than in `#[operation(...)]`.
+    /// 4. **Web path collision**: one of the new op's `Surface::Web` `(path, method)`
+    ///    pairs matches a `Surface::Web` `(path, method)` pair already claimed by an
+    ///    existing op (exact string match on `path` — HTTP paths are case-sensitive —
+    ///    plus an exact `method` match; the same `path` under a different `method` is
+    ///    not a collision). See [`RegistryError::WebPathCollision`] for why this check
+    ///    lives here rather than in `#[operation(...)]`.
     ///
     /// If all checks pass, the op is appended in insert order.
     ///
@@ -337,8 +359,8 @@ impl OperationRegistry {
     /// - [`RegistryError::SelfCollision`]: op's name equals one of its aliases, or an alias is repeated.
     /// - [`RegistryError::DuplicateName`]: a different op with the same canonical name exists.
     /// - [`RegistryError::AliasCollision`]: a new alias collides with an existing op's name or alias.
-    /// - [`RegistryError::WebPathCollision`]: a new `Surface::Web` path collides with an
-    ///   existing op's `Surface::Web` path.
+    /// - [`RegistryError::WebPathCollision`]: a new `Surface::Web` `(path, method)` pair
+    ///   collides with an existing op's `Surface::Web` `(path, method)` pair.
     ///
     /// # Nebenläufigkeit
     /// Erfordert exklusiven Zugriff (`&mut self`).
@@ -427,20 +449,34 @@ impl OperationRegistry {
                 });
             }
 
-            // 4. Web path collision — two operations answering the same HTTP
-            // path are indistinguishable to `harw-web`. Checked against every
-            // already-registered operation's `Surface::Web` entries.
+            // 4. Web path collision — two operations answering the same
+            // `(path, method)` pair are indistinguishable to `harw-web`. The
+            // same `path` under a different `method` is a legitimate,
+            // distinct route (e.g. `GET /api/x` and `POST /api/x`) and must
+            // not collide (F-031). Checked against every already-registered
+            // operation's `Surface::Web` entries.
             for new_surface in &meta.surfaces {
-                let Surface::Web { path: new_path, .. } = new_surface else {
+                let Surface::Web {
+                    path: new_path,
+                    method: new_method,
+                    ..
+                } = new_surface
+                else {
                     continue;
                 };
                 for ex_surface in &ex_meta.surfaces {
-                    let Surface::Web { path: ex_path, .. } = ex_surface else {
+                    let Surface::Web {
+                        path: ex_path,
+                        method: ex_method,
+                        ..
+                    } = ex_surface
+                    else {
                         continue;
                     };
-                    if new_path == ex_path {
+                    if new_path == ex_path && new_method == ex_method {
                         return Err(RegistryError::WebPathCollision {
                             path: (*new_path).to_owned(),
+                            method: *new_method,
                             first_owner: ex_meta.name.to_owned(),
                             second_owner: meta.name.to_owned(),
                         });
@@ -655,7 +691,7 @@ mod tests {
     use super::OperationRegistry;
     use crate::operation::{
         ApprovalPolicy, CommandVisibility, OpFuture, OpInput, Operation, OperationCategory,
-        OperationDomain, OperationMeta, PermissionTier, Surface,
+        OperationDomain, OperationMeta, PermissionTier, Surface, WebMethod,
     };
 
     // ── Fixtures ─────────────────────────────────────────────────────────────
@@ -683,6 +719,7 @@ mod tests {
                 aliases: &[],
                 category: OperationCategory::Misc,
                 args_schema: None,
+                output_schema: None,
             }))
         }
 
@@ -967,7 +1004,7 @@ mod tests {
             "status",
             vec![Surface::Web {
                 path: "/api/status",
-                readonly: true,
+                method: WebMethod::Get,
                 approval: ApprovalPolicy::None,
             }],
         ));
@@ -975,15 +1012,16 @@ mod tests {
             "other",
             vec![Surface::Web {
                 path: "/api/status",
-                readonly: true,
+                method: WebMethod::Get,
                 approval: ApprovalPolicy::None,
             }],
         ));
         assert!(
             matches!(
                 result,
-                Err(RegistryError::WebPathCollision { ref path, ref first_owner, ref second_owner })
-                    if path == "/api/status" && first_owner == "status" && second_owner == "other"
+                Err(RegistryError::WebPathCollision { ref path, method, ref first_owner, ref second_owner })
+                    if path == "/api/status" && method == WebMethod::Get
+                        && first_owner == "status" && second_owner == "other"
             ),
             "expected WebPathCollision for two ops on '/api/status', got: {result:?}"
         );
@@ -998,7 +1036,7 @@ mod tests {
             "status",
             vec![Surface::Web {
                 path: "/api/status",
-                readonly: true,
+                method: WebMethod::Get,
                 approval: ApprovalPolicy::None,
             }],
         ));
@@ -1006,7 +1044,7 @@ mod tests {
             "ps",
             vec![Surface::Web {
                 path: "/api/ps",
-                readonly: true,
+                method: WebMethod::Get,
                 approval: ApprovalPolicy::None,
             }],
         ));
@@ -1015,10 +1053,40 @@ mod tests {
     }
 
     #[test]
+    fn test_try_register_allows_same_path_with_different_methods() {
+        // F-031: `GET /api/session` and `POST /api/session` are two distinct,
+        // legitimate routes — the same `path` under a different `method` must
+        // not be treated as a collision.
+        let mut registry = OperationRegistry::new();
+        registry.register(make_op(
+            "session-read",
+            vec![Surface::Web {
+                path: "/api/session",
+                method: WebMethod::Get,
+                approval: ApprovalPolicy::None,
+            }],
+        ));
+        let result = registry.try_register(make_op(
+            "session-write",
+            vec![Surface::Web {
+                path: "/api/session",
+                method: WebMethod::Post,
+                approval: ApprovalPolicy::Always,
+            }],
+        ));
+        assert!(
+            result.is_ok(),
+            "same path with distinct methods must not collide, got: {result:?}"
+        );
+        assert_eq!(registry.len(), 2);
+    }
+
+    #[test]
     fn test_web_path_collision_display_mentions_both_owners_and_path() {
         use super::RegistryError;
         let err = RegistryError::WebPathCollision {
             path: "/api/status".to_owned(),
+            method: WebMethod::Get,
             first_owner: "status".to_owned(),
             second_owner: "other".to_owned(),
         };
@@ -1047,6 +1115,7 @@ mod tests {
                     aliases: &["m"],
                     category: OperationCategory::Misc,
                     args_schema: None,
+                    output_schema: None,
                 })
             }
             fn run<'a>(
@@ -1074,6 +1143,7 @@ mod tests {
                     aliases: &["m"],
                     category: OperationCategory::Misc,
                     args_schema: None,
+                    output_schema: None,
                 })
             }
             fn run<'a>(
@@ -1111,6 +1181,7 @@ mod tests {
                     aliases: &["bad"],
                     category: OperationCategory::Misc,
                     args_schema: None,
+                    output_schema: None,
                 })
             }
             fn run<'a>(
@@ -1166,6 +1237,7 @@ mod tests {
                     aliases: &[],
                     category: OperationCategory::Misc,
                     args_schema: None,
+                    output_schema: None,
                 })
             }
 

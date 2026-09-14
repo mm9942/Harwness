@@ -39,7 +39,7 @@
 use std::collections::HashSet;
 
 use time::OffsetDateTime;
-use tracing::{trace, warn};
+use tracing::trace;
 
 use crate::actions::{NodePatch, PlanAction};
 use crate::ids::TaskId;
@@ -249,17 +249,11 @@ pub(crate) fn apply_mutation(
             }
         }
 
-        // FEHLENDES FELD: `Plan` besitzt kein `goal_id`. Die Bindung kann
-        // deshalb nicht am Plan festgehalten werden; `goal_statement` wäre der
-        // falsche Ort (freier Text statt Referenz) und wird nicht überschrieben.
-        // Sobald `Plan.goal_id: Option<String>` in `types.rs` existiert, wird
-        // hier `plan.goal_id = Some(goal_id.clone())` gesetzt. Bis dahin bleibt
-        // die Aktion allein im Event-Log sichtbar.
+        // F-126: die Bindung wird am Plan festgehalten. `goal_statement`
+        // bleibt unverändert (freier Text, keine Referenz).
         PlanAction::BindGoal { goal_id } => {
-            warn!(
-                goal_id = %goal_id,
-                "BindGoal ist derzeit ein No-op: Plan besitzt kein goal_id-Feld"
-            );
+            plan.goal_id = Some(goal_id.clone());
+            trace!(goal_id = %goal_id, "Plan an Goal gebunden");
         }
 
         // Lesende Aktion ohne Zustandsänderung.
@@ -284,6 +278,15 @@ fn materialize_node(node: &PlanNode, parent: Option<&TaskId>, now: OffsetDateTim
     }
     materialized.created_at = now;
     materialized.updated_at = now;
+    // F-013 §5.1 Punkt 3: ein Payload-Nachweis mit Zukunfts-Zeitstempel würde
+    // dauerhaft als „frische Exploration“ gelten. Der Zeitstempel wird auf
+    // `now` gekappt; ältere Zeitstempel bleiben erhalten (sie können nur
+    // früher verfallen, nie später).
+    for evidence in &mut materialized.evidence {
+        if evidence.attached_at > now {
+            evidence.attached_at = now;
+        }
+    }
     materialized
 }
 
@@ -386,17 +389,21 @@ fn begin_next_attempt(node: &mut PlanNode, actor: &str) {
 
 /// Hängt einen Nachweis an, sofern (kind, locator) noch nicht vorhanden ist.
 ///
-/// Duplikate werden still ignoriert (Design-Doc §5 Regel 9). Der
-/// `attached_at`-Zeitstempel der Payload wird verworfen.
+/// Duplikate erzeugen keinen zweiten Eintrag (Design-Doc §5 Regel 9), erneuern
+/// aber den `attached_at`-Zeitstempel des vorhandenen Eintrags: eine erneute
+/// Exploration unter demselben Locator muss die Frist (Regel 12) wieder
+/// aufladen können (G-014). Der `attached_at`-Zeitstempel der Payload wird
+/// verworfen.
 fn push_evidence_unique(
     evidence: &mut Vec<EvidenceRef>,
     candidate: &EvidenceRef,
     now: OffsetDateTime,
 ) {
-    let is_duplicate = evidence
-        .iter()
-        .any(|existing| existing.kind == candidate.kind && existing.locator == candidate.locator);
-    if is_duplicate {
+    if let Some(existing) = evidence
+        .iter_mut()
+        .find(|existing| existing.kind == candidate.kind && existing.locator == candidate.locator)
+    {
+        existing.attached_at = now;
         return;
     }
     let mut attached = candidate.clone();
@@ -1186,7 +1193,7 @@ mod tests {
     // ── No-ops ────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_bind_goal_is_noop_until_plan_has_goal_id() {
+    fn test_bind_goal_sets_goal_id() {
         let mut plan = make_plan(vec![make_node("t1", PlanNodeStatus::Draft)]);
         let action = PlanAction::BindGoal {
             goal_id: "g-1".to_owned(),
@@ -1194,11 +1201,50 @@ mod tests {
 
         apply_mutation(&mut plan, &action, "owner", now());
 
+        assert_eq!(plan.goal_id.as_deref(), Some("g-1"), "F-126: goal_id gesetzt");
         assert_eq!(
             plan.goal_statement, "Mutationstests",
             "BindGoal darf goal_statement nicht überschreiben"
         );
         assert_eq!(find(&plan, "t1").updated_at, payload_time());
+    }
+
+    #[test]
+    fn test_add_node_clamps_future_evidence_timestamp() {
+        let mut plan = make_plan(Vec::new());
+        let mut node = make_node("t1", PlanNodeStatus::Draft);
+        let mut future = make_evidence(EvidenceKind::Finding, "q-1");
+        future.attached_at = now() + Duration::days(3650);
+        let mut past = make_evidence(EvidenceKind::Finding, "q-0");
+        past.attached_at = now() - Duration::hours(1);
+        node.evidence = vec![future, past];
+
+        apply_mutation(&mut plan, &PlanAction::AddNode { node }, "worker", now());
+
+        let node = find(&plan, "t1");
+        assert_eq!(node.evidence[0].attached_at, now(), "Zukunft wird gekappt");
+        assert_eq!(
+            node.evidence[1].attached_at,
+            now() - Duration::hours(1),
+            "Vergangenheit bleibt"
+        );
+    }
+
+    #[test]
+    fn test_attach_evidence_duplicate_refreshes_attached_at() {
+        let mut plan = make_plan(vec![make_node("t1", PlanNodeStatus::Draft)]);
+        let action = PlanAction::AttachEvidence {
+            id: TaskId::new("t1"),
+            evidence: make_evidence(EvidenceKind::Finding, "q-1"),
+        };
+
+        apply_mutation(&mut plan, &action, "explorer", now());
+        let later = now() + Duration::hours(30);
+        apply_mutation(&mut plan, &action, "explorer", later);
+
+        let node = find(&plan, "t1");
+        assert_eq!(node.evidence.len(), 1);
+        assert_eq!(node.evidence[0].attached_at, later, "G-014: Frist erneuert");
     }
 
     #[test]

@@ -71,8 +71,12 @@
 //! # fn demo(input: ReconcileInput<'_>, plan: &dyn harw_plan::PlanStore) {
 //! let steps = PlanController::reconcile(input);
 //! // Angewandt wird nur, was Runtime-Aktion ist; der Rest kommt zurück.
-//! let applied = PlanController::apply(&steps, plan, None, "runtime");
-//! let _ = applied;
+//! match PlanController::apply(&steps, plan, None, "runtime") {
+//!     Ok((events, proposals)) => {
+//!         println!("{} Events, {} Vorschläge", events.len(), proposals.len());
+//!     }
+//!     Err(error) => eprintln!("Abgleich abgelehnt: {error}"),
+//! }
 //! # }
 //! ```
 
@@ -124,15 +128,26 @@ pub use crate::security_bridge::{
 /// importieren können.
 #[cfg(test)]
 pub(crate) mod testing {
-    use harw_plan::actions::PlanAction;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use harw_job_runtime::{Budget, JobScope, RetryPolicy};
+    use harw_plan::actions::{PlanAction, PlanEvent};
+    use harw_plan::admission::RepoRevision;
+    use harw_plan::error::{PlanError, PlanResult};
     use harw_plan::goal::{Goal, GoalId, GoalStatus, Invariant};
     use harw_plan::types::{Criterion, VerificationStep};
     use harw_plan::{
-        EvidenceKind, EvidenceRef, InMemoryPlanStore, PathOrSymbol, Plan, PlanId, PlanNode,
-        PlanNodeKind, PlanNodeStatus, PlanStore, PlanToolConfig, RevisionId, TaskId,
+        EvidenceKind, EvidenceRef, InMemoryPlanStore, InvalidationCondition, PathOrSymbol, Plan,
+        PlanId, PlanNode, PlanNodeKind, PlanNodeStatus, PlanRevision, PlanStore, PlanToolConfig,
+        RevisionId, TaskId,
     };
     use harw_research::{Confidence, QuestionId, ResearchFinding, SourceClass, SourceReference};
+    use harw_session_store::{JobListQuery, JobStore};
+    use harw_types::{ApprovalActor, TenantId, WorkspaceId};
+    use jiff::SignedDuration;
     use time::OffsetDateTime;
+
+    use crate::job_bridge::JobAdmissionTemplate;
 
     /// Re-Export des echten Goal-Stores für die Aufrufstellen in dieser Crate.
     pub(crate) use harw_plan::InMemoryGoalStore;
@@ -265,10 +280,18 @@ pub(crate) mod testing {
         node_with(id, PlanNodeKind::Research, status)
     }
 
+    /// Parst eine Test-Plan-ID über die geprüfte Grammatik (`PlanId::parse`).
+    pub(crate) fn plan_id(raw: &str) -> PlanId {
+        match PlanId::parse(raw) {
+            Ok(id) => id,
+            Err(error) => panic!("Test-Plan-ID '{raw}' ungültig: {error}"),
+        }
+    }
+
     /// Baut einen Plan-Snapshot von Hand (ohne Store-Validation).
     pub(crate) fn plan_with(nodes: Vec<PlanNode>) -> Plan {
         Plan {
-            id: PlanId::new("p-test"),
+            id: plan_id("p-test"),
             revision: RevisionId::new(1),
             parent_revision: None,
             goal_statement: "Test-Ziel".to_owned(),
@@ -279,25 +302,241 @@ pub(crate) mod testing {
         }
     }
 
-    /// Legt einen `InMemoryPlanStore` mit Plan und Knoten an.
+    /// Legt einen `InMemoryPlanStore` (aktivierte Standardwerte, ohne
+    /// Explorationspflicht) mit Plan und Knoten an.
+    ///
+    /// Siehe [`seeded_plan_store_with_config`] für die Einfügeregeln.
     pub(crate) fn seeded_plan_store(nodes: Vec<PlanNode>) -> InMemoryPlanStore {
-        let store = InMemoryPlanStore::new();
+        seeded_plan_store_with_config(PlanToolConfig::enabled_defaults(), nodes)
+    }
+
+    /// Legt einen `InMemoryPlanStore` mit `config`, Plan `p-test` und Knoten an.
+    ///
+    /// # Description
+    /// `harw-plan` nimmt neue Knoten nur als `Draft` an (F-013 §5.1 Punkt 1).
+    /// Die Fixture fügt deshalb jeden Knoten als `Draft` ein und führt ihn
+    /// danach über die zulässigen Übergänge der Statusmatrix in seinen
+    /// gewünschten Status — alles in **einem** `apply_batch`:
+    ///
+    /// - `Ready`: `SetStatus(Ready)`
+    /// - `InProgress`: `Ready → InProgress`
+    /// - `Completed`: `Ready → InProgress`, ein `Manual`-Nachweis (falls der
+    ///   Knoten keinen mitbringt), `→ Completed`
+    /// - `Blocked` / `Superseded`: direkter `SetStatus`
+    /// - `Invalidated`: `Invalidate(ManualInvalidate)`
+    ///
+    /// Erst werden alle Knoten eingefügt, dann die Übergänge in Listenordnung
+    /// ausgeführt: Abhängigkeiten und Kinder eines Composite müssen also
+    /// **vor** dem Knoten stehen, der ihren Abschluss voraussetzt. Knoten, die
+    /// laut `config` eine Exploration verlangen, lassen sich ohne passende
+    /// Abhängigkeit nicht auf `Ready` bringen.
+    pub(crate) fn seeded_plan_store_with_config(
+        config: PlanToolConfig,
+        nodes: Vec<PlanNode>,
+    ) -> InMemoryPlanStore {
+        let store = match InMemoryPlanStore::with_config(config) {
+            Ok(store) => store,
+            Err(error) => panic!("Store anlegen: {error}"),
+        };
         if let Err(error) = store.apply(
             PlanAction::Create {
-                plan_id: PlanId::new("p-test"),
+                plan_id: plan_id("p-test"),
                 goal: "Test-Ziel".to_owned(),
             },
             "test",
         ) {
             panic!("Plan anlegen: {error}");
         }
-        for node in nodes {
-            let id = node.id.clone();
-            if let Err(error) = store.apply(PlanAction::AddNode { node }, "test") {
-                panic!("Knoten '{id}' anlegen: {error}");
+        let actions = seed_actions(nodes);
+        if !actions.is_empty() {
+            if let Err(error) =
+                store.apply_batch(&plan_id("p-test"), actions, "test", RevisionId::new(1))
+            {
+                panic!("Knoten einsäen: {error}");
             }
         }
         store
+    }
+
+    /// Übersetzt Wunschknoten in `AddNode(Draft)` plus zulässige Übergänge.
+    fn seed_actions(nodes: Vec<PlanNode>) -> Vec<PlanAction> {
+        let mut inserts: Vec<PlanAction> = Vec::with_capacity(nodes.len());
+        let mut transitions: Vec<PlanAction> = Vec::new();
+        for mut node in nodes {
+            let target = node.status;
+            let id = node.id.clone();
+            let has_evidence = !node.evidence.is_empty();
+            node.status = PlanNodeStatus::Draft;
+            inserts.push(PlanAction::AddNode { node });
+            transitions.extend(seed_transitions(&id, target, has_evidence));
+        }
+        inserts.extend(transitions);
+        inserts
+    }
+
+    /// Die Übergangskette von `Draft` in den Zielstatus.
+    fn seed_transitions(id: &TaskId, target: PlanNodeStatus, has_evidence: bool) -> Vec<PlanAction> {
+        let set = |status: PlanNodeStatus| PlanAction::SetStatus {
+            id: id.clone(),
+            status,
+            reason: Some("Test-Fixture".to_owned()),
+        };
+        match target {
+            PlanNodeStatus::Draft => Vec::new(),
+            PlanNodeStatus::Ready => vec![set(PlanNodeStatus::Ready)],
+            PlanNodeStatus::InProgress => {
+                vec![set(PlanNodeStatus::Ready), set(PlanNodeStatus::InProgress)]
+            }
+            PlanNodeStatus::Completed => {
+                let mut chain = vec![set(PlanNodeStatus::Ready), set(PlanNodeStatus::InProgress)];
+                if !has_evidence {
+                    chain.push(PlanAction::AttachEvidence {
+                        id: id.clone(),
+                        evidence: EvidenceRef {
+                            kind: EvidenceKind::Manual,
+                            locator: format!("fixture:{id}"),
+                            attached_at: plan_time(),
+                            actor: "test".to_owned(),
+                            digest: None,
+                        },
+                    });
+                }
+                chain.push(set(PlanNodeStatus::Completed));
+                chain
+            }
+            PlanNodeStatus::Blocked => vec![set(PlanNodeStatus::Blocked)],
+            PlanNodeStatus::Superseded => vec![set(PlanNodeStatus::Superseded)],
+            PlanNodeStatus::Invalidated => vec![PlanAction::Invalidate {
+                ids: vec![id.clone()],
+                condition: InvalidationCondition::ManualInvalidate,
+            }],
+        }
+    }
+
+    /// Ein Plan-Store-Double, das Revisionskonflikte und Batch-Fehler
+    /// injiziert und alles andere an einen `InMemoryPlanStore` weiterreicht.
+    ///
+    /// # Description
+    /// - `inject_conflicts(n)`: die nächsten `n` `apply_batch`-Aufrufe
+    ///   finden einen „fremden Schreiber“ vor — vor dem Batch wird
+    ///   `PlanAction::Inspect` angewandt, das die Revision erhöht, sodass der
+    ///   Batch mit echtem `RevisionConflict` scheitert.
+    /// - `inject_failures(n)`: die nächsten `n` `apply_batch`-Aufrufe
+    ///   scheitern mit `PlanError::Io`, ohne etwas zu schreiben.
+    ///
+    /// # Concurrency
+    /// Zähler als `AtomicUsize`; `Send + Sync` wie der innere Store.
+    #[derive(Default)]
+    pub(crate) struct ScriptedPlanStore {
+        inner: InMemoryPlanStore,
+        conflicts: AtomicUsize,
+        failures: AtomicUsize,
+        batch_calls: AtomicUsize,
+    }
+
+    impl ScriptedPlanStore {
+        /// Umhüllt einen (üblicherweise eingesäten) Store.
+        pub(crate) fn new(inner: InMemoryPlanStore) -> Self {
+            Self {
+                inner,
+                ..Self::default()
+            }
+        }
+
+        /// Lässt die nächsten `count` Batches auf einen Revisionskonflikt laufen.
+        pub(crate) fn inject_conflicts(&self, count: usize) {
+            self.conflicts.store(count, Ordering::SeqCst);
+        }
+
+        /// Lässt die nächsten `count` Batches mit einem I/O-Fehler scheitern.
+        pub(crate) fn inject_failures(&self, count: usize) {
+            self.failures.store(count, Ordering::SeqCst);
+        }
+
+        /// Zahl der bisherigen `apply_batch`-Aufrufe.
+        pub(crate) fn batch_calls(&self) -> usize {
+            self.batch_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    // Verbraucht eine Einheit eines Injektionszählers, falls vorhanden.
+    fn take_one(counter: &AtomicUsize) -> bool {
+        counter
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+    }
+
+    impl PlanStore for ScriptedPlanStore {
+        fn current(&self) -> PlanResult<Plan> {
+            self.inner.current()
+        }
+
+        fn revision(&self) -> RevisionId {
+            self.inner.revision()
+        }
+
+        fn apply(&self, action: PlanAction, actor: &str) -> PlanResult<PlanEvent> {
+            self.inner.apply(action, actor)
+        }
+
+        fn history(&self, since: Option<RevisionId>) -> PlanResult<Vec<PlanEvent>> {
+            self.inner.history(since)
+        }
+
+        fn apply_batch(
+            &self,
+            plan: &PlanId,
+            actions: Vec<PlanAction>,
+            actor: &str,
+            expected_rev: RevisionId,
+        ) -> PlanResult<PlanRevision> {
+            self.batch_calls.fetch_add(1, Ordering::SeqCst);
+            if take_one(&self.failures) {
+                return Err(PlanError::Io(std::io::Error::other("injizierter Batch-Fehler")));
+            }
+            if take_one(&self.conflicts) {
+                self.inner.apply(PlanAction::Inspect, "fremder-schreiber")?;
+            }
+            self.inner.apply_batch(plan, actions, actor, expected_rev)
+        }
+    }
+
+    /// Ein Job-Admission-Template mit festen Testwerten.
+    pub(crate) fn admission_template() -> JobAdmissionTemplate {
+        let retry = match RetryPolicy::try_new(1, SignedDuration::ZERO, 2.0, SignedDuration::ZERO) {
+            Ok(retry) => retry,
+            Err(error) => panic!("RetryPolicy: {error}"),
+        };
+        JobAdmissionTemplate::new(
+            JobScope::new(
+                TenantId::from_str("tenant-test"),
+                WorkspaceId::from_str("workspace"),
+                ApprovalActor::Operator {
+                    id: "operator-1".to_owned(),
+                },
+            ),
+            Budget::unbounded(),
+            retry,
+            RepoRevision("abc123".to_owned()),
+            timestamp(),
+        )
+    }
+
+    /// Ein Job-Store in einem frischen Temp-Verzeichnis.
+    pub(crate) fn temp_job_store() -> (JobStore, tempfile::TempDir) {
+        let dir = match tempfile::tempdir() {
+            Ok(dir) => dir,
+            Err(error) => panic!("Temp-Verzeichnis: {error}"),
+        };
+        (JobStore::new(dir.path()), dir)
+    }
+
+    /// Zahl aller Jobs im Store (eine Seite genügt für Tests).
+    pub(crate) fn job_count(jobs: &JobStore) -> usize {
+        match jobs.list(&JobListQuery::default()) {
+            Ok(page) => page.jobs.len(),
+            Err(error) => panic!("Jobs auflisten: {error}"),
+        }
     }
 
     /// Konfiguration, die Exploration vor `Coding` verlangt.
@@ -419,9 +658,54 @@ pub(crate) mod testing {
                 coding_node("t-2", PlanNodeStatus::Completed),
             ]);
             match store.current() {
-                Ok(plan) => assert_eq!(plan.nodes.len(), 2),
+                Ok(plan) => {
+                    assert_eq!(plan.nodes.len(), 2);
+                    assert_eq!(plan.nodes[0].status, PlanNodeStatus::Ready);
+                    assert_eq!(plan.nodes[1].status, PlanNodeStatus::Completed);
+                    assert_eq!(plan.nodes[1].evidence.len(), 1);
+                }
                 Err(error) => panic!("current schlug fehl: {error}"),
             }
+        }
+
+        #[test]
+        fn test_seeded_plan_store_reaches_every_status_through_legal_transitions() {
+            let statuses = [
+                PlanNodeStatus::Draft,
+                PlanNodeStatus::Ready,
+                PlanNodeStatus::InProgress,
+                PlanNodeStatus::Blocked,
+                PlanNodeStatus::Completed,
+                PlanNodeStatus::Superseded,
+                PlanNodeStatus::Invalidated,
+            ];
+            let nodes = statuses
+                .iter()
+                .enumerate()
+                .map(|(index, status)| coding_node(&format!("t-{index}"), *status))
+                .collect();
+            let store = seeded_plan_store(nodes);
+            let plan = match store.current() {
+                Ok(plan) => plan,
+                Err(error) => panic!("current schlug fehl: {error}"),
+            };
+            let seen: Vec<PlanNodeStatus> = plan.nodes.iter().map(|node| node.status).collect();
+            assert_eq!(seen, statuses.to_vec());
+        }
+
+        #[test]
+        fn test_scripted_plan_store_injects_a_real_revision_conflict() {
+            let store = ScriptedPlanStore::new(seeded_plan_store(vec![coding_node(
+                "t-1",
+                PlanNodeStatus::Draft,
+            )]));
+            store.inject_conflicts(1);
+            let revision = store.revision();
+            match store.apply_batch(&plan_id("p-test"), vec![PlanAction::Inspect], "t", revision) {
+                Err(PlanError::RevisionConflict { .. }) => {}
+                other => panic!("erwartet RevisionConflict, bekommen: {other:?}"),
+            }
+            assert_eq!(store.batch_calls(), 1);
         }
     }
 }

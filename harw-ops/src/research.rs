@@ -369,7 +369,7 @@ async fn run_research(
     model_tool(readonly, approval = "none"),
     // Web-Fläche übernimmt dieselbe Achse wie das ModelTool: read-only
     // Kindagent, keine Mutation.
-    web(path = "/api/research-deps", readonly, approval = "none"),
+    web(path = "/api/research-deps", method = "get", approval = "none"),
     agent_tool(
         child = "researcher-deps",
         authority = "reduce_to_read_only",
@@ -430,7 +430,7 @@ async fn research_deps(ctx: &OpContext, args: ResearchArgs) -> Result<OpOutput, 
     model_tool(readonly, approval = "none"),
     // Web-Fläche übernimmt dieselbe Achse wie das ModelTool: read-only
     // Kindagent, keine Mutation.
-    web(path = "/api/research-web", readonly, approval = "none"),
+    web(path = "/api/research-web", method = "get", approval = "none"),
     agent_tool(
         child = "researcher-web",
         authority = "reduce_to_read_only",

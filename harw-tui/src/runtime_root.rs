@@ -18,6 +18,14 @@
 //!   ([`run_tui`]); ein Wechsel der Sitzung montiert über
 //!   [`TuiAssemblyFactory`] eine **neue** Laufzeit, denn eine Montage vergibt
 //!   ihre Wurzel-Registry genau einmal.
+//! - Schritt 7 (Session-Titel und Resume-Picker): `/resume` ohne Selektor
+//!   öffnet den Session-Picker statt einer Textliste (`session_entries`
+//!   reichert die vom Selektor gelieferten IDs über
+//!   [`harw_session_store::meta::load_or_derive`] an), das Fortsetzen einer
+//!   Sitzung aktualisiert ihren Metadaten-Sidecar
+//!   ([`harw_session_store::meta::touch_opened`]), und [`build_root_runtime`]
+//!   stellt den Kontext für die (noch in `crate::app` zu verdrahtende)
+//!   Titel-Job-Anstoßung zusammen ([`TitleJobContext`]).
 //!
 //! Der Renderer selbst (`run_loop`, Zellen, Tastatur) bleibt in
 //! [`crate::app`].
@@ -25,7 +33,9 @@
 //! ## Schlüsseltypen
 //! - [`TuiSessionWiring`] — Controller + Sitzungs-Ereigniskanal einer Montage.
 //! - [`TuiAssemblyFactory`] — baut für `/resume <id>` eine neue Montage.
-//! - [`TuiResume`] — Auswahl dauerhafter Sitzungen plus Fabrik.
+//! - [`TuiResume`] — Auswahl dauerhafter Sitzungen plus Fabrik plus
+//!   Session-Store-Wurzel (Schritt 7).
+//! - [`TitleJobContext`] — Zutaten für die Titel-Job-Anstoßung (Schritt 7).
 //! - [`TuiRunOptions`] — Eingaben von [`run_tui`] neben der Montage.
 //! - `ResumableGateway` — `ChatGateway` mit austauschbarer Sitzung (privat).
 //!
@@ -56,7 +66,9 @@
 //! # }
 //! ```
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use ratatui::text::Line;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -66,8 +78,9 @@ use harw_extension_api::ApprovalHandler;
 use harw_operations::SharedSessionController;
 use harw_operations::adapter::CommandAdapter;
 use harw_protocol::events::{SessionEvent, TurnEvent};
-use harw_runtime::{RootSession, RuntimeAssembly, RuntimeAssemblyBuilder};
-use harw_types::SessionId;
+use harw_runtime::{RootSession, RuntimeAssembly, RuntimeAssemblyBuilder, ServiceSurface};
+use harw_session_store::meta::{self, SessionMeta};
+use harw_types::{Clock, SessionId, SystemClock};
 
 use crate::app::{
     ChatApp, ResumeSessionSelector, TerminalGuard, TuiError, TuiPlanServices, TuiRunOutcome,
@@ -78,6 +91,7 @@ use crate::events::harw_event_channel;
 use crate::frame_requester::frame_channel;
 use crate::input_reader::spawn_input_reader;
 use crate::session_controller::TuiSessionController;
+use crate::session_picker::SessionEntry;
 use crate::tui_event::TuiEvent;
 
 /// Hinweis, wenn `/resume` ohne konfigurierte [`TuiResume`] eintrifft.
@@ -215,11 +229,37 @@ pub trait TuiAssemblyFactory {
 }
 
 /// Alles, was `/resume` braucht.
+///
+/// # Annahme (Schritt 7)
+/// [`ResumeSessionSelector`] (definiert in `crate::app`, gehört nicht zu
+/// diesem Slice) liefert weiterhin nur `Vec<SessionId>` /
+/// `Result<SessionId, String>` — die reichhaltigere Anzeige des Session-
+/// Pickers (Titel, letzte Aktivität, Projekt, Turns) wird **hier lokal**
+/// nachgerüstet, über [`harw_session_store::meta::load_or_derive`]
+/// ([`session_entries`]). Dafür braucht dieser Typ zusätzlich die Wurzel des
+/// Session-Stores, in der die `<id>.meta.json`-Sidecars liegen — dieselbe
+/// Wurzel, die die Composition-Root (`harw-cli/src/chat.rs`) auch dem
+/// Transcript-Speicher und `ProfileResumeSelector` übergibt. **Fremde
+/// Anpassung nötig**: `harw-cli/src/chat.rs` muss beim Bau von `TuiResume`
+/// zusätzlich `session_store_root: sessions_root.clone()` mitgeben (aktuell
+/// wird `sessions_root` unverändert in `ProfileResumeSelector::new`
+/// verschoben).
 pub struct TuiResume {
     /// Listet und löst dauerhafte Sitzungen auf.
     pub selector: Box<dyn ResumeSessionSelector>,
     /// Montiert die gewählte Sitzung.
     pub factory: Box<dyn TuiAssemblyFactory>,
+    /// Wurzelverzeichnis des Session-Stores (Transcripts und
+    /// `.meta.json`-Sidecars), für [`session_entries`] und
+    /// [`harw_session_store::meta::touch_opened`].
+    pub session_store_root: PathBuf,
+    /// Ob beim Start sofort der Session-Picker erscheinen soll.
+    ///
+    /// `harw -r` ohne Selektor setzt das: die CLI startet dann eine frische
+    /// Sitzung, und die Auswahl übernimmt der Picker. Ohne dieses Feld bliebe
+    /// `-r` wirkungslos, weil der Picker sonst nur über `/resume` in der
+    /// laufenden Sitzung erscheint.
+    pub open_picker_at_start: bool,
 }
 
 /// Handgeschriebenes `Debug`: die Trait-Objekte leiten kein `Debug` ab.
@@ -229,6 +269,70 @@ impl std::fmt::Debug for TuiResume {
             .debug_struct("TuiResume")
             .field("selector", &"<dyn ResumeSessionSelector>")
             .field("factory", &"<dyn TuiAssemblyFactory>")
+            .field("session_store_root", &self.session_store_root)
+            .field("open_picker_at_start", &self.open_picker_at_start)
+            .finish()
+    }
+}
+
+/// Kontext für die (noch ausstehende) Titel-Job-Anstoßung nach dem ersten
+/// abgeschlossenen Turn einer neuen Sitzung (Schritt 7).
+///
+/// # Annahme
+/// `harw_runtime::session_title::spawn_title_job` existiert zum Zeitpunkt
+/// dieses Slices noch nicht (paralleler Slice `harw-runtime/src/session_title.rs`,
+/// Welle W1 „Schritt 7 Store/Titel"). Erwartete Signatur, dokumentiert für die
+/// Gegenseite:
+///
+/// ```ignore
+/// pub fn spawn_title_job(
+///     provider: std::sync::Arc<dyn harw_core::ModelProvider>,
+///     session_store_root: std::path::PathBuf,
+///     session_id: harw_types::SessionId,
+///     first_user_message: String,
+///     assistant_reply_start: String,
+///     title_model: Option<String>,
+/// );
+/// ```
+///
+/// Der eigentliche Aufruf gehört an die Stelle, an der
+/// `SessionEvent::TurnCompleted` in `crate::app::run_loop` behandelt wird
+/// (`harw-tui/src/app.rs:~1279`) — diese Datei gehört nicht zu diesem Slice
+/// (B3b, nur `runtime_root.rs`). [`build_root_runtime`] stellt hier nur
+/// zusammen, was für diesen (noch zu ergänzenden) Aufruf gebraucht wird, und
+/// reicht es über die ebenfalls noch zu ergänzende
+/// `ChatApp::with_title_job_context(TitleJobContext) -> ChatApp` an den
+/// Renderer-Zustand weiter. `run_loop` müsste dort beim ersten
+/// `SessionEvent::TurnCompleted` einer Sitzung ohne vorhandenen Titel (siehe
+/// `harw_session_store::meta::SessionMeta::title_source`) `spawn_title_job`
+/// mit der ersten Nutzernachricht und dem Anfang der ersten Modellantwort
+/// aufrufen und den Kontext danach verwerfen (nur einmal je Sitzung).
+///
+/// Die Bedingung „nur wenn ein Provider verfügbar ist" ist in dieser
+/// Laufzeit-Architektur strukturell immer erfüllt: [`RuntimeAssembly::model`]
+/// liefert stets einen `Arc<dyn ModelProvider>` (auch der Offline-Echo-Modus
+/// zählt als „verfügbar"). [`build_root_runtime`] gattert stattdessen nur auf
+/// die Konfiguration (`title_generation`) und darauf, ob überhaupt eine
+/// Session-Store-Wurzel bekannt ist (kein `TuiResume` → keine Wurzel → kein
+/// Titel-Job, da nirgends ein Sidecar geschrieben werden könnte).
+#[derive(Clone)]
+pub struct TitleJobContext {
+    /// Modell-Anbieter der (neuen) Wurzelsitzung.
+    pub provider: Arc<dyn ModelProvider>,
+    /// Wurzelverzeichnis des Session-Stores für den Sidecar-Schreibzugriff.
+    pub session_store_root: PathBuf,
+    /// Konfiguriertes Titel-Modell (`[session] title_model`), falls gesetzt.
+    pub title_model: Option<String>,
+}
+
+/// Handgeschriebenes `Debug`: `provider` ist ein Trait-Objekt.
+impl std::fmt::Debug for TitleJobContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TitleJobContext")
+            .field("provider", &"<dyn ModelProvider>")
+            .field("session_store_root", &self.session_store_root)
+            .field("title_model", &self.title_model)
             .finish()
     }
 }
@@ -267,8 +371,11 @@ impl std::fmt::Debug for TuiRunOptions {
 /// Freigabetreiber gemeinsam aus und schließt danach die alte Sitzung
 /// ([`RuntimeAssembly::close_session`]). Scheitert einer dieser Schritte,
 /// bleibt die bisherige Sitzung aktiv und der Fehler erscheint als
-/// Systemzeile. Beim Verlassen der Schleife wird die aktive Sitzung
-/// geschlossen.
+/// Systemzeile. Scheitert das Laden des Verlaufs der Startsitzung (Schritt 3)
+/// oder das Betreten des Terminals (Schritt 4), ist die Wurzelsitzung bereits
+/// erzeugt; sie wird vor der Rückgabe von `Err` ebenfalls per
+/// [`RuntimeAssembly::close_session`] geschlossen. Beim Verlassen der
+/// Schleife wird die aktive Sitzung geschlossen.
 ///
 /// # Argumente
 /// - `assembly` (`Arc<RuntimeAssembly>`): Montage mit Einstieg `Tui`, gebaut
@@ -280,8 +387,9 @@ impl std::fmt::Debug for TuiRunOptions {
 ///
 /// # Fehler
 /// - [`TuiError::Io`]: Runtime-, Terminal- oder Zeichenfehler.
-/// - [`TuiError::Core`]: Wurzelsitzung nicht montierbar, Verlauf der
-///   Startsitzung nicht ladbar oder Fehler im Turn-Loop.
+/// - [`TuiError::Core`]: `options.wiring` gehört nicht zu `assembly`,
+///   Wurzelsitzung nicht montierbar, Verlauf der Startsitzung nicht ladbar
+///   oder Fehler im Turn-Loop.
 ///
 /// # Nebenläufigkeit
 /// Blockiert den aufrufenden Thread; startet einen Eingabe-Reader-Thread und
@@ -311,10 +419,20 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
         mut turn_event_rx,
         mut approval_driver,
         mut approvals,
-    } = build_root_runtime(&assembly, wiring)?;
-    let history = runtime
-        .block_on(assembly.state_store().load_history(session.id()))
-        .map_err(|error| TuiError::Core(format!("durable history load failed: {error}")))?;
+    } = build_root_runtime(
+        &assembly,
+        wiring,
+        resume.as_ref().map(|r| r.session_store_root.as_path()),
+    )?;
+    let history = match runtime.block_on(assembly.state_store().load_history(session.id())) {
+        Ok(history) => history,
+        Err(error) => {
+            // Die Wurzelsitzung wurde bereits erzeugt (`build_root_runtime`);
+            // ihr Ende wird gemeldet, bevor der Fehler propagiert.
+            assembly.close_session(assembly.root_session_id());
+            return Err(TuiError::Core(format!("durable history load failed: {error}")));
+        }
+    };
     install_loaded_history(&mut session, &mut app, history);
     app.push_lines(vec![Line::from(WELCOME)]);
     let mut gateway = ResumableGateway::new(
@@ -323,7 +441,33 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
         Arc::clone(assembly.model()),
     );
     let mut current = assembly;
-    let mut guard = TerminalGuard::enter()?;
+    let mut guard = match TerminalGuard::enter() {
+        Ok(guard) => guard,
+        Err(error) => {
+            // Die Wurzelsitzung wurde bereits erzeugt; ihr Ende wird gemeldet,
+            // bevor der Terminal-Setup-Fehler propagiert.
+            current.close_session(current.root_session_id());
+            return Err(error);
+        }
+    };
+
+    // `harw -r` ohne Selektor: die Auswahl gehört vor die erste Eingabe, nicht
+    // hinter ein getipptes `/resume`. Schlägt das Auflisten fehl, startet die
+    // frische Sitzung trotzdem — mit einer Meldung statt eines Abbruchs.
+    if let Some(resume_options) = resume.as_ref()
+        && resume_options.open_picker_at_start
+    {
+        match resume_options.selector.available_sessions() {
+            Ok(ids) => {
+                let entries = session_entries(&resume_options.session_store_root, ids);
+                app.open_session_picker(entries);
+            }
+            Err(error) => push_system_text(
+                &mut app,
+                &format!("Could not list resumable sessions: {error}"),
+            ),
+        }
+    }
 
     let result = runtime.block_on(async {
         let (tui_tx, mut tui_rx) = tokio::sync::mpsc::unbounded_channel::<TuiEvent>();
@@ -351,11 +495,23 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
             {
                 TuiRunOutcome::Quit => return Ok(()),
                 TuiRunOutcome::Resume { selector: None } => {
-                    let message = match resume.as_ref() {
-                        Some(resume) => resumable_sessions_message(resume.selector.as_ref()),
-                        None => RESUME_NOT_CONFIGURED.to_owned(),
-                    };
-                    push_system_text(&mut app, &message);
+                    match resume.as_ref() {
+                        Some(resume) => match resume.selector.available_sessions() {
+                            Ok(ids) => {
+                                let entries = session_entries(&resume.session_store_root, ids);
+                                // `ChatApp::open_session_picker` ist eine noch
+                                // zu ergänzende Erwartung an `crate::app`
+                                // (paralleler Slice B-app); der Aufruf steht
+                                // schon hier, damit die Verdrahtung feststeht.
+                                app.open_session_picker(entries);
+                            }
+                            Err(error) => push_system_text(
+                                &mut app,
+                                &format!("Could not list resumable sessions: {error}"),
+                            ),
+                        },
+                        None => push_system_text(&mut app, RESUME_NOT_CONFIGURED),
+                    }
                     frame_req.schedule_frame();
                 }
                 TuiRunOutcome::Resume {
@@ -466,15 +622,36 @@ struct ResumedRuntime {
 // Baut Wurzelsitzung, Freigabetreiber und Renderer-Zustand aus einer Montage
 // (CONTRACTS-W2d2 §2 T1). Die Montage entscheidet Registry, Sandbox, Modus
 // (`spec.mode_override`) und Agent; hier wird nur verdrahtet.
+//
+// `session_store_root` ist `None`, wenn `/resume` in dieser Laufzeit gar
+// nicht konfiguriert ist (`TuiRunOptions::resume`); in dem Fall gibt es
+// keine bekannte Sidecar-Wurzel und der Titel-Job-Kontext (Schritt 7,
+// [`TitleJobContext`]) bleibt unbestückt.
 fn build_root_runtime(
     assembly: &Arc<RuntimeAssembly>,
     wiring: TuiSessionWiring,
+    session_store_root: Option<&Path>,
 ) -> Result<RootRuntime, TuiError> {
     let TuiSessionWiring {
         controller,
         events_tx,
         events_rx,
     } = wiring;
+    // Die Verdrahtung muss aus derselben Montage stammen: `install` legte den
+    // Controller als `SharedSessionController` in die Slash-`ServiceMap`, ehe
+    // die Montage gebaut wurde (E1.2). Eine fremde Verdrahtung trüge einen
+    // anderen `Arc`, dessen Ereignisse nirgends in dieser Montage ankommen.
+    let slash_services = assembly.services().service_map(ServiceSurface::Slash);
+    let belongs_to_assembly = slash_services
+        .get::<SharedSessionController>()
+        .is_some_and(|installed| {
+            std::ptr::addr_eq(Arc::as_ptr(installed), Arc::as_ptr(&controller))
+        });
+    if !belongs_to_assembly {
+        return Err(TuiError::Core(
+            "wiring does not belong to this assembly".to_owned(),
+        ));
+    }
     // AP W5-03, Bedingung 2: genau ein Handler, dessen `Arc` gleichzeitig in
     // der Freigabekette der Sitzung und im `ApprovalDriver` liegt.
     let (approval_handler, approvals) = TuiApprovalHandler::new();
@@ -511,6 +688,21 @@ fn build_root_runtime(
     if let Some(plan) = assembly.plan_services() {
         app = app.with_plan_services(TuiPlanServices::from(plan));
     }
+    // Schritt 7: Titel-Job-Kontext nur bestücken, wenn eine Sidecar-Wurzel
+    // bekannt ist (`/resume` konfiguriert) und die Konfiguration die
+    // Titelerzeugung nicht abgeschaltet hat. `ChatApp::with_title_job_context`
+    // ist eine noch zu ergänzende Erwartung an `crate::app` (siehe
+    // [`TitleJobContext`]-Dokumentation).
+    if let Some(store_root) = session_store_root {
+        let session_config = &assembly.config().harness.session;
+        if session_config.title_generation {
+            app = app.with_title_job_context(TitleJobContext {
+                provider: Arc::clone(assembly.model()),
+                session_store_root: store_root.to_path_buf(),
+                title_model: session_config.title_model.clone(),
+            });
+        }
+    }
     app.set_active_mode(session.mode());
     tracing::info!(
         session_id = %session.id(),
@@ -539,12 +731,24 @@ async fn resume_session(
         .selector
         .resolve_session(raw_selector)
         .map_err(|error| format!("Could not resolve session: {error}"))?;
+    // Schritt 7: `last_opened_at` beim Fortsetzen aktualisieren. Ein Fehler
+    // hier darf das Fortsetzen selbst nicht verhindern (best effort, nur
+    // gemeldet) — die Sitzung bleibt auch ohne aktualisierten Sidecar nutzbar.
+    if let Err(error) = meta::touch_opened(&resume.session_store_root, &selected, SystemClock.now())
+    {
+        tracing::warn!(
+            session = %selected,
+            error = %error,
+            "tui.resume.touch_opened_failed"
+        );
+    }
     let (assembly, wiring) = resume
         .factory
         .assemble(Some(selected))
         .map_err(|error| format!("Could not assemble session: {error}"))?;
-    let mut runtime = build_root_runtime(&assembly, wiring)
-        .map_err(|error| format!("Could not start session: {error}"))?;
+    let mut runtime =
+        build_root_runtime(&assembly, wiring, Some(resume.session_store_root.as_path()))
+            .map_err(|error| format!("Could not start session: {error}"))?;
     let history = match assembly.state_store().load_history(runtime.session.id()).await {
         Ok(history) => history,
         Err(error) => {
@@ -559,18 +763,58 @@ async fn resume_session(
     Ok(ResumedRuntime { assembly, runtime })
 }
 
-// Baut die Systemzeile für `/resume` ohne Selektor.
-fn resumable_sessions_message(selector: &dyn ResumeSessionSelector) -> String {
-    match selector.available_sessions() {
-        Ok(ids) if ids.is_empty() => "No resumable sessions available.".to_owned(),
-        Ok(ids) => format!(
-            "Select a session with /resume <selector>:\n{}",
-            ids.iter()
-                .map(SessionId::as_str)
-                .collect::<Vec<_>>()
-                .join("\n")
-        ),
-        Err(error) => format!("Could not list resumable sessions: {error}"),
+// Baut Picker-Einträge aus Sitzungs-IDs (Schritt 7). Nutzt
+// `harw_session_store::meta::load_or_derive`, um `ResumeSessionSelector`
+// (siehe `TuiResume`-Dokumentation) nicht um Anzeigefelder erweitern zu
+// müssen — dieser Slice besitzt `crate::app` nicht.
+//
+// Eine Sitzung, deren Sidecar weder geladen noch aus dem Transcript
+// abgeleitet werden kann (z. B. defektes Transcript), wird übersprungen und
+// nur mit `tracing::warn!` gemeldet: ein einzelner kaputter Eintrag darf den
+// gesamten Picker nicht leeren. Eine leere `ids`-Liste ergibt eine leere
+// Ergebnisliste — der Picker selbst zeigt dafür seinen Leerzustand
+// ("Keine Sessions gefunden", `session_picker.rs`).
+fn session_entries(session_store_root: &Path, ids: Vec<SessionId>) -> Vec<SessionEntry> {
+    ids.into_iter()
+        .filter_map(|id| match meta::load_or_derive(session_store_root, &id) {
+            Ok(session_meta) => Some(session_entry_from_meta(id, &session_meta)),
+            Err(error) => {
+                tracing::warn!(
+                    session = %id,
+                    error = %error,
+                    "tui.resume.session_meta_failed"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+// Übersetzt einen geladenen/abgeleiteten `SessionMeta` in einen
+// Picker-Eintrag.
+//
+// # Annahmen
+// - `title`: [`SessionMeta::display_title`] ist nie leer (gesetzter Titel,
+//   sonst aus der ersten Nutzernachricht abgeleitet, sonst Platzhalter) —
+//   genau das erwartet [`SessionEntry::title`].
+// - `project_label`: bevorzugt `project_root`, fällt auf `cwd` zurück, da
+//   der Picker nur ein einzelnes Label anzeigt und beide Felder optional
+//   sind (ältere, abgeleitete Sitzungen kennen keins von beidem).
+// - `turns`: nur gesetzt, wenn mindestens ein Turn abgeschlossen wurde
+//   (`meta.turns > 0`); eine druckfrische Sitzung zeigt sonst irreführend
+//   "0 Turns" statt gar keine Turn-Angabe.
+fn session_entry_from_meta(id: SessionId, session_meta: &SessionMeta) -> SessionEntry {
+    let project_label = session_meta
+        .project_root
+        .as_deref()
+        .or(session_meta.cwd.as_deref())
+        .map(|path| path.display().to_string());
+    SessionEntry {
+        id: id.as_str().to_owned(),
+        title: session_meta.display_title(),
+        last_active: SystemTime::from(session_meta.last_opened_at),
+        project_label,
+        turns: (session_meta.turns > 0).then_some(session_meta.turns),
     }
 }
 
@@ -742,7 +986,7 @@ mod tests {
         let (assembly, wiring) = tui_assembly(&fixture, None);
         let chain_before = assembly.rights_snapshot().approval_chain;
 
-        let runtime = build_root_runtime(&assembly, wiring).expect("root runtime builds");
+        let runtime = build_root_runtime(&assembly, wiring, None).expect("root runtime builds");
 
         let chain_after = assembly.rights_snapshot().approval_chain;
         assert_eq!(chain_after.len(), chain_before.len() + 1);
@@ -768,9 +1012,145 @@ mod tests {
         let fixture = fixture();
         let (assembly, wiring) = tui_assembly(&fixture, Some(InteractionMode::Plan));
 
-        let runtime = build_root_runtime(&assembly, wiring).expect("root runtime builds");
+        let runtime = build_root_runtime(&assembly, wiring, None).expect("root runtime builds");
 
         assert_eq!(runtime.session.mode(), InteractionMode::Plan);
         assert_eq!(runtime.app.active_mode(), InteractionMode::Plan);
+    }
+
+    #[test]
+    fn test_build_root_runtime_rejects_foreign_wiring() {
+        let fixture = fixture();
+        let (assembly_a, _wiring_a) = tui_assembly(&fixture, None);
+        let (_assembly_b, wiring_b) = tui_assembly(&fixture, None);
+
+        // `wiring_b` wurde in die Slash-`ServiceMap` von `assembly_b` gelegt,
+        // nicht in die von `assembly_a`; der Bau muss fail-closed ablehnen,
+        // statt eine Verdrahtung zu verwenden, deren Ereignisse nirgends in
+        // `assembly_a` ankommen.
+        let result = build_root_runtime(&assembly_a, wiring_b, None);
+
+        match result {
+            Ok(_) => panic!("expected TuiError::Core for foreign wiring, got Ok"),
+            Err(TuiError::Core(message)) => {
+                assert!(
+                    message.contains("does not belong"),
+                    "unexpected error message: {message}"
+                );
+            }
+            Err(other) => panic!("expected TuiError::Core for foreign wiring, got {other:?}"),
+        }
+    }
+
+    use harw_session_store::TitleSource;
+
+    fn meta_with(
+        id: &str,
+        title: Option<&str>,
+        turns: u64,
+        project_root: Option<&str>,
+        cwd: Option<&str>,
+    ) -> SessionMeta {
+        SessionMeta {
+            version: harw_session_store::SESSION_META_VERSION,
+            session_id: SessionId::from_str(id),
+            title: title.map(str::to_owned),
+            title_source: if title.is_some() {
+                TitleSource::Manual
+            } else {
+                TitleSource::None
+            },
+            created_at: SystemClock.now(),
+            last_opened_at: SystemClock.now(),
+            cwd: cwd.map(PathBuf::from),
+            project_root: project_root.map(PathBuf::from),
+            project_key: None,
+            first_user_message: None,
+            turns,
+        }
+    }
+
+    /// [`session_entry_from_meta`] übernimmt Titel und `last_opened_at`,
+    /// bevorzugt `project_root` vor `cwd` fürs Label und blendet `turns == 0`
+    /// als `None` aus.
+    #[test]
+    fn test_session_entry_from_meta_maps_fields_and_hides_zero_turns() {
+        let meta = meta_with(
+            "session-a",
+            Some("Mein Titel"),
+            0,
+            Some("/home/mia/projects/harwness"),
+            Some("/home/mia/projects/harwness/sub"),
+        );
+
+        let entry = session_entry_from_meta(SessionId::from_str("session-a"), &meta);
+
+        assert_eq!(entry.id, "session-a");
+        assert_eq!(entry.title, "Mein Titel");
+        assert_eq!(entry.last_active, SystemTime::from(meta.last_opened_at));
+        assert_eq!(
+            entry.project_label.as_deref(),
+            Some("/home/mia/projects/harwness"),
+            "project_root has priority over cwd"
+        );
+        assert_eq!(entry.turns, None, "zero completed turns must not be shown");
+    }
+
+    /// Fehlt `project_root`, fällt das Label auf `cwd` zurück; ein Titel aus
+    /// `SessionMeta::display_title` (kein gesetzter Titel) wird übernommen.
+    #[test]
+    fn test_session_entry_from_meta_falls_back_to_cwd_and_derived_title() {
+        let mut meta = meta_with("session-b", None, 3, None, Some("/tmp/project"));
+        meta.first_user_message = Some("Erste Nachricht der Sitzung".to_owned());
+
+        let entry = session_entry_from_meta(SessionId::from_str("session-b"), &meta);
+
+        assert_eq!(entry.project_label.as_deref(), Some("/tmp/project"));
+        assert_eq!(entry.title, "Erste Nachricht der Sitzung");
+        assert_eq!(entry.turns, Some(3));
+    }
+
+    /// [`session_entries`] liest jeden Sidecar über `meta::load_or_derive` und
+    /// baut daraus die Anzeige-Einträge des Pickers.
+    #[test]
+    fn test_session_entries_reads_saved_sidecars() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let meta_a = meta_with("session-a", Some("Alpha"), 5, None, None);
+        let meta_b = meta_with("session-b", Some("Beta"), 0, None, None);
+        meta::save(temp.path(), &meta_a).expect("save a");
+        meta::save(temp.path(), &meta_b).expect("save b");
+
+        let entries = session_entries(
+            temp.path(),
+            vec![SessionId::from_str("session-a"), SessionId::from_str("session-b")],
+        );
+
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|entry| entry.title == "Alpha" && entry.turns == Some(5)));
+        assert!(entries.iter().any(|entry| entry.title == "Beta" && entry.turns.is_none()));
+    }
+
+    /// Ohne fortsetzbare Sitzungen liefert [`session_entries`] eine leere
+    /// Liste (der Picker zeigt dafür selbst seinen Leerzustand) — Schritt 7,
+    /// "Verhalten ohne Sessions".
+    #[test]
+    fn test_session_entries_of_empty_ids_is_empty() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let entries = session_entries(temp.path(), Vec::new());
+
+        assert!(entries.is_empty());
+    }
+
+    /// Eine Sitzungs-ID, die nicht einmal adressierbar ist (z. B. durch einen
+    /// Ableitungsfehler), wird übersprungen statt den gesamten Picker leer zu
+    /// machen oder zu paniken.
+    #[test]
+    fn test_session_entries_skips_unaddressable_session_id() {
+        let temp = tempfile::tempdir().expect("tempdir");
+
+        let entries = session_entries(temp.path(), vec![SessionId::from_str("../escape")]);
+
+        assert!(entries.is_empty());
     }
 }

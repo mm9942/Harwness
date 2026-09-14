@@ -32,6 +32,8 @@ use harw_macros::HarwError;
 ///   Verbindung war nicht lesbar.
 /// - [`WebError::DuplicateRoute`]: Zwei Operationen deklarieren denselben
 ///   `Surface::Web`-Pfad.
+/// - [`WebError::RouteMethodUndeclared`]: Für eine Route ließ sich keine
+///   `Surface::Web { method, .. }`-Deklaration finden (fail-closed, F-031).
 /// - [`WebError::InvalidEventCapacity`]: Eine [`crate::events::WebEventBus`]
 ///   wurde mit Kapazität `0` angefordert.
 /// - [`WebError::EventEncode`]: Ein [`crate::events::WebEvent`] ließ sich nicht
@@ -90,6 +92,18 @@ pub enum WebError {
         first_owner: String,
         /// Name der Operation, die denselben Pfad erneut beanspruchte.
         second_owner: String,
+    },
+
+    /// Für die Route `path` der Operation `operation` ließ sich keine
+    /// `Surface::Web`-Deklaration mit HTTP-Methode finden. Die Routentabelle
+    /// wird dann nicht gebaut — eine Route ohne deklarierte Methode wird nie
+    /// bedient (F-031: keine Ableitung, kein Standardwert).
+    #[msg("Web-Route '{path}' der Operation '{operation}' hat keine deklarierte HTTP-Methode")]
+    RouteMethodUndeclared {
+        /// Der betroffene Routenpfad.
+        path: String,
+        /// Name der Operation, die die Route bereitstellt.
+        operation: String,
     },
 
     /// Eine [`crate::events::WebEventBus`] wurde mit Kapazität `0` angefordert.
@@ -172,6 +186,19 @@ mod tests {
         assert!(text.contains("/api/x"));
         assert!(text.contains("op-a"));
         assert!(text.contains("op-b"));
+    }
+
+    #[test]
+    fn test_display_route_method_undeclared_contains_path_and_operation() {
+        let err = WebError::RouteMethodUndeclared {
+            path: "/api/analyze".to_owned(),
+            operation: "analyze".to_owned(),
+        };
+        let text = err.to_string();
+        assert!(text.contains("/api/analyze"));
+        assert!(text.contains("analyze"));
+        assert!(text.contains("HTTP-Methode"));
+        assert!(err.source().is_none());
     }
 
     #[test]

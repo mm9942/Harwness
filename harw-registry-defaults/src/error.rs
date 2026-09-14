@@ -8,6 +8,7 @@ use std::fmt;
 use harw_extension_api::registry::ContextProviderRegistrationError;
 
 use harw_agent_dsl::error::DslError;
+use harw_egress::EgressError;
 use harw_project_discovery::DiscoveryError;
 
 /// Result type returned by default-registry construction.
@@ -46,6 +47,16 @@ pub enum RegistryDefaultsError {
         /// Ursächlicher Fehler aus der Erweiterungs-Registry.
         source: ContextProviderRegistrationError,
     },
+    /// Die Egress-Policy der Rolle `researcher-web` liess sich aus
+    /// `[network].researcher_web_hosts` nicht bauen (W5 RD).
+    ///
+    /// Ein ungültiger Host-Eintrag (Schema, Port, Userinfo, Wildcard …) ist ein
+    /// Konfigurationsfehler; die Rolle bekommt dann **keine** Policy statt einer
+    /// stillschweigend verkürzten.
+    ResearcherWebPolicy {
+        /// Ursächlicher Fehler aus `harw_egress::EgressPolicy::new`.
+        source: EgressError,
+    },
 }
 
 impl fmt::Display for RegistryDefaultsError {
@@ -66,6 +77,13 @@ impl fmt::Display for RegistryDefaultsError {
             Self::ContextProviderRegistration { source } => {
                 write!(f, "Kontextanbieter konnte nicht registriert werden: {source}")
             }
+            Self::ResearcherWebPolicy { source } => {
+                write!(
+                    f,
+                    "Egress-Policy für researcher-web aus [network].researcher_web_hosts \
+                     ungültig: {source}"
+                )
+            }
         }
     }
 }
@@ -76,6 +94,7 @@ impl std::error::Error for RegistryDefaultsError {
             Self::ProjectDiscovery { source } => Some(source),
             Self::AgentDefinition { source, .. } => Some(source),
             Self::ContextProviderRegistration { source } => Some(source),
+            Self::ResearcherWebPolicy { source } => Some(source),
             Self::BrowserHost(_) => None,
         }
     }

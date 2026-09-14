@@ -1,3 +1,5 @@
+//! Navigate/Back/Forward/Reload execution with the pre-navigation origin check.
+
 use crate::error::{AdapterError, DriverOperation};
 use crate::runtime::FirefoxRuntime;
 use harw_browser::action::{ActionOutcome, ActionRequest, BrowserAction};
@@ -12,12 +14,10 @@ impl FirefoxRuntime {
         self.require_revision(request.context_id, request.expected_revision)
             .await?;
 
+        // Pre-navigation check; the observed location after the effect is
+        // enforced by the runtime (F-009).
         if let BrowserAction::Navigate { url } = &request.action {
-            if !self.origin_policy().is_allowed(url) {
-                return Err(BrowserError::OriginNotAllowed {
-                    origin: url.origin().ascii_serialization(),
-                });
-            }
+            self.request().check_navigation_target(url)?;
         }
 
         let window = {

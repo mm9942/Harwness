@@ -16,6 +16,8 @@ harw-sandbox = { path = "../harw-sandbox" }
 # `FindingId` (Identität ab `RuleChecked`) und `Confidence` (Zielskala von
 # `epistemic_confidence_for`).
 harw-types = { path = "../harw-types" }
+# `FindingRecord` (W3 C-FIND) ist serialisierbar.
+serde = { workspace = true }
 # Quelltyp der einzigen echten Konvertierung dieser Crate:
 # `epistemic_confidence_for`. Kein Zyklus: `harw-research` hängt nur auf
 # `harw-macros`/`harw-types`/serde/jiff.
@@ -50,6 +52,16 @@ serde_json = { workspace = true }
 # Dev-Dependency-Zyklen sind in Cargo ausdrücklich unterstützt — sie fließen
 # nie in den produktiven Abhängigkeitsgraphen ein.
 harw-knowledge = { path = "../harw-knowledge" }
+
+[features]
+# Nur für Testfixtures abhängiger Crates (z. B. `harw-dod-escalate`s
+# `Ladder`-Tests): schaltet `finding::triaged_finding_for_test` frei, das
+# beliebige `Severity`/`Hardness`-Kombinationen erzeugt, die keine echte Regel
+# liefert. Wegen `resolver = "2"` (Workspace-Root) nur aktiv, wenn eine Crate
+# es unter `[dev-dependencies]` anfordert — nie im Build eines produktiven
+# Konsumenten. Siehe `src/finding.rs`-Moduldoku, Abschnitt „Der Besitz des
+# Wertes ist die Berechtigung", für die dadurch unangetastete Invariante.
+test-support = []
 
 [lints]
 workspace = true

@@ -77,11 +77,11 @@ pub struct StopArgs {
     permission = "operator",
     command(path = "/stop", visibility = "channel_parity"),
     model_tool(approval = "always"),
-    // Web-Fläche übernimmt exakt dieselbe Achse wie das ModelTool: kein
-    // `readonly` (Abbruch ist ein Seiteneffekt), `approval = "always" —
+    // Web-Fläche übernimmt exakt dieselbe Achse wie das ModelTool:
+    // `method = "post"` (Abbruch ist ein Seiteneffekt), `approval = "always"` —
     // ein Job-Abbruch ist irreversibel und wird dadurch für `harw-web` zu
     // einem ApprovalRequest, nie zu einem direkt ausführbaren Knopf.
-    web(path = "/api/stop", approval = "always")
+    web(path = "/api/stop", method = "post", approval = "always")
 )]
 async fn stop(ctx: &OpContext, args: StopArgs) -> Result<OpOutput, OpError> {
     let Some(job) = args.job_id.as_deref() else {
@@ -106,12 +106,10 @@ async fn stop(ctx: &OpContext, args: StopArgs) -> Result<OpOutput, OpError> {
         .map_err(|error| {
             OpError::Execution(format!("could not cancel durable job `{job}`: {error}"))
         })?;
-    Ok(OpOutput {
-        text: format!(
-            "Cancelled job {} (revision {}).",
-            transition.work_id, transition.revision
-        ),
-    })
+    Ok(OpOutput::from(format!(
+        "Cancelled job {} (revision {}).",
+        transition.work_id, transition.revision
+    )))
 }
 
 #[cfg(test)]

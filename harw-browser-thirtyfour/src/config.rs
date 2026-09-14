@@ -1,27 +1,62 @@
-//! Host-level Firefox process configuration.
+//! Host-level Firefox process configuration (B-ADAPT).
+//!
+//! # Description
+//! Owns everything that is decided by the trusted host, never by a model
+//! request: the Firefox executable, the pinned geckodriver
+//! ([`GeckodriverPin`], from `harw_config::BrowserSection::{geckodriver_path,
+//! geckodriver_sha256}`), the sandbox [`BrowserLauncher`], the event-journal
+//! policy and persistent-profile bindings. There is no managed/automatic
+//! driver mode: without both a pin and a launcher, sessions cannot open.
+//!
+//! # Concurrency
+//! `Clone + Send + Sync`; the launcher is shared through `Arc`.
+//!
+//! # Errors
+//! Builders return `harw_browser::Error::InvalidArgument` for empty bindings.
 
+use crate::journal::{DEFAULT_JOURNAL_CAPACITY, EventJournalPolicy};
+use crate::launcher::{BrowserLauncher, GeckodriverPin};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Configuration shared by sessions opened through one Firefox host.
 ///
 /// Request-specific policy such as headless mode, profile selection, origins,
-/// and viewport remains in `OpenBrowserRequest`; this type only owns adapter
-/// process configuration.
-#[derive(Debug, Clone)]
+/// limits and viewport remains in `OpenBrowserRequest`; this type only owns
+/// adapter process configuration.
+#[derive(Clone)]
 pub struct FirefoxHostConfig {
     firefox_binary: Option<PathBuf>,
-    managed_driver: bool,
+    geckodriver: Option<GeckodriverPin>,
+    launcher: Option<Arc<dyn BrowserLauncher>>,
+    journal_policy: Option<EventJournalPolicy>,
     profile_bindings: BTreeMap<String, PathBuf>,
 }
 
+impl fmt::Debug for FirefoxHostConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FirefoxHostConfig")
+            .field("firefox_binary", &self.firefox_binary)
+            .field("geckodriver", &self.geckodriver)
+            .field("launcher", &self.launcher)
+            .field("journal_policy", &self.journal_policy)
+            .field("profile_bindings", &self.profile_bindings)
+            .finish()
+    }
+}
+
 impl FirefoxHostConfig {
-    /// Creates the production default: discover Firefox and let thirtyfour
-    /// manage the geckodriver lifecycle.
+    /// Creates a fail-closed default: no pinned geckodriver and no launcher,
+    /// so `open` reports `CapabilityUnavailable` until both are configured.
     pub fn new() -> Self {
         Self {
             firefox_binary: None,
-            managed_driver: true,
+            geckodriver: None,
+            launcher: None,
+            journal_policy: None,
             profile_bindings: BTreeMap::new(),
         }
     }
@@ -33,10 +68,24 @@ impl FirefoxHostConfig {
         self
     }
 
-    /// Enables or disables thirtyfour's managed geckodriver lifecycle.
+    /// Sets the pinned geckodriver (path + SHA-256) verified before every start.
     #[must_use]
-    pub fn with_managed_driver(mut self, managed_driver: bool) -> Self {
-        self.managed_driver = managed_driver;
+    pub fn with_geckodriver_pin(mut self, pin: GeckodriverPin) -> Self {
+        self.geckodriver = Some(pin);
+        self
+    }
+
+    /// Sets the sandbox launcher that starts geckodriver with `NetworkMode::ProxyOnly`.
+    #[must_use]
+    pub fn with_launcher(mut self, launcher: Arc<dyn BrowserLauncher>) -> Self {
+        self.launcher = Some(launcher);
+        self
+    }
+
+    /// Overrides the per-session event-journal bounds.
+    #[must_use]
+    pub fn with_journal_policy(mut self, policy: EventJournalPolicy) -> Self {
+        self.journal_policy = Some(policy);
         self
     }
 
@@ -64,9 +113,25 @@ impl FirefoxHostConfig {
         self.firefox_binary.as_deref()
     }
 
-    /// Reports whether the host should use the managed driver lifecycle.
-    pub fn managed_driver(&self) -> bool {
-        self.managed_driver
+    /// Returns the pinned geckodriver, if configured.
+    pub fn geckodriver_pin(&self) -> Option<&GeckodriverPin> {
+        self.geckodriver.as_ref()
+    }
+
+    /// Returns a shared handle to the configured launcher, if any.
+    pub fn launcher(&self) -> Option<Arc<dyn BrowserLauncher>> {
+        self.launcher.as_ref().map(Arc::clone)
+    }
+
+    /// Returns the effective event-journal policy.
+    ///
+    /// # Errors
+    /// - `InvalidArgument`: only if the built-in default were invalid.
+    pub fn journal_policy(&self) -> harw_browser::Result<EventJournalPolicy> {
+        match self.journal_policy {
+            Some(policy) => Ok(policy),
+            None => EventJournalPolicy::bounded(DEFAULT_JOURNAL_CAPACITY),
+        }
     }
 
     /// Returns the directory bound to `binding` without allocating or exposing
@@ -79,5 +144,29 @@ impl FirefoxHostConfig {
 impl Default for FirefoxHostConfig {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_firefox_host_config_new_is_fail_closed() {
+        let config = FirefoxHostConfig::new();
+        assert!(config.geckodriver_pin().is_none());
+        assert!(config.launcher().is_none());
+        assert_eq!(
+            config.journal_policy().expect("default policy").capacity(),
+            DEFAULT_JOURNAL_CAPACITY
+        );
+    }
+
+    #[test]
+    fn test_firefox_host_config_with_geckodriver_pin_is_retained() {
+        let pin = GeckodriverPin::new(PathBuf::from("/opt/geckodriver"), &"b".repeat(64))
+            .expect("valid pin");
+        let config = FirefoxHostConfig::new().with_geckodriver_pin(pin.clone());
+        assert_eq!(config.geckodriver_pin(), Some(&pin));
     }
 }
