@@ -85,10 +85,10 @@ fn run_wizard_with_interaction_mode(home: &Path, interactive: bool) -> Result<()
     // Provider-Katalog. Ohne TTY (Tests/Pipes) verwenden wir die
     // zeilenbasierten Prompts; ein expliziter Abbruch bleibt ein Abbruch.
     if interactive && std::io::stdin().is_terminal() {
-        let mut catalog = harw_model_catalog::embedded_catalog();
-        if let Err(error) = harw_model_catalog::enrich_models(&home.join("cache"), &mut catalog) {
-            eprintln!("Modellkatalog: {error}");
-        }
+        // Der Setup-Picker bleibt deterministisch. Die konto-spezifische
+        // Quelle ist `harw models scan`, nicht ein impliziter Drittanbieter-
+        // Download, der die Auswahl unerwartet aufbläht.
+        let catalog = harw_model_catalog::embedded_catalog();
         if let Some(outcome) = harw_tui::run_setup(catalog).map_err(|e| e.to_string())? {
             persist_outcome(home, &outcome)?;
             return maybe_recommend_openrouter(home, interactive);

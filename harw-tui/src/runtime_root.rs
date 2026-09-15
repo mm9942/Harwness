@@ -61,25 +61,30 @@
 //! # ) -> Result<(), Box<dyn std::error::Error>> {
 //! let wiring = TuiSessionWiring::new();
 //! let assembly = Arc::new(wiring.install(builder).build()?);
-//! run_tui(assembly, TuiRunOptions { wiring, resume: None })?;
+//! run_tui(assembly, TuiRunOptions { wiring, resume: None, verbose_tools: false })?;
 //! # Ok(())
 //! # }
 //! ```
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use ratatui::text::Line;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use time::OffsetDateTime;
 
-use harw_core::{AgentSession, ModelProvider, StateStore};
+use harw_core::turn_loop::{TurnControl, TurnLimits};
+use harw_core::{AgentSession, ConversationHistory, ModelMessage, ModelProvider, StateStore, TurnInput, TurnOutcome};
 use harw_extension_api::ApprovalHandler;
 use harw_operations::SharedSessionController;
 use harw_operations::adapter::CommandAdapter;
+use harw_plan::PlanNodeStatus;
 use harw_protocol::events::{SessionEvent, TurnEvent};
-use harw_runtime::{RootSession, RuntimeAssembly, RuntimeAssemblyBuilder, ServiceSurface};
+use harw_protocol::items::{ContentPart, TurnItem};
+use harw_runtime::{
+    PlanServices, RootSession, RuntimeAssembly, RuntimeAssemblyBuilder, ServiceSurface,
+};
 use harw_session_store::meta::{self, SessionMeta};
 use harw_types::{Clock, SessionId, SystemClock};
 
@@ -420,6 +425,9 @@ pub struct TuiRunOptions {
     pub wiring: TuiSessionWiring,
     /// `/resume`-Unterstützung; `None` lehnt `/resume` mit Hinweis ab.
     pub resume: Option<TuiResume>,
+    /// Ausführliche Werkzeugzellen; wird von `harw chat --verbose` gesetzt
+    /// und beim anschließenden Fortsetzen einer Sitzung beibehalten.
+    pub verbose_tools: bool,
 }
 
 /// Handgeschriebenes `Debug`: [`TuiSessionWiring`] enthält Kanäle.
@@ -429,6 +437,7 @@ impl std::fmt::Debug for TuiRunOptions {
             .debug_struct("TuiRunOptions")
             .field("wiring", &self.wiring)
             .field("resume", &self.resume)
+            .field("verbose_tools", &self.verbose_tools)
             .finish()
     }
 }
@@ -479,11 +488,15 @@ impl std::fmt::Debug for TuiRunOptions {
 /// #     assembly: Arc<harw_runtime::RuntimeAssembly>,
 /// #     wiring: harw_tui::TuiSessionWiring,
 /// # ) -> Result<(), harw_tui::TuiError> {
-/// harw_tui::run_tui(assembly, harw_tui::TuiRunOptions { wiring, resume: None })
+/// harw_tui::run_tui(assembly, harw_tui::TuiRunOptions { wiring, resume: None, verbose_tools: false })
 /// # }
 /// ```
 pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result<(), TuiError> {
-    let TuiRunOptions { wiring, resume } = options;
+    let TuiRunOptions {
+        wiring,
+        resume,
+        verbose_tools,
+    } = options;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -500,6 +513,7 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
         &assembly,
         wiring,
         resume.as_ref().map(|r| r.session_store_root.as_path()),
+        verbose_tools,
     )?;
     let history = match runtime.block_on(assembly.state_store().load_history(session.id())) {
         Ok(history) => history,
@@ -604,7 +618,7 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
                         frame_req.schedule_frame();
                         continue;
                     };
-                    match resume_session(resume, &raw_selector).await {
+                    match resume_session(resume, &raw_selector, verbose_tools).await {
                         Ok(next) => {
                             let ResumedRuntime {
                                 assembly: next_assembly,
@@ -713,6 +727,7 @@ fn build_root_runtime(
     assembly: &Arc<RuntimeAssembly>,
     wiring: TuiSessionWiring,
     session_store_root: Option<&Path>,
+    verbose_tools: bool,
 ) -> Result<RootRuntime, TuiError> {
     let TuiSessionWiring {
         controller,
@@ -764,6 +779,7 @@ fn build_root_runtime(
         assembly.memory().cloned(),
     )
     .with_runtime(Arc::clone(assembly))
+    .with_verbose_tools(verbose_tools)
     .with_session_controller(controller)
     .with_project_root(assembly.project().project_root.display().to_string())
     .with_managed_spawner(assembly.spawner().cloned());
@@ -809,6 +825,7 @@ fn build_root_runtime(
 async fn resume_session(
     resume: &TuiResume,
     raw_selector: &str,
+    verbose_tools: bool,
 ) -> Result<ResumedRuntime, String> {
     let selected = resume
         .selector
@@ -830,8 +847,13 @@ async fn resume_session(
         .assemble(Some(selected))
         .map_err(|error| format!("Could not assemble session: {error}"))?;
     let mut runtime =
-        build_root_runtime(&assembly, wiring, Some(resume.session_store_root.as_path()))
-            .map_err(|error| format!("Could not start session: {error}"))?;
+        build_root_runtime(
+            &assembly,
+            wiring,
+            Some(resume.session_store_root.as_path()),
+            verbose_tools,
+        )
+        .map_err(|error| format!("Could not start session: {error}"))?;
     let history = match assembly.state_store().load_history(runtime.session.id()).await {
         Ok(history) => history,
         Err(error) => {
@@ -1074,7 +1096,7 @@ mod tests {
         let (assembly, wiring) = tui_assembly(&fixture, None);
         let chain_before = assembly.rights_snapshot().approval_chain;
 
-        let runtime = build_root_runtime(&assembly, wiring, None).expect("root runtime builds");
+        let runtime = build_root_runtime(&assembly, wiring, None, false).expect("root runtime builds");
 
         let chain_after = assembly.rights_snapshot().approval_chain;
         assert_eq!(chain_after.len(), chain_before.len() + 1);
@@ -1100,7 +1122,7 @@ mod tests {
         let fixture = fixture();
         let (assembly, wiring) = tui_assembly(&fixture, Some(InteractionMode::Plan));
 
-        let runtime = build_root_runtime(&assembly, wiring, None).expect("root runtime builds");
+        let runtime = build_root_runtime(&assembly, wiring, None, false).expect("root runtime builds");
 
         assert_eq!(runtime.session.mode(), InteractionMode::Plan);
         assert_eq!(runtime.app.active_mode(), InteractionMode::Plan);
@@ -1116,7 +1138,7 @@ mod tests {
         // nicht in die von `assembly_a`; der Bau muss fail-closed ablehnen,
         // statt eine Verdrahtung zu verwenden, deren Ereignisse nirgends in
         // `assembly_a` ankommen.
-        let result = build_root_runtime(&assembly_a, wiring_b, None);
+        let result = build_root_runtime(&assembly_a, wiring_b, None, false);
 
         match result {
             Ok(_) => panic!("expected TuiError::Core for foreign wiring, got Ok"),

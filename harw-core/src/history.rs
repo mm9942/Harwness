@@ -268,6 +268,24 @@ impl ConversationHistory {
         self.items.is_empty()
     }
 
+    /// Kürzt die Historie auf die ersten `len` Items; überzählige Items am Ende
+    /// werden verworfen. Ein `len >= self.len()` ist ein No-op.
+    ///
+    /// # Description
+    /// Genutzt, um einen rein flüchtigen Begrüßungs-Turn (`harw-tui`s
+    /// `run_greeting_turn`) wieder aus der In-Memory-Historie zu entfernen,
+    /// nachdem der Modelltext daraus gelesen wurde: die Begrüßung darf weder
+    /// die Kontextsicht künftiger Turns noch die Ableitung von
+    /// `first_user_message`/Sitzungstitel beeinflussen (die Begrüßung wird nie
+    /// über den echten `StateStore` persistiert, siehe `run_greeting_turn`s
+    /// Doku).
+    ///
+    /// # Arguments
+    /// - `len` (`usize`): Anzahl der ab Index 0 zu behaltenden Items.
+    pub fn truncate(&mut self, len: usize) {
+        self.items.truncate(len);
+    }
+
     /// Zerlegt die Historie in atomare Gruppen: ein einzelnes Item, außer es
     /// gehört zu einer Tool-Runde — dann bilden alle Calls dieser Runde und
     /// ihre Ergebnisse zusammen **eine** Gruppe.

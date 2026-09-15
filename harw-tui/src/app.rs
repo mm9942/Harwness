@@ -4210,17 +4210,23 @@ async fn drive_pauses_to_completion(
 }
 
 /// Bearbeitet den Composer während eines laufenden Turns. Chat-Zeilen gehen
-/// direkt in die FIFO. Slash-Kommandos bleiben nach Enter im Composer, damit
-/// sie weder verloren gehen noch die laufende Ausführung beeinflussen.
+/// direkt in die FIFO. Slash-Kommandos werden als Paste-plus-Enter in die
+/// nachgelagerte Eingabe-Queue gelegt: Nach dem Turn laufen sie dadurch über
+/// denselben autorisierten Command-Kanal wie interaktiv eingegebene Befehle,
+/// statt im Composer stecken zu bleiben oder still verloren zu gehen.
 fn queue_busy_key(app: &mut ChatApp, key: KeyEvent) -> bool {
     match app.input.handle_key(key) {
         InputAction::Submit(text) => {
             app.remember_input(&text);
             match classify_line(&text) {
                 LineAction::Chat(text) => app.pending_turns.push_back(text),
-                // Commands require the runtime command channel. Preserve the
-                // original line in the composer rather than silently losing it.
-                LineAction::Command(raw) => app.input.insert_str(&raw),
+                LineAction::Command(raw) => {
+                    app.deferred_input.push_back(TuiEvent::Paste(raw));
+                    app.deferred_input.push_back(TuiEvent::Key(KeyEvent::new(
+                        KeyCode::Enter,
+                        KeyModifiers::NONE,
+                    )));
+                }
                 LineAction::Quit | LineAction::Ignore | LineAction::System(_) => {}
             }
             true
@@ -4720,6 +4726,30 @@ mod tests {
         assert!(!handle_busy_event(&mut app, pasted.clone()));
         assert_eq!(app.deferred_input.pop_front(), Some(typed));
         assert_eq!(app.deferred_input.pop_front(), Some(pasted));
+        assert!(app.deferred_input.is_empty());
+    }
+
+    #[test]
+    fn busy_turn_queues_submitted_command_for_authorized_dispatch_after_turn() {
+        let mut app = test_chat_app();
+        app.input.insert_str("/status");
+
+        assert!(queue_busy_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ));
+        assert!(app.input.is_empty());
+        assert_eq!(
+            app.deferred_input.pop_front(),
+            Some(TuiEvent::Paste("/status".to_owned()))
+        );
+        assert_eq!(
+            app.deferred_input.pop_front(),
+            Some(TuiEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+        );
         assert!(app.deferred_input.is_empty());
     }
 

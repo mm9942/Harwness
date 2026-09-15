@@ -132,7 +132,7 @@ pub struct DetectedCredential {
 ///
 /// # Description
 /// Provides the built-in set of known local credential locations for the
-/// `codex` and `claude-cli` tooling, including an OAuth variant for `codex`.
+/// `codex` and `claude-cli` tooling.
 ///
 /// # Returns
 /// A [`Vec<CredentialSource>`] of embedded sources (never empty).
@@ -155,14 +155,6 @@ pub fn embedded_sources() -> Vec<CredentialSource> {
             path: "~/.codex/auth.json".to_owned(),
             extract: ExtractRule::JsonPointer("/OPENAI_API_KEY".to_owned()),
             kind: SourceKind::ApiKey,
-        },
-        // Codex — OAuth access token variant in the same file.
-        CredentialSource {
-            id: "codex-oauth".to_owned(),
-            provider: "openai".to_owned(),
-            path: "~/.codex/auth.json".to_owned(),
-            extract: ExtractRule::JsonPointer("/tokens/access_token".to_owned()),
-            kind: SourceKind::OAuthToken,
         },
         // Claude CLI — OAuth token stored in ~/.claude/.credentials.json.
         CredentialSource {
@@ -375,7 +367,7 @@ mod tests {
     fn test_embedded_sources_contains_codex_and_claude() {
         let sources = embedded_sources();
         assert!(sources.iter().any(|s| s.id == "codex"));
-        assert!(sources.iter().any(|s| s.id == "codex-oauth"));
+        assert!(!sources.iter().any(|s| s.id == "codex-oauth"));
         assert!(sources.iter().any(|s| s.id == "claude-cli"));
         assert!(sources.iter().any(|s| s.id == "gemini-env"));
         assert!(sources.iter().any(|s| s.id == "mistral-env"));
@@ -532,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn test_probe_source_null_field_yields_exists_false() {
+    fn test_codex_oauth_access_token_is_not_an_import_source() {
         let dir = TempDir::new("probe-null-field");
         let file = dir.write(
             "auth.json",
@@ -548,15 +540,12 @@ mod tests {
         };
         let detected = probe_source(api_key_source);
         assert!(!detected.exists);
-
-        let oauth_source = CredentialSource {
-            id: "codex-oauth".to_owned(),
-            provider: "openai".to_owned(),
-            path: file.to_string_lossy().into_owned(),
-            extract: ExtractRule::JsonPointer("/tokens/access_token".to_owned()),
-            kind: SourceKind::OAuthToken,
-        };
-        let detected_oauth = probe_source(oauth_source);
-        assert!(detected_oauth.exists);
+        assert!(embedded_sources().iter().all(|source| {
+            !matches!(
+                (&*source.path, &source.extract),
+                ("~/.codex/auth.json", ExtractRule::JsonPointer(pointer))
+                    if pointer == "/tokens/access_token"
+            )
+        }));
     }
 }

@@ -53,12 +53,14 @@
 //!   Verlauf; vom Harness erzeugte Ergebnisse (Ablehnung, Abbruch, fehlender
 //!   Kontext, fehlender Ausführer, deaktivierter Handoff) mit
 //!   `ResultTrust::Runtime`.
-//! - **Stop-Gründe.** `StopReason::{MaxTokens, ContextWindowExceeded}` →
-//!   [`TurnOutcome::Truncated`], `StopReason::{Refusal, ContentFilter}` →
-//!   [`TurnOutcome::Refused`]; Tool-Calls einer solchen Antwort werden nie
-//!   ausgeführt (Argumente können abgeschnitten sein). Opakes Reasoning wird als
-//!   `TurnItem::Reasoning` gespeichert (`raw_content[0]` = JSON des
-//!   `OpaqueReasoning`, verlustfrei).
+//! - **Stop-Gründe.** Bei `StopReason::MaxTokens` fordert der Loop höchstens
+//!   drei Mal automatisch eine nahtlose Fortsetzung an. Bleibt die Ausgabe
+//!   danach abgeschnitten, sowie sofort bei `ContextWindowExceeded`, endet der
+//!   Turn mit [`TurnOutcome::Truncated`]. `StopReason::{Refusal,
+//!   ContentFilter}` endet mit [`TurnOutcome::Refused`]. Tool-Calls einer
+//!   solchen Antwort werden nie ausgeführt (Argumente können abgeschnitten
+//!   sein). Opakes Reasoning wird als `TurnItem::Reasoning` gespeichert
+//!   (`raw_content[0]` = JSON des `OpaqueReasoning`, verlustfrei).
 //! - **Resume-Fehler.** Eine abgelehnte Wiederaufnahme (falscher Actor, falsches
 //!   Kind, keine offene Anfrage, bereits aufgelöst) bleibt `Err` und lässt die
 //!   Pause intakt. Scheitert eine *angenommene* Wiederaufnahme (Persistenz,
@@ -791,6 +793,30 @@ fn delegation_targets_fragment(names: &[String]) -> Option<harw_context::Fragmen
         cost: harw_lens_types::CostEstimate(body.len() as u32),
         digest: harw_types::ContentDigest::of(body.as_bytes()),
         body,
+    })
+}
+
+/// Wickelt eine Fortsetzungs-Instruktion nach einem `MaxTokens`-Abbruch in
+/// einen [`harw_context::Fragment`]-Block (Trust-Klasse `Instruction`), damit
+/// sie wie die übrigen Instructions in die Kontextmontage eingeht. Ein
+/// Fehlschlag der Newtype-Validierung ist kein Turn-Fehler: ohne den Hinweis
+/// liefert der Provider eben eine zweiteilige statt einer nahtlosen Antwort.
+fn continuation_fragment(body: &str) -> Option<harw_context::Fragment> {
+    let label = harw_context::FragmentLabel::try_new("continuation.instruction").ok()?;
+    let section = harw_context::SectionName::try_new("continuation.instruction").ok()?;
+    Some(harw_context::Fragment {
+        label,
+        section,
+        trust: harw_context::TrustClass::Instruction,
+        stability: harw_context::Stability::Stable,
+        origin: harw_context::FragmentOrigin {
+            provider: "turn_loop.continuation".to_owned(),
+            namespace: "core".to_owned(),
+            produced_at: jiff::Timestamp::now(),
+        },
+        cost: harw_lens_types::CostEstimate(body.len() as u32),
+        digest: harw_types::ContentDigest::of(body.as_bytes()),
+        body: body.to_owned(),
     })
 }
 
@@ -2011,7 +2037,16 @@ async fn drive_turn(
     handle: TurnHandle,
     control: TurnControl,
 ) -> CoreResult<TurnOutcome> {
+    // Ein Provider kann trotz expliziter Fortsetzungsanweisung erneut am
+    // Ausgabelimit enden. Die feste Obergrenze verhindert einen stillen,
+    // kostenpflichtigen Endlos-Loop; danach erhält der Aufrufer weiterhin den
+    // ehrlichen `Truncated`-Ausgang mitsamt bereits persistiertem Teiltext.
+    const MAX_AUTOMATIC_CONTINUATIONS: u32 = 3;
+    const CONTINUATION_INSTRUCTION: &str =
+        "Die unmittelbar vorherige Assistant-Antwort wurde wegen eines Ausgabelimits abgeschnitten. Setze exakt an ihrer letzten Stelle fort, ohne Text zu wiederholen oder neu anzufangen. Schließe den ursprünglichen Auftrag eigenständig ab.";
+
     let mut total_usage = harw_types::TokenUsage::default();
+    let mut automatic_continuations = 0u32;
     // Fortlaufende Modell-Runden-Nummer dieses `drive_turn`-Aufrufs, für
     // `UsageRound::round` — bei jedem Modellaufruf inkrementiert, bevor die
     // Runde persistiert wird.
@@ -2067,6 +2102,14 @@ async fn drive_turn(
 
         // 1./2. Context + Instructions.
         let mut fragments = gather_context(session, ctx).await;
+        if automatic_continuations > 0 {
+            match continuation_fragment(CONTINUATION_INSTRUCTION) {
+                Some(fragment) => fragments.push(fragment),
+                None => {
+                    tracing::warn!("turn_loop.continuation_fragment_unavailable");
+                }
+            }
+        }
         let instructions = load_instructions(session).await;
         let tools = collect_tools(session)?;
 
@@ -2154,6 +2197,7 @@ async fn drive_turn(
         // („Assistant-Text ohne Tool-Aufrufe") vor dem Move gesichert.
         let response_had_text = response.message.is_some();
         let response_had_no_tool_calls = response.tool_calls.is_empty();
+        let response_stop = response.stop.clone();
         // Fortschritt durch erfolgreiche Tool-Aufrufe mit neuer Signatur wird
         // unten im Tool-Call-Loop gesetzt.
         let mut round_progressed_by_tools = false;
@@ -2180,6 +2224,47 @@ async fn drive_turn(
                     }),
                 },
             );
+        }
+
+        // Ein Provider darf nie dazu verleitet werden, abgeschnittene oder
+        // gefilterte Tool-Argumente auszuführen. Die Antwort ist trotzdem
+        // bereits als Text erhalten, damit ein Nutzer den sichtbaren Teil
+        // nicht verliert.
+        if !response_had_no_tool_calls {
+            match response_stop {
+                crate::model::StopReason::MaxTokens
+                | crate::model::StopReason::ContextWindowExceeded => {
+                    return finish_model_stop(
+                        session,
+                        handle,
+                        total_usage,
+                        pending_guard_hint.clone(),
+                        TurnOutcome::Truncated,
+                    )
+                        .await;
+                }
+                crate::model::StopReason::Refusal { detail } => {
+                    return finish_model_stop(
+                        session,
+                        handle,
+                        total_usage,
+                        pending_guard_hint.clone(),
+                        TurnOutcome::Refused { detail },
+                    )
+                    .await;
+                }
+                crate::model::StopReason::ContentFilter => {
+                    return finish_model_stop(
+                        session,
+                        handle,
+                        total_usage,
+                        pending_guard_hint.clone(),
+                        TurnOutcome::Refused { detail: None },
+                    )
+                    .await;
+                }
+                _ => {}
+            }
         }
 
         // 6. Keine Tool-Calls mehr ⇒ Turn fertig.
@@ -2209,7 +2294,51 @@ async fn drive_turn(
                     }
                 }
             }
-            break;
+            match response_stop {
+                crate::model::StopReason::MaxTokens
+                    if automatic_continuations < MAX_AUTOMATIC_CONTINUATIONS =>
+                {
+                    automatic_continuations += 1;
+                    tracing::info!(
+                        continuation = automatic_continuations,
+                        "turn_loop.auto_continue_after_max_tokens"
+                    );
+                    maybe_compact(session, model, store, &last_round_usage, false).await;
+                    continue;
+                }
+                crate::model::StopReason::MaxTokens
+                | crate::model::StopReason::ContextWindowExceeded => {
+                    return finish_model_stop(
+                        session,
+                        handle,
+                        total_usage,
+                        pending_guard_hint.clone(),
+                        TurnOutcome::Truncated,
+                    )
+                        .await;
+                }
+                crate::model::StopReason::Refusal { detail } => {
+                    return finish_model_stop(
+                        session,
+                        handle,
+                        total_usage,
+                        pending_guard_hint.clone(),
+                        TurnOutcome::Refused { detail },
+                    )
+                    .await;
+                }
+                crate::model::StopReason::ContentFilter => {
+                    return finish_model_stop(
+                        session,
+                        handle,
+                        total_usage,
+                        pending_guard_hint.clone(),
+                        TurnOutcome::Refused { detail: None },
+                    )
+                    .await;
+                }
+                _ => break,
+            }
         }
 
         // Prüfpunkt vor jeder Werkzeugausführung: Abbruch, Aufrufzahl, Wanduhr.
@@ -2872,6 +3001,62 @@ async fn cancel_turn(
     );
     session.complete_turn(handle, total_usage)?;
     Ok(TurnOutcome::Cancelled { reason })
+}
+
+/// Beendet einen Turn nach einem Provider-Stop-Grund, der kein reguläres
+/// Turn-Ende ist ([`StopReason::MaxTokens`] nach ausgeschöpften
+/// Auto-Continuations, [`StopReason::ContextWindowExceeded`],
+/// [`StopReason::Refusal`], [`StopReason::ContentFilter`]).
+///
+/// # Beschreibung
+/// Spiegelt den regulären Abschluss-Pfad am Ende von [`drive_turn`]
+/// (Guard-Hinweis, Observer, `TurnCompleted`, `complete_turn`), endet aber mit
+/// dem ehrlichen [`TurnOutcome::Truncated`]- bzw. [`TurnOutcome::Refused`]-Ausgang
+/// statt `Completed`. Die bereits erhaltene Assistant-Antwort (inklusive
+/// abgeschnittener Teiltext) ist zu diesem Zeitpunkt bereits persistiert; das
+/// `complete_turn` hier sorgt dafür, dass die Session nach `Idle` zurückkehrt
+/// und der nächste Turn sauber starten kann.
+///
+/// # Errors
+/// Reicht einen Fehler von `AgentSession::complete_turn` durch (z. B. wenn
+/// `handle` nicht mehr der aktive Turn der Session ist).
+async fn finish_model_stop(
+    session: &mut AgentSession,
+    handle: TurnHandle,
+    total_usage: harw_types::TokenUsage,
+    pending_guard_hint: Option<String>,
+    outcome: TurnOutcome,
+) -> CoreResult<TurnOutcome> {
+    // Welle FANIN-K: ein Hinweis, der am Ende der letzten Runde entstand,
+    // aber keinem Tool-Ergebnis mehr zugeordnet werden konnte, geht auch an
+    // dieser Endgrenze nicht verloren — er wird ans letzte Verlaufs-Item
+    // angehängt (identisch zum regulären Abschluss-Pfad).
+    if let Some(hint) = pending_guard_hint {
+        session.history_mut().append_hint_to_last(&hint);
+    }
+    emit(
+        session,
+        TurnEvent::TurnCompleted {
+            turn_id: handle.turn_id.clone(),
+            usage: Some(total_usage.clone()),
+        },
+    );
+    notify_turn_stop(
+        session,
+        &TurnStopInput {
+            session_id: handle.session_id.clone(),
+            turn_id: handle.turn_id.clone(),
+            token_usage: total_usage.clone(),
+        },
+    );
+    // Kein Auto-Compact an dieser Grenze: ein abgeschnittener oder
+    // abgelehnter Turn ist keine sichere Kompaktionsgrenze; die Policy greift
+    // spätestens am regulär abgeschlossenen Folge-Turn.
+    if let Some(observer) = session.tool_outcome_observer().cloned() {
+        observer.on_turn_finished(session.id());
+    }
+    session.complete_turn(handle, total_usage)?;
+    Ok(outcome)
 }
 
 /// Wie [`cancel_turn`], aber für einen Treffer am Werkzeug-Prüfpunkt: `calls`

@@ -534,10 +534,8 @@ pub fn catalog(home_override: Option<PathBuf>, refresh: bool) -> Result<(), Stri
     let home = resolve_home(home_override)?;
     if refresh {
         harw_model_catalog::models_dev::refresh_models(&home.join("cache"), &mut catalog)
-    } else {
-        harw_model_catalog::enrich_models(&home.join("cache"), &mut catalog)
+            .map_err(|error| error.to_string())?;
     }
-    .map_err(|error| error.to_string())?;
     println!("{:<12} {:<28} BASE-URL", "ID", "NAME");
     for provider in &catalog {
         println!(

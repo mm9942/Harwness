@@ -646,7 +646,7 @@ name = "Mistral"
 base_url = "https://api.mistral.ai/v1"
 api = "openai-chat"
 featured = true
-default_model = "mistral-large-2411"
+default_model = "mistral-medium-2604"
 auth = [{ method = "api-key", env_vars = ["MISTRAL_API_KEY"] }]
 models = [
   "codestral-latest",

@@ -176,8 +176,8 @@ struct SecretSources<'a> {
 const EXTERNAL_CLI_CREDENTIALS: &[(&str, &[&str], &[&str])] = &[
     (
         ".codex/auth.json",
-        &["/OPENAI_API_KEY", "/tokens/access_token"],
-        &["api.openai.com", "chatgpt.com"],
+        &["/OPENAI_API_KEY"],
+        &["api.openai.com"],
     ),
     (
         ".claude/.credentials.json",
@@ -2976,6 +2976,23 @@ mod tests {
             Some("https://api.openai.com/v1"),
             raw_path,
             "/not/an/allowlisted/pointer",
+        );
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_codex_chatgpt_access_token_cannot_be_used_for_openai_api() {
+        let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+            return;
+        };
+        let path = PathBuf::from(home).join(".codex/auth.json");
+        let raw_path = path.to_str().expect("utf8 test path");
+
+        let result = read_external_cli_credential(
+            Some("https://api.openai.com/v1"),
+            raw_path,
+            "/tokens/access_token",
         );
 
         assert!(result.is_none());

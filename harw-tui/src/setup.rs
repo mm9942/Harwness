@@ -883,7 +883,7 @@ fn api_str(api: ProviderApi) -> &'static str {
 ///
 /// # Concurrency
 /// Nicht thread-sicher; ausschließlich vom Renderer-Thread verwendet.
-struct TerminalGuard {
+pub(crate) struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
 
@@ -893,7 +893,7 @@ impl TerminalGuard {
     ///
     /// # Errors
     /// [`TuiError::Io`], wenn Terminal-Setup fehlschlägt.
-    fn enter() -> Result<Self, TuiError> {
+    pub(crate) fn enter() -> Result<Self, TuiError> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         if let Err(error) = crossterm::execute!(stdout, EnterAlternateScreen) {
@@ -925,7 +925,7 @@ impl TerminalGuard {
     }
 
     /// Liefert eine veränderbare Referenz auf das zugrunde liegende Terminal.
-    fn terminal(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
+    pub(crate) fn terminal(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
         &mut self.terminal
     }
 }

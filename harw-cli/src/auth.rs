@@ -88,6 +88,14 @@ fn token(home: &Path, provider: &str) -> Result<(), String> {
     if trimmed.is_empty() {
         return Err("kein Token eingegeben".to_owned());
     }
+    if provider == "openai" && looks_like_jwt(trimmed) {
+        return Err(
+            "der eingegebene Wert sieht wie ein ChatGPT-/Codex-OAuth-Token aus, nicht wie ein \
+             OpenAI-Platform-API-Key. Harw sendet solche Tokens nicht an api.openai.com; \
+             verwende einen Platform-API-Key."
+                .to_owned(),
+        );
+    }
     let token = SecretString::new(trimmed.to_owned().into_boxed_str());
     persist_and_hint(home, provider, &token)
 }
@@ -113,15 +121,30 @@ fn persist_and_hint(home: &Path, provider: &str, token: &SecretString) -> Result
 }
 
 /// Importiert lokale Credentials und zeigt die nutzbare Referenz an.
+///
+/// Ein ChatGPT-Login der Codex-CLI enthält einen kurzlebigen OAuth-Access-Token.
+/// Dieser ist kein OpenAI-Platform-API-Key und darf nie an `api.openai.com`
+/// weitergereicht werden. Harw importiert aus der Codex-Datei daher ausschließlich
+/// den dort gegebenenfalls vorhandenen `OPENAI_API_KEY`.
 fn import(source: &str) -> Result<(), String> {
     let provider = match source {
-        "codex" | "codex-oauth" => "openai",
+        "codex" => "openai",
+        "codex-oauth" => {
+            return Err(
+                "Codex-ChatGPT-OAuth-Tokens können nicht als OpenAI-API-Key importiert werden. \
+                 Verwende einen OpenAI-Platform-API-Key mit `harw auth token openai` oder \
+                 importiere `codex` nur, wenn ~/.codex/auth.json einen OPENAI_API_KEY enthält."
+                    .to_owned(),
+            );
+        }
         "claude-cli" | "claude-setup-token" => "anthropic",
         "gemini-env" => "gemini",
         "mistral-env" => "mistral",
-        other => return Err(format!(
-            "unbekannte Quelle: {other} (codex | claude-cli | gemini-env | mistral-env)"
-        )),
+        other => {
+            return Err(format!(
+                "unbekannte Quelle: {other} (codex | claude-cli | gemini-env | mistral-env)"
+            ));
+        }
     };
     if matches!(source, "claude-cli" | "claude-setup-token") {
         warn_anthropic_subscription_token();
@@ -130,7 +153,7 @@ fn import(source: &str) -> Result<(), String> {
     let detected = harw_model_catalog::detect_local_sources(provider);
     let mut any = false;
     for entry in &detected {
-        if source != "codex" && entry.source.id != source {
+        if entry.source.id != source {
             continue;
         }
         let mark = if entry.exists {
@@ -144,6 +167,14 @@ fn import(source: &str) -> Result<(), String> {
         }
     }
     if !any {
+        if source == "codex" {
+            return Err(
+                "kein OpenAI-Platform-API-Key in ~/.codex/auth.json gefunden. Ein \
+                 ChatGPT-Codex-Login-Token wird absichtlich nicht importiert; verwende \
+                 `harw auth token openai` mit einem Platform-API-Key."
+                    .to_owned(),
+            );
+        }
         return Err(format!(
             "keine lokale Quelle für '{source}' gefunden (Provider {provider})"
         ));
@@ -250,17 +281,43 @@ fn require_token_provider(provider: &str) -> Result<(), String> {
 /// aus (`eprintln!`, bestehender Ausgabestil dieser Datei). Bricht den Ablauf
 /// nicht ab — nur ein Hinweis, keine Blockade.
 fn warn_anthropic_subscription_token() {
-    eprintln!("\n{}\n", harw_provider_http::ANTHROPIC_SUBSCRIPTION_TOKEN_WARNING);
+    eprintln!(
+        "\n{}\n",
+        harw_provider_http::ANTHROPIC_SUBSCRIPTION_TOKEN_WARNING
+    );
 }
 
 fn token_prompt(provider: &str) -> &'static str {
     match provider {
-        "anthropic" => "Füge den Setup-Token ein (z. B. Ausgabe von `claude setup-token`) und drücke Enter:",
-        "openai" => "Füge den OpenAI-API-Key oder einen bereits vorhandenen Codex-Token ein und drücke Enter:",
+        "anthropic" => {
+            "Füge den Setup-Token ein (z. B. Ausgabe von `claude setup-token`) und drücke Enter:"
+        }
+        "openai" => {
+            "Füge einen OpenAI-Platform-API-Key ein (kein ChatGPT-/Codex-OAuth-Token) und drücke Enter:"
+        }
         "gemini" => "Füge den Gemini-/Google-API-Key ein und drücke Enter:",
         "mistral" => "Füge den Mistral-API-Key ein und drücke Enter:",
         _ => "Füge das Secret ein und drücke Enter:",
     }
+}
+
+/// Erkennt das dreiteilige, URL-sichere Format eines JWT, ohne seinen Inhalt
+/// zu dekodieren oder auszugeben. OpenAI-Platform-API-Keys verwenden dieses
+/// Format nicht; ChatGPT-/Codex-Access-Tokens dagegen schon.
+fn looks_like_jwt(value: &str) -> bool {
+    let mut parts = value.split('.');
+    let is_segment = |segment: Option<&str>| {
+        segment.is_some_and(|segment| {
+            !segment.is_empty()
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+    };
+    is_segment(parts.next())
+        && is_segment(parts.next())
+        && is_segment(parts.next())
+        && parts.next().is_none()
 }
 
 /// Liest ein Secret ohne Terminal-Echo oder aus einer nicht-interaktiven Pipe.
@@ -331,4 +388,19 @@ fn read_all_stdin() -> Result<String, String> {
         .read_to_string(&mut buffer)
         .map_err(|error| format!("stdin lesen: {error}"))?;
     Ok(buffer)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_like_jwt;
+
+    #[test]
+    fn jwt_like_values_are_rejected_for_openai_platform_auth() {
+        assert!(looks_like_jwt(
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signature"
+        ));
+        assert!(!looks_like_jwt("sk-proj-example"));
+        assert!(!looks_like_jwt("not.a.jwt.with.four.parts"));
+        assert!(!looks_like_jwt("missing..segment"));
+    }
 }

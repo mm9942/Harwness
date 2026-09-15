@@ -505,15 +505,24 @@ pub enum ModelsAction {
         /// Nur diesen Provider abfragen; ohne Angabe alle aktivierten
         /// Provider.
         provider: Option<String>,
-        /// Legt für jedes entdeckte Modell eine `models/<id>.toml` im
-        /// aktiven Profil an (bereits vorhandene Dateien bleiben
-        /// unverändert).
+        /// Veraltet und nur noch zur Rückwärtskompatibilität akzeptiert:
+        /// jeder erfolgreiche Scan synchronisiert Modell-Dateien ohnehin.
         #[arg(long)]
         add: bool,
         /// Zeigt/übernimmt nur kostenlose Modelle (Preis 0 oder
         /// `:free`-Suffix der Modell-ID).
         #[arg(long)]
         free_only: bool,
+    },
+    /// Fügt ein live entdecktes Modell zur sichtbaren Auswahl hinzu.
+    Add {
+        /// `provider/modell`; ohne Angabe öffnet sich der Auswahl-Picker.
+        target: Option<String>,
+    },
+    /// Entfernt ein Modell aus der sichtbaren Auswahl und dem lokalen Cache.
+    Delete {
+        /// `provider/modell`.
+        target: String,
     },
     /// Interne Modellstellen verwalten (Session-Titel, Kompaktierungs-
     /// Zusammenfassung, Speicher-Konsolidierung, Traumreflexion, Explorer,
@@ -1050,6 +1059,36 @@ mod tests {
         assert_eq!(provider, None);
         assert!(!add);
         assert!(!free_only);
+    }
+
+    #[test]
+    fn test_models_add_and_delete_parse_targets_and_picker_mode() {
+        let cli = Cli::try_parse_from(["harw", "models", "add"])
+            .expect("picker mode should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Models {
+                action: Some(ModelsAction::Add { target: None })
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["harw", "models", "add", "mistral/mistral-medium-2604"])
+            .expect("add target should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Models {
+                action: Some(ModelsAction::Add { target: Some(target) })
+            }) if target == "mistral/mistral-medium-2604"
+        ));
+
+        let cli = Cli::try_parse_from(["harw", "models", "delete", "openrouter/meta-llama/x"])
+            .expect("delete target should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Models {
+                action: Some(ModelsAction::Delete { target })
+            }) if target == "openrouter/meta-llama/x"
+        ));
     }
 
     #[test]

@@ -247,6 +247,7 @@ pub fn run_chat(
                 assembly,
                 TuiRunOptions {
                     wiring,
+                    verbose_tools: factory.verbose_tools(),
                     resume: Some(TuiResume {
                         selector: Box::new(ProfileResumeSelector::new(
                             sessions_root.clone(),
@@ -470,6 +471,11 @@ struct ChatTuiFactory {
 }
 
 impl ChatTuiFactory {
+    /// Returns the CLI verbosity selected for every runtime assembled by this factory.
+    fn verbose_tools(&self) -> bool {
+        self.inputs.verbose
+    }
+
     // Übernimmt die Zutaten, die Modellquelle und die `--add-dir`-Wurzeln.
     fn new(inputs: ChatRuntimeInputs, model: fn() -> ModelSource, add_dirs: Vec<PathBuf>) -> Self {
         Self {

@@ -24,6 +24,7 @@
 //! verwendet und nie geloggt oder in einer Fehlermeldung ausgegeben.
 
 use std::fmt;
+use std::path::Path;
 use std::time::Duration;
 
 use secrecy::ExposeSecret;
@@ -125,12 +126,11 @@ impl std::error::Error for DiscoveryError {}
 /// `auth`-`SecretRef` gesetzt ist.
 ///
 /// # Description
-/// Baut eine `crate::SecretSources` ohne injizierten Resolver und ohne
-/// harw-Home (wie `OpenAiResponsesProvider::from_config`) und delegiert an
-/// `crate::resolve_secret`. Nicht auflösbare Referenzen (fehlender Resolver
-/// für `secrets:`, fehlendes Home für `file:`/`file-json:`, fehlende
-/// Umgebungsvariable) führen zu `None`, nicht zu einem Fehler — der Aufrufer
-/// (`harw models scan`) meldet fehlende Auth separat.
+/// Verwendet denselben optionalen sealed-secret-Resolver und dasselbe
+/// harw-Home wie die Runtime. Ein Provider mit `auth = "secrets:…"` oder
+/// `file:`-Credentials muss auch mit `harw models scan` auffindbar sein.
+/// Nicht auflösbare Referenzen führen zu `None`, nicht zu einem Fehler — der
+/// Aufrufer meldet fehlende Auth separat.
 ///
 /// # Arguments
 /// - `provider_name`: Name des Providers, nur für Diagnose-Logging.
@@ -147,12 +147,14 @@ pub fn resolve_provider_api_key(
     provider_name: &str,
     provider: &harw_config::ProviderToml,
     config: &harw_config::ResolvedConfig,
+    home: Option<&Path>,
+    resolver: Option<&dyn crate::SecretResolver>,
 ) -> Option<String> {
     let reference = provider.auth.as_ref()?;
     let sources = crate::SecretSources {
         env_layer: &config.env_layer,
-        resolver: None,
-        home: None,
+        resolver,
+        home,
         endpoint: Some(&provider.base_url),
     };
     match crate::resolve_secret(reference, sources) {
@@ -209,7 +211,13 @@ pub async fn list_models(
             let normalized = format!("{}/v1", base.trim_end_matches("/v1"));
             format!("{normalized}/models")
         }
-        "anthropic-messages" => format!("{base}/v1/models"),
+        "anthropic-messages" => {
+            // Direct Anthropic configurations commonly use either the API
+            // origin or an already versioned `/v1` base URL.  Do not turn
+            // the latter into the invalid `/v1/v1/models` path.
+            let api_base = base.strip_suffix("/v1").unwrap_or(base);
+            format!("{api_base}/v1/models")
+        }
         other => {
             return Err(DiscoveryError::Unsupported {
                 api: other.to_owned(),

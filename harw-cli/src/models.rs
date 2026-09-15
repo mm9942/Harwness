@@ -21,9 +21,9 @@
 //! # Modell-Discovery
 //! [`crate::models::run_scan`] fragt `harw_provider_http::discovery::list_models`
 //! je konfiguriertem Provider ab; der API-Schlüssel kommt aus
-//! `harw_provider_http::discovery::resolve_provider_api_key` (env-/Klartext-
-//! Referenzen, kein Home-gebundenes `file:`/`file-json:` — siehe dortige
-//! Doku). Das Ergebnis wird nie geloggt.
+//! `harw_provider_http::discovery::resolve_provider_api_key`. Der Scan erhält
+//! dieselbe Home- und sealed-secret-Auflösung wie die Runtime. Das Ergebnis
+//! wird nie geloggt.
 //!
 //! # Concurrency
 //! Zustandslos; `harw models scan` baut für die Dauer des Befehls eine
@@ -33,6 +33,8 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use toml_edit::value;
@@ -64,6 +66,11 @@ pub enum ModelsError {
     ProviderNotFound { name: String },
     /// Ein unbekannter Stellen-Schlüssel wurde an `harw models internal` übergeben.
     UnknownPoint { point: String, valid: String },
+    /// Der versiegelte Secret-Store konnte für eine Modellabfrage nicht geöffnet werden.
+    SecretStore { reason: String },
+    InvalidModelTarget { target: String },
+    ModelNotLive { provider: String, model: String },
+    ProviderDisabled { provider: String },
 }
 
 impl fmt::Display for ModelsError {
@@ -84,6 +91,12 @@ impl fmt::Display for ModelsError {
                 f,
                 "unbekannte interne Modellstelle {point:?}; gültige Schlüssel: {valid}"
             ),
+            Self::SecretStore { reason } => {
+                write!(f, "Secret-Store für Modellabfrage nicht verfügbar: {reason}")
+            }
+            Self::InvalidModelTarget { target } => write!(f, "Modellziel muss `provider/modell` sein: {target:?}"),
+            Self::ModelNotLive { provider, model } => write!(f, "Modell {provider}/{model} ist nicht live entdeckt; zuerst `harw models scan {provider}` ausführen"),
+            Self::ProviderDisabled { provider } => write!(f, "Provider {provider:?} ist deaktiviert"),
         }
     }
 }
@@ -142,6 +155,9 @@ fn execute(home: &Path, action: Option<ModelsAction>) -> Result<(), ModelsError>
             add,
             free_only,
         }) => run_scan(home, provider, add, free_only),
+        Some(ModelsAction::Add { target: Some(target) }) => add_model(home, &target),
+        Some(ModelsAction::Add { target: None }) => run_model_picker(home),
+        Some(ModelsAction::Delete { target }) => delete_model(home, &target),
         Some(ModelsAction::Internal { action }) => run_internal(home, action),
         Some(ModelsAction::Default { id }) => {
             set_default_model(home, &id)?;
@@ -179,6 +195,11 @@ fn global_config_path(home: &Path) -> Result<PathBuf, ModelsError> {
 
 fn run_list(home: &Path) -> Result<(), ModelsError> {
     let (config, _profile) = load_config_and_profile(home)?;
+    let resolver = crate::secret_store::open_configured_secret_resolver(home, &config)
+        .map_err(|reason| ModelsError::SecretStore { reason })?;
+    let resolver = resolver
+        .as_ref()
+        .map(|resolver| resolver as &dyn harw_provider_http::SecretResolver);
 
     println!("== Provider ==");
     let mut provider_names: Vec<&String> = config.providers.keys().collect();
@@ -188,7 +209,8 @@ fn run_list(home: &Path) -> Result<(), ModelsError> {
     }
     for name in provider_names {
         let provider = &config.providers[name];
-        let auth_ok = discovery::resolve_provider_api_key(name, provider, &config).is_some()
+        let auth_ok = discovery::resolve_provider_api_key(name, provider, &config, Some(home), resolver)
+            .is_some()
             || provider.auth_header.as_deref() == Some("none");
         println!(
             "{name}\tapi={}\thost={}\tauth={}\tenabled={}",
@@ -244,6 +266,11 @@ fn run_scan(
     free_only: bool,
 ) -> Result<(), ModelsError> {
     let (config, profile) = load_config_and_profile(home)?;
+    let resolver = crate::secret_store::open_configured_secret_resolver(home, &config)
+        .map_err(|reason| ModelsError::SecretStore { reason })?;
+    let resolver = resolver
+        .as_ref()
+        .map(|resolver| resolver as &dyn harw_provider_http::SecretResolver);
 
     let mut targets: Vec<(&String, &harw_config::ProviderToml)> = match &provider_filter {
         Some(name) => {
@@ -275,8 +302,11 @@ fn run_scan(
         })?;
 
     let models_dir = profile.join("models");
+    if add {
+        println!("--add ist nicht mehr nötig: erfolgreiche Scans synchronisieren Modell-Dateien.");
+    }
     for (name, provider) in targets {
-        let api_key = discovery::resolve_provider_api_key(name, provider, &config);
+        let api_key = discovery::resolve_provider_api_key(name, provider, &config, Some(home), resolver);
         match runtime.block_on(discovery::list_models(name, provider, api_key.as_deref())) {
             Ok(models) => {
                 let filtered: Vec<DiscoveredModel> = if free_only {
@@ -287,13 +317,137 @@ fn run_scan(
                 println!("{name}: verbunden ({} Modelle)", filtered.len());
                 for model in &filtered {
                     print_discovered_model(model);
-                    if add {
-                        write_discovered_model_file(&models_dir, name, model)?;
-                    }
                 }
+                sync_provider_model_list(&profile, name, &filtered)?;
+                sync_discovered_model_files(&models_dir, name, &filtered)?;
             }
             Err(error) => println!("{name}: {error}"),
         }
+    }
+    Ok(())
+}
+
+/// Entfernt aus der TUI-Auswahl ausschließlich IDs, die der Provider nicht
+/// mehr meldet. Neue Live-Modelle werden bewusst nicht automatisch gewählt;
+/// dafür dienen `harw models add` und der Picker.
+fn sync_provider_model_list(
+    profile: &Path,
+    provider_name: &str,
+    discovered: &[DiscoveredModel],
+) -> Result<(), ModelsError> {
+    if !provider_name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(ModelsError::Toml {
+            path: profile.join("providers"),
+            reason: "ungültiger Provider-Name für Modell-Synchronisation".to_owned(),
+        });
+    }
+    let path = profile.join("providers").join(format!("{provider_name}.toml"));
+    let document = open_document(&path)?;
+    let provider: harw_config::ProviderToml = toml::from_str(&document.to_string()).map_err(|error| {
+        ModelsError::Toml { path: path.clone(), reason: error.to_string() }
+    })?;
+    let live = discovered.iter().map(|model| model.id.as_str()).collect::<BTreeSet<_>>();
+    let ids = provider.models.iter().filter(|id| live.contains(id.as_str())).collect::<BTreeSet<_>>();
+    write_provider_model_list(&path, ids.into_iter().map(ToString::to_string))
+}
+
+fn write_provider_model_list(
+    path: &Path,
+    ids: impl IntoIterator<Item = String>,
+) -> Result<(), ModelsError> {
+    let mut document = open_document(path)?;
+    let mut models = toml_edit::Array::new();
+    for id in ids.into_iter().collect::<BTreeSet<_>>() {
+        models.push(id);
+    }
+    document["models"] = toml_edit::value(models);
+    write_atomic(path, document.to_string().as_bytes())
+}
+
+fn parse_model_target(target: &str) -> Result<(&str, &str), ModelsError> {
+    let Some((provider, model)) = target.split_once('/') else {
+        return Err(ModelsError::InvalidModelTarget { target: target.to_owned() });
+    };
+    if provider.is_empty() || model.is_empty() {
+        return Err(ModelsError::InvalidModelTarget { target: target.to_owned() });
+    }
+    Ok((provider, model))
+}
+
+fn provider_path(profile: &Path, provider: &str) -> PathBuf {
+    profile.join("providers").join(format!("{provider}.toml"))
+}
+
+fn add_model(home: &Path, target: &str) -> Result<(), ModelsError> {
+    let (provider_name, model_id) = parse_model_target(target)?;
+    let (config, profile) = load_config_and_profile(home)?;
+    let provider = config.providers.get(provider_name).ok_or_else(|| ModelsError::ProviderNotFound { name: provider_name.to_owned() })?;
+    if !provider.enabled {
+        return Err(ModelsError::ProviderDisabled { provider: provider_name.to_owned() });
+    }
+    if !config.models.values().any(|model| model.provider == provider_name && model.id == model_id) {
+        return Err(ModelsError::ModelNotLive { provider: provider_name.to_owned(), model: model_id.to_owned() });
+    }
+    let mut selected = provider.models.iter().cloned().collect::<BTreeSet<_>>();
+    selected.insert(model_id.to_owned());
+    write_provider_model_list(&provider_path(&profile, provider_name), selected)?;
+    println!("{provider_name}/{model_id} hinzugefügt.");
+    Ok(())
+}
+
+fn delete_model(home: &Path, target: &str) -> Result<(), ModelsError> {
+    let (provider_name, model_id) = parse_model_target(target)?;
+    let (config, profile) = load_config_and_profile(home)?;
+    let provider = config.providers.get(provider_name).ok_or_else(|| ModelsError::ProviderNotFound { name: provider_name.to_owned() })?;
+    let mut selected = provider.models.iter().cloned().collect::<BTreeSet<_>>();
+    selected.remove(model_id);
+    write_provider_model_list(&provider_path(&profile, provider_name), selected)?;
+    let model_path = profile.join("models").join(model_filename(model_id));
+    if let Ok(metadata) = fs::symlink_metadata(&model_path) {
+        if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
+            fs::remove_file(&model_path).map_err(|source| ModelsError::Io {
+                path: model_path,
+                source,
+            })?;
+        }
+    }
+    println!("{provider_name}/{model_id} entfernt.");
+    Ok(())
+}
+
+fn run_model_picker(home: &Path) -> Result<(), ModelsError> {
+    let (config, profile) = load_config_and_profile(home)?;
+    let mut providers = config
+        .providers
+        .iter()
+        .filter(|(_, provider)| provider.enabled)
+        .map(|(name, provider)| {
+            let mut models = config.models.values()
+                .filter(|model| model.provider == *name)
+                .map(|model| model.id.clone())
+                .collect::<Vec<_>>();
+            if models.is_empty() { models = provider.models.clone(); }
+            harw_tui::ModelPickerProvider {
+                id: name.clone(),
+                models,
+                selected: provider.models.iter().cloned().collect(),
+            }
+        })
+        .collect::<Vec<_>>();
+    providers.sort_by(|left, right| left.id.cmp(&right.id));
+    if providers.is_empty() {
+        println!("Keine aktivierten Provider konfiguriert.");
+        return Ok(());
+    }
+    if let Some(outcome) = harw_tui::run_model_picker(providers).map_err(|error| ModelsError::Toml {
+        path: profile.join("providers"), reason: error.to_string()
+    })? {
+        let count = outcome.models.len();
+        write_provider_model_list(&provider_path(&profile, &outcome.provider), outcome.models)?;
+        println!("{}: {count} Modelle gewählt.", outcome.provider);
     }
     Ok(())
 }
@@ -323,21 +477,91 @@ fn print_discovered_model(model: &DiscoveredModel) {
     println!("  {}{context}{price}{tools}", model.id);
 }
 
-/// Legt `models/<id>.toml` im aktiven Profil an, sofern die Datei noch nicht
-/// existiert (bestehende Dateien bleiben unverändert).
-fn write_discovered_model_file(
+/// Synchronisiert die Modell-Dateien eines Providers mit dessen erfolgreicher
+/// Live-Antwort. Nicht mehr gemeldete IDs werden gelöscht; vorhandene und neue
+/// IDs erhalten jeweils eine frisch gerenderte Datei. Fremde Provider, nicht
+/// lesbare TOML-Dateien und Symlinks bleiben absichtlich unangetastet.
+fn sync_discovered_model_files(
     models_dir: &Path,
+    provider_name: &str,
+    discovered: &[DiscoveredModel],
+) -> Result<(), ModelsError> {
+    let live: BTreeMap<&str, &DiscoveredModel> = discovered
+        .iter()
+        .map(|model| (model.id.as_str(), model))
+        .collect();
+    let mut existing = BTreeMap::<String, PathBuf>::new();
+
+    match fs::read_dir(models_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(|source| ModelsError::Io {
+                    path: models_dir.to_path_buf(),
+                    source,
+                })?;
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+                    continue;
+                }
+                let file_type = entry.file_type().map_err(|source| ModelsError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+                if file_type.is_symlink() {
+                    println!("  übersprungen (Symlink): {}", path.display());
+                    continue;
+                }
+                let raw = fs::read_to_string(&path).map_err(|source| ModelsError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+                let model: harw_config::ModelToml = match toml::from_str(&raw) {
+                    Ok(model) => model,
+                    Err(_) => {
+                        println!("  übersprungen (ungültiges Modell-TOML): {}", path.display());
+                        continue;
+                    }
+                };
+                if model.provider != provider_name {
+                    continue;
+                }
+                if live.contains_key(model.id.as_str()) {
+                    existing.entry(model.id).or_insert(path);
+                } else {
+                    fs::remove_file(&path).map_err(|source| ModelsError::Io {
+                        path: path.clone(),
+                        source,
+                    })?;
+                    println!("  entfernt: {}", path.display());
+                }
+            }
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => return Err(ModelsError::Io { path: models_dir.to_path_buf(), source }),
+    }
+
+    for model in live.values() {
+        let path = existing
+            .get(model.id.as_str())
+            .cloned()
+            .unwrap_or_else(|| models_dir.join(model_filename(&model.id)));
+        write_discovered_model_file(&path, provider_name, model)?;
+    }
+    Ok(())
+}
+
+/// Rendert einen durch einen erfolgreichen Provider-Scan bestätigten
+/// Modell-Eintrag atomar an seinen Zielpfad.
+fn write_discovered_model_file(
+    path: &Path,
     provider_name: &str,
     model: &DiscoveredModel,
 ) -> Result<(), ModelsError> {
-    std::fs::create_dir_all(models_dir).map_err(|source| ModelsError::Io {
+    let models_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(models_dir).map_err(|source| ModelsError::Io {
         path: models_dir.to_path_buf(),
         source,
     })?;
-    let path = models_dir.join(model_filename(&model.id));
-    if path.exists() {
-        return Ok(());
-    }
     let toml_model = harw_config::ModelToml {
         id: model.id.clone(),
         name: None,
@@ -356,10 +580,10 @@ fn write_discovered_model_file(
         },
     };
     let rendered = toml::to_string_pretty(&toml_model).map_err(|error| ModelsError::Toml {
-        path: path.clone(),
+        path: path.to_path_buf(),
         reason: error.to_string(),
     })?;
-    write_atomic(&path, rendered.as_bytes())
+    write_atomic(path, rendered.as_bytes())
 }
 
 /// Encode API identifiers as a single collision-free filename component.
@@ -658,6 +882,51 @@ mod tests {
     }
 
     #[test]
+    fn add_then_delete_changes_only_the_selected_provider_models() {
+        let (_guard, home) = temp_home();
+        let profile = home.join("profiles/default");
+        let providers = profile.join("providers");
+        let models = profile.join("models");
+        std::fs::create_dir_all(&providers).expect("providers dir");
+        std::fs::create_dir_all(&models).expect("models dir");
+        std::fs::write(
+            providers.join("acme.toml"),
+            "name = \"acme\"\napi = \"openai-chat\"\nbase_url = \"https://api.example.test/v1\"\nauth = \"env:ACME_TOKEN\"\nenabled = true\nmodels = []\n",
+        )
+        .expect("provider");
+        let live = harw_config::ModelToml {
+            id: "model/with-slash".to_owned(),
+            name: None,
+            provider: "acme".to_owned(),
+            aliases: Vec::new(),
+            context_window: None,
+            max_tokens: None,
+            prompt_caching: None,
+            reasoning: false,
+            input_types: Vec::new(),
+            capabilities: harw_config::ModelCapabilitiesToml::default(),
+        };
+        let cache_path = models.join(model_filename(&live.id));
+        std::fs::write(&cache_path, toml::to_string(&live).expect("serialize model"))
+            .expect("model cache");
+
+        add_model(&home, "acme/model/with-slash").expect("add live model");
+        let provider: harw_config::ProviderToml = toml::from_str(
+            &std::fs::read_to_string(providers.join("acme.toml")).expect("read provider"),
+        )
+        .expect("parse provider");
+        assert_eq!(provider.models, ["model/with-slash"]);
+
+        delete_model(&home, "acme/model/with-slash").expect("delete model");
+        let provider: harw_config::ProviderToml = toml::from_str(
+            &std::fs::read_to_string(providers.join("acme.toml")).expect("read provider"),
+        )
+        .expect("parse provider");
+        assert!(provider.models.is_empty());
+        assert!(!cache_path.exists());
+    }
+
+    #[test]
     fn test_is_free_model_matches_free_suffix_and_zero_price() {
         let free_suffix = DiscoveredModel {
             id: "nvidia/nemotron-3.5-lightning:free".to_owned(),
@@ -685,6 +954,75 @@ mod tests {
             supports_tools: None,
         };
         assert!(!is_free_model(&paid));
+    }
+
+    #[test]
+    fn scan_sync_replaces_live_models_and_removes_only_missing_provider_models() {
+        let (_guard, home) = temp_home();
+        let models_dir = home.join("profiles/default/models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        let old = harw_config::ModelToml {
+            id: "gone".to_owned(),
+            name: None,
+            provider: "acme".to_owned(),
+            aliases: Vec::new(),
+            context_window: None,
+            max_tokens: None,
+            prompt_caching: None,
+            reasoning: false,
+            input_types: Vec::new(),
+            capabilities: harw_config::ModelCapabilitiesToml::default(),
+        };
+        let other = harw_config::ModelToml { provider: "other".to_owned(), ..old.clone() };
+        std::fs::write(models_dir.join("gone.toml"), toml::to_string(&old).unwrap())
+            .expect("write stale model");
+        std::fs::write(models_dir.join("other.toml"), toml::to_string(&other).unwrap())
+            .expect("write other provider model");
+
+        let live = DiscoveredModel {
+            id: "current".to_owned(),
+            context_length: Some(262_144),
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            supports_tools: Some(true),
+        };
+        sync_discovered_model_files(&models_dir, "acme", &[live]).expect("sync models");
+
+        assert!(!models_dir.join("gone.toml").exists());
+        assert!(models_dir.join("other.toml").exists());
+        let current: harw_config::ModelToml = toml::from_str(
+            &std::fs::read_to_string(models_dir.join("current.toml")).expect("read current"),
+        )
+        .expect("parse current");
+        assert_eq!(current.provider, "acme");
+        assert_eq!(current.context_window, Some(262_144));
+        assert!(current.capabilities.tool_use);
+    }
+
+    #[test]
+    fn scan_sync_updates_the_tui_provider_model_list_without_touching_auth() {
+        let (_guard, home) = temp_home();
+        let profile = home.join("profiles/default");
+        let providers = profile.join("providers");
+        std::fs::create_dir_all(&providers).expect("providers dir");
+        let path = providers.join("acme.toml");
+        std::fs::write(
+            &path,
+            "# keep this comment\nname = \"acme\"\napi = \"openai-chat\"\nbase_url = \"https://api.example.test/v1\"\nauth = \"file:/home/test/.harw/secrets/acme.key\"\nmodels = [\"stale\", \"zeta\"]\n",
+        )
+        .expect("write provider");
+        let models = [
+            DiscoveredModel { id: "zeta".to_owned(), context_length: None, input_price_per_mtok: None, output_price_per_mtok: None, supports_tools: None },
+            DiscoveredModel { id: "alpha".to_owned(), context_length: None, input_price_per_mtok: None, output_price_per_mtok: None, supports_tools: None },
+        ];
+
+        sync_provider_model_list(&profile, "acme", &models).expect("sync provider list");
+
+        let content = std::fs::read_to_string(&path).expect("read provider");
+        assert!(content.contains("# keep this comment"));
+        assert!(content.contains("auth = \"file:/home/test/.harw/secrets/acme.key\""));
+        let provider: harw_config::ProviderToml = toml::from_str(&content).expect("parse provider");
+        assert_eq!(provider.models, ["zeta"]);
     }
 
     #[test]
