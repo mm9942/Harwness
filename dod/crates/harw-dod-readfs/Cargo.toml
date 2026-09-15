@@ -1,0 +1,15 @@
+[package]
+name = "harw-dod-readfs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-dod-cap = { path = "../harw-dod-cap" }
+harw-macros = { path = "../../../harw-macros" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

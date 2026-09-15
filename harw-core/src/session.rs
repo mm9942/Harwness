@@ -243,6 +243,40 @@ pub struct AgentSession {
     /// warum dieses Feld hier und nicht auf [`SpawnContext`] liegt, und warum
     /// ein Kind sein Programm mitbringt statt es zu erben.
     context_program: Option<ContextProgram>,
+    /// Richtlinie für automatisches Verdichten des Verlaufs dieser Session.
+    /// `None`: keine automatische Verdichtung.
+    auto_compact: Option<crate::auto_compact::AutoCompactPolicy>,
+    /// Beobachter, der nach jeder Verdichtung (siehe
+    /// [`crate::compaction::compact_session`]) benachrichtigt wird. `None`:
+    /// kein Beobachter registriert.
+    compaction_observer: Option<std::sync::Arc<dyn crate::compaction::CompactionObserver>>,
+    /// Beobachter, der über das Ergebnis jedes ausgeführten Tool-Aufrufs
+    /// dieser Session benachrichtigt wird (Projektgedächtnis-Erfassung,
+    /// siehe [`crate::capture::ToolOutcomeObserver`]). `None`: kein
+    /// Beobachter registriert.
+    tool_outcome_observer: Option<std::sync::Arc<dyn crate::capture::ToolOutcomeObserver>>,
+    /// Fest zugeordnetes Provider-/Modellpaar für den Compaction-
+    /// Zusammenfassungs-Aufruf dieser Session (Addendum C: interne
+    /// Modellstellen). `(None, None)`: kein Pin gesetzt — `maybe_compact`
+    /// lässt `CompactionPlan::summary_provider`/`summary_model` unangetastet
+    /// (Katalog-/Hauptmodell-Default).
+    compaction_summary_model: (Option<ProviderId>, Option<ModelId>),
+    /// Schwellenwerte der Turn-Wächter dieser Session (Addendum F+G). `None`
+    /// im Builder-Setter bedeutet „`GuardPolicy::default()` verwenden" —
+    /// [`Self::guard_policy`] löst das bereits auf, das Feld selbst trägt
+    /// deshalb immer einen konkreten Wert.
+    guard_policy: crate::guard::GuardPolicy,
+    /// Beobachter, der über jedes von [`crate::guard::TurnGuard`] erkannte
+    /// Drift-Ereignis dieser Session benachrichtigt wird. `None`: kein
+    /// Beobachter registriert.
+    drift_observer: Option<std::sync::Arc<dyn crate::guard::DriftObserver>>,
+    /// Berater, der vor jeder Werkzeugausführung dieser Session befragt wird,
+    /// ob ein bekannter Pitfall zutrifft. `None`: keine Beratung.
+    pitfall_advisor: Option<std::sync::Arc<dyn crate::guard::PitfallAdvisor>>,
+    /// Beobachter, der nach jeder Modellrunde und jedem Tool-Ergebnis dieser
+    /// Session über Fortschritt benachrichtigt wird (Lease-Erneuerung durch
+    /// `ManagedAgentSpawner`). `None`: kein Beobachter registriert.
+    progress_observer: Option<std::sync::Arc<dyn crate::guard::ProgressObserver>>,
 }
 
 #[derive(Debug, Clone)]
@@ -429,6 +463,14 @@ impl AgentSession {
             mode: InteractionMode::default(),
             executable_snapshot_id: None,
             context_program: None,
+            auto_compact: None,
+            compaction_observer: None,
+            tool_outcome_observer: None,
+            compaction_summary_model: (None, None),
+            guard_policy: crate::guard::GuardPolicy::default(),
+            drift_observer: None,
+            pitfall_advisor: None,
+            progress_observer: None,
         }
     }
 
@@ -691,6 +733,169 @@ impl AgentSession {
     /// werden). `None` fällt auf den Provider-Default zurück.
     pub fn set_reasoning_effort(&mut self, reasoning_effort: Option<ReasoningEffort>) {
         self.reasoning_effort = reasoning_effort;
+    }
+
+    /// Setzt die Richtlinie für automatisches Verdichten des Verlaufs.
+    /// `None`: keine automatische Verdichtung.
+    #[must_use]
+    pub fn with_auto_compact(
+        mut self,
+        policy: Option<crate::auto_compact::AutoCompactPolicy>,
+    ) -> Self {
+        self.auto_compact = policy;
+        self
+    }
+
+    /// Liefert die aktuell gesetzte Auto-Compact-Richtlinie, falls vorhanden.
+    #[must_use]
+    pub fn auto_compact(&self) -> Option<&crate::auto_compact::AutoCompactPolicy> {
+        self.auto_compact.as_ref()
+    }
+
+    /// Setzt die Auto-Compact-Richtlinie in-place.
+    ///
+    /// Nicht-konsumierendes Gegenstück zu [`Self::with_auto_compact`].
+    pub fn set_auto_compact(&mut self, policy: Option<crate::auto_compact::AutoCompactPolicy>) {
+        self.auto_compact = policy;
+    }
+
+    /// Setzt den Beobachter, der nach jeder Verdichtung
+    /// ([`crate::compaction::compact_session`]) benachrichtigt wird.
+    /// `None`: kein Beobachter registriert.
+    #[must_use]
+    pub fn with_compaction_observer(
+        mut self,
+        observer: Option<std::sync::Arc<dyn crate::compaction::CompactionObserver>>,
+    ) -> Self {
+        self.compaction_observer = observer;
+        self
+    }
+
+    /// Liefert den aktuell registrierten Verdichtungs-Beobachter, falls vorhanden.
+    #[must_use]
+    pub fn compaction_observer(
+        &self,
+    ) -> Option<&std::sync::Arc<dyn crate::compaction::CompactionObserver>> {
+        self.compaction_observer.as_ref()
+    }
+
+    /// Setzt das fest zugeordnete Provider-/Modellpaar für den Compaction-
+    /// Zusammenfassungs-Aufruf dieser Session (Addendum C).
+    ///
+    /// # Arguments
+    /// - `provider` (`Option<ProviderId>`): feste Provider-ID, oder `None`
+    ///   für „Session-/Katalog-Default verwenden".
+    /// - `model` (`Option<ModelId>`): feste Modell-ID, oder `None` für
+    ///   „Session-/Katalog-Default verwenden".
+    #[must_use]
+    pub fn with_compaction_summary_model(
+        mut self,
+        provider: Option<ProviderId>,
+        model: Option<ModelId>,
+    ) -> Self {
+        self.compaction_summary_model = (provider, model);
+        self
+    }
+
+    /// Liefert das aktuell gesetzte Provider-/Modellpaar für den Compaction-
+    /// Zusammenfassungs-Aufruf, falls gesetzt.
+    #[must_use]
+    pub fn compaction_summary_model(&self) -> (Option<&ProviderId>, Option<&ModelId>) {
+        (
+            self.compaction_summary_model.0.as_ref(),
+            self.compaction_summary_model.1.as_ref(),
+        )
+    }
+
+    /// Setzt den Beobachter, der über das Ergebnis jedes ausgeführten
+    /// Tool-Aufrufs dieser Session benachrichtigt wird (Projektgedächtnis-
+    /// Erfassung). `None`: kein Beobachter registriert.
+    #[must_use]
+    pub fn with_tool_outcome_observer(
+        mut self,
+        observer: Option<std::sync::Arc<dyn crate::capture::ToolOutcomeObserver>>,
+    ) -> Self {
+        self.tool_outcome_observer = observer;
+        self
+    }
+
+    /// Liefert den aktuell registrierten Tool-Outcome-Beobachter, falls vorhanden.
+    #[must_use]
+    pub fn tool_outcome_observer(
+        &self,
+    ) -> Option<&std::sync::Arc<dyn crate::capture::ToolOutcomeObserver>> {
+        self.tool_outcome_observer.as_ref()
+    }
+
+    /// Setzt die Schwellenwerte der Turn-Wächter dieser Session (Addendum
+    /// F+G). `None` übernimmt [`crate::guard::GuardPolicy::default`].
+    #[must_use]
+    pub fn with_guard_policy(mut self, policy: Option<crate::guard::GuardPolicy>) -> Self {
+        self.guard_policy = policy.unwrap_or_default();
+        self
+    }
+
+    /// Liefert die aktuell gültigen Wächter-Schwellenwerte dieser Session
+    /// (nie `None` — ein nicht gesetzter Wert löst bereits zu
+    /// [`crate::guard::GuardPolicy::default`] auf).
+    #[must_use]
+    pub fn guard_policy(&self) -> crate::guard::GuardPolicy {
+        self.guard_policy
+    }
+
+    /// Setzt den Beobachter, der über jedes erkannte Drift-Ereignis dieser
+    /// Session benachrichtigt wird. `None`: kein Beobachter registriert.
+    #[must_use]
+    pub fn with_drift_observer(
+        mut self,
+        observer: Option<std::sync::Arc<dyn crate::guard::DriftObserver>>,
+    ) -> Self {
+        self.drift_observer = observer;
+        self
+    }
+
+    /// Liefert den aktuell registrierten Drift-Beobachter, falls vorhanden.
+    #[must_use]
+    pub fn drift_observer(&self) -> Option<&std::sync::Arc<dyn crate::guard::DriftObserver>> {
+        self.drift_observer.as_ref()
+    }
+
+    /// Setzt den Berater, der vor jeder Werkzeugausführung dieser Session
+    /// nach bekannten Pitfalls befragt wird. `None`: keine Beratung.
+    #[must_use]
+    pub fn with_pitfall_advisor(
+        mut self,
+        advisor: Option<std::sync::Arc<dyn crate::guard::PitfallAdvisor>>,
+    ) -> Self {
+        self.pitfall_advisor = advisor;
+        self
+    }
+
+    /// Liefert den aktuell registrierten Pitfall-Berater, falls vorhanden.
+    #[must_use]
+    pub fn pitfall_advisor(&self) -> Option<&std::sync::Arc<dyn crate::guard::PitfallAdvisor>> {
+        self.pitfall_advisor.as_ref()
+    }
+
+    /// Setzt den Beobachter, der nach jeder Modellrunde und jedem
+    /// Tool-Ergebnis dieser Session über Fortschritt benachrichtigt wird.
+    /// `None`: kein Beobachter registriert.
+    #[must_use]
+    pub fn with_progress_observer(
+        mut self,
+        observer: Option<std::sync::Arc<dyn crate::guard::ProgressObserver>>,
+    ) -> Self {
+        self.progress_observer = observer;
+        self
+    }
+
+    /// Liefert den aktuell registrierten Fortschritts-Beobachter, falls
+    /// vorhanden.
+    #[must_use]
+    pub fn progress_observer(
+        &self,
+    ) -> Option<&std::sync::Arc<dyn crate::guard::ProgressObserver>> {
+        self.progress_observer.as_ref()
     }
 
     /// Builder-style setter: overrides the model selected for every turn of
@@ -2131,6 +2336,7 @@ forbidden = [{forbidden}]
             output_tokens: 5,
             reasoning_tokens: None,
             cached_tokens: None,
+            cache_write_tokens: None,
         };
 
         let error = session

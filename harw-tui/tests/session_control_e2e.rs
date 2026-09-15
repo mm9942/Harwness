@@ -314,6 +314,7 @@ async fn slice9_incompatible_provider_switch_is_atomic() {
             models: vec!["gpt-test-slice9".to_owned()],
             enabled: true,
             origin_allowlist: Default::default(),
+            rate_limit: None,
         },
     );
     config.providers.insert(
@@ -329,6 +330,7 @@ async fn slice9_incompatible_provider_switch_is_atomic() {
             models: vec!["claude-opus-4-8".to_owned()],
             enabled: true,
             origin_allowlist: Default::default(),
+            rate_limit: None,
         },
     );
     config.models.insert(
@@ -343,6 +345,7 @@ async fn slice9_incompatible_provider_switch_is_atomic() {
             reasoning: false,
             input_types: Vec::new(),
             capabilities: Default::default(),
+            prompt_caching: None,
         },
     );
     config.models.insert(
@@ -357,6 +360,7 @@ async fn slice9_incompatible_provider_switch_is_atomic() {
             reasoning: false,
             input_types: Vec::new(),
             capabilities: Default::default(),
+            prompt_caching: None,
         },
     );
 

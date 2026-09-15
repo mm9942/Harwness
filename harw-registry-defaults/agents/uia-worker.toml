@@ -1,0 +1,72 @@
+# Eingebauter Schnellhelfer der UIA (Addendum J, ersetzt den
+# Exklusivitaets-Mechanismus aus Addendum I).
+#
+# Nutzerentscheidung: `uia-worker` ist eine eigene, vollstaendig
+# abgekapselte Organisationsrolle (`AgentRoleId::UiaWorker`,
+# `harw-agent-dsl/src/roles.rs`) neben `worker` — Root- und
+# Sub-Orchestratoren duerfen ihn weder sehen noch spawnen, das erzwingt
+# bereits die versiegelte Spawn-Matrix selbst (kein
+# `exclusive_parent_role` mehr noetig). Zweck sind kleine Schnelleingriffe:
+# eine Frage mit einem Aufruf beantworten, schnell etwas in der Shell
+# regeln, eine Datei lesen — vergleichbar schnelle Dinge. Alles darueber
+# hinaus ist ein klares Nein und geht als Auftrag an Root.
+#
+# Vorher war diese Rolle reine Netz-Recherche
+# (`RegistryProfile::Research`, identisch zu `researcher-web`). Addendum I
+# korrigiert das auf `RegistryProfile::UiaQuickHelper`: lesender
+# Workspace-Zugriff (`fs.read/list/search/glob/grep`) plus `shell.exec`
+# (laeuft wie ueberall ueber Sandbox+Freigabe) plus ausschliesslich
+# `web.fetch` — kein `fs.write`, kein `deps.*`, kein `lens.ask`, kein
+# `browser.*`. Die tatsaechlich erreichbaren Netz-Hosts bestimmt weiterhin
+# die Egress-Policy aus `[network].researcher_web_hosts`.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.uia-worker@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "uia-worker"
+specialization = "uia-worker"
+
+name = "UIA Quick Helper"
+description = "Schnellhelfer der UIA fuer kleine Schnelleingriffe: eine Frage, ein Shell-Griff, ein Dateilesen."
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "shell.exec",
+  "web.fetch",
+]
+forbidden = [
+  "fs.write",
+  "web.docs_rs",
+  "web.crates_io",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+  "lens.ask",
+  "browser.open",
+  "browser.observe",
+  "browser.find",
+  "browser.act",
+  "browser.wait",
+  "browser.events",
+  "browser.close",
+]
+
+[spawn]
+max_depth = 0
+
+[spawn.budget]
+max_tokens = 20000
+max_tool_calls = 6
+max_wall_secs = 90
+effort_cap = "low"
+
+[return]
+contract = "harwness.return.execution-summary@1"

@@ -1,0 +1,67 @@
+[package]
+name = "harw-probe-fs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Formungsteil, `FsEventSource`/`FixtureFsEventSource`, `FsMonSensor`.
+harw-dod-fsmon = { path = "../harw-dod-fsmon" }
+# Zugriffsvokabular: `Capability`, `ReadScope`, `SensorHandle`.
+harw-dod-cap = { path = "../harw-dod-cap" }
+# Datenvokabular: `SecurityEvent`, `trait Sensor`.
+harw-dod-signals = { path = "../harw-dod-signals" }
+# Kennungen: `SensorId`.
+harw-types = { path = "../../../harw-types" }
+jiff = { workspace = true }
+tracing = { workspace = true }
+# Version identisch zu `harw-cli`/`harw-sentinel` — ein Sink für `tracing`,
+# keine Zweitwahl je Binary.
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# `--log`-Grammatik; Version identisch zu `harw-cli`/`harw-sentinel`.
+clap = { version = "4.6.1", features = ["derive"] }
+# Sicherer `SOCK_SEQPACKET`-Unix-Socket ohne `unsafe` (`net`-Feature). Das
+# `event`-Feature liefert `rustix::event::poll`, mit dem `src/source.rs` den
+# `timeout`-Parameter von `FsEventSource::read_events` gegen den echten
+# fanotify-Deskriptor durchsetzt, statt ihn zu ignorieren.
+rustix = { workspace = true, features = ["net", "event"] }
+# Liefert `nix::sys::fanotify` — die sichere fanotify-Bindung, die `rustix`
+# 1.1.4 (siehe `[workspace.dependencies]`) nicht hat: dort stehen
+# `fanotify_init`/`fanotify_mark` in `src/not_implemented.rs` (Modul `yet`),
+# ohne jede Hülle. Fassung 0.31.3 laut `crates.io`-API zum Recherchezeitpunkt
+# dieses Knotens die aktuelle stabile Fassung (`max_stable_version` ==
+# `newest_version`); das `fanotify`-Modul selbst kam mit nix 0.28.0
+# (CHANGELOG.md: "Added new fanotify API: wrappers for `fanotify_init` and
+# `fanotify_mark`", #2194) und übernahm mit 0.30.0 I/O-Sicherheit
+# (`BorrowedFd`/`OwnedFd` statt roher `RawFd`, CHANGELOG.md #2443/#2575).
+# `default-features = false`, weil ausschließlich das `fanotify`-Modul
+# gebraucht wird — laut `Cargo.toml` der Crate ist `fanotify = []` eine
+# eigenständige Feature ohne weitere Abhängigkeiten (die von `fanotify.rs`
+# genutzten Module `errno`, `fcntl`, `unistd` sind in `nix` unbedingt
+# kompiliert, nicht hinter einem eigenen Feature). Jede Funktion, die dieser
+# Knoten aus `nix::sys::fanotify` aufruft (`Fanotify::init`, `Fanotify::mark`,
+# `Fanotify::read_events`, `FanotifyEvent::{mask,fd,pid,check_version}`), ist
+# laut dem auf GitHub (`nix-rust/nix`, Tag `v0.31.3`,
+# `src/sys/fanotify.rs`) nachgelesenen Quelltext eine gewöhnliche sichere
+# Funktion — jedes `unsafe` darin (z. B. `BorrowedFd::borrow_raw`) ist internes
+# Detail der `nix`-Crate, nicht dieser.
+nix = { version = "0.31", default-features = false, features = ["fanotify"] }
+# Sichere Landlock-Bindung. **Nicht** über `[workspace.dependencies]`
+# verfügbar (dort bislang ungenutzt) und diese Crate ist eine von zwei
+# Konsumentinnen — direkte Versionsangabe statt Workspace-Umweg, wie es
+# dieser Workspace auch für andere Einzel-/Doppelkonsumenten hält (z. B.
+# `tikv-jemallocator` nur in `harw-cli/Cargo.toml`). Version 0.4.7 identisch
+# zu `harw-sentinel/Cargo.toml` übernommen (dort über `docs.rs/crate/landlock`
+# nachgeschlagen) — `cargo add` konnte hier nicht laufen, siehe
+# `src/landlock.rs`-Moduldoku.
+landlock = "0.4.7"
+# Wire-Kodierung für `harw_dod_signals::SecurityEvent` auf dem Sendeweg zum
+# Sentinel — derselbe Vertrag, den `harw-sentinel::ipc` auf der Empfangsseite
+# voraussetzt (`#[serde(deny_unknown_fields)]`, kebab-case `EventKind`-Tag).
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

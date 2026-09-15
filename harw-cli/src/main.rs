@@ -30,6 +30,7 @@ mod home;
 mod job_worker;
 mod lifecycle;
 mod mcp_auth;
+mod models;
 mod observe;
 mod onboarding;
 mod project_trust;
@@ -312,6 +313,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Update { check }) => lifecycle::update(home_override, check),
         Some(Command::Service { action }) => lifecycle::service(home_override, action),
         Some(Command::Catalog { refresh }) => lifecycle::catalog(home_override, refresh),
+        Some(Command::Models { action }) => models::run(home_override, action),
         Some(Command::Uninstall {
             scope,
             dry_run,
@@ -343,6 +345,7 @@ fn run_startup_migrations(
         | Some(Command::Connect { .. })
         | Some(Command::Gateway { .. })
         | Some(Command::Settings { .. })
+        | Some(Command::Models { .. })
         | Some(Command::Analyze(_)) => {
             let home = home::resolve_home(home_override)?;
             harw_home::ensure_home(&home).map_err(|error| error.to_string())?;
@@ -909,6 +912,7 @@ fn open_serve_secret_resolver(
             models: Vec::new(),
             enabled: true,
             origin_allowlist: OriginAllowlistToml::default(),
+            rate_limit: None,
         },
     );
     secret_store::open_configured_secret_resolver(home, &resolver_config)
@@ -2332,6 +2336,7 @@ mod tests {
             models: vec!["model".to_owned()],
             enabled: true,
             origin_allowlist: OriginAllowlistToml::default(),
+            rate_limit: None,
         };
         let mut config = ResolvedConfig::default();
         config.harness.default_provider = Some("gateway".to_owned());

@@ -2,9 +2,9 @@
 #
 # Anders als die fünf ursprünglichen eingebauten Rollen unter `agents/`
 # (`explorer`, `researcher-deps`, `researcher-web`, `planner`, `analyst`) ist
-# `executor` **nicht** read-only: er führt Befehls- und Dateioperationen im
-# Auftrag des Haupt-Agenten aus (`fs.write`, `shell.exec`) und liefert eine
-# kurze Zusammenfassung statt der Rohausgaben zurück. Zweck laut Contract
+# `executor` **nicht** read-only: er führt ausschließlich eng gebundene
+# Prozessaufträge (`shell.exec`) im Auftrag des Haupt-Agenten aus und liefert eine kurze
+# Zusammenfassung statt der Rohausgaben zurück. Zweck laut Contract
 # (`harw-scopes-contract.md`, Abschnitt „Nachträgliche Entscheidungen“ /
 # Welle-B-Tabelle): die TUI soll Befehlsfolgen an diesen Worker delegieren
 # können, damit im Hauptfenster nur eine kompakte Fortschrittszeile erscheint
@@ -19,21 +19,20 @@
 # Rollendatei erweitert die Werkzeugoberfläche eines Kindes, nicht die
 # Freigabegrenze der Sandbox.
 #
-# ── Warum `RegistryProfile::Full` ───────────────────────────────────────────
-# `Full` ist das einzige Profil, das `fs.write`/`shell.exec` überhaupt
-# registriert (`harw-registry-defaults/src/profile.rs`,
-# `RegistryProfile::Full::registered_tool_names`). Vor diesem Knoten bildete
+# ── Warum `RegistryProfile::ShellExecution` ─────────────────────────────────
+# Das schmale `ShellExecution`-Profil ist das einzige eingebaute
+# Prozessprofil und registriert ausschließlich `shell.exec` (`harw-registry-defaults/src/profile.rs`,
+# `RegistryProfile::ShellExecution::registered_tool_names`). Vor diesem Knoten bildete
 # `profile_for_role` **keine** eingebaute Rolle auf `Full` ab (siehe den
 # damaligen Test `test_full_is_the_only_writable_profile_and_never_a_fallback`
 # in `profile.rs`) — `executor` ist die erste ausdrückliche Ausnahme, keine
 # stillschweigende.
 #
-# ── `admitted` deckt `Full` vollstaendig ab ─────────────────────────────────
-# `RegistryProfile::Full::registered_tool_names()` liefert sieben Werkzeuge
-# (`fs.read`, `fs.write`, `fs.list`, `fs.search`, `fs.glob`, `fs.grep`,
-# `shell.exec`). Dieser Knoten admittiert alle sieben: `executor` fuehrt
-# Befehls- und Dateioperationen im Auftrag des Haupt-Agenten aus und braucht
-# dafuer auch die Suchwerkzeuge, um vor einem Schreibzugriff nachzusehen.
+# ── `admitted` deckt `ShellExecution` vollständig ab ───────────────────────
+# `RegistryProfile::ShellExecution::registered_tool_names()` liefert genau
+# `shell.exec`. Dieser Knoten admittiert ausschließlich `shell.exec`: Der
+# Worker führt nur den vom Parent übergebenen Prozessauftrag aus und erhält
+# keine unabhängige Datei- oder Suchoberfläche.
 # Die Deckungspruefung `tests/tool_admission_coverage.rs::
 # every_profile_registered_tool_is_admitted_by_its_role` verlangt genau diese
 # Gleichheit — eine Teilmenge waere ein Testbruch, keine Haertung.
@@ -58,27 +57,25 @@ role = "worker"
 specialization = "executor"
 
 name = "Executor"
-description = "Führt Befehls- und Dateioperationen im Auftrag des Haupt-Agenten aus und liefert eine Zusammenfassung."
+description = "Führt ausschließlich eng beauftragte Sandbox-Prozesse aus und liefert eine Zusammenfassung."
 
 [work]
 mode = "delegated-execution"
-may_write_code = true
+may_write_code = false
 may_research_web = false
 
 # Die zugelassene Werkzeugoberflaeche. `forbidden` benennt die verweigerten
 # Werkzeuge ausdruecklich, damit ein Konsument die Ablehnung begruenden kann,
 # statt nur "nicht in admitted" zu melden.
 [tools]
-admitted = [
+admitted = ["shell.exec"]
+forbidden = [
   "fs.read",
   "fs.search",
   "fs.list",
   "fs.glob",
   "fs.grep",
   "fs.write",
-  "shell.exec",
-]
-forbidden = [
   "web.fetch",
   "web.docs_rs",
   "web.crates_io",

@@ -16,7 +16,7 @@ harw-research = { path = "../harw-research" }
 # (`harwness.security-verdict/v1`, AW6-02). Bewusst NICHT
 # `harw-dod-warden-proto`: dieser Adapter darf aus einem Verdikt keine
 # `WardenAction` bauen können (siehe `agent_tool.rs`, `ChildReturnContract`).
-harw-dod-signals = { path = "../harw-dod-signals" }
+harw-dod-signals = { path = "../dod/crates/harw-dod-signals" }
 serde_json = "1.0.150"
 tracing = "0.1.44"
 

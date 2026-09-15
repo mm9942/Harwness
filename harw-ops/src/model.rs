@@ -262,7 +262,11 @@ fn format_list(
 /// The resolved config is the operation layer's catalog authority.  The static
 /// bootstrap catalog intentionally does not participate here: it can advertise
 /// a model that the configured provider does not expose.
-fn configured_model<'a>(
+///
+/// `pub(crate)` so [`crate::provider::handle_switch`] can validate an
+/// optional `/provider switch <provider> <model>` model argument against the
+/// same catalog authority instead of duplicating the lookup.
+pub(crate) fn configured_model<'a>(
     config: &'a harw_config::ResolvedConfig,
     requested_id: &str,
 ) -> Option<&'a harw_config::ModelToml> {
@@ -384,9 +388,24 @@ async fn model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError> {
             .set_active_model(configured_id.clone())
             .map_err(|e| OpError::Execution(e.to_string()))?;
 
-        return Ok(OpOutput::from(format!(
-            "model switched to {configured_id}; next turn will use it"
-        )));
+        // Step C-d: persist as the profile's default for future sessions,
+        // best-effort. The active provider is read back from the controller
+        // (rather than re-derived) so a still-unknown provider never gets
+        // written as a stale default.
+        let snap_after = controller.snapshot();
+        let mut text = format!("model switched to {configured_id}; next turn will use it");
+        match crate::config_util::persist_default_selection(
+            snap_after.active_provider.as_deref(),
+            Some(configured_id.as_str()),
+        ) {
+            Some(note) => {
+                text.push('\n');
+                text.push_str(&note);
+            }
+            None => text.push_str("\n(als Standard für künftige Sitzungen gespeichert)"),
+        }
+
+        return Ok(OpOutput::from(text));
     }
 
     // ── TASK A/B: show + list read live state then fall back to config ────────
@@ -437,6 +456,7 @@ mod tests {
                 reasoning: false,
                 input_types: Vec::new(),
                 capabilities: harw_config::ModelCapabilitiesToml::default(),
+                prompt_caching: None,
             },
         );
 
@@ -642,6 +662,7 @@ mod tests {
                     reasoning: false,
                     input_types: Vec::new(),
                     capabilities: harw_config::ModelCapabilitiesToml::default(),
+                    prompt_caching: None,
                 },
             );
         }

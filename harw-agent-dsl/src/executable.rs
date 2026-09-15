@@ -905,6 +905,7 @@ impl SpawnContract {
     pub fn permits_child_orchestrator(&self, role_name: &str) -> bool {
         self.child_orchestrators.iter().any(|allowed| allowed == role_name)
     }
+
 }
 
 impl BudgetSpec {

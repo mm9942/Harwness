@@ -11,6 +11,7 @@ pub mod approval_mode;
 pub mod capabilities;
 pub mod contributors;
 pub mod error;
+pub mod lenient;
 pub mod registry;
 pub mod types;
 pub mod v1_compat;

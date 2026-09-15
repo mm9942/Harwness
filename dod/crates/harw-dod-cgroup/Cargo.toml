@@ -1,0 +1,44 @@
+[package]
+name = "harw-dod-cgroup"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Zugriffsvokabular: Capability, ReadScope, SensorHandle, SensorError.
+harw-dod-cap = { path = "../harw-dod-cap" }
+# Datenvokabular und der eine `trait Sensor`, den dieser Sensor implementiert.
+harw-dod-signals = { path = "../harw-dod-signals" }
+# Die eine Dateisystem-Naht: `parse_u64`, `read_first_line`, `read_key_values`
+# und `glob::glob` lesen die cgroup-v2-Kontrolldateien, nie direktes
+# `std::fs` (siehe src/lib.rs-Moduldoku).
+harw-dod-readfs = { path = "../harw-dod-readfs" }
+# `SensorId` für `SensorHandle`.
+harw-types = { path = "../../../harw-types" }
+# Verbindliche Abhängigkeit jeder Sensor-Crate laut Arbeitsauftrag AW2-13.
+# `#[derive(harw_macros::SensorSource)]` selbst trägt genau ein
+# glob-adressiertes Feld mit genau einem zur Kompilierzeit festen Metriknamen
+# je Treffer (siehe `harw-macros/src/sensor_source.rs`). Ein cgroup braucht
+# vier verschiedene Kontrolldateien mit vier verschiedenen Metriknamen je
+# Treffer und ein Label je Treffer (der cgroup-Name) — dafür passt das Makro
+# nicht (siehe src/lib.rs-Moduldoku, Abschnitt „Warum kein
+# `#[derive(SensorSource)]`"). Aktuell ungenutzt, analog zur unbenutzten
+# `harw-macros`-Abhängigkeit in `harw-dod-cpu/Cargo.toml` und
+# `harw-dod-netcounters/Cargo.toml`.
+harw-macros = { path = "../../../harw-macros" }
+jiff = { workspace = true }
+
+[dev-dependencies]
+# `sensor_suite!` — die geerbte Fixture-Testsuite (acht Prüfungen).
+harw-dod-fixtures = { path = "../harw-dod-fixtures" }
+tempfile = { workspace = true }
+# Ausschließlich für den eigenen, zusätzlichen Test „kein Prozessname/keine
+# Kommandozeile im serialisierten Ergebnis" (siehe `src/sensor.rs`-Tests):
+# `HostSample` implementiert `serde::Serialize`, aber
+# `harw_dod_fixtures::sensor_suite!` serialisiert nicht öffentlich — dieser
+# eine zusätzliche, crate-eigene Test serialisiert deshalb selbst, analog zu
+# `harw-dod-netcounters/Cargo.toml`.
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

@@ -31,6 +31,10 @@ pub struct ProviderToml {
     pub enabled: bool,
     #[serde(default)]
     pub origin_allowlist: OriginAllowlistToml,
+    /// Client-seitiges Rate-Limiting für diesen Provider; `None` = kein
+    /// Override (deaktiviert, siehe [`RateLimitToml::default`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<RateLimitToml>,
 }
 
 impl ProviderToml {
@@ -93,6 +97,33 @@ pub struct OriginAllowlistToml {
 
 fn default_true() -> bool {
     true
+}
+
+/// Default-Sicherheitsmarge für client-seitiges Rate-Limiting in Prozent.
+fn default_safety_margin_pct() -> u8 {
+    10
+}
+
+/// Client-seitiges Rate-Limiting-Konfiguration für einen Provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RateLimitToml {
+    /// `true` aktiviert client-seitiges Rate-Limiting/Throttling.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Sicherheitsmarge (Prozent) unterhalb des vom Provider gemeldeten
+    /// Limits, die eingehalten wird, bevor gewartet wird.
+    #[serde(default = "default_safety_margin_pct")]
+    pub safety_margin_pct: u8,
+}
+
+impl Default for RateLimitToml {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            safety_margin_pct: default_safety_margin_pct(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -208,5 +239,32 @@ mod tests {
 
         let error = toml::from_str::<ProviderToml>(src).unwrap_err();
         assert!(error.to_string().contains("unknown field `ap`"));
+    }
+
+    #[test]
+    fn test_provider_with_rate_limit_section_parses_and_defaults_margin() {
+        let src = r#"
+            name = "openai"
+            api = "openai-chat"
+            base_url = "https://api.openai.com/v1"
+
+            [rate_limit]
+            enabled = true
+        "#;
+        let provider: ProviderToml = toml::from_str(src).unwrap();
+        let rate_limit = provider.rate_limit.expect("rate_limit section present");
+        assert!(rate_limit.enabled);
+        assert_eq!(rate_limit.safety_margin_pct, 10);
+    }
+
+    #[test]
+    fn test_provider_without_rate_limit_section_is_none() {
+        let src = r#"
+            name = "openai"
+            api = "openai-chat"
+            base_url = "https://api.openai.com/v1"
+        "#;
+        let provider: ProviderToml = toml::from_str(src).unwrap();
+        assert!(provider.rate_limit.is_none());
     }
 }

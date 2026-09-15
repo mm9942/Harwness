@@ -274,6 +274,28 @@ pub struct SessionStateSnapshot {
     pub activation: ActivationSnapshot,
 }
 
+/// Eine einzelne Token-Nutzungsrunde (ein Turn), zur Persistenz über
+/// [`StateStore::record_usage`].
+///
+/// # Description
+/// Getrennt von [`SessionStateSnapshot::total_usage`] (dem laufenden
+/// Akkumulator): dieser Typ trägt die Nutzung **einer** Runde samt
+/// Provider/Modell/Cache-Strategie, für Auswertung pro Runde statt nur
+/// kumuliert.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageRound {
+    /// Fortlaufende Runden-Nummer innerhalb der Session.
+    pub round: u32,
+    /// ID des Providers, der diese Runde bediente (falls bekannt).
+    pub provider_id: Option<String>,
+    /// ID des Modells, das diese Runde bediente (falls bekannt).
+    pub model_id: Option<String>,
+    /// Token-Nutzung dieser Runde.
+    pub usage: TokenUsage,
+    /// Label der verwendeten Prompt-Cache-Strategie (falls bekannt).
+    pub cache_strategy: Option<String>,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SessionStateRecord {
@@ -300,6 +322,74 @@ fn decode_session_state(payload: serde_json::Value) -> StateStoreResult<SessionS
     serde_json::from_value::<SessionStateRecord>(payload)
         .map(|record| record.state)
         .map_err(|error| harw_session_store::SessionStoreError::from(error).into())
+}
+
+// ---------------------------------------------------------------------------
+// Verlaufsersetzung im Append-only-Transkript (compaction-safe `save_history`)
+// ---------------------------------------------------------------------------
+
+// Diskriminator im Payload eines `RecordKind::Lifecycle`-Datensatzes, der eine
+// Verlaufsersetzung markiert (siehe `TranscriptStateStore::save_history`
+// unten). Ein eigenes Feld statt `"kind"`, damit `is_session_state_payload`
+// diesen Marker nie fälschlich als Sitzungszustand liest.
+const HISTORY_REPLACED_MARKER: &str = "history_replaced";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryReplacedRecord {
+    marker: String,
+    item_count: usize,
+}
+
+fn history_replaced_payload(item_count: usize) -> StateStoreResult<serde_json::Value> {
+    serde_json::to_value(HistoryReplacedRecord {
+        marker: HISTORY_REPLACED_MARKER.to_owned(),
+        item_count,
+    })
+    .map_err(|error| harw_session_store::SessionStoreError::from(error).into())
+}
+
+// Diskriminator im Payload eines `RecordKind::Lifecycle`-Datensatzes, der ein
+// Drift-Ereignis eines Turn-Wächters markiert (Addendum F+G).
+const DRIFT_MARKER: &str = "drift";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DriftRecord {
+    marker: String,
+    kind: crate::guard::DriftKind,
+    session_id: String,
+    detail: String,
+    tool_name: Option<String>,
+    child_role: Option<String>,
+}
+
+fn drift_payload(event: &crate::guard::DriftEvent) -> StateStoreResult<serde_json::Value> {
+    serde_json::to_value(DriftRecord {
+        marker: DRIFT_MARKER.to_owned(),
+        kind: event.kind,
+        session_id: event.session_id.clone(),
+        detail: event.detail.clone(),
+        tool_name: event.tool_name.clone(),
+        child_role: event.child_role.clone(),
+    })
+    .map_err(|error| harw_session_store::SessionStoreError::from(error).into())
+}
+
+// Liefert `item_count`, wenn `payload` ein `history_replaced`-Marker ist,
+// sonst `None` (auch für den Sitzungszustand- und `{"event": …}`-Payload).
+fn history_replaced_item_count(payload: &serde_json::Value) -> Option<usize> {
+    let is_marker = payload
+        .get("marker")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|marker| marker == HISTORY_REPLACED_MARKER);
+    if !is_marker {
+        return None;
+    }
+    payload
+        .get("item_count")
+        .and_then(serde_json::Value::as_u64)
+        .map(|count| count as usize)
 }
 
 // ---------------------------------------------------------------------------
@@ -434,12 +524,16 @@ pub trait StateStore: Send + Sync {
         sid: &'a SessionId,
     ) -> ExtFuture<'a, StateStoreResult<ConversationHistory>>;
 
-    /// Persistiert einen kompletten Verlauf. Default: ersetzt den gespeicherten
-    /// Verlauf, indem jedes Item einzeln über `save_turn` geschrieben wird.
+    /// Persistiert einen kompletten Verlauf und **ersetzt** den zuvor
+    /// gespeicherten (z. B. nach `compact_session`): ein nachfolgendes
+    /// `load_history` darf nur noch die hier übergebenen Items liefern, nie
+    /// zusätzlich ältere.
     ///
-    /// Backends mit Bulk-Write (SQLite-Transaktion, S3-Put) überschreiben das
-    /// für Effizienz; die in-memory-Impl tut es bewusst, um Duplikate zu
-    /// vermeiden.
+    /// Default: schreibt jedes Item einzeln über `save_turn`. Für die
+    /// in-memory-Impl ist das bereits ein echtes Ersetzen (die Map wird
+    /// überschrieben). Ein reines Append-only-Backend (siehe
+    /// [`TranscriptStateStore`]) MUSS diese Methode überschreiben, sonst
+    /// akkumuliert `load_history` alte und neue Items statt zu ersetzen.
     fn save_history<'a>(
         &'a self,
         sid: &'a SessionId,
@@ -483,6 +577,41 @@ pub trait StateStore: Send + Sync {
         _sid: &'a SessionId,
     ) -> ExtFuture<'a, StateStoreResult<Option<SessionStateSnapshot>>> {
         Box::pin(async { Ok(None) })
+    }
+
+    /// Persistiert eine einzelne Token-Nutzungsrunde ([`UsageRound`]).
+    ///
+    /// # Description
+    /// Default: No-op, damit bestehende Test-Doubles ohne Nutzungs-Historie
+    /// unverändert gültig bleiben.
+    ///
+    /// # Errors
+    /// Backend-spezifisch, siehe [`StateStoreError`].
+    fn record_usage<'a>(
+        &'a self,
+        sid: &'a SessionId,
+        round: &'a UsageRound,
+    ) -> ExtFuture<'a, StateStoreResult<()>> {
+        let _ = (sid, round);
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Persistiert ein einzelnes Drift-Ereignis eines Turn-Wächters (Addendum
+    /// F+G, siehe [`crate::guard::DriftEvent`]).
+    ///
+    /// # Description
+    /// Default: No-op, damit bestehende Test-Doubles ohne Wächter-Historie
+    /// unverändert gültig bleiben — analog zu [`Self::record_usage`].
+    ///
+    /// # Errors
+    /// Backend-spezifisch, siehe [`StateStoreError`].
+    fn record_drift<'a>(
+        &'a self,
+        sid: &'a SessionId,
+        event: &'a crate::guard::DriftEvent,
+    ) -> ExtFuture<'a, StateStoreResult<()>> {
+        let _ = (sid, event);
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -628,6 +757,31 @@ impl StateStore for TranscriptStateStore {
         })
     }
 
+    /// Ersetzt den Verlauf append-only: hängt jedes Item aus `history` als
+    /// `RecordKind::Item` an (wie `save_turn`) und schreibt danach EINEN
+    /// `RecordKind::Lifecycle`-Datensatz mit Payload
+    /// `{"marker": "history_replaced", "item_count": N}`
+    /// (`N = history.items().len()`). `load_history` behält beim Auftreten
+    /// dieses Markers rückwirkend nur die letzten `N` bis dahin gesammelten
+    /// Items; danach neu angehängte Items zählen normal weiter dazu.
+    ///
+    /// Stürzt der Prozess vor dem Marker ab, bleibt der alte Zustand
+    /// (Duplikate, aber kein Datenverlust) — ein späterer `save_history`-Aufruf
+    /// schreibt den Marker nach.
+    fn save_history<'a>(
+        &'a self,
+        sid: &'a SessionId,
+        history: &'a ConversationHistory,
+    ) -> ExtFuture<'a, StateStoreResult<()>> {
+        Box::pin(async move {
+            for item in history.items() {
+                self.save_turn(sid, item).await?;
+            }
+            let payload = history_replaced_payload(history.items().len())?;
+            self.append_record(sid, RecordKind::Lifecycle, payload).await
+        })
+    }
+
     fn load_history<'a>(
         &'a self,
         sid: &'a SessionId,
@@ -647,11 +801,19 @@ impl StateStore for TranscriptStateStore {
                 let mut items = Vec::new();
                 for record in reader {
                     let record = record?;
-                    if record.kind == RecordKind::Item && record.thread == thread {
+                    if record.thread != thread {
+                        continue;
+                    }
+                    if record.kind == RecordKind::Item {
                         items.push(
                             serde_json::from_value(record.payload)
                                 .map_err(harw_session_store::SessionStoreError::from)?,
                         );
+                    } else if record.kind == RecordKind::Lifecycle {
+                        if let Some(item_count) = history_replaced_item_count(&record.payload) {
+                            let keep_from = items.len().saturating_sub(item_count);
+                            items.drain(..keep_from);
+                        }
                     }
                 }
                 Ok(ConversationHistory::from_items(items))
@@ -702,6 +864,68 @@ impl StateStore for TranscriptStateStore {
                 latest.map(decode_session_state).transpose()
             })
             .await
+        })
+    }
+
+    fn record_usage<'a>(
+        &'a self,
+        sid: &'a SessionId,
+        round: &'a UsageRound,
+    ) -> ExtFuture<'a, StateStoreResult<()>> {
+        Box::pin(async move {
+            let payload = serde_json::to_value(round)
+                .map_err(harw_session_store::SessionStoreError::from)?;
+            self.append_record(sid, RecordKind::Turn, payload).await?;
+
+            // Best-effort: die Sidecar-Metadaten sind eine Ableitung für den
+            // Resume-Picker, kein Teil der Wahrheit. Ein Fehler hier darf die
+            // Runde nicht ungültig machen — sie ist im Transkript oben bereits
+            // durabel gespeichert.
+            let store = Arc::clone(&self.transcript_store);
+            let sid_owned = sid.clone();
+            let usage = round.usage.clone();
+            let meta_result = run_blocking("transcript_usage_meta", move || {
+                harw_session_store::meta::add_usage_round(store.root(), &sid_owned, &usage)
+                    .map(|_meta| ())
+                    .map_err(StateStoreError::from)
+            })
+            .await;
+            if let Err(error) = meta_result {
+                tracing::warn!(session = %sid, error = %error, "state_store.usage_meta_failed");
+            }
+
+            Ok(())
+        })
+    }
+
+    /// Schreibt einen `RecordKind::Lifecycle`-Datensatz mit
+    /// `{"marker": "drift", ...event}` und aktualisiert danach best-effort
+    /// die Sidecar-Metadaten (`harw_session_store::meta::add_drift_event`) —
+    /// dasselbe Muster wie [`Self::record_usage`]: ein Metadaten-Fehler
+    /// macht das bereits durabel gespeicherte Ereignis nicht ungültig.
+    fn record_drift<'a>(
+        &'a self,
+        sid: &'a SessionId,
+        event: &'a crate::guard::DriftEvent,
+    ) -> ExtFuture<'a, StateStoreResult<()>> {
+        Box::pin(async move {
+            let payload = drift_payload(event)?;
+            self.append_record(sid, RecordKind::Lifecycle, payload).await?;
+
+            let store = Arc::clone(&self.transcript_store);
+            let sid_owned = sid.clone();
+            let kind = event.kind.key();
+            let meta_result = run_blocking("transcript_drift_meta", move || {
+                harw_session_store::meta::add_drift_event(store.root(), &sid_owned, kind)
+                    .map(|_meta| ())
+                    .map_err(StateStoreError::from)
+            })
+            .await;
+            if let Err(error) = meta_result {
+                tracing::warn!(session = %sid, error = %error, "state_store.drift_meta_failed");
+            }
+
+            Ok(())
         })
     }
 }
@@ -874,6 +1098,75 @@ mod tests {
             .unwrap();
         assert_eq!(records[0].thread, transcript_thread(&session()));
         assert_eq!(records[0].sequence, 0);
+    }
+
+    #[tokio::test]
+    async fn transcript_store_save_history_replaces_after_compaction() {
+        let temp = tempfile::tempdir().unwrap();
+        let sid = session();
+        let store = TranscriptStateStore::new(TranscriptStore::new(temp.path()), transcript_thread);
+
+        store.save_turn(&sid, &error_item("pre-compact 1")).await.unwrap();
+        store.save_turn(&sid, &error_item("pre-compact 2")).await.unwrap();
+        store.save_turn(&sid, &error_item("pre-compact 3")).await.unwrap();
+
+        let compacted_item = error_item("compacted summary");
+        let compacted = ConversationHistory::from_items(vec![compacted_item.clone()]);
+        store.save_history(&sid, &compacted).await.unwrap();
+
+        let loaded = store.load_history(&sid).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(loaded.items()).unwrap(),
+            serde_json::json!([compacted_item]),
+            "load_history must return exactly the compacted item, not old + new"
+        );
+    }
+
+    #[tokio::test]
+    async fn transcript_store_save_history_marker_keeps_later_appended_items() {
+        let temp = tempfile::tempdir().unwrap();
+        let sid = session();
+        let store = TranscriptStateStore::new(TranscriptStore::new(temp.path()), transcript_thread);
+
+        store.save_turn(&sid, &error_item("pre-compact 1")).await.unwrap();
+        store.save_turn(&sid, &error_item("pre-compact 2")).await.unwrap();
+        store.save_turn(&sid, &error_item("pre-compact 3")).await.unwrap();
+
+        let compacted_item = error_item("compacted summary");
+        let compacted = ConversationHistory::from_items(vec![compacted_item.clone()]);
+        store.save_history(&sid, &compacted).await.unwrap();
+
+        let new_item = error_item("post-compact turn");
+        store.save_turn(&sid, &new_item).await.unwrap();
+
+        let loaded = store.load_history(&sid).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(loaded.items()).unwrap(),
+            serde_json::json!([compacted_item, new_item]),
+            "items appended after the history_replaced marker must accumulate normally"
+        );
+    }
+
+    #[tokio::test]
+    async fn transcript_store_load_session_state_unaffected_by_history_replaced_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let sid = session();
+        let store = TranscriptStateStore::new(TranscriptStore::new(temp.path()), transcript_thread);
+
+        store.save_turn(&sid, &error_item("pre-compact")).await.unwrap();
+        store
+            .save_session_state(&sid, &snapshot(InteractionMode::Plan, 2))
+            .await
+            .unwrap();
+        let compacted = ConversationHistory::from_items(vec![error_item("compacted summary")]);
+        store.save_history(&sid, &compacted).await.unwrap();
+
+        let loaded_state = store.load_session_state(&sid).await.unwrap();
+        assert_eq!(
+            loaded_state,
+            Some(snapshot(InteractionMode::Plan, 2)),
+            "the history_replaced marker must never be mistaken for a session-state snapshot"
+        );
     }
 
     #[tokio::test]
@@ -1120,6 +1413,7 @@ mod tests {
                 output_tokens: 2,
                 reasoning_tokens: None,
                 cached_tokens: None,
+                cache_write_tokens: None,
             },
             executable_snapshot_id: None,
             base_activation: ActivationSnapshot::capture(

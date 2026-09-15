@@ -139,6 +139,7 @@ use harw_agent_dsl::organization::{RawOrganizationDefinition, resolve_organizati
 use harw_agent_dsl::parse::parse_toml;
 use harw_agent_dsl::raw::RawAgentDefinition;
 use harw_agent_dsl::resolve::resolve_definition;
+use harw_agent_dsl::roles::AgentRoleId;
 use harw_agent_dsl::{ExecutableAgentIr, lower};
 use include_dir::{Dir, DirEntry, File, include_dir};
 use time::OffsetDateTime;
@@ -980,6 +981,130 @@ fn dsl_error_from_toml(message: String) -> DslError {
     }
 }
 
+// ─── Organisatorisches Regelwerk (Addendum D+E) ─────────────────────────────
+
+/// Regelwerk-Text der UIA (`knowledge/roles/uia.md`).
+const UIA_KNOWLEDGE: &str = include_str!("../knowledge/roles/uia.md");
+/// Regelwerk-Text des Root-Orchestrators (`knowledge/roles/root-orchestrator.md`).
+const ROOT_ORCHESTRATOR_KNOWLEDGE: &str = include_str!("../knowledge/roles/root-orchestrator.md");
+/// Regelwerk-Text eines Sub-/Child-Orchestrators (`knowledge/roles/sub-orchestrator.md`).
+const SUB_ORCHESTRATOR_KNOWLEDGE: &str = include_str!("../knowledge/roles/sub-orchestrator.md");
+/// Regelwerk-Text eines Workers (`knowledge/roles/worker.md`), gilt für alle
+/// eingebauten Agentenrollen mit organisatorischer Rolle `AgentRoleId::Worker`
+/// (siehe `test_every_builtin_toml_parses`).
+const WORKER_KNOWLEDGE: &str = include_str!("../knowledge/roles/worker.md");
+/// Regelwerk-Text des `uia-worker` (`knowledge/roles/uia-worker.md`,
+/// Addendum J): eigene, vollständig abgekapselte Organisationsrolle
+/// (`AgentRoleId::UiaWorker`), kein Abschnitt in `worker.md` mehr.
+const UIA_WORKER_KNOWLEDGE: &str = include_str!("../knowledge/roles/uia-worker.md");
+/// Regelwerk-Text des `agent-steward` (`knowledge/roles/agent-steward.md`,
+/// Addendum K + Nachtrag K/K2): eigene Organisationsrolle
+/// (`AgentRoleId::AgentSteward`), setzt Agentendefinitionen und
+/// UIA-Bündel um, validiert immer vor dem Schreiben, endet bei einem
+/// Root-gestarteten Lauf als Vorschlag statt als sofortiger Commit.
+const AGENT_STEWARD_KNOWLEDGE: &str = include_str!("../knowledge/roles/agent-steward.md");
+
+/// Organisationswissen (Addendum K): Hierarchie, Zuständigkeiten, Delegation.
+const ORGANIZATION_KNOWLEDGE: &str =
+    include_str!("../knowledge/organization/agent-organization.md");
+/// Bauplan-Wissen für Agentendefinitionen (Addendum K + Nachtrag K).
+const AUTHORING_KNOWLEDGE: &str = include_str!("../knowledge/authoring/agent-authoring.md");
+
+/// Liefert den eingebauten Regelwerk-Text für eine organisatorische Rolle
+/// (Addendum D+E).
+///
+/// # Beschreibung
+/// Bildet [`AgentRoleId`] auf ihren statischen Regelwerk-Text ab, der zur
+/// Bauzeit über `include_str!` aus `harw-registry-defaults/knowledge/roles/`
+/// eingebettet ist — außerhalb von `agents/`, also nicht Teil der
+/// Verzeichnis-Sammlung dieser Datei. Der Aufrufer (z. B.
+/// [`crate::profile::assemble_registry_for_sandbox`]) reicht das Ergebnis an
+/// [`harw_instructions::AgentIdentity::with_organization_knowledge`] weiter.
+///
+/// # Argumente
+/// - `role` (`AgentRoleId`): die organisatorische Rolle im Agenten-Baum.
+///
+/// # Rückgabe
+/// Der statische, stabile Regelwerk-Text der Rolle (cachebares
+/// Prompt-Präfix — kein Zeitstempel, keine Laufzeitdaten).
+///
+/// # Nebenläufigkeit
+/// Rein; liefert nur einen `'static`-Verweis, von jedem Thread aus sicher.
+///
+/// # Beispiele
+/// ```rust
+/// use harw_agent_dsl::roles::AgentRoleId;
+/// use harw_registry_defaults::embedded_agents::builtin_role_knowledge;
+///
+/// let text = builtin_role_knowledge(AgentRoleId::Worker);
+/// assert!(text.contains("Worker"));
+/// ```
+#[must_use]
+pub fn builtin_role_knowledge(role: AgentRoleId) -> &'static str {
+    match role {
+        AgentRoleId::UserInterface => UIA_KNOWLEDGE,
+        AgentRoleId::RootOrchestrator => ROOT_ORCHESTRATOR_KNOWLEDGE,
+        AgentRoleId::ChildOrchestrator => SUB_ORCHESTRATOR_KNOWLEDGE,
+        AgentRoleId::Worker => WORKER_KNOWLEDGE,
+        AgentRoleId::UiaWorker => UIA_WORKER_KNOWLEDGE,
+        AgentRoleId::AgentSteward => AGENT_STEWARD_KNOWLEDGE,
+    }
+}
+
+/// Liefert das vollständige Regelwerk für eine organisatorische Rolle,
+/// inklusive des einkompilierten Organisations- und Bauplan-Wissens
+/// (Addendum K).
+///
+/// # Beschreibung
+/// Setzt sich für jede Rolle unterschiedlich zusammen: die UIA und
+/// `agent-steward` bekommen Organisationswissen **und** den
+/// Agentendefinitions-Bauplan **und** ihre eigene Rollenregel angehängt (sie
+/// beraten bzw. setzen Agentendefinitionen um); Root- und
+/// Child-Orchestrator bekommen Organisationswissen plus Rollenregel, aber
+/// keinen Bauplan (sie schreiben selbst keine Agentendefinitionen); Worker
+/// und `uia-worker` bekommen ausschließlich ihre Rollenregel — sie
+/// delegieren nie und brauchen deshalb kein Organisationswissen. Der
+/// Aufrufer ([`crate::profile::assemble_registry_for_sandbox`]) reicht das
+/// Ergebnis an [`harw_instructions::AgentIdentity::with_organization_knowledge`]
+/// weiter, anstelle von [`builtin_role_knowledge`] direkt.
+///
+/// # Argumente
+/// - `role` (`AgentRoleId`): die organisatorische Rolle im Agenten-Baum.
+///
+/// # Rückgabe
+/// Der zusammengesetzte, cachbare Regelwerk-Text der Rolle (kein
+/// Zeitstempel, keine Laufzeitdaten — nur zur Laufzeit zusammengefügte,
+/// zur Bauzeit eingebettete Bausteine).
+///
+/// # Nebenläufigkeit
+/// Rein; jeder Thread darf gleichzeitig aufrufen.
+///
+/// # Beispiele
+/// ```rust
+/// use harw_agent_dsl::roles::AgentRoleId;
+/// use harw_registry_defaults::embedded_agents::builtin_organization_knowledge;
+///
+/// let uia_text = builtin_organization_knowledge(AgentRoleId::UserInterface);
+/// assert!(uia_text.contains("agent-steward"));
+/// let worker_text = builtin_organization_knowledge(AgentRoleId::Worker);
+/// assert!(!worker_text.contains("harwness.knowledge.agent-organization"));
+/// ```
+#[must_use]
+pub fn builtin_organization_knowledge(role: AgentRoleId) -> String {
+    match role {
+        AgentRoleId::UserInterface | AgentRoleId::AgentSteward => {
+            format!(
+                "{ORGANIZATION_KNOWLEDGE}\n\n{AUTHORING_KNOWLEDGE}\n\n{}",
+                builtin_role_knowledge(role)
+            )
+        }
+        AgentRoleId::RootOrchestrator | AgentRoleId::ChildOrchestrator => {
+            format!("{ORGANIZATION_KNOWLEDGE}\n\n{}", builtin_role_knowledge(role))
+        }
+        AgentRoleId::Worker | AgentRoleId::UiaWorker => builtin_role_knowledge(role).to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -1016,7 +1141,16 @@ mod tests {
             let raw = parse_toml(source)
                 .unwrap_or_else(|error| panic!("{name} parst nicht: {error}"));
             assert_eq!(raw.schema, "harwness.agent/v1", "{name}");
-            assert_eq!(raw.role, harw_agent_dsl::roles::AgentRoleId::Worker, "{name}");
+            assert!(
+                matches!(
+                    raw.role,
+                    harw_agent_dsl::roles::AgentRoleId::Worker
+                        | harw_agent_dsl::roles::AgentRoleId::UiaWorker
+                        | harw_agent_dsl::roles::AgentRoleId::AgentSteward
+                ),
+                "{name}: eingebaute Rollen tragen organisatorisch Worker, UiaWorker oder \
+                 AgentSteward (Addendum J + K)"
+            );
             assert_eq!(raw.specialization, *name, "{name}");
         }
     }
@@ -1499,10 +1633,14 @@ mod tests {
     #[test]
     fn test_every_builtin_role_is_a_non_pausing_worker_with_a_return_contract() {
         for (role, ir) in builtin() {
-            assert_eq!(
-                ir.role(),
-                harw_agent_dsl::roles::AgentRoleId::Worker,
-                "{role} muss Rolle 'worker' tragen"
+            assert!(
+                matches!(
+                    ir.role(),
+                    harw_agent_dsl::roles::AgentRoleId::Worker
+                        | harw_agent_dsl::roles::AgentRoleId::UiaWorker
+                        | harw_agent_dsl::roles::AgentRoleId::AgentSteward
+                ),
+                "{role} muss Rolle 'worker', 'uia-worker' oder 'agent-steward' tragen (Addendum J + K)"
             );
             assert_eq!(ir.specialization(), role, "{role}");
             assert!(
@@ -1535,7 +1673,18 @@ mod tests {
         // Freigabeweg. Eine zweite schreibende Rolle muss diese Liste (und
         // den begleitenden Test unten) bewusst anfassen, statt
         // stillschweigend durchzurutschen.
-        const ALLOWED_TO_WRITE_AND_EXEC: &[&str] = &[role_names::EXECUTOR];
+        //
+        // Addendum I: `uia-worker` (`RegistryProfile::UiaQuickHelper`)
+        // admittiert jetzt ebenfalls `shell.exec` — der exklusive
+        // Schnellhelfer der UIA braucht die Shell für schnelle
+        // Schnelleingriffe. Kein `fs.write` (siehe `agents/uia-worker.toml`).
+        const ALLOWED_TO_WRITE_AND_EXEC: &[&str] =
+            &[role_names::EXECUTOR, role_names::UIA_WORKER];
+        // `memory-steward` (Memory v3, §5.3, `RegistryProfile::MemoryStewardship`)
+        // darf `fs.write` zulassen — die Konsolidierung muss Fakten und
+        // `MEMORY.md` tatsächlich schreiben können —, muss aber weiterhin
+        // `shell.exec` ausdrücklich verbieten (siehe `agents/memory-steward.toml`).
+        const ALLOWED_TO_WRITE_ONLY: &[&str] = &[role_names::MEMORY_STEWARD];
 
         for (role, ir) in builtin() {
             if ALLOWED_TO_WRITE_AND_EXEC.contains(&role.as_str()) {
@@ -1543,7 +1692,15 @@ mod tests {
             }
             let admitted = ir.tool_surface().admitted();
             let forbidden = ir.tool_surface().forbidden();
+            let may_write = ALLOWED_TO_WRITE_ONLY.contains(&role.as_str());
             for tool in ["fs.write", "shell.exec"] {
+                if may_write && tool == "fs.write" {
+                    assert!(
+                        admitted.iter().any(|name| name == tool),
+                        "{role} muss {tool} zulassen"
+                    );
+                    continue;
+                }
                 assert!(
                     !admitted.iter().any(|name| name == tool),
                     "{role} darf {tool} nicht zulassen"
@@ -1557,39 +1714,61 @@ mod tests {
     }
 
     /// Ergänzung zu [`test_every_builtin_role_forbids_write_and_shell_tools`]:
-    /// die Ausnahme dort darf sich nicht unbemerkt ausweiten. Dieser Test
+    /// die Ausnahmen dort dürfen sich nicht unbemerkt ausweiten. Dieser Test
     /// prüft in beide Richtungen — `executor` ist die EINZIGE Rolle, die
-    /// `fs.write`/`shell.exec` zulässt, und `executor` bekommt tatsächlich
-    /// [`crate::profile::RegistryProfile::Full`] (nicht nur eine TOML, die
-    /// zufällig dieselben Werkzeugnamen admittiert).
+    /// `shell.exec` zulässt und bekommt tatsächlich
+    /// [`crate::profile::RegistryProfile::ShellExecution`]; `memory-steward`
+    /// ist die EINZIGE Rolle, die `fs.write` zulässt und bekommt tatsächlich
+    /// [`crate::profile::RegistryProfile::MemoryStewardship`] (nicht nur eine
+    /// TOML, die zufällig dieselben Werkzeugnamen admittiert).
     #[test]
-    fn test_only_executor_gets_the_full_writable_profile() {
+    fn test_only_executor_gets_the_shell_execution_profile() {
         use crate::profile::{RegistryProfile, profile_for_role};
 
         for (role, ir) in builtin() {
             let admitted = ir.tool_surface().admitted();
-            let admits_write_or_exec = admitted
-                .iter()
-                .any(|name| name == "fs.write" || name == "shell.exec");
             if role == role_names::EXECUTOR {
+                assert_eq!(
+                    admitted.iter().map(String::as_str).collect::<Vec<_>>(),
+                    vec!["shell.exec"],
+                    "executor must expose only shell.exec"
+                );
+            } else if role == role_names::UIA_WORKER {
+                // Addendum I: `uia-worker` admits `shell.exec` too, but as
+                // part of the broader `UiaQuickHelper` surface (fs.read.*
+                // plus shell.exec plus web.fetch), not shell.exec alone.
                 assert!(
-                    admits_write_or_exec,
-                    "executor muss fs.write und/oder shell.exec zulassen"
+                    admitted.iter().any(|name| name == "shell.exec"),
+                    "uia-worker must admit shell.exec (RegistryProfile::UiaQuickHelper)"
                 );
             } else {
                 assert!(
-                    !admits_write_or_exec,
-                    "{role} admittiert fs.write/shell.exec, aber nur \
-                     executor darf das (Slice B7)"
+                    !admitted.iter().any(|name| name == "shell.exec"),
+                    "{role} admits shell.exec, but only executor and uia-worker may do so"
+                );
+            }
+            if role == role_names::MEMORY_STEWARD {
+                assert!(
+                    admitted.iter().any(|name| name == "fs.write"),
+                    "{role} must admit fs.write to consolidate memory facts"
+                );
+            } else {
+                assert!(
+                    !admitted.iter().any(|name| name == "fs.write"),
+                    "{role} must not admit fs.write; process execution and file mutation are separate capabilities"
                 );
             }
         }
 
         assert_eq!(
             profile_for_role(role_names::EXECUTOR),
-            Some(RegistryProfile::Full),
-            "executor muss RegistryProfile::Full bekommen, sonst besäße die \
-             Rolle keinen Executor für die von ihr admittierten Werkzeuge"
+            Some(RegistryProfile::ShellExecution),
+            "the executor must get the shell-only profile"
+        );
+        assert_eq!(
+            profile_for_role(role_names::MEMORY_STEWARD),
+            Some(RegistryProfile::MemoryStewardship),
+            "the memory steward must get the fs-write-only profile"
         );
         for role in role_names::ALL {
             if *role == role_names::EXECUTOR {
@@ -1597,9 +1776,8 @@ mod tests {
             }
             assert_ne!(
                 profile_for_role(role),
-                Some(RegistryProfile::Full),
-                "{role} darf RegistryProfile::Full nicht bekommen — nur \
-                 executor ist die dokumentierte Ausnahme"
+                Some(RegistryProfile::ShellExecution),
+                "{role} must not receive the dedicated process profile"
             );
         }
     }
@@ -1729,6 +1907,10 @@ mod tests {
 
     #[test]
     fn test_researcher_web_is_the_only_role_with_web_tools() {
+        // Addendum I: `uia-worker` (`RegistryProfile::UiaQuickHelper`)
+        // admittiert seit der Korrektur ebenfalls ein Netz-Werkzeug —
+        // ausschließlich `web.fetch`, siehe `agents/uia-worker.toml`. Er ist
+        // damit die zweite (und einzige weitere) Rolle mit `web.*`.
         let definitions = builtin();
         for (role, ir) in &definitions {
             let has_web = ir
@@ -1736,10 +1918,11 @@ mod tests {
                 .admitted()
                 .iter()
                 .any(|name| name.starts_with("web."));
+            let expects_web =
+                role == role_names::RESEARCHER_WEB || role == role_names::UIA_WORKER;
             assert_eq!(
-                has_web,
-                role == role_names::RESEARCHER_WEB,
-                "{role}: web.* darf nur der Web-Rechercheur führen"
+                has_web, expects_web,
+                "{role}: web.* darf nur der Web-Rechercheur und der UIA-Schnellhelfer führen"
             );
         }
     }
@@ -1784,17 +1967,35 @@ mod tests {
     /// Offener Punkt für einen Folgeknoten: `context-steward` und
     /// `intel-scout` tragen ebenfalls `max_depth = 0`, stehen aber (bewusst,
     /// siehe `role_names::ALL`) nicht im gesenkten Inventar. Wer sie dort
-    /// aufnimmt, trägt sie hier in `TRIAGE_ROLES` nach — sonst erwartet
+    /// aufnimmt, trägt sie hier in `ZERO_DEPTH_ROLES` nach — sonst erwartet
     /// dieser Test für sie `1` und schlägt fehl. Dasselbe gilt für ihren
     /// fehlenden `[return].contract` im Vertragstest weiter oben.
+    ///
+    /// `memory-steward` (Memory v3, §5.3) trägt ebenfalls `max_depth = 0`
+    /// (`agents/memory-steward.toml`, `[spawn] max_depth = 0`): eine
+    /// Konsolidierung ist ein einzelner, in sich geschlossener Lauf über
+    /// bereits gelieferten Kontext, kein Fan-out.
     #[test]
     fn test_analyst_is_the_only_role_allowed_to_spawn_two_levels() {
-        // Die Tiefe-0-Klasse: Triage-Rollen ohne eigene Ebene darunter.
-        const TRIAGE_ROLES: [&str; 4] = [
+        // Die Tiefe-0-Klasse: Rollen ohne eigene Ebene darunter — die vier
+        // Triage-Rollen plus `memory-steward` und `agent-steward` (Addendum
+        // K: ein Umsetzungslauf ist ein einzelner, in sich geschlossener
+        // Validieren-dann-Schreiben-Schritt, kein Fan-out) plus `uia-worker`
+        // (Addendum J/I: ein Schnelleingriff ist ein einzelner, in sich
+        // geschlossener Lauf, kein Fan-out — siehe `agents/uia-worker.toml`
+        // `[spawn] max_depth = 0`) plus `executor` (Slice B7: ein
+        // Ausführungs-Job führt die ihm übergebene Befehlsfolge selbst aus
+        // und meldet zurück, statt weiter zu delegieren — siehe
+        // `agents/executor.toml` `[spawn] max_depth = 0`).
+        const ZERO_DEPTH_ROLES: [&str; 8] = [
             role_names::SECURITY_EGRESS_TRIAGE,
             role_names::SECURITY_BASELINE_TRIAGE,
             role_names::SECURITY_STRUCTURE_TRIAGE,
             role_names::SECURITY_ENDPOINT_TRIAGE,
+            role_names::MEMORY_STEWARD,
+            role_names::AGENT_STEWARD,
+            role_names::UIA_WORKER,
+            role_names::EXECUTOR,
         ];
 
         let definitions = builtin();
@@ -1802,7 +2003,7 @@ mod tests {
         for (role, ir) in &definitions {
             let expected = if role == role_names::ANALYST {
                 2
-            } else if TRIAGE_ROLES.contains(&role.as_str()) {
+            } else if ZERO_DEPTH_ROLES.contains(&role.as_str()) {
                 0
             } else {
                 1
@@ -2142,6 +2343,63 @@ mod tests {
                 second[*role].snapshot_id(),
                 "{role}: gleiche Definition muss denselben Snapshot-Digest ergeben"
             );
+        }
+    }
+
+    // ─── Addendum K: eingebettetes Organisations-/Bauplan-Wissen ──────────
+
+    /// Größenlimits der Wissensdokumente (Addendum K + Nachtrag K): die
+    /// Dokumente sind Prompt-Präfixe, die bei jedem Lauf der jeweiligen Rolle
+    /// mitgesendet werden — ein Budget hält sie knapp, statt unbegrenzt zu
+    /// wachsen.
+    #[test]
+    fn test_knowledge_documents_stay_within_their_byte_budget() {
+        assert!(
+            ORGANIZATION_KNOWLEDGE.len() <= 3500,
+            "agent-organization.md: {} Bytes > 3500",
+            ORGANIZATION_KNOWLEDGE.len()
+        );
+        assert!(
+            AUTHORING_KNOWLEDGE.len() <= 7000,
+            "agent-authoring.md: {} Bytes > 7000",
+            AUTHORING_KNOWLEDGE.len()
+        );
+        assert!(
+            AGENT_STEWARD_KNOWLEDGE.len() <= 1500,
+            "roles/agent-steward.md: {} Bytes > 1500",
+            AGENT_STEWARD_KNOWLEDGE.len()
+        );
+        for (name, text) in [
+            ("uia.md", UIA_KNOWLEDGE),
+            ("root-orchestrator.md", ROOT_ORCHESTRATOR_KNOWLEDGE),
+            ("sub-orchestrator.md", SUB_ORCHESTRATOR_KNOWLEDGE),
+        ] {
+            assert!(text.len() <= 1500, "roles/{name}: {} Bytes > 1500", text.len());
+        }
+    }
+
+    /// `builtin_organization_knowledge` hängt für UIA und `agent-steward`
+    /// Organisation, Bauplan und Rollenregel an; für Root-/Sub-Orchestrator
+    /// nur Organisation plus Rollenregel; für Worker/`uia-worker` nur die
+    /// Rollenregel — siehe die Begründung an der Funktion selbst.
+    #[test]
+    fn test_builtin_organization_knowledge_composes_the_right_fragments_per_role() {
+        use harw_agent_dsl::roles::AgentRoleId;
+
+        for role in [AgentRoleId::UserInterface, AgentRoleId::AgentSteward] {
+            let text = builtin_organization_knowledge(role);
+            assert!(text.contains("harwness.knowledge.agent-organization@1"), "{role:?}");
+            assert!(text.contains("harwness.knowledge.agent-authoring@1"), "{role:?}");
+            assert!(text.ends_with(builtin_role_knowledge(role)), "{role:?}");
+        }
+        for role in [AgentRoleId::RootOrchestrator, AgentRoleId::ChildOrchestrator] {
+            let text = builtin_organization_knowledge(role);
+            assert!(text.contains("harwness.knowledge.agent-organization@1"), "{role:?}");
+            assert!(!text.contains("harwness.knowledge.agent-authoring@1"), "{role:?}");
+            assert!(text.ends_with(builtin_role_knowledge(role)), "{role:?}");
+        }
+        for role in [AgentRoleId::Worker, AgentRoleId::UiaWorker] {
+            assert_eq!(builtin_organization_knowledge(role), builtin_role_knowledge(role));
         }
     }
 }

@@ -16,6 +16,10 @@ harw-config = { path = "../harw-config" }
 harw-context = { path = "../harw-context" }
 harw-core = { path = "../harw-core" }
 harw-extension-api = { path = "../harw-extension-api" }
+# `handoff.rs` (Agent OPS): symlinkfestes, atomares Schreiben der
+# `handoff.json` (Tempdatei im Zielverzeichnis + `rename`), analog zu
+# `harw-session-store/src/meta.rs`.
+harw-fsutil = { path = "../harw-fsutil" }
 harw-home = { path = "../harw-home" }
 harw-job-runtime = { path = "../harw-job-runtime" }
 harw-lens-types = { path = "../harw-lens-types" }
@@ -38,17 +42,21 @@ harw-secrets = { path = "../harw-secrets" }
 harw-session-store = { path = "../harw-session-store" }
 harw-types = { path = "../harw-types" }
 # Kein `[workspace.dependencies]`-Eintrag für tokio; Version = Cargo.lock.
-tokio = { version = "1.53.0", features = ["rt", "sync"] }
+tokio = { version = "1.53.0", features = ["rt", "sync", "time"] }
 tracing = { workspace = true }
 # secrecy 0.10 wie harw-provider-http/harw-model-catalog (Version = Cargo.lock)
 secrecy = "0.10.3"
 serde = { workspace = true }
+# `handoff.rs` (Agent OPS): `SessionHandoff::written_at` über
+# `jiff::Timestamp::now().to_string()` (RFC3339), wie `harw-session-store`.
+jiff = { workspace = true }
+# `handoff.rs` (Agent OPS): (De-)Serialisierung von `SessionHandoff` als
+# `handoff.json`. War zuvor nur Dev-Dependency; jetzt auch für den
+# Produktivpfad benötigt.
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-# `SpawnInput.context` ist ein `serde_json::Value`
-# (harw-extension-api/src/capabilities.rs:63); nur der Kind-Fabrik-Test baut einen.
-serde_json = { workspace = true }
 
 [lints]
 workspace = true

@@ -14,11 +14,15 @@
 //!   registriert (z. B. via `inventory::submit!` durch Extension-Crate).
 //!
 //! # Op-Set
-//! **Grundausstattung** ([`register_all`], 24 Ops): `help`, `status`, `quit`,
+//! **Grundausstattung** ([`register_all`], 25 Ops): `help`, `status`, `quit`,
 //! `new`, `work`, `ps`, `attach`, `stop`, `diff`, `agent`, `skills`, `plugins`,
 //! `model`, `provider`, `permissions`, `compact`, `memory`, `effort`, `mode`,
 //! `context-proposal`, `approval.pending`, `approval.resolve`, `add-workdir`,
-//! `export`.
+//! `export`, `usage`.
+//! `usage` liest `harw_core::state_store::SessionStateSnapshot::total_usage`
+//! über `harw_core_bridge::OpContextCoreExt::state_store` — reine
+//! Session-Introspektion wie `mode`/`context-proposal`, deshalb ebenfalls
+//! Grundausstattung statt Planungsfläche.
 //! `add-workdir` (Slice B4, Contract §2 A8) legt eine zusätzliche
 //! Workspace-Wurzel für die Sitzung frei (`harw_sandbox::ExtraRootsCell`),
 //! optional dauerhaft fürs Projekt gemerkt; `export` (Slice B4, „Nachträgliche
@@ -128,6 +132,7 @@ pub mod status;
 pub mod stop;
 #[cfg(test)]
 pub(crate) mod testutil;
+pub mod usage;
 pub mod work;
 
 use std::sync::{Arc, OnceLock};
@@ -172,17 +177,18 @@ impl Operation for UnavailableCompactOperation {
 }
 
 fn compact_unavailable_output() -> OpOutput {
-    OpOutput::from("Session compaction is not available in this runtime.".to_owned())
+    OpOutput::from(crate::compact::COMPACT_HINT.to_owned())
 }
 
-/// Registriert alle 24 in dieser Crate definierten Kern-Operationen in der Registry.
+/// Registriert alle 25 in dieser Crate definierten Kern-Operationen in der Registry.
 ///
 /// # Beschreibung
 /// Fügt der übergebenen [`OperationRegistry`] eine `Arc<dyn Operation>`-Instanz
 /// jeder konkreten Op-Struct hinzu — jeweils genau einmal, in fester Reihenfolge:
 /// `help, status, quit, new, work, ps, attach, stop, diff, agent, skills,
 /// plugins, model, provider, permissions, compact, memory, effort, mode,
-/// context-proposal, approval.pending, approval.resolve, add-workdir, export`.
+/// context-proposal, approval.pending, approval.resolve, add-workdir, export,
+/// usage`.
 ///
 /// Die Reihenfolge steuert nur die `iter()`-Reihenfolge und den Fallback-Namens-
 /// Vorschlag; die eigentliche Auflösung erfolgt über `find_by_name` /
@@ -202,7 +208,7 @@ fn compact_unavailable_output() -> OpOutput {
 ///
 /// let mut registry = OperationRegistry::new();
 /// harw_ops::register_all(&mut registry);
-/// assert_eq!(registry.len(), 24);
+/// assert_eq!(registry.len(), 25);
 /// assert!(registry.find_by_name("help").is_some());
 /// assert!(registry.find_by_command("/status").is_some());
 /// assert!(registry.find_by_command("/effort").is_some());
@@ -212,9 +218,10 @@ fn compact_unavailable_output() -> OpOutput {
 /// assert!(registry.find_by_name("approval.resolve").is_some());
 /// assert!(registry.find_by_command("/add-workdir").is_some());
 /// assert!(registry.find_by_command("/export").is_some());
+/// assert!(registry.find_by_command("/usage").is_some());
 /// ```
 pub fn register_all(registry: &mut OperationRegistry) {
-    let ops: [Arc<dyn Operation>; 24] = [
+    let ops: [Arc<dyn Operation>; 25] = [
         Arc::new(help::HelpOperation),
         Arc::new(status::StatusOperation),
         Arc::new(quit::QuitOperation),
@@ -253,6 +260,11 @@ pub fn register_all(registry: &mut OperationRegistry) {
         // dem `[tools.plan]`-Gate.
         Arc::new(add_workdir::AddWorkdirOperation),
         Arc::new(export::ExportOperation),
+        // `/usage` (Agent OPS): liest `SessionStateSnapshot::total_usage` über
+        // `OpContextCoreExt::state_store()` — reine Session-Introspektion wie
+        // `mode`/`context-proposal` oben, deshalb Grundausstattung statt
+        // Planungsfläche.
+        Arc::new(usage::UsageOperation),
     ];
     for op in ops {
         registry.register(op);
@@ -558,10 +570,10 @@ mod tests {
     }
 
     #[test]
-    fn register_all_adds_twenty_four_operations() {
+    fn register_all_adds_twenty_five_operations() {
         let mut reg = OperationRegistry::new();
         register_all(&mut reg);
-        assert_eq!(reg.len(), 24);
+        assert_eq!(reg.len(), 25);
     }
 
     #[test]
@@ -643,6 +655,7 @@ mod tests {
             "/context-proposal",
             "/add-workdir",
             "/export",
+            "/usage",
         ] {
             assert!(
                 reg.find_by_command(path).is_some(),
@@ -720,6 +733,7 @@ mod tests {
             "approval.resolve",
             "add-workdir",
             "export",
+            "usage",
             "plan",
             "goal",
             "explore",
@@ -755,7 +769,7 @@ mod tests {
     fn compact_unavailable_output_is_explicit_and_renderable() {
         assert_eq!(
             compact_unavailable_output().text,
-            "Session compaction is not available in this runtime."
+            crate::compact::COMPACT_HINT
         );
     }
 
@@ -768,8 +782,8 @@ mod tests {
         register_all(&mut reg);
         assert_eq!(
             reg.len(),
-            24,
-            "first register_all must produce exactly 24 ops"
+            25,
+            "first register_all must produce exactly 25 ops"
         );
 
         // Attempt to register HelpOperation a second time via the fallible path.
@@ -783,8 +797,8 @@ mod tests {
         // Registry must not have grown — the rejected op was not inserted.
         assert_eq!(
             reg.len(),
-            24,
-            "registry must stay at 24 after a rejected duplicate"
+            25,
+            "registry must stay at 25 after a rejected duplicate"
         );
     }
 }

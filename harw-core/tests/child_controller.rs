@@ -9,7 +9,7 @@ use harw_catalog::{
 use harw_core::{
     AgentSession, ChildLimits, ChildRegistryFactory, EchoModelProvider, InMemoryStateStore,
     ManagedAgentSpawner, ModelFuture, ModelProvider, ModelRequest, ModelResponse, SessionManager,
-    SessionState, SpawnContext, TurnInput, TurnOutcome,
+    SessionState, SpawnContext, TaskComplexity, TurnInput, TurnOutcome,
 };
 use harw_extension_api::{
     AgentSpawnError, AgentSpawner, ExtensionRegistry, ExtensionRegistryBuilder, SpawnInput,
@@ -202,6 +202,7 @@ fn managed_parent() -> (Arc<Mutex<SessionManager>>, SessionId, SandboxSpec) {
                     id: "test-operator".to_owned(),
                 }),
                 organizational_role: AgentRoleId::RootOrchestrator,
+                allowed_child_orchestrators: Vec::new(),
                 // Generic fixture — not exercising trace propagation.
                 trace: None,
                 // Generic fixture — not exercising context-ceiling propagation.
@@ -236,6 +237,7 @@ fn managed_parent_with_organizational_role(
                     id: "test-operator".to_owned(),
                 }),
                 organizational_role,
+                allowed_child_orchestrators: Vec::new(),
                 // Generic fixture — not exercising trace propagation.
                 trace: None,
                 // Generic fixture — not exercising context-ceiling propagation.
@@ -270,6 +272,7 @@ fn managed_parent_with_effort(
             id: "test-operator".to_owned(),
         }),
         organizational_role: AgentRoleId::RootOrchestrator,
+        allowed_child_orchestrators: Vec::new(),
         // Generic fixture — not exercising trace propagation.
         trace: None,
         // Generic fixture — not exercising context-ceiling propagation.
@@ -340,6 +343,9 @@ async fn managed_spawner_creates_a_governed_child_and_tracks_its_lifecycle() {
             .sandbox,
         sandbox
     );
+    // `close_child` releases the child session in the manager and therefore
+    // takes the manager lock itself; holding the guard across it self-deadlocks.
+    drop(manager_guard);
 
     spawner.close_child(&child);
     assert!(spawner.child_record(&child).is_none());
@@ -488,11 +494,12 @@ async fn admit_rejects_spawn_forbidden_by_organizational_role_matrix() {
         .await
         .expect_err("Worker organizational role must never spawn a Worker child");
 
-    assert!(
-        rejected.message.contains("organizational role"),
-        "rejection should name the organizational-role authority check, got: {}",
-        rejected.message
+    assert_eq!(
+        rejected.message,
+        "no delegation capability is available for this request"
     );
+    assert!(!rejected.message.contains("Worker"));
+    assert!(!rejected.message.contains("worker"));
 }
 
 #[tokio::test]
@@ -720,6 +727,9 @@ async fn test_clamp_child_reasoning_effort_cap_lowers_high_base_to_low() {
         .spawn_child("worker", spawn_input(parent), sandbox, None)
         .await
         .expect("child admitted and inherits parent effort");
+    // Addendum F+G: die Admission klammert nicht mehr nur auf das
+    // Eltern-Level, sondern zusätzlich auf das Rollengewicht des Kindes
+    // (hier `worker_complex`, Default `Medium`) — `min(High, Medium)`.
     assert_eq!(
         manager
             .lock()
@@ -727,7 +737,7 @@ async fn test_clamp_child_reasoning_effort_cap_lowers_high_base_to_low() {
             .get(&child)
             .expect("child session")
             .reasoning_effort(),
-        Some(ReasoningEffort::High)
+        Some(ReasoningEffort::Medium)
     );
 
     let effective = spawner
@@ -782,8 +792,11 @@ async fn test_clamp_child_reasoning_effort_no_cap_keeps_base_unchanged() {
 
 #[tokio::test]
 async fn test_clamp_child_reasoning_effort_no_base_with_cap_falls_back_to_the_default() {
-    // `managed_parent` builds a parent with no reasoning-effort level set, so
-    // `admit()` never inherits a base into the child.
+    // `managed_parent` builds a parent with no reasoning-effort level set.
+    // Addendum F+G: `admit()` no longer leaves the child unset in that case —
+    // it unconditionally computes `min(parent.unwrap_or(DEFAULT), role
+    // weight)`, so the child still ends up at `DEFAULT_CHILD_REASONING_EFFORT`
+    // (`Medium`) here, clamped by the same `worker_complex` weight (`Medium`).
     let (manager, parent, sandbox) = managed_parent();
     let spawner = worker_spawner(manager.clone());
     let child = spawner
@@ -797,7 +810,7 @@ async fn test_clamp_child_reasoning_effort_no_base_with_cap_falls_back_to_the_de
             .get(&child)
             .expect("child session")
             .reasoning_effort(),
-        None
+        Some(ReasoningEffort::Medium)
     );
 
     let effective = spawner
@@ -854,4 +867,71 @@ async fn test_clamp_child_reasoning_effort_unknown_child_returns_err() {
         Err(error) => assert!(error.message.contains("unknown child")),
         Ok(_) => panic!("clamping an unregistered child must return an error"),
     }
+}
+
+// --- Addendum D: Aufgabenkomplexität aus dem Spawn-Kontext -----------------
+
+fn spawn_input_with_context(
+    parent_session_id: SessionId,
+    context: serde_json::Value,
+) -> SpawnInput {
+    SpawnInput {
+        parent_session_id,
+        handoff_call_id: ToolCallId::new(),
+        instructions: None,
+        context,
+        ceiling: None,
+    }
+}
+
+#[tokio::test]
+async fn admit_reads_complex_task_complexity_from_spawn_context() {
+    let (manager, parent, sandbox) = managed_parent();
+    let spawner = worker_spawner(manager);
+
+    let child = spawner
+        .spawn_child(
+            "worker",
+            spawn_input_with_context(parent, serde_json::json!({"complexity": "complex"})),
+            sandbox,
+            None,
+        )
+        .await
+        .expect("registered role admits governed child");
+
+    let record = spawner.child_record(&child).expect("child is tracked");
+    assert_eq!(record.task_complexity, Some(TaskComplexity::Complex));
+}
+
+#[tokio::test]
+async fn admit_reads_simple_task_complexity_from_spawn_context() {
+    let (manager, parent, sandbox) = managed_parent();
+    let spawner = worker_spawner(manager);
+
+    let child = spawner
+        .spawn_child(
+            "worker",
+            spawn_input_with_context(parent, serde_json::json!({"complexity": "simple"})),
+            sandbox,
+            None,
+        )
+        .await
+        .expect("registered role admits governed child");
+
+    let record = spawner.child_record(&child).expect("child is tracked");
+    assert_eq!(record.task_complexity, Some(TaskComplexity::Simple));
+}
+
+#[tokio::test]
+async fn admit_without_complexity_in_context_leaves_task_complexity_none() {
+    let (manager, parent, sandbox) = managed_parent();
+    let spawner = worker_spawner(manager);
+
+    let child = spawner
+        .spawn_child("worker", spawn_input(parent), sandbox, None)
+        .await
+        .expect("registered role admits governed child");
+
+    let record = spawner.child_record(&child).expect("child is tracked");
+    assert_eq!(record.task_complexity, None);
 }

@@ -123,6 +123,7 @@ fn spawn_context(sandbox: SandboxSpec) -> SpawnContext {
         capability_snapshot: None,
         approval_actor: None,
         organizational_role: AgentRoleId::RootOrchestrator,
+        allowed_child_orchestrators: Vec::new(),
         trace: None,
         ceiling: None,
     }

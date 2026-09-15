@@ -40,6 +40,10 @@ struct FsListArgs {
     /// Pfad relativ zum Workspace-Root (Verzeichnis).
     path: String,
     /// Maximale Anzahl Einträge (Default: [`DEFAULT_MAX_ENTRIES`]).
+    #[serde(
+        default,
+        deserialize_with = "harw_extension_api::lenient::lenient_opt_usize"
+    )]
     max_entries: Option<usize>,
 }
 

@@ -66,14 +66,16 @@ use harw_agent_dsl::roles::AgentRoleId;
 use harw_config::{PermissionsSection, PlanSection, ResolvedConfig, discover_config};
 use harw_context::ContextCeiling;
 use harw_core::{
-    AgentSession, ChildRegistryFactory, ManagedAgentSpawner, ModelProvider, SessionActivation,
-    SessionManager, SpawnContext, StateStore, ToolProfile,
+    AgentSession, ChildRegistryFactory, DriftObserver, GuardPolicy, ManagedAgentSpawner,
+    ModelProvider, PitfallAdvisor, RoleEffortWeights, SessionActivation, SessionManager,
+    SpawnContext, StateStore, ToolProfile,
 };
 use harw_extension_api::allow_rules::{AllowRuleSet, ApprovalRule, RuleDecision, RuleScope};
 use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
-use harw_extension_api::contributors::ApprovalHandlerKind;
+use harw_extension_api::contributors::{ApprovalHandlerKind, ContextProvider, ExtFuture};
+use harw_extension_api::types::{ContextFragment, TurnInputContext};
 use harw_extension_api::{ApprovalHandler, ExtensionRegistry, ExtensionRegistryBuilder, ToolName};
-use harw_home::paths::active_profile_name;
+use harw_home::paths::{active_profile_name, profile_dir};
 use harw_home::project::{
     ProjectHome, ProjectRoot, discover_project as discover_home_project, project_key,
     project_settings_dir,
@@ -97,7 +99,7 @@ use harw_sandbox::{
     WorkspaceRegistry,
 };
 use harw_session_store::{ApprovalStore, JobStore};
-use harw_types::{AgentRole, Principal, SessionId, TenantId, TurnId, WorkspaceId};
+use harw_types::{AgentRole, ModelId, Principal, ProviderId, SessionId, TenantId, TurnId, WorkspaceId};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::approval::ApprovalChain;
@@ -136,6 +138,14 @@ const TOOL_RESULT_MAX_BYTES: usize = 64 * 1024;
 /// Projekt- noch globale Konfiguration `[permissions] approval_timeout_secs`
 /// setzen (Plan Schritt 3: 1800 s statt der bisherigen 300 s).
 const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 1800;
+
+/// Rückfall-Kontextfenster (Token), wenn weder das konfigurierte Modell
+/// (`config.models[id].context_window`) noch eine andere Quelle eine Größe
+/// nennt. 200k ist die kleinste unter den heute eingebauten Modellen
+/// (siehe `harw-registry-defaults`/`config/models.toml`) — konservativ genug,
+/// dass [`harw_core::AutoCompactPolicy::for_context_window`] eher zu früh als
+/// zu spät verdichtet.
+const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 200_000;
 
 /// Grenzwerte eines einzelnen Turns, abgeleitet aus dem [`RootBudget`].
 ///
@@ -290,7 +300,7 @@ pub const fn default_approval_mode(entry: EntryKind) -> ApprovalMode {
 /// # Beschreibung
 /// Wird ausschließlich als Ausschlussregel für `/add-workdir`-Kandidaten
 /// gebraucht ([`harw_sandbox::validate_extra_root`]) — dieselbe Quelle wie
-/// `harw_home::project::refuse_unsupported_root` (privat dort, deshalb hier
+/// `harw_home::project::classify_project_home_root` (privat dort, deshalb hier
 /// dupliziert statt importiert). Ein leerer oder fehlender Wert liefert
 /// `None`; der Aufrufer überspringt die Home-Prüfung dann statt sie
 /// abzulehnen.
@@ -933,10 +943,12 @@ fn ensure_bound_to(sandbox: &SandboxSpec, expected: &Path) -> RuntimeResult<()> 
 ///
 /// # Beschreibung
 /// Fail-closed Whitelist (CONTRACTS-W2d2 §1.1): Einstieg `Full` erlaubt
-/// `Full | ReadOnlyExplore | NoTools`, Einstieg `NoTools` nur `NoTools`, jede
-/// andere Kombination wird abgelehnt. Das `match` ist bewusst ohne
-/// Auffang-Arm im ersten Tupelelement: eine neue [`RegistryProfile`]-Variante
-/// bricht den Compiler, statt still zugelassen zu werden.
+/// `Full | ShellExecution | ReadOnlyExplore | NoTools | MemoryStewardship`,
+/// Einstieg `NoTools` nur `NoTools`, Einstieg `MemoryStewardship` nur
+/// `MemoryStewardship` (identisch, kein Aufweiten), jede andere Kombination
+/// wird abgelehnt. Das `match` ist bewusst ohne Auffang-Arm im ersten
+/// Tupelelement: eine neue [`RegistryProfile`]-Variante bricht den Compiler,
+/// statt still zugelassen zu werden.
 ///
 /// `ReadOnlyExplore` ist **keine** Werkzeug-Teilmenge von `Full`: es bringt
 /// `deps.*` mit, das `Full` nicht registriert. Die Whitelist bleibt trotzdem
@@ -951,12 +963,67 @@ fn narrowed_registry_profile(
     entry_profile: RegistryProfile,
     requested: RegistryProfile,
 ) -> RuntimeResult<RegistryProfile> {
-    use RegistryProfile::{Full, NoTools, Planning, ReadOnlyExplore, Research};
+    use RegistryProfile::{
+        AgentStewardship, Full, MemoryStewardship, NoTools, Planning, ReadOnlyExplore, Research,
+        ShellExecution, UiaQuickHelper,
+    };
 
     match (entry_profile, requested) {
-        (Full, Full | ReadOnlyExplore | NoTools) | (NoTools, NoTools) => Ok(requested),
+        // Full darf auf ShellExecution, MemoryStewardship, UiaQuickHelper
+        // oder AgentStewardship verengt werden (alle vier Werkzeugsätze ⊆
+        // Full oder — wie ReadOnlyExplore — über die Sandbox abgesichert,
+        // siehe unten); ShellExecution, MemoryStewardship, UiaQuickHelper
+        // und AgentStewardship selbst dürfen nur identisch bleiben (kein
+        // Aufweiten auf Full, kein Mischen mit ReadOnly-/Planungs-Profilen).
+        // `AgentStewardship` wird dabei wie `MemoryStewardship`/
+        // `UiaQuickHelper` behandelt (Addendum K): nur Full darf zu ihm
+        // verengen, und als Einstieg narrowt er ausschließlich auf sich
+        // selbst.
+        (
+            Full,
+            Full | ShellExecution
+                | ReadOnlyExplore
+                | NoTools
+                | MemoryStewardship
+                | UiaQuickHelper
+                | AgentStewardship,
+        )
+        | (ShellExecution, ShellExecution)
+        | (UiaQuickHelper, UiaQuickHelper)
+        | (NoTools, NoTools)
+        | (MemoryStewardship, MemoryStewardship)
+        | (AgentStewardship, AgentStewardship) => Ok(requested),
         (Full, Research | Planning)
-        | (NoTools, Full | ReadOnlyExplore | Research | Planning)
+        | (
+            ShellExecution,
+            Full | ReadOnlyExplore | Research | Planning | NoTools | MemoryStewardship
+                | UiaQuickHelper
+                | AgentStewardship,
+        )
+        | (
+            UiaQuickHelper,
+            Full | ShellExecution | ReadOnlyExplore | Research | Planning | NoTools
+                | MemoryStewardship
+                | AgentStewardship,
+        )
+        | (
+            NoTools,
+            Full | ShellExecution | ReadOnlyExplore | Research | Planning | MemoryStewardship
+                | UiaQuickHelper
+                | AgentStewardship,
+        )
+        | (
+            MemoryStewardship,
+            Full | ShellExecution | ReadOnlyExplore | Research | Planning | NoTools
+                | UiaQuickHelper
+                | AgentStewardship,
+        )
+        | (
+            AgentStewardship,
+            Full | ShellExecution | ReadOnlyExplore | Research | Planning | NoTools
+                | MemoryStewardship
+                | UiaQuickHelper,
+        )
         | (ReadOnlyExplore | Research | Planning, _) => Err(RuntimeError::Registry {
             detail: format!(
                 "refusing to narrow entry {entry:?} from registry profile {entry_profile:?} \
@@ -1037,6 +1104,20 @@ pub struct RuntimeAssemblyBuilder {
     /// Verengung von Werkzeugsatz, Identität und Sandbox-Rechten durch den
     /// Aufrufer (CONTRACTS-W2d2 §1.1); `None` heißt „Profil unverändert".
     narrowing: Option<RuntimeNarrowing>,
+    /// Projekt-Fakten-Wurzel für den Gedächtnis-Recall (Addendum B, §2/§4);
+    /// ohne expliziten Aufruf öffnet [`Self::build`] die Vorgabe unter
+    /// `home_project.memories_dir()` best-effort selbst.
+    project_facts: Option<Arc<harw_memory::FactStore>>,
+    /// Globale Fakten-Wurzel, analog zu [`Self::project_facts`]; ohne
+    /// expliziten Aufruf bleibt sie `None` — anders als die Projekt-Wurzel
+    /// kennt die Montage keinen Vorgabepfad für sie (das Profilverzeichnis
+    /// liegt außerhalb von `RuntimeSpec`).
+    global_facts: Option<Arc<harw_memory::FactStore>>,
+    /// Zusätzliche Lebenszyklus-Haken des Aufrufers (Addendum B,
+    /// [`crate::memory_wiring::MemoryConsolidationHook`] u. ä.); werden in
+    /// [`Self::build`] mit den Beiträgen der [`AssemblyContributor`]s
+    /// zusammengeführt.
+    extra_lifecycle_hooks: Vec<Arc<dyn SessionLifecycleHook>>,
 }
 
 impl std::fmt::Debug for RuntimeAssemblyBuilder {
@@ -1058,6 +1139,9 @@ impl std::fmt::Debug for RuntimeAssemblyBuilder {
                     .as_ref()
                     .map(|narrowing| narrowing.registry_profile),
             )
+            .field("project_facts", &self.project_facts.is_some())
+            .field("global_facts", &self.global_facts.is_some())
+            .field("extra_lifecycle_hooks", &self.extra_lifecycle_hooks.len())
             .finish_non_exhaustive()
     }
 }
@@ -1190,6 +1274,51 @@ impl RuntimeAssemblyBuilder {
         self
     }
 
+    /// Übergibt die Fakten-Stores des Gedächtnis-Recalls (Addendum B, §2/§4).
+    ///
+    /// # Beschreibung
+    /// Beide Argumente sind optional und unabhängig voneinander: fehlt
+    /// `project`, öffnet [`Self::build`] die Projekt-Vorgabe unter
+    /// `home_project.memories_dir()` selbst (best-effort, `warn!` bei
+    /// Fehlschlag); fehlt `global`, bleibt der globale Anteil des Recalls
+    /// leer — dafür gibt es keine eingebaute Vorgabe. Ein Aufrufer, der
+    /// bereits Stores geöffnet hat (etwa `harw-cli/src/chat.rs`s
+    /// `open_fact_stores`), reicht sie hier durch, statt sie doppelt zu
+    /// öffnen.
+    ///
+    /// # Argumente
+    /// - `project` (`Option<Arc<harw_memory::FactStore>>`): Projekt-Fakten-
+    ///   Wurzel, Projekt geht laut Design §4 im Lesepfad vor.
+    /// - `global` (`Option<Arc<harw_memory::FactStore>>`): globale
+    ///   Fakten-Wurzel.
+    #[must_use]
+    pub fn fact_stores(
+        mut self,
+        project: Option<Arc<harw_memory::FactStore>>,
+        global: Option<Arc<harw_memory::FactStore>>,
+    ) -> Self {
+        self.project_facts = project;
+        self.global_facts = global;
+        self
+    }
+
+    /// Hängt einen zusätzlichen [`SessionLifecycleHook`] an.
+    ///
+    /// # Beschreibung
+    /// Ergänzt, nicht ersetzt: [`Self::build`] führt alle hier angehängten
+    /// Haken mit denen zusammen, die [`AssemblyContributor`]s über
+    /// [`AssemblyParts::lifecycle_hooks`] beisteuern (Addendum B braucht
+    /// diesen Weg für [`crate::memory_wiring::MemoryConsolidationHook`], ohne
+    /// dass `harw-memory` selbst ein `AssemblyContributor` werden müsste).
+    ///
+    /// # Argumente
+    /// - `hook` (`Arc<dyn SessionLifecycleHook>`): der anzuhängende Haken.
+    #[must_use]
+    pub fn lifecycle_hook(mut self, hook: Arc<dyn SessionLifecycleHook>) -> Self {
+        self.extra_lifecycle_hooks.push(hook);
+        self
+    }
+
     /// Montiert den Lauf.
     ///
     /// # Rückgabe
@@ -1231,6 +1360,9 @@ impl RuntimeAssemblyBuilder {
             root_session_id,
             secret_resolver,
             narrowing,
+            project_facts,
+            global_facts,
+            extra_lifecycle_hooks,
         } = self;
 
         let model_source = model.ok_or_else(|| RuntimeError::Provider {
@@ -1288,6 +1420,58 @@ impl RuntimeAssemblyBuilder {
             );
         }
 
+        // Addendum B: die Projekt-Erfassungsfläche (`<home_project>/memories`)
+        // best-effort öffnen — ein Fehlschlag (kaputtes Verzeichnis, fehlende
+        // Rechte) darf die Montage nie zu Fall bringen, nur den Recall/die
+        // Erfassung dieses Laufs abschalten.
+        let memory_capture = match harw_memory::capture::ProjectMemoryCapture::open(
+            &home_project.memories_dir(),
+        ) {
+            Ok(capture) => Some(Arc::new(capture)),
+            Err(error) => {
+                tracing::warn!(
+                    root = %home_project_root.root.display(),
+                    error = %error,
+                    "runtime.memory_capture.open_failed"
+                );
+                None
+            }
+        };
+
+        // Vorgabe der Projekt-Fakten-Wurzel, falls der Aufrufer keine über
+        // `RuntimeAssemblyBuilder::fact_stores` mitgebracht hat (siehe dessen
+        // Doku). Dieselbe Wurzel wie `memory_capture`, unabhängig davon, ob
+        // deren Öffnen gelang — `FactStore::open` legt `facts/` bei Bedarf
+        // selbst an.
+        let project_facts = project_facts.or_else(|| {
+            match harw_memory::FactStore::open(
+                &home_project.memories_dir(),
+                harw_memory::FactScope::Project,
+            ) {
+                Ok(store) => Some(Arc::new(store)),
+                Err(error) => {
+                    tracing::warn!(
+                        root = %home_project_root.root.display(),
+                        error = %error,
+                        "runtime.memory_facts.project_default_open_failed"
+                    );
+                    None
+                }
+            }
+        });
+
+        // Addendum F+G: Wächter-Schwellen, Rollen-Reasoning-Gewichtung und
+        // Pitfall-Berater dieses Laufs — alle drei einmalig hier aufgelöst,
+        // damit [`Self::new_root_session`] sie unverändert wiederverwendet
+        // statt bei jedem Aufruf neu zu bauen (`build_registry` ruft
+        // `new_root_session` genau einmal, aber `role_effort_weights` wird
+        // auch von [`build_spawner`] gebraucht).
+        let guard_policy = crate::guard_wiring::guard_policy_from_config(&config);
+        let role_effort_weights = crate::guard_wiring::role_effort_weights_from_config(&config);
+        let pitfall_advisor: Option<Arc<dyn PitfallAdvisor>> = project_facts.clone().map(|store| {
+            Arc::new(crate::guard_wiring::MemoryPitfallAdvisor::new(store)) as Arc<dyn PitfallAdvisor>
+        });
+
         // Freigaben-Konfiguration: Projekt schlägt Global schlägt eingebaute
         // Vorgabe (Contract §2). Die Projekt-Einstellungsdatei liegt
         // autoritätsgewährend außerhalb des Repos.
@@ -1296,6 +1480,15 @@ impl RuntimeAssemblyBuilder {
         let project_permissions =
             load_project_permissions(&spec.home, &profile_name, &project_settings_key);
         let global_permissions = config.harness.permissions.clone();
+        // Welle FANIN-K/FANIN-RT: das Agentendefinitions-Verzeichnis des
+        // aktiven Profils (`<profil>/agents`) — gebraucht sowohl für die
+        // Kind-Fabrik (Schritt 9, `agent-steward`-Kinder) als auch für die
+        // UIA-Wurzelregistrierung selbst (Schritt 7, unten). Ein nicht
+        // auflösbares Profil (`HomeError::InvalidProfileName`) bleibt `None`
+        // (fail-closed).
+        let profile_agents_dir = profile_dir(&spec.home, &profile_name)
+            .ok()
+            .map(|dir| dir.join("agents"));
 
         // 3./4. Sandbox und Decke aus dem Einstiegsprofil.
         //      Eine Verengung schneidet die Sandbox, sie ersetzt sie nie; ein
@@ -1397,6 +1590,11 @@ impl RuntimeAssemblyBuilder {
         // 7. Registry: ein Projektkontext, eine Kette. Der Modellkontext folgt
         //    `profile.project_context` und einem gebundenen `workspace_root`.
         let mut overrides = root_identity(&spec, narrowing.as_ref());
+        // Addendum F+G: die organisatorische Rolle der Wurzel-Identität folgt
+        // exakt derselben Regel wie `spawn_context.organizational_role` oben
+        // (Rolle der aktiven UIA-IR bzw. `root_organizational_role(...)`) —
+        // beide dürfen nie auseinanderlaufen.
+        overrides.organizational_role = Some(spawn_context.organizational_role);
         if let Some(uia) = uia_ir.as_ref() {
             let definition_id = uia.id().to_string();
             if let Some(agent_dir) = config.agent_definition_dirs.get(&definition_id) {
@@ -1415,12 +1613,52 @@ impl RuntimeAssemblyBuilder {
             .as_ref()
             .and_then(|narrowing| narrowing.workspace_root.as_ref())
             .map(|_| bound_root.as_path());
-        let assembled = assemble_registry_for_project(
-            registry_profile,
-            &registry_project_context(&project, &profile, narrowed_root),
-            overrides,
-            chain.mode().clone(),
-        )
+        // Welle FANIN-K/FANIN-RT: nur die UIA-Wurzel bekommt die
+        // Bauplan-Prüfwerkzeuge (`agents.validate`/`agents.list_proposals`/
+        // `agents.commit_proposal`/`agents.reject_proposal`) — nie ein
+        // nicht-UIA-Root-Einstieg. Die Decke ist die UIA aus ihren eigenen
+        // effektiven Rechten: `tools`/`permissions` aus dem gebundenen
+        // Wurzel-`sandbox` dieses Laufs, `max_depth` aus den für das
+        // Vorgabemodell abgeleiteten Kindlimits, `budget_tokens` aus
+        // [`RootBudget`], `effort_cap` aus
+        // [`RoleEffortWeights::uia`](role_effort_weights). `mode` ist immer
+        // `Commit`: nur die UIA selbst darf Vorschläge committen/verwerfen
+        // (Nachtrag K2).
+        let assembled = if uia_ir.is_some() {
+            let default_model_id = config.harness.default_model.as_deref().unwrap_or_default();
+            let ceiling = harw_registry_defaults::agent_definition_tools::DefinitionAuthorCeiling {
+                role: AgentRoleId::UserInterface,
+                tools: registry_profile
+                    .tool_names_for(sandbox.permissions())
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                permissions: sandbox.permissions().clone(),
+                max_depth: child_limits(&config, default_model_id).max_depth,
+                budget_tokens: RootBudget::from_config(&config, spec.entry).max_total_tokens,
+                effort_cap: Some(role_effort_weights.uia.to_string()),
+            };
+            let access = harw_registry_defaults::profile::AgentDefinitionAccess {
+                project_agents_dir: Some(project.project_root.join(".harw").join("agents")),
+                profile_agents_dir: profile_agents_dir.clone(),
+                mode: harw_registry_defaults::agent_definition_tools::DefinitionWriteMode::Commit,
+                ceiling: Some(ceiling),
+            };
+            harw_registry_defaults::profile::assemble_registry_for_project_with_definition_access(
+                registry_profile,
+                &registry_project_context(&project, &profile, narrowed_root),
+                overrides,
+                chain.mode().clone(),
+                Some(access),
+            )
+        } else {
+            assemble_registry_for_project(
+                registry_profile,
+                &registry_project_context(&project, &profile, narrowed_root),
+                overrides,
+                chain.mode().clone(),
+            )
+        }
         .map_err(|error| RuntimeError::Registry {
             detail: format!("could not assemble the root registry: {error}"),
         })?;
@@ -1472,9 +1710,33 @@ impl RuntimeAssemblyBuilder {
                 reasoning_effort: spec.reasoning_effort,
                 activation: &activation,
                 definitions: &agent_definitions,
+                guard_policy,
+                pitfall_advisor: pitfall_advisor.clone(),
+                profile_agents_dir: profile_agents_dir.clone(),
             },
             session_events,
         )?;
+        // Addendum F+G ("Zombies"): der periodische Kind-Reaper braucht eine
+        // laufende Tokio-Runtime — geprüft **hier**, nicht in
+        // `guard_wiring::spawn_child_reaper` selbst (dessen `tokio::task::spawn`
+        // würde ohne Runtime panicken statt sauber zu degradieren). Ohne
+        // Spawner (`SpawnerPolicy::None`) gibt es nichts zu räumen.
+        if let Some(spawner) = spawner.as_ref() {
+            match tokio::runtime::Handle::try_current() {
+                Ok(_handle) => {
+                    let _reaper = crate::guard_wiring::spawn_child_reaper(
+                        Arc::clone(spawner),
+                        Duration::from_secs(30),
+                    );
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error,
+                        "runtime.child_reaper.no_tokio_runtime_skipping"
+                    );
+                }
+            }
+        }
 
         // 10. Contributors.
         let mut parts = AssemblyParts {
@@ -1506,6 +1768,19 @@ impl RuntimeAssemblyBuilder {
             network_scope,
         } = parts;
 
+        // Addendum B: Lebenszyklus-Haken des Aufrufers ([`Self::lifecycle_hook`])
+        // und — falls die Erfassungsfläche geöffnet werden konnte — der
+        // Konsolidierungs-Haken werden mit den Beiträgen der Contributors
+        // zusammengeführt. Reihenfolge ist reine Diagnose ([`Self::close_session`]
+        // ruft jeden Haken, keiner kann einen anderen verhindern).
+        let mut lifecycle_hooks = lifecycle_hooks;
+        lifecycle_hooks.extend(extra_lifecycle_hooks);
+        if let Some(capture) = memory_capture.as_ref() {
+            lifecycle_hooks.push(Arc::new(crate::memory_wiring::MemoryConsolidationHook::new(
+                Arc::clone(capture),
+            )) as Arc<dyn SessionLifecycleHook>);
+        }
+
         let operations = Arc::new(operations);
 
         // 11. Dienste. Sie entstehen **vor** dem Bau der Registry, weil die
@@ -1533,6 +1808,66 @@ impl RuntimeAssemblyBuilder {
             &operations,
             &services,
         );
+
+        // 12b. Handoff-Kontext: liest, falls vorhanden,
+        //     `<home_project>/.harw/handoff.json` (siehe
+        //     `crate::handoff::handoff_path`) in den Modellkontext der
+        //     Wurzelsitzung ein — dieselbe Registrierungsart wie jeder andere
+        //     Provider (`ExtensionRegistryBuilder::context_provider`).
+        //     `home_project` wird unten in den `RuntimeAssembly`-Literal
+        //     verschoben, deshalb hier geklont statt geliehen.
+        let registry_builder = registry_builder
+            .context_provider(Arc::new(crate::handoff::HandoffContextProvider::new(
+                home_project.clone(),
+            )))
+            .map_err(|error| RuntimeError::Registry {
+                detail: format!("could not register the handoff context provider: {error}"),
+            })?;
+
+        // 12c. Gedächtnis-Fakten-Recall (Addendum B, §2/§4). Registriert nur,
+        //      wenn mindestens eine Quelle etwas beitragen könnte (siehe
+        //      `MemoryFactsContextProvider`-Doku für die Begründung, warum
+        //      dies **nicht** über
+        //      `harw_memory::context_provider::MemoryContextProvider`
+        //      läuft).
+        let registry_builder = if project_facts.is_some() || global_facts.is_some() {
+            let file_index =
+                harw_memory::file_index::FileKnowledgeIndex::open(&home_project.memories_dir())
+                    .map(Arc::new)
+                    .map_err(|error| {
+                        tracing::warn!(
+                            error = %error,
+                            "runtime.memory_file_index.open_failed"
+                        );
+                    })
+                    .ok();
+            registry_builder
+                .context_provider(Arc::new(MemoryFactsContextProvider::new(
+                    project_facts.clone(),
+                    global_facts.clone(),
+                    file_index,
+                )))
+                .map_err(|error| RuntimeError::Registry {
+                    detail: format!(
+                        "could not register the memory facts context provider: {error}"
+                    ),
+                })?
+        } else {
+            registry_builder
+        };
+
+        // Addendum B, „Präzisierung Konsolidierungszeitpunkt": holt beim
+        // Aufbau der Wurzelsitzung liegengebliebene `_incoming`-Kandidaten
+        // eines abgestürzten vorherigen Laufs nach. Nur für Einstiege, deren
+        // Arbeit nicht so kurzlebig/intern ist, dass ein zusätzlicher
+        // Hintergrund-Thread reine Verschwendung wäre (siehe
+        // `entry_wants_startup_sweep`); harmlos best-effort, kein Fehler
+        // dieses Schritts bricht die Montage ab.
+        if let Some(capture) = memory_capture.as_ref() {
+            if entry_wants_startup_sweep(spec.entry) {
+                crate::memory_wiring::spawn_startup_sweep(Arc::clone(capture));
+            }
+        }
 
         let registry = registry_builder.build();
         let tools = registered_tool_names(&registry);
@@ -1567,6 +1902,10 @@ impl RuntimeAssemblyBuilder {
             lifecycle_hooks,
             tools,
             root_session_id,
+            memory_capture,
+            guard_policy,
+            role_effort_weights,
+            pitfall_advisor,
             registry: Mutex::new(Some(registry)),
             responder: Mutex::new(None),
         })
@@ -1781,6 +2120,429 @@ fn registered_tool_names(registry: &ExtensionRegistry) -> Vec<String> {
     names
 }
 
+/// Ob ein Einstieg den Gedächtnis-Startup-Sweep bekommt (Addendum B,
+/// „Präzisierung Konsolidierungszeitpunkt").
+///
+/// # Beschreibung
+/// [`crate::memory_wiring::spawn_startup_sweep`] öffnet einen eigenen
+/// Hintergrund-Thread; das lohnt sich für Einstiege, deren Lauf lange genug
+/// lebt, dass ein liegengebliebener `_incoming`-Kandidat eines vorherigen
+/// Absturzes während dieses Laufs überhaupt sichtbar würde
+/// (`Tui`/`OneShot`, die beiden Gateways, `Web`). Kurzlebige, oft
+/// wiederholte oder rein interne Einstiege (`Doctor`, `LocalEcho`,
+/// `McpServe`, die beiden Job-Varianten) bekämen bei jedem Aufruf einen
+/// zusätzlichen Thread, ohne dass ein Mensch je den Nachholeffekt sähe —
+/// die Montage überspringt den Sweep dort. Der Sweep selbst bliebe in jedem
+/// Fall harmlos (best-effort, siehe seine eigene Doku); diese Funktion ist
+/// reine Sparsamkeit, keine Korrektheitsanforderung.
+///
+/// # Argumente
+/// - `entry` ([`EntryKind`]): der Einstieg des Laufs.
+///
+/// # Rückgabe
+/// `true` für `Tui`, `OneShot`, `Web`, `GatewayTelegram`, `GatewayDream`;
+/// sonst `false`.
+#[must_use]
+const fn entry_wants_startup_sweep(entry: EntryKind) -> bool {
+    matches!(
+        entry,
+        EntryKind::Tui
+            | EntryKind::OneShot
+            | EntryKind::Web
+            | EntryKind::GatewayTelegram
+            | EntryKind::GatewayDream
+    )
+}
+
+/// Höchstzahl Präferenz-/Pitfall-Fakten, die [`MemoryFactsContextProvider`]
+/// insgesamt (Projekt + Global) ausliefert (Addendum B: „immer laden …, max.
+/// 10").
+const MEMORY_FACTS_MAX_DELIVERED: usize = 10;
+
+/// Höchstzahl Dateiwissen-Einträge, die [`MemoryFactsContextProvider`] im
+/// Abschnitt „Bekannte Dateien" ausliefert (Addendum B: „12").
+const MEMORY_FILES_MAX_DELIVERED: usize = 12;
+
+/// Gesamtobergrenze der Faktenzeilen (Präferenzen/Fallen **plus**
+/// Stichwort-Treffer), die [`MemoryFactsContextProvider`] insgesamt
+/// ausliefert (Ticket „Recall-Stichwörter", Pending-Integration-Punkt 4:
+/// „total fact lines ≤ 15"). [`MEMORY_FACTS_MAX_DELIVERED`] bleibt die
+/// Obergrenze für den unveränderten Präferenzen/Fallen-Anteil; der Rest bis
+/// hierhin steht Stichwort-Treffern zur Verfügung.
+const MEMORY_FACTS_TOTAL_MAX_DELIVERED: usize = 15;
+
+/// Mindestwortlänge für aus dem Turn-Eingang abgeleitete Suchstichwörter.
+const MEMORY_KEYWORD_MIN_CHARS: usize = 4;
+
+/// Höchstzahl Stichwörter, die [`derive_memory_search_keywords`] aus dem
+/// letzten Nutzertext ableitet (wie `harw_memory::context_provider`s
+/// `MAX_FACT_SEARCH_KEYWORDS`).
+const MEMORY_KEYWORDS_MAX: usize = 12;
+
+/// Kleine, undogmatische deutsch/englische Stopwortliste für
+/// [`derive_memory_search_keywords`].
+///
+/// # Beschreibung
+/// `harw_memory::context_provider::MemoryContextProvider::search_keywords`
+/// ist privat und kennt selbst **keine** Stopwortliste (nur Wortlänge ≥ 3);
+/// dieser Adapter repliziert deshalb eine eigene, bewusst kleine Liste statt
+/// die private Funktion zu duplizieren oder sie öffentlich zu machen (außerhalb
+/// dieses Vertrags).
+const MEMORY_KEYWORD_STOPWORDS: &[&str] = &[
+    "dass", "eine", "einen", "einem", "einer", "eines", "sich", "sind", "wird", "werden",
+    "wurde", "wurden", "haben", "hatte", "hatten", "kann", "könnte", "muss", "müssen", "auch",
+    "aber", "oder", "nicht", "noch", "schon", "wenn", "dann", "diese", "dieser", "dieses",
+    "dabei", "damit", "durch", "über", "unter", "immer", "mehr", "sehr", "nach", "vor", "bei",
+    "bitte", "danke", "bereits", "dafür", "davon", "diesem", "diesen",
+    "that", "this", "these", "those", "with", "from", "have", "has", "had", "will", "would",
+    "could", "should", "please", "about", "what", "when", "where", "which", "your", "the",
+    "and", "for", "are", "was", "were", "been", "being", "into", "onto", "than", "then",
+    "there", "their", "them", "they", "some", "such", "just", "like", "want", "need", "make",
+    "does", "doing", "done", "here", "also", "only", "very",
+];
+
+/// Liest den jüngsten Nutzertext aus `ctx.metadata`, falls vorhanden.
+///
+/// # Beschreibung
+/// `harw_extension_api::TurnInputContext` trägt selbst keinen eigenen
+/// Freitext-Nutzertext, nur `session_id`, `turn_id` und `metadata`
+/// (`serde_json::Value`) — siehe `harw_memory::context_provider.rs`, das
+/// dieselbe Lücke dokumentiert und stattdessen sein eigenes STM liest,
+/// worauf dieser Adapter keinen Zugriff hat. `TurnInput::metadata` ist am
+/// einzigen produktiven Aufrufort (`harw-core/src/turn_loop.rs`) heute immer
+/// `Null` — diese Funktion liest deshalb best-effort einen von mehreren
+/// gebräuchlichen Feldnamen (oder `metadata` selbst als String), damit ein
+/// künftiger Aufrufer, der Text mitgibt, ohne Änderung an dieser Stelle
+/// greift; heute liefert sie strukturbedingt `None` und die Aufrufer fallen
+/// auf den bisherigen Pfad ohne Stichwortsuche zurück (keine Regression).
+fn latest_user_text_from_metadata(ctx: &TurnInputContext) -> Option<String> {
+    match &ctx.metadata {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Object(map) => {
+            const CANDIDATE_KEYS: &[&str] =
+                &["user_text", "latest_user_message", "text", "message", "input"];
+            CANDIDATE_KEYS.iter().find_map(|key| match map.get(*key) {
+                Some(serde_json::Value::String(text)) => Some(text.clone()),
+                _ => None,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Leitet Suchstichwörter aus dem Turn-Eingang ab (Pending-Integration-Punkt
+/// 4).
+///
+/// # Beschreibung
+/// Zerlegt den über [`latest_user_text_from_metadata`] gefundenen Text an
+/// nicht-alphanumerischen Zeichen, senkt auf Kleinschreibung, verwirft Wörter
+/// unter [`MEMORY_KEYWORD_MIN_CHARS`] Zeichen sowie [`MEMORY_KEYWORD_STOPWORDS`]
+/// und dedupliziert, bis höchstens [`MEMORY_KEYWORDS_MAX`] Stichwörter übrig
+/// sind — dieselbe Grundform wie `harw_memory::context_provider`s
+/// `search_keywords` (dort: Länge ≥ 3, keine Stopwortliste, keine
+/// Deduplizierung), hier bewusst etwas strenger für eine gezieltere Suche.
+///
+/// # Returns
+/// Eine leere Liste, wenn kein Nutzertext verfügbar ist oder keine
+/// hinreichend langen Wörter übrig bleiben — die Aufrufer fallen dann auf
+/// ihre bisherigen Recency-Pfade zurück.
+fn derive_memory_search_keywords(ctx: &TurnInputContext) -> Vec<String> {
+    let Some(text) = latest_user_text_from_metadata(ctx) else {
+        return Vec::new();
+    };
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    text.split(|c: char| !c.is_alphanumeric())
+        .map(str::to_lowercase)
+        .filter(|word| word.chars().count() >= MEMORY_KEYWORD_MIN_CHARS)
+        .filter(|word| !MEMORY_KEYWORD_STOPWORDS.contains(&word.as_str()))
+        .filter(|word| seen.insert(word.clone()))
+        .take(MEMORY_KEYWORDS_MAX)
+        .collect()
+}
+
+/// Facts-only-Gedächtnis-Recall für die Wurzel-Registry (Addendum B, §2/§4).
+///
+/// # Beschreibung
+/// `harw_memory::context_provider::MemoryContextProvider<M>` verlangt
+/// `M: Memory` **ohne** `?Sized` — der implizite `Sized`-Bound jedes
+/// Typarameters gilt dort unverändert (siehe `harw-memory/src/context_provider.rs`,
+/// `pub struct MemoryContextProvider<M: Memory> { store: Arc<M>, .. }`).
+/// [`RuntimeAssemblyBuilder::memory`] hält aber nur `Arc<dyn Memory>` — ein
+/// unsized Trait-Objekt, für das `MemoryContextProvider<dyn Memory>` deshalb
+/// **nicht** instanziierbar ist (`the trait Sized is not implemented for
+/// dyn Memory`). Diese Inkompatibilität besteht unabhängig davon, ob
+/// überhaupt ein `Arc<dyn Memory>` übergeben wurde — sie ist strukturell.
+///
+/// Dieser Typ ist der nächstliegende gangbare Pfad (Addendum B, Vertrag für
+/// diesen Knoten: „sonst BLOCKED-Detail und Fakten-only-Recall auf dem
+/// nächstliegenden gangbaren Pfad implementieren"): er umgeht
+/// `MemoryContextProvider<M>` vollständig und liefert eigenständig zwei
+/// Abschnitte aus den bereits geöffneten [`harw_memory::FactStore`]s und dem
+/// [`harw_memory::file_index::FileKnowledgeIndex`] — beide sind
+/// M-generic-frei (`FactStore`/`FileKnowledgeIndex` sind konkrete Typen,
+/// kein Trait-Objekt-Problem):
+///
+/// 1. „Präferenzen & Fallen" — alle [`harw_memory::FactType::Preference`]-
+///    und [`harw_memory::FactType::Pitfall`]-Fakten, Projekt vor Global, bis
+///    [`MEMORY_FACTS_MAX_DELIVERED`] insgesamt.
+/// 2. „Bekannte Dateien" — bis zu [`MEMORY_FILES_MAX_DELIVERED`]
+///    Dateiwissen-Einträge, nach `last_seen` absteigend sortiert (ohne
+///    Stichwortsuche: dieser Adapter hat keinen Zugriff auf den STM-Puffer,
+///    den `MemoryContextProvider::search_keywords` dafür liest — der lebt
+///    ausschließlich innerhalb des M-generischen Providers).
+///
+/// HOT/STM/WARM (der eigentliche v2-`Memory`-Store) bleibt damit außerhalb
+/// des Modellkontexts dieses Laufs; das ist keine Verschlechterung
+/// gegenüber dem Zustand vor diesem Knoten — vor ihm erreichte **gar kein**
+/// Gedächtnis-Fragment die Registry (siehe Bericht: `MemoryContextProvider`
+/// wurde nirgends instanziiert).
+///
+/// # Nebenläufigkeit
+/// `Send + Sync`: hält nur `Arc`s (`FactStore`, `FileKnowledgeIndex`), keine
+/// eigene innere Veränderlichkeit.
+///
+/// # Fehler
+/// Kein eigener Fehlertyp: ein Lesefehler eines Stores wird nur
+/// `tracing::warn!`, der betroffene Abschnitt liefert dann schlicht nichts —
+/// derselbe Grundsatz wie `harw_memory::context_provider::MemoryContextProvider`.
+struct MemoryFactsContextProvider {
+    /// Projekt-Fakten-Wurzel; Projekt geht laut Design §4 im Lesepfad vor.
+    project_facts: Option<Arc<harw_memory::FactStore>>,
+    /// Globale Fakten-Wurzel.
+    global_facts: Option<Arc<harw_memory::FactStore>>,
+    /// Dateiwissen-Index der Projekt-Wurzel, falls er geöffnet werden konnte.
+    file_index: Option<Arc<harw_memory::file_index::FileKnowledgeIndex>>,
+}
+
+impl MemoryFactsContextProvider {
+    /// Baut den Provider aus bereits geöffneten Quellen.
+    #[must_use]
+    fn new(
+        project_facts: Option<Arc<harw_memory::FactStore>>,
+        global_facts: Option<Arc<harw_memory::FactStore>>,
+        file_index: Option<Arc<harw_memory::file_index::FileKnowledgeIndex>>,
+    ) -> Self {
+        Self {
+            project_facts,
+            global_facts,
+            file_index,
+        }
+    }
+
+    /// Rendert den Abschnitt „Präferenzen & Fallen" (Addendum B).
+    ///
+    /// # Beschreibung
+    /// Liest [`harw_memory::FactType::Preference`]- und
+    /// [`harw_memory::FactType::Pitfall`]-Fakten aus Projekt- (zuerst) und
+    /// Global-Store, bis [`MEMORY_FACTS_MAX_DELIVERED`] insgesamt erreicht
+    /// sind. Ein Lesefehler eines Stores wird nur geloggt; der andere Store
+    /// trägt trotzdem weiter bei.
+    ///
+    /// # Arguments
+    /// - `keywords` (`&[String]`): über [`derive_memory_search_keywords`]
+    ///   aus dem Turn-Eingang abgeleitete Stichwörter; leer, wenn keiner
+    ///   verfügbar war. Zusätzlich zu den unverändert immer geladenen
+    ///   Präferenz-/Fallen-Fakten liefert ein nicht-leeres `keywords` weitere,
+    ///   über [`harw_memory::FactStore::search`] gefundene Treffer beliebigen
+    ///   Fakttyps, dedupliziert gegen bereits ausgelieferte Fakten, bis
+    ///   insgesamt [`MEMORY_FACTS_TOTAL_MAX_DELIVERED`] Zeilen erreicht sind.
+    fn preferences_and_pitfalls(&self, keywords: &[String]) -> Vec<ContextFragment> {
+        let mut lines: Vec<String> = Vec::new();
+        let mut seen_facts: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let stores = [
+            ("project", &self.project_facts),
+            ("global", &self.global_facts),
+        ];
+        for (scope_name, store) in stores {
+            let Some(store) = store else { continue };
+            if lines.len() >= MEMORY_FACTS_MAX_DELIVERED {
+                break;
+            }
+            match store.list() {
+                Ok(facts) => {
+                    for fact in facts.into_iter().filter(|fact| {
+                        matches!(
+                            fact.fact_type,
+                            harw_memory::FactType::Preference | harw_memory::FactType::Pitfall
+                        )
+                    }) {
+                        if lines.len() >= MEMORY_FACTS_MAX_DELIVERED {
+                            break;
+                        }
+                        seen_facts.insert(format!("{scope_name}:{}", fact.name));
+                        lines.push(format!(
+                            "- ({scope_name}, {}) {}",
+                            fact.fact_type, fact.description
+                        ));
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        scope = scope_name,
+                        error = %error,
+                        "runtime.memory_facts.list_failed"
+                    );
+                }
+            }
+        }
+        if !keywords.is_empty() {
+            let keyword_refs: Vec<&str> = keywords.iter().map(String::as_str).collect();
+            for (scope_name, store) in stores {
+                let Some(store) = store else { continue };
+                if lines.len() >= MEMORY_FACTS_TOTAL_MAX_DELIVERED {
+                    break;
+                }
+                let remaining = MEMORY_FACTS_TOTAL_MAX_DELIVERED - lines.len();
+                match store.search(&keyword_refs, remaining) {
+                    Ok(facts) => {
+                        for fact in facts {
+                            if lines.len() >= MEMORY_FACTS_TOTAL_MAX_DELIVERED {
+                                break;
+                            }
+                            if !seen_facts.insert(format!("{scope_name}:{}", fact.name)) {
+                                continue;
+                            }
+                            lines.push(format!(
+                                "- ({scope_name}, {} · Stichwort) {}",
+                                fact.fact_type, fact.description
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            scope = scope_name,
+                            error = %error,
+                            "runtime.memory_facts.search_failed"
+                        );
+                    }
+                }
+            }
+        }
+        if lines.is_empty() {
+            return Vec::new();
+        }
+        vec![ContextFragment {
+            label: "memory.facts.preferences".to_owned(),
+            content: format!("Präferenzen & bekannte Fallen:\n{}", lines.join("\n")),
+        }]
+    }
+
+    /// Rendert den Abschnitt „Bekannte Dateien" (Addendum B).
+    ///
+    /// # Beschreibung
+    /// Ist `keywords` nicht leer, liefert
+    /// [`harw_memory::file_index::FileKnowledgeIndex::search`] bis zu
+    /// [`MEMORY_FILES_MAX_DELIVERED`] stichwort-passende Einträge. Sonst (kein
+    /// Stichwort aus dem Turn-Eingang ableitbar) fällt diese Funktion auf die
+    /// bisherige Recency-Liste zurück: bis zu [`MEMORY_FILES_MAX_DELIVERED`]
+    /// Einträge des Dateiwissen-Index, nach `last_seen` absteigend sortiert
+    /// (jüngstes zuerst). Ein Lesefehler des Index wird nur geloggt.
+    fn known_files(&self, keywords: &[String]) -> Vec<ContextFragment> {
+        let Some(index) = self.file_index.as_ref() else {
+            return Vec::new();
+        };
+        let entries = if keywords.is_empty() {
+            let mut entries = match index.list() {
+                Ok(entries) => entries,
+                Err(error) => {
+                    tracing::warn!(error = %error, "runtime.memory_files.list_failed");
+                    return Vec::new();
+                }
+            };
+            entries.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+            entries.truncate(MEMORY_FILES_MAX_DELIVERED);
+            entries
+        } else {
+            match index.search(keywords, MEMORY_FILES_MAX_DELIVERED) {
+                Ok(entries) => entries,
+                Err(error) => {
+                    tracing::warn!(error = %error, "runtime.memory_files.search_failed");
+                    return Vec::new();
+                }
+            }
+        };
+        if entries.is_empty() {
+            return Vec::new();
+        }
+
+        let lines: Vec<String> = entries
+            .iter()
+            .map(|entry| {
+                let summary = entry.summary.as_deref().unwrap_or("");
+                if entry.symbols.is_empty() {
+                    format!("- {} — {summary}", entry.path)
+                } else {
+                    format!("- {} — {summary} [{}]", entry.path, entry.symbols.join(", "))
+                }
+            })
+            .collect();
+        vec![ContextFragment {
+            label: "memory.files.known".to_owned(),
+            content: format!("Bekannte Dateien (bereits gelesen):\n{}", lines.join("\n")),
+        }]
+    }
+}
+
+impl ContextProvider for MemoryFactsContextProvider {
+    /// Liefert die beiden Fakten-/Dateiwissen-Abschnitte dieses Laufs.
+    ///
+    /// # Beschreibung
+    /// Synchron gebaut (keine `.await`-Stelle nötig — beide Quellen sind
+    /// dateibasiert und werden ohne eigenen Async-Layer gelesen). `ctx` wird
+    /// über [`derive_memory_search_keywords`] gelesen: dieser Adapter hat —
+    /// anders als `harw_memory::context_provider::MemoryContextProvider` —
+    /// kein STM, aus dem er sonst eine Stichwortsuche ableiten könnte, liest
+    /// deshalb `ctx.metadata` best-effort (siehe dort für die strukturelle
+    /// Einschränkung); ohne Treffer fallen beide Abschnitte unverändert auf
+    /// ihre bisherigen Recency-Pfade zurück.
+    fn contribute<'a>(&'a self, ctx: &'a TurnInputContext) -> ExtFuture<'a, Vec<ContextFragment>> {
+        Box::pin(async move {
+            let keywords = derive_memory_search_keywords(ctx);
+            let mut fragments = self.preferences_and_pitfalls(&keywords);
+            fragments.extend(self.known_files(&keywords));
+            fragments
+        })
+    }
+}
+
+/// Das Kontextfenster (Token) des Vorgabemodells dieses Laufs.
+///
+/// # Beschreibung
+/// Sucht `config.harness.default_model` in `config.models` — zuerst als
+/// direkten Schlüssel/`id`-Treffer, sonst über `ModelToml::aliases` — und
+/// liest dessen `context_window`. Ohne Vorgabemodell, ohne passenden
+/// Katalogeintrag oder ohne gesetztes `context_window` greift
+/// [`DEFAULT_CONTEXT_WINDOW_TOKENS`]: `harw-model-catalog` ist in diesem
+/// Crate nicht importiert (kein bestehender Verwendungsort in
+/// `assembly.rs`), ein zweiter Nachschlagepfad wäre deshalb unbelegte
+/// Spekulation statt eines dokumentierten Vertragswegs.
+///
+/// # Argumente
+/// - `config` (`&ResolvedConfig`): die aufgelöste Konfiguration dieses Laufs.
+///
+/// # Rückgabe
+/// Die Token-Zahl des effektiven Kontextfensters, nie 0 (Vorgabe greift).
+fn resolve_context_window(config: &ResolvedConfig) -> u64 {
+    let Some(model_id) = config.harness.default_model.as_deref() else {
+        return DEFAULT_CONTEXT_WINDOW_TOKENS;
+    };
+    let entry = config.models.get(model_id).or_else(|| {
+        config
+            .models
+            .values()
+            .find(|model| {
+                model.id == model_id
+                    || model
+                        .aliases
+                        .iter()
+                        .any(|alias| alias.as_str() == model_id)
+            })
+    });
+    entry
+        .and_then(|model| model.context_window)
+        .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS)
+}
+
 /// Die Leihgaben, aus denen [`build_spawner`] den Spawner baut.
 ///
 /// # Beschreibung
@@ -1814,6 +2576,19 @@ struct SpawnerInputs<'a> {
     activation: &'a SessionActivation,
     /// Die **einmal** gesenkten eingebauten Rollen.
     definitions: &'a HashMap<String, ExecutableAgentIr>,
+    /// Wächter-Schwellen dieses Laufs (Addendum F+G); jedes über diesen
+    /// Spawner admittierte Kind bekommt dieselbe Politik wie die Wurzel
+    /// (`children.rs`-Brief: "Kind-Sessions bekommen dieselbe GuardPolicy +
+    /// DriftTracer + PitfallAdvisor, falls die Factory die Session baut" —
+    /// hier: falls [`ManagedAgentSpawner`] die Session baut).
+    guard_policy: GuardPolicy,
+    /// Pitfall-Berater dieses Laufs (Addendum F+G), `None` ohne geöffnete
+    /// Projekt-Fakten-Wurzel; wie `guard_policy` an jedes Kind weitergereicht.
+    pitfall_advisor: Option<Arc<dyn PitfallAdvisor>>,
+    /// Agentendefinitions-Verzeichnis des aktiven Profils (`<profil>/agents`,
+    /// Welle FANIN-K/FANIN-RT, Fan-in-Zusatzpunkt "`profile_agents_dir` …
+    /// im Runtime-Pfad setzen"). `None`, wenn kein Profil ermittelbar war.
+    profile_agents_dir: Option<PathBuf>,
 }
 
 /// Montiert den Spawner eines Laufs nach seiner [`SpawnerPolicy`].
@@ -1845,6 +2620,9 @@ fn build_spawner(
         reasoning_effort,
         activation,
         definitions,
+        guard_policy,
+        pitfall_advisor,
+        profile_agents_dir,
     } = inputs;
 
     let events = session_events.ok_or_else(|| RuntimeError::Spawner {
@@ -1854,16 +2632,37 @@ fn build_spawner(
     })?;
 
     let factory: Arc<dyn ChildRegistryFactory> =
-        Arc::new(RuntimeChildRegistryFactory::with_definitions(
-            project.clone(),
-            Arc::clone(model),
-            chain.clone(),
-            definitions.clone(),
-        ));
+        Arc::new(
+            RuntimeChildRegistryFactory::with_definitions(
+                project.clone(),
+                Arc::clone(model),
+                chain.clone(),
+                definitions.clone(),
+            )
+            .with_internal_models(crate::children::resolve_internal_models_for_children(
+                config,
+            ))
+            .with_profile_agents_dir(profile_agents_dir),
+        );
 
     let model_id = config.harness.default_model.as_deref().unwrap_or_default();
     let manager = Arc::new(std::sync::Mutex::new(SessionManager::new(events)));
-    let mut spawner = ManagedAgentSpawner::new(manager, child_limits(config, model_id));
+    let mut spawner = ManagedAgentSpawner::new(manager, child_limits(config, model_id))
+        // Addendum F+G: Rollen-Reasoning-Gewichtung und Drift-Beobachter
+        // gelten für jedes über diesen Spawner admittierte Kind.
+        .with_role_effort_weights(Some(crate::guard_wiring::role_effort_weights_from_config(
+            config,
+        )))
+        .with_drift_observer(Some(
+            Arc::new(crate::guard_wiring::DriftTracer) as Arc<dyn DriftObserver>
+        ))
+        // Welle FANIN-K/FANIN-RT: dieselben Wächter-Schwellen und derselbe
+        // Pitfall-Berater wie die Wurzelsitzung (`Self::new_root_session`,
+        // `with_guard_policy`/`with_pitfall_advisor`) gelten für jedes über
+        // diesen Spawner gebaute Kind — die Kind-Fabrik baut keine eigene
+        // Session, [`ManagedAgentSpawner`] tut das.
+        .with_guard_policy(guard_policy)
+        .with_pitfall_advisor(pitfall_advisor.clone());
     let mut roles: Vec<String> = Vec::with_capacity(role_names::ALL.len());
     for role in role_names::ALL {
         spawner = spawner.with_role(
@@ -1946,6 +2745,27 @@ pub struct RuntimeAssembly {
     lifecycle_hooks: Vec<Arc<dyn SessionLifecycleHook>>,
     tools: Vec<String>,
     root_session_id: SessionId,
+    /// Die Projekt-Erfassungsfläche des Gedächtnisses (Addendum B), `None`
+    /// wenn [`RuntimeAssemblyBuilder::build`] sie nicht öffnen konnte.
+    /// [`Self::new_root_session`] hängt daraus, falls gesetzt, einen
+    /// [`crate::memory_wiring::MemoryCaptureObserver`] an die Wurzelsitzung.
+    memory_capture: Option<Arc<harw_memory::capture::ProjectMemoryCapture>>,
+    /// Wächter-Schwellen dieses Laufs (Addendum F+G), aus `[guards]`
+    /// aufgelöst über [`crate::guard_wiring::guard_policy_from_config`].
+    /// [`Self::new_root_session`] hängt sie über `with_guard_policy` an die
+    /// Wurzelsitzung.
+    guard_policy: GuardPolicy,
+    /// Rollen-Reasoning-Effort-Gewichtung dieses Laufs (Addendum F+G), aus
+    /// `[reasoning]` aufgelöst über
+    /// [`crate::guard_wiring::role_effort_weights_from_config`].
+    /// [`Self::new_root_session`] nutzt `weights.uia`, falls die Wurzel eine
+    /// UIA ist und [`RuntimeSpec::reasoning_effort`] `None` bleibt.
+    role_effort_weights: RoleEffortWeights,
+    /// Pitfall-Berater über die Projekt-Fakten-Wurzel (Addendum F+G,
+    /// `PitfallMatch`), `None` ohne geöffnete Projekt-Fakten-Wurzel.
+    /// [`Self::new_root_session`] hängt ihn, falls gesetzt, über
+    /// `with_pitfall_advisor` an die Wurzelsitzung.
+    pitfall_advisor: Option<Arc<dyn PitfallAdvisor>>,
     registry: Mutex<Option<ExtensionRegistry>>,
     responder: Mutex<Option<Arc<dyn ApprovalHandler>>>,
 }
@@ -1985,6 +2805,9 @@ impl RuntimeAssembly {
             root_session_id: None,
             secret_resolver: None,
             narrowing: None,
+            project_facts: None,
+            global_facts: None,
+            extra_lifecycle_hooks: Vec::new(),
         }
     }
 
@@ -2325,11 +3148,63 @@ impl RuntimeAssembly {
             *stored = Some(handler);
         }
 
+        // Auto-Verdichtung: Schwellen aus dem Kontextfenster des
+        // Vorgabemodells (`resolve_context_window`), nie deaktiviert — es
+        // gibt (noch) keinen `harw_config::HarnessConfig`-Schalter, der eine
+        // Abwahl erlaubte, und einen neuen zu erfinden ist außerhalb dieses
+        // Vertrags. Der Handoff-Beobachter schreibt bei jeder Verdichtung
+        // `<project>/.harw/handoff.json` (Contract §"harw-runtime/src/handoff.rs").
+        let context_window = resolve_context_window(&self.config);
+        // Addendum F+G: eine UIA-Wurzel ohne expliziten Effort erbt
+        // `role_effort_weights.uia`, statt unverändert `None` zu bleiben (was
+        // `AgentSession` seinerseits auf den Modell-Vorgabewert abbildet).
+        // Jeder andere Einstieg (auch ein `active_agent`-Root ohne UIA) bleibt
+        // unverändert bei `spec.reasoning_effort`.
+        let reasoning_effort = if self.spawn_context.organizational_role == AgentRoleId::UserInterface {
+            self.spec.reasoning_effort.or(Some(self.role_effort_weights.uia))
+        } else {
+            self.spec.reasoning_effort
+        };
         let mut session =
             AgentSession::new_with_id(id, AgentRole::Assistant, None, registry, events)
                 .with_spawn_context(self.spawn_context.clone())
-                .with_reasoning_effort(self.spec.reasoning_effort)
-                .with_turn_event_sink(turn_events);
+                .with_reasoning_effort(reasoning_effort)
+                .with_turn_event_sink(turn_events)
+                .with_auto_compact(Some(
+                    harw_core::AutoCompactPolicy::for_context_window(context_window)
+                        .with_absolute_ceiling(Some(
+                            self.config
+                                .harness
+                                .compaction
+                                .absolute_ceiling_tokens
+                                .unwrap_or(harw_core::DEFAULT_ABSOLUTE_CEILING_TOKENS),
+                        )),
+                ))
+                .with_compaction_observer(Some(Arc::new(crate::handoff::HandoffWriter::new(
+                    self.home_project.clone(),
+                ))))
+                .with_tool_outcome_observer(self.memory_capture.clone().map(|capture| {
+                    Arc::new(crate::memory_wiring::MemoryCaptureObserver::new(capture))
+                        as Arc<dyn harw_core::capture::ToolOutcomeObserver>
+                }))
+                // Addendum F+G: Wächter-Verdrahtung der Wurzel-(UIA-)Sitzung.
+                .with_guard_policy(Some(self.guard_policy))
+                .with_drift_observer(Some(
+                    Arc::new(crate::guard_wiring::DriftTracer) as Arc<dyn DriftObserver>
+                ))
+                .with_pitfall_advisor(self.pitfall_advisor.clone());
+        // Addendum C: die Verdichtungs-Zusammenfassung nutzt die interne
+        // Modellstelle `CompactionSummary`, sofern sie nicht auf das
+        // Hauptmodell aufgelöst hat (dann bleibt `AgentSession` unverändert
+        // beim Vorgabemodell der Sitzung).
+        let summary =
+            harw_config::resolve_internal_model(&self.config, harw_config::InternalModelPoint::CompactionSummary);
+        if !summary.is_main_model() {
+            session = session.with_compaction_summary_model(
+                summary.provider.map(ProviderId::from),
+                summary.model.map(ModelId::from),
+            );
+        }
         if let Some(ir) = self.agent_ir.as_ref() {
             session = session.with_executable_agent_ir(ir);
         }
@@ -2342,6 +3217,7 @@ impl RuntimeAssembly {
             session_id = %self.root_session_id,
             mode = session.mode().as_str(),
             approval_mode = ?self.approval_mode.get(),
+            context_window = context_window,
             "runtime.root_session.created"
         );
 
@@ -2715,11 +3591,45 @@ mod tests {
         std::fs::create_dir_all(&project).expect("project");
         // Projekt-Marker, damit `discover_project` genau hier stehen bleibt.
         std::fs::write(project.join("Cargo.toml"), "[workspace]\n").expect("marker");
+        write_fixture_uia(&home);
         BuildFixture {
             _dir: dir,
             home,
             project,
         }
+    }
+
+    /// Legt eine minimale, gültige UIA (`role = "user-interface"`) im
+    /// Standardprofil des Test-`home` an und aktiviert sie über
+    /// `harness.active_uia_definition`.
+    ///
+    /// # Beschreibung
+    /// Seit dem UIA-Vertrag (siehe `resolve_active_uia`,
+    /// `docs/session-transcript-2026-09-14.md`) montieren `EntryKind::Tui`
+    /// und `EntryKind::OneShot` nur mit einer konfigurierten UIA
+    /// (fail-closed, `RuntimeError::Registry`). Test-Fixtures müssen deshalb
+    /// selbst eine bereitstellen, statt implizit auf einen Bootstrap
+    /// außerhalb dieser Crate (`harw-cli/src/uia_bootstrap.rs`) zu vertrauen.
+    /// Layout und Inhalt spiegeln exakt `write_generated_uia` dort:
+    /// `<home>/profiles/default/agents/fixture-uia/definition.toml` plus
+    /// `<home>/profiles/default/config.toml` mit
+    /// `active_uia_definition = "<id>"` — das aktive Profil ohne
+    /// `active_profile`-Datei ist `"default"`
+    /// (`harw_home::active_profile_name`).
+    fn write_fixture_uia(home: &std::path::Path) {
+        let profile_dir = home.join("profiles").join("default");
+        let agent_dir = profile_dir.join("agents").join("fixture-uia");
+        std::fs::create_dir_all(&agent_dir).expect("fixture uia dir");
+        std::fs::write(
+            agent_dir.join("definition.toml"),
+            "schema = \"harwness.agent/v1\"\nid = \"harwness.agent.fixture-uia@1\"\nversion = \"1.0.0\"\nrole = \"user-interface\"\nspecialization = \"terminal-ui\"\n",
+        )
+        .expect("fixture uia definition");
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            "active_uia_definition = \"harwness.agent.fixture-uia@1\"\n",
+        )
+        .expect("fixture profile config");
     }
 
     /// Ein Builder mit Echo-Modell und In-Memory-Verlauf. Nur für Einstiege
@@ -2800,6 +3710,29 @@ mod tests {
         assert!(assembly.memory().is_none());
         assert!(assembly.services().memory().is_none());
         assert!(assembly.plan_services().is_none());
+    }
+
+    /// Addendum B: eine Montage in einem frischen Tempdir-Projekt öffnet die
+    /// Erfassungsfläche best-effort und hängt daraus einen
+    /// [`crate::memory_wiring::MemoryCaptureObserver`] an die Wurzelsitzung.
+    #[test]
+    fn test_root_session_gets_a_memory_capture_observer_when_capture_opens() {
+        let fixture = build_fixture();
+        let assembly = fixture_builder(EntryKind::LocalEcho, &fixture)
+            .build()
+            .expect("LocalEcho montiert");
+
+        let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+        let (turn_events, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
+        let root = assembly
+            .new_root_session(assembly.root_session_id().clone(), events, turn_events, None)
+            .expect("Wurzelsitzung entsteht");
+
+        assert!(
+            root.session.tool_outcome_observer().is_some(),
+            "eine erfolgreich geöffnete Erfassungsfläche muss die Wurzelsitzung \
+             mit einem ToolOutcomeObserver verdrahten"
+        );
     }
 
     #[test]
@@ -2981,6 +3914,7 @@ mod tests {
                 agent_name: Some("plan-node".to_owned()),
                 role_description: Some("research node".to_owned()),
                 extra_context: vec!["node 7".to_owned()],
+                organizational_role: None,
             },
             permissions: PermissionSet::empty(),
             workspace_root: None,
@@ -3440,12 +4374,19 @@ mod tests {
 
     /// Eine ungültige Extra-Root (hier: nicht existent) wird übersprungen,
     /// nicht abgelehnt — nur der gültige Eintrag landet in der Zelle.
+    ///
+    /// Der gültige Kandidat muss außerhalb von `primary` liegen: eine
+    /// zusätzliche Wurzel *innerhalb* der primären Wurzel würde deren Rechte
+    /// nicht erweitern und wird von [`validate_extra_root`]
+    /// (`harw-sandbox/src/extra_roots.rs`) als `AlreadyContained` verworfen
+    /// (die vorherige Fassung dieses Tests platzierte `valid` fälschlich
+    /// unter `primary` und scheiterte deshalb mit `0` statt `1`).
     #[test]
     fn test_seed_extra_roots_skips_invalid_entries() {
         let dir = tempfile::tempdir().expect("tempdir");
         let primary = dir.path().join("primary");
         std::fs::create_dir_all(&primary).expect("primary");
-        let valid = primary.join("valid");
+        let valid = dir.path().join("valid");
         std::fs::create_dir_all(&valid).expect("valid");
         let missing = primary.join("does-not-exist");
 

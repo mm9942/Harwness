@@ -1,0 +1,97 @@
+# Eingebauter Agent-Steward (Addendum K + Nachtrag K + Nachtrag K2) —
+# Registry-Profil `RegistryProfile::AgentStewardship`
+# (`harw-registry-defaults/src/profile.rs`).
+#
+# Setzt Agentendefinitionen um, die die UIA (beratend, mit dem Nutzer) oder
+# der Root-Orchestrator als Auftrag geben (`AgentRoleId::AgentSteward`,
+# `harw-agent-dsl/src/roles.rs`, Agent K-A). Validiert jeden Entwurf zwingend
+# über `agents.validate`, bevor er schreibt, und schreibt ausschließlich über
+# die geprüfte Pipeline von
+# `harw_registry_defaults::agent_definition_tools::AgentDefinitionToolProvider`
+# (Agent K-C) — nie über rohen Dateizugriff (`fs.write` fehlt bewusst in
+# `admitted` und steht ausdrücklich in `forbidden`).
+#
+# ── Werkzeugoberfläche ──────────────────────────────────────────────────────
+# Lesender fs.*-Kern (wie `explorer`) plus die Agentendefinitions-Werkzeuge
+# in ihrer maximalen, Commit-Modus-Ausprägung (Nachtrag K2):
+# `agents.validate` (rein lesend, senkt einen Entwurf über dieselbe
+# DSL-Pipeline wie ein eingebetteter Agent), `agents.list_proposals`
+# (listet offene Vorschläge unter `agents/.proposals/`), `agents.
+# write_definition` (Agentendefinition, Projekt- oder Profil-Scope),
+# `agents.write_uia` (neues UIA-Bündel, ausschließlich Profil-Scope,
+# aktiviert nie), `agents.commit_proposal`/`agents.reject_proposal`
+# (übernehmen/verwerfen eines zuvor abgelegten Vorschlags). Die beiden
+# letzten registriert der Provider laut Nachtrag K2 nur im Commit-Modus
+# (Elternrolle der UIA); diese TOML admittiert trotzdem die volle,
+# maximale Werkzeugmenge — `RegistryProfile::AgentStewardship.tool_names()`
+# ist bewusst die Commit-Modus-Obermenge (siehe die Begründung dort und in
+# `tests/tool_admission_coverage.rs`), ein Vorschlagsmodus-Lauf sieht die
+# beiden Werkzeuge im System-Prompt-Inventar, kann sie aber laut Provider
+# nicht ausführen — keine Rechteausweitung, nur ein enger werdender
+# Laufzeitzustand desselben admittierten Namens.
+#
+# ── Kein Fan-out ─────────────────────────────────────────────────────────
+# `max_depth = 0`: ein Umsetzungslauf ist ein einzelner, in sich
+# geschlossener Validieren-dann-Schreiben-Schritt, kein Fan-out — dieselbe
+# Begründung wie bei `memory-steward` und den Triage-Rollen.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.agent-steward@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "agent-steward"
+specialization = "agent-steward"
+
+name = "Agent Steward"
+description = "Setzt Agentendefinitionen und neue UIA-Buendel um: validiert zwingend vor dem Schreiben, erfindet keine Rechte, meldet Konflikte zurueck."
+
+[work]
+mode = "agent-definition-stewardship"
+may_write_code = false
+may_research_web = false
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "agents.validate",
+  "agents.list_proposals",
+  "agents.write_definition",
+  "agents.write_uia",
+  "agents.commit_proposal",
+  "agents.reject_proposal",
+]
+forbidden = [
+  "fs.write",
+  "shell.exec",
+  "web.fetch",
+  "web.docs_rs",
+  "web.crates_io",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+  "lens.ask",
+  "browser.open",
+  "browser.observe",
+  "browser.find",
+  "browser.act",
+  "browser.wait",
+  "browser.events",
+  "browser.close",
+]
+
+[spawn]
+max_depth = 0
+
+[spawn.budget]
+max_tokens = 80000
+max_tool_calls = 40
+max_wall_secs = 600
+
+[return]
+contract = "harwness.return.execution-summary@1"

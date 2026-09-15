@@ -29,6 +29,12 @@
 //!   Kind-Registries montiert, ohne die Projekterkennung je Kind zu wiederholen.
 //! - [`profile::assemble_registry_for_sandbox`]: wie oben, registriert aber nur
 //!   Werkzeuge, deren Recht der gewährte `PermissionSet` trägt (W5 RD).
+//! - [`profile::assemble_registry_for_project_with_definition_access`] /
+//!   [`profile::assemble_registry_for_sandbox_with_definition_access`]: wie
+//!   die beiden vorherigen, nehmen aber zusätzlich eine optionale
+//!   [`profile::AgentDefinitionAccess`] entgegen (Nachtrag K3) — nur für
+//!   [`profile::RegistryProfile::AgentStewardship`] relevant; ohne sie bleibt
+//!   `agent-steward` fail-closed bei `agents.validate`/`agents.list_proposals`.
 //! - [`authority`]: Werkzeug→Recht, Rollen-Reducer (`reduce_to_read_only`,
 //!   `reduce_to_read_registry`, `reduce_to_read_network`).
 //! - [`research_web`]: Egress-Policy der Rolle `researcher-web` aus
@@ -53,6 +59,7 @@
 
 mod error;
 
+pub mod agent_definition_tools;
 pub mod authority;
 pub mod embedded_agents;
 pub mod profile;
@@ -69,10 +76,15 @@ use harw_instructions::AgentIdentity;
 use harw_project_discovery::ProjectContext;
 
 pub use error::{RegistryDefaultsError, RegistryDefaultsResult};
+pub use agent_definition_tools::{
+    AgentDefinitionToolProvider, DefinitionAuthorCeiling, DefinitionWriteMode,
+};
 pub use authority::{AuthorityReducer, authority_reducer_for_role, tool_permission};
 pub use profile::{
-    IdentityOverrides, RegistryProfile, RestrictedToolProvider, assemble_registry,
-    assemble_registry_for_project, assemble_registry_for_sandbox, profile_for_role, role_names,
+    AgentDefinitionAccess, IdentityOverrides, RegistryProfile, RestrictedToolProvider,
+    agent_definition_tool_names_for_access, assemble_registry, assemble_registry_for_project,
+    assemble_registry_for_project_with_definition_access, assemble_registry_for_sandbox,
+    assemble_registry_for_sandbox_with_definition_access, profile_for_role, role_names,
 };
 pub use research_web::{researcher_web_network_scope, researcher_web_policy};
 
@@ -157,6 +169,37 @@ pub const AUTO_APPROVED_TOOLS: &[&str] = &[
     // - `mode`: hat keine Modell-Tool-Fläche; der Eintrag war wirkungslos und
     //   hätte ein gleichnamiges Fremdwerkzeug (Plugin/MCP) freigeschaltet.
 ];
+
+/// Werkzeuge, die **immer** eine Rückfrage auslösen — auch unter
+/// [`ApprovalMode::FullAccess`] und selbst dann, wenn eine passende
+/// [`AllowRuleSet`]-Regel sonst automatisch freigeben würde (Welle FANIN-K,
+/// Nachtrag K3, „Freigabe-Härtung“).
+///
+/// # Description
+/// `agents.write_uia` (`crate::agent_definition_tools`, Nachtrag K) legt ein
+/// vollständiges neues UIA-Bündel an; `agents.commit_proposal`
+/// (Nachtrag K2/K3) übernimmt einen zuvor abgelegten Agentendefinitions-
+/// Vorschlag dauerhaft. Beide verlangen bei `review_level = "user_required"`
+/// ein `user_confirmed: true` im Aufrufargument — aber dieses Feld ist keine
+/// echte Freigabe, nur eine vom Modell behauptete Zeichenkette. Ohne diese
+/// Liste könnte ein im [`ApprovalMode::FullAccess`]-Modus laufendes Modell
+/// (oder eine `/permissions`-Regel für den Werkzeugnamen) `user_confirmed:
+/// true` selbst setzen und den vorgelagerten Freigabepfad damit umgehen.
+///
+/// [`DefaultApprovalPolicy::review`] prüft diese Liste deshalb **vor** jeder
+/// [`AllowRuleSet`]-Auswertung und vor der Modus-Logik — wie eine
+/// eingebaute, nie löschbare `Deny`-Regel für genau diese beiden Namen. Jedes
+/// hier gelistete Werkzeug bleibt zusätzlich außerhalb von
+/// [`AUTO_APPROVED_TOOLS`] (das gilt bereits, da beide Werkzeuge schreiben).
+///
+/// # Warum nur diese zwei
+/// `agents.write_definition` legt lediglich einen Vorschlag ab (nie eine
+/// aktive Definition) — dessen Prüfung ist Sache von `agents.commit_proposal`,
+/// nicht des Ablegens selbst. `agents.reject_proposal` verwirft nur, verleiht
+/// keine Rechte. Beide bleiben normal freigabepflichtig über
+/// [`AUTO_APPROVED_TOOLS`]/die Modus-Logik, aber nicht zusätzlich über diese
+/// Liste.
+pub const ALWAYS_ASK_TOOLS: &[&str] = &["agents.write_uia", "agents.commit_proposal"];
 
 /// Default approval boundary for the built-in coding-agent tool set.
 ///
@@ -269,10 +312,15 @@ impl DefaultApprovalPolicy {
 }
 
 impl ApprovalHandler for DefaultApprovalPolicy {
-    /// Entscheidet zuerst anhand der [`AllowRuleSet`], dann anhand des
-    /// Freigabemodus in der eigenen [`ApprovalModeCell`].
+    /// Entscheidet zuerst anhand von [`ALWAYS_ASK_TOOLS`], dann anhand der
+    /// [`AllowRuleSet`], dann anhand des Freigabemodus in der eigenen
+    /// [`ApprovalModeCell`].
     ///
     /// # Description
+    /// 0. `call.name` ∈ [`ALWAYS_ASK_TOOLS`] → sofort
+    ///    [`ApprovalDecision::AskUser`], ohne Regeln oder Modus überhaupt zu
+    ///    befragen — auch nicht unter [`ApprovalMode::FullAccess`] oder mit
+    ///    einer passenden `Allow`-Regel (Nachtrag K3, „Freigabe-Härtung“).
     /// 1. [`AllowRuleSet::evaluate`] auf `call.name`/`call.arguments`:
     ///    - `Some(`[`RuleDecision::Deny`]`)` → [`ApprovalDecision::AskUser`],
     ///      unabhängig vom Modus (fail-closed, nie automatisch freigegeben).
@@ -289,6 +337,12 @@ impl ApprovalHandler for DefaultApprovalPolicy {
     /// Regeln und Modus werden bei **jedem** Aufruf frisch gelesen, damit eine
     /// Umschaltung sofort greift und nicht erst im nächsten Turn.
     fn review<'a>(&'a self, call: &'a ToolCall) -> ExtFuture<'a, ApprovalDecision> {
+        // Nachtrag K3, „Freigabe-Härtung“: gewinnt über jede Regel und jeden
+        // Modus, auch `FullAccess` — siehe die Begründung bei
+        // `ALWAYS_ASK_TOOLS`.
+        if ALWAYS_ASK_TOOLS.contains(&call.name.as_str()) {
+            return Box::pin(async { ApprovalDecision::AskUser(Default::default()) });
+        }
         let rule_decision = self.rules.evaluate(call.name.as_str(), &call.arguments);
         let requires_approval = match self.mode.get() {
             ApprovalMode::AlwaysAsk => true,
@@ -521,9 +575,32 @@ mod tests {
                 profile.registered_tool_names(),
                 "Rolle {role}: beworbene und registrierte Werkzeuge müssen übereinstimmen"
             );
+            // Dieselbe berechnete Bedingung wie
+            // `crate::authority::tests::test_authority_reducer_for_role_covers_every_role_and_bounds_its_profile`
+            // (dort `exempt_from_subset_bound`), statt einer zweiten,
+            // handgepflegten Rollenliste: `executor`, `memory-steward`,
+            // `uia-worker` und `agent-steward` bekommen ihr freigabepflichtiges
+            // Werkzeug (`shell.exec`/`fs.write`/die schreibenden
+            // Agentendefinitions-Werkzeuge) über ihre feste Profilzuweisung bei
+            // der Registry-Montage, nicht über den `AuthorityReducer` — siehe
+            // `authority_reducer_for_role`. Für genau diese dokumentierten
+            // Ausnahmen existiert der Kind-Freigabepfad: jedes Kind erbt einen
+            // `ApprovalActor` aus `Principal::approval_actor`
+            // (`harw-runtime/src/spec.rs`), der eine Rückfrage tatsächlich
+            // beantworten kann, statt dass sie unbeantwortet hängen bleibt.
+            let reducer = crate::authority::authority_reducer_for_role(role)
+                .unwrap_or_else(|| panic!("eingebaute Rolle {role} ohne Reducer"));
+            let is_documented_gated_exception =
+                !profile.required_permissions().is_subset_of(&reducer.ceiling());
             for tool in profile.tool_names() {
+                let needs_approval = DefaultApprovalPolicy::requires_explicit_approval(&call(tool));
+                if needs_approval && is_documented_gated_exception {
+                    // Erwartete Rückfrage einer dokumentierten Ausnahmerolle —
+                    // der Kind-Freigabepfad existiert, siehe oben.
+                    continue;
+                }
                 assert!(
-                    !DefaultApprovalPolicy::requires_explicit_approval(&call(tool)),
+                    !needs_approval,
                     "Rolle {role}: {tool} würde im Kind an einer Rückfrage hängen"
                 );
             }
@@ -745,6 +822,34 @@ mod tests {
             block_on(policy.review(&call)),
             ApprovalDecision::AskUser(_)
         ));
+    }
+
+    /// Nachtrag K3, „Freigabe-Härtung“: `agents.write_uia` und
+    /// `agents.commit_proposal` fragen immer nach — auch unter
+    /// `ApprovalMode::FullAccess` und selbst mit einer passenden `Allow`-Regel,
+    /// die für jedes andere Werkzeug automatisch freigeben würde.
+    #[test]
+    fn review_always_asks_for_uia_and_commit_proposal_even_under_full_access_and_an_allow_rule() {
+        use harw_extension_api::allow_rules::{ApprovalRule, RuleDecision, RuleScope};
+
+        for tool in ALWAYS_ASK_TOOLS {
+            let rules = AllowRuleSet::new();
+            rules.add(ApprovalRule {
+                tool: (*tool).to_owned(),
+                pattern: None,
+                decision: RuleDecision::Allow,
+                scope: RuleScope::Global,
+            });
+            let policy = DefaultApprovalPolicy::with_rules(
+                ApprovalModeCell::new(ApprovalMode::FullAccess),
+                rules,
+            );
+
+            assert!(
+                matches!(block_on(policy.review(&call(tool))), ApprovalDecision::AskUser(_)),
+                "{tool} muss trotz FullAccess und einer Allow-Regel nachfragen"
+            );
+        }
     }
 
     /// Ohne passende Regel bleibt die bisherige Modus-Logik unverändert in

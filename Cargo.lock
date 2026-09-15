@@ -183,12 +183,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
-name = "assert_matches"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b34d609dfbaf33d6889b2b7106d3ca345eacad44200913df5ba02bfd31d2ba9"
-
-[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -390,36 +384,6 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
-]
-
-[[package]]
-name = "aya"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "66e644424fada9fff4fdc63848db1732fb69b626e8328202ef55c03df1f4d939"
-dependencies = [
- "assert_matches",
- "aya-obj",
- "bitflags 2.13.0",
- "hashbrown 0.17.1",
- "libc",
- "log",
- "object",
- "once_cell",
- "scopeguard",
- "thiserror",
-]
-
-[[package]]
-name = "aya-obj"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c76b9c75d9cdc155ff8f6a06d61e873f67bf47be8cfa92a3b5aaea43f4b4077"
-dependencies = [
- "bytes",
- "log",
- "object",
- "thiserror",
 ]
 
 [[package]]
@@ -1518,12 +1482,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
-name = "foldhash"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
-
-[[package]]
 name = "form_urlencoded"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2047,111 +2005,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "harw-dod"
-version = "0.3.0"
-dependencies = [
- "harw-dod-authlog",
- "harw-dod-blockio",
- "harw-dod-bpf",
- "harw-dod-cap",
- "harw-dod-cpu",
- "harw-dod-flow",
- "harw-dod-fsmon",
- "harw-dod-gpu",
- "harw-dod-listener",
- "harw-dod-memory",
- "harw-dod-netcounters",
- "harw-dod-procmon",
- "harw-dod-rules",
- "harw-dod-scanreport",
- "harw-dod-sentinel",
- "harw-dod-signals",
- "harw-dod-thermal",
- "harw-dod-workspace",
- "harw-sandbox",
- "harw-types",
- "jiff",
- "tempfile",
-]
-
-[[package]]
-name = "harw-dod-authlog"
-version = "0.3.0"
-dependencies = [
- "harw-dod-cap",
- "harw-dod-fixtures",
- "harw-dod-netlink",
- "harw-dod-signals",
- "harw-macros",
- "harw-types",
- "jiff",
- "tempfile",
-]
-
-[[package]]
-name = "harw-dod-blockio"
-version = "0.3.0"
-dependencies = [
- "harw-dod-cap",
- "harw-dod-fixtures",
- "harw-dod-readfs",
- "harw-dod-signals",
- "harw-macros",
- "harw-types",
- "jiff",
- "tempfile",
-]
-
-[[package]]
-name = "harw-dod-bpf"
-version = "0.3.0"
-dependencies = [
- "aya",
- "harw-dod-cap",
- "harw-macros",
- "harw-types",
- "jiff",
- "tempfile",
-]
-
-[[package]]
 name = "harw-dod-cap"
 version = "0.3.0"
 dependencies = [
  "harw-macros",
  "harw-types",
  "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "harw-dod-cgroup"
-version = "0.3.0"
-dependencies = [
- "harw-dod-cap",
- "harw-dod-fixtures",
- "harw-dod-readfs",
- "harw-dod-signals",
- "harw-macros",
- "harw-types",
- "jiff",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "harw-dod-cpu"
-version = "0.3.0"
-dependencies = [
- "harw-dod-cap",
- "harw-dod-fixtures",
- "harw-dod-readfs",
- "harw-dod-signals",
- "harw-macros",
- "harw-types",
- "jiff",
- "tempfile",
 ]
 
 [[package]]
@@ -2162,151 +2021,10 @@ dependencies = [
  "harw-dod-signals",
  "harw-dod-warden-proto",
  "harw-macros",
- "harw-sandbox",
  "harw-session-store",
  "harw-types",
  "jiff",
  "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "harw-dod-fixtures"
-version = "0.3.0"
-dependencies = [
- "harw-dod-cap",
- "harw-dod-readfs",
- "harw-dod-signals",
- "harw-macros",
- "harw-types",
- "jiff",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "harw-dod-flow"
-version = "0.3.0"
-dependencies = [
- "harw-dod-bpf",
- "harw-dod-cap",
- "harw-dod-signals",
- "harw-macros",
- "harw-sandbox",
- "harw-types",
- "ipnet",
- "jiff",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "harw-dod-fsmon"
-version = "0.3.0"
-dependencies = [
- "harw-dod-cap",
- "harw-dod-fixtures",
- "harw-dod-readfs",
- "harw-dod-signals",
- "harw-macros",
- "harw-types",
- "jiff",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "harw-dod-gpu"
-version = "0.3.0"
-dependencies = [
- "harw-dod-cap",
- "harw-dod-fixtures",
- "harw-dod-readfs",
- "harw-dod-signals",
- "harw-macros",
- "harw-types",
- "jiff",
- "tempfile",
-]
-
-[[package]]
-name = "harw-dod-listener"
-version = "0.3.0"
-dependencies = [
- "harw-dod-cap",
- "harw-dod-fixtures",
- "harw-dod-readfs",
- "harw-dod-signals",
- "harw-macros",
- "harw-types",
- "jiff",
- "tempfile",
-]
-
-[[package]]
-name = "harw-dod-memory"
-version = "0.3.0"
-dependencies = [
- "harw-dod-cap",
- "harw-dod-fixtures",
- "harw-dod-readfs",
- "harw-dod-signals",
- "harw-macros",
- "harw-types",
- "jiff",
- "tempfile",
-]
-
-[[package]]
-name = "harw-dod-netcounters"
-version = "0.3.0"
-dependencies = [
- "harw-dod-cap",
- "harw-dod-fixtures",
- "harw-dod-readfs",
- "harw-dod-signals",
- "harw-macros",
- "harw-types",
- "jiff",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "harw-dod-netlink"
-version = "0.3.0"
-dependencies = [
- "harw-dod-cap",
- "harw-macros",
- "jiff",
- "rustix 1.1.4",
-]
-
-[[package]]
-name = "harw-dod-netpolicy"
-version = "0.3.0"
-dependencies = [
- "harw-dod-cap",
- "harw-macros",
- "harw-sandbox",
- "ipnet",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "harw-dod-procmon"
-version = "0.3.0"
-dependencies = [
- "harw-dod-bpf",
- "harw-dod-cap",
- "harw-dod-signals",
- "harw-macros",
- "harw-types",
- "jiff",
- "tempfile",
 ]
 
 [[package]]
@@ -2315,7 +2033,6 @@ version = "0.3.0"
 dependencies = [
  "harw-dod-cap",
  "harw-macros",
- "tempfile",
 ]
 
 [[package]]
@@ -2324,48 +2041,12 @@ version = "0.3.0"
 dependencies = [
  "harw-code-graph",
  "harw-dod-signals",
- "harw-knowledge",
  "harw-research",
  "harw-sandbox",
  "harw-types",
  "jiff",
  "semver",
  "serde",
- "serde_json",
-]
-
-[[package]]
-name = "harw-dod-scanreport"
-version = "0.3.0"
-dependencies = [
- "harw-dod-cap",
- "harw-dod-fixtures",
- "harw-dod-readfs",
- "harw-dod-signals",
- "harw-home",
- "harw-macros",
- "harw-types",
- "jiff",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "harw-dod-sentinel"
-version = "0.3.0"
-dependencies = [
- "harw-dod-cap",
- "harw-dod-rules",
- "harw-dod-signals",
- "harw-fsutil",
- "harw-macros",
- "harw-observe",
- "harw-sandbox",
- "harw-types",
- "jiff",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]
@@ -2382,32 +2063,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "harw-dod-thermal"
-version = "0.3.0"
-dependencies = [
- "harw-dod-cap",
- "harw-dod-fixtures",
- "harw-dod-readfs",
- "harw-dod-signals",
- "harw-macros",
- "harw-types",
- "jiff",
- "tempfile",
-]
-
-[[package]]
-name = "harw-dod-warden"
-version = "0.3.0"
-dependencies = [
- "harw-dod-warden-proto",
- "harw-macros",
- "harw-types",
- "jiff",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
 name = "harw-dod-warden-proto"
 version = "0.3.0"
 dependencies = [
@@ -2417,23 +2072,6 @@ dependencies = [
  "jiff",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "harw-dod-workspace"
-version = "0.3.0"
-dependencies = [
- "harw-code-graph",
- "harw-dod-cap",
- "harw-dod-fixtures",
- "harw-dod-signals",
- "harw-macros",
- "harw-types",
- "jiff",
- "semver",
- "serde",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]
@@ -2867,6 +2505,7 @@ dependencies = [
  "time",
  "tokio",
  "toml 1.1.3+spec-1.1.0",
+ "toml_edit 0.25.13+spec-1.1.0",
  "tracing",
 ]
 
@@ -2912,47 +2551,6 @@ dependencies = [
  "tempfile",
  "time",
  "tracing",
-]
-
-[[package]]
-name = "harw-probe-bpf"
-version = "0.3.0"
-dependencies = [
- "clap",
- "harw-dod-bpf",
- "harw-dod-cap",
- "harw-dod-flow",
- "harw-dod-procmon",
- "harw-dod-signals",
- "harw-sandbox",
- "harw-types",
- "ipnet",
- "jiff",
- "landlock",
- "rustix 1.1.4",
- "serde_json",
- "tempfile",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "harw-probe-fs"
-version = "0.3.0"
-dependencies = [
- "clap",
- "harw-dod-cap",
- "harw-dod-fsmon",
- "harw-dod-signals",
- "harw-types",
- "jiff",
- "landlock",
- "nix 0.31.3",
- "rustix 1.1.4",
- "serde_json",
- "tempfile",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -3029,7 +2627,9 @@ dependencies = [
  "harw-tool-lens",
  "harw-tool-shell",
  "harw-tool-web",
+ "harw-tools",
  "include_dir",
+ "serde",
  "serde_json",
  "time",
  "toml 1.1.3+spec-1.1.0",
@@ -3056,6 +2656,7 @@ dependencies = [
  "harw-context",
  "harw-core",
  "harw-extension-api",
+ "harw-fsutil",
  "harw-home",
  "harw-job-runtime",
  "harw-lens-types",
@@ -3075,6 +2676,7 @@ dependencies = [
  "harw-secrets",
  "harw-session-store",
  "harw-types",
+ "jiff",
  "secrecy 0.10.3",
  "serde",
  "serde_json",
@@ -3113,40 +2715,6 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "uuid",
-]
-
-[[package]]
-name = "harw-sentinel"
-version = "0.3.0"
-dependencies = [
- "clap",
- "harw-dod-blockio",
- "harw-dod-cap",
- "harw-dod-cgroup",
- "harw-dod-cpu",
- "harw-dod-gpu",
- "harw-dod-listener",
- "harw-dod-memory",
- "harw-dod-netcounters",
- "harw-dod-rules",
- "harw-dod-scanreport",
- "harw-dod-sentinel",
- "harw-dod-signals",
- "harw-dod-thermal",
- "harw-dod-workspace",
- "harw-home",
- "harw-macros",
- "harw-observe",
- "harw-observe-file",
- "harw-sandbox",
- "harw-types",
- "jiff",
- "landlock",
- "rustix 1.1.4",
- "serde_json",
- "tempfile",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -3340,25 +2908,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "harw-warden"
-version = "0.3.0"
-dependencies = [
- "clap",
- "harw-dod-warden",
- "harw-dod-warden-proto",
- "harw-macros",
- "harw-types",
- "jiff",
- "landlock",
- "rustix 1.1.4",
- "sd-listen-fds",
- "serde",
- "serde_json",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "harw-web"
 version = "0.3.0"
 dependencies = [
@@ -3388,7 +2937,7 @@ checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
  "allocator-api2",
  "equivalent",
- "foldhash 0.1.5",
+ "foldhash",
 ]
 
 [[package]]
@@ -3396,10 +2945,6 @@ name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
-dependencies = [
- "equivalent",
- "foldhash 0.2.0",
-]
 
 [[package]]
 name = "hax-lib"
@@ -4113,17 +3658,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 
 [[package]]
-name = "landlock"
-version = "0.4.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cca98e95f35b29d469dade6724c6f96cec9236640f745a0e99b0334ec320ab1"
-dependencies = [
- "enumflags2",
- "libc",
- "thiserror",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4440,18 +3974,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nix"
-version = "0.31.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
-dependencies = [
- "bitflags 2.13.0",
- "cfg-if",
- "cfg_aliases",
- "libc",
-]
-
-[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4536,18 +4058,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
-]
-
-[[package]]
-name = "object"
-version = "0.39.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
-dependencies = [
- "crc32fast",
- "hashbrown 0.17.1",
- "indexmap",
- "memchr",
 ]
 
 [[package]]
@@ -5381,12 +4891,6 @@ dependencies = [
  "selectors",
  "tendril",
 ]
-
-[[package]]
-name = "sd-listen-fds"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8bb51d45a99c1bafff550fd40ce1d2152917dc9908fb3090c283e3f058d39b3f"
 
 [[package]]
 name = "sec1"
@@ -7137,7 +6641,7 @@ dependencies = [
  "futures-sink",
  "futures-util",
  "hex",
- "nix 0.29.0",
+ "nix",
  "ordered-stream",
  "rand 0.8.7",
  "serde",

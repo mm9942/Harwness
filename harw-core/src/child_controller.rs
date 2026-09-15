@@ -114,6 +114,106 @@ const CANCELLED_BY_SIBLING: &str = "cancelled: sibling completed first";
 /// Ordnung `Minimal < Low < Medium < High < Xhigh < Max`.
 const DEFAULT_CHILD_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Medium;
 
+/// Obergrenze (in Bytes) für den Text, den [`ManagedAgentSpawner::child_final_assistant_text`]
+/// an den Elternteil zurückgibt.
+///
+/// # Beschreibung
+/// Verhindert, dass ein Kind mit einer sehr langen finalen Antwort den
+/// Kontext des Elternteils sprengt. Die Kürzung geschieht ausschließlich auf
+/// dem Rückgabepfad — eine eventuell vorhandene vollständige Persistenz
+/// (z. B. Transcript/State-Store des Kindes) bleibt davon unberührt, weil
+/// diese Konstante nur von [`cap_child_return_text`] konsumiert wird.
+pub const CHILD_RETURN_MAX_BYTES: usize = 8 * 1024;
+
+/// Kürzt einen Text auf höchstens `max_bytes`, ohne einen UTF-8-Zeichen zu zerschneiden.
+///
+/// # Beschreibung
+/// Ist `text.len() <= max_bytes`, wird `text` unverändert zurückgegeben.
+/// Andernfalls werden ein Kopf (~3/4 des Budgets) und ein Ende (~1/4 des
+/// Budgets) behalten, getrennt durch eine Markierung `\n[… {n} Bytes der
+/// Kind-Antwort gekürzt …]\n`, wobei `{n}` die Anzahl der weggelassenen
+/// Bytes ist. Kopf und Ende werden jeweils auf die nächstliegende gültige
+/// UTF-8-Zeichengrenze zurückgeschnitten, damit niemals ein Mehrbyte-Zeichen
+/// mittendrin geteilt wird.
+///
+/// # Argumente
+/// - `text` (`&str`): der ungekürzte Text.
+/// - `max_bytes` (`usize`): das Byte-Budget für Kopf + Ende (ohne die
+///   Markierung selbst).
+///
+/// # Rückgabe
+/// Der unveränderte Text, oder ein gekürzter Text aus Kopf + Markierung +
+/// Ende, dessen Gesamtlänge `max_bytes` um die Länge der Markierung
+/// überschreiten kann (die Markierung selbst zählt nicht gegen `max_bytes`).
+///
+/// # Beispiele
+/// ```rust
+/// use harw_core::child_controller::cap_child_return_text;
+///
+/// assert_eq!(cap_child_return_text("kurz", 100), "kurz");
+/// let long = "a".repeat(200);
+/// let capped = cap_child_return_text(&long, 100);
+/// assert!(capped.len() <= 100 + 64);
+/// assert!(capped.contains("gekürzt"));
+/// ```
+#[must_use]
+pub fn cap_child_return_text(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_owned();
+    }
+
+    let head_budget = max_bytes * 3 / 4;
+    let tail_budget = max_bytes - head_budget;
+
+    let head_end = floor_char_boundary(text, head_budget);
+    let tail_start_min = text.len().saturating_sub(tail_budget);
+    let tail_start = ceil_char_boundary(text, tail_start_min);
+    // Kopf und Ende dürfen sich nicht überlappen; bei sehr kleinen Budgets
+    // (oder sehr großen UTF-8-Zeichen an der Grenze) wird das Ende notfalls
+    // hinter das Kopfende gezogen.
+    let tail_start = tail_start.max(head_end);
+
+    let omitted = text.len().saturating_sub(head_end) - (text.len() - tail_start);
+    let marker = format!("\n[… {omitted} Bytes der Kind-Antwort gekürzt …]\n");
+
+    tracing::debug!(
+        original_bytes = text.len(),
+        max_bytes,
+        omitted_bytes = omitted,
+        "child_final_assistant_text.truncated"
+    );
+
+    let mut capped = String::with_capacity(head_end + marker.len() + (text.len() - tail_start));
+    capped.push_str(&text[..head_end]);
+    capped.push_str(&marker);
+    capped.push_str(&text[tail_start..]);
+    capped
+}
+
+/// Größte Byte-Position `<= idx`, die auf einer UTF-8-Zeichengrenze von `s` liegt.
+fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    let mut i = idx;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Kleinste Byte-Position `>= idx`, die auf einer UTF-8-Zeichengrenze von `s` liegt.
+fn ceil_char_boundary(s: &str, idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    let mut i = idx;
+    while i < s.len() && !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
+}
+
 /// Ein bereits geboxtes Kind-Future im Fan-out-Scheduler.
 ///
 /// `Send` bleibt bewusst gefordert: sonst wäre das Future von
@@ -386,6 +486,12 @@ pub struct ChildRecord {
     /// Kinder starten mit [`ChildStatus::Admitted`]; nur der Controller
     /// schreibt diesen Wert fort. Er fließt **nicht** in den durablen Lease ein.
     pub status: ChildStatus,
+    /// Bei der Admission aus `SpawnInput::context` gelesene
+    /// Aufgabenkomplexität (Addendum D,
+    /// [`TaskComplexity::from_spawn_context`]). `None`, wenn der Aufrufer
+    /// keine Einstufung mitgegeben hat. Wird beim Kind-Start an
+    /// [`ChildRegistryFactory::model_for_task`] weitergereicht.
+    pub task_complexity: Option<TaskComplexity>,
 }
 
 impl ChildRecord {
@@ -680,6 +786,200 @@ struct ParentToken {
     registered: bool,
 }
 
+/// Aufgabenkomplexität eines Kind-Auftrags (Addendum D).
+///
+/// # Beschreibung
+/// Rein additiv: `SpawnInput` selbst trägt kein eigenes Feld dafür (siehe
+/// `harw-extension-api/src/capabilities.rs`). Der Spawner liest den Wert aus
+/// `SpawnInput::context["complexity"]` (`"simple"` oder `"complex"`) und
+/// reicht ihn an [`ChildRegistryFactory::model_for_task`] weiter, damit die
+/// Modellstelle eines Workers von der Arbeit statt allein von der Rolle
+/// abhängen kann.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskComplexity {
+    /// Einfache Aufgabe — leichtes Modell.
+    Simple,
+    /// Komplexe Aufgabe (auch wenn klein) — Mittelklasse-Modell.
+    Complex,
+}
+
+impl TaskComplexity {
+    /// Liest `context["complexity"]` aus einem Spawn-Kontext.
+    ///
+    /// # Arguments
+    /// - `context` (`&serde_json::Value`): der rohe `SpawnInput::context`.
+    ///
+    /// # Returns
+    /// `Some(Self::Simple)` bei `"simple"`, `Some(Self::Complex)` bei
+    /// `"complex"`; `None`, wenn das Feld fehlt, kein String ist oder einen
+    /// anderen Wert trägt.
+    #[must_use]
+    pub fn from_spawn_context(context: &serde_json::Value) -> Option<Self> {
+        match context.get("complexity").and_then(serde_json::Value::as_str) {
+            Some("simple") => Some(Self::Simple),
+            Some("complex") => Some(Self::Complex),
+            _ => None,
+        }
+    }
+}
+
+/// Rollenbasierte Reasoning-Effort-Gewichte (Addendum F+G).
+///
+/// # Beschreibung
+/// Klammert das an ein Kind vererbte Effort-Level zusätzlich zur monotonen
+/// Eltern-Vererbung ([`DEFAULT_CHILD_REASONING_EFFORT`]) nach der
+/// organisatorischen Rolle des Kindes: UIA und ein Root-Orchestrator ohne
+/// eigene Sub-Orchestrator-Freigaben bekommen `High`, ein Root-Orchestrator
+/// MIT Sub-Orchestrator-Freigaben, ein Sub-Orchestrator und ein komplexer
+/// Worker `Medium`, ein einfacher Worker `Low`. [`Self::for_child`] ist die
+/// einzige Konsumstelle; [`ManagedAgentSpawner::admit`] klammert das
+/// Ergebnis zusätzlich gegen das geerbte Eltern-Level (`min`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoleEffortWeights {
+    pub uia: ReasoningEffort,
+    pub root_orchestrator: ReasoningEffort,
+    pub root_orchestrator_with_subs: ReasoningEffort,
+    pub sub_orchestrator: ReasoningEffort,
+    pub worker_complex: ReasoningEffort,
+    pub worker_simple: ReasoningEffort,
+}
+
+impl Default for RoleEffortWeights {
+    fn default() -> Self {
+        Self {
+            uia: ReasoningEffort::High,
+            root_orchestrator: ReasoningEffort::High,
+            root_orchestrator_with_subs: ReasoningEffort::Medium,
+            sub_orchestrator: ReasoningEffort::Medium,
+            worker_complex: ReasoningEffort::Medium,
+            worker_simple: ReasoningEffort::Low,
+        }
+    }
+}
+
+impl RoleEffortWeights {
+    /// Liefert das Rollengewicht für ein admittiertes Kind.
+    ///
+    /// # Arguments
+    /// - `role` (`harw_agent_dsl::roles::AgentRoleId`): organisatorische
+    ///   Rolle des Kindes.
+    /// - `has_child_orchestrator_grants` (`bool`): ob das Kind selbst
+    ///   mindestens eine `ChildOrchestrator`-Freigabe trägt (nur für
+    ///   `RootOrchestrator` relevant).
+    /// - `complexity` (`Option<TaskComplexity>`): bei `Worker` gelesene
+    ///   Aufgabenkomplexität; `None` zählt wie `Complex`.
+    ///
+    /// # Returns
+    /// Das für diese Rolle geltende [`ReasoningEffort`]-Gewicht, **vor** der
+    /// Klammerung gegen das geerbte Eltern-Level.
+    #[must_use]
+    pub fn for_child(
+        &self,
+        role: harw_agent_dsl::roles::AgentRoleId,
+        has_child_orchestrator_grants: bool,
+        complexity: Option<TaskComplexity>,
+    ) -> ReasoningEffort {
+        match role {
+            harw_agent_dsl::roles::AgentRoleId::UserInterface => self.uia,
+            harw_agent_dsl::roles::AgentRoleId::RootOrchestrator => {
+                if has_child_orchestrator_grants {
+                    self.root_orchestrator_with_subs
+                } else {
+                    self.root_orchestrator
+                }
+            }
+            harw_agent_dsl::roles::AgentRoleId::ChildOrchestrator => self.sub_orchestrator,
+            harw_agent_dsl::roles::AgentRoleId::Worker => match complexity {
+                Some(TaskComplexity::Simple) => self.worker_simple,
+                Some(TaskComplexity::Complex) | None => self.worker_complex,
+            },
+            // Addendum J: `uia-worker` ist eine eigene, abgekapselte
+            // Organisationsrolle, gewichtet aber wie ein einfacher Worker.
+            harw_agent_dsl::roles::AgentRoleId::UiaWorker => self.worker_simple,
+            // Addendum K: `agent-steward` ist eine eigene, interne
+            // Organisationsrolle, gewichtet aber wie ein komplexer Worker.
+            harw_agent_dsl::roles::AgentRoleId::AgentSteward => self.worker_complex,
+        }
+    }
+}
+
+/// Gemeinsame Delegations-Prüfung für [`ManagedAgentSpawner::admit`] und
+/// [`crate::delegation_visibility::visible_delegation_targets`] — dieselben
+/// zwei Prädikate an einer Stelle, damit keine Drift zwischen der
+/// tatsächlichen Admission und der dem Modell angezeigten Zielliste
+/// entstehen kann.
+///
+/// # Arguments
+/// - `caller_role` (`harw_agent_dsl::roles::AgentRoleId`): organisatorische
+///   Rolle des delegieren wollenden Agenten.
+/// - `target_role` (`harw_agent_dsl::roles::AgentRoleId`): organisatorische
+///   Rolle des Ziels.
+/// - `target_role_name` (`&str`): exakter registrierter Rollenname des
+///   Ziels — nur für die `ChildOrchestrator`-Freigabeliste relevant.
+/// - `allowed_child_orchestrators` (`&[String]`): exakte Namen, die der
+///   Aufrufer laut seiner eigenen, eingefrorenen Agentendefinition als
+///   Kind-Orchestrator delegieren darf.
+///
+/// # Returns
+/// `true`, wenn die Delegation laut geschlossener Spawn-Matrix
+/// ([`harw_agent_dsl::roles::can_spawn`], Addendum J: `uia-worker` ist eine
+/// eigene Rolle in der Matrix selbst, kein Exklusivitäts-Sonderfall mehr) und
+/// — bei einem `ChildOrchestrator`-Ziel — der exakten Freigabeliste erlaubt
+/// ist.
+pub(crate) fn can_delegate_to(
+    caller_role: harw_agent_dsl::roles::AgentRoleId,
+    target_role: harw_agent_dsl::roles::AgentRoleId,
+    target_role_name: &str,
+    allowed_child_orchestrators: &[String],
+) -> bool {
+    if !harw_agent_dsl::roles::can_spawn(caller_role, target_role) {
+        return false;
+    }
+    if target_role == harw_agent_dsl::roles::AgentRoleId::ChildOrchestrator
+        && !allowed_child_orchestrators
+            .iter()
+            .any(|allowed| allowed == target_role_name)
+    {
+        return false;
+    }
+    true
+}
+
+/// Vertrauenswürdiger Auszug aus dem Eltern-Kontext einer Admission, wie ihn
+/// [`ManagedAgentSpawner::admit`] unmittelbar aus den bereits geprüften
+/// Eltern-Daten (Session-Rolle, Registry-Aktivierung, Sandbox, Tiefe,
+/// Budget, Effort) bildet — nie aus rohem, modellgesteuertem Handoff-JSON.
+///
+/// # Beschreibung
+/// Welle FANIN-K. Eine [`ChildRegistryFactory`], die eine Kind-Registry
+/// enger als nur nach Rolle bauen will (z. B. Werkzeuge auf die tatsächlich
+/// vom Elternteil nutzbaren beschränken), erhält hierüber die dafür nötigen
+/// Fakten, ohne selbst den `SessionManager` oder die Aktivierung des
+/// Elternteils lesen zu müssen.
+///
+/// # Felder
+/// - `role`: die organisatorische Rolle des Elternteils, `None` nur wenn sie
+///   sich nicht auflösen ließ.
+/// - `tools`: Schnittmenge aus den von der Eltern-Registry tatsächlich
+///   bereitgestellten Werkzeugnamen und der Eltern-Aktivierung — leer, wenn
+///   keine Registry erreichbar war (fail-closed).
+/// - `permissions`: die Sandbox-Rechte des Elternteils.
+/// - `max_depth`: verbleibende Tiefe, die der Elternteil selbst noch an
+///   Nachkommen vergeben darf.
+/// - `budget_tokens`: das effektive Token-Gesamtbudget des Elternteils, `0`
+///   wenn keines eingetragen ist.
+/// - `reasoning_effort`: das Effort-Label des Elternteils in Kleinschreibung
+///   (`"low"`, `"medium"`, …), `None` wenn der Elternteil keines gesetzt hat.
+#[derive(Debug, Clone)]
+pub struct ParentGrant {
+    pub role: Option<harw_agent_dsl::roles::AgentRoleId>,
+    pub tools: BTreeSet<String>,
+    pub permissions: harw_sandbox::PermissionSet,
+    pub max_depth: u32,
+    pub budget_tokens: u64,
+    pub reasoning_effort: Option<String>,
+}
+
 /// Supplies a fresh, role-specific extension registry for an admitted child.
 /// It is intentionally fallible: a role must not start with a partial plugin,
 /// skill, or MCP activation.
@@ -718,10 +1018,80 @@ pub trait ChildRegistryFactory: Send + Sync {
         )
     }
 
+    /// Wie [`Self::build_registry_with_capabilities`], zusätzlich mit dem
+    /// vertrauenswürdigen [`ParentGrant`] der admittierenden Elternsitzung
+    /// (Welle FANIN-K).
+    ///
+    /// # Beschreibung
+    /// Der Kompatibilitäts-Default delegiert unverändert an
+    /// [`Self::build_registry_with_capabilities`] — mit demselben
+    /// Capability-Snapshot, den [`Self::capability_snapshot`] für dieselbe
+    /// Rolle/`input`-Kombination liefert, damit eine Factory, die nur
+    /// `capability_snapshot`/`build_registry_with_capabilities` überschreibt
+    /// (nicht diese Methode), bei der Admission genau dasselbe Verhalten
+    /// zeigt wie vor Welle FANIN-K. `suggestions` und `parent` bleiben im
+    /// Default ungenutzt — eine Factory, die eine Kind-Registry anhand des
+    /// Eltern-Kontexts (Werkzeuge, Rechte, verbleibende Tiefe, Budget,
+    /// Effort) enger bauen will, überschreibt stattdessen diese Methode
+    /// direkt.
+    ///
+    /// # Arguments
+    /// - `role` (`&str`): der exakte registrierte Rollenname.
+    /// - `input` (`&SpawnInput`): der rohe Spawn-Auftrag.
+    /// - `suggestions` (`Option<&AgentSuggestions>`): beratende
+    ///   Katalog-Vorschläge für diesen Spawn, falls vorhanden.
+    /// - `parent` (`&ParentGrant`): der geprüfte Eltern-Kontext dieser
+    ///   Admission.
+    ///
+    /// # Returns
+    /// Wie [`Self::build_registry_with_capabilities`].
+    ///
+    /// # Errors
+    /// Wie [`Self::build_registry_with_capabilities`], zusätzlich alles, was
+    /// [`Self::capability_snapshot`] selbst zurückgeben kann.
+    fn build_registry_with_capabilities_for_parent(
+        &self,
+        role: &str,
+        input: &SpawnInput,
+        suggestions: Option<&AgentSuggestions>,
+        parent: &ParentGrant,
+    ) -> Result<ExtensionRegistry, AgentSpawnError> {
+        let _ = suggestions;
+        let _ = parent;
+        let snapshot = self.capability_snapshot(role, input)?;
+        self.build_registry_with_capabilities(role, input, snapshot.as_ref())
+    }
+
     /// Returns the model provider selected for an admitted child role. The
     /// factory owns provider routing; the controller only owns lifecycle and
     /// concurrency boundaries.
     fn model_for(&self, role: &str) -> Result<Arc<dyn ModelProvider>, AgentSpawnError>;
+
+    /// Wie [`Self::model_for`], zusätzlich mit der Aufgabenkomplexität
+    /// (Addendum D) — erlaubt Factories, Worker-Modellstellen nach Arbeit
+    /// statt allein nach Rolle zu routen. Der Default ignoriert `complexity`
+    /// und delegiert an [`Self::model_for`], damit bestehende Factories ohne
+    /// Anpassung gültig bleiben.
+    ///
+    /// # Arguments
+    /// - `role` (`&str`): exakter registrierter Rollenname.
+    /// - `complexity` (`Option<TaskComplexity>`): aus
+    ///   [`TaskComplexity::from_spawn_context`] gelesene Einstufung des
+    ///   Auftrags, `None` wenn nicht angegeben.
+    ///
+    /// # Returns
+    /// Der Modell-Provider für diesen Kind-Start.
+    ///
+    /// # Errors
+    /// Wie [`Self::model_for`].
+    fn model_for_task(
+        &self,
+        role: &str,
+        complexity: Option<TaskComplexity>,
+    ) -> Result<Arc<dyn ModelProvider>, AgentSpawnError> {
+        let _ = complexity;
+        self.model_for(role)
+    }
 
     /// Die aufgelöste Agent-IR dieser Rolle, falls vorhanden. Der Controller
     /// wendet daraus Tool-Aktivierung, Budget und Pause-Sperre an.
@@ -787,7 +1157,11 @@ pub struct ManagedAgentSpawner {
     /// the session manager. It is a construction-time bridge for TUI/CLI
     /// roots, not model-controlled spawn input.
     external_root_parent: Option<ExternalRootParent>,
-    active: Mutex<BTreeMap<String, ChildRecord>>,
+    /// Geteilt über [`Self::progress_observer`] mit einem lock-freien
+    /// [`crate::guard::ProgressObserver`], der nur diese Registry braucht,
+    /// um eine Kind-Lease zu verlängern — ohne einen `Arc<Self>` zu
+    /// benötigen (Addendum F+G).
+    active: Arc<Mutex<BTreeMap<String, ChildRecord>>>,
     /// Lease-expired children which may still be unwinding a model/tool future.
     /// Tombstones make late completion fail closed instead of restoring an
     /// apparently healthy, untracked child session after its parent has been
@@ -808,6 +1182,126 @@ pub struct ManagedAgentSpawner {
     /// `reap_expired_durable`/`reconcile_expired_leases` rather than the
     /// compatibility in-memory reaper.
     lease_store: Option<Arc<ChildLeaseStore>>,
+    /// Rollengewichte für die Kind-Effort-Klammerung (Addendum F+G,
+    /// [`Self::with_role_effort_weights`]). `Default`, solange nichts
+    /// explizit gesetzt wurde.
+    role_effort_weights: RoleEffortWeights,
+    /// Beobachter für Wächter-Ereignisse, die dieser Controller selbst
+    /// erkennt (`DuplicateDelegation`, `ChildOverBudget`,
+    /// `ChildLeaseExpired`). `None`: keine Beobachtung.
+    drift_observer: Option<Arc<dyn crate::guard::DriftObserver>>,
+    /// Turn-Wächter-Schwellenwerte, die jede admittierte Kind-Session erhält
+    /// (Welle FANIN-K) — dieselben wie die Wurzel-Session dieses Controllers.
+    /// `GuardPolicy::default()`, solange nichts explizit gesetzt wurde.
+    guard_policy: crate::guard::GuardPolicy,
+    /// Pitfall-Berater, den jede admittierte Kind-Session erhält (Welle
+    /// FANIN-K), analog zu [`Self::drift_observer`]. `None`: keine Beratung.
+    pitfall_advisor: Option<Arc<dyn crate::guard::PitfallAdvisor>>,
+    /// Pro Elternteil die letzten 16 normalisierten Auftragstext-Hashes
+    /// (Rolle + Anweisung, whitespace-normalisiert, kleingeschrieben) —
+    /// erkennt eine doppelt vergebene Delegation (Addendum F+G).
+    recent_delegation_hashes: Mutex<BTreeMap<String, VecDeque<u64>>>,
+}
+
+/// Anzahl der pro Elternteil vorgehaltenen Delegations-Brief-Hashes
+/// (Addendum F+G).
+const RECENT_DELEGATION_HASH_CAPACITY: usize = 16;
+
+/// Token-Obergrenze (Summe aus Input- und Output-Tokens), ab der ein
+/// abgeschlossenes Kind mit [`TaskComplexity::Simple`] als über dem Budget
+/// gilt (Addendum F+G).
+const CHILD_OVER_BUDGET_SIMPLE_TOKENS: u64 = 60_000;
+
+/// Token-Obergrenze für ein abgeschlossenes Kind mit
+/// [`TaskComplexity::Complex`] oder ohne eingestufte Komplexität
+/// (Addendum F+G).
+const CHILD_OVER_BUDGET_COMPLEX_TOKENS: u64 = 250_000;
+
+/// Verlängert eine noch nicht abgelaufene Kind-Lease auf `now +
+/// lease_seconds`, sofern das mehr ist als der aktuell eingetragene Wert.
+///
+/// # Beschreibung
+/// Gemeinsame Kernlogik von [`ManagedAgentSpawner::renew_lease`] und dem
+/// leichten [`ProgressObserver`](crate::guard::ProgressObserver), den
+/// [`ManagedAgentSpawner::progress_observer`] liefert — beide dürfen eine
+/// bereits abgelaufene Lease nicht wiederbeleben.
+///
+/// # Arguments
+/// - `active` (`&Mutex<BTreeMap<String, ChildRecord>>`): die Aktiv-Registry.
+/// - `lease_seconds` (`i64`): die konfigurierte Lease-Dauer.
+/// - `child` (`&SessionId`): das zu verlängernde Kind.
+/// - `now` (`Timestamp`): Referenzzeitpunkt.
+fn renew_active_lease(
+    active: &Mutex<BTreeMap<String, ChildRecord>>,
+    lease_seconds: i64,
+    child: &SessionId,
+    now: Timestamp,
+) {
+    let Ok(mut active) = active.lock() else {
+        tracing::warn!(child = %child, "child_lease_renew.lock_poisoned");
+        return;
+    };
+    let Some(record) = active.get_mut(child.as_str()) else {
+        return;
+    };
+    if now >= record.lease_expires_at {
+        // Bereits abgelaufen: kein Wiederbeleben durch einen späten
+        // Fortschritts-Event.
+        return;
+    }
+    let Ok(candidate) = now.checked_add(SignedDuration::from_secs(lease_seconds)) else {
+        tracing::warn!(child = %child, "child_lease_renew.overflow");
+        return;
+    };
+    if candidate > record.lease_expires_at {
+        record.lease_expires_at = candidate;
+    }
+}
+
+/// Leichter [`crate::guard::ProgressObserver`], der nur die Aktiv-Registry
+/// und die Lease-Dauer hält — kein `Arc<Self>` auf den vollen Controller
+/// (Addendum F+G, [`ManagedAgentSpawner::progress_observer`]).
+struct ActiveLeaseProgressObserver {
+    active: Arc<Mutex<BTreeMap<String, ChildRecord>>>,
+    lease_seconds: i64,
+}
+
+impl crate::guard::ProgressObserver for ActiveLeaseProgressObserver {
+    fn on_progress(&self, session_id: &SessionId) {
+        renew_active_lease(&self.active, self.lease_seconds, session_id, Timestamp::now());
+    }
+}
+
+/// Normalisiert einen Delegations-Auftragstext für den Duplikat-Vergleich:
+/// Rolle + Anweisung, Whitespace zu einzelnen Leerzeichen zusammengefasst,
+/// kleingeschrieben (Addendum F+G).
+fn normalize_delegation_brief(role_name: &str, instructions: Option<&str>) -> String {
+    let mut normalized = String::new();
+    for ch in role_name.chars() {
+        normalized.extend(ch.to_lowercase());
+    }
+    normalized.push('\u{0}');
+    let mut last_was_space = false;
+    for ch in instructions.unwrap_or_default().chars() {
+        if ch.is_whitespace() {
+            if !last_was_space {
+                normalized.push(' ');
+                last_was_space = true;
+            }
+        } else {
+            normalized.extend(ch.to_lowercase());
+            last_was_space = false;
+        }
+    }
+    normalized
+}
+
+/// Hasht einen bereits normalisierten Delegations-Auftragstext.
+fn hash_delegation_brief(normalized: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    normalized.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl ManagedAgentSpawner {
@@ -818,13 +1312,59 @@ impl ManagedAgentSpawner {
             limits,
             roles: BTreeMap::new(),
             external_root_parent: None,
-            active: Mutex::new(BTreeMap::new()),
+            active: Arc::new(Mutex::new(BTreeMap::new())),
             expired: Mutex::new(BTreeMap::new()),
             cancellations: Mutex::new(BTreeMap::new()),
             parent_tokens: Mutex::new(BTreeMap::new()),
             released: Mutex::new(BTreeSet::new()),
             lease_store: None,
+            role_effort_weights: RoleEffortWeights::default(),
+            drift_observer: None,
+            guard_policy: crate::guard::GuardPolicy::default(),
+            pitfall_advisor: None,
+            recent_delegation_hashes: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Setzt die Rollengewichte für die Kind-Effort-Klammerung.
+    /// `None` klammert auf [`RoleEffortWeights::default`].
+    #[must_use]
+    pub fn with_role_effort_weights(mut self, weights: Option<RoleEffortWeights>) -> Self {
+        self.role_effort_weights = weights.unwrap_or_default();
+        self
+    }
+
+    /// Setzt den Beobachter für vom Controller selbst erkannte
+    /// Wächter-Ereignisse (`DuplicateDelegation`, `ChildOverBudget`,
+    /// `ChildLeaseExpired`). `None`: keine Beobachtung.
+    #[must_use]
+    pub fn with_drift_observer(
+        mut self,
+        observer: Option<Arc<dyn crate::guard::DriftObserver>>,
+    ) -> Self {
+        self.drift_observer = observer;
+        self
+    }
+
+    /// Setzt die Turn-Wächter-Schwellenwerte, die jede über diesen
+    /// Controller admittierte Kind-Session erhält (Welle FANIN-K) — dieselbe
+    /// Politik wie die Wurzel-Session.
+    #[must_use]
+    pub fn with_guard_policy(mut self, policy: crate::guard::GuardPolicy) -> Self {
+        self.guard_policy = policy;
+        self
+    }
+
+    /// Setzt den Pitfall-Berater, den jede über diesen Controller
+    /// admittierte Kind-Session erhält (Welle FANIN-K), analog zu
+    /// [`Self::with_drift_observer`]. `None`: keine Beratung.
+    #[must_use]
+    pub fn with_pitfall_advisor(
+        mut self,
+        advisor: Option<Arc<dyn crate::guard::PitfallAdvisor>>,
+    ) -> Self {
+        self.pitfall_advisor = advisor;
+        self
     }
 
     /// Registers one exact role name. Replacing an existing definition is
@@ -916,6 +1456,67 @@ impl ManagedAgentSpawner {
     pub fn with_lease_store(mut self, lease_store: Arc<ChildLeaseStore>) -> Self {
         self.lease_store = Some(lease_store);
         self
+    }
+
+    /// Verlängert die Lease eines noch aktiven, nicht abgelaufenen Kindes auf
+    /// `max(aktueller Wert, now + lease_seconds)` (Addendum F+G).
+    ///
+    /// # Beschreibung
+    /// Wirkt nur auf die In-Memory-Registry — `harw-session-store` bietet
+    /// (Stand dieses Vertrags) keine Verlängerung eines bereits admittierten
+    /// durablen Leases, nur `admit`/`claim_expired`/`complete`. Eine bereits
+    /// abgelaufene Lease wird nicht wiederbelebt: sie ist bereits Kandidat
+    /// für [`Self::reap_expired_durable`].
+    ///
+    /// # Arguments
+    /// - `child` (`&SessionId`): das zu verlängernde Kind.
+    /// - `now` (`Timestamp`): Referenzzeitpunkt.
+    ///
+    /// # Returns
+    /// `Ok(())` immer — unbekannte Kinder und eine vergiftete Sperre werden
+    /// ignoriert (`tracing::warn!`, idempotent), nicht als Fehler propagiert;
+    /// die `Result`-Hülle folgt der Vertragssignatur und bleibt damit
+    /// erweiterbar, falls eine künftige durable Verlängerung fehlschlagen
+    /// kann.
+    ///
+    /// # Errors
+    /// Liefert derzeit nie `Err` — siehe `# Returns`.
+    pub fn renew_lease(&self, child: &SessionId, now: Timestamp) -> Result<(), AgentSpawnError> {
+        renew_active_lease(&self.active, self.limits.lease_seconds, child, now);
+        // Welle FANIN-K: die In-Memory-Verlängerung oben bleibt maßgeblich für
+        // den laufenden Prozess; ist zusätzlich ein durabler Lease-Store
+        // konfiguriert, wird derselbe Fortschritt auch dorthin gespiegelt,
+        // damit ein Neustart die verlängerte Fälligkeit sieht. Ein Fehler
+        // dabei bricht die Verlängerung nicht ab — die In-Memory-Sicht bleibt
+        // korrekt, nur die Durability hinkt bis zur nächsten Verlängerung
+        // hinterher.
+        if let Some(lease_store) = &self.lease_store {
+            if let Err(error) = lease_store.renew(child, self.limits.lease_seconds, now) {
+                tracing::warn!(
+                    child = %child,
+                    error = %error,
+                    "child_lease_renew.durable_renew_failed"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Liefert einen [`crate::guard::ProgressObserver`], der Fortschritt in
+    /// einer laufenden Kind-Session in eine Lease-Verlängerung übersetzt.
+    ///
+    /// # Beschreibung
+    /// Hält nur einen `Arc`-Klon der geteilten Aktiv-Registry (kein
+    /// `Arc<Self>` nötig) und die konfigurierte Lease-Dauer. Registriert
+    /// über [`crate::session::AgentSession::with_progress_observer`] an
+    /// jeder Kind-Session, ruft die dieselbe Renew-Logik wie
+    /// [`Self::renew_lease`] mit dem aktuellen Zeitpunkt auf.
+    #[must_use]
+    pub fn progress_observer(&self) -> Arc<dyn crate::guard::ProgressObserver> {
+        Arc::new(ActiveLeaseProgressObserver {
+            active: Arc::clone(&self.active),
+            lease_seconds: self.limits.lease_seconds,
+        })
     }
 
     /// Releases an admitted child in memory (compatibility entry point for
@@ -1277,6 +1878,32 @@ impl ManagedAgentSpawner {
         }
     }
 
+    /// Meldet [`crate::guard::DriftKind::ChildOverBudget`], wenn ein
+    /// abgeschlossenes Kind mehr Tokens verbraucht hat als sein
+    /// Komplexitätsdeckel erlaubt (Addendum F+G). Meldet nicht blockierend —
+    /// wird genau einmal aufgerufen, beim Verlassen des Managers.
+    fn check_child_over_budget(&self, record: &ChildRecord, total_tokens: u64) {
+        let threshold = match record.task_complexity {
+            Some(TaskComplexity::Simple) => CHILD_OVER_BUDGET_SIMPLE_TOKENS,
+            Some(TaskComplexity::Complex) | None => CHILD_OVER_BUDGET_COMPLEX_TOKENS,
+        };
+        if total_tokens <= threshold {
+            return;
+        }
+        if let Some(observer) = &self.drift_observer {
+            observer.on_drift(&crate::guard::DriftEvent {
+                kind: crate::guard::DriftKind::ChildOverBudget,
+                session_id: record.parent.as_str().to_owned(),
+                detail: format!(
+                    "child {} (role '{}') used {total_tokens} tokens, exceeding the {threshold} token budget",
+                    record.child, record.role
+                ),
+                tool_name: None,
+                child_role: Some(record.role.clone()),
+            });
+        }
+    }
+
     /// In-Memory-Teil von [`Self::release_child`].
     fn release_in_memory(&self, child: &SessionId) -> Result<Option<ChildRecord>, AgentSpawnError> {
         let record = self
@@ -1308,7 +1935,15 @@ impl ManagedAgentSpawner {
                 .manager
                 .lock()
                 .map_err(|_| Self::reject("session manager lock is poisoned"))?;
-            let removed = manager.remove(child).is_some();
+            let removed_session = manager.remove(child);
+            // Addendum F+G: beim Abschluss (nicht bei jeder Freigabe — aber
+            // hier ist der einzige Ort, an dem die Session noch verfügbar
+            // ist, bevor sie den Manager verlässt) gegen den Rollen-/
+            // Komplexitätsdeckel prüfen.
+            if let (Some(session), Some(record)) = (removed_session.as_ref(), record.as_ref()) {
+                self.check_child_over_budget(record, session.total_usage().total());
+            }
+            let removed = removed_session.is_some();
             if !removed && may_be_running {
                 self.released
                     .lock()
@@ -1432,7 +2067,11 @@ impl ManagedAgentSpawner {
     ///
     /// A completed child is restored to this spawner's session manager before
     /// [`Self::run_child`] returns, so callers can retrieve its terminal text
-    /// without receiving session or history access.
+    /// without receiving session or history access. The returned text is
+    /// capped to [`CHILD_RETURN_MAX_BYTES`] via [`cap_child_return_text`] —
+    /// the full, uncapped text stays available to anything that persists it
+    /// independently (e.g. the child's own transcript/state store); this
+    /// method only shrinks what is handed back to the parent.
     ///
     /// # Errors
     /// Returns [`AgentSpawnError`] when the child is not admitted, its restored
@@ -1449,7 +2088,7 @@ impl ManagedAgentSpawner {
                 "admitted child session {child} is not available: {error}"
             ))
         })?;
-        session
+        let text: String = session
             .history()
             .items()
             .iter()
@@ -1468,7 +2107,9 @@ impl ManagedAgentSpawner {
                 _ => None,
             })
             .filter(|text: &String| !text.is_empty())
-            .ok_or_else(|| Self::reject(format!("child {child} has no assistant response text")))
+            .ok_or_else(|| Self::reject(format!("child {child} has no assistant response text")))?;
+
+        Ok(cap_child_return_text(&text, CHILD_RETURN_MAX_BYTES))
     }
 
     #[must_use]
@@ -1659,6 +2300,21 @@ impl ManagedAgentSpawner {
                 if let Ok(session) = manager.get_mut(&record.child) {
                     session.fail("child lease expired before reporting a result".to_owned());
                 }
+            }
+        }
+        // Addendum F+G: je abgelaufenem Kind ein ChildLeaseExpired-Ereignis.
+        if let Some(observer) = &self.drift_observer {
+            for record in expired {
+                observer.on_drift(&crate::guard::DriftEvent {
+                    kind: crate::guard::DriftKind::ChildLeaseExpired,
+                    session_id: record.parent.as_str().to_owned(),
+                    detail: format!(
+                        "child {} (role '{}') lease expired at {}",
+                        record.child, record.role, record.expired_at
+                    ),
+                    tool_name: None,
+                    child_role: Some(record.role.clone()),
+                });
             }
         }
     }
@@ -2100,7 +2756,7 @@ impl ManagedAgentSpawner {
             .ok_or_else(|| Self::reject(format!("child role '{}' disappeared", record.role)))?
             .registry_factory
             .clone();
-        let model = factory.model_for(&record.role)?;
+        let model = factory.model_for_task(&record.role, record.task_complexity)?;
         let token = self
             .child_cancel_token(child)
             .ok_or_else(|| Self::reject(format!("child {child} has no cancellation token")))?;
@@ -2500,6 +3156,79 @@ impl ManagedAgentSpawner {
         Ok(cut)
     }
 
+    /// Kern von [`AgentSpawner::delegation_target_names`] für
+    /// [`ManagedAgentSpawner`] (Addendum F+G, Nachtrag F).
+    ///
+    /// # Beschreibung
+    /// Holt den Eltern-`SpawnContext` genau wie [`Self::admit`] (Manager
+    /// bzw. `external_root_parent`), baut die Kandidatenliste aus allen
+    /// registrierten Rollen (Name + `organizational_role`) und berechnet die
+    /// verbleibende Tiefe als `depth_ceiling(parent) − depth(parent)` —
+    /// dieselbe Größe, gegen die [`Self::admit`] die Tiefe eines
+    /// tatsächlichen Kindes prüft. Delegiert die eigentliche Projektion an
+    /// [`crate::delegation_visibility::visible_delegation_targets`].
+    ///
+    /// # Errors
+    /// [`AgentSpawnError`] bei unbekanntem Elternteil oder vergifteter
+    /// Sperre; der öffentliche Trait-Pfad übersetzt das in eine leere Liste.
+    fn visible_delegation_target_names(
+        &self,
+        parent_session_id: &SessionId,
+    ) -> Result<Vec<String>, AgentSpawnError> {
+        let manager = self
+            .manager
+            .lock()
+            .map_err(|_| Self::reject("session manager lock is poisoned"))?;
+        let (caller_role, allowed_child_orchestrators, parent_depth) =
+            match manager.get(parent_session_id) {
+                Ok(parent) => {
+                    let context = parent.spawn_context().ok_or_else(|| {
+                        Self::reject("delegation caller has no trusted sandbox context")
+                    })?;
+                    let depth = Self::parent_depth(&manager, parent_session_id)?;
+                    (
+                        context.organizational_role,
+                        context.allowed_child_orchestrators.clone(),
+                        depth,
+                    )
+                }
+                Err(_) => {
+                    let external_root = self
+                        .external_root_parent
+                        .as_ref()
+                        .filter(|root| &root.session_id == parent_session_id)
+                        .ok_or_else(|| {
+                            Self::reject(format!("unknown delegation caller: {parent_session_id}"))
+                        })?;
+                    (
+                        external_root.spawn_context.organizational_role,
+                        external_root.spawn_context.allowed_child_orchestrators.clone(),
+                        0,
+                    )
+                }
+            };
+        drop(manager);
+        let inherited_depth_ceiling = self
+            .active
+            .lock()
+            .map_err(|_| Self::reject("child registry lock is poisoned"))?
+            .get(parent_session_id.as_str())
+            .map_or(self.limits.max_depth, |record| record.depth_ceiling);
+        let remaining_depth = inherited_depth_ceiling.saturating_sub(parent_depth);
+        let candidates: Vec<(String, harw_agent_dsl::roles::AgentRoleId)> = self
+            .roles
+            .iter()
+            .map(|(name, definition)| (name.clone(), definition.organizational_role))
+            .collect();
+        let targets = crate::delegation_visibility::visible_delegation_targets(
+            caller_role,
+            &candidates,
+            &allowed_child_orchestrators,
+            remaining_depth,
+        );
+        Ok(targets.into_iter().map(|target| target.name).collect())
+    }
+
     fn admit(
         &self,
         role_name: &str,
@@ -2511,6 +3240,10 @@ impl ManagedAgentSpawner {
             .roles
             .get(role_name)
             .ok_or_else(|| Self::reject(format!("child role '{role_name}' is not registered")))?;
+
+        // Addendum D: aus dem rohen Spawn-Kontext gelesen, bevor `input`
+        // weiter unten feldweise in den `ChildRecord` verschoben wird.
+        let task_complexity = TaskComplexity::from_spawn_context(&input.context);
 
         // W2-19: die Agent-IR dieser Rolle wird vor jeder Prüfung aufgelöst,
         // weil sie die Tiefengrenze verschärfen darf. Ein fehlerhaftes Budget
@@ -2568,29 +3301,59 @@ impl ManagedAgentSpawner {
                     )
                 }
             };
-        if !harw_agent_dsl::roles::can_spawn(
+        // Beide Prüfungen (geschlossene Rollenmatrix inkl. `uia-worker`,
+        // Addendum J + exakte `ChildOrchestrator`-Freigabeliste) laufen über
+        // `can_delegate_to`, dieselbe Hilfsfunktion, die auch
+        // `delegation_visibility::visible_delegation_targets` verwendet —
+        // damit kann die dem Modell gezeigte Zielliste nie von der
+        // tatsächlichen Admission abweichen.
+        if !can_delegate_to(
             parent_context.organizational_role,
             definition.organizational_role,
+            role_name,
+            &parent_context.allowed_child_orchestrators,
         ) {
-            return Err(Self::reject(format!(
-                "organizational role {:?} is not permitted to spawn role {:?} (role '{role_name}')",
-                parent_context.organizational_role, definition.organizational_role
-            )));
+            // Admission errors cross the model-facing spawn boundary. Do not
+            // turn either check into an agent-catalog oracle by naming the
+            // caller, target category, registered definition, or which of
+            // the two predicates failed — a sibling/hidden sub-orchestrator
+            // must stay unobservable either way.
+            return Err(Self::reject(
+                "no delegation capability is available for this request",
+            ));
         }
-        // The sealed role matrix is only a coarse upper bound. Delegating a
-        // child orchestrator additionally needs an exact, frozen grant from
-        // the parent's own agent definition. Worker delegation remains
-        // available to eligible orchestrators without this list.
-        if definition.organizational_role
-            == harw_agent_dsl::roles::AgentRoleId::ChildOrchestrator
-            && !parent_context
-                .allowed_child_orchestrators
-                .iter()
-                .any(|allowed| allowed == role_name)
+
+        // Addendum F+G: doppelte Delegation erkennen — nicht blockieren, nur
+        // melden. Läuft vor den Kapazitätsprüfungen, weil die Erkennung
+        // selbst keine Ressource verbraucht und auch für eine später
+        // abgelehnte Admission aussagekräftig bleibt.
         {
-            return Err(Self::reject(format!(
-                "parent definition does not explicitly permit spawning child orchestrator '{role_name}'"
-            )));
+            let normalized = normalize_delegation_brief(role_name, input.instructions.as_deref());
+            let hash = hash_delegation_brief(&normalized);
+            let mut recent = self
+                .recent_delegation_hashes
+                .lock()
+                .map_err(|_| Self::reject("delegation-brief history lock is poisoned"))?;
+            let entry = recent
+                .entry(input.parent_session_id.as_str().to_owned())
+                .or_default();
+            if entry.contains(&hash) {
+                if let Some(observer) = &self.drift_observer {
+                    observer.on_drift(&crate::guard::DriftEvent {
+                        kind: crate::guard::DriftKind::DuplicateDelegation,
+                        session_id: input.parent_session_id.as_str().to_owned(),
+                        detail: format!(
+                            "parent already delegated an equivalent brief to role '{role_name}' recently"
+                        ),
+                        tool_name: None,
+                        child_role: Some(role_name.to_owned()),
+                    });
+                }
+            }
+            entry.push_back(hash);
+            if entry.len() > RECENT_DELEGATION_HASH_CAPACITY {
+                entry.pop_front();
+            }
         }
 
         let mut active = self
@@ -2682,9 +3445,42 @@ impl ManagedAgentSpawner {
             .as_ref()
             .map(|snapshot| snapshot.suggestions.clone())
             .or(suggestions);
+        // Welle FANIN-K: der ParentGrant wird ausschließlich aus bereits
+        // geprüften, vertrauenswürdigen Eltern-Daten gebildet — derselbe
+        // `parent_context`/`parent_activation`, der oben schon den
+        // Rollenmatrix-Schnitt und den Aktivierungsschnitt trägt. Ohne
+        // erreichbare Eltern-Registry (externe Wurzel ohne Manager-Eintrag)
+        // bleibt `tools` fail-closed leer.
+        let parent_tools: BTreeSet<String> = match manager.get(&input.parent_session_id) {
+            Ok(parent_session) => parent_session
+                .registry()
+                .tool_providers()
+                .iter()
+                .flat_map(|provider| provider.tools())
+                .filter(|spec| parent_activation.is_tool_enabled(&harw_tools::ToolName::new(spec.name())))
+                .map(|spec| spec.name().to_string())
+                .collect(),
+            Err(_) => BTreeSet::new(),
+        };
+        let parent_grant = ParentGrant {
+            role: Some(parent_context.organizational_role),
+            tools: parent_tools,
+            permissions: parent_context.sandbox.permissions().clone(),
+            max_depth: inherited_depth_ceiling.saturating_sub(parent_depth),
+            budget_tokens: active
+                .get(input.parent_session_id.as_str())
+                .and_then(|record| record.budget.max_tokens)
+                .unwrap_or(0),
+            reasoning_effort: parent_reasoning_effort.map(|effort| effort.to_string()),
+        };
         let registry = definition
             .registry_factory
-            .build_registry_with_capabilities(role_name, &input, capability_snapshot.as_ref())?;
+            .build_registry_with_capabilities_for_parent(
+                role_name,
+                &input,
+                child_suggestions.as_ref(),
+                &parent_grant,
+            )?;
         if self.limits.lease_seconds <= 0 {
             return Err(Self::reject("child lease duration must be positive"));
         }
@@ -2692,6 +3488,13 @@ impl ManagedAgentSpawner {
         let lease_expires_at = admitted_at
             .checked_add(SignedDuration::from_secs(self.limits.lease_seconds))
             .map_err(|error| Self::reject(format!("child lease overflow: {error}")))?;
+        // This grant belongs to the child definition, not its parent. An
+        // absent IR/list is default-deny for its future child-orchestrator
+        // delegation. Captured up front (Addendum F+G) so the effort-weight
+        // lookup below can reuse it without a second IR read.
+        let child_allowed_child_orchestrators: Vec<String> = executable_ir
+            .map(|ir| ir.spawn_contract().child_orchestrators().to_vec())
+            .unwrap_or_default();
         let child = manager.create_governed_session(
             definition.role.clone(),
             Some(input.parent_session_id.clone()),
@@ -2702,12 +3505,7 @@ impl ManagedAgentSpawner {
                 capability_snapshot,
                 approval_actor,
                 organizational_role: definition.organizational_role,
-                // This grant belongs to the child definition, not its parent.
-                // An absent IR/list is default-deny for its future
-                // child-orchestrator delegation.
-                allowed_child_orchestrators: executable_ir
-                    .map(|ir| ir.spawn_contract().child_orchestrators().to_vec())
-                    .unwrap_or_default(),
+                allowed_child_orchestrators: child_allowed_child_orchestrators.clone(),
                 trace: child_trace.clone(),
                 // AW2-02: dieselbe Decke, die soeben neben der Sandbox
                 // geschnitten wurde — kein zweiter, separater Zustand.
@@ -2769,10 +3567,77 @@ impl ManagedAgentSpawner {
             // keinen Moduswechsel überleben müssen — sie muss ihn überleben.
             child_session.narrow_base_activation(&parent_activation);
         }
-        // Monotone Vererbung: das Kind startet mit dem Effort-Level des Parents.
-        if parent_reasoning_effort.is_some() {
+        // Addendum D: Auto-Compact-Policy des Kindes nach organisatorischer
+        // Rolle. Root-/Sub-Orchestrator-Sessions bekommen zusätzlich zur
+        // relativen Schwelle einen festen Deckel und ein Turn-Start-
+        // Verdichtungsziel (sie leben lang und tragen die UIA→Root-Schicht
+        // über Auftragsgrenzen hinweg); reine Worker-Kinder nur den festen
+        // Deckel, kein Turn-Start-Ziel (sie sind kurzlebig und erledigen
+        // genau einen Auftrag).
+        {
+            let child_session = manager.get_mut(&child).map_err(|error| {
+                Self::reject(format!(
+                    "child session {child} disappeared before the auto-compact policy was set: {error}"
+                ))
+            })?;
+            // 200_000: Default-Kontextfenster laut Addendum D, unabhängig vom
+            // tatsächlich aktiven Modell — der feste Deckel (s. u.) greift bei
+            // jedem realen Fenster ohnehin zuerst.
+            let base_policy = crate::auto_compact::AutoCompactPolicy::for_context_window(200_000)
+                .with_absolute_ceiling(Some(crate::auto_compact::DEFAULT_ABSOLUTE_CEILING_TOKENS));
+            let policy = match definition.organizational_role {
+                harw_agent_dsl::roles::AgentRoleId::RootOrchestrator
+                | harw_agent_dsl::roles::AgentRoleId::ChildOrchestrator => base_policy
+                    .with_turn_start_target(Some(
+                        crate::auto_compact::DEFAULT_ORCHESTRATOR_TURN_START_TARGET_TOKENS,
+                    )),
+                harw_agent_dsl::roles::AgentRoleId::UserInterface
+                | harw_agent_dsl::roles::AgentRoleId::Worker
+                | harw_agent_dsl::roles::AgentRoleId::UiaWorker
+                | harw_agent_dsl::roles::AgentRoleId::AgentSteward => base_policy,
+            };
+            child_session.set_auto_compact(Some(policy));
+        }
+        // Addendum F+G: Fortschritts-Feedback für den Lease-Wächter. Dasselbe
+        // Wieder-Einsetzen-Muster wie bei der IR-Aktivierung oben, weil
+        // `with_progress_observer` eine verbrauchende Methode ist.
+        //
+        // Welle FANIN-K: dieselbe Gelegenheit setzt auch die Turn-Wächter der
+        // Kind-Session — Guard-Policy, Drift-Observer, Pitfall-Advisor —,
+        // dieselben, die die Wurzel-Session dieses Controllers trägt. Ein
+        // Kind soll denselben Schutz vor Drift, Endlosschleifen und bekannten
+        // Pitfalls haben wie die Wurzel, nicht weniger.
+        {
+            let child_session = manager.remove(&child).ok_or_else(|| {
+                Self::reject(format!(
+                    "child session {child} disappeared before the progress observer was attached"
+                ))
+            })?;
+            let child_session = child_session
+                .with_progress_observer(Some(self.progress_observer()))
+                .with_guard_policy(Some(self.guard_policy))
+                .with_drift_observer(self.drift_observer.clone())
+                .with_pitfall_advisor(self.pitfall_advisor.clone());
+            manager.restore(child_session).map_err(|error| {
+                Self::reject(format!(
+                    "could not restore child {child} after attaching the progress observer: {error}"
+                ))
+            })?;
+        }
+        // Monotone Vererbung + Rollengewicht (Addendum F+G): das Kind startet
+        // mit dem Effort-Level des Parents, geklammert auf das Rollengewicht
+        // seiner eigenen organisatorischen Rolle — nie höher als eines von
+        // beiden.
+        {
+            let role_weight = self.role_effort_weights.for_child(
+                definition.organizational_role,
+                !child_allowed_child_orchestrators.is_empty(),
+                task_complexity,
+            );
+            let inherited = parent_reasoning_effort.unwrap_or(DEFAULT_CHILD_REASONING_EFFORT);
+            let effective = inherited.min(role_weight);
             if let Ok(child_session) = manager.get_mut(&child) {
-                child_session.set_reasoning_effort(parent_reasoning_effort);
+                child_session.set_reasoning_effort(Some(effective));
             }
         }
         let record = ChildRecord {
@@ -2788,6 +3653,7 @@ impl ManagedAgentSpawner {
             depth_ceiling: child_depth_ceiling,
             trace: child_trace,
             status: ChildStatus::Admitted,
+            task_complexity,
         };
         if let Some(lease_store) = &self.lease_store {
             if let Err(error) = lease_store.admit(&record.durable_lease()) {
@@ -2850,6 +3716,11 @@ impl AgentSpawner for ManagedAgentSpawner {
     ) -> Result<(), AgentSpawnError> {
         self.close_child_durable(child, completed_at)
     }
+
+    fn delegation_target_names(&self, parent_session_id: &SessionId) -> Vec<String> {
+        self.visible_delegation_target_names(parent_session_id)
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
@@ -2873,6 +3744,72 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
+
+    // ── cap_child_return_text (Vertrag CHILD_RETURN_MAX_BYTES) ─────────────
+
+    #[test]
+    fn test_cap_child_return_text_short_text_unchanged() {
+        let text = "kurze Antwort";
+        assert_eq!(cap_child_return_text(text, CHILD_RETURN_MAX_BYTES), text);
+    }
+
+    #[test]
+    fn test_cap_child_return_text_exact_budget_unchanged() {
+        let text = "x".repeat(64);
+        assert_eq!(cap_child_return_text(&text, 64), text);
+    }
+
+    #[test]
+    fn test_cap_child_return_text_long_ascii_truncated_with_marker() {
+        let max_bytes = 100usize;
+        let text = "a".repeat(1000);
+        let capped = cap_child_return_text(&text, max_bytes);
+
+        assert!(
+            capped.len() < text.len(),
+            "der gekürzte Text muss kürzer als das Original sein"
+        );
+        assert!(
+            capped.contains("gekürzt"),
+            "der gekürzte Text muss die Markierung enthalten"
+        );
+        // Kopf und Ende dürfen zusammen `max_bytes` nicht überschreiten; die
+        // Markierung selbst kommt oben drauf, bleibt aber klein.
+        assert!(
+            capped.len() <= max_bytes + 128,
+            "gekürzter Text (+ Markierung) muss nahe am Budget bleiben, war {}",
+            capped.len()
+        );
+        assert!(capped.starts_with('a'), "der Kopf muss erhalten bleiben");
+        assert!(capped.ends_with('a'), "das Ende muss erhalten bleiben");
+    }
+
+    #[test]
+    fn test_cap_child_return_text_never_splits_multibyte_char() {
+        // '€' ist 3 Bytes, '🦀' ist 4 Bytes UTF-8 — beide werden wiederholt,
+        // damit ein naives Byte-Cutoff garantiert mitten in einem Zeichen läge.
+        let text = "€🦀".repeat(200);
+        let max_bytes = 97usize; // bewusst kein Vielfaches von 3 oder 4
+        let capped = cap_child_return_text(&text, max_bytes);
+
+        assert!(capped.len() < text.len());
+        // `String` kann nur gültiges UTF-8 enthalten; wäre irgendwo ein
+        // Zeichen zerschnitten worden, hätte `cap_child_return_text` selbst
+        // nicht kompiliert/gebaut werden können, ohne zu paniken. Diese
+        // Prüfung stellt zusätzlich sicher, dass kein Ersatzzeichen (U+FFFD)
+        // durch eine fehlerhafte Byte-Slice-Operation entstanden ist.
+        assert!(!capped.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn test_cap_child_return_text_reports_omitted_byte_count() {
+        let text = "b".repeat(500);
+        let capped = cap_child_return_text(&text, 50);
+        assert!(
+            capped.contains(" Bytes der Kind-Antwort gekürzt "),
+            "die Markierung muss die Anzahl gekürzter Bytes nennen: {capped}"
+        );
+    }
 
     struct EmptyChildRegistry;
 
@@ -3126,6 +4063,7 @@ specialization = "child-controller-test"
                 id: "external-root-operator".to_owned(),
             }),
             organizational_role,
+            allowed_child_orchestrators: Vec::new(),
             trace: None,
             // AW2-02: `None` here is fail-closed (see `SpawnContext::ceiling`
             // doc), not "unlimited" — tests that need a specific parent
@@ -3209,6 +4147,7 @@ specialization = "child-controller-test"
             depth_ceiling: ChildLimits::conservative().max_depth,
             trace: None,
             status: ChildStatus::Admitted,
+            task_complexity: None,
         };
         if let Some(lease_store) = lease_store {
             lease_store
@@ -3424,7 +4363,7 @@ specialization = "child-controller-test"
             .admit("worker", spawn_input(parent), sandbox, None)
             .expect_err("worker roots cannot spawn durable workers");
 
-        assert!(error.message.contains("not permitted to spawn role"));
+        assert_eq!(error.message, "no delegation capability is available for this request");
     }
 
     // --- W2-16: `ChildLimits`-Ableitung ------------------------------------
@@ -3524,6 +4463,7 @@ specialization = "child-controller-test"
                         depth_ceiling: ChildLimits::conservative().max_depth,
                         trace: None,
                         status: ChildStatus::Admitted,
+                        task_complexity: None,
                     },
                 );
             spawner
@@ -4084,7 +5024,7 @@ admitted = ["fs.read"]
         let error = spawner
             .admit("specialist", spawn_input(root), sandbox, None)
             .expect_err("a missing exact grant must deny child orchestration");
-        assert!(error.message.contains("does not explicitly permit"));
+        assert_eq!(error.message, "no delegation capability is available for this request");
     }
 
     #[test]
@@ -4949,6 +5889,7 @@ max_trust = "instruction"
             depth_ceiling: ChildLimits::conservative().max_depth,
             trace: Some(trace.clone()),
             status: ChildStatus::Admitted,
+            task_complexity: None,
         };
 
         let lease = record.durable_lease();
@@ -5256,6 +6197,15 @@ admitted = ["fs.read", "shell.exec"]
         let capped = spawner
             .admit("worker", spawn_input(parent.clone()), sandbox.clone(), None)
             .expect("first child is admitted");
+        // Seit Addendum F+G liefert `RoleEffortWeights` auch ohne geerbte
+        // Eltern-Basis ein Rollengewicht (Default: `worker_complex` = Medium
+        // für einen `Worker` ohne bekannte Komplexität) — die Erwartung wird
+        // deshalb aus derselben Gewichtsquelle abgeleitet statt hart kodiert.
+        let expected_role_weight = RoleEffortWeights::default().for_child(
+            harw_agent_dsl::roles::AgentRoleId::Worker,
+            false,
+            None,
+        );
         assert_eq!(
             spawner
                 .manager
@@ -5264,8 +6214,8 @@ admitted = ["fs.read", "shell.exec"]
                 .get(&capped)
                 .expect("child is manager-owned")
                 .reasoning_effort(),
-            None,
-            "ohne Eltern-Level erbt das Kind bei der Admission nichts"
+            Some(expected_role_weight),
+            "ohne Eltern-Level erbt das Kind bei der Admission das Rollengewicht aus RoleEffortWeights::default()"
         );
         assert_eq!(
             spawner

@@ -58,6 +58,7 @@
 //! # }
 //! ```
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -137,6 +138,22 @@ pub struct SessionMeta {
     pub first_user_message: Option<String>,
     /// Anzahl der Turns dieser Session (Zählweise: siehe Modul-Doku).
     pub turns: u64,
+    /// Anzahl der über [`add_usage_round`] aufgezeichneten Nutzungsrunden.
+    #[serde(default)]
+    pub usage_rounds: u64,
+    /// Über alle Runden dieser Session aufsummierte Token-Nutzung
+    /// ([`harw_types::TokenUsage::add`]).
+    #[serde(default)]
+    pub total_usage: harw_types::TokenUsage,
+    /// Wächter-Ereignisse dieser Session (Addendum F+G), gezählt je Art.
+    ///
+    /// Schlüssel ist [`harw_core::guard::DriftKind::key`] (z. B.
+    /// `"repeated_failing_call"`); Wert ist die Anzahl, wie oft
+    /// [`add_drift_event`] mit dieser Art aufgerufen wurde. Dieses Crate
+    /// bleibt bewusst unabhängig von `harw-core` (siehe Modul-Doku), daher
+    /// wird die Art hier als `String` geführt statt als `DriftKind`.
+    #[serde(default)]
+    pub drift_events: BTreeMap<String, u64>,
 }
 
 impl SessionMeta {
@@ -157,6 +174,9 @@ impl SessionMeta {
             project_key: None,
             first_user_message: None,
             turns: 0,
+            usage_rounds: 0,
+            total_usage: harw_types::TokenUsage::default(),
+            drift_events: BTreeMap::new(),
         }
     }
 
@@ -356,6 +376,9 @@ fn derive_from_transcript(root: &Path, id: &SessionId) -> SessionStoreResult<Ses
         project_key: None,
         first_user_message,
         turns,
+        usage_rounds: 0,
+        total_usage: harw_types::TokenUsage::default(),
+        drift_events: BTreeMap::new(),
     })
 }
 
@@ -464,6 +487,60 @@ pub fn set_project(
     Ok(meta)
 }
 
+/// Zeichnet eine weitere Nutzungsrunde einer Session auf und speichert.
+///
+/// # Description
+/// Lädt zunächst über [`load_or_derive`] (leitet also bei Bedarf ab), erhöht
+/// dann sowohl `usage_rounds` als auch `turns` um je `1` und akkumuliert
+/// `usage` in `total_usage` über [`harw_types::TokenUsage::add`], bevor der
+/// Sidecar gespeichert wird. `turns` wird bewusst mitgezählt: eine
+/// aufgezeichnete Nutzungsrunde ist immer auch ein abgeschlossener Turn (siehe
+/// Modul-Doku „Zählweise von `turns`").
+///
+/// # Arguments
+/// - `usage` (`&harw_types::TokenUsage`): Nutzung der aktuellen Runde, wird
+///   additiv in `total_usage` übernommen.
+///
+/// # Errors
+/// Wie [`load_or_derive`] und [`save`].
+pub fn add_usage_round(
+    root: &Path,
+    id: &SessionId,
+    usage: &harw_types::TokenUsage,
+) -> SessionStoreResult<SessionMeta> {
+    let mut meta = load_or_derive(root, id)?;
+    meta.usage_rounds += 1;
+    meta.turns += 1;
+    meta.total_usage.add(usage);
+    save(root, &meta)?;
+    Ok(meta)
+}
+
+/// Zeichnet ein weiteres Wächter-Ereignis einer Session auf und speichert
+/// (Addendum F+G, Agent F-FIX).
+///
+/// # Description
+/// Lädt zunächst über [`load_or_derive`] (leitet also bei Bedarf ab), erhöht
+/// dann `meta.drift_events[kind]` um `1` (legt den Eintrag mit `1` an, falls
+/// die Art noch nicht vorkam), und speichert den Sidecar — dasselbe Muster
+/// wie [`add_usage_round`]. Der Aufrufer (`harw-core`,
+/// `TranscriptStateStore::record_drift`) behandelt einen Fehler hier als
+/// Best-Effort-Fehlschlag: das bereits durabel gespeicherte Ereignis bleibt
+/// gültig, nur der Sidecar hinkt hinterher.
+///
+/// # Arguments
+/// - `kind` (`&str`): die Wächter-Art, üblicherweise
+///   `harw_core::guard::DriftKind::key()`.
+///
+/// # Errors
+/// Wie [`load_or_derive`] und [`save`].
+pub fn add_drift_event(root: &Path, id: &SessionId, kind: &str) -> SessionStoreResult<SessionMeta> {
+    let mut meta = load_or_derive(root, id)?;
+    *meta.drift_events.entry(kind.to_owned()).or_insert(0) += 1;
+    save(root, &meta)?;
+    Ok(meta)
+}
+
 /// Leitet einen Fallback-Titel aus der ersten Nutzernachricht ab.
 ///
 /// # Description
@@ -534,6 +611,15 @@ mod tests {
             project_key: Some("harwness-abc123".to_owned()),
             first_user_message: Some("Hallo".to_owned()),
             turns: 3,
+            usage_rounds: 2,
+            total_usage: harw_types::TokenUsage {
+                input_tokens: 100,
+                output_tokens: 40,
+                reasoning_tokens: None,
+                cached_tokens: Some(10),
+                cache_write_tokens: Some(5),
+            },
+            drift_events: BTreeMap::from([("repeated_failing_call".to_owned(), 2)]),
         };
 
         save(temp.path(), &meta).unwrap();
@@ -803,6 +889,42 @@ mod tests {
             b"sentinel-should-not-be-read"
         );
         assert_eq!(load(temp.path(), &session).unwrap(), Some(meta));
+    }
+
+    #[test]
+    fn add_usage_round_accumulates_usage_and_increments_counters() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = SessionId::from_str("session-a");
+        let first = harw_types::TokenUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            reasoning_tokens: None,
+            cached_tokens: Some(10),
+            cache_write_tokens: None,
+        };
+        let second = harw_types::TokenUsage {
+            input_tokens: 50,
+            output_tokens: 5,
+            reasoning_tokens: None,
+            cached_tokens: Some(5),
+            cache_write_tokens: Some(3),
+        };
+
+        let after_first = add_usage_round(temp.path(), &session, &first).unwrap();
+        assert_eq!(after_first.usage_rounds, 1);
+        assert_eq!(after_first.turns, 1);
+        assert_eq!(after_first.total_usage, first);
+
+        let after_second = add_usage_round(temp.path(), &session, &second).unwrap();
+        assert_eq!(after_second.usage_rounds, 2);
+        assert_eq!(after_second.turns, 2);
+        assert_eq!(after_second.total_usage.input_tokens, 150);
+        assert_eq!(after_second.total_usage.output_tokens, 25);
+        assert_eq!(after_second.total_usage.cached_tokens, Some(15));
+        assert_eq!(after_second.total_usage.cache_write_tokens, Some(3));
+
+        let reloaded = load(temp.path(), &session).unwrap().unwrap();
+        assert_eq!(reloaded, after_second);
     }
 
     #[test]

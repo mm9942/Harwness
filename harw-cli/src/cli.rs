@@ -208,6 +208,15 @@ pub enum Command {
         #[arg(long)]
         refresh: bool,
     },
+    /// Konfigurierte Modelle entdecken/verwalten und interne Modellstellen
+    /// (Session-Titel, Kompaktierung, Speicher-Konsolidierung,
+    /// Traumreflexion, Explorer, Recherche) einzeln konfigurieren.
+    /// Ohne Unterbefehl entspricht dies `harw models list`.
+    Models {
+        /// Auszuführende Models-Aktion; ohne Angabe wird gelistet.
+        #[command(subcommand)]
+        action: Option<ModelsAction>,
+    },
     /// Auth-/Credential-Verwaltung (Claude-Setup-Token, Import, Status).
     Auth {
         /// Auszuführende Auth-Aktion.
@@ -478,6 +487,83 @@ pub enum SettingsModelAction {
     Default {
         /// Modell-ID, wie in `models/<id>.toml` deklariert.
         id: String,
+    },
+}
+
+/// Aktionen des `harw models`-Subcommands (Addendum C).
+///
+/// Ohne diesen Subcommand (`Cli::command == Some(Command::Models { action:
+/// None })`) entspricht das dem `list`-Zweig (siehe `crate::models::run`).
+#[derive(Debug, Subcommand)]
+pub enum ModelsAction {
+    /// Listet aktivierte Provider, konfigurierte Modelle (mit markiertem
+    /// Standardmodell) und die internen Modellstellen samt Auflösung.
+    List,
+    /// Fragt die `/models`-Endpunkte konfigurierter Provider ab
+    /// (`harw_provider_http::discovery::list_models`).
+    Scan {
+        /// Nur diesen Provider abfragen; ohne Angabe alle aktivierten
+        /// Provider.
+        provider: Option<String>,
+        /// Legt für jedes entdeckte Modell eine `models/<id>.toml` im
+        /// aktiven Profil an (bereits vorhandene Dateien bleiben
+        /// unverändert).
+        #[arg(long)]
+        add: bool,
+        /// Zeigt/übernimmt nur kostenlose Modelle (Preis 0 oder
+        /// `:free`-Suffix der Modell-ID).
+        #[arg(long)]
+        free_only: bool,
+    },
+    /// Interne Modellstellen verwalten (Session-Titel, Kompaktierungs-
+    /// Zusammenfassung, Speicher-Konsolidierung, Traumreflexion, Explorer,
+    /// Recherche). Ohne Unterbefehl entspricht dies `internal show`.
+    Internal {
+        #[command(subcommand)]
+        action: Option<InternalAction>,
+    },
+    /// Setzt das globale Standardmodell — derselbe Schreibpfad wie `harw
+    /// settings model default`.
+    Default {
+        /// Modell-ID, wie in `models/<id>.toml` deklariert.
+        id: String,
+    },
+}
+
+/// Aktionen des `harw models internal`-Subcommands.
+#[derive(Debug, Subcommand)]
+pub enum InternalAction {
+    /// Zeigt jede interne Modellstelle mit ihrer effektiven Auflösung
+    /// (explizit / OpenRouter-Standard / Hauptmodell).
+    Show,
+    /// Setzt eine interne Modellstelle explizit auf `model`, optional bei
+    /// einem anderen Provider als `harness.default_provider`.
+    Set {
+        /// Stellen-Schlüssel, z. B. `session_title` oder `session-title`
+        /// (siehe `harw_config::InternalModelPoint::parse`).
+        point: String,
+        /// Modell-ID beim gewählten Provider.
+        model: String,
+        /// Provider-Name; ohne Angabe `harness.default_provider`.
+        #[arg(long)]
+        provider: Option<String>,
+    },
+    /// Erzwingt für diese Stelle das Hauptmodell der Sitzung (leere Wahl).
+    Main {
+        /// Stellen-Schlüssel.
+        point: String,
+    },
+    /// Entfernt eine explizite Wahl für diese Stelle; die Auflösung fällt
+    /// zurück auf den OpenRouter-Standard bzw. das Hauptmodell.
+    Reset {
+        /// Stellen-Schlüssel.
+        point: String,
+    },
+    /// Schaltet `use_openrouter_defaults` global an (`on`) oder aus (`off`).
+    OpenrouterDefaults {
+        /// `on` oder `off`.
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
     },
 }
 
@@ -919,6 +1005,174 @@ mod tests {
                 }),
             })
         ));
+    }
+
+    #[test]
+    fn test_models_without_action_parses_for_list() {
+        let cli = match Cli::try_parse_from(["harw", "models"]) {
+            Ok(cli) => cli,
+            Err(err) => panic!("`harw models` sollte parsen: {err}"),
+        };
+        assert!(matches!(cli.command, Some(Command::Models { action: None })));
+    }
+
+    #[test]
+    fn test_models_scan_parses_provider_and_flags() {
+        let cli = match Cli::try_parse_from([
+            "harw", "models", "scan", "openrouter", "--add", "--free-only",
+        ]) {
+            Ok(cli) => cli,
+            Err(err) => panic!("`harw models scan ...` sollte parsen: {err}"),
+        };
+        let Some(Command::Models {
+            action: Some(ModelsAction::Scan { provider, add, free_only }),
+        }) = cli.command
+        else {
+            panic!("erwartete Models(Scan), bekam {:?}", cli.command);
+        };
+        assert_eq!(provider.as_deref(), Some("openrouter"));
+        assert!(add);
+        assert!(free_only);
+    }
+
+    #[test]
+    fn test_models_scan_without_provider_defaults_to_all() {
+        let cli = match Cli::try_parse_from(["harw", "models", "scan"]) {
+            Ok(cli) => cli,
+            Err(err) => panic!("`harw models scan` sollte parsen: {err}"),
+        };
+        let Some(Command::Models {
+            action: Some(ModelsAction::Scan { provider, add, free_only }),
+        }) = cli.command
+        else {
+            panic!("erwartete Models(Scan), bekam {:?}", cli.command);
+        };
+        assert_eq!(provider, None);
+        assert!(!add);
+        assert!(!free_only);
+    }
+
+    #[test]
+    fn test_models_internal_show_parses() {
+        let cli = match Cli::try_parse_from(["harw", "models", "internal"]) {
+            Ok(cli) => cli,
+            Err(err) => panic!("`harw models internal` sollte parsen: {err}"),
+        };
+        assert!(matches!(
+            cli.command,
+            Some(Command::Models {
+                action: Some(ModelsAction::Internal { action: None }),
+            })
+        ));
+
+        let cli = match Cli::try_parse_from(["harw", "models", "internal", "show"]) {
+            Ok(cli) => cli,
+            Err(err) => panic!("`harw models internal show` sollte parsen: {err}"),
+        };
+        assert!(matches!(
+            cli.command,
+            Some(Command::Models {
+                action: Some(ModelsAction::Internal {
+                    action: Some(InternalAction::Show),
+                }),
+            })
+        ));
+    }
+
+    #[test]
+    fn test_models_internal_set_parses_point_model_and_provider() {
+        let cli = match Cli::try_parse_from([
+            "harw",
+            "models",
+            "internal",
+            "set",
+            "session-title",
+            "nvidia/nemotron-3.5-lightning",
+            "--provider",
+            "openrouter",
+        ]) {
+            Ok(cli) => cli,
+            Err(err) => panic!("`harw models internal set ...` sollte parsen: {err}"),
+        };
+        let Some(Command::Models {
+            action: Some(ModelsAction::Internal {
+                action: Some(InternalAction::Set { point, model, provider }),
+            }),
+        }) = cli.command
+        else {
+            panic!("erwartete Models(Internal(Set)), bekam {:?}", cli.command);
+        };
+        assert_eq!(point, "session-title");
+        assert_eq!(model, "nvidia/nemotron-3.5-lightning");
+        assert_eq!(provider.as_deref(), Some("openrouter"));
+    }
+
+    #[test]
+    fn test_models_internal_main_and_reset_parse() {
+        let main = match Cli::try_parse_from(["harw", "models", "internal", "main", "explorer"]) {
+            Ok(cli) => cli,
+            Err(err) => panic!("`harw models internal main ...` sollte parsen: {err}"),
+        };
+        assert!(matches!(
+            main.command,
+            Some(Command::Models {
+                action: Some(ModelsAction::Internal {
+                    action: Some(InternalAction::Main { .. }),
+                }),
+            })
+        ));
+
+        let reset = match Cli::try_parse_from(["harw", "models", "internal", "reset", "research"])
+        {
+            Ok(cli) => cli,
+            Err(err) => panic!("`harw models internal reset ...` sollte parsen: {err}"),
+        };
+        assert!(matches!(
+            reset.command,
+            Some(Command::Models {
+                action: Some(ModelsAction::Internal {
+                    action: Some(InternalAction::Reset { .. }),
+                }),
+            })
+        ));
+    }
+
+    #[test]
+    fn test_models_internal_openrouter_defaults_accepts_on_off_only() {
+        let on = Cli::try_parse_from(["harw", "models", "internal", "openrouter-defaults", "on"])
+            .expect("`on` sollte parsen");
+        assert!(matches!(
+            on.command,
+            Some(Command::Models {
+                action: Some(ModelsAction::Internal {
+                    action: Some(InternalAction::OpenrouterDefaults { .. }),
+                }),
+            })
+        ));
+
+        let invalid = Cli::try_parse_from([
+            "harw",
+            "models",
+            "internal",
+            "openrouter-defaults",
+            "maybe",
+        ]);
+        assert!(invalid.is_err(), "ungültiger Zustand muss scheitern");
+    }
+
+    #[test]
+    fn test_models_default_parses() {
+        let cli = match Cli::try_parse_from(["harw", "models", "default", "gpt-5.4"]) {
+            Ok(cli) => cli,
+            Err(err) => panic!("`harw models default ...` sollte parsen: {err}"),
+        };
+        let Some(Command::Models {
+            action: Some(ModelsAction::Default { id }),
+        }) = cli.command
+        else {
+            panic!("erwartete Models(Default), bekam {:?}", cli.command);
+        };
+        assert_eq!(id, "gpt-5.4");
     }
 
     #[test]

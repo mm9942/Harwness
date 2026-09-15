@@ -10,6 +10,10 @@ pub struct TokenUsage {
     pub output_tokens: u64,
     pub reasoning_tokens: Option<u64>,
     pub cached_tokens: Option<u64>,
+    /// Anzahl der Tokens, die beim Schreiben eines neuen Prompt-Cache-Eintrags
+    /// angefallen sind (z. B. `cache_creation_input_tokens`).
+    #[serde(default)]
+    pub cache_write_tokens: Option<u64>,
 }
 
 impl TokenUsage {
@@ -25,6 +29,7 @@ impl TokenUsage {
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
         self.reasoning_tokens = sum_opt(self.reasoning_tokens, other.reasoning_tokens);
         self.cached_tokens = sum_opt(self.cached_tokens, other.cached_tokens);
+        self.cache_write_tokens = sum_opt(self.cache_write_tokens, other.cache_write_tokens);
     }
 }
 

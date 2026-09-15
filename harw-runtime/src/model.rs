@@ -207,6 +207,7 @@ mod tests {
                 models: Vec::new(),
                 enabled: true,
                 origin_allowlist: OriginAllowlistToml::default(),
+                rate_limit: None,
             },
         );
         config

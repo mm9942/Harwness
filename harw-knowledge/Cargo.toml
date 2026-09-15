@@ -12,7 +12,7 @@ harw-session-store = { path = "../harw-session-store" }
 # `SecurityEvidence`, `Hardness`, `Severity` behind `SecurityFinding` /
 # `Baseline` (AW4-05). No cycle: `harw-dod-signals` does not depend on
 # `harw-knowledge` (checked at AW4-05 time).
-harw-dod-signals = { path = "../harw-dod-signals" }
+harw-dod-signals = { path = "../dod/crates/harw-dod-signals" }
 # `Baseline::to_rule_baseline` converts into
 # `harw_dod_rules::baseline::{Baseline, PalaceStatus}` — the edge-cut that
 # stops this crate's whole graph (notably `harw-model-catalog` ->
@@ -22,7 +22,7 @@ harw-dod-signals = { path = "../harw-dod-signals" }
 # `harw-dod-rules/Cargo.toml`) for its own test/doctest convenience; Cargo
 # explicitly supports dev-dependency cycles since they never enter the
 # production dependency graph.
-harw-dod-rules = { path = "../harw-dod-rules" }
+harw-dod-rules = { path = "../dod/crates/harw-dod-rules" }
 # AW3-03: Quellenbindung `KnowledgeContextProvider` liefert `harw_context::Fragment`.
 # Kein Zyklus: `harw-context` hängt nur von harw-types/harw-lens-types/harw-macros
 # ab, keines davon kennt harw-knowledge.

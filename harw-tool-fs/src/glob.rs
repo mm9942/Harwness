@@ -73,7 +73,10 @@ pub struct GlobArgs {
     pub path: Option<String>,
     /// Obergrenze der Treffer (Default 200, Maximum 1000).
     #[tool(default = 200)]
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "harw_extension_api::lenient::lenient_opt_usize"
+    )]
     pub max_results: Option<usize>,
 }
 

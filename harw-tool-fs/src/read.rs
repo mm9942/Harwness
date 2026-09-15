@@ -43,9 +43,10 @@ struct FsReadArgs {
     /// Pfad relativ zum Workspace-Root.
     path: String,
     /// Optionales Byte-Limit für diesen Aufruf.
+    #[serde(default, deserialize_with = "harw_extension_api::lenient::lenient_opt_u64")]
     max_bytes: Option<u64>,
     /// Optionaler Byte-Offset, ab dem gelesen wird (Default 0).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "harw_extension_api::lenient::lenient_opt_u64")]
     offset: Option<u64>,
 }
 

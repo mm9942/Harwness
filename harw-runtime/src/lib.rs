@@ -12,6 +12,9 @@ pub mod children;
 pub mod config;
 pub mod contributors;
 pub mod error;
+pub mod guard_wiring;
+pub mod handoff;
+pub mod memory_wiring;
 pub mod model;
 pub mod sandbox;
 pub mod services;
@@ -32,6 +35,15 @@ pub use contributors::{
     AssemblyContributor, AssemblyInputs, AssemblyParts, default_contributors,
 };
 pub use error::{RuntimeError, RuntimeResult};
+pub use guard_wiring::{
+    DriftTracer, MemoryPitfallAdvisor, guard_policy_from_config, role_effort_weights_from_config,
+    spawn_child_reaper,
+};
+pub use handoff::{
+    HANDOFF_MAX_BYTES, HandoffContextProvider, HandoffWriter, SessionHandoff, handoff_path,
+    read_handoff,
+};
+pub use memory_wiring::{MemoryCaptureObserver, MemoryConsolidationHook, spawn_startup_sweep};
 pub use model::{ModelSource, build_root_model, build_root_model_with_resolver};
 pub use sandbox::{permissions_for_tier, plan_node_sandbox, root_sandbox};
 pub use services::{PlanServices, RuntimeServices, RuntimeServicesParts, ServiceSurface};

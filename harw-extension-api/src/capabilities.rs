@@ -48,6 +48,33 @@ pub trait AgentSpawner: Send + Sync {
         self.child_finished(child);
         Ok(())
     }
+
+    /// Sichtbare Delegationsziele für `parent_session_id` (Addendum F+G,
+    /// Nachtrag F — Delegationsprojektion).
+    ///
+    /// # Description
+    /// Namen registrierter Rollen, an die `parent_session_id` laut
+    /// derselben zwei Prädikaten delegieren dürfte, die auch die echte
+    /// Admission durchsetzt (`can_delegate_to` /
+    /// `harw_core::delegation_visibility::visible_delegation_targets`). Ein
+    /// Aufrufer (`harw-core/src/turn_loop.rs`) hängt daraus — nur wenn die
+    /// Liste nicht leer ist — einen deterministischen Kontextblock an die
+    /// Modellanfrage an.
+    ///
+    /// Der Default liefert immer eine leere Liste, damit bestehende
+    /// [`AgentSpawner`]-Implementierungen (Tests, Dummy-Spawner) ohne
+    /// Änderung weiter kompilieren; sie zeigen dann schlicht keine
+    /// Delegationsziele an.
+    ///
+    /// # Arguments
+    /// - `parent_session_id` (`&SessionId`): der delegieren wollende Agent.
+    ///
+    /// # Returns
+    /// Exakte, sortierte registrierte Rollennamen; leer, wenn nichts
+    /// sichtbar ist oder die Implementierung diese Projektion nicht anbietet.
+    fn delegation_target_names(&self, _parent_session_id: &SessionId) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 #[derive(Debug, Clone)]

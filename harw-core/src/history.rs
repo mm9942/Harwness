@@ -170,6 +170,63 @@ impl ConversationHistory {
         self.items.last()
     }
 
+    /// Hängt einen Wächter-Hinweis an das zuletzt angehängte Item dieser
+    /// Historie an, ohne eine neue [`TurnItem`]-Variante zu erzeugen
+    /// (Welle FANIN-K).
+    ///
+    /// # Beschreibung
+    /// Ein `GuardVerdict::Warn`-Hinweis, der am Rundenende entsteht (kein
+    /// weiterer Tool-Aufruf mehr in dieser Runde), hatte bislang kein
+    /// Ziel: `harw-core/src/turn_loop.rs`s `append_hint` hängt einen Hinweis
+    /// an ein `ToolCallResult` an, das an dieser Stelle nicht mehr entsteht,
+    /// wenn die Runde ohne Tool-Aufrufe endet. Diese Methode schließt die
+    /// Lücke, indem sie den Hinweis an das **letzte** Item der Historie
+    /// anhängt:
+    /// - Ein [`TurnItem::ToolResult`] bekommt denselben Anhang wie das
+    ///   Tool-Ergebnis-`append_hint` in `turn_loop.rs`: der bisherige
+    ///   Reintext (über [`tool_result_text`]) plus Leerzeile plus `hint`,
+    ///   unter Beibehaltung der `Success`/`Error`-Variante (über
+    ///   [`tool_result_with_text`]).
+    /// - Ein [`TurnItem::UserMessage`] oder [`TurnItem::AssistantMessage`]
+    ///   bekommt einen zusätzlichen [`ContentPart::Text`] mit dem Hinweis
+    ///   angehängt — der ursprüngliche Inhalt bleibt vollständig erhalten.
+    ///
+    /// Ist das letzte Item keines der drei (leere Historie, `ToolCall`,
+    /// `Reasoning` oder `Error`), wird nichts verändert.
+    ///
+    /// # Arguments
+    /// - `hint` (`&str`): der bereits fertig formatierte Hinweistext (Präfix
+    ///   `[harw-Wächter] `, siehe `turn_loop.rs`s `append_hint`).
+    ///
+    /// # Returns
+    /// `true`, wenn der Hinweis angehängt werden konnte; `false`, wenn kein
+    /// passendes letztes Item existierte.
+    pub fn append_hint_to_last(&mut self, hint: &str) -> bool {
+        let Some(last) = self.items.last_mut() else {
+            return false;
+        };
+        match last {
+            TurnItem::ToolResult(item) => {
+                let extended = format!("{}\n\n{hint}", tool_result_text(&item.result));
+                item.result = tool_result_with_text(&item.result, extended);
+                true
+            }
+            TurnItem::UserMessage(item) => {
+                item.content.push(ContentPart::Text {
+                    text: hint.to_owned(),
+                });
+                true
+            }
+            TurnItem::AssistantMessage(item) => {
+                item.content.push(ContentPart::Text {
+                    text: hint.to_owned(),
+                });
+                true
+            }
+            TurnItem::ToolCall(_) | TurnItem::Reasoning(_) | TurnItem::Error(_) => false,
+        }
+    }
+
     /// Projiziert den Verlauf auf die provider-neutrale [`ModelMessage`]-Sicht.
     ///
     /// Reasoning-Items werden bewusst ausgelassen — sie sind Surface-Metadaten,

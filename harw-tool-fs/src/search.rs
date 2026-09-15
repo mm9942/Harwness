@@ -61,6 +61,10 @@ struct FsSearchArgs {
     /// Start-Pfad relativ zum Workspace-Root (Default: `"."`).
     path: Option<String>,
     /// Maximale Anzahl Treffer (Default: [`DEFAULT_MAX_MATCHES`]).
+    #[serde(
+        default,
+        deserialize_with = "harw_extension_api::lenient::lenient_opt_usize"
+    )]
     max_matches: Option<usize>,
 }
 

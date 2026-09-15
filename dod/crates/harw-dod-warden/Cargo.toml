@@ -1,0 +1,40 @@
+[package]
+name = "harw-dod-warden"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Wire-Vokabular und die bereits nachprüfbare Bindungs-/Zulässigkeitslogik
+# (`AuthorizationProof::verify`, `WardenAction::is_admissible_from`) — siehe
+# lib.rs-Moduldoku, Abschnitt „Abhängigkeitsbudget".
+harw-dod-warden-proto = { path = "../harw-dod-warden-proto" }
+# `CgroupId`/`FindingId` direkt: der Warden liest cgroup-Kennungen aus
+# WardenAction-Varianten, um sie an Ausführungs-Traits zu reichen, und nimmt
+# `finding` als unabhängigen Kontextparameter entgegen (siehe warden.rs).
+# Bereits vollständig durch `harw-dod-warden-proto` transitiv mitgebracht —
+# kein einziges neues Blatt-Crate.
+harw-types = { path = "../../../harw-types" }
+# `#[derive(harw_macros::HarwError)]` für `error.rs` — wie bei der
+# proto-Crate ausschließlich dafür, nie für `warden_actions!`. Ebenfalls
+# bereits transitiv vorhanden.
+harw-macros = { path = "../../../harw-macros" }
+
+[dev-dependencies]
+# Nur für den Test „unbekanntes Feld in der Anfrage -> abgelehnt" (Rundlauf
+# über die tatsächliche Wire-Deserialisierung von
+# `harw_dod_warden_proto::WardenActionRequest`) und für die
+# Antwort-Inhaltsfreiheits-Prüfung (serialisierten Text inspizieren). Reine
+# Dev-Dependency, zählt nicht gegen das Laufzeit-Abhängigkeitsbudget des
+# Warden-Binaries.
+serde_json = { workspace = true }
+# Nur für die Dateisystem-Tests von `CgroupV2Executor` (Tempdir statt
+# echtem `/sys/fs/cgroup`). Reine Dev-Dependency.
+tempfile = { workspace = true }
+# Nur für Tests/Doctests, die einen `AuthorizationProof` bauen (verlangt
+# einen `jiff::Timestamp`, siehe `harw-dod-warden-proto`). Reine
+# Dev-Dependency — Laufzeitcode dieser Crate liest ohnehin keine Zeit.
+jiff = { workspace = true }
+
+[lints]
+workspace = true

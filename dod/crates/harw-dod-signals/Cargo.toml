@@ -1,0 +1,28 @@
+[package]
+name = "harw-dod-signals"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Vokabular-Grundlage: Kennungen (`SensorId`, `CgroupId`) und `ContentDigest`.
+harw-types = { path = "../../../harw-types" }
+# `trait Sensor` (hier definiert) nennt `SensorHandle<Bound>` und
+# `SensorError` aus dem Zugriffsvokabular (Vertrag F, Knoten AW0-06).
+harw-dod-cap = { path = "../harw-dod-cap" }
+# Von elf Sensor-Crates gebraucht, nicht von diesem Vokabular selbst; laut
+# Arbeitsauftrag dennoch verbindliche Abhängigkeit dieser Crate (Vertrag,
+# Abschnitt AW0-07). Aktuell ungenutzt in `pub`-Signaturen.
+harw-observe = { path = "../../../harw-observe" }
+# `#[derive(harw_macros::HarwError)]` für `error.rs`.
+harw-macros = { path = "../../../harw-macros" }
+serde = { workspace = true }
+jiff = { workspace = true }
+# Trägt die Bildungsregel für `SecurityEvidence::digest` (kanonische
+# Serialisierung der enthaltenen Samples und Events, siehe `evidence.rs`).
+# Deshalb ein regulärer Abhängigkeitseintrag und keine reine Dev-Dependency:
+# die Digestbildung läuft zur Laufzeit, nicht nur in Tests.
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

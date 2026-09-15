@@ -1,0 +1,23 @@
+[package]
+name = "harw-dod-netlink"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-dod-cap = { path = "../harw-dod-cap" }
+harw-macros = { path = "../../../harw-macros" }
+jiff = { workspace = true }
+
+# Syscalls ohne libc. Nur der Bindungsteil (`src/socket.rs`, unter
+# `#[cfg(target_os = "linux")]`) benutzt sie; der Formungsteil (Tokenisierung,
+# `parse_record`, Netlink-Rahmenzerlegung) ist reiner Code auf Bytes/Strings
+# ohne jede Systemabhängigkeit. Eine vollwertige Netlink-Bibliothek (z. B.
+# `neli`) wäre für den Umfang dieser Crate — einen Socket öffnen, Zeilen
+# lesen — unverhältnismäßig; `rustix` liefert `socket`/`bind`/`recv` und die
+# `AUDIT`-Netlink-Konstanten bereits sicher (kein `unsafe` auf Aufruferseite)
+# und steht ohnehin als Workspace-Abhängigkeit bereit.
+rustix = { workspace = true, features = ["net"] }
+
+[lints]
+workspace = true

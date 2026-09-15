@@ -44,3 +44,6 @@ docs/remediation/AGENT-BRIEF.md
 harw.zip
 .harw/
 harw-export-*
+
+# lokale/experimentelle Räume, nicht Teil des Projekts
+/spaces/

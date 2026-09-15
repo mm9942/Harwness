@@ -9,7 +9,10 @@
 //!
 //! Der eigentliche Session-Store-Aufruf und der Provider-Summarize-Call sind
 //! noch nicht angebunden. Die Operation schlägt deshalb für jede Invocation
-//! geschlossen mit [`OpError::NotAvailable`] fehl.
+//! geschlossen mit [`OpError::NotAvailable`] fehl und weist dabei auf den
+//! automatischen Verdichtungsweg hin (`harw_core::compaction`/`auto_compact`):
+//! Verdichtung läuft automatisch beim Erreichen der Kontextschwelle; in der
+//! TUI führt `/compact` sie sofort aus.
 //!
 //! # Schlüsseltypen
 //! - [`CompactArgs`] — optionale Zusatzanweisung für den Kompaktierungs-Lauf.
@@ -124,10 +127,12 @@ pub struct CompactArgs {
     command(path = "/compact", visibility = "channel_parity")
 )]
 async fn compact(_ctx: &OpContext, _args: CompactArgs) -> Result<OpOutput, OpError> {
-    Err(OpError::NotAvailable(
-        "session compaction is not available".to_owned(),
-    ))
+    Err(OpError::NotAvailable(COMPACT_HINT.to_owned()))
 }
+
+/// Deutscher Hinweistext für `/compact` — sowohl für [`compact`] als auch für
+/// `UnavailableCompactOperation` in `crate::compact_unavailable_output`.
+pub(crate) const COMPACT_HINT: &str = "Verdichtung läuft automatisch beim Erreichen der Kontextschwelle; in der TUI führt /compact sie sofort aus.";
 
 #[cfg(test)]
 mod tests {
@@ -192,7 +197,7 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove test workspace");
 
         assert!(
-            matches!(result, Err(OpError::NotAvailable(message)) if message == "session compaction is not available")
+            matches!(result, Err(OpError::NotAvailable(message)) if message == super::COMPACT_HINT)
         );
     }
 

@@ -322,15 +322,14 @@ struct ChatRuntimeInputs {
     secret_resolver: Option<Arc<dyn harw_provider_http::SecretResolver + Send + Sync>>,
     // Projekt-Fakten-Wurzel (Memory v3, `docs/design/memory-v3-ltm.md` §2/§4),
     // `<projekt>/.harw/memories`, sofern Projekterkennung und `ensure()`
-    // gelingen. Noch an keine Montage gebunden — der bestehende
-    // `chat_builder` registriert weiterhin nur `memory` (v2, `Memory`-Trait);
-    // siehe `open_fact_stores` für die dokumentierte Annahme des parallelen
-    // Memory-Slices (M2).
-    #[allow(dead_code)]
+    // gelingen. Über `chat_builder` → `RuntimeAssemblyBuilder::fact_stores`
+    // an die Montage gebunden (Addendum B, Agent MEM-RUNTIME); die Montage
+    // öffnet ohne diesen Wert selbst eine Projekt-Vorgabe unter
+    // `home_project.memories_dir()`, dieser bereits geöffnete Store spart ihr
+    // das doppelte Öffnen.
     project_facts: Option<Arc<FactStore>>,
     // Globale Fakten-Wurzel (`<home>/profiles/<profil>/memories`), analog zu
     // `project_facts`; Projekt geht laut Design §4 im Lesepfad vor.
-    #[allow(dead_code)]
     global_facts: Option<Arc<FactStore>>,
     // `--verbose` (Contract §5 Zeile B5, Plan Schritt 2 Ctrl+O-Äquivalent).
     // Bereitgehalten für die TUI-Montage; `TuiRunOptions`/`TuiSessionWiring`
@@ -395,6 +394,10 @@ fn chat_builder(inputs: &ChatRuntimeInputs, model: ModelSource) -> RuntimeAssemb
     if let Some(memory) = inputs.memory.as_ref() {
         builder = builder.memory(Arc::clone(memory));
     }
+    builder = builder.fact_stores(
+        inputs.project_facts.clone(),
+        inputs.global_facts.clone(),
+    );
     if let Some(provider) = inputs.startup.goal_context.as_ref() {
         builder = builder.contributor(Arc::new(GoalContextContributor {
             provider: Arc::clone(provider),
@@ -489,6 +492,11 @@ impl TuiAssemblyFactory for ChatTuiFactory {
         }
         let assembly = builder.build().map_err(assembly_error)?;
         apply_extra_dirs(&assembly, &self.add_dirs);
+        tag_session_project(
+            &self.inputs.spec.home,
+            &self.inputs.spec.cwd,
+            assembly.root_session_id(),
+        );
         tracing::info!(
             session_id = %assembly.root_session_id(),
             "chat.tui.assembled"
@@ -566,6 +574,45 @@ fn current_project_key(cwd: &Path) -> Option<String> {
         Err(error) => {
             tracing::warn!(%error, "resume: konnte Projekt-Schlüssel nicht ermitteln");
             None
+        }
+    }
+}
+
+// Ordnet eine Session einmalig dem Projekt des Arbeitsverzeichnisses zu, damit
+// der `-r`-Projektfilter sie wiederfindet. Eine bereits zugeordnete Session
+// behält ihr Projekt (ein `--all`-Resume aus einem anderen Projekt hängt sie
+// nicht um). Best-effort: Fehler werden geloggt und blockieren den Start nie.
+fn tag_session_project(home: &Path, cwd: &Path, session_id: &SessionId) {
+    let project = match harw_home::project::discover_project(cwd, &[]) {
+        Ok(project) => project,
+        Err(error) => {
+            tracing::warn!(%error, "resume: Projekt für Session-Zuordnung nicht erkannt");
+            return;
+        }
+    };
+    let sessions_root = match profile_sessions_root(home) {
+        Ok(root) => root,
+        Err(error) => {
+            tracing::warn!(%error, "resume: Session-Verzeichnis nicht auflösbar");
+            return;
+        }
+    };
+    match harw_session_store::meta::load_or_derive(&sessions_root, session_id) {
+        Ok(meta) if meta.project_key.is_some() => {}
+        Ok(_) => {
+            let key = harw_home::project::project_key(&project.root);
+            if let Err(error) = harw_session_store::meta::set_project(
+                &sessions_root,
+                session_id,
+                Some(cwd),
+                Some(&project.root),
+                Some(&key),
+            ) {
+                tracing::warn!(session = %session_id, %error, "resume: Projekt-Zuordnung nicht gespeichert");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(session = %session_id, %error, "resume: Session-Meta nicht lesbar");
         }
     }
 }
@@ -684,14 +731,18 @@ fn build_memory(home: &Path) -> Option<Arc<dyn harw_memory::Memory>> {
 /// mit `tracing::warn!` gemeldet — wie [`build_memory`] darf ein
 /// Gedächtnisproblem den Chatstart nie verhindern.
 ///
-/// # Annahme für den parallelen Memory-Slice (M2)
-/// [`harw_memory::context_provider::MemoryContextProvider`] kennt heute nur
-/// eine Wurzel über `M: harw_memory::Memory`; `FactStore` implementiert
-/// dieses Trait nicht. Bis M2 einen Zwei-Wurzel-Kontext-Provider für
-/// `FactStore` liefert (Projekt vor Global, siehe Design §4), hält diese
-/// Funktion beide Stores bereit ([`ChatRuntimeInputs::project_facts`]/
-/// [`ChatRuntimeInputs::global_facts`]), ohne sie an `chat_builder`/die
-/// Montage zu binden.
+/// # Bindung an die Montage (Addendum B, Agent MEM-RUNTIME)
+/// Beide Stores werden über [`ChatRuntimeInputs::project_facts`]/
+/// [`ChatRuntimeInputs::global_facts`] gehalten und von `chat_builder` per
+/// [`harw_runtime::RuntimeAssemblyBuilder::fact_stores`] an die Montage
+/// gebunden — der Gedächtnis-Recall (§4) sieht sie damit für jeden Turn der
+/// Wurzelsitzung. [`harw_memory::context_provider::MemoryContextProvider`]
+/// selbst kennt weiterhin nur eine HOT/STM/WARM-Wurzel über
+/// `M: harw_memory::Memory`; `FactStore` implementiert dieses Trait nicht —
+/// der Fakten-Anteil hängt deshalb zusätzlich an [`ChatRuntimeInputs::memory`]
+/// (siehe `RuntimeAssembly::build`, Schritt 12c: ohne v2-`Memory`-Store
+/// bleibt der Recall aus, unabhängig davon, ob hier Fakten-Stores geöffnet
+/// werden konnten).
 fn open_fact_stores(home: &Path, cwd: &Path) -> (Option<Arc<FactStore>>, Option<Arc<FactStore>>) {
     let project = project_memories_root(cwd).and_then(|root| {
         match FactStore::open(&root, FactScope::Project) {
@@ -810,6 +861,7 @@ fn run_one_shot(inputs: &ChatRuntimeInputs, prompt: &str, add_dirs: &[PathBuf]) 
     let assembly = one_shot_assembly(inputs, ModelSource::Configured, event_tx.clone())?;
     apply_extra_dirs(&assembly, add_dirs);
     let root_id = assembly.root_session_id().clone();
+    tag_session_project(&inputs.spec.home, &inputs.spec.cwd, &root_id);
     let RootSession { mut session, .. } = assembly
         .new_root_session(root_id.clone(), event_tx, turn_tx, None)
         .map_err(assembly_error)?;
@@ -1164,6 +1216,139 @@ mod tests {
             all_ids,
             vec![
                 SessionId::from_str("in-project"),
+                SessionId::from_str("other-project"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_tag_session_project_tags_an_untagged_session() {
+        let fixture = chat_fixture();
+        let sessions_root = profile_sessions_root(&fixture.home).expect("resolve sessions root");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions directory");
+        std::fs::File::create(sessions_root.join("sess-untagged.jsonl"))
+            .expect("create empty transcript for meta derivation");
+        let session_id = SessionId::from_str("sess-untagged");
+
+        tag_session_project(&fixture.home, &fixture.cwd, &session_id);
+
+        let meta = harw_session_store::meta::load_or_derive(&sessions_root, &session_id)
+            .expect("load meta after tagging");
+        let expected_key =
+            current_project_key(&fixture.cwd).expect("fixture cwd always yields a project key");
+        assert_eq!(meta.project_key.as_deref(), Some(expected_key.as_str()));
+        assert_eq!(meta.cwd.as_deref(), Some(fixture.cwd.as_path()));
+        assert!(meta.project_root.is_some());
+    }
+
+    #[test]
+    fn test_tag_session_project_does_not_overwrite_an_existing_different_key() {
+        let fixture = chat_fixture();
+        let sessions_root = profile_sessions_root(&fixture.home).expect("resolve sessions root");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions directory");
+        std::fs::File::create(sessions_root.join("sess-already-tagged.jsonl"))
+            .expect("create empty transcript for meta derivation");
+        let session_id = SessionId::from_str("sess-already-tagged");
+        harw_session_store::meta::set_project(
+            &sessions_root,
+            &session_id,
+            None,
+            None,
+            Some("pre-existing-key"),
+        )
+        .expect("pre-tag session with a foreign project key");
+
+        tag_session_project(&fixture.home, &fixture.cwd, &session_id);
+
+        let meta = harw_session_store::meta::load_or_derive(&sessions_root, &session_id)
+            .expect("load meta after tagging attempt");
+        assert_eq!(meta.project_key.as_deref(), Some("pre-existing-key"));
+    }
+
+    #[test]
+    fn test_tag_session_project_with_nonexistent_cwd_leaves_meta_untouched() {
+        let fixture = chat_fixture();
+        let sessions_root = profile_sessions_root(&fixture.home).expect("resolve sessions root");
+        std::fs::create_dir_all(&sessions_root).expect("create sessions directory");
+        std::fs::File::create(sessions_root.join("sess-missing-cwd.jsonl"))
+            .expect("create empty transcript for meta derivation");
+        let session_id = SessionId::from_str("sess-missing-cwd");
+        let missing_cwd = fixture.cwd.join("does-not-exist");
+
+        tag_session_project(&fixture.home, &missing_cwd, &session_id);
+
+        let meta = harw_session_store::meta::load_or_derive(&sessions_root, &session_id)
+            .expect("load meta after failed tagging attempt");
+        assert_eq!(meta.project_key, None);
+        assert_eq!(meta.cwd, None);
+        assert_eq!(meta.project_root, None);
+    }
+
+    // Bugfix: `harw -r` ohne `--all` zeigte zuvor auch Alt-Sessions ohne
+    // `project_key` in jedem Projekt (der Filter behandelte ein fehlendes
+    // `project_key` bisher als Universal-Treffer). Eine untagged Alt-Session,
+    // deren Transcript keinen per Backfill auflösbaren Projekt-Root enthält
+    // (hier: leeres Transcript), bleibt jetzt nur noch über `--all`
+    // erreichbar — analog zu einer Session mit einem fremden `project_key`.
+    #[test]
+    fn test_profile_resume_selector_available_sessions_excludes_untagged_legacy_session_without_all() {
+        use harw_tui::app::ResumeSessionSelector;
+
+        let project_dir = tempfile::tempdir().expect("create project directory");
+        let sessions_dir = tempfile::tempdir().expect("create sessions directory");
+        std::fs::File::create(sessions_dir.path().join("in-project.jsonl"))
+            .expect("create empty transcript for meta derivation");
+        std::fs::File::create(sessions_dir.path().join("legacy-untagged.jsonl"))
+            .expect("create empty transcript for meta derivation");
+        std::fs::File::create(sessions_dir.path().join("other-project.jsonl"))
+            .expect("create empty transcript for meta derivation");
+
+        let current_key = current_project_key(project_dir.path())
+            .expect("a real directory always yields a project key");
+        harw_session_store::meta::set_project(
+            sessions_dir.path(),
+            &SessionId::from_str("in-project"),
+            None,
+            None,
+            Some(current_key.as_str()),
+        )
+        .expect("tag in-project session with the current project key");
+        harw_session_store::meta::set_project(
+            sessions_dir.path(),
+            &SessionId::from_str("other-project"),
+            None,
+            None,
+            Some("some-other-project-key"),
+        )
+        .expect("tag other-project session with a foreign project key");
+        // `legacy-untagged` gets no `set_project` call and an empty
+        // transcript: `meta::load_or_derive` leaves `project_key` as `None`,
+        // and `crate::resume::backfill_project_key` finds no path candidate
+        // to backfill from, matching a real legacy session whose transcript
+        // predates any absolute-path tool usage.
+
+        let filtered = ProfileResumeSelector::new(
+            sessions_dir.path().to_path_buf(),
+            project_dir.path().to_path_buf(),
+            false,
+        );
+        let visible_ids = filtered
+            .available_sessions()
+            .expect("list filtered sessions");
+        assert_eq!(visible_ids, vec![SessionId::from_str("in-project")]);
+
+        let all = ProfileResumeSelector::new(
+            sessions_dir.path().to_path_buf(),
+            project_dir.path().to_path_buf(),
+            true,
+        );
+        let mut all_ids = all.available_sessions().expect("list all sessions with --all");
+        all_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        assert_eq!(
+            all_ids,
+            vec![
+                SessionId::from_str("in-project"),
+                SessionId::from_str("legacy-untagged"),
                 SessionId::from_str("other-project"),
             ]
         );

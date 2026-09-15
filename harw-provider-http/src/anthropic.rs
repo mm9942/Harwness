@@ -50,6 +50,27 @@ pub(crate) const ANTHROPIC_API_HOST: &str = "api.anthropic.com";
 /// Default-Ausgabe-Token-Obergrenze, falls die Anfrage keine vorgibt.
 pub const DEFAULT_MAX_TOKENS: u32 = 4096;
 
+/// Warnhinweis für die Nutzung eines Abo-OAuth-/Setup-Tokens (Claude Free/Pro/Max)
+/// mit `harw` statt eines Console-API-Keys.
+///
+/// # Description
+/// Laut Anthropics Nutzungsbedingungen ist Abo-OAuth für Claude Code und
+/// native Anthropic-Apps vorgesehen; Drittanbieter-Tools sollen API-Keys aus
+/// der Claude Console nutzen. Anthropic hat eine geplante Abrechnungsänderung
+/// für Drittanbieter-Nutzung im Juni 2026 vorerst pausiert, behält sich die
+/// Durchsetzung aber ohne Vorankündigung vor. Diese Konstante dient
+/// ausschließlich der Warnung, nicht der Blockade.
+///
+/// Quellen: <https://code.claude.com/docs/en/legal-and-compliance>,
+/// <https://the-decoder.de/anthropic-rudert-bei-claude-abrechnung-zurueck-und-laesst-drittanbieter-nutzung-vorerst-im-abo/>
+pub const ANTHROPIC_SUBSCRIPTION_TOKEN_WARNING: &str = "Hinweis: Du nutzt ein Abo-OAuth-/Setup-Token (Claude Free/Pro/Max) statt eines API-Keys. \
+Laut Anthropics Nutzungsbedingungen ist Abo-OAuth für Claude Code und native Anthropic-Apps vorgesehen; \
+Drittanbieter-Tools sollen API-Keys aus der Claude Console nutzen. \
+Anthropic hat eine geplante Abrechnungsänderung für Drittanbieter-Nutzung im Juni 2026 vorerst pausiert, \
+behält sich Durchsetzung aber ohne Vorankündigung vor – Anfragen können jederzeit abgelehnt werden. \
+Nutzung auf eigene Gefahr. Stabil: API-Key (platform.claude.com). \
+Quelle: https://code.claude.com/docs/en/legal-and-compliance";
+
 /// Art des Anthropic-Credentials und damit des Auth-Header-Schemas.
 ///
 /// # Description
@@ -87,6 +108,11 @@ pub struct AnthropicMessagesProvider {
     max_tokens: u32,
     request_timeout: Duration,
     configured_headers: Option<reqwest::header::HeaderMap>,
+    /// Client-seitiger Rate-Limiter (siehe
+    /// [`crate::rate_limiter::ProviderRateLimiter`]); standardmäßig
+    /// deaktiviert (`ProviderRateLimiter::new(None)`) — dieser Konstruktionsweg
+    /// hat keinen Zugriff auf `harw_config::ProviderToml::rate_limit`.
+    rate_limiter: std::sync::Arc<crate::rate_limiter::ProviderRateLimiter>,
 }
 
 impl AnthropicMessagesProvider {
@@ -115,6 +141,7 @@ impl AnthropicMessagesProvider {
             max_tokens: DEFAULT_MAX_TOKENS,
             request_timeout: super::DEFAULT_REQUEST_TIMEOUT,
             configured_headers: None,
+            rate_limiter: std::sync::Arc::new(crate::rate_limiter::ProviderRateLimiter::new(None)),
         }
     }
 
@@ -135,6 +162,16 @@ impl AnthropicMessagesProvider {
     pub(crate) fn configure(&mut self, id: &str, headers: reqwest::header::HeaderMap) {
         self.provider_id = id.to_owned();
         self.configured_headers = Some(headers);
+    }
+
+    /// Setzt den Rate-Limiter aus der Provider-Konfiguration
+    /// (`harw_config::ProviderToml::rate_limit`); aufgerufen von
+    /// `build_named_provider` im Anthropic-Zweig, da `AnthropicMessagesProvider`
+    /// selbst keinen `from_named_config`-Konstruktionsweg besitzt.
+    pub(crate) fn configure_rate_limit(&mut self, rate_limit: Option<harw_config::RateLimitToml>) {
+        self.rate_limiter = std::sync::Arc::new(crate::rate_limiter::ProviderRateLimiter::new(
+            rate_limit,
+        ));
     }
 
     /// Resolves the model for one request after checking its provider affinity.
@@ -554,12 +591,17 @@ pub fn extract_anthropic_usage(body: &Value) -> TokenUsage {
         .get("usage")
         .and_then(|usage| usage.get("cache_read_input_tokens"))
         .and_then(Value::as_u64);
+    let cache_write_tokens = body
+        .get("usage")
+        .and_then(|usage| usage.get("cache_creation_input_tokens"))
+        .and_then(Value::as_u64);
 
     TokenUsage {
         input_tokens,
         output_tokens,
         reasoning_tokens: None,
         cached_tokens,
+        cache_write_tokens,
     }
 }
 
@@ -660,8 +702,18 @@ impl ModelProvider for AnthropicMessagesProvider {
     fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
         Box::pin(async move {
             let model = self.selected_model(&request)?;
-            tracing::debug!(model, "sending anthropic messages request");
-            let wire = build_messages_body(model, self.max_tokens, &request);
+            let strategy = crate::cache_strategy::resolve_cache_strategy(
+                &self.provider_id,
+                model,
+                None,
+            );
+            let mut wire = build_messages_body(model, self.max_tokens, &request);
+            crate::cache_strategy::apply_messages_cache_control(&mut wire, strategy);
+            tracing::debug!(
+                model,
+                strategy = strategy.label(),
+                "sending anthropic messages request"
+            );
 
             let mut builder = self
                 .client
@@ -686,6 +738,7 @@ impl ModelProvider for AnthropicMessagesProvider {
                 }
             }
 
+            self.rate_limiter.wait_for_slot().await;
             let response = builder
                 .json(&wire)
                 .timeout(self.request_timeout)
@@ -695,6 +748,7 @@ impl ModelProvider for AnthropicMessagesProvider {
                     ModelError::RequestFailed(super::HttpProviderError::from(error).to_string())
                 })?;
 
+            self.rate_limiter.observe_headers(response.headers());
             let status = response.status();
             let retry_after_header = response
                 .headers()

@@ -1,0 +1,31 @@
+[package]
+name = "harw-dod-workspace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Liefert `WorkspaceGraph`/`parse_lockfile`: liest Cargo.toml/Cargo.lock ohne
+# Subprozess. Siehe Crate-Moduldoku (`src/lib.rs`) für die Arbeitsteilung.
+harw-code-graph = { path = "../../../harw-code-graph" }
+# Zugriffsvokabular: `ReadScope`, `SensorHandle<Bound>`, `Capability`,
+# `SensorError` (der von `harw_dod_signals::Sensor::poll` vorgeschriebene
+# Fehlertyp).
+harw-dod-cap = { path = "../harw-dod-cap" }
+# Daten-Vokabular: `trait Sensor`, `SensorReading`, `EventKind::StructureDrift`.
+harw-dod-signals = { path = "../harw-dod-signals" }
+# `SensorId` (siehe `sensor.rs`) und `#[derive(harw_macros::HarwError)]`-Basis.
+harw-types = { path = "../../../harw-types" }
+# `#[derive(harw_macros::HarwError)]` für `error.rs`.
+harw-macros = { path = "../../../harw-macros" }
+serde = { workspace = true }
+jiff = { workspace = true }
+semver = { workspace = true }
+
+[dev-dependencies]
+harw-dod-fixtures = { path = "../harw-dod-fixtures" }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

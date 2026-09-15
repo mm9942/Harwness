@@ -1,0 +1,2387 @@
+//! `AgentDefinitionToolProvider` — Bauplan-Werkzeuge für die Rolle
+//! `agent-steward` (Addendum K, Contract Master §"Agent K-C", Nachtrag K,
+//! Zusatzauftrag "Vorschlagsmodus", Nachtrag K3 "Schärfung der
+//! Steward-Prüfung").
+//!
+//! # Verantwortung
+//! Stellt bis zu sechs Werkzeuge bereit (welche registriert sind, hängt von
+//! [`DefinitionWriteMode`] **und** von [`DefinitionAuthorCeiling`] ab):
+//! - `agents.validate {toml}`: parst + senkt eine Agentendefinition über
+//!   dieselbe Pipeline wie
+//!   [`crate::embedded_agents::builtin_agent_definitions`] (`parse_toml →
+//!   resolve_definition → lower`) und meldet Fehler, ohne etwas zu schreiben.
+//!   Rein lesend, **immer** registriert.
+//! - `agents.list_proposals {}`: listet alle Vorschläge unter
+//!   `<profile_agents_dir>/.proposals/`, markiert abgelaufene mit
+//!   `expired: true`. Rein lesend, **immer** registriert.
+//! - `agents.write_definition {scope, name, toml, run_id?}`: validiert
+//!   zwingend, berechnet die Rechte-Deltas (siehe unten) und legt — außer im
+//!   Sonderfall `scope = "run"` mit leeren Deltas — **immer** einen Vorschlag
+//!   ab (nie einen Direkt-Schreibvorgang: Nachtrag K3 bindet dauerhaftes
+//!   Schreiben an die Prüfung, unabhängig vom [`DefinitionWriteMode`]).
+//! - `agents.write_uia {dir_name, definition_toml, personality_md, user_md?,
+//!   identity_md?}`: wie oben, aber für ein vollständiges UIA-Bundle; verlangt
+//!   zusätzlich `role = "user-interface"`, lehnt offensichtliche Geheimnisse
+//!   ab und bekommt immer `review_level = "user_required"` (UIAs werden nie
+//!   automatisch aktiviert). Kein `scope = "run"`.
+//! - `agents.commit_proposal {proposal_id, user_confirmed?}` **nur im
+//!   [`DefinitionWriteMode::Commit`] und nur mit gesetzter Decke**: validiert
+//!   den Vorschlag erneut, rechnet beide Deltas erneut — **gegen die Decke
+//!   des committenden Aufrufers**, die von der Decke des ursprünglichen
+//!   Autors abweichen kann — und schreibt danach ans Ziel.
+//! - `agents.reject_proposal {proposal_id, reason}` **nur im
+//!   [`DefinitionWriteMode::Commit`] und nur mit gesetzter Decke**.
+//!
+//! # Die Urheber-Decke (Nachtrag K3)
+//! Ein Spawn prüft bereits ∩-Algebra (`child_controller.rs`,
+//! `AuthorityCeiling::intersect`), aber eine **dauerhafte Definitionsdatei**
+//! ist an sich an keinen Urheber gebunden — sie gilt für jeden späteren
+//! Aufrufer, der den definierten Agenten spawnt. [`DefinitionAuthorCeiling`]
+//! schließt diese Lücke: Ohne sie (`ceiling = None`) registriert dieser
+//! Provider fail-closed **nur** `agents.validate`/`agents.list_proposals` —
+//! kein Schreiben, kein Vorschlag, kein Commit. Mit ihr vergleicht jeder
+//! schreibende Aufruf die vom Kandidaten beanspruchten Rechte
+//! ([`claimed_rights_of`]) gegen zwei Referenzen:
+//! - **Urheber-Delta** (`rights_delta_author`): was der Kandidat über die
+//!   Decke selbst hinaus beansprucht. Nicht leer ⇒ harte Ablehnung
+//!   (`"authority elevation: the author cannot grant rights it does not
+//!   hold"`) — niemand verleiht Rechte, die er selbst nicht hält. Es wird in
+//!   diesem Fall **nichts** geschrieben, auch kein Vorschlag.
+//! - **Basisrollen-Delta** (`rights_delta_base_role`): was der Kandidat über
+//!   die eingebaute Definition bzw. das Registry-Profil derselben Rolle
+//!   hinaus beansprucht (siehe [`base_role_rights_of`]).
+//!
+//! Daraus ergibt sich `review_level`: `"user_required"` für jedes
+//! UIA-Bundle oder ein nicht-leeres Basisrollen-Delta; sonst `"uia"`
+//! (dauerhaft, aber ohne über die Basisrolle hinausgehende Rechte); ein
+//! auftragsgebundener `scope = "run"`-Vorschlag mit **beiden** leeren Deltas
+//! bekommt `"none"` und wird sofort geschrieben (kein Vorschlag).
+//!
+//! # `user_confirmed` und die Freigabe-Kette
+//! `agents.commit_proposal` verlangt bei `review_level = "user_required"`
+//! `user_confirmed = true`. Dieses Feld ist **kein** Ersatz für die
+//! Freigabe-Prüfung des Harness: `agents.commit_proposal` ist — wie jedes
+//! schreibende Werkzeug dieses Providers — bewusst nicht in
+//! [`crate::AUTO_APPROVED_TOOLS`] gelistet und bleibt damit über
+//! [`crate::DefaultApprovalPolicy`] fail-closed freigabepflichtig: Der
+//! Aufruf pausiert beim Nutzer, **bevor** dieser Code überhaupt läuft. Ein
+//! Modell kann `user_confirmed: true` zwar im Argument behaupten, aber ohne
+//! die vorgelagerte Freigabe erreicht der Aufruf diesen Code gar nicht erst.
+//! Dieser Datei fehlt jede Möglichkeit, eine echte Nutzerbestätigung von
+//! einer Modellbehauptung zu unterscheiden — sie verlässt sich strukturell
+//! auf die Freigabekette, genau wie `fs.write`.
+//!
+//! # Schlüsseltypen
+//! - [`AgentDefinitionToolProvider`]
+//! - [`DefinitionWriteMode`]
+//! - [`DefinitionAuthorCeiling`]
+//!
+//! # Nebenläufigkeit
+//! `Send + Sync`; zustandslos außer den konfigurierten Zielverzeichnissen,
+//! dem Modus und der Decke. Alle Dateizugriffe sind synchrones, blockierendes
+//! I/O.
+//!
+//! # Fehler
+//! Kein Aufruf dieses Providers gibt `Err` an den Aufrufer zurück —
+//! Validierungs-, Rechte- und I/O-Fehler werden als `ToolOutput::Json`
+//! (`{"ok": false, "errors": [...]}`) bzw. `ToolOutput::Error` gemeldet.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use harw_agent_dsl::layers::DefinitionLayer;
+use harw_agent_dsl::parse::parse_toml;
+use harw_agent_dsl::raw::RawAgentDefinition;
+use harw_agent_dsl::resolve::resolve_definition;
+use harw_agent_dsl::roles::AgentRoleId;
+use harw_agent_dsl::{ExecutableAgentIr, lower};
+use harw_extension_api::contributors::ToolProvider;
+use harw_extension_api::{
+    ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName, ToolOutput,
+    ToolSpec,
+};
+use harw_sandbox::PermissionSet;
+use harw_tools::{AdditionalProperties, FunctionToolSpec, JsonSchema, JsonSchemaType};
+use serde::Deserialize;
+
+use crate::embedded_agents::builtin_agent_toml;
+
+/// Zähler für eindeutige Temp-/Vorschlags-Namen innerhalb eines Prozesses
+/// (mehrere gleichzeitige Aufrufe dürfen sich nie denselben Pfad teilen).
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Offensichtliche Geheimnis-Muster (Klein-/Großschreibung ignoriert), die
+/// `agents.write_uia` (und `agents.commit_proposal` für `kind = "uia"`) in
+/// jedem übergebenen Feld ablehnt (Nachtrag K).
+const SECRET_PATTERNS: &[&str] = &["sk-", "-----begin", "api_key ="];
+
+/// Name des Vorschlags-Unterverzeichnisses unter `profile_agents_dir`.
+const PROPOSALS_DIR_NAME: &str = ".proposals";
+
+/// Anzahl der Tage, nach denen ein Vorschlag abläuft (Nachtrag K3).
+const PROPOSAL_TTL_DAYS: i64 = 7;
+
+/// Der aktuelle Zeitpunkt für Auflösungs-Traces und Vorschlags-Zeitstempel.
+fn now() -> time::OffsetDateTime {
+    time::OffsetDateTime::now_utc()
+}
+
+/// Formatiert `dt` als RFC-3339-Text. Ein Formatierungsfehler (praktisch
+/// unerreichbar für `OffsetDateTime`-Werte aus dieser Datei) fällt auf einen
+/// festen Platzhalter zurück statt zu `panic!`en.
+fn format_rfc3339(dt: time::OffsetDateTime) -> String {
+    dt.format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_else(|_| "unbekannt".to_owned())
+}
+
+/// `now()` als RFC-3339-Text.
+fn now_rfc3339() -> String {
+    format_rfc3339(now())
+}
+
+/// Parst einen RFC-3339-Zeitstempel und prüft, ob er in der Vergangenheit
+/// liegt. Ein nicht parsbarer Zeitstempel gilt als **nicht** abgelaufen
+/// (lenient: eine defekte Altdatei blockiert die Listen-/Commit-Ansicht
+/// nicht zusätzlich zu ihrem eigentlichen Defekt).
+fn is_expired(rfc3339_timestamp: &str) -> bool {
+    match time::OffsetDateTime::parse(
+        rfc3339_timestamp,
+        &time::format_description::well_known::Rfc3339,
+    ) {
+        Ok(expires_at) => expires_at < now(),
+        Err(_) => false,
+    }
+}
+
+/// Ob ein `agents.commit_proposal`/`agents.reject_proposal`-Aufruf
+/// registriert ist. `agents.write_definition`/`agents.write_uia` schreiben
+/// seit Nachtrag K3 **nie** direkt (außer `scope = "run"` mit leeren
+/// Rechte-Deltas) — der Modus entscheidet nur noch, ob diese
+/// Provider-Instanz ihre eigenen (oder fremde) Vorschläge auch freigeben
+/// darf.
+///
+/// # Description
+/// Ein `agent-steward`, der vom Root-Orchestrator gestartet wird, darf
+/// Vorschläge nie selbst freigeben — nur die UIA (bzw. ihr eigener
+/// `agent-steward`) darf das. Der Aufrufer wählt den Modus beim
+/// Konstruieren des Providers ([`AgentDefinitionToolProvider::new`]); er ist
+/// nicht zur Laufzeit umschaltbar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefinitionWriteMode {
+    /// Registriert zusätzlich `agents.commit_proposal` und
+    /// `agents.reject_proposal` (sofern eine [`DefinitionAuthorCeiling`]
+    /// gesetzt ist).
+    Commit,
+    /// `agents.commit_proposal`/`agents.reject_proposal` sind in diesem
+    /// Modus nie registriert.
+    ProposalOnly,
+}
+
+/// Die effektiven Rechte eines Aufrufers (oder eines Kandidaten, oder einer
+/// Basisrolle) für den Vergleich der ∩-Algebra (Nachtrag K3).
+///
+/// # Description
+/// Dient in drei Rollen mit identischer Form: als **Urheber-Decke**, die
+/// [`AgentDefinitionToolProvider::new`] entgegennimmt (die effektiven Rechte
+/// des Eltern-Aufrufers des Stewards); als Rückgabe von
+/// [`claimed_rights_of`] (die von einer gesenkten Definition beanspruchten
+/// Rechte); und als Rückgabe von [`base_role_rights_of`] (die Rechte der
+/// eingebauten Definition/des Profils derselben Rolle). Alle drei Werte
+/// werden mit derselben Funktion ([`compute_rights_delta`]) verglichen.
+///
+/// # Concurrency
+/// `Send + Sync`; reiner Datenwert.
+#[derive(Debug, Clone)]
+pub struct DefinitionAuthorCeiling {
+    /// Organisatorische Rolle, für die diese Rechte gelten (bei einem
+    /// Kandidaten: seine eigene Rolle; bei der Decke: die Rolle des
+    /// Eltern-Aufrufers).
+    pub role: AgentRoleId,
+    /// Zugelassene Werkzeugnamen.
+    pub tools: BTreeSet<String>,
+    /// Zugelassene Sandbox-Rechte.
+    pub permissions: PermissionSet,
+    /// Maximale Spawn-Tiefe.
+    pub max_depth: u32,
+    /// Token-Budget-Obergrenze.
+    pub budget_tokens: u64,
+    /// Obergrenze der Reasoning-Effort-Stufe als undurchsichtiges Label
+    /// (`"low"`/`"medium"`/`"high"`, wie in `[spawn.budget].effort_cap`).
+    /// `None` ist die niedrigste Stufe — dieselbe „keine Aussage = kein
+    /// Anspruch"-Semantik wie bei einer leeren `tools`-Menge oder
+    /// `budget_tokens = 0`, damit alle fünf Felder monoton denselben Nullwert
+    /// tragen.
+    pub effort_cap: Option<String>,
+}
+
+/// Der Provider für die Bauplan-Werkzeuge der Rolle `agent-steward`.
+///
+/// # Description
+/// `agents.write_definition` schreibt nur im Sonderfall `scope = "run"` mit
+/// leeren Rechte-Deltas sofort (nach `<project_agents_dir>/../state/runs/
+/// <run_id>/agents/<name>.toml`); sonst legt es — wie `agents.write_uia`
+/// immer — einen Vorschlag unter `profile_agents_dir/.proposals/<id>/` ab.
+///
+/// # Concurrency
+/// `Send + Sync`; hält nur zwei `PathBuf`s, den Modus und die optionale
+/// Decke, kein veränderlicher Zustand.
+pub struct AgentDefinitionToolProvider {
+    /// Zielverzeichnis für `scope = "project"` und für `scope = "run"`
+    /// (relativ dazu: `../state/runs/<run_id>/agents/`). `None`, wenn kein
+    /// Projektkontext bekannt ist.
+    project_agents_dir: Option<PathBuf>,
+    /// Zielverzeichnis für `scope = "profile"`, für jedes
+    /// `agents.write_uia`-Bundle und für `.proposals/`. `None`, wenn kein
+    /// Profil bekannt ist.
+    profile_agents_dir: Option<PathBuf>,
+    /// Ob diese Instanz `agents.commit_proposal`/`agents.reject_proposal`
+    /// registriert (nur zusammen mit einer gesetzten Decke).
+    mode: DefinitionWriteMode,
+    /// Die Urheber-Decke; `None` ⇒ fail-closed (nur `agents.validate` und
+    /// `agents.list_proposals`).
+    ceiling: Option<DefinitionAuthorCeiling>,
+}
+
+impl AgentDefinitionToolProvider {
+    /// Erstellt einen neuen Provider.
+    ///
+    /// # Arguments
+    /// - `project_agents_dir` (`Option<PathBuf>`): Ziel für `scope =
+    ///   "project"`/`"run"`.
+    /// - `profile_agents_dir` (`Option<PathBuf>`): Ziel für `scope =
+    ///   "profile"`, jedes `agents.write_uia`-Bundle und `.proposals/`.
+    /// - `mode` ([`DefinitionWriteMode`]): steuert, ob diese Instanz
+    ///   `agents.commit_proposal`/`agents.reject_proposal` registriert.
+    /// - `ceiling` (`Option<`[`DefinitionAuthorCeiling`]`>`): die effektiven
+    ///   Rechte des Eltern-Aufrufers. `None` ⇒ fail-closed: nur
+    ///   `agents.validate` und `agents.list_proposals` werden registriert.
+    ///
+    /// # Returns
+    /// Den fertig konfigurierten Provider.
+    #[must_use]
+    pub fn new(
+        project_agents_dir: Option<PathBuf>,
+        profile_agents_dir: Option<PathBuf>,
+        mode: DefinitionWriteMode,
+        ceiling: Option<DefinitionAuthorCeiling>,
+    ) -> Self {
+        Self {
+            project_agents_dir,
+            profile_agents_dir,
+            mode,
+            ceiling,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Validierungs-Pipeline (dieselbe wie embedded_agents: parse_toml → resolve → lower)
+// ---------------------------------------------------------------------------
+
+/// Ergebnis von [`validate_definition_toml`]: entweder eine erfolgreich
+/// gesenkte Definition mit ihrer Roh-Form, oder eine Liste menschenlesbarer
+/// Fehler.
+enum Validated {
+    /// Parsen, Auflösen und Senken sind erfolgreich durchgelaufen.
+    Ok {
+        /// Die roh geparste Definition (für `id`/`role`-Vorabprüfungen ohne
+        /// erneutes Parsen).
+        raw: Box<RawAgentDefinition>,
+        /// Die gesenkte ausführbare Form.
+        ir: Box<ExecutableAgentIr>,
+    },
+    /// Parsen, Auflösen oder Senken ist gescheitert; nichts wurde geschrieben.
+    Err(Vec<String>),
+}
+
+/// Validiert eine Agentendefinition über dieselbe Pipeline wie
+/// [`crate::embedded_agents::builtin_agent_definitions`]: `parse_toml` →
+/// `resolve_definition` (über den eingebetteten Rollen als Basis-Schichten,
+/// damit `extends`/Mixins gegen eingebaute Rollen wie `worker-base` auflösen)
+/// → `lower`.
+///
+/// # Description
+/// Die zu validierende Definition selbst wird als [`DefinitionLayer::Project`]
+/// eingehängt — die höchste Schicht unterhalb von `RunLocal` — damit sie jede
+/// eingebettete Basis überschreiben, aber nie mit ihr kollidieren kann.
+///
+/// # Arguments
+/// - `toml_source` (`&str`): der zu validierende TOML-Quelltext.
+///
+/// # Returns
+/// [`Validated::Ok`] mit roher und gesenkter Form bei Erfolg, sonst
+/// [`Validated::Err`] mit mindestens einem Fehlertext.
+fn validate_definition_toml(toml_source: &str) -> Validated {
+    let raw = match parse_toml(toml_source) {
+        Ok(raw) => raw,
+        Err(error) => return Validated::Err(vec![format!("TOML: {error}")]),
+    };
+
+    let mut layers: Vec<(DefinitionLayer, RawAgentDefinition)> = Vec::new();
+    for (name, source) in builtin_agent_toml() {
+        match parse_toml(source) {
+            Ok(base_raw) => layers.push((DefinitionLayer::BuiltIn, base_raw)),
+            Err(error) => {
+                return Validated::Err(vec![format!(
+                    "interner Fehler: eingebettete Basis '{name}' ist defekt: {error}"
+                )]);
+            }
+        }
+    }
+    let target_id = raw.id.clone();
+    layers.push((DefinitionLayer::Project, raw.clone()));
+
+    let resolved = match resolve_definition(&target_id, &layers, now()) {
+        Ok(resolved) => resolved,
+        Err(error) => return Validated::Err(vec![error.to_string()]),
+    };
+    match lower(&resolved) {
+        Ok(ir) => Validated::Ok {
+            raw: Box::new(raw),
+            ir: Box::new(ir),
+        },
+        Err(error) => Validated::Err(vec![error.to_string()]),
+    }
+}
+
+/// Ein gültiger, dateisystem-sicherer Slug: nicht leer, nur
+/// `[a-z0-9-]`, kein Pfadtrenner, kein `.`/`..`.
+fn is_valid_slug(candidate: &str) -> bool {
+    !candidate.is_empty()
+        && candidate
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+// ---------------------------------------------------------------------------
+// Rechte-Algebra (Nachtrag K3)
+// ---------------------------------------------------------------------------
+
+/// Ein Rechte-Delta: was ein Kandidat über eine Referenz (Decke oder
+/// Basisrolle) hinaus beansprucht. Format wie im Contract vorgegeben:
+/// `{added_tools[], added_permissions[], depth_increase, budget_increase,
+/// effort_increase}`.
+#[derive(Debug, Clone, Default)]
+struct RightsDelta {
+    added_tools: Vec<String>,
+    added_permissions: Vec<String>,
+    depth_increase: Option<u32>,
+    budget_increase: Option<u64>,
+    effort_increase: Option<String>,
+}
+
+impl RightsDelta {
+    /// `true`, wenn keines der fünf Felder eine Überschreitung meldet.
+    fn is_empty(&self) -> bool {
+        self.added_tools.is_empty()
+            && self.added_permissions.is_empty()
+            && self.depth_increase.is_none()
+            && self.budget_increase.is_none()
+            && self.effort_increase.is_none()
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "added_tools": self.added_tools,
+            "added_permissions": self.added_permissions,
+            "depth_increase": self.depth_increase,
+            "budget_increase": self.budget_increase,
+            "effort_increase": self.effort_increase,
+        })
+    }
+}
+
+/// Rang einer Effort-Stufe für den Vergleich in [`compute_rights_delta`].
+/// `None` (keine Aussage) ist der niedrigste Rang, ein unbekanntes Label der
+/// höchste (konservativ: eine nicht erkannte Stufe gilt immer als
+/// Überschreitung, außer die Referenz trägt exakt dasselbe Label).
+fn effort_rank(label: Option<&str>) -> (i32, Option<String>) {
+    match label.map(str::to_lowercase) {
+        None => (0, None),
+        Some(l) if l == "low" => (1, Some(l)),
+        Some(l) if l == "medium" => (2, Some(l)),
+        Some(l) if l == "high" => (3, Some(l)),
+        Some(other) => (4, Some(other)),
+    }
+}
+
+/// Vergleicht `claimed` gegen `limit` und liefert das Delta (siehe
+/// [`RightsDelta`]). Beide Seiten müssen exakt dieselbe Form
+/// ([`DefinitionAuthorCeiling`]) tragen — daher dient dieser Typ sowohl als
+/// öffentliche Urheber-Decke als auch intern als Rückgabe von
+/// [`claimed_rights_of`]/[`base_role_rights_of`].
+fn compute_rights_delta(
+    claimed: &DefinitionAuthorCeiling,
+    limit: &DefinitionAuthorCeiling,
+) -> RightsDelta {
+    let added_tools: Vec<String> = claimed.tools.difference(&limit.tools).cloned().collect();
+    let added_permissions: Vec<String> = claimed
+        .permissions
+        .iter()
+        .filter(|permission| !limit.permissions.contains(*permission))
+        .map(|permission| format!("{permission:?}"))
+        .collect();
+    let depth_increase = claimed
+        .max_depth
+        .checked_sub(limit.max_depth)
+        .filter(|delta| *delta > 0);
+    let budget_increase = claimed
+        .budget_tokens
+        .checked_sub(limit.budget_tokens)
+        .filter(|delta| *delta > 0);
+    let (claimed_rank, claimed_label) = effort_rank(claimed.effort_cap.as_deref());
+    let (limit_rank, _) = effort_rank(limit.effort_cap.as_deref());
+    let effort_increase = if claimed_rank > limit_rank {
+        claimed_label
+    } else {
+        None
+    };
+
+    RightsDelta {
+        added_tools,
+        added_permissions,
+        depth_increase,
+        budget_increase,
+        effort_increase,
+    }
+}
+
+/// Ermittelt die von einer gesenkten Definition beanspruchten Rechte:
+/// `[tools].admitted` als Werkzeugmenge, deren Rechte über
+/// [`crate::tool_permission`], `[spawn].max_depth` (0, wenn nicht gesetzt),
+/// `[spawn.budget].max_tokens` (0, wenn nicht gesetzt) und
+/// `[spawn.budget].effort_cap`.
+fn claimed_rights_of(ir: &ExecutableAgentIr) -> DefinitionAuthorCeiling {
+    let tools: BTreeSet<String> = ir.tool_surface().admitted().iter().cloned().collect();
+    let permissions =
+        PermissionSet::from_policy(tools.iter().filter_map(|tool| crate::tool_permission(tool)));
+    let max_depth = ir.spawn_contract().max_depth().unwrap_or(0);
+    let budget = ir.spawn_contract().budget();
+    let budget_tokens = budget.and_then(|b| b.max_tokens()).unwrap_or(0);
+    let effort_cap = budget.and_then(|b| b.effort_cap()).map(str::to_owned);
+    DefinitionAuthorCeiling {
+        role: ir.role(),
+        tools,
+        permissions,
+        max_depth,
+        budget_tokens,
+        effort_cap,
+    }
+}
+
+/// Ermittelt die Rechte der Basisrolle für den Vergleich in
+/// `rights_delta_base_role`.
+///
+/// # Description
+/// Drei Stufen, in dieser Reihenfolge:
+/// 1. Trägt eine eingebaute Rolle denselben Namen (`raw.id.name`), gelten
+///    ihre gesenkten Rechte ([`claimed_rights_of`] auf ihrer eigenen IR) —
+///    der genaueste verfügbare Vergleich.
+/// 2. Sonst, falls [`crate::profile_for_role`] für diesen Namen ein
+///    Registry-Profil kennt, gilt dessen Werkzeugmenge und
+///    `required_permissions()`; Tiefe/Budget/Effort sind für ein Profil
+///    nicht definiert und bleiben bei `0`/`None` (jeder Anspruch des
+///    Kandidaten in diesen drei Feldern zählt dann als Überschreitung —
+///    bewusst konservativ, siehe Bericht).
+/// 3. Ist beides unbekannt (ein neuer, freihändig benannter Agent), hat die
+///    Basisrolle keine Rechte — jeder Anspruch des Kandidaten ist ein Delta.
+///    Das ist beabsichtigt: ein völlig neuer Rollenname bekommt ohne
+///    erkennbare Referenz immer eine menschliche Prüfung.
+fn base_role_rights_of(definition_name: &str, role: AgentRoleId) -> DefinitionAuthorCeiling {
+    if let Ok(builtins) =
+        crate::embedded_agents::builtin_agent_definitions(&std::collections::HashMap::new())
+    {
+        if let Some(base_ir) = builtins.get(definition_name) {
+            return claimed_rights_of(base_ir);
+        }
+    }
+    if let Some(profile) = crate::profile_for_role(definition_name) {
+        let tools: BTreeSet<String> = profile
+            .registered_tool_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        return DefinitionAuthorCeiling {
+            role,
+            tools,
+            permissions: profile.required_permissions(),
+            max_depth: 0,
+            budget_tokens: 0,
+            effort_cap: None,
+        };
+    }
+    DefinitionAuthorCeiling {
+        role,
+        tools: BTreeSet::new(),
+        permissions: PermissionSet::empty(),
+        max_depth: 0,
+        budget_tokens: 0,
+        effort_cap: None,
+    }
+}
+
+/// Ergebnis der Prüfung eines Kandidaten: seine roh geparste und gesenkte
+/// Form sowie beide Rechte-Deltas.
+struct EvaluatedCandidate {
+    raw: Box<RawAgentDefinition>,
+    ir: Box<ExecutableAgentIr>,
+    rights_delta_author: RightsDelta,
+    rights_delta_base_role: RightsDelta,
+}
+
+/// Validiert `toml_source` und berechnet beide Rechte-Deltas gegen `ceiling`.
+fn evaluate_candidate(
+    toml_source: &str,
+    ceiling: &DefinitionAuthorCeiling,
+) -> Result<EvaluatedCandidate, Vec<String>> {
+    let (raw, ir) = match validate_definition_toml(toml_source) {
+        Validated::Ok { raw, ir } => (raw, ir),
+        Validated::Err(errors) => return Err(errors),
+    };
+    let claimed = claimed_rights_of(&ir);
+    let rights_delta_author = compute_rights_delta(&claimed, ceiling);
+    let base = base_role_rights_of(&raw.id.name, ir.role());
+    let rights_delta_base_role = compute_rights_delta(&claimed, &base);
+    Ok(EvaluatedCandidate {
+        raw,
+        ir,
+        rights_delta_author,
+        rights_delta_base_role,
+    })
+}
+
+/// Baut die `ToolOutput`-Ablehnung für ein nicht-leeres Urheber-Delta
+/// (Contract-Fehlertext, wörtlich).
+fn author_elevation_rejection(delta: &RightsDelta) -> ToolOutput {
+    ToolOutput::json(serde_json::json!({
+        "ok": false,
+        "written": false,
+        "errors": ["authority elevation: the author cannot grant rights it does not hold"],
+        "rights_delta_author": delta.to_json(),
+    }))
+}
+
+/// Bestimmt `review_level` aus `kind` und dem Basisrollen-Delta (das
+/// Urheber-Delta ist an dieser Stelle bereits als leer geprüft — siehe
+/// [`author_elevation_rejection`]). `kind == "uia"` ist immer
+/// `"user_required"` (Nachtrag K: UIAs aktivieren sich nie selbst); sonst
+/// `"user_required"`, wenn die Definition mehr beansprucht als ihre
+/// Basisrolle, sonst `"uia"`. Der Sonderfall `"none"` (auftragsgebunden,
+/// `scope = "run"`) wird nicht hier, sondern vom Aufrufer entschieden, weil
+/// er zusätzlich verlangt, dass **beide** Deltas leer sind.
+fn review_level_for(kind: &str, rights_delta_base_role: &RightsDelta) -> &'static str {
+    if kind == "uia" {
+        "user_required"
+    } else if !rights_delta_base_role.is_empty() {
+        "user_required"
+    } else {
+        "uia"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Atomares Schreiben (Temp-Datei + rename im selben Verzeichnis)
+// ---------------------------------------------------------------------------
+
+/// Schreibt `content` atomar nach `path`: ein Temp-Nachbar im selben
+/// Verzeichnis wird angelegt (`create_new`, also nie ein vorhandenes Ziel
+/// verändert), geschrieben, synchronisiert und über `path` umbenannt.
+/// Nachgebaut aus dem Muster in `harw-cli/src/settings.rs::write_atomic`
+/// (dieses Crate hat keine `harw-fsutil`-Abhängigkeit).
+///
+/// # Arguments
+/// - `path` (`&Path`): Zielpfad; sein Elternverzeichnis wird angelegt, falls
+///   es fehlt.
+/// - `content` (`&[u8]`): zu schreibender Inhalt.
+/// - `mode` (`u32`): Unix-Dateirechte der neuen Datei (unter Unix gesetzt,
+///   unter anderen Plattformen ignoriert).
+///
+/// # Returns
+/// `Ok(())` bei Erfolg.
+///
+/// # Errors
+/// Jeder I/O-Fehler beim Anlegen, Schreiben oder Umbenennen wird
+/// durchgereicht; ein angelegter Temp-Pfad wird beim Fehlschlag entfernt
+/// (best effort).
+fn write_atomic(path: &Path, content: &[u8], mode: u32) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("Zielpfad hat kein Elternverzeichnis"))?;
+    std::fs::create_dir_all(parent)?;
+
+    let temp_path = parent.join(format!(
+        ".agent-def-{}-{}.tmp",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(mode);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+    }
+    let write_result = options.open(&temp_path).and_then(|mut file| {
+        std::io::Write::write_all(&mut file, content).and_then(|()| file.sync_all())
+    });
+    if let Err(source) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(source);
+    }
+    std::fs::rename(&temp_path, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temp_path);
+    })
+}
+
+/// Liest die `id` einer vorhandenen Definitionsdatei, falls sie existiert und
+/// parsbar ist.
+///
+/// # Returns
+/// `Ok(Some(id))`, wenn die Datei existiert und parst; `Ok(None)`, wenn sie
+/// nicht existiert; `Err(reason)`, wenn sie existiert, aber weder lesbar noch
+/// parsbar ist (fail-closed: eine defekte Nachbardatei wird nie stillschweigend
+/// überschrieben).
+fn existing_definition_id(path: &Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(source) => match parse_toml(&source) {
+            Ok(raw) => Ok(Some(raw.id.to_string())),
+            Err(error) => Err(format!(
+                "vorhandene Datei {} ist nicht parsbar und wird nicht überschrieben: {error}",
+                path.display()
+            )),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "vorhandene Datei {} ist nicht lesbar: {error}",
+            path.display()
+        )),
+    }
+}
+
+/// Kebab-case-Name der Rolle, wie ihn `role = "..."` in einer TOML-Definition
+/// trägt (`AgentRoleId` serialisiert selbst schon `rename_all = "kebab-case"`).
+fn role_key(role: AgentRoleId) -> String {
+    serde_json::to_value(role)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+/// Prüft `fields` gegen [`SECRET_PATTERNS`] und liefert für jedes betroffene
+/// Feld eine Fehlermeldung.
+fn scan_for_secrets(fields: &[(&str, &str)]) -> Vec<String> {
+    let mut errors = Vec::new();
+    for (field_name, content) in fields {
+        let lower = content.to_lowercase();
+        if let Some(pattern) = SECRET_PATTERNS
+            .iter()
+            .find(|pattern| lower.contains(*pattern))
+        {
+            errors.push(format!(
+                "Feld '{field_name}' enthält ein offensichtliches Geheimnis-Muster ('{pattern}') \
+                 und wird abgelehnt"
+            ));
+        }
+    }
+    errors
+}
+
+/// Ein einfaches zeilenweises Diff gegen eine bestehende Zieldatei (kein
+/// LCS-Alignment — nur ein positionsweiser Vergleich, wie vom Contract als
+/// "einfaches Zeilen-Diff" verlangt). `old` = `None` ⇒ `"new file"`.
+fn simple_line_diff(old: Option<&str>, new_content: &str) -> String {
+    let Some(old) = old else {
+        return "new file".to_owned();
+    };
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new_content.lines().collect();
+    let mut out = String::new();
+    for index in 0..old_lines.len().max(new_lines.len()) {
+        match (old_lines.get(index), new_lines.get(index)) {
+            (Some(o), Some(n)) if o == n => {}
+            (Some(o), Some(n)) => out.push_str(&format!("-{o}\n+{n}\n")),
+            (Some(o), None) => out.push_str(&format!("-{o}\n")),
+            (None, Some(n)) => out.push_str(&format!("+{n}\n")),
+            (None, None) => {}
+        }
+    }
+    if out.is_empty() {
+        "no changes".to_owned()
+    } else {
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ziel-Commit (Sonderfall `scope = "run"` UND `agents.commit_proposal`)
+// ---------------------------------------------------------------------------
+
+/// Rechte-Bits neu angelegter Agentendefinitions-Dateien.
+const DEFINITION_FILE_MODE: u32 = 0o644;
+
+/// Rechte-Bits der UIA-Bundle-Dateien (persönlich, nie welt-/gruppenlesbar).
+const UIA_FILE_MODE: u32 = 0o600;
+
+/// Schreibt eine einzelne Agentendefinition atomar nach
+/// `<target_dir>/<name>.toml`, sofern eine dort bereits vorhandene Datei
+/// dieselbe `id` trägt (sonst Fehler, siehe [`existing_definition_id`]).
+fn commit_definition(
+    target_dir: &Path,
+    name: &str,
+    toml_source: &str,
+    new_id: &str,
+) -> Result<PathBuf, String> {
+    let target_path = target_dir.join(format!("{name}.toml"));
+    if let Some(existing_id) = existing_definition_id(&target_path)? {
+        if existing_id != new_id {
+            return Err(format!(
+                "vorhandene Datei {} hat id '{existing_id}', neue Definition hat id '{new_id}' \
+                 — wird nicht überschrieben",
+                target_path.display()
+            ));
+        }
+    }
+    write_atomic(&target_path, toml_source.as_bytes(), DEFINITION_FILE_MODE).map_err(|error| {
+        format!(
+            "Schreiben von {} fehlgeschlagen: {error}",
+            target_path.display()
+        )
+    })?;
+    Ok(target_path)
+}
+
+/// Schreibt ein vollständiges UIA-Bundle (`definition.toml`, `agent.toml`,
+/// `Personality.md`, `USER.md`) atomar je Datei nach `bundle_dir`, sofern ein
+/// dort bereits vorhandenes `definition.toml` dieselbe `id` trägt.
+fn commit_uia_bundle(
+    bundle_dir: &Path,
+    new_id: &str,
+    definition_toml: &str,
+    agent_toml: &str,
+    personality_md: &str,
+    user_md: &str,
+) -> Result<(), String> {
+    let definition_path = bundle_dir.join("definition.toml");
+    if let Some(existing_id) = existing_definition_id(&definition_path)? {
+        if existing_id != new_id {
+            return Err(format!(
+                "vorhandenes Bundle {} hat id '{existing_id}', neue Definition hat id '{new_id}' \
+                 — wird nicht überschrieben",
+                bundle_dir.display()
+            ));
+        }
+    }
+    let files: [(PathBuf, &str); 4] = [
+        (definition_path, definition_toml),
+        (bundle_dir.join("agent.toml"), agent_toml),
+        (bundle_dir.join("Personality.md"), personality_md),
+        (bundle_dir.join("USER.md"), user_md),
+    ];
+    for (path, content) in &files {
+        write_atomic(path, content.as_bytes(), UIA_FILE_MODE)
+            .map_err(|error| format!("Schreiben von {} fehlgeschlagen: {error}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Baut den Inhalt von `agent.toml` aus der geparsten `definition.toml`.
+///
+/// Gespiegeltes Feld-Set von `harw-cli/src/uia_bootstrap.rs::write_generated_uia`
+/// (`name`/`role`/`description`), zusätzlich `identity`, wenn `identity_md`
+/// angegeben wurde. Der bestehende Loader (`harw_config::load_uia_personalization`)
+/// liest keine eigene `Identity.md`-Datei (Contract Nachtrag K: "sonst
+/// weglassen") — `identity_md` landet deshalb, wenn angegeben, als
+/// zusätzliches Feld in `agent.toml` statt in einer eigenen, ungelesenen
+/// Datei (ABWEICHUNG, siehe Bericht).
+fn build_agent_toml(raw: &RawAgentDefinition, identity_md: Option<&str>) -> String {
+    let name = raw
+        .name
+        .clone()
+        .unwrap_or_else(|| raw.specialization.clone());
+    let description = raw.description.clone().unwrap_or_default();
+    let mut out =
+        format!("name = {name:?}\nrole = \"user-interface\"\ndescription = {description:?}\n");
+    if let Some(identity) = identity_md {
+        out.push_str(&format!("identity = {identity:?}\n"));
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Vorschläge (`agents.list_proposals`, `agents.commit_proposal`,
+// `agents.reject_proposal`)
+// ---------------------------------------------------------------------------
+
+/// Erzeugt eine zufällig/zeitbasierte, slug-sichere Vorschlags-ID.
+///
+/// Kein Zufallszahlengenerator als neue Abhängigkeit nötig: Millisekunden
+/// seit der Unix-Epoche, Prozess-ID und ein prozessweiter Zähler ergeben in
+/// Kombination eine praktisch eindeutige, rein aus `[a-z0-9-]` bestehende ID.
+fn generate_proposal_id() -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{millis:x}-{:x}-{counter:x}", std::process::id())
+}
+
+/// Das `.proposals/`-Verzeichnis unterhalb von `profile_agents_dir`.
+fn proposals_root(profile_agents_dir: &Path) -> PathBuf {
+    profile_agents_dir.join(PROPOSALS_DIR_NAME)
+}
+
+/// Das Verzeichnis eines einzelnen Vorschlags.
+fn proposal_dir(profile_agents_dir: &Path, proposal_id: &str) -> PathBuf {
+    proposals_root(profile_agents_dir).join(proposal_id)
+}
+
+/// Liest und parst `proposal.json` eines Vorschlags.
+fn read_proposal_json(dir: &Path) -> Result<serde_json::Value, String> {
+    let path = dir.join("proposal.json");
+    let source = std::fs::read_to_string(&path)
+        .map_err(|error| format!("Vorschlag {} nicht lesbar: {error}", path.display()))?;
+    serde_json::from_str(&source).map_err(|error| {
+        format!(
+            "Vorschlag {} nicht lesbar (defektes JSON): {error}",
+            path.display()
+        )
+    })
+}
+
+/// Schreibt `value` atomar als `proposal.json` in `dir`.
+fn write_proposal_json(dir: &Path, value: &serde_json::Value) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|error| format!("Vorschlags-Metadaten nicht serialisierbar: {error}"))?;
+    write_atomic(&dir.join("proposal.json"), &bytes, DEFINITION_FILE_MODE)
+        .map_err(|error| format!("Vorschlags-Metadaten nicht schreibbar: {error}"))
+}
+
+/// Legt einen `kind = "definition"`-Vorschlag an und gibt seine ID zurück.
+#[allow(clippy::too_many_arguments)]
+fn propose_definition(
+    profile_agents_dir: &Path,
+    scope: &str,
+    name: &str,
+    toml_source: &str,
+    evaluated: &EvaluatedCandidate,
+    review_level: &str,
+    existing_target: Option<&Path>,
+) -> Result<String, String> {
+    let proposal_id = generate_proposal_id();
+    let dir = proposal_dir(profile_agents_dir, &proposal_id);
+    write_atomic(
+        &dir.join("definition.toml"),
+        toml_source.as_bytes(),
+        DEFINITION_FILE_MODE,
+    )
+    .map_err(|error| format!("Vorschlag nicht schreibbar: {error}"))?;
+    let old_content = existing_target.and_then(|path| std::fs::read_to_string(path).ok());
+    let diff = simple_line_diff(old_content.as_deref(), toml_source);
+    let created_at = now();
+    let expires_at = created_at + time::Duration::days(PROPOSAL_TTL_DAYS);
+    write_proposal_json(
+        &dir,
+        &serde_json::json!({
+            "proposal_id": proposal_id,
+            "kind": "definition",
+            "scope": scope,
+            "name": name,
+            "dir_name": serde_json::Value::Null,
+            "created_at": format_rfc3339(created_at),
+            "expires_at": format_rfc3339(expires_at),
+            "status": "pending_uia_review",
+            "review_level": review_level,
+            "author_role": role_key(evaluated.ir.role()),
+            "rights_delta_author": evaluated.rights_delta_author.to_json(),
+            "rights_delta_base_role": evaluated.rights_delta_base_role.to_json(),
+            "diff": diff,
+            "validation": {
+                "ok": true,
+                "role": role_key(evaluated.ir.role()),
+                "id": evaluated.ir.id().to_string(),
+            },
+        }),
+    )?;
+    Ok(proposal_id)
+}
+
+/// Legt einen `kind = "uia"`-Vorschlag an und gibt seine ID zurück.
+#[allow(clippy::too_many_arguments)]
+fn propose_uia(
+    profile_agents_dir: &Path,
+    dir_name: &str,
+    definition_toml: &str,
+    agent_toml: &str,
+    personality_md: &str,
+    user_md: &str,
+    evaluated: &EvaluatedCandidate,
+    review_level: &str,
+) -> Result<String, String> {
+    let proposal_id = generate_proposal_id();
+    let dir = proposal_dir(profile_agents_dir, &proposal_id);
+    let files: [(&str, &str); 4] = [
+        ("definition.toml", definition_toml),
+        ("agent.toml", agent_toml),
+        ("Personality.md", personality_md),
+        ("USER.md", user_md),
+    ];
+    for (file_name, content) in files {
+        write_atomic(&dir.join(file_name), content.as_bytes(), UIA_FILE_MODE)
+            .map_err(|error| format!("Vorschlag nicht schreibbar ({file_name}): {error}"))?;
+    }
+    let existing_definition = profile_agents_dir.join(dir_name).join("definition.toml");
+    let old_content = std::fs::read_to_string(&existing_definition).ok();
+    let diff = simple_line_diff(old_content.as_deref(), definition_toml);
+    let created_at = now();
+    let expires_at = created_at + time::Duration::days(PROPOSAL_TTL_DAYS);
+    write_proposal_json(
+        &dir,
+        &serde_json::json!({
+            "proposal_id": proposal_id,
+            "kind": "uia",
+            "scope": serde_json::Value::Null,
+            "name": serde_json::Value::Null,
+            "dir_name": dir_name,
+            "created_at": format_rfc3339(created_at),
+            "expires_at": format_rfc3339(expires_at),
+            "status": "pending_uia_review",
+            "review_level": review_level,
+            "author_role": role_key(evaluated.ir.role()),
+            "rights_delta_author": evaluated.rights_delta_author.to_json(),
+            "rights_delta_base_role": evaluated.rights_delta_base_role.to_json(),
+            "diff": diff,
+            "validation": {
+                "ok": true,
+                "role": role_key(evaluated.ir.role()),
+                "id": evaluated.ir.id().to_string(),
+            },
+        }),
+    )?;
+    Ok(proposal_id)
+}
+
+// ---------------------------------------------------------------------------
+// `agents.validate`
+// ---------------------------------------------------------------------------
+
+/// Deserialisierte Argumente für `agents.validate`.
+#[derive(Debug, Deserialize)]
+struct ValidateArgs {
+    /// Der zu validierende TOML-Quelltext.
+    toml: String,
+}
+
+fn agents_validate_spec() -> ToolSpec {
+    let mut props = BTreeMap::new();
+    props.insert(
+        "toml".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some("TOML-Quelltext einer Agentendefinition.".to_owned()),
+            ..Default::default()
+        },
+    );
+    ToolSpec::Function(FunctionToolSpec {
+        name: ToolName::new("agents.validate"),
+        description: "Validiert eine Agentendefinition (parse_toml → resolve_definition → \
+             lower, gegen die eingebauten Rollen als Basis-Schichten). Schreibt nichts. \
+             Gibt {ok, role?, id?, errors[]} zurück."
+            .to_owned(),
+        parameters: JsonSchema {
+            schema_type: Some(JsonSchemaType::Object),
+            properties: Some(props),
+            required: Some(vec!["toml".to_owned()]),
+            additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
+            ..Default::default()
+        },
+        strict: true,
+    })
+}
+
+/// Baut das `agents.validate`-Ergebnis aus einem [`Validated`].
+fn validate_output(validated: Validated) -> ToolOutput {
+    match validated {
+        Validated::Ok { ir, .. } => ToolOutput::json(serde_json::json!({
+            "ok": true,
+            "role": role_key(ir.role()),
+            "id": ir.id().to_string(),
+            "errors": Vec::<String>::new(),
+        })),
+        Validated::Err(errors) => ToolOutput::json(serde_json::json!({
+            "ok": false,
+            "role": serde_json::Value::Null,
+            "id": serde_json::Value::Null,
+            "errors": errors,
+        })),
+    }
+}
+
+struct AgentsValidateExecutor;
+
+impl ToolExecutor for AgentsValidateExecutor {
+    fn execute<'a>(
+        &'a self,
+        _context: &'a ToolExecutionContext,
+        call: &'a ToolCall,
+    ) -> ToolExecutorFuture<'a> {
+        let arguments = call.arguments.clone();
+        Box::pin(async move {
+            let args: ValidateArgs = match serde_json::from_value(arguments) {
+                Ok(args) => args,
+                Err(error) => {
+                    return Ok(ToolOutput::error(format!(
+                        "agents.validate: ungültige Argumente: {error}"
+                    )));
+                }
+            };
+            Ok(validate_output(validate_definition_toml(&args.toml)))
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `agents.write_definition`
+// ---------------------------------------------------------------------------
+
+/// Deserialisierte Argumente für `agents.write_definition`.
+#[derive(Debug, Deserialize)]
+struct WriteDefinitionArgs {
+    /// `"project"`, `"profile"` oder `"run"`.
+    scope: String,
+    /// Dateiname ohne `.toml`; muss `[a-z0-9-]+` sein.
+    name: String,
+    /// Der zu schreibende TOML-Quelltext.
+    toml: String,
+    /// Pflicht bei `scope = "run"`, sonst unzulässig.
+    #[serde(default)]
+    run_id: Option<String>,
+}
+
+fn agents_write_definition_spec() -> ToolSpec {
+    let mut props = BTreeMap::new();
+    props.insert(
+        "scope".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some(
+                "Zielschicht: \"project\", \"profile\" oder \"run\" (auftragsgebunden, \
+                 nur bei leeren Rechte-Deltas)."
+                    .to_owned(),
+            ),
+            ..Default::default()
+        },
+    );
+    props.insert(
+        "name".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some(
+                "Dateiname ohne '.toml', nur [a-z0-9-], kein Pfadtrenner.".to_owned(),
+            ),
+            ..Default::default()
+        },
+    );
+    props.insert(
+        "toml".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some("TOML-Quelltext der Agentendefinition.".to_owned()),
+            ..Default::default()
+        },
+    );
+    props.insert(
+        "run_id".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some(
+                "Pflicht bei scope = \"run\": Slug des Auftrags, unter dem sofort geschrieben \
+                 wird (nur wenn beide Rechte-Deltas leer sind)."
+                    .to_owned(),
+            ),
+            ..Default::default()
+        },
+    );
+    ToolSpec::Function(FunctionToolSpec {
+        name: ToolName::new("agents.write_definition"),
+        description: "Validiert eine Agentendefinition zwingend und berechnet die Rechte-Deltas \
+             gegen die Urheber-Decke und die Basisrolle. Ein nicht-leeres Urheber-Delta lehnt \
+             hart ab (nichts wird geschrieben, auch kein Vorschlag). Bei scope = \"run\" mit \
+             leeren Deltas wird sofort nach <project>/../state/runs/<run_id>/agents/<name>.toml \
+             geschrieben (review_level \"none\"). Sonst wird immer nur ein Vorschlag abgelegt, \
+             den die UIA über agents.commit_proposal freigeben muss (review_level \"uia\" oder \
+             \"user_required\"). Freigabepflichtig."
+            .to_owned(),
+        parameters: JsonSchema {
+            schema_type: Some(JsonSchemaType::Object),
+            properties: Some(props),
+            required: Some(vec![
+                "scope".to_owned(),
+                "name".to_owned(),
+                "toml".to_owned(),
+            ]),
+            additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
+            ..Default::default()
+        },
+        strict: true,
+    })
+}
+
+struct AgentsWriteDefinitionExecutor {
+    project_agents_dir: Option<PathBuf>,
+    profile_agents_dir: Option<PathBuf>,
+    ceiling: DefinitionAuthorCeiling,
+}
+
+impl AgentsWriteDefinitionExecutor {
+    fn write(&self, call: &ToolCall) -> ToolOutput {
+        let args: WriteDefinitionArgs = match serde_json::from_value(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(error) => {
+                return ToolOutput::error(format!(
+                    "agents.write_definition: ungültige Argumente: {error}"
+                ));
+            }
+        };
+        if !matches!(args.scope.as_str(), "project" | "profile" | "run") {
+            return ToolOutput::error(format!(
+                "agents.write_definition: unbekannter scope '{}' \
+                 (erwartet \"project\", \"profile\" oder \"run\")",
+                args.scope
+            ));
+        }
+        if !is_valid_slug(&args.name) {
+            return ToolOutput::error(format!(
+                "agents.write_definition: '{}' ist kein gültiger Name (nur [a-z0-9-], nicht leer)",
+                args.name
+            ));
+        }
+        if args.scope == "run" {
+            match &args.run_id {
+                Some(run_id) if is_valid_slug(run_id) => {}
+                Some(_) => {
+                    return ToolOutput::error(
+                        "agents.write_definition: run_id ist kein gültiger Slug (nur [a-z0-9-])"
+                            .to_owned(),
+                    );
+                }
+                None => {
+                    return ToolOutput::error(
+                        "agents.write_definition: run_id ist bei scope = \"run\" Pflicht"
+                            .to_owned(),
+                    );
+                }
+            }
+        } else if args.run_id.is_some() {
+            return ToolOutput::error(
+                "agents.write_definition: run_id ist nur bei scope = \"run\" zulässig".to_owned(),
+            );
+        }
+
+        let evaluated = match evaluate_candidate(&args.toml, &self.ceiling) {
+            Ok(evaluated) => evaluated,
+            Err(errors) => {
+                return ToolOutput::json(serde_json::json!({
+                    "ok": false,
+                    "written": false,
+                    "errors": errors,
+                }));
+            }
+        };
+        if !evaluated.rights_delta_author.is_empty() {
+            return author_elevation_rejection(&evaluated.rights_delta_author);
+        }
+
+        if args.scope == "run" {
+            if !evaluated.rights_delta_base_role.is_empty() {
+                return ToolOutput::json(serde_json::json!({
+                    "ok": false,
+                    "written": false,
+                    "errors": ["scope = \"run\" erfordert, dass beide Rechte-Deltas leer sind"],
+                    "rights_delta_base_role": evaluated.rights_delta_base_role.to_json(),
+                }));
+            }
+            let Some(project_agents_dir) = &self.project_agents_dir else {
+                return ToolOutput::error(
+                    "agents.write_definition: kein Projekt-Verzeichnis konfiguriert (scope = \"run\")"
+                        .to_owned(),
+                );
+            };
+            // `run_id` wurde oben bereits als Some+Slug geprüft.
+            let run_id = args.run_id.as_deref().unwrap_or_default();
+            let target_dir = project_agents_dir
+                .join("..")
+                .join("state")
+                .join("runs")
+                .join(run_id)
+                .join("agents");
+            return match commit_definition(
+                &target_dir,
+                &args.name,
+                &args.toml,
+                &evaluated.ir.id().to_string(),
+            ) {
+                Ok(path) => ToolOutput::json(serde_json::json!({
+                    "ok": true,
+                    "written": true,
+                    "path": path.display().to_string(),
+                    "id": evaluated.ir.id().to_string(),
+                    "review_level": "none",
+                    "errors": Vec::<String>::new(),
+                })),
+                Err(reason) => ToolOutput::json(serde_json::json!({
+                    "ok": false,
+                    "written": false,
+                    "errors": [reason],
+                })),
+            };
+        }
+
+        let Some(profile_agents_dir) = &self.profile_agents_dir else {
+            return ToolOutput::error(
+                "agents.write_definition: kein Profil-Verzeichnis konfiguriert — Vorschläge \
+                 können nicht abgelegt werden"
+                    .to_owned(),
+            );
+        };
+        let target_dir = match args.scope.as_str() {
+            "project" => &self.project_agents_dir,
+            _ => &self.profile_agents_dir,
+        };
+        let existing_target = target_dir
+            .as_ref()
+            .map(|dir| dir.join(format!("{}.toml", args.name)));
+        let review_level = review_level_for("definition", &evaluated.rights_delta_base_role);
+        match propose_definition(
+            profile_agents_dir,
+            &args.scope,
+            &args.name,
+            &args.toml,
+            &evaluated,
+            review_level,
+            existing_target.as_deref(),
+        ) {
+            Ok(proposal_id) => ToolOutput::json(serde_json::json!({
+                "ok": true,
+                "written": false,
+                "proposal_id": proposal_id,
+                "status": "pending_uia_review",
+                "review_level": review_level,
+                "note": "Vorschlag abgelegt, noch nicht wirksam. Die UIA muss ihn prüfen und \
+                          über agents.commit_proposal freigeben.",
+                "errors": Vec::<String>::new(),
+            })),
+            Err(reason) => ToolOutput::json(serde_json::json!({
+                "ok": false,
+                "written": false,
+                "errors": [reason],
+            })),
+        }
+    }
+}
+
+impl ToolExecutor for AgentsWriteDefinitionExecutor {
+    fn execute<'a>(
+        &'a self,
+        _context: &'a ToolExecutionContext,
+        call: &'a ToolCall,
+    ) -> ToolExecutorFuture<'a> {
+        Box::pin(async move { Ok(self.write(call)) })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `agents.write_uia` (Nachtrag K)
+// ---------------------------------------------------------------------------
+
+/// Deserialisierte Argumente für `agents.write_uia`.
+#[derive(Debug, Deserialize)]
+struct WriteUiaArgs {
+    /// Verzeichnisname des Bundles unter `<profil>/agents/`; muss `[a-z0-9-]+` sein.
+    dir_name: String,
+    /// TOML-Quelltext von `definition.toml`; muss `role = "user-interface"` tragen.
+    definition_toml: String,
+    /// Inhalt von `Personality.md`.
+    personality_md: String,
+    /// Optionaler Inhalt von `USER.md`; ohne Angabe wird ein leeres Muster
+    /// geschrieben (dieselbe Platzhalterform wie `uia_bootstrap::write_generated_uia`).
+    #[serde(default)]
+    user_md: Option<String>,
+    /// Optionaler frei formulierter Identitätstext (siehe [`build_agent_toml`]).
+    #[serde(default)]
+    identity_md: Option<String>,
+}
+
+fn agents_write_uia_spec() -> ToolSpec {
+    let mut props = BTreeMap::new();
+    props.insert(
+        "dir_name".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some(
+                "Bundle-Verzeichnisname unter <profil>/agents/, nur [a-z0-9-].".to_owned(),
+            ),
+            ..Default::default()
+        },
+    );
+    props.insert(
+        "definition_toml".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some(
+                "TOML-Quelltext von definition.toml; role muss \"user-interface\" sein.".to_owned(),
+            ),
+            ..Default::default()
+        },
+    );
+    props.insert(
+        "personality_md".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some("Inhalt von Personality.md (Ton, Antwortverhalten).".to_owned()),
+            ..Default::default()
+        },
+    );
+    props.insert(
+        "user_md".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some(
+                "Optionaler Inhalt von USER.md (freiwilliger Nutzerkontext).".to_owned(),
+            ),
+            ..Default::default()
+        },
+    );
+    props.insert(
+        "identity_md".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some(
+                "Optionaler zusätzlicher Identitätstext (wird in agent.toml abgelegt).".to_owned(),
+            ),
+            ..Default::default()
+        },
+    );
+    ToolSpec::Function(FunctionToolSpec {
+        name: ToolName::new("agents.write_uia"),
+        description: "Validiert ein UIA-Bundle zwingend, verlangt role = \"user-interface\" und \
+             lehnt offensichtliche Geheimnisse ab. Berechnet die Rechte-Deltas wie \
+             agents.write_definition; ein nicht-leeres Urheber-Delta lehnt hart ab. Legt sonst \
+             immer einen Vorschlag mit review_level \"user_required\" ab (UIAs aktivieren sich \
+             nie selbst) — die UIA muss ihn über agents.commit_proposal freigeben. \
+             Freigabepflichtig."
+            .to_owned(),
+        parameters: JsonSchema {
+            schema_type: Some(JsonSchemaType::Object),
+            properties: Some(props),
+            required: Some(vec![
+                "dir_name".to_owned(),
+                "definition_toml".to_owned(),
+                "personality_md".to_owned(),
+            ]),
+            additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
+            ..Default::default()
+        },
+        strict: true,
+    })
+}
+
+/// Platzhaltertext für `USER.md`, wenn `user_md` nicht angegeben wurde —
+/// dieselbe Form wie `harw-cli/src/uia_bootstrap.rs::write_generated_uia`.
+const DEFAULT_USER_MD: &str = "# Nutzerkontext\n\n<!-- Trage hier freiwillig bereitgestellte Präferenzen, Arbeitsweisen und relevante Kontextinformationen ein. Keine Geheimnisse eintragen. -->\n";
+
+/// Aktivierungs-Hinweistext für ein erfolgreich freigegebenes UIA-Bundle
+/// (Nachtrag K: "Ergebnistext nennt, wie der Nutzer aktivieren kann").
+fn activation_hint(id: &str) -> String {
+    format!(
+        "Nicht aktiviert. Zum Aktivieren active_uia_definition = \"{id}\" in der \
+         Harness-Config (harness.toml) setzen."
+    )
+}
+
+struct AgentsWriteUiaExecutor {
+    profile_agents_dir: Option<PathBuf>,
+    ceiling: DefinitionAuthorCeiling,
+}
+
+impl AgentsWriteUiaExecutor {
+    fn write(&self, call: &ToolCall) -> ToolOutput {
+        let args: WriteUiaArgs = match serde_json::from_value(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(error) => {
+                return ToolOutput::error(format!(
+                    "agents.write_uia: ungültige Argumente: {error}"
+                ));
+            }
+        };
+
+        let Some(profile_agents_dir) = &self.profile_agents_dir else {
+            return ToolOutput::error(
+                "agents.write_uia: kein Profil-Verzeichnis konfiguriert — UIA-Bundles werden \
+                 nie ins Projekt geschrieben"
+                    .to_owned(),
+            );
+        };
+        if !is_valid_slug(&args.dir_name) {
+            return ToolOutput::error(format!(
+                "agents.write_uia: '{}' ist kein gültiger Verzeichnisname (nur [a-z0-9-], nicht leer)",
+                args.dir_name
+            ));
+        }
+
+        let user_md = args
+            .user_md
+            .clone()
+            .unwrap_or_else(|| DEFAULT_USER_MD.to_owned());
+        let secret_errors = scan_for_secrets(&[
+            ("definition_toml", &args.definition_toml),
+            ("personality_md", &args.personality_md),
+            ("user_md", &user_md),
+            ("identity_md", args.identity_md.as_deref().unwrap_or("")),
+        ]);
+        if !secret_errors.is_empty() {
+            return ToolOutput::json(serde_json::json!({
+                "ok": false,
+                "written": false,
+                "errors": secret_errors,
+            }));
+        }
+
+        let evaluated = match evaluate_candidate(&args.definition_toml, &self.ceiling) {
+            Ok(evaluated) => evaluated,
+            Err(errors) => {
+                return ToolOutput::json(serde_json::json!({
+                    "ok": false,
+                    "written": false,
+                    "errors": errors,
+                }));
+            }
+        };
+        if evaluated.ir.role() != AgentRoleId::UserInterface {
+            return ToolOutput::json(serde_json::json!({
+                "ok": false,
+                "written": false,
+                "errors": [format!(
+                    "agents.write_uia: definition_toml hat role '{}', erwartet 'user-interface'",
+                    role_key(evaluated.ir.role())
+                )],
+            }));
+        }
+        if !evaluated.rights_delta_author.is_empty() {
+            return author_elevation_rejection(&evaluated.rights_delta_author);
+        }
+
+        let agent_toml = build_agent_toml(&evaluated.raw, args.identity_md.as_deref());
+        let review_level = review_level_for("uia", &evaluated.rights_delta_base_role);
+        match propose_uia(
+            profile_agents_dir,
+            &args.dir_name,
+            &args.definition_toml,
+            &agent_toml,
+            &args.personality_md,
+            &user_md,
+            &evaluated,
+            review_level,
+        ) {
+            Ok(proposal_id) => ToolOutput::json(serde_json::json!({
+                "ok": true,
+                "written": false,
+                "proposal_id": proposal_id,
+                "status": "pending_uia_review",
+                "review_level": review_level,
+                "note": "Vorschlag abgelegt, noch nicht wirksam. Die UIA muss ihn prüfen und \
+                          über agents.commit_proposal freigeben.",
+                "errors": Vec::<String>::new(),
+            })),
+            Err(reason) => ToolOutput::json(serde_json::json!({
+                "ok": false,
+                "written": false,
+                "errors": [reason],
+            })),
+        }
+    }
+}
+
+impl ToolExecutor for AgentsWriteUiaExecutor {
+    fn execute<'a>(
+        &'a self,
+        _context: &'a ToolExecutionContext,
+        call: &'a ToolCall,
+    ) -> ToolExecutorFuture<'a> {
+        Box::pin(async move { Ok(self.write(call)) })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `agents.list_proposals`
+// ---------------------------------------------------------------------------
+
+fn agents_list_proposals_spec() -> ToolSpec {
+    ToolSpec::Function(FunctionToolSpec {
+        name: ToolName::new("agents.list_proposals"),
+        description: "Listet alle abgelegten Vorschläge unter <profile_agents_dir>/.proposals/ \
+             mit proposal_id, kind, scope/dir_name, review_level, created_at, expires_at, \
+             status und expired. Rein lesend."
+            .to_owned(),
+        parameters: JsonSchema {
+            schema_type: Some(JsonSchemaType::Object),
+            properties: Some(BTreeMap::new()),
+            required: Some(Vec::new()),
+            additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
+            ..Default::default()
+        },
+        strict: true,
+    })
+}
+
+struct AgentsListProposalsExecutor {
+    profile_agents_dir: Option<PathBuf>,
+}
+
+impl AgentsListProposalsExecutor {
+    fn list(&self) -> ToolOutput {
+        let Some(profile_agents_dir) = &self.profile_agents_dir else {
+            return ToolOutput::json(serde_json::json!({ "ok": true, "proposals": [] }));
+        };
+        let root = proposals_root(profile_agents_dir);
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return ToolOutput::json(serde_json::json!({ "ok": true, "proposals": [] }));
+            }
+            Err(error) => {
+                return ToolOutput::error(format!(
+                    "agents.list_proposals: {} nicht lesbar: {error}",
+                    root.display()
+                ));
+            }
+        };
+
+        let mut proposals = Vec::new();
+        for entry in entries.flatten() {
+            if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            match read_proposal_json(&entry.path()) {
+                Ok(mut value) => {
+                    let expired = value
+                        .get("expires_at")
+                        .and_then(|v| v.as_str())
+                        .map(is_expired)
+                        .unwrap_or(false);
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("expired".to_owned(), serde_json::Value::Bool(expired));
+                    }
+                    proposals.push(value);
+                }
+                Err(reason) => proposals.push(serde_json::json!({
+                    "proposal_id": entry.file_name().to_string_lossy(),
+                    "error": reason,
+                })),
+            }
+        }
+        proposals.sort_by(|a, b| {
+            let a = a
+                .get("proposal_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let b = b
+                .get("proposal_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            a.cmp(b)
+        });
+
+        ToolOutput::json(serde_json::json!({ "ok": true, "proposals": proposals }))
+    }
+}
+
+impl ToolExecutor for AgentsListProposalsExecutor {
+    fn execute<'a>(
+        &'a self,
+        _context: &'a ToolExecutionContext,
+        _call: &'a ToolCall,
+    ) -> ToolExecutorFuture<'a> {
+        Box::pin(async move { Ok(self.list()) })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `agents.commit_proposal` (nur `DefinitionWriteMode::Commit` + gesetzte Decke)
+// ---------------------------------------------------------------------------
+
+/// Deserialisierte Argumente für `agents.commit_proposal`.
+#[derive(Debug, Deserialize)]
+struct CommitProposalArgs {
+    proposal_id: String,
+    /// Pflicht (`true`), wenn der neu berechnete `review_level` dieses
+    /// Providers `"user_required"` ist. Siehe Moduldoku, Abschnitt
+    /// „`user_confirmed` und die Freigabe-Kette" — dieses Feld ersetzt die
+    /// Freigabe-Prüfung des Harness nicht, sondern setzt sie voraus.
+    #[serde(default)]
+    user_confirmed: bool,
+}
+
+fn agents_commit_proposal_spec() -> ToolSpec {
+    let mut props = BTreeMap::new();
+    props.insert(
+        "proposal_id".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some(
+                "ID des freizugebenden Vorschlags (aus agents.list_proposals).".to_owned(),
+            ),
+            ..Default::default()
+        },
+    );
+    props.insert(
+        "user_confirmed".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::Boolean),
+            description: Some(
+                "Pflicht (true), wenn der neu berechnete review_level \"user_required\" ist \
+                 (jedes UIA-Bundle, oder ein Basisrollen-Delta). Dieses Werkzeug ist selbst \
+                 freigabepflichtig — die eigentliche Nutzerbestätigung läuft über die \
+                 Freigabe-Kette des Harness, bevor dieser Aufruf überhaupt ausgeführt wird."
+                    .to_owned(),
+            ),
+            ..Default::default()
+        },
+    );
+    ToolSpec::Function(FunctionToolSpec {
+        name: ToolName::new("agents.commit_proposal"),
+        description: "Validiert einen abgelegten, nicht abgelaufenen Vorschlag erneut und \
+             berechnet beide Rechte-Deltas neu gegen die Decke DIESES Aufrufers (kann von der \
+             Decke des ursprünglichen Autors abweichen). Ein Urheber-Delta lehnt hart ab. Bei \
+             review_level \"user_required\" ist user_confirmed = true Pflicht. Schreibt danach \
+             ans Ziel wie agents.write_definition/agents.write_uia. UIA-Bundles werden dadurch \
+             nicht aktiviert. Freigabepflichtig."
+            .to_owned(),
+        parameters: JsonSchema {
+            schema_type: Some(JsonSchemaType::Object),
+            properties: Some(props),
+            required: Some(vec!["proposal_id".to_owned()]),
+            additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
+            ..Default::default()
+        },
+        strict: true,
+    })
+}
+
+struct AgentsCommitProposalExecutor {
+    project_agents_dir: Option<PathBuf>,
+    profile_agents_dir: Option<PathBuf>,
+    ceiling: DefinitionAuthorCeiling,
+}
+
+impl AgentsCommitProposalExecutor {
+    fn commit(&self, call: &ToolCall) -> ToolOutput {
+        let args: CommitProposalArgs = match serde_json::from_value(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(error) => {
+                return ToolOutput::error(format!(
+                    "agents.commit_proposal: ungültige Argumente: {error}"
+                ));
+            }
+        };
+        if !is_valid_slug(&args.proposal_id) {
+            return ToolOutput::error(format!(
+                "agents.commit_proposal: '{}' ist keine gültige proposal_id",
+                args.proposal_id
+            ));
+        }
+        let Some(profile_agents_dir) = &self.profile_agents_dir else {
+            return ToolOutput::error(
+                "agents.commit_proposal: kein Profil-Verzeichnis konfiguriert".to_owned(),
+            );
+        };
+
+        let dir = proposal_dir(profile_agents_dir, &args.proposal_id);
+        let proposal = match read_proposal_json(&dir) {
+            Ok(value) => value,
+            Err(reason) => return ToolOutput::error(format!("agents.commit_proposal: {reason}")),
+        };
+        let status = proposal
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if status != "pending_uia_review" {
+            return ToolOutput::error(format!(
+                "agents.commit_proposal: Vorschlag '{}' hat status '{status}', erwartet \
+                 'pending_uia_review'",
+                args.proposal_id
+            ));
+        }
+        let expired = proposal
+            .get("expires_at")
+            .and_then(|v| v.as_str())
+            .map(is_expired)
+            .unwrap_or(false);
+        if expired {
+            return ToolOutput::json(serde_json::json!({
+                "ok": false,
+                "written": false,
+                "errors": [format!("Vorschlag '{}' ist abgelaufen", args.proposal_id)],
+            }));
+        }
+        let kind = proposal
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        let definition_toml = match std::fs::read_to_string(dir.join("definition.toml")) {
+            Ok(source) => source,
+            Err(error) => {
+                return ToolOutput::error(format!(
+                    "agents.commit_proposal: definition.toml von '{}' nicht lesbar: {error}",
+                    args.proposal_id
+                ));
+            }
+        };
+
+        // Erneute Validierung UND erneute Deltas — jeweils gegen DIESE Decke
+        // (kann von der Decke des ursprünglichen Autors abweichen).
+        let evaluated = match evaluate_candidate(&definition_toml, &self.ceiling) {
+            Ok(evaluated) => evaluated,
+            Err(errors) => {
+                return ToolOutput::json(serde_json::json!({
+                    "ok": false,
+                    "written": false,
+                    "errors": errors,
+                }));
+            }
+        };
+        if kind == "uia" && evaluated.ir.role() != AgentRoleId::UserInterface {
+            return ToolOutput::json(serde_json::json!({
+                "ok": false,
+                "written": false,
+                "errors": [format!(
+                    "agents.commit_proposal: definition_toml hat role '{}', erwartet \
+                     'user-interface'",
+                    role_key(evaluated.ir.role())
+                )],
+            }));
+        }
+        if !evaluated.rights_delta_author.is_empty() {
+            return author_elevation_rejection(&evaluated.rights_delta_author);
+        }
+
+        let review_level = review_level_for(kind, &evaluated.rights_delta_base_role);
+        if review_level == "user_required" && !args.user_confirmed {
+            return ToolOutput::json(serde_json::json!({
+                "ok": false,
+                "written": false,
+                "review_level": review_level,
+                "requires_user_approval": true,
+                "errors": ["review_level ist \"user_required\" — user_confirmed = true ist Pflicht \
+                            (siehe Freigabe-Kette in der Moduldoku)"],
+            }));
+        }
+
+        let commit_result: Result<(String, Option<String>), String> = match kind {
+            "definition" => {
+                let scope = proposal
+                    .get("scope")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let name = proposal
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let target_dir = match scope {
+                    "project" => &self.project_agents_dir,
+                    _ => &self.profile_agents_dir,
+                };
+                match target_dir {
+                    Some(target_dir) => commit_definition(
+                        target_dir,
+                        name,
+                        &definition_toml,
+                        &evaluated.ir.id().to_string(),
+                    )
+                    .map(|path| (path.display().to_string(), None)),
+                    None => Err(format!("kein Verzeichnis für scope '{scope}' konfiguriert")),
+                }
+            }
+            "uia" => {
+                let secret_errors = scan_for_secrets(&[("definition_toml", &definition_toml)]);
+                if !secret_errors.is_empty() {
+                    Err(secret_errors.join("; "))
+                } else {
+                    let dir_name = proposal
+                        .get("dir_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let agent_toml =
+                        std::fs::read_to_string(dir.join("agent.toml")).unwrap_or_default();
+                    let personality_md =
+                        std::fs::read_to_string(dir.join("Personality.md")).unwrap_or_default();
+                    let user_md = std::fs::read_to_string(dir.join("USER.md")).unwrap_or_default();
+                    let bundle_dir = profile_agents_dir.join(dir_name);
+                    let new_id = evaluated.ir.id().to_string();
+                    commit_uia_bundle(
+                        &bundle_dir,
+                        &new_id,
+                        &definition_toml,
+                        &agent_toml,
+                        &personality_md,
+                        &user_md,
+                    )
+                    .map(|()| {
+                        (
+                            bundle_dir.display().to_string(),
+                            Some(activation_hint(&new_id)),
+                        )
+                    })
+                }
+            }
+            other => Err(format!("unbekannte Vorschlagsart '{other}'")),
+        };
+
+        match commit_result {
+            Ok((path, hint)) => {
+                let mut updated = proposal.clone();
+                if let Some(object) = updated.as_object_mut() {
+                    object.insert(
+                        "status".to_owned(),
+                        serde_json::Value::String("committed".to_owned()),
+                    );
+                    object.insert(
+                        "committed_at".to_owned(),
+                        serde_json::Value::String(now_rfc3339()),
+                    );
+                    object.insert(
+                        "user_confirmed".to_owned(),
+                        serde_json::Value::Bool(args.user_confirmed),
+                    );
+                }
+                // Ziel ist bereits geschrieben; ein Fehler beim Status-Update
+                // ist nicht mehr rückgängig zu machen (kein Rollback des
+                // Ziel-Schreibens) und wird deshalb nur als zusätzlicher
+                // Eintrag in `errors` gemeldet, nicht als harter Fehlschlag —
+                // dieses Crate hat keine `tracing`-Abhängigkeit (siehe Bericht).
+                let mut status_update_errors: Vec<String> = Vec::new();
+                if let Err(reason) = write_proposal_json(&dir, &updated) {
+                    status_update_errors.push(format!(
+                        "Ziel geschrieben, aber Vorschlags-Status nicht aktualisierbar: {reason}"
+                    ));
+                }
+                let mut result = serde_json::json!({
+                    "ok": true,
+                    "written": true,
+                    "proposal_id": args.proposal_id,
+                    "path": path,
+                    "id": evaluated.ir.id().to_string(),
+                    "review_level": review_level,
+                    "requires_user_approval": review_level == "user_required",
+                    "errors": status_update_errors,
+                });
+                if let (Some(hint), Some(object)) = (hint, result.as_object_mut()) {
+                    object.insert(
+                        "activation_hint".to_owned(),
+                        serde_json::Value::String(hint),
+                    );
+                }
+                ToolOutput::json(result)
+            }
+            Err(reason) => ToolOutput::json(serde_json::json!({
+                "ok": false,
+                "written": false,
+                "errors": [reason],
+            })),
+        }
+    }
+}
+
+impl ToolExecutor for AgentsCommitProposalExecutor {
+    fn execute<'a>(
+        &'a self,
+        _context: &'a ToolExecutionContext,
+        call: &'a ToolCall,
+    ) -> ToolExecutorFuture<'a> {
+        Box::pin(async move { Ok(self.commit(call)) })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `agents.reject_proposal` (nur `DefinitionWriteMode::Commit` + gesetzte Decke)
+// ---------------------------------------------------------------------------
+
+/// Deserialisierte Argumente für `agents.reject_proposal`.
+#[derive(Debug, Deserialize)]
+struct RejectProposalArgs {
+    proposal_id: String,
+    reason: String,
+}
+
+fn agents_reject_proposal_spec() -> ToolSpec {
+    let mut props = BTreeMap::new();
+    props.insert(
+        "proposal_id".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some("ID des abzulehnenden Vorschlags.".to_owned()),
+            ..Default::default()
+        },
+    );
+    props.insert(
+        "reason".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some("Menschenlesbare Begründung der Ablehnung.".to_owned()),
+            ..Default::default()
+        },
+    );
+    ToolSpec::Function(FunctionToolSpec {
+        name: ToolName::new("agents.reject_proposal"),
+        description: "Markiert einen Vorschlag als 'rejected' mit Begründung. Schreibt nichts \
+             an ein Ziel. Nur für einen Vorschlag mit status = \"pending_uia_review\". \
+             Freigabepflichtig."
+            .to_owned(),
+        parameters: JsonSchema {
+            schema_type: Some(JsonSchemaType::Object),
+            properties: Some(props),
+            required: Some(vec!["proposal_id".to_owned(), "reason".to_owned()]),
+            additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
+            ..Default::default()
+        },
+        strict: true,
+    })
+}
+
+struct AgentsRejectProposalExecutor {
+    profile_agents_dir: Option<PathBuf>,
+}
+
+impl AgentsRejectProposalExecutor {
+    fn reject(&self, call: &ToolCall) -> ToolOutput {
+        let args: RejectProposalArgs = match serde_json::from_value(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(error) => {
+                return ToolOutput::error(format!(
+                    "agents.reject_proposal: ungültige Argumente: {error}"
+                ));
+            }
+        };
+        if !is_valid_slug(&args.proposal_id) {
+            return ToolOutput::error(format!(
+                "agents.reject_proposal: '{}' ist keine gültige proposal_id",
+                args.proposal_id
+            ));
+        }
+        let Some(profile_agents_dir) = &self.profile_agents_dir else {
+            return ToolOutput::error(
+                "agents.reject_proposal: kein Profil-Verzeichnis konfiguriert".to_owned(),
+            );
+        };
+
+        let dir = proposal_dir(profile_agents_dir, &args.proposal_id);
+        let mut proposal = match read_proposal_json(&dir) {
+            Ok(value) => value,
+            Err(reason) => return ToolOutput::error(format!("agents.reject_proposal: {reason}")),
+        };
+        let status = proposal
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if status != "pending_uia_review" {
+            return ToolOutput::error(format!(
+                "agents.reject_proposal: Vorschlag '{}' hat status '{status}', erwartet \
+                 'pending_uia_review'",
+                args.proposal_id
+            ));
+        }
+
+        if let Some(object) = proposal.as_object_mut() {
+            object.insert(
+                "status".to_owned(),
+                serde_json::Value::String("rejected".to_owned()),
+            );
+            object.insert(
+                "rejected_at".to_owned(),
+                serde_json::Value::String(now_rfc3339()),
+            );
+            object.insert(
+                "reason".to_owned(),
+                serde_json::Value::String(args.reason.clone()),
+            );
+        }
+        match write_proposal_json(&dir, &proposal) {
+            Ok(()) => ToolOutput::json(serde_json::json!({
+                "ok": true,
+                "proposal_id": args.proposal_id,
+                "status": "rejected",
+            })),
+            Err(reason) => ToolOutput::error(format!("agents.reject_proposal: {reason}")),
+        }
+    }
+}
+
+impl ToolExecutor for AgentsRejectProposalExecutor {
+    fn execute<'a>(
+        &'a self,
+        _context: &'a ToolExecutionContext,
+        call: &'a ToolCall,
+    ) -> ToolExecutorFuture<'a> {
+        Box::pin(async move { Ok(self.reject(call)) })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `ToolProvider`
+// ---------------------------------------------------------------------------
+
+impl ToolProvider for AgentDefinitionToolProvider {
+    /// Gibt die registrierten Werkzeug-Spezifikationen zurück.
+    ///
+    /// # Description
+    /// `agents.validate` und `agents.list_proposals` sind immer registriert.
+    /// `agents.write_definition`/`agents.write_uia` nur, wenn [`Self::ceiling`]
+    /// gesetzt ist (fail-closed sonst). `agents.commit_proposal`/
+    /// `agents.reject_proposal` zusätzlich nur im [`DefinitionWriteMode::Commit`].
+    fn tools(&self) -> Vec<ToolSpec> {
+        let mut tools = vec![agents_validate_spec(), agents_list_proposals_spec()];
+        if self.ceiling.is_some() {
+            tools.push(agents_write_definition_spec());
+            tools.push(agents_write_uia_spec());
+            if self.mode == DefinitionWriteMode::Commit {
+                tools.push(agents_commit_proposal_spec());
+                tools.push(agents_reject_proposal_spec());
+            }
+        }
+        tools
+    }
+
+    /// Gibt den Executor für den angegebenen Tool-Namen zurück; `None` für
+    /// jedes Werkzeug, das laut [`Self::tools`] gerade nicht registriert ist.
+    fn executor(&self, name: &ToolName) -> Option<std::sync::Arc<dyn ToolExecutor>> {
+        match name.as_str() {
+            "agents.validate" => Some(std::sync::Arc::new(AgentsValidateExecutor)),
+            "agents.list_proposals" => Some(std::sync::Arc::new(AgentsListProposalsExecutor {
+                profile_agents_dir: self.profile_agents_dir.clone(),
+            })),
+            "agents.write_definition" => self.ceiling.clone().map(|ceiling| {
+                std::sync::Arc::new(AgentsWriteDefinitionExecutor {
+                    project_agents_dir: self.project_agents_dir.clone(),
+                    profile_agents_dir: self.profile_agents_dir.clone(),
+                    ceiling,
+                }) as std::sync::Arc<dyn ToolExecutor>
+            }),
+            "agents.write_uia" => self.ceiling.clone().map(|ceiling| {
+                std::sync::Arc::new(AgentsWriteUiaExecutor {
+                    profile_agents_dir: self.profile_agents_dir.clone(),
+                    ceiling,
+                }) as std::sync::Arc<dyn ToolExecutor>
+            }),
+            "agents.commit_proposal" if self.mode == DefinitionWriteMode::Commit => {
+                self.ceiling.clone().map(|ceiling| {
+                    std::sync::Arc::new(AgentsCommitProposalExecutor {
+                        project_agents_dir: self.project_agents_dir.clone(),
+                        profile_agents_dir: self.profile_agents_dir.clone(),
+                        ceiling,
+                    }) as std::sync::Arc<dyn ToolExecutor>
+                })
+            }
+            "agents.reject_proposal" if self.mode == DefinitionWriteMode::Commit => {
+                self.ceiling.as_ref().map(|_| {
+                    std::sync::Arc::new(AgentsRejectProposalExecutor {
+                        profile_agents_dir: self.profile_agents_dir.clone(),
+                    }) as std::sync::Arc<dyn ToolExecutor>
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// `agents.validate` und `agents.list_proposals` sind rein lesend und
+    /// commutative; alle schreibenden Werkzeuge sind es nicht.
+    fn parallel_safe(&self, name: &ToolName) -> bool {
+        matches!(name.as_str(), "agents.validate" | "agents.list_proposals")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use harw_sandbox::Permission;
+
+    fn empty_ceiling(role: AgentRoleId) -> DefinitionAuthorCeiling {
+        DefinitionAuthorCeiling {
+            role,
+            tools: BTreeSet::new(),
+            permissions: PermissionSet::empty(),
+            max_depth: 0,
+            budget_tokens: 0,
+            effort_cap: None,
+        }
+    }
+
+    #[test]
+    fn test_is_valid_slug_rejects_path_separators_and_empty() {
+        assert!(is_valid_slug("agent-steward"));
+        assert!(is_valid_slug("uia-01"));
+        assert!(!is_valid_slug(""));
+        assert!(!is_valid_slug("../escape"));
+        assert!(!is_valid_slug("a/b"));
+        assert!(!is_valid_slug("Has-Upper"));
+        assert!(!is_valid_slug("has space"));
+    }
+
+    #[test]
+    fn test_generate_proposal_id_is_a_valid_slug() {
+        let id = generate_proposal_id();
+        assert!(is_valid_slug(&id), "proposal id must be a valid slug: {id}");
+    }
+
+    #[test]
+    fn test_validate_definition_toml_rejects_unparsable_source() {
+        match validate_definition_toml("not = [valid") {
+            Validated::Err(errors) => assert!(!errors.is_empty()),
+            Validated::Ok { .. } => panic!("expected a validation error"),
+        }
+    }
+
+    #[test]
+    fn test_compute_rights_delta_flags_added_tool_and_higher_budget() {
+        let claimed = DefinitionAuthorCeiling {
+            role: AgentRoleId::Worker,
+            tools: BTreeSet::from(["fs.write".to_owned(), "shell.exec".to_owned()]),
+            permissions: PermissionSet::from_policy([
+                Permission::WriteWorkspace,
+                Permission::ExecuteProcess,
+            ]),
+            max_depth: 2,
+            budget_tokens: 5_000,
+            effort_cap: Some("high".to_owned()),
+        };
+        let limit = DefinitionAuthorCeiling {
+            role: AgentRoleId::Worker,
+            tools: BTreeSet::from(["fs.write".to_owned()]),
+            permissions: PermissionSet::from_policy([Permission::WriteWorkspace]),
+            max_depth: 1,
+            budget_tokens: 1_000,
+            effort_cap: Some("low".to_owned()),
+        };
+        let delta = compute_rights_delta(&claimed, &limit);
+        assert_eq!(delta.added_tools, vec!["shell.exec".to_owned()]);
+        assert_eq!(delta.added_permissions, vec!["ExecuteProcess".to_owned()]);
+        assert_eq!(delta.depth_increase, Some(1));
+        assert_eq!(delta.budget_increase, Some(4_000));
+        assert_eq!(delta.effort_increase, Some("high".to_owned()));
+        assert!(!delta.is_empty());
+    }
+
+    #[test]
+    fn test_compute_rights_delta_is_empty_for_equal_or_narrower_claim() {
+        let ceiling = DefinitionAuthorCeiling {
+            role: AgentRoleId::Worker,
+            tools: BTreeSet::from(["fs.read".to_owned()]),
+            permissions: PermissionSet::from_policy([Permission::ReadWorkspace]),
+            max_depth: 3,
+            budget_tokens: 10_000,
+            effort_cap: Some("medium".to_owned()),
+        };
+        let delta = compute_rights_delta(&ceiling, &ceiling);
+        assert!(
+            delta.is_empty(),
+            "identical claim and ceiling must yield an empty delta"
+        );
+    }
+
+    #[test]
+    fn test_agents_write_definition_rejects_author_elevation_without_touching_disk() {
+        let ceiling = empty_ceiling(AgentRoleId::UserInterface);
+        let executor = AgentsWriteDefinitionExecutor {
+            project_agents_dir: None,
+            profile_agents_dir: None,
+            ceiling,
+        };
+        let toml = r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.elevated-worker@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "elevated-worker"
+
+[tools]
+admitted = ["fs.write"]
+
+[spawn]
+max_depth = 0
+
+[return]
+contract = "harwness.return.research-finding@1"
+"#;
+        let call = ToolCall {
+            id: Default::default(),
+            name: ToolName::new("agents.write_definition"),
+            arguments: serde_json::json!({
+                "scope": "profile",
+                "name": "elevated-worker",
+                "toml": toml,
+            }),
+        };
+        let output = executor.write(&call);
+        match output {
+            ToolOutput::Json { content } => {
+                assert_eq!(content["ok"], serde_json::json!(false));
+                assert_eq!(content["written"], serde_json::json!(false));
+                let errors = content["errors"].as_array().unwrap();
+                assert!(errors[0].as_str().unwrap().contains("authority elevation"));
+            }
+            other => panic!("expected a json error output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_agents_write_definition_rejects_invalid_slug_without_touching_disk() {
+        let ceiling = empty_ceiling(AgentRoleId::RootOrchestrator);
+        let executor = AgentsWriteDefinitionExecutor {
+            project_agents_dir: None,
+            profile_agents_dir: None,
+            ceiling,
+        };
+        let call = ToolCall {
+            id: Default::default(),
+            name: ToolName::new("agents.write_definition"),
+            arguments: serde_json::json!({
+                "scope": "project",
+                "name": "../escape",
+                "toml": "irrelevant",
+            }),
+        };
+        let output = executor.write(&call);
+        match output {
+            ToolOutput::Error { message } => assert!(message.contains("gültiger Name")),
+            other => panic!("expected an error output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_agents_write_definition_run_scope_requires_run_id() {
+        let ceiling = empty_ceiling(AgentRoleId::RootOrchestrator);
+        let executor = AgentsWriteDefinitionExecutor {
+            project_agents_dir: None,
+            profile_agents_dir: None,
+            ceiling,
+        };
+        let call = ToolCall {
+            id: Default::default(),
+            name: ToolName::new("agents.write_definition"),
+            arguments: serde_json::json!({
+                "scope": "run",
+                "name": "task-agent",
+                "toml": "irrelevant",
+            }),
+        };
+        let output = executor.write(&call);
+        match output {
+            ToolOutput::Error { message } => assert!(message.contains("run_id")),
+            other => panic!("expected an error output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_review_level_for_uia_is_always_user_required() {
+        let empty_delta = RightsDelta::default();
+        assert_eq!(review_level_for("uia", &empty_delta), "user_required");
+    }
+
+    #[test]
+    fn test_review_level_for_definition_with_base_role_delta_is_user_required() {
+        let mut delta = RightsDelta::default();
+        delta.added_tools.push("shell.exec".to_owned());
+        assert_eq!(review_level_for("definition", &delta), "user_required");
+    }
+
+    #[test]
+    fn test_review_level_for_definition_without_base_role_delta_is_uia() {
+        let empty_delta = RightsDelta::default();
+        assert_eq!(review_level_for("definition", &empty_delta), "uia");
+    }
+
+    #[test]
+    fn test_is_expired_detects_past_timestamp() {
+        let past = format_rfc3339(now() - time::Duration::days(1));
+        let future = format_rfc3339(now() + time::Duration::days(1));
+        assert!(is_expired(&past));
+        assert!(!is_expired(&future));
+    }
+
+    #[test]
+    fn test_provider_lists_tools_by_ceiling_and_mode() {
+        let no_ceiling =
+            AgentDefinitionToolProvider::new(None, None, DefinitionWriteMode::Commit, None);
+        let no_ceiling_tools = no_ceiling.tools();
+        let names: Vec<&str> = no_ceiling_tools.iter().map(|t| t.name()).collect();
+        assert_eq!(names, vec!["agents.validate", "agents.list_proposals"]);
+        assert!(
+            no_ceiling
+                .executor(&ToolName::new("agents.write_definition"))
+                .is_none()
+        );
+        assert!(
+            no_ceiling
+                .executor(&ToolName::new("agents.commit_proposal"))
+                .is_none()
+        );
+
+        let ceiling = Some(empty_ceiling(AgentRoleId::UserInterface));
+        let commit = AgentDefinitionToolProvider::new(
+            None,
+            None,
+            DefinitionWriteMode::Commit,
+            ceiling.clone(),
+        );
+        let commit_tools = commit.tools();
+        let commit_names: Vec<&str> = commit_tools.iter().map(|t| t.name()).collect();
+        assert_eq!(
+            commit_names,
+            vec![
+                "agents.validate",
+                "agents.list_proposals",
+                "agents.write_definition",
+                "agents.write_uia",
+                "agents.commit_proposal",
+                "agents.reject_proposal",
+            ]
+        );
+        for name in &commit_names {
+            assert!(commit.executor(&ToolName::new(*name)).is_some());
+        }
+
+        let proposal_only = AgentDefinitionToolProvider::new(
+            None,
+            None,
+            DefinitionWriteMode::ProposalOnly,
+            ceiling,
+        );
+        let proposal_tools = proposal_only.tools();
+        let proposal_names: Vec<&str> = proposal_tools.iter().map(|t| t.name()).collect();
+        assert_eq!(
+            proposal_names,
+            vec![
+                "agents.validate",
+                "agents.list_proposals",
+                "agents.write_definition",
+                "agents.write_uia",
+            ]
+        );
+        assert!(
+            proposal_only
+                .executor(&ToolName::new("agents.commit_proposal"))
+                .is_none()
+        );
+        assert!(
+            proposal_only
+                .executor(&ToolName::new("agents.reject_proposal"))
+                .is_none()
+        );
+    }
+}

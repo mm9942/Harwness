@@ -48,44 +48,14 @@ members = [
     "harw-tui",
     "harw-cli",
     "harw",
-
-    # === Ausbauprogramm AW0–AW7: Telemetrie, Kontext, DoD, Lens, Control Plane ===
+    # === Ausbauprogramm AW0–AW7: Telemetrie, Kontext, Lens, Control Plane ===
+    # (DoD ist ausgelagert nach `dod/` — eigener Cargo-Workspace, eigene
+    # Builddomäne; siehe `exclude` unten und `dod/Cargo.toml`.)
     "harw-observe",
     "harw-observe-file",
     "harw-observe-prom",
     "harw-observe-otlp",
     "harw-context",
-    "harw-dod-cap",
-    "harw-dod-signals",
-    "harw-dod-readfs",
-    "harw-dod-netlink",
-    "harw-dod-fixtures",
-    "harw-dod-thermal",
-    "harw-dod-cpu",
-    "harw-dod-memory",
-    "harw-dod-blockio",
-    "harw-dod-netcounters",
-    "harw-dod-gpu",
-    "harw-dod-cgroup",
-    "harw-dod-listener",
-    "harw-dod-authlog",
-    "harw-dod-scanreport",
-    "harw-dod-workspace",
-    "harw-dod-sentinel",
-    "harw-dod-fsmon",
-    "harw-dod-rules",
-    "harw-dod-netpolicy",
-    "harw-dod-warden-proto",
-    "harw-dod-warden",
-    "harw-dod-escalate",
-    "harw-dod-bpf",
-    "harw-dod-procmon",
-    "harw-dod-flow",
-    "harw-dod",
-    "harw-sentinel",
-    "harw-probe-fs",
-    "harw-probe-bpf",
-    "harw-warden",
     "harw-lens-types",
     "harw-lens-rank",
     "harw-lens-chunk",
@@ -98,13 +68,20 @@ members = [
     "harw-lens",
     "harw-tool-lens",
     "harw-web",
-
     # === Remediation (Plan P0–P3) ===
     "harw-egress",
     "harw-fsutil",
     "harw-runtime",
     "xtask",
 ]
+# DoD ist ein eigener Cargo-Workspace in derselben Repository-Domäne: eigener
+# Lockfile, eigene `workspace.package`-/`workspace.dependencies`-Vorgaben.
+# `exclude` verhindert, dass Cargo `dod/` versehentlich als Teil des
+# Produkt-Workspace behandelt (z. B. bei Glob-Expansion oder Metadata-Läufen).
+# Pfad-Abhängigkeiten Produkt → DoD (`harw-knowledge`, `harw-plan-bridge`,
+# `harw-core-bridge`, `harw-macros` [dev]) lösen über `dod/crates/…` auf und
+# sind zulässig; DoD-Mitgliedschaft im Produkt-Workspace ist es nicht.
+exclude = ["dod"]
 
 [workspace.package]
 version = "0.3.0"

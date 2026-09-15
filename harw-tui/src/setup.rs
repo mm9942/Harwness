@@ -76,6 +76,15 @@ use harw_model_catalog::{AuthMethod, DetectedCredential, ProviderApi, ProviderSp
 use crate::app::TuiError;
 use crate::style;
 
+/// Warnhinweis, wenn im Anthropic-Auth-Schritt eine Abo-OAuth-/Setup-Token-
+/// Authentifizierung (statt eines API-Keys) gewählt oder eingefügt wird.
+///
+/// # Description
+/// Wortgleich vorgegebener Hinweistext (siehe WARN-TUI-Auftrag). `harw-tui`
+/// hängt nicht von `harw-provider-http` ab, daher ist der Text hier als
+/// lokale Konstante dupliziert statt importiert.
+const ANTHROPIC_OAUTH_WARNING: &str = "Hinweis: Du nutzt ein Abo-OAuth-/Setup-Token (Claude Free/Pro/Max) statt eines API-Keys. Laut Anthropics Nutzungsbedingungen ist Abo-OAuth für Claude Code und native Anthropic-Apps vorgesehen; Drittanbieter-Tools sollen API-Keys aus der Claude Console nutzen. Anthropic hat eine geplante Abrechnungsänderung für Drittanbieter-Nutzung im Juni 2026 vorerst pausiert, behält sich Durchsetzung aber ohne Vorankündigung vor – Anfragen können jederzeit abgelehnt werden. Nutzung auf eigene Gefahr. Stabil: API-Key (platform.claude.com). Quelle: https://code.claude.com/docs/en/legal-and-compliance";
+
 /// Phase des Ersteinrichtungs-Assistenten.
 ///
 /// # Description
@@ -563,6 +572,74 @@ impl SetupApp {
             .get(self.selected)
             .map(AuthOption::is_secret)
             .unwrap_or(false)
+    }
+
+    /// Gibt zurück, ob die aktuell in der Auth-Phase markierte bzw.
+    /// eingegebene Authentifizierung eine Anthropic-Abo-OAuth-/Setup-Token-
+    /// Nutzung darstellt.
+    ///
+    /// # Description
+    /// Greift nur für den Anthropic-Provider (`provider.id == "anthropic"`,
+    /// API [`ProviderApi::AnthropicMessages`]). Erkennt: die Auswahl einer
+    /// OAuth-/Setup-Token-Option ([`AuthOption::OAuth`]) oder einer bereits
+    /// erkannten lokalen Quelle ([`AuthOption::Detected`]), deren Referenz auf
+    /// `~/.claude/.credentials.json` oder das Setup-Token-Environment
+    /// verweist, sowie einen getippten/eingefügten API-Key, der mit
+    /// `sk-ant-oat` beginnt oder ebenfalls auf diese Quellen referenziert.
+    ///
+    /// # Returns
+    /// `true`, wenn die aktuelle Auswahl/Eingabe eine solche Nutzung ist.
+    ///
+    /// # Concurrency
+    /// Rein; liest nur den eigenen Zustand.
+    fn is_anthropic_oauth_selection(&self) -> bool {
+        let Some(provider) = self.chosen_provider.as_ref() else {
+            return false;
+        };
+        if self.stage != SetupStage::Auth
+            || provider.id != "anthropic"
+            || provider.api != ProviderApi::AnthropicMessages
+        {
+            return false;
+        }
+        let looks_like_oauth_ref = |value: &str| {
+            let trimmed = value.trim();
+            trimmed.starts_with("sk-ant-oat")
+                || trimmed.contains(".credentials.json")
+                || trimmed.contains("CLAUDE_CODE_OAUTH_TOKEN")
+        };
+        match self.auth_options.get(self.selected) {
+            Some(AuthOption::OAuth { secret_ref, .. }) => {
+                looks_like_oauth_ref(secret_ref) || looks_like_oauth_ref(&self.api_key)
+            }
+            Some(AuthOption::Detected(detected)) => looks_like_oauth_ref(&detected.secret_ref),
+            Some(AuthOption::ApiKey) => looks_like_oauth_ref(&self.api_key),
+            _ => false,
+        }
+    }
+
+    /// Gibt den Anthropic-OAuth-Warnhinweis zurück, wenn die aktuell
+    /// markierte bzw. eingegebene Auth-Option eine Abo-OAuth-/Setup-Token-
+    /// Nutzung für Anthropic darstellt, sonst `None`.
+    ///
+    /// # Description
+    /// Reine Anzeige-Ableitung ohne gespeicherten Zustand: verschwindet
+    /// automatisch, sobald der Nutzer auf eine reine API-Key-Auswahl (ohne
+    /// OAuth-artigen Wert) wechselt. Contract-Quelle: WARN-TUI-Auftrag
+    /// (Setup-Warnung bei Anthropic-Bearer-/OAuth-Auswahl).
+    ///
+    /// # Returns
+    /// `Some(text)` mit dem wortgleich vorgegebenen Warnhinweis, sonst `None`.
+    ///
+    /// # Concurrency
+    /// Rein; liest nur den eigenen Zustand.
+    #[must_use]
+    pub fn oauth_warning(&self) -> Option<&'static str> {
+        if self.is_anthropic_oauth_selection() {
+            Some(ANTHROPIC_OAUTH_WARNING)
+        } else {
+            None
+        }
     }
 
     /// Berechnet die Indizes der Provider, die den Filter erfüllen.
@@ -1086,6 +1163,18 @@ fn body_lines(app: &SetupApp) -> Vec<Line<'static>> {
                 )));
             }
 
+            // Anthropic-Abo-OAuth-Warnung: erscheint bei Auswahl/Eingabe einer
+            // Bearer-/OAuth-Authentifizierung, verschwindet bei Wechsel auf
+            // eine reine API-Key-Auswahl. Wortumbruch auf Leerzeichen, damit
+            // der lange Hinweis in der schmalen Liste lesbar bleibt — der
+            // Text selbst bleibt dabei wortgleich.
+            if let Some(warning) = app.oauth_warning() {
+                let warn_style = Style::default().fg(style::warning_color(theme));
+                for chunk in wrap_warning(warning, 76) {
+                    lines.push(Line::from(Span::styled(chunk, warn_style)));
+                }
+            }
+
             lines
         }
         SetupStage::Model => {
@@ -1133,6 +1222,32 @@ fn selectable_line(selected: bool, text: String, theme: style::Theme) -> Line<'s
 /// Maskiert einen getippten Key für die Anzeige.
 fn mask(key: &str) -> String {
     "*".repeat(key.chars().count())
+}
+
+/// Bricht `text` auf Leerzeichen-Grenzen in Zeilen von höchstens `width`
+/// Zeichen um, ohne einzelne Wörter zu verändern.
+///
+/// # Description
+/// Reine Anzeigehilfe für lange Hinweiszeilen in den nicht umbrechenden
+/// Listen-Phasen (siehe [`selected_line_index`]). Der Ursprungstext bleibt
+/// wortgleich erhalten — es werden nur Zeilenumbrüche eingefügt.
+fn wrap_warning(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let extra = usize::from(!current.is_empty());
+        if !current.is_empty() && current.chars().count() + extra + word.chars().count() > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -1290,6 +1405,107 @@ mod tests {
         assert_eq!(outcome.api, "ollama");
         assert_eq!(outcome.model, "llama3");
         assert_eq!(outcome.secret_ref, None);
+    }
+
+    /// Nativer Anthropic-Provider (Provider-Id `"anthropic"`,
+    /// `anthropic-messages`) für die OAuth-Warnungs-Tests.
+    fn anthropic_provider() -> ProviderSpec {
+        ProviderSpec {
+            id: "anthropic".to_owned(),
+            name: "Anthropic".to_owned(),
+            base_url: "https://api.anthropic.com/v1".to_owned(),
+            api: ProviderApi::AnthropicMessages,
+            auth: vec![
+                AuthMethod::ApiKey {
+                    env_vars: vec!["ANTHROPIC_API_KEY".to_owned()],
+                },
+                AuthMethod::LocalImport {
+                    sources: vec!["claude-setup-token".to_owned(), "claude-cli".to_owned()],
+                },
+            ],
+            default_model: Some("claude-opus-4-8".to_owned()),
+            featured: true,
+            models: vec!["claude-opus-4-8".to_owned()],
+        }
+    }
+
+    /// Setzt deterministische Auth-Optionen, unabhängig von lokal erkannten
+    /// Credentials (z. B. `~/.claude/.credentials.json` auf der Build-Maschine).
+    fn force_anthropic_options(app: &mut SetupApp) {
+        app.auth_options = vec![
+            AuthOption::ApiKey,
+            AuthOption::OAuth {
+                label: "OAuth/Setup-Token: claude-setup-token".to_owned(),
+                secret_ref: "env:CLAUDE_CODE_OAUTH_TOKEN".to_owned(),
+            },
+        ];
+        app.selected = 0;
+    }
+
+    #[test]
+    fn anthropic_oauth_selection_shows_warning_apikey_clears_it() {
+        let mut app = SetupApp::new(vec![anthropic_provider()]);
+        app.on_key(press(KeyCode::Enter)); // Provider -> Endpoint
+        app.on_key(press(KeyCode::Enter)); // Endpoint -> Auth
+        assert_eq!(app.stage(), SetupStage::Auth);
+        force_anthropic_options(&mut app);
+        // Erste Option ist der deklarierte API-Key (x-api-key) — keine Warnung.
+        assert_eq!(app.selected, 0);
+        assert!(matches!(app.auth_options[0], AuthOption::ApiKey));
+        assert!(app.oauth_warning().is_none());
+
+        // Weiter zur OAuth-/Setup-Token-Option — Warnung erscheint, wortgleich.
+        app.on_key(press(KeyCode::Down));
+        assert!(matches!(
+            app.auth_options[app.selected],
+            AuthOption::OAuth { .. }
+        ));
+        assert_eq!(app.oauth_warning(), Some(ANTHROPIC_OAUTH_WARNING));
+
+        // Zurück zur API-Key-Option — Warnung verschwindet wieder.
+        app.on_key(press(KeyCode::Up));
+        assert!(app.oauth_warning().is_none());
+    }
+
+    #[test]
+    fn anthropic_pasted_setup_token_shows_warning_on_apikey_option() {
+        let mut app = SetupApp::new(vec![anthropic_provider()]);
+        app.on_key(press(KeyCode::Enter));
+        app.on_key(press(KeyCode::Enter));
+        force_anthropic_options(&mut app);
+        assert_eq!(app.selected, 0);
+        assert!(app.oauth_warning().is_none());
+
+        // Ein eingefügtes `sk-ant-oat...`-Token in der API-Key-Option löst die
+        // Warnung ebenfalls aus.
+        app.on_paste("sk-ant-oat01-fake-token-for-test".into());
+        assert!(app.oauth_warning().is_some());
+    }
+
+    #[test]
+    fn anthropic_plain_api_key_never_warns() {
+        let mut app = SetupApp::new(vec![anthropic_provider()]);
+        app.on_key(press(KeyCode::Enter));
+        app.on_key(press(KeyCode::Enter));
+        force_anthropic_options(&mut app);
+        app.on_paste("sk-ant-api03-not-an-oauth-token".into());
+        assert!(app.oauth_warning().is_none());
+    }
+
+    #[test]
+    fn non_anthropic_provider_never_shows_oauth_warning() {
+        let mut app = SetupApp::new(vec![groq_provider()]);
+        app.on_key(press(KeyCode::Enter));
+        app.on_key(press(KeyCode::Enter));
+        assert_eq!(app.stage(), SetupStage::Auth);
+        assert!(app.oauth_warning().is_none());
+    }
+
+    #[test]
+    fn wrap_warning_preserves_words_and_splits_on_width() {
+        let wrapped = wrap_warning("eins zwei drei vier fuenf", 12);
+        assert_eq!(wrapped.join(" "), "eins zwei drei vier fuenf");
+        assert!(wrapped.iter().all(|line| line.chars().count() <= 12 + 5));
     }
 
     #[test]

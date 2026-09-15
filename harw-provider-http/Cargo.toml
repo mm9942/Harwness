@@ -20,6 +20,7 @@ keyring = { version = "3.6.3", default-features = false, features = ["apple-nati
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 secrecy = "0.10.3"
 serde_json = "1.0.150"
+tokio = { version = "1.52.3", features = ["time"] }
 tracing = "0.1.44"
 
 [dev-dependencies]

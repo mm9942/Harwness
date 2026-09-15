@@ -60,19 +60,32 @@
 //!    Dateizugriff auf die Store-Wurzel besitzt.
 //! 2. Immer: alle [`crate::facts::FactType::Preference`]-Fakten, Projekt vor
 //!    Global.
+//! 2b. Immer (Addendum B): alle [`crate::facts::FactType::Pitfall`]-Fakten,
+//!    Projekt vor Global, höchstens [`PITFALL_MAX_FACTS`] insgesamt, als ein
+//!    Fragment unter der Überschrift „Bekannte Fallstricke".
 //! 3. Nach Bedarf: Stichworttreffer aus [`crate::facts::FactStore::search`]
 //!    gegen den jüngsten `user`-Eintrag im STM (`TurnInputContext` selbst
 //!    trägt keinen Freitext-Nutzertext — nur `session_id`/`turn_id`/
 //!    `metadata`), Projekt vor Global, bis [`DEFAULT_MEMORY_TOKEN_BUDGET`]
 //!    (änderbar über [`MemoryContextProvider::with_memory_token_budget`])
-//!    erschöpft ist. Nur dieser Schritt prüft das Budget — die „immer"-Teile
-//!    zählen unbedingt, wie in §4 beschrieben.
+//!    erschöpft ist.
+//! 4. Nach Bedarf (Addendum B): sofern ein
+//!    [`crate::file_index::FileKnowledgeIndex`] über
+//!    [`MemoryContextProvider::with_file_index`] gesetzt ist und dieselben
+//!    Stichworte aus Schritt 3 nicht leer sind, dessen Treffer als ein
+//!    Fragment unter der Überschrift „Bekannte Dateien (bereits gelesen)".
 //!
-//! Jeder individuell ausgelieferte Fakt (Schritt 2 und 3, nicht der Index)
-//! trägt Scope und Name in seiner [`harw_context::FragmentLabel`] und wird
-//! am Ende genau einmal je Store über
+//! Schritte 3 und 4 prüfen das Budget; die übrigen Schritte zählen
+//! unbedingt (2b trägt seine geschätzten Kosten dennoch in dieselbe laufende
+//! Bilanz ein, wie in §4/Addendum B beschrieben).
+//!
+//! Jeder individuell ausgelieferte Fakt (Schritt 2, 2b und 3, nicht der
+//! Index) trägt Scope und Name in seiner [`harw_context::FragmentLabel`] und
+//! wird am Ende genau einmal je Store über
 //! [`crate::facts::FactStore::record_usage`] gezählt; ein Fehler dabei ist
-//! nur `tracing::warn!`, nie propagiert.
+//! nur `tracing::warn!`, nie propagiert. Dateiwissen-Treffer (Schritt 4)
+//! zählen nicht als Fakten und tragen nicht zu `record_usage` bei; ein
+//! Fehler bei der Indexsuche ist ebenfalls nur `tracing::warn!`.
 //!
 //! # Concurrency
 //! `MemoryContextProvider<M>` ist `Send + Sync`, solange `M: Memory` es ist
@@ -99,6 +112,7 @@ use harw_lens_types::{BytesOverFour, CostEstimator};
 use crate::context_policy::ContextPolicy;
 use crate::context_selector::{SelectionRequest, SelectionRole, select_for_turn_no_signals};
 use crate::facts::{Fact, FactScope, FactStore, FactType};
+use crate::file_index::FileKnowledgeIndex;
 use crate::short_term::{ShortTermMemory, StmRole};
 use crate::store::Memory;
 
@@ -133,6 +147,12 @@ const SECTION_FACT_INDEX: &str = "memory.facts.index";
 const SECTION_FACT_PREFERENCE: &str = "memory.facts.preference";
 /// Sektion für Stichwort-Treffer unter Fakten (§4.3).
 const SECTION_FACT_SEARCH: &str = "memory.facts.search";
+/// Sektion für die immer geladenen `FactType::Pitfall`-Fakten
+/// (Addendum B, "Bekannte Fallstricke").
+const SECTION_FACT_PITFALL: &str = "memory.facts.pitfall";
+/// Sektion für Dateiwissen-Treffer aus dem `FileKnowledgeIndex`
+/// (Addendum B, "Bekannte Dateien (bereits gelesen)").
+const SECTION_FILE_INDEX: &str = "memory.files.known";
 
 /// Default-Token-Budget für den Fakten-Anteil aus §4, wenn
 /// [`MemoryContextProvider::with_memory_token_budget`] nicht aufgerufen
@@ -152,6 +172,21 @@ const FACT_SEARCH_LIMIT_PER_STORE: usize = 20;
 /// Höchstzahl Stichworte, die aus dem STM-Nutzertext für §4.3 verwendet
 /// werden (siehe [`MemoryContextProvider::search_keywords`]).
 const MAX_FACT_SEARCH_KEYWORDS: usize = 12;
+
+/// Höchstzahl `FactType::Pitfall`-Fakten insgesamt (Projekt+Global
+/// zusammen), die unter der Überschrift "Bekannte Fallstricke" ausgeliefert
+/// werden (Addendum B).
+const PITFALL_MAX_FACTS: usize = 10;
+
+/// Höchstzahl Treffer, die [`FileKnowledgeIndex::search`] für den
+/// Dateiwissen-Abschnitt liefern darf, bevor das Budget in
+/// [`MemoryContextProvider::push_fact_fragments`] selbst greift
+/// (Addendum B).
+const FILE_INDEX_SEARCH_LIMIT: usize = 12;
+
+/// Höchstzahl Symbole je Datei, die in der Dateiwissen-Zeile angezeigt
+/// werden (Addendum B).
+const FILE_INDEX_MAX_SYMBOLS: usize = 6;
 
 /// Bestimmt die [`SelectionRole`] eines Turns — die einzige Stelle, die
 /// `ctx.metadata` danach befragt.
@@ -246,6 +281,10 @@ pub struct MemoryContextProvider<M: Memory> {
     /// Token-Budget für den Fakten-Anteil aus §4 (Default
     /// [`DEFAULT_MEMORY_TOKEN_BUDGET`]).
     memory_token_budget: usize,
+    /// Dateiwissen-Index (`<memories>/files/index.json`, Addendum B).
+    /// `None`, wenn diesem Provider kein Index übergeben wurde — dann
+    /// trägt der Dateiwissen-Abschnitt nichts zu [`Self::fragments`] bei.
+    file_index: Option<Arc<FileKnowledgeIndex>>,
 }
 
 impl<M: Memory> MemoryContextProvider<M> {
@@ -274,6 +313,7 @@ impl<M: Memory> MemoryContextProvider<M> {
             project_facts: None,
             global_facts: None,
             memory_token_budget: DEFAULT_MEMORY_TOKEN_BUDGET,
+            file_index: None,
         }
     }
 
@@ -308,6 +348,7 @@ impl<M: Memory> MemoryContextProvider<M> {
             project_facts,
             global_facts,
             memory_token_budget: DEFAULT_MEMORY_TOKEN_BUDGET,
+            file_index: None,
         }
     }
 
@@ -323,6 +364,27 @@ impl<M: Memory> MemoryContextProvider<M> {
     #[must_use]
     pub fn with_memory_token_budget(mut self, budget: usize) -> Self {
         self.memory_token_budget = budget;
+        self
+    }
+
+    /// Setzt (oder entfernt) den Dateiwissen-Index für den Abschnitt
+    /// "Bekannte Dateien (bereits gelesen)" (Addendum B).
+    ///
+    /// # Beschreibung
+    /// Ohne einen nachträglichen Aufruf trägt der Dateiwissen-Abschnitt
+    /// nichts zu [`Self::fragments`] bei — analog zu [`Self::with_facts`]
+    /// für die Fakten-Stores.
+    ///
+    /// # Arguments
+    /// - `index` (`Option<Arc<FileKnowledgeIndex>>`): der Dateiwissen-Index
+    ///   der Projekt-Wurzel (`<memories>/files/index.json`), oder `None`.
+    ///
+    /// # Returns
+    /// `self` mit gesetztem Dateiwissen-Index (Builder-Stil, verkettbar mit
+    /// [`Self::new`]/[`Self::with_facts`]/[`Self::with_memory_token_budget`]).
+    #[must_use]
+    pub fn with_file_index(mut self, index: Option<Arc<FileKnowledgeIndex>>) -> Self {
+        self.file_index = index;
         self
     }
 
@@ -397,29 +459,43 @@ impl<M: Memory> MemoryContextProvider<M> {
         fragments
     }
 
-    /// Baut die Fakten-Fragmente aus §4(1-3) und pflegt anschließend die
-    /// Nutzungszähler der ausgelieferten Fakten (§4, letzter Satz).
+    /// Baut die Fakten- und Dateiwissen-Fragmente aus §4(1-3) +
+    /// Addendum B und pflegt anschließend die Nutzungszähler der
+    /// ausgelieferten Fakten (§4, letzter Satz).
     ///
     /// # Beschreibung
-    /// Reihenfolge exakt nach §4: (1) der aus [`FactStore::list`]
-    /// abgeleitete Projekt-Index ([`render_fact_index`]), immer wenn ein
-    /// Projekt-Store konfiguriert ist; (2) alle
-    /// [`FactType::Preference`]-Fakten, Projekt vor Global, je Store bereits
-    /// nach `updated` absteigend sortiert (`FactStore::list`s eigene
-    /// Garantie); (3) Stichworttreffer aus [`FactStore::search`] gegen den
-    /// jüngsten `user`-STM-Eintrag ([`Self::search_keywords`]), Projekt vor
-    /// Global, so lange bis [`Self::memory_token_budget`] erschöpft ist.
+    /// Reihenfolge: (1) der aus [`FactStore::list`] abgeleitete
+    /// Projekt-Index ([`render_fact_index`]), immer wenn ein Projekt-Store
+    /// konfiguriert ist; (2) alle [`FactType::Preference`]-Fakten, Projekt
+    /// vor Global, je Store bereits nach `updated` absteigend sortiert
+    /// (`FactStore::list`s eigene Garantie); (2b) alle
+    /// [`FactType::Pitfall`]-Fakten, Projekt vor Global, höchstens
+    /// [`PITFALL_MAX_FACTS`] insgesamt, als **ein** Fragment unter der
+    /// Überschrift "Bekannte Fallstricke" (eine Zeile `- <description>` je
+    /// Fakt, Rückfall auf `name` bei leerer Beschreibung); (3)
+    /// Stichworttreffer aus [`FactStore::search`] gegen den jüngsten
+    /// `user`-STM-Eintrag ([`Self::search_keywords`]), Projekt vor Global,
+    /// so lange bis [`Self::memory_token_budget`] erschöpft ist; (4) falls
+    /// [`Self::file_index`] gesetzt ist und Stichworte vorliegen, Treffer aus
+    /// [`FileKnowledgeIndex::search`] (Limit [`FILE_INDEX_SEARCH_LIMIT`])
+    /// als **ein** Fragment unter der Überschrift "Bekannte Dateien (bereits
+    /// gelesen)" (eine Zeile `- <path> — <summary> [<symbole>]` je Treffer,
+    /// höchstens [`FILE_INDEX_MAX_SYMBOLS`] Symbole).
     /// (1) und (2) zählen laut Design "immer" und werden nicht gegen das
-    /// Budget geprüft; nur (3) respektiert das verbleibende Budget
-    /// (`len() / 4`-Schätzung je Fragment-Inhalt, wie überall sonst in
-    /// diesem Crate).
+    /// Budget geprüft; (2b) zählt ebenso "immer" wie (2), trägt aber wie (2)
+    /// seine geschätzten Tokenkosten in [`Self::memory_token_budget`]s
+    /// laufende Bilanz ein; (3) und (4) respektieren das verbleibende
+    /// Budget (`len() / 4`-Schätzung je Zeile/Fragment-Inhalt, wie überall
+    /// sonst in diesem Crate) und brechen ab statt fehlzuschlagen, sobald es
+    /// erschöpft ist.
     ///
-    /// Jeder individuell ausgelieferte Fakt (2 und 3, nicht der Index) wird
-    /// dedupliziert — ein Fakt erscheint höchstens einmal, auch wenn er
+    /// Jeder individuell ausgelieferte Fakt (2, 2b und 3, nicht der Index)
+    /// wird dedupliziert — ein Fakt erscheint höchstens einmal, auch wenn er
     /// sowohl Präferenz als auch Stichworttreffer ist — und am Ende in
     /// genau einem gepufferten [`FactStore::record_usage`]-Aufruf je Store
     /// gezählt; ein Fehler dabei wird nur geloggt (`tracing::warn!`), nie
-    /// propagiert.
+    /// propagiert. Fehler beim Lesen des Dateiwissen-Index sind ebenfalls
+    /// nur `tracing::warn!`.
     fn push_fact_fragments(&self, out: &mut Vec<Fragment>, produced_at: jiff::Timestamp) {
         let mut used_tokens = 0usize;
         let mut delivered: HashSet<(FactScope, String)> = HashSet::new();
@@ -473,8 +549,63 @@ impl<M: Memory> MemoryContextProvider<M> {
             record_delivery(scope, &fact.name, &mut project_delivered, &mut global_delivered);
         }
 
+        // (2b) Fallstricke — immer, Projekt vor Global, max.
+        // PITFALL_MAX_FACTS insgesamt (Addendum B).
+        let mut pitfall_facts: Vec<(FactScope, Fact)> = Vec::new();
+        for (scope, store) in [
+            (FactScope::Project, &self.project_facts),
+            (FactScope::Global, &self.global_facts),
+        ] {
+            let Some(store) = store else { continue };
+            match store.list() {
+                Ok(facts) => pitfall_facts.extend(
+                    facts
+                        .into_iter()
+                        .filter(|fact| fact.fact_type == FactType::Pitfall)
+                        .map(|fact| (scope, fact)),
+                ),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        scope = %scope,
+                        "facts: Fallstricke konnten nicht gelesen werden"
+                    );
+                }
+            }
+        }
+        let mut pitfall_lines: Vec<String> = Vec::new();
+        for (scope, fact) in pitfall_facts {
+            if pitfall_lines.len() >= PITFALL_MAX_FACTS {
+                break;
+            }
+            if delivered.contains(&(scope, fact.name.clone())) {
+                continue;
+            }
+            delivered.insert((scope, fact.name.clone()));
+            let text = if fact.description.trim().is_empty() {
+                fact.name.clone()
+            } else {
+                fact.description.clone()
+            };
+            pitfall_lines.push(format!("- {text}"));
+            record_delivery(scope, &fact.name, &mut project_delivered, &mut global_delivered);
+        }
+        if !pitfall_lines.is_empty() {
+            let body = format!("## Bekannte Fallstricke\n{}", pitfall_lines.join("\n"));
+            let cost = body.len() / 4;
+            let before = out.len();
+            push_fragment(out, SECTION_FACT_PITFALL, "pitfalls", &body, produced_at);
+            if out.len() > before {
+                used_tokens += cost;
+            }
+        }
+
+        // Stichworte werden für (3) und den Dateiwissen-Abschnitt (Addendum
+        // B) gemeinsam benötigt — einmal aus dem STM abgeleitet.
+        let keywords_opt = self.search_keywords();
+
         // (3) Stichworttreffer — Projekt vor Global, bis das Budget voll ist.
-        if let Some(keywords) = self.search_keywords() {
+        if let Some(keywords) = &keywords_opt {
             let keyword_refs: Vec<&str> = keywords.iter().map(String::as_str).collect();
             let mut hits: Vec<(FactScope, Fact)> = Vec::new();
             for (scope, store) in [
@@ -506,6 +637,48 @@ impl<M: Memory> MemoryContextProvider<M> {
                 push_fact_fragment(out, SECTION_FACT_SEARCH, scope, &fact, produced_at);
                 used_tokens += cost;
                 record_delivery(scope, &fact.name, &mut project_delivered, &mut global_delivered);
+            }
+        }
+
+        // (4) Dateiwissen-Treffer — nur wenn ein Index gesetzt ist und
+        // Stichworte vorliegen (Addendum B); respektiert dasselbe Budget.
+        if let Some(index) = &self.file_index {
+            if let Some(keywords) = &keywords_opt {
+                match index.search(keywords, FILE_INDEX_SEARCH_LIMIT) {
+                    Ok(hits) => {
+                        let mut lines: Vec<String> = Vec::new();
+                        for hit in hits {
+                            let summary = hit.summary.as_deref().unwrap_or("");
+                            let symbols: Vec<&str> = hit
+                                .symbols
+                                .iter()
+                                .take(FILE_INDEX_MAX_SYMBOLS)
+                                .map(String::as_str)
+                                .collect();
+                            let line =
+                                format!("- {} — {} [{}]", hit.path, summary, symbols.join(", "));
+                            let cost = line.len() / 4;
+                            if used_tokens + cost > self.memory_token_budget {
+                                break;
+                            }
+                            used_tokens += cost;
+                            lines.push(line);
+                        }
+                        if !lines.is_empty() {
+                            let body = format!(
+                                "## Bekannte Dateien (bereits gelesen)\n{}",
+                                lines.join("\n")
+                            );
+                            push_fragment(out, SECTION_FILE_INDEX, "known-files", &body, produced_at);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "file_index: Stichwortsuche fehlgeschlagen"
+                        );
+                    }
+                }
             }
         }
 
@@ -1024,6 +1197,145 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&mem_root);
         let _ = std::fs::remove_dir_all(&project_root);
+    }
+
+    // ── Fallstricke + Dateiwissen (Addendum B) ───────────────────────────
+
+    #[test]
+    fn test_pitfall_fact_appears_under_heading_without_keyword_match() {
+        let mem_root = tmp_root("pitfall-mem");
+        let project_root = tmp_root("pitfall-project");
+
+        let project_store =
+            Arc::new(FactStore::open(&project_root, FactScope::Project).expect("open project"));
+        project_store
+            .write(&make_fact(
+                "known-pitfall",
+                FactType::Pitfall,
+                FactScope::Project,
+                "Popup darf Enter nie schlucken.",
+            ))
+            .expect("write pitfall");
+
+        // Kein STM-Nutzertext -> search_keywords() liefert None, der
+        // Pitfall-Abschnitt darf trotzdem erscheinen ("immer" laut §4/Addendum B).
+        let fragments = facts_provider(&mem_root, Some(project_store), None).fragments(
+            &TurnInputContext::default(),
+            time::OffsetDateTime::UNIX_EPOCH,
+            jiff::Timestamp::UNIX_EPOCH,
+        );
+
+        let pitfall = fragments
+            .iter()
+            .find(|f| f.section.as_str() == SECTION_FACT_PITFALL)
+            .expect("pitfall fragment present even without keyword match");
+        assert!(pitfall.body.contains("Bekannte Fallstricke"));
+        assert!(pitfall.body.contains("- Popup darf Enter nie schlucken."));
+
+        let _ = std::fs::remove_dir_all(&mem_root);
+        let _ = std::fs::remove_dir_all(&project_root);
+    }
+
+    fn make_file_knowledge(path: &str, summary: &str, symbols: Vec<String>) -> crate::file_index::FileKnowledge {
+        crate::file_index::FileKnowledge {
+            path: path.to_owned(),
+            size_bytes: 42,
+            line_count: 7,
+            digest: "digest".to_owned(),
+            language: Some("rust".to_owned()),
+            summary: Some(summary.to_owned()),
+            symbols,
+            last_seen: "2024-01-01T00:00:00Z".to_owned(),
+            read_count: 1,
+        }
+    }
+
+    #[test]
+    fn test_file_index_hit_appears_when_keyword_matches_symbol() {
+        let mem_root = tmp_root("fidx-mem");
+        let index_root = tmp_root("fidx-index");
+
+        let index = crate::file_index::FileKnowledgeIndex::open(&index_root)
+            .expect("open file knowledge index");
+        index
+            .upsert(make_file_knowledge(
+                "src/zeppelin.rs",
+                "Zeppelin-Hilfsfunktionen",
+                vec!["zeppelin_helper".to_owned()],
+            ))
+            .expect("upsert file knowledge");
+
+        let store = Arc::new(FileMemoryStore::open(&mem_root).expect("open memory store"));
+        let stm = ShortTermMemory::new("session-1", 32, 2_048);
+        stm.push(StmRole::User, 80, "Erzähl mir etwas über zeppelin");
+        let provider = MemoryContextProvider::new(store, stm, ContextPolicy::Balanced)
+            .with_file_index(Some(Arc::new(index)));
+
+        let fragments = provider.fragments(
+            &TurnInputContext::default(),
+            time::OffsetDateTime::UNIX_EPOCH,
+            jiff::Timestamp::UNIX_EPOCH,
+        );
+
+        let file_hit = fragments
+            .iter()
+            .find(|f| f.section.as_str() == SECTION_FILE_INDEX)
+            .expect("file-index fragment present when a keyword matches a symbol");
+        assert!(file_hit.body.contains("Bekannte Dateien (bereits gelesen)"));
+        assert!(file_hit.body.contains("src/zeppelin.rs"));
+
+        let _ = std::fs::remove_dir_all(&mem_root);
+        let _ = std::fs::remove_dir_all(&index_root);
+    }
+
+    #[test]
+    fn test_file_index_section_is_truncated_by_a_tiny_budget_without_panicking() {
+        let mem_root = tmp_root("fidx-budget-mem");
+        let index_root = tmp_root("fidx-budget-index");
+
+        let index = crate::file_index::FileKnowledgeIndex::open(&index_root)
+            .expect("open file knowledge index");
+        for i in 0..5 {
+            index
+                .upsert(make_file_knowledge(
+                    &format!("src/zeppelin_{i}.rs"),
+                    "Ein langer Beschreibungstext über Zeppeline und ihre Geschichte in der Luftfahrt, damit die Zeile teuer wird.",
+                    vec!["zeppelin_helper".to_owned()],
+                ))
+                .expect("upsert file knowledge");
+        }
+
+        let store = Arc::new(FileMemoryStore::open(&mem_root).expect("open memory store"));
+        let stm = ShortTermMemory::new("session-1", 32, 2_048);
+        stm.push(StmRole::User, 80, "Erzähl mir etwas über zeppelin");
+        let provider = MemoryContextProvider::new(store, stm, ContextPolicy::Balanced)
+            .with_file_index(Some(Arc::new(index)))
+            .with_memory_token_budget(1);
+
+        let fragments = provider.fragments(
+            &TurnInputContext::default(),
+            time::OffsetDateTime::UNIX_EPOCH,
+            jiff::Timestamp::UNIX_EPOCH,
+        );
+
+        let file_hit_count = fragments
+            .iter()
+            .filter(|f| f.section.as_str() == SECTION_FILE_INDEX)
+            .count();
+        assert!(
+            file_hit_count <= 1,
+            "ein winziges Budget darf höchstens ein Dateiwissen-Fragment (oder keins) zulassen"
+        );
+        if let Some(hit) = fragments.iter().find(|f| f.section.as_str() == SECTION_FILE_INDEX) {
+            let line_count = hit.body.lines().filter(|l| l.starts_with("- src/zeppelin")).count();
+            assert!(
+                line_count < 5,
+                "ein Budget von 1 Token darf nicht alle 5 Dateizeilen zulassen, got {line_count}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&mem_root);
+        let _ = std::fs::remove_dir_all(&index_root);
     }
 
     #[test]

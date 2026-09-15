@@ -20,9 +20,9 @@ harw-observe = { path = "../harw-observe" }
 # zurück (dieselbe Cargo-Dev-Dependency-Ausnahme wie bei `harw-observe`
 # oben) — Cargo erlaubt das, weil Dev-Dependencies nicht Teil des
 # Graphen sind, den ein Abnehmer dieser Crate als Bibliothek sieht.
-harw-dod-cap = { path = "../harw-dod-cap" }
-harw-dod-signals = { path = "../harw-dod-signals" }
-harw-dod-readfs = { path = "../harw-dod-readfs" }
+harw-dod-cap = { path = "../dod/crates/harw-dod-cap" }
+harw-dod-signals = { path = "../dod/crates/harw-dod-signals" }
+harw-dod-readfs = { path = "../dod/crates/harw-dod-readfs" }
 harw-types = { path = "../harw-types" }
 # AW5-01 (`warden_actions!`): `ProposedAction::tool_schema()` returns a
 # `harw_tools::ToolSpec`; needed for Positivtests und trybuild. Ebenfalls

@@ -110,6 +110,29 @@ impl ChoiceDialog {
         }
     }
 
+    /// Setzt die anfänglich markierte Option und gibt `self` für
+    /// Builder-Verkettung zurück (z. B. um den aktiven Provider/Modell
+    /// vorauszuwählen).
+    ///
+    /// # Beschreibung
+    /// `index` wird auf den gültigen Bereich `0..options.len()` begrenzt
+    /// (leere Optionsliste → `selected` bleibt `0`, ohne Panik).
+    ///
+    /// # Argumente
+    /// - `index` (`usize`): der gewünschte Anfangsindex.
+    ///
+    /// # Rückgabe
+    /// `Self` für Builder-Verkettung.
+    #[must_use]
+    pub fn with_selected(mut self, index: usize) -> Self {
+        self.selected = if self.options.is_empty() {
+            0
+        } else {
+            index.min(self.options.len() - 1)
+        };
+        self
+    }
+
     /// Verarbeitet einen Tastendruck und gibt eine [`ChoiceAction`] zurück.
     ///
     /// # Beschreibung

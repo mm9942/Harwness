@@ -178,3 +178,66 @@ fn profile_tools_unclaimed_by_any_role_match_the_documented_expectation() {
          bewusst um {unclaimed:?} erweitert werden"
     );
 }
+
+/// `agent-steward` und `RegistryProfile::AgentStewardship` sind ein
+/// Sonderfall der beiden Deckungstests oben (Nachtrag K2): zwei ihrer
+/// Werkzeuge (`agents.commit_proposal`, `agents.reject_proposal`) registriert
+/// `crate::agent_definition_tools::AgentDefinitionToolProvider` zur
+/// **Laufzeit** nur im Commit-Modus (Elternrolle der UIA) — im
+/// Vorschlagsmodus (Elternrolle Root-Orchestrator oder unbekannt,
+/// fail-closed) bleiben sie ungenutzt. Die statische Deckung zwischen TOML
+/// und `RegistryProfile` kann diesen Laufzeitzustand nicht ausdrücken; sie
+/// bleibt deshalb bewusst bei der **maximalen** (Commit-Modus-)Werkzeugmenge
+/// maßgeblich — `agent-steward.toml` admittiert alle sechs
+/// `agents.*`-Werkzeuge, `AgentStewardship::tool_names()` bewirbt sie
+/// ebenfalls alle sechs, und die beiden generischen Tests oben decken damit
+/// unverändert beide Richtungen ab, ohne dass die statische Prüfung den
+/// Modus kennen müsste. Dieser Test macht die Absicht explizit, statt sie
+/// stillschweigend an den beiden generischen Tests hängen zu lassen.
+#[test]
+fn agent_steward_admits_the_commit_mode_tool_set_even_though_two_tools_are_mode_gated_at_runtime()
+{
+    let roles = resolved_roles();
+    let ir = roles
+        .get(role_names::AGENT_STEWARD)
+        .expect("agent-steward ist eingebaut");
+    let admitted: BTreeSet<&str> =
+        ir.tool_surface().admitted().iter().map(String::as_str).collect();
+
+    let profile = profile_for_role(role_names::AGENT_STEWARD)
+        .expect("agent-steward braucht ein Profil");
+    assert_eq!(profile, RegistryProfile::AgentStewardship);
+    let advertised: BTreeSet<&str> = profile.tool_names().into_iter().collect();
+
+    assert_eq!(
+        admitted, advertised,
+        "agent-steward.toml muss exakt die Commit-Modus-Werkzeugmenge \
+         admittieren, auch wenn zwei ihrer Werkzeuge im Vorschlagsmodus zur \
+         Laufzeit nicht registriert werden"
+    );
+    for mode_gated in ["agents.commit_proposal", "agents.reject_proposal"] {
+        assert!(admitted.contains(mode_gated), "{mode_gated} fehlt in admitted");
+    }
+    for always_on in ["agents.validate", "agents.list_proposals", "agents.write_definition", "agents.write_uia"] {
+        assert!(admitted.contains(always_on), "{always_on} fehlt in admitted");
+    }
+}
+
+/// Nachtrag K3 (Welle FANIN-K, Fan-in-Zusatzpunkte): schärft den Test oben um
+/// den tatsächlichen Laufzeit-**Standard**zustand — ohne eine vom Aufrufer
+/// gesetzte `AgentDefinitionAccess` (der fail-closed Standardpfad über
+/// `assemble_registry_for_project`/`assemble_registry_for_sandbox` ohne
+/// `..._with_definition_access`) registriert `AgentDefinitionToolProvider`
+/// **nur** die beiden lesenden Werkzeuge — unabhängig davon, dass
+/// `agent-steward.toml` und `RegistryProfile::AgentStewardship::tool_names()`
+/// (Test oben) weiterhin die volle Vertrags-Obermenge admittieren/bewerben.
+/// Mit einer gesetzten Decke und `DefinitionWriteMode::Commit` registriert
+/// derselbe Provider dagegen genau diese Obermenge — siehe
+/// `harw-registry-defaults/src/profile.rs::
+/// test_agent_stewardship_registers_all_six_tools_with_a_commit_ceiling` für
+/// den End-to-End-Beleg über die montierte Registry.
+#[test]
+fn agent_definition_tool_provider_without_access_registers_only_read_and_list_tools() {
+    let names = harw_registry_defaults::agent_definition_tool_names_for_access(None);
+    assert_eq!(names, vec!["agents.validate", "agents.list_proposals"]);
+}

@@ -113,8 +113,9 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use harw_core::cancel::{CancelReason, CancelToken};
 use harw_core::turn_loop::TurnControl;
 use harw_core::{
-    AgentSession, ConversationHistory, CoreError, InteractionMode, ManagedAgentSpawner, ModelError,
-    ModelMessage, TurnInput, TurnOutcome, run_turn,
+    AgentSession, CompactionPlan, ConversationHistory, CoreError, InteractionMode,
+    ManagedAgentSpawner, ModelError, ModelMessage, TurnInput, TurnOutcome, compact_session,
+    run_turn,
 };
 use harw_extension_api::allow_rules::{ApprovalRule, RuleDecision, RuleScope, derive_shell_rule};
 use harw_extension_api::approval_mode::ApprovalMode;
@@ -139,7 +140,7 @@ use crate::chat_scroll::{ChatScroll, ScrollAction};
 use crate::choice_dialog::{ChoiceAction, ChoiceDialog};
 use crate::clipboard::{self, ClipboardTarget};
 use crate::command_exec::execute_command_as;
-use crate::command_popup::{CommandPopup, PopupAction};
+use crate::command_popup::{CommandPopup, PopupAction, TabOutcome};
 use crate::events::{HarwEvent, HarwEventSender};
 use crate::export::{self, ExportEntry, ExportMeta, ExportOptions};
 use crate::frame_requester::{FrameRequester, MIN_FRAME_INTERVAL};
@@ -436,6 +437,35 @@ enum Overlay {
     /// `/export` ohne `--datei` öffnet die Auswahl Zwischenablage/Datei/Abbrechen
     /// (Contract „Nachträgliche Entscheidungen", Slice E1).
     ExportChoice(ChoiceDialog),
+    /// `/provider` ohne Argument öffnet die interaktive Provider-Auswahl.
+    ///
+    /// `ids[i]` ist die kanonische Provider-ID der `i`-ten Zeile in `dialog`
+    /// — getrennt vom Anzeigetext gehalten, statt aus dem Label
+    /// zurückgeparst zu werden.
+    ProviderChoice {
+        /// Kanonische Provider-IDs in derselben Reihenfolge wie die Optionen
+        /// des Dialogs.
+        ids: Vec<String>,
+        /// Der eigentliche Auswahldialog (Titel, Optionen, Markierung).
+        dialog: ChoiceDialog,
+    },
+    /// `/model` ohne Argument (oder die zweite Stufe nach einer
+    /// Providerwahl, deren aktives Modell nicht kompatibel ist) öffnet die
+    /// Modell-Auswahl, gefiltert auf `provider`.
+    ModelChoice {
+        /// Kanonische Provider-ID, auf die der Katalog gefiltert wurde.
+        provider: String,
+        /// Kanonische Modell-IDs in derselben Reihenfolge wie die Optionen
+        /// des Dialogs.
+        ids: Vec<String>,
+        /// Der eigentliche Auswahldialog.
+        dialog: ChoiceDialog,
+        /// `true`, wenn diese Auswahl die zweite Stufe von `/provider` ist
+        /// (Enter emittiert `/provider switch <provider> <model>`); `false`
+        /// für die direkte `/model`-Auswahl (Enter emittiert
+        /// `/model switch <model>`).
+        combined: bool,
+    },
 }
 
 /// Plan- und Ziel-Dienste, die der Renderer für [`PlanGraphCell`] und
@@ -1107,6 +1137,228 @@ impl ChatApp {
         )));
     }
 
+    /// Liest die aufgelöste Konfiguration aus derselben Runtime-Montage, die
+    /// auch die Slash-Dienste bestückt — öffnet niemals eine zweite
+    /// Config-Discovery.
+    ///
+    /// # Beschreibung
+    /// Baut die Slash-`ServiceMap` über [`crate::runtime_commands::slash_service_map`]
+    /// (dieselbe Fabrik, die `/command`-Dispatches benutzen) und liest daraus
+    /// `Arc<harw_config::ResolvedConfig>`. `None` ohne Runtime-Montage oder
+    /// wenn die Fläche den Dienst nicht bestückt hat.
+    ///
+    /// # Rückgabe
+    /// `Some(Arc<ResolvedConfig>)`, sofern verfügbar; sonst `None`.
+    #[must_use]
+    fn resolved_config(&self) -> Option<Arc<harw_config::ResolvedConfig>> {
+        let rt = self.runtime.as_ref()?;
+        let services = runtime_commands::slash_service_map(rt.services());
+        services.get::<Arc<harw_config::ResolvedConfig>>().cloned()
+    }
+
+    /// Löst eine konfigurierte Provider-ID oder einen konfigurierten Namen zu
+    /// ihrem kanonischen Namen auf (Spiegel von `harw_ops::provider`s
+    /// gleichnamiger privater Hilfsfunktion, die von hier aus nicht
+    /// referenzierbar ist).
+    #[must_use]
+    fn canonical_provider_name<'a>(
+        config: &'a harw_config::ResolvedConfig,
+        requested: &str,
+    ) -> Option<&'a str> {
+        config.providers.iter().find_map(|(key, provider)| {
+            (key == requested || provider.name == requested).then_some(provider.name.as_str())
+        })
+    }
+
+    /// Liest den aktiven Provider (Snapshot des Controllers) oder — falls
+    /// noch nicht explizit gewechselt — den Config-Default.
+    ///
+    /// # Beschreibung
+    /// Dieselbe Präzedenz wie `harw_ops::provider::handle_show`: Laufzeit vor
+    /// Konfiguration. Wird sowohl von [`Self::open_provider_choice`] (zur
+    /// Vorauswahl) als auch von der bare-`/model`-Auswahl (zur Filterung)
+    /// verwendet.
+    #[must_use]
+    fn active_or_default_provider(&self, config: &harw_config::ResolvedConfig) -> Option<String> {
+        self.session_controller
+            .snapshot()
+            .active_provider
+            .clone()
+            .or_else(|| config.harness.default_provider.clone())
+    }
+
+    /// Öffnet die interaktive Provider-Auswahl (`/provider` ohne Argument).
+    ///
+    /// # Beschreibung
+    /// Listet alle konfigurierten Provider alphabetisch mit Statusmarker
+    /// (aktiv / Auth fehlt / deaktiviert) und markiert den aktiven Provider
+    /// vorausgewählt (Snapshot des Controllers, sonst Config-Default). Ohne
+    /// Konfiguration oder ohne konfigurierte Provider wird stattdessen eine
+    /// klare Systemzeile angehängt — nie ein leerer Dialog.
+    pub(crate) fn open_provider_choice(&mut self) {
+        let Some(config) = self.resolved_config() else {
+            self.push_line(
+                Role::System,
+                "Provider-Auswahl nicht verfügbar: keine Konfiguration geladen.",
+            );
+            return;
+        };
+        if config.providers.is_empty() {
+            self.push_line(
+                Role::System,
+                "Provider-Auswahl nicht verfügbar: keine Provider konfiguriert.",
+            );
+            return;
+        }
+
+        let active = self.active_or_default_provider(&config);
+
+        let mut providers: Vec<&harw_config::ProviderToml> = config.providers.values().collect();
+        providers.sort_by(|left, right| left.name.cmp(&right.name));
+
+        let mut ids = Vec::with_capacity(providers.len());
+        let mut options = Vec::with_capacity(providers.len());
+        let mut selected = 0usize;
+        for (index, provider) in providers.iter().enumerate() {
+            let is_active = active.as_deref() == Some(provider.name.as_str());
+            if is_active {
+                selected = index;
+            }
+            let marker = if is_active {
+                "aktiv"
+            } else if !provider.enabled {
+                "deaktiviert"
+            } else if provider.auth.is_none() && !provider.has_plaintext_secret() {
+                "Auth fehlt"
+            } else {
+                "bereit"
+            };
+            options.push(format!("{} [{marker}]", provider.name));
+            ids.push(provider.name.clone());
+        }
+
+        let dialog = ChoiceDialog::new("Provider wählen", None, options).with_selected(selected);
+        self.overlay = Some(Overlay::ProviderChoice { ids, dialog });
+    }
+
+    /// Löst eine getroffene Providerwahl auf (zweite Stufe von
+    /// [`Self::open_provider_choice`]).
+    ///
+    /// # Beschreibung
+    /// Ohne aktives Modell oder mit einem Modell, das bereits zum gewählten
+    /// Provider passt, wird sofort `/provider switch <provider>` emittiert.
+    /// Ist das aktive Modell einem anderen Provider zugeordnet, öffnet sich
+    /// stattdessen die Modell-Auswahl gefiltert auf `provider`
+    /// (`combined = true`): die dort getroffene Wahl emittiert
+    /// `/provider switch <provider> <model>` in einem Schritt, damit die
+    /// Sitzung nie durch einen inkompatiblen Zwischenschritt läuft — dieselbe
+    /// Atomarität, die `harw_ops::provider::handle_switch` serverseitig
+    /// erzwingt. Ein unbekanntes aktives Modell gilt (wie dort) als
+    /// kompatibel — die Ablehnung bleibt allein Sache des Laufzeit-Executors.
+    ///
+    /// # Argumente
+    /// - `bus` (`&HarwEventSender`): Kanal für die synthetisierte
+    ///   `/provider switch`-Befehlszeile.
+    /// - `provider` (`String`): die kanonische Provider-ID der getroffenen Wahl.
+    fn resolve_provider_choice(&mut self, bus: &HarwEventSender, provider: String) {
+        let Some(config) = self.resolved_config() else {
+            bus.send(HarwEvent::Command(format!("/provider switch {provider}")));
+            return;
+        };
+        let active_model = self.session_controller.snapshot().active_model;
+        let compatible = match &active_model {
+            None => true,
+            Some(active_model) => config
+                .models
+                .values()
+                .find(|model| {
+                    model.id == *active_model
+                        || model.aliases.iter().any(|alias| alias == active_model)
+                })
+                .map(|model| {
+                    Self::canonical_provider_name(&config, &model.provider) == Some(provider.as_str())
+                })
+                .unwrap_or(true),
+        };
+        if compatible {
+            bus.send(HarwEvent::Command(format!("/provider switch {provider}")));
+        } else {
+            self.open_model_choice(provider, true);
+        }
+    }
+
+    /// Öffnet die interaktive Modell-Auswahl, gefiltert auf `provider`.
+    ///
+    /// # Beschreibung
+    /// Listet nur Modelle, deren (kanonisierter) Provider `provider`
+    /// entspricht, alphabetisch nach ID; markiert das aktive Modell (falls
+    /// eines gesetzt und in dieser Liste vorhanden ist) vorausgewählt. Ist
+    /// die gefilterte Liste leer, wird stattdessen eine klare Systemzeile
+    /// angehängt.
+    ///
+    /// # Argumente
+    /// - `provider` (`String`): kanonische Provider-ID, auf die gefiltert wird.
+    /// - `combined` (`bool`): `true`, wenn dies die zweite Stufe von
+    ///   `/provider` ist (Enter emittiert `/provider switch <provider> <model>`);
+    ///   `false` für die direkte `/model`-Auswahl (Enter emittiert
+    ///   `/model switch <model>`).
+    fn open_model_choice(&mut self, provider: String, combined: bool) {
+        let Some(config) = self.resolved_config() else {
+            self.push_line(
+                Role::System,
+                "Modell-Auswahl nicht verfügbar: keine Konfiguration geladen.",
+            );
+            return;
+        };
+
+        let snap = self.session_controller.snapshot();
+        let active_model = snap.active_model.clone();
+
+        let mut models: Vec<&harw_config::ModelToml> = config
+            .models
+            .values()
+            .filter(|model| {
+                Self::canonical_provider_name(&config, &model.provider) == Some(provider.as_str())
+            })
+            .collect();
+        models.sort_by(|left, right| left.id.cmp(&right.id));
+
+        if models.is_empty() {
+            self.push_line(
+                Role::System,
+                format!("Modell-Auswahl nicht verfügbar: keine Modelle für Provider '{provider}' konfiguriert."),
+            );
+            return;
+        }
+
+        let mut ids = Vec::with_capacity(models.len());
+        let mut options = Vec::with_capacity(models.len());
+        let mut selected = 0usize;
+        for (index, model) in models.iter().enumerate() {
+            let is_active = active_model.as_deref() == Some(model.id.as_str());
+            if is_active {
+                selected = index;
+            }
+            let marker = if is_active { " [aktiv]" } else { "" };
+            let label = model.name.as_deref().unwrap_or(model.id.as_str());
+            options.push(format!("{label} ({}){marker}", model.id));
+            ids.push(model.id.clone());
+        }
+
+        let dialog = ChoiceDialog::new(
+            format!("Modell wählen ({provider})"),
+            None,
+            options,
+        )
+        .with_selected(selected);
+        self.overlay = Some(Overlay::ModelChoice {
+            provider,
+            ids,
+            dialog,
+            combined,
+        });
+    }
+
     /// Gibt `true` zurück, wenn gerade ein Vollflächen-Overlay geöffnet ist.
     #[must_use]
     fn has_overlay(&self) -> bool {
@@ -1714,6 +1966,26 @@ fn resume_request(raw: &str) -> Option<TuiRunOutcome> {
     }
 }
 
+/// Erkennt genau `command` ohne weitere Tokens (beliebiger Umgebungs-Whitespace).
+///
+/// # Beschreibung
+/// Genau wie [`resume_request`]s Präfix-Erkennung, aber ohne
+/// `TuiRunOutcome`-Nutzlast: `/provider list` oder `/model switch x` bleiben
+/// unberührt (der reguläre `/command`-Dispatch behandelt sie unverändert) —
+/// nur die bare Form öffnet die interaktive Auswahl.
+///
+/// # Argumente
+/// - `raw` (`&str`): die unveränderte Befehlszeile.
+/// - `command` (`&str`): der zu erkennende Befehl, z. B. `"/provider"`.
+///
+/// # Rückgabe
+/// `true` für genau `command` (mit beliebigem Whitespace drumherum), sonst
+/// `false`.
+fn is_bare_command(raw: &str, command: &str) -> bool {
+    let mut words = raw.split_whitespace();
+    words.next() == Some(command) && words.next().is_none()
+}
+
 fn visible_message_text(content: &[ContentPart]) -> String {
     let mut visible = String::new();
     for part in content {
@@ -1947,6 +2219,35 @@ pub(crate) async fn run_loop(
                         if let Some(request) = resume_request(&raw) {
                             return Ok(request);
                         }
+                        // `/provider`/`/model` ohne Argument öffnen die
+                        // interaktive Auswahl statt der Text-Ausgabe (`show`)
+                        // — vor dem regulären `/command`-Dispatch
+                        // abgefangen, damit `show` nicht zusätzlich läuft.
+                        // `/provider list`, `/model switch x` u. ä. bleiben
+                        // unberührt und laufen unverändert weiter unten.
+                        if is_bare_command(&raw, "/provider") {
+                            app.open_provider_choice();
+                            frame_req.schedule_frame();
+                            continue;
+                        }
+                        if is_bare_command(&raw, "/model") {
+                            match app.resolved_config() {
+                                Some(config) => match app.active_or_default_provider(&config) {
+                                    Some(provider) => app.open_model_choice(provider, false),
+                                    None => app.push_line(
+                                        Role::System,
+                                        "Modell-Auswahl nicht verfügbar: kein aktiver oder \
+                                         Standard-Provider bekannt.",
+                                    ),
+                                },
+                                None => app.push_line(
+                                    Role::System,
+                                    "Modell-Auswahl nicht verfügbar: keine Konfiguration geladen.",
+                                ),
+                            }
+                            frame_req.schedule_frame();
+                            continue;
+                        }
                         // `/tools` — handled locally via `tools_command` module;
                         // does NOT go through the Operation-Adapter pipeline so
                         // that it can mutate the session's `SessionActivation`
@@ -2014,21 +2315,41 @@ pub(crate) async fn run_loop(
                             // wird sofort persistiert, damit ein anschließendes `/resume`
                             // denselben Kontext erhält.
                             let output = if raw.trim() == "/compact" {
-                                const COMPACT_HISTORY_BYTES: usize = 128 * 1024;
-                                let (session, store, _) = gateway.borrow_turn_ctx();
-                                let before = session.history().len();
-                                let (compacted, _used_bytes, dropped) = session
-                                    .history()
-                                    .tail_within_estimated_bytes(COMPACT_HISTORY_BYTES);
-                                *session.history_mut() = compacted;
-                                let after = session.history().len();
-                                match store.save_history(session.id(), session.history()).await {
-                                    Ok(()) => format!(
-                                        "Session-Kontext komprimiert: {dropped} ältere Einträge entfernt ({before} → {after})."
-                                    ),
-                                    Err(error) => format!(
-                                        "Session-Kontext wurde nur im Speicher komprimiert; Persistenz fehlgeschlagen: {error}"
-                                    ),
+                                let (session, store, model) = gateway.borrow_turn_ctx();
+                                let context_window_tokens = session
+                                    .auto_compact()
+                                    .map(|policy| policy.context_window_tokens())
+                                    .unwrap_or(200_000);
+                                let mut plan = CompactionPlan::for_context_window(context_window_tokens);
+                                let (summary_provider, summary_model) =
+                                    session.compaction_summary_model();
+                                plan.summary_provider = summary_provider.cloned();
+                                plan.summary_model = summary_model.cloned();
+                                match compact_session(session, model, &plan, None).await {
+                                    Ok(outcome) => {
+                                        if let Err(error) =
+                                            store.save_history(session.id(), session.history()).await
+                                        {
+                                            tracing::warn!(
+                                                %error,
+                                                "compact: Verlauf verdichtet, aber Persistenz fehlgeschlagen"
+                                            );
+                                        }
+                                        let summarized_suffix = if outcome.summarized {
+                                            ", zusammengefasst"
+                                        } else {
+                                            ""
+                                        };
+                                        format!(
+                                            "Kontext verdichtet: {} → {} Bytes ({} entfernt, {} Duplikate, {} gekürzt{summarized_suffix})",
+                                            outcome.bytes_before,
+                                            outcome.bytes_after,
+                                            outcome.items_dropped,
+                                            outcome.calls_deduplicated,
+                                            outcome.results_truncated,
+                                        )
+                                    }
+                                    Err(error) => format!("Verdichtung fehlgeschlagen: {error}"),
                                 }
                             } else {
                             // `/command`-Zeile asynchron über die Operation-Adapter-
@@ -2113,6 +2434,7 @@ pub(crate) async fn run_loop(
                     // je Sitzung, unabhängig davon, ob ein Modell auflösbar war
                     // (siehe `TitleJobContext`-Doku in `runtime_root.rs`).
                     if let Some(ctx) = app.title_job_context.take() {
+                        let pin = harw_runtime::session_title::title_model_selection(&ctx.config);
                         let model = ctx.title_model.clone().or_else(|| {
                             gateway
                                 .session_mut()
@@ -2125,6 +2447,7 @@ pub(crate) async fn run_loop(
                                 app.session_id().clone(),
                                 ctx.provider,
                                 model,
+                                pin,
                             ),
                             None => tracing::debug!(
                                 "tui.session_title.no_model_available_skipping_job"
@@ -2710,7 +3033,8 @@ pub(crate) async fn frame_scheduler(
 }
 
 /// Verarbeitet einen Tastendruck, während ein Vollflächen-Overlay
-/// (Session-Picker, `/export`-Auswahl) den normalen Eingabepfad ersetzt.
+/// (Session-Picker, `/export`-, `/provider`-, `/model`-Auswahl) den normalen
+/// Eingabepfad ersetzt.
 ///
 /// # Beschreibung
 /// - [`Overlay::SessionPicker`]: delegiert an [`SessionPicker::handle_key`].
@@ -2722,6 +3046,15 @@ pub(crate) async fn frame_scheduler(
 /// - [`Overlay::ExportChoice`]: delegiert an [`ChoiceDialog::handle_key`].
 ///   Eine getroffene Wahl schließt das Overlay und wird über
 ///   [`resolve_export_choice`] eingelöst.
+/// - [`Overlay::ProviderChoice`]: delegiert an [`ChoiceDialog::handle_key`].
+///   Eine getroffene Wahl schließt das Overlay und wird über
+///   [`ChatApp::resolve_provider_choice`] eingelöst — entweder ein direktes
+///   `/provider switch <id>`, oder das Öffnen der zweiten Stufe
+///   ([`Overlay::ModelChoice`] mit `combined = true`).
+/// - [`Overlay::ModelChoice`]: delegiert an [`ChoiceDialog::handle_key`].
+///   Eine getroffene Wahl schließt das Overlay und synthetisiert je nach
+///   `combined` entweder `/provider switch <provider> <model>` oder
+///   `/model switch <model>` über [`HarwEvent::Command`].
 ///
 /// # Rückgabe
 /// `true` (jede Taste verändert entweder den Overlay-Zustand oder schließt
@@ -2742,6 +3075,35 @@ fn handle_overlay_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -
             ChoiceAction::Chosen(index) => {
                 app.overlay = None;
                 resolve_export_choice(app, bus, index);
+            }
+        },
+        Some(Overlay::ProviderChoice { ids, dialog }) => match dialog.handle_key(key) {
+            ChoiceAction::Stay => {}
+            ChoiceAction::Cancel => app.overlay = None,
+            ChoiceAction::Chosen(index) => {
+                let provider = ids.get(index).cloned();
+                app.overlay = None;
+                if let Some(provider) = provider {
+                    app.resolve_provider_choice(bus, provider);
+                }
+            }
+        },
+        Some(Overlay::ModelChoice { provider, ids, dialog, combined }) => match dialog.handle_key(key) {
+            ChoiceAction::Stay => {}
+            ChoiceAction::Cancel => app.overlay = None,
+            ChoiceAction::Chosen(index) => {
+                let model = ids.get(index).cloned();
+                let provider = provider.clone();
+                let combined = *combined;
+                app.overlay = None;
+                if let Some(model) = model {
+                    let command = if combined {
+                        format!("/provider switch {provider} {model}")
+                    } else {
+                        format!("/model switch {model}")
+                    };
+                    bus.send(HarwEvent::Command(command));
+                }
             }
         },
         None => {}
@@ -2934,17 +3296,28 @@ fn handle_key(
     // ── Popup-Navigations-Pfad ────────────────────────────────────────────
     if app.has_popup() {
         match key.code {
-            // Tab akzeptiert die aktuell markierte Autocomplete-Auswahl.
+            // Tab vervollständigt shell-artig: unveränderte Markierung →
+            // Rang-/Präfixlogik (`CommandPopup::tab_outcome`); bewusst per
+            // Pfeiltaste/Ziffer bewegte Markierung → deren Auswahl gilt.
             KeyCode::Tab => {
-                if let Some(name) = app
+                let outcome = app
                     .command_popup
                     .as_ref()
-                    .and_then(CommandPopup::selected_name)
-                {
-                    app.input.clear();
-                    app.input.insert_str(&format!("/{name} "));
+                    .map(CommandPopup::tab_outcome)
+                    .unwrap_or(TabOutcome::None);
+                match outcome {
+                    TabOutcome::None => {}
+                    TabOutcome::Accept(name) => {
+                        app.input.clear();
+                        app.input.insert_str(&format!("/{name} "));
+                        app.command_popup = None;
+                    }
+                    TabOutcome::ExtendQuery(common) => {
+                        app.input.clear();
+                        app.input.insert_str(&format!("/{common}"));
+                        app.sync_popup();
+                    }
                 }
-                app.command_popup = None;
                 true
             }
             KeyCode::Up | KeyCode::Down | KeyCode::Esc | KeyCode::Char('1'..='9') => {
@@ -3069,6 +3442,10 @@ async fn run_turn_streaming(
     app.active_cancel = None;
 
     let reply = reply?;
+
+    // Auto-Compact läuft jetzt in harw-core selbst (Turn-Loop nach
+    // Runden/Turns), gesteuert über `AgentSession::auto_compact()`. Die TUI
+    // muss dafür nichts mehr tun.
     reveal_reply(guard, app, &reply).await?;
     Ok(())
 }
@@ -3076,7 +3453,16 @@ async fn run_turn_streaming(
 /// Maximale Wartezeit nach einem Rate-Limit in Sekunden, die automatisch
 /// abgewartet wird. Darüber hinaus wird dem User eine manuelle Retry-Bitte
 /// angezeigt, aber die Session bleibt geöffnet.
-const RATE_LIMIT_AUTO_RETRY_CAP_SECS: u64 = 60;
+///
+/// Obergrenze je Wartephase. Anthropic meldet `retry-after` oft bei 60–120 s;
+/// über diesem Deckel ist weitere automatische Warterei nicht mehr
+/// produktiv — dann bekommt der User die Kontrolle zurück.
+const RATE_LIMIT_AUTO_RETRY_CAP_SECS: u64 = 120;
+
+/// Maximale Gesamtzahl automatischer Rate-Limit-Versuche (Erstversuch
+/// eingeschlossen). Harte Anbieter-Limits können mehrere aufeinanderfolgende
+/// 429 liefern; ein einzelner Retry reicht dort nicht aus.
+const RATE_LIMIT_MAX_ATTEMPTS: u32 = 3;
 
 /// Re-enters the core turn loop without appending the already-persisted user
 /// message a second time. A rate-limited turn is returned to `Idle` by core,
@@ -3093,14 +3479,17 @@ fn rate_limit_retry_input() -> TurnInput {
 /// gezeichnet, bis der Turn abgeschlossen ist. Extrahiert danach die letzte
 /// Assistant-Antwort aus der Session-Historie.
 ///
-/// Wenn der Provider HTTP 429 zurückgibt ([`ModelError::RateLimited`]), wird
-/// einmalig automatisch gewartet (`retry_after_secs`, max
-/// [`RATE_LIMIT_AUTO_RETRY_CAP_SECS`]) und ein Retry versucht. Die Chat-Session
-/// wird dabei **nicht** beendet:
-/// - Retry erfolgreich → Antwort wie gewohnt.
-/// - Retry erneut rate-limitiert → `Ok("⏱ Rate limit — please retry in Ns")`;
-///   der User kann erneut senden.
-/// - Retry mit anderem Fehler → `Err(TuiError::Core(...))` (normaler Fehlerfall).
+/// Wenn der Provider HTTP 429 zurückgibt ([`ModelError::RateLimited`]), läuft
+/// eine budgetierte Retry-Schleife: bis zu [`RATE_LIMIT_MAX_ATTEMPTS`]
+/// Versuche, je Wartephase `retry_after_secs` (gedeckelt auf
+/// [`RATE_LIMIT_AUTO_RETRY_CAP_SECS`]) plus einem deterministischen Jitter
+/// von bis zu 25 %, damit parallele Clients nicht im Gleichtakt erneut
+/// an denselben Anbieter-Limiter schlagen. Die Chat-Session wird dabei
+/// **nicht** beendet:
+/// - Irgendein Versuch erfolgreich → Antwort wie gewohnt.
+/// - Budget erschöpft, weiterhin 429 → `Ok("⏱ Rate limit — …")`; der User
+///   kann erneut senden.
+/// - Anderer Fehler → `Err(TuiError::Core(...))` (normaler Fehlerfall).
 ///
 /// # Freigaben und Kind-Wiederaufnahme (AP W5-03)
 /// Beide Ausgänge — der Erstversuch **und** der Rate-Limit-Retry — münden in
@@ -3145,64 +3534,30 @@ async fn drive_turn_animated(
     // Einmal zeichnen, damit der Spinner sofort erscheint.
     draw_viewport(guard, app, spinner, None)?;
 
-    // Erster Versuch — Turn-Future in einen Block scopen, damit der
-    // `&mut session`-Borrow freigegeben wird, bevor wir `session.history()` lesen.
+    // Rate-Limit-Retry-Schleife: Erstversuch plus bis zu
+    // RATE_LIMIT_MAX_ATTEMPTS-1 Wiederholungen. Jeder Versuch läuft durch
+    // dieselbe animierte Select-Schleife; nur das TurnInput unterscheidet
+    // sich — Retries nutzen `rate_limit_retry_input()`, damit die bereits
+    // persistierte User-Message nicht doppelt angehängt wird.
     let mut input_open = true;
-    let first_result = {
-        let (session, store, model) = gateway.borrow_turn_ctx();
-        let turn = run_turn(session, model, store, input);
-        tokio::pin!(turn);
-        loop {
-            tokio::select! {
-                result = &mut turn => break result,
-                event = tui_rx.recv(), if input_open => {
-                    match event {
-                        Some(event) => {
-                            if handle_busy_event(app, event) {
-                                draw_viewport(guard, app, spinner, None)?;
-                            }
-                        }
-                        None => input_open = false,
-                    }
-                }
-                // Werkzeug-, Kind- und Plan-Zellen erscheinen dadurch bereits
-                // während des Turns statt erst nach seinem Ende.
-                maybe_turn_event = turn_event_rx.recv() => {
-                    if let Some(event) = maybe_turn_event {
-                        if handle_turn_event(app, turn_state, event) {
-                            draw_viewport(guard, app, spinner, None)?;
-                        }
-                    }
-                }
-                _ = tokio::time::sleep(SPINNER_INTERVAL) => {
-                    spinner.tick();
-                    draw_viewport(guard, app, spinner, None)?;
-                }
-            }
-        }
-    };
+    let mut pending_input = Some(input);
+    let mut attempt: u32 = 0;
 
-    // Rate-Limit-Behandlung: einmaliger automatischer Retry mit Backoff.
-    let outcome = match first_result {
-        Err(CoreError::Model(ModelError::RateLimited {
-            retry_after_secs, ..
-        })) => {
-            let wait_secs = retry_after_secs.min(RATE_LIMIT_AUTO_RETRY_CAP_SECS);
-            // Warten — Spinner läuft weiter, Session bleibt offen.
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
-            while tokio::time::Instant::now() < deadline {
-                tokio::time::sleep(SPINNER_INTERVAL).await;
-                spinner.tick();
-                draw_viewport(guard, app, spinner, None)?;
-            }
-            // Zweiter Versuch nach Backoff.
-            let retry_result = {
-                let (session, store, model) = gateway.borrow_turn_ctx();
-                let turn = run_turn(session, model, store, rate_limit_retry_input());
-                tokio::pin!(turn);
-                loop {
-                    tokio::select! {
-                            result = &mut turn => break result,
+    let outcome = loop {
+        attempt += 1;
+        let turn_input = pending_input
+            .take()
+            .unwrap_or_else(rate_limit_retry_input);
+
+        // Turn-Future in einen Block scopen, damit der `&mut session`-Borrow
+        // freigegeben wird, bevor wir `session.history()` lesen.
+        let result = {
+            let (session, store, model) = gateway.borrow_turn_ctx();
+            let turn = run_turn(session, model, store, turn_input);
+            tokio::pin!(turn);
+            loop {
+                tokio::select! {
+                    result = &mut turn => break result,
                     event = tui_rx.recv(), if input_open => {
                         match event {
                             Some(event) => {
@@ -3213,36 +3568,56 @@ async fn drive_turn_animated(
                             None => input_open = false,
                         }
                     }
-                            maybe_turn_event = turn_event_rx.recv() => {
-                                if let Some(event) = maybe_turn_event {
-                                    if handle_turn_event(app, turn_state, event) {
-                                        draw_viewport(guard, app, spinner, None)?;
-                                    }
-                                }
-                            }
-                            _ = tokio::time::sleep(SPINNER_INTERVAL) => {
-                                spinner.tick();
+                    // Werkzeug-, Kind- und Plan-Zellen erscheinen dadurch
+                    // bereits während des Turns statt erst nach seinem Ende.
+                    maybe_turn_event = turn_event_rx.recv() => {
+                        if let Some(event) = maybe_turn_event {
+                            if handle_turn_event(app, turn_state, event) {
                                 draw_viewport(guard, app, spinner, None)?;
                             }
                         }
+                    }
+                    _ = tokio::time::sleep(SPINNER_INTERVAL) => {
+                        spinner.tick();
+                        draw_viewport(guard, app, spinner, None)?;
+                    }
                 }
-            };
-            match retry_result {
-                // Noch immer rate-limitiert → Session am Leben lassen, User informieren.
-                Err(CoreError::Model(ModelError::RateLimited {
-                    retry_after_secs, ..
-                })) => {
-                    return Ok(format!(
-                        "⏱ Rate limit — please retry in {}s",
-                        retry_after_secs
-                    ));
-                }
-                // Anderer Fehler oder Erfolg nach Retry.
-                other => other.map_err(|error| TuiError::Core(error.to_string()))?,
             }
+        };
+
+        match result {
+            Err(CoreError::Model(ModelError::RateLimited {
+                retry_after_secs, ..
+            })) if attempt < RATE_LIMIT_MAX_ATTEMPTS => {
+                // Wartezeit: provider-Hinweis, gedeckelt, plus deterministischer
+                // Jitter (bis 25 %, abgeleitet aus der Versuchsnummer), damit
+                // parallele Clients nicht im Gleichtakt erneut auf denselben
+                // Limiter schlagen.
+                let base = retry_after_secs.min(RATE_LIMIT_AUTO_RETRY_CAP_SECS);
+                let jitter = (base / 4).min(15).saturating_mul(u64::from(attempt - 1) % 2);
+                let wait_secs = base.saturating_add(jitter);
+                let deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
+                while tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(SPINNER_INTERVAL).await;
+                    spinner.tick();
+                    draw_viewport(guard, app, spinner, None)?;
+                }
+                // Nächster Schleifendurchlauf: leerer Retry-Input.
+            }
+            // Budget erschöpft und weiterhin 429 → Session am Leben lassen,
+            // User informieren; er kann erneut senden.
+            Err(CoreError::Model(ModelError::RateLimited {
+                retry_after_secs, ..
+            })) => {
+                return Ok(format!(
+                    "⏱ Rate limit — provider busy; retry in {}s ({} attempts used)",
+                    retry_after_secs, attempt
+                ));
+            }
+            // Kein Rate-Limit: normaler Fehler oder Erfolg.
+            other => break other.map_err(|error| TuiError::Core(error.to_string()))?,
         }
-        // Kein Rate-Limit: normaler Fehler oder Erfolg.
-        other => other.map_err(|error| TuiError::Core(error.to_string()))?,
     };
 
     // AP W5-03: Beide Ausgänge oben (Erstversuch und Rate-Limit-Retry) landen
@@ -3956,17 +4331,19 @@ fn render_viewport(
     let theme = app.theme;
     let area = frame.area();
 
-    // Vollflächige Overlays (Session-Picker, `/export`-Auswahl) ersetzen die
-    // gesamte Viewport (Plan Schritt 6/7) — `Clear` erst, sonst bliebe
-    // Chat-Text unter dem Overlay stehen (dasselbe Muster wie beim
-    // `/command`-Popup weiter unten).
+    // Vollflächige Overlays (Session-Picker, `/export`-, `/provider`-,
+    // `/model`-Auswahl) ersetzen die gesamte Viewport (Plan Schritt 6/7) —
+    // `Clear` erst, sonst bliebe Chat-Text unter dem Overlay stehen
+    // (dasselbe Muster wie beim `/command`-Popup weiter unten).
     match &app.overlay {
         Some(Overlay::SessionPicker(picker)) => {
             frame.render_widget(Clear, area);
             picker.render(area, frame.buffer_mut(), &theme);
             return;
         }
-        Some(Overlay::ExportChoice(dialog)) => {
+        Some(Overlay::ExportChoice(dialog))
+        | Some(Overlay::ProviderChoice { dialog, .. })
+        | Some(Overlay::ModelChoice { dialog, .. }) => {
             frame.render_widget(Clear, area);
             dialog.render(area, frame.buffer_mut(), theme);
             return;
@@ -4006,8 +4383,15 @@ fn render_viewport(
         PermissionCycleStage::Full => "Full Access",
         PermissionCycleStage::Plan => "Plan",
     };
+    let cached = app.total_usage.cached_tokens.unwrap_or(0);
+    let cache_write = app.total_usage.cache_write_tokens.unwrap_or(0);
+    let cache_suffix = if cached > 0 || cache_write > 0 {
+        format!(", cache {cached} / neu {cache_write}")
+    } else {
+        String::new()
+    };
     let status = format!(
-        " Shift+Tab: {permission} | Modus: {} | Tokens: {} (in {}, out {})",
+        " Shift+Tab: {permission} | Modus: {} | Tokens: {} (in {}, out {}{cache_suffix})",
         app.active_mode.as_str(), app.total_usage.total(),
         app.total_usage.input_tokens, app.total_usage.output_tokens,
     );
@@ -4282,8 +4666,17 @@ mod tests {
     /// frischen Test-Sandbox. Für Tests, die nur Verlauf/Popup/Scroll prüfen
     /// (nicht die Command-Adapter-Pipeline selbst — dafür siehe
     /// `command_exec.rs`).
+    ///
+    /// # Beschreibung
+    /// `ChatApp::new` baut `command_registry` aus der (hier leeren)
+    /// Adapter-Pipeline (`CommandRegistry::from_command_adapters`) — für
+    /// Popup-/Tab-Tests wird die Registry deshalb im Anschluss durch
+    /// [`CommandRegistry::built_in()`] ersetzt, damit `/`-Präfixe echte
+    /// Treffer liefern statt eines leeren, sofort wieder geschlossenen Popups.
     fn test_chat_app() -> ChatApp {
-        ChatApp::new(Vec::new(), test_sandbox(), SessionId::new())
+        let mut app = ChatApp::new(Vec::new(), test_sandbox(), SessionId::new());
+        app.command_registry = CommandRegistry::built_in();
+        app
     }
 
     /// Test-lokaler Ersatz für das gelöschte `trusted_tui_spawn_context`
@@ -4305,6 +4698,7 @@ mod tests {
                 id: "local-tui".to_owned(),
             }),
             organizational_role: AgentRoleId::RootOrchestrator,
+            allowed_child_orchestrators: Vec::new(),
             trace: None,
             ceiling: None,
         }
@@ -4751,6 +5145,47 @@ forbidden = [{forbidden}]
             Err(_) => {}
             Ok(event) => panic!("Tab darf kein HarwEvent senden, war: {event:?}"),
         }
+    }
+
+    /// Regression: `/mo` listet zwei Präfix-Treffer (`/mode`, `/model`) UND
+    /// einen reinen Teilstring-Treffer (`/memory`, enthält „mo", ist aber
+    /// kein Präfix-Treffer). Ohne bewegte Markierung darf Tab weder den
+    /// Teilstring-Treffer noch irgendeinen einzelnen Präfix-Treffer sofort
+    /// übernehmen, solange mehrere Präfix-Treffer uneindeutig sind —
+    /// stattdessen wird die Eingabe auf deren längstes gemeinsames Präfix
+    /// erweitert (`/mode`) und das Popup bleibt offen.
+    #[test]
+    fn test_handle_key_tab_extends_query_to_common_prefix_for_ambiguous_matches() {
+        let mut app = test_chat_app();
+        app.input.clear();
+        app.input.insert_str("/mo");
+        app.sync_popup();
+
+        let (bus, mut receiver) = harw_event_channel();
+        let mut pending_quit: Option<QuitArm> = None;
+        let key = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+
+        let redraw = handle_key(&mut app, key, &mut pending_quit, &bus);
+
+        assert!(redraw, "Tab muss einen Redraw anfordern");
+        assert_eq!(
+            app.input(),
+            "/mode",
+            "Tab muss auf das gemeinsame Präfix von /mode und /model erweitern"
+        );
+        assert_ne!(
+            app.input(),
+            "/memory ",
+            "Tab darf niemals den reinen Teilstring-Treffer /memory übernehmen"
+        );
+        assert!(
+            app.command_popup.is_some(),
+            "Popup muss offen bleiben, solange die Erweiterung mehrdeutig bleibt"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "Query-Erweiterung darf keinen Command absenden"
+        );
     }
 
     // ────────────────────────────────────────────────────────────────────

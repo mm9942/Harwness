@@ -19,13 +19,15 @@
 //! `<name>.corrupt-<ts>` verschoben und mit `warn!` übersprungen.
 
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use fs4::FileExt;
 use harw_observe::TraceContext;
 use harw_types::{SessionId, ToolCallId};
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
+use tempfile::NamedTempFile;
 use crate::error::{SessionStoreError, SessionStoreResult};
 use crate::store::{persist_noclobber, quarantine_file};
 
@@ -216,6 +218,87 @@ impl ChildLeaseStore {
                 Err(error) => return Err(SessionStoreError::Io(error)),
             }
             Ok(completion)
+        })();
+        unlock(lock, result)
+    }
+
+    /// Verlängert eine noch nicht abgelaufene aktive Lease durabel auf
+    /// `max(aktueller Wert, now + lease_seconds)`.
+    ///
+    /// # Beschreibung
+    /// Welle FANIN-K. Liest die aktuelle `.active.json`, berechnet die neue
+    /// Fälligkeit und schreibt den Datensatz nur bei tatsächlicher
+    /// Verlängerung zurück: Inhalt in eine Geschwister-Temp-Datei, `sync_all`,
+    /// dann ein **ersetzendes** `rename` über die vorhandene aktive Datei.
+    /// Im Unterschied zu [`Self::admit`]/[`Self::complete`], die über
+    /// [`persist_noclobber`] nie ein vorhandenes Ziel überschreiben dürfen,
+    /// MUSS diese Schreiboperation das bestehende Ziel ersetzen — dafür
+    /// nutzt sie `NamedTempFile::persist` (dieselbe zugrunde liegende
+    /// Bibliothek, nur ohne dessen No-Replace-Verhalten) statt
+    /// [`persist_noclobber`]. Das Elternverzeichnis wird nicht erneut
+    /// gesynct: der Verzeichniseintrag selbst ändert sich nicht, nur der
+    /// Inode-Inhalt hinter ihm — ein Stromausfall zeigt danach höchstens die
+    /// alte oder die neue Fälligkeit, nie eine leere Datei.
+    ///
+    /// # Arguments
+    /// - `child` (`&SessionId`): das zu verlängernde Kind.
+    /// - `lease_seconds` (`i64`): die konfigurierte Lease-Dauer.
+    /// - `now` (`Timestamp`): Referenzzeitpunkt.
+    ///
+    /// # Returns
+    /// `Ok(())` immer bei erfolgreichem Abschluss — auch wenn keine
+    /// Verlängerung nötig war (unbekanntes Kind, bereits abgelaufene Lease,
+    /// oder die berechnete neue Fälligkeit liegt nicht nach der
+    /// eingetragenen). Idempotent, damit ein Aufrufer eine verspätete
+    /// Verlängerung nicht als Fehler behandeln muss.
+    ///
+    /// # Errors
+    /// [`SessionStoreError::Io`] bei Lese-/Schreib-/Sync-Fehlern (inklusive
+    /// eines kontendierten Lease-Locks), [`SessionStoreError::Serde`] bei
+    /// einem undekodierbaren aktiven Datensatz.
+    ///
+    /// # Concurrency
+    /// Nimmt denselben Verzeichnis-Lock wie [`Self::claim_expired`]/
+    /// [`Self::complete`]; von beliebig vielen Threads/Prozessen aufrufbar,
+    /// serialisiert über diesen Lock.
+    pub fn renew(
+        &self,
+        child: &SessionId,
+        lease_seconds: i64,
+        now: Timestamp,
+    ) -> SessionStoreResult<()> {
+        self.ensure_root()?;
+        let lock = self.lock()?;
+        let result = (|| {
+            let active = self.active_path(child)?;
+            if !is_regular_file(&active)? {
+                // Unbekannt oder bereits terminal: keine aktive Lease zum
+                // Verlängern, kein Fehler.
+                return Ok(());
+            }
+            let mut record = read_lease(&active)?;
+            if now >= record.lease_expires_at {
+                // Bereits abgelaufen: kein Wiederbeleben durch eine späte
+                // Verlängerung.
+                return Ok(());
+            }
+            let Ok(candidate) = now.checked_add(SignedDuration::from_secs(lease_seconds)) else {
+                return Ok(());
+            };
+            if candidate <= record.lease_expires_at {
+                return Ok(());
+            }
+            record.lease_expires_at = candidate;
+            let bytes = serde_json::to_vec(&record)?;
+            let parent = active.parent().ok_or_else(|| {
+                SessionStoreError::Io(std::io::Error::other("child lease path has no parent"))
+            })?;
+            let mut temp = NamedTempFile::new_in(parent).map_err(SessionStoreError::Io)?;
+            temp.write_all(&bytes).map_err(SessionStoreError::Io)?;
+            temp.as_file().sync_all().map_err(SessionStoreError::Io)?;
+            temp.persist(&active)
+                .map_err(|error| SessionStoreError::Io(error.error))?;
+            Ok(())
         })();
         unlock(lock, result)
     }

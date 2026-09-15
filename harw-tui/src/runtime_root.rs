@@ -394,6 +394,11 @@ pub struct TitleJobContext {
     pub session_store_root: PathBuf,
     /// Konfiguriertes Titel-Modell (`[session] title_model`), falls gesetzt.
     pub title_model: Option<String>,
+    /// Aufgelöste Konfiguration der Montage, aus der `run_loop` die interne
+    /// Modellstelle [`harw_config::InternalModelPoint::SessionTitle`] auflöst
+    /// (Addendum C) und `harw_runtime::session_title::title_model_selection`
+    /// aufruft, um `spawn_title_job` deren `pin`-Argument zu geben.
+    pub config: Arc<harw_config::ResolvedConfig>,
 }
 
 /// Handgeschriebenes `Debug`: `provider` ist ein Trait-Objekt.
@@ -404,6 +409,7 @@ impl std::fmt::Debug for TitleJobContext {
             .field("provider", &"<dyn ModelProvider>")
             .field("session_store_root", &self.session_store_root)
             .field("title_model", &self.title_model)
+            .field("config", &"<ResolvedConfig>")
             .finish()
     }
 }
@@ -776,6 +782,7 @@ fn build_root_runtime(
                 provider: Arc::clone(assembly.model()),
                 session_store_root: store_root.to_path_buf(),
                 title_model: session_config.title_model.clone(),
+                config: Arc::clone(assembly.config()),
             });
         }
     }
@@ -1148,6 +1155,9 @@ mod tests {
             project_key: None,
             first_user_message: None,
             turns,
+            usage_rounds: 0,
+            total_usage: harw_types::TokenUsage::default(),
+            drift_events: std::collections::BTreeMap::new(),
         }
     }
 

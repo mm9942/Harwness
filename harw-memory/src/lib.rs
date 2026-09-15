@@ -46,6 +46,7 @@
 //! assert!(hot.is_empty() || hot.lines().count() <= 100);
 //! ```
 
+pub mod capture;
 pub mod context_policy;
 pub mod context_provider;
 pub mod context_selector;
@@ -56,6 +57,7 @@ pub mod error;
 pub mod consolidation;
 pub mod extraction;
 pub mod facts;
+pub mod file_index;
 pub mod file_store;
 pub mod heartbeat;
 pub mod learning;
@@ -66,6 +68,7 @@ pub mod summary;
 pub mod types;
 pub mod workflow;
 
+pub use capture::{ProjectMemoryCapture, consolidate_project_memories};
 pub use context_provider::{
     MEMORY_CONTEXT_MAX_TRUST, MEMORY_CONTEXT_MAY_CARRY_USER_CONTENT, MEMORY_CONTEXT_NAMESPACE,
     MemoryContextProvider, selection_role_for,
@@ -77,6 +80,7 @@ pub use extraction::{
     TranscriptEntry, build_input, parse_response, select_sessions, system_prompt, user_prompt,
 };
 pub use facts::{Fact, FactScope, FactStore, FactType, redact, slugify};
+pub use file_index::{FileKnowledge, FileKnowledgeIndex};
 pub use file_store::FileMemoryStore;
 pub use store::Memory;
 pub use types::{Entry, MaintenanceReport, RecallQuery, Signal, Stats, Tier};

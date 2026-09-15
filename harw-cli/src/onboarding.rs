@@ -90,7 +90,8 @@ fn run_wizard_with_interaction_mode(home: &Path, interactive: bool) -> Result<()
             eprintln!("Modellkatalog: {error}");
         }
         if let Some(outcome) = harw_tui::run_setup(catalog).map_err(|e| e.to_string())? {
-            return persist_outcome(home, &outcome);
+            persist_outcome(home, &outcome)?;
+            return maybe_recommend_openrouter(home, interactive);
         }
         return Err("Einrichtung abgebrochen".to_owned());
     }
@@ -136,7 +137,96 @@ fn run_wizard_with_interaction_mode(home: &Path, interactive: bool) -> Result<()
         },
         auth_header: None,
     };
-    persist_outcome(home, &outcome)
+    persist_outcome(home, &outcome)?;
+    maybe_recommend_openrouter(home, interactive)
+}
+
+/// Empfiehlt nach erfolgreicher Ersteinrichtung eines Providers, zusätzlich
+/// `openrouter` einzurichten (Addendum C: Standard für interne Modellstellen
+/// wie Session-Titel, Kontext-Verdichtung, Traumreflexion und
+/// Explorer-/Recherche-Subagenten).
+///
+/// # Description
+/// Überspringt still (ohne Ausgabe), wenn nicht-interaktiv, ohne TTY, oder
+/// wenn bereits ein `providers/openrouter.toml` im aktiven Profil existiert.
+/// Bei Zustimmung wird der Schlüssel wie beim ersten Provider entweder als
+/// bereits fertige [`SecretRef`] übernommen oder über [`write_secret_file`]
+/// als `file:`-Referenz abgelegt; danach wird `providers/openrouter.toml`
+/// geschrieben (`api = "openai-chat"`, `base_url =
+/// "https://openrouter.ai/api/v1"`, `enabled = true`, `models = []`).
+///
+/// # Errors
+/// Ein `String` bei Schreib- oder Serialisierungsfehlern.
+fn maybe_recommend_openrouter(home: &Path, interactive: bool) -> Result<(), String> {
+    if !interactive || !std::io::stdin().is_terminal() {
+        return Ok(());
+    }
+    let profile_name = harw_home::active_profile_name(home);
+    let profile = harw_home::profile_dir(home, &profile_name).map_err(|e| e.to_string())?;
+    if profile.join("providers").join("openrouter.toml").exists() {
+        return Ok(());
+    }
+
+    println!();
+    println!(
+        "Tipp: Mit OpenRouter kann harw interne Aufgaben — Session-Titel, \
+Kontext-Verdichtung, Traumreflexion sowie Explorer-/Recherche-Subagenten — \
+über schnelle, günstige NVIDIA-Nemotron-Modelle abwickeln, statt dafür dein \
+Hauptmodell zu belegen. Kostenlose ':free'-Varianten existieren, sind aber \
+ratenbegrenzt und können Prompts protokollieren."
+    );
+    let answer = prompt_default(true, "OpenRouter jetzt einrichten? [y/N]", "n")?;
+    if !matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "j" | "ja" | "y" | "yes"
+    ) {
+        println!(
+            "Interne Aufgaben nutzen bis auf Weiteres das Hauptmodell; \
+änderbar mit `harw models internal`."
+        );
+        return Ok(());
+    }
+
+    let raw_key = prompt_default(true, "OpenRouter-API-Schlüssel (leer = abbrechen)", "")?;
+    let trimmed_key = raw_key.trim();
+    if trimmed_key.is_empty() {
+        println!(
+            "Kein Schlüssel eingegeben — interne Aufgaben nutzen bis auf \
+Weiteres das Hauptmodell; änderbar mit `harw models internal`."
+        );
+        return Ok(());
+    }
+    let auth_ref: SecretRef = if is_secret_ref(trimmed_key) {
+        trimmed_key
+            .parse()
+            .map_err(|e: harw_config::ConfigError| e.to_string())?
+    } else {
+        write_secret_file(home, "openrouter", trimmed_key)?
+    };
+
+    let provider = ProviderToml {
+        name: "openrouter".to_owned(),
+        api: "openai-chat".to_owned(),
+        base_url: "https://openrouter.ai/api/v1".to_owned(),
+        auth: Some(auth_ref),
+        auth_header: None,
+        api_key: None,
+        headers: std::collections::HashMap::new(),
+        models: Vec::new(),
+        enabled: true,
+        origin_allowlist: harw_config::OriginAllowlistToml::default(),
+        rate_limit: None,
+    };
+    let providers_dir = profile.join("providers");
+    create_dir_all(&providers_dir)?;
+    write_file(
+        &providers_dir.join("openrouter.toml"),
+        &toml::to_string_pretty(&provider).map_err(|e| format!("provider serialisieren: {e}"))?,
+    )?;
+    println!(
+        "OpenRouter eingerichtet. Interne Modellstellen verwalten: `harw models internal`."
+    );
+    Ok(())
 }
 
 /// Persistiert das Ergebnis des ratatui-Setup-Pickers: schreibt Provider- und
@@ -188,6 +278,7 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
         models: vec![model_id.clone()],
         enabled: true,
         origin_allowlist: harw_config::OriginAllowlistToml::default(),
+        rate_limit: None,
     };
     let providers_dir = profile.join("providers");
     create_dir_all(&providers_dir)?;
@@ -206,6 +297,7 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
         reasoning: false,
         input_types: Vec::new(),
         capabilities: harw_config::ModelCapabilitiesToml::default(),
+        prompt_caching: None,
     };
     let models_dir = profile.join("models");
     create_dir_all(&models_dir)?;

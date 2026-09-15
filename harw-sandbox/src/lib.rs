@@ -52,6 +52,12 @@ pub use egress::{EgressHost, EgressUrl, EgressUrlError, host_matches_suffix};
 mod extra_roots;
 pub use extra_roots::{ExtraRoot, ExtraRootError, ExtraRootsCell, MAX_EXTRA_ROOTS, validate_extra_root};
 
+mod process_permit;
+pub use process_permit::{
+    GrantedProcessPermit, HostApprovalScope, ProcessEnvironment, ProcessPermitError,
+    ProcessPermitId, ProcessPermitLedger, ProcessPermitRequest, request_for_workspace,
+};
+
 /// Operationsklassen, die eine Sandbox autorisieren kann.
 ///
 /// Es gibt bewusst keine Permission für beliebigen Dateisystemzugriff außerhalb

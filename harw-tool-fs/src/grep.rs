@@ -93,11 +93,17 @@ pub struct GrepArgs {
     pub glob: Option<String>,
     /// Kontextzeilen vor und nach dem Treffer (Default 0, Maximum 10).
     #[tool(default = 0)]
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "harw_extension_api::lenient::lenient_opt_usize"
+    )]
     pub context_lines: Option<usize>,
     /// Obergrenze der Treffer (Default 100, Maximum 1000).
     #[tool(default = 100)]
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "harw_extension_api::lenient::lenient_opt_usize"
+    )]
     pub max_matches: Option<usize>,
     /// Groß-/Kleinschreibung ignorieren.
     #[tool(default = false)]

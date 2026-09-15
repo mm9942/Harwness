@@ -363,6 +363,17 @@ fn all_registered_ops_are_reachable_by_name() {
         // erschöpfend: eine Operation, die `register_all` einträgt und die
         // TUI nicht kennt, wäre über keine Fläche erreichbar.
         "context-proposal",
+        // Slice B4 (Contract §2 A8): `/add-workdir` legt eine zusätzliche
+        // Workspace-Wurzel frei, `/export` liefert nachträglichen Export --
+        // beide sind `tui_only` Command-Operationen aus `register_all` und
+        // gehören deshalb in diese erschöpfende Liste.
+        "add-workdir",
+        "export",
+        // Agent OPS: `/usage` liest `SessionStateSnapshot::total_usage` --
+        // reine Session-Introspektion wie `mode`/`context-proposal`, deshalb
+        // ebenfalls Grundausstattung statt Planungsfläche und in dieser
+        // Liste zu führen.
+        "usage",
     ];
 
     // Jede Operation muss mindestens eine Fläche tragen. Eine ohne wäre über

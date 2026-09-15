@@ -52,6 +52,7 @@ fn new_session(
                 capability_snapshot: None,
                 approval_actor: Some(test_approval_actor()),
                 organizational_role: AgentRoleId::RootOrchestrator,
+                allowed_child_orchestrators: Vec::new(),
                 // Generic fixture — not exercising trace propagation.
                 trace: None,
                 // Generic fixture — not exercising context-ceiling propagation.

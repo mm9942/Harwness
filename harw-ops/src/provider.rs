@@ -173,15 +173,29 @@ fn resolved_config(ctx: &OpContext) -> Result<Arc<harw_config::ResolvedConfig>, 
 async fn provider(ctx: &OpContext, args: ProviderArgs) -> Result<OpOutput, OpError> {
     let sub = args.cmd.as_deref().unwrap_or("show");
 
-    // ── `switch <id>` — atomic validation + mutation via SessionController ────
+    // ── `switch <id> [<model-id>]` — atomic validation + mutation via
+    // SessionController. An optional second token pins the model in the
+    // same call, so a provider+model pair never passes through a moment of
+    // provider/model incompatibility.
     if let Some(target) = sub.strip_prefix("switch ") {
-        let target = target.trim().to_string();
+        let target = target.trim();
         if target.is_empty() {
             return Err(OpError::InvalidArguments(
-                "switch requires a provider ID: /provider switch <id>".into(),
+                "switch requires a provider ID: /provider switch <id> [<model-id>]".into(),
             ));
         }
-        return handle_switch(ctx, target);
+        let mut tokens = target.split_whitespace();
+        // `target` is non-empty (checked above), so the first token always exists.
+        let provider_target = tokens.next().unwrap_or_default().to_owned();
+        let model_target = tokens.next().map(str::to_owned);
+        if tokens.next().is_some() {
+            return Err(OpError::InvalidArguments(
+                "switch accepts at most a provider ID and a model ID: \
+                 /provider switch <id> [<model-id>]"
+                    .into(),
+            ));
+        }
+        return handle_switch(ctx, provider_target, model_target);
     }
 
     match sub {
@@ -190,7 +204,7 @@ async fn provider(ctx: &OpContext, args: ProviderArgs) -> Result<OpOutput, OpErr
         "test" => handle_test(ctx),
         other => Err(OpError::InvalidArguments(format!(
             "Unknown /provider sub-command: '{other}'. \
-             Supported: show, list, switch <id>, test."
+             Supported: show, list, switch <id> [<model-id>], test."
         ))),
     }
 }
@@ -325,36 +339,58 @@ fn handle_list(ctx: &OpContext) -> Result<OpOutput, OpError> {
     Ok(OpOutput::from(lines.join("\n")))
 }
 
-/// Implements `/provider switch <id>` — atomic, validated provider switch.
+/// Implements `/provider switch <id> [<model-id>]` — atomic, validated
+/// provider (and optional model) switch.
 ///
 /// # Description
-/// Performs three checks before mutating the controller:
+/// Performs every validation step before mutating the controller, so a
+/// failed check never leaves the session in a half-switched state:
 /// 1. Validates the provider exists in the resolved configuration. Returns [`OpError::InvalidArguments`] with
 ///    `"unknown provider: <id>"` if not found.
 /// 2. Validates enabled/auth configuration and returns [`OpError::InvalidArguments`]
 ///    with a credential hint when it cannot be used.
-/// 3. Validates active-model compatibility: if `controller.snapshot().active_model`
-///    is `Some(m)`, resolves `m` in the configured model catalog and checks whether
-///    its configured provider matches the target provider. If incompatible,
-///    returns [`OpError::InvalidArguments`] with a message asking the operator to
-///    use `/model switch` first. **Never silently falls back to another model.**
-/// 4. Only when all checks pass, calls `controller.set_active_provider(id)`.
+/// 3. Validates model compatibility:
+///    - If `model` is `Some`, resolves it in the configured model catalog
+///      (id or alias, via [`crate::model::configured_model`]) and rejects it
+///      with [`OpError::InvalidArguments`] if it does not exist or belongs to
+///      a different (canonicalized) provider than the target.
+///    - If `model` is `None`, falls back to the previous behavior: if
+///      `controller.snapshot().active_model` is `Some(m)`, resolves `m` in the
+///      configured model catalog and checks whether its configured provider
+///      matches the target provider. If incompatible, returns
+///      [`OpError::InvalidArguments`] with a message asking the operator to
+///      use `/model switch` first. **Never silently falls back to another
+///      model.**
+/// 4. Only when all checks pass, calls `controller.set_active_provider(id)`
+///    and, if a model argument was given, `controller.set_active_model(id)`.
+/// 5. Best-effort persists the resulting active provider/model as the
+///    profile's on-disk default via
+///    [`crate::config_util::persist_default_selection`], so future sessions
+///    start with the same selection. A persistence failure never fails the
+///    operation — it is appended to the success text as a clear note instead.
 ///
 /// # Arguments
 /// - `ctx` (`&OpContext`): used to obtain the controller.
 /// - `target` (`String`): the provider ID to switch to (already trimmed).
+/// - `model` (`Option<String>`): an optional model ID/alias to switch to in
+///   the same call.
 ///
 /// # Returns
-/// [`OpOutput`] with `"provider switched to <id>; next turn will use it"`.
+/// [`OpOutput`] confirming the switch, with a trailing persistence note.
 ///
 /// # Errors
 /// - [`OpError::Execution`]: controller not in context, or controller mutation failed.
-/// - [`OpError::InvalidArguments`]: unknown provider, missing credentials, or model
-///   incompatibility.
+/// - [`OpError::InvalidArguments`]: unknown provider, missing credentials, unknown
+///   model, or provider/model incompatibility.
 ///
 /// # Spec Reference
 /// harwness Plan v2 — Task C: `/provider switch` becomes atomic + compatibility-checked.
-fn handle_switch(ctx: &OpContext, target: String) -> Result<OpOutput, OpError> {
+/// Folgeauftrag — `/provider switch <id> <model-id>` und persistenter Default.
+fn handle_switch(
+    ctx: &OpContext,
+    target: String,
+    model: Option<String>,
+) -> Result<OpOutput, OpError> {
     let config = resolved_config(ctx)?;
     if config.providers.is_empty() {
         return Err(OpError::Execution(
@@ -380,40 +416,88 @@ fn handle_switch(ctx: &OpContext, target: String) -> Result<OpOutput, OpError> {
         )));
     }
 
-    // ── Step 3: validate active-model compatibility ───────────────────────────
     let controller = ctx
         .service::<SharedSessionController>()
         .ok_or_else(|| OpError::Execution("SessionController not available".into()))?;
 
-    let snap = controller.snapshot();
-    if let Some(ref active_model) = snap.active_model {
-        if let Some(model) = config.models.values().find(|model| {
-            model.id == *active_model || model.aliases.iter().any(|alias| alias == active_model)
-        }) {
-            let model_provider = configured_provider(&config, &model.provider)
+    // ── Step 3: validate model compatibility ──────────────────────────────────
+    // An explicit model argument is validated against the catalog directly;
+    // otherwise the *current* active model (if any) must already be
+    // compatible with the target provider.
+    let resolved_model: Option<String> = match &model {
+        Some(requested_model) => {
+            let configured = crate::model::configured_model(&config, requested_model)
+                .ok_or_else(|| OpError::InvalidArguments(format!("unknown model: {requested_model}")))?;
+            let model_provider = configured_provider(&config, &configured.provider)
                 .map(|(canonical, _)| canonical)
-                .unwrap_or(model.provider.as_str());
+                .unwrap_or(configured.provider.as_str());
             if model_provider != canonical_target {
                 return Err(OpError::InvalidArguments(format!(
-                    "active model '{active_model}' is not available on provider '{canonical_target}' \
-                     (model belongs to provider '{model_provider}'); \
-                     use `/model switch` first or accept a provider-appropriate model."
+                    "model '{requested_model}' is not available on provider '{canonical_target}' \
+                     (model belongs to provider '{model_provider}')"
                 )));
             }
+            Some(configured.id.clone())
         }
-        // An unknown active model is outside this operation's authority. Its runtime
-        // executor remains responsible for rejecting it; provider selection stays
-        // constrained to the configured provider catalog above.
-    }
+        None => {
+            let snap = controller.snapshot();
+            if let Some(ref active_model) = snap.active_model {
+                if let Some(model) = config.models.values().find(|model| {
+                    model.id == *active_model || model.aliases.iter().any(|alias| alias == active_model)
+                }) {
+                    let model_provider = configured_provider(&config, &model.provider)
+                        .map(|(canonical, _)| canonical)
+                        .unwrap_or(model.provider.as_str());
+                    if model_provider != canonical_target {
+                        return Err(OpError::InvalidArguments(format!(
+                            "active model '{active_model}' is not available on provider '{canonical_target}' \
+                             (model belongs to provider '{model_provider}'); \
+                             use `/model switch` first or accept a provider-appropriate model."
+                        )));
+                    }
+                }
+                // An unknown active model is outside this operation's authority. Its runtime
+                // executor remains responsible for rejecting it; provider selection stays
+                // constrained to the configured provider catalog above.
+            }
+            None
+        }
+    };
 
     // ── Step 4: mutate the controller ─────────────────────────────────────────
     controller
         .set_active_provider(canonical_target.clone())
         .map_err(|e| OpError::Execution(e.to_string()))?;
+    if let Some(ref model_id) = resolved_model {
+        controller
+            .set_active_model(model_id.clone())
+            .map_err(|e| OpError::Execution(e.to_string()))?;
+    }
 
-    Ok(OpOutput::from(format!(
-        "provider switched to {canonical_target}; next turn will use it"
-    )))
+    // ── Step 5: persist as the profile's default for future sessions ─────────
+    // Read back the post-mutation snapshot rather than re-deriving it, so a
+    // provider-only switch with no active model never writes a stale
+    // `default_model`.
+    let snap_after = controller.snapshot();
+    let mut text = match &resolved_model {
+        Some(model_id) => format!(
+            "provider switched to {canonical_target}; model switched to {model_id}; \
+             next turn will use it"
+        ),
+        None => format!("provider switched to {canonical_target}; next turn will use it"),
+    };
+    match crate::config_util::persist_default_selection(
+        Some(canonical_target.as_str()),
+        snap_after.active_model.as_deref(),
+    ) {
+        Some(note) => {
+            text.push('\n');
+            text.push_str(&note);
+        }
+        None => text.push_str("\n(als Standard für künftige Sitzungen gespeichert)"),
+    }
+
+    Ok(OpOutput::from(text))
 }
 
 /// Implements `/provider test` — shows the auth-ref type for the config-default provider.
@@ -621,6 +705,7 @@ mod tests {
                 models: Vec::new(),
                 enabled: true,
                 origin_allowlist: Default::default(),
+                rate_limit: None,
             },
         );
 

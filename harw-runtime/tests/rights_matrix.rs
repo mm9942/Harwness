@@ -72,11 +72,46 @@ fn fixture() -> Fixture {
     std::fs::create_dir_all(&project).expect("project");
     // Projekt-Marker, damit `discover_project` genau hier stehen bleibt.
     std::fs::write(project.join("Cargo.toml"), "[workspace]\n").expect("marker");
+    write_fixture_uia(&home);
     Fixture {
         _dir: dir,
         home,
         project,
     }
+}
+
+/// Legt eine minimale, gültige UIA (`role = "user-interface"`) im
+/// Standardprofil des Test-`home` an und aktiviert sie über
+/// `harness.active_uia_definition`.
+///
+/// # Beschreibung
+/// `EntryKind::Tui` und `EntryKind::OneShot` montieren seit dem UIA-Vertrag
+/// (`harw-runtime/src/assembly.rs::resolve_active_uia`,
+/// `docs/session-transcript-2026-09-14.md`) nur noch mit einer konfigurierten
+/// UIA — fail-closed, ohne stillen Full-Tool-Fallback. Diese Tabellen-Tests
+/// prüfen genau diese acht (bzw. elf) Einstiege in einem leeren
+/// Tempverzeichnis, das ohne diese Funktion keine UIA kennt. Layout und
+/// Inhalt spiegeln exakt `harw-cli/src/uia_bootstrap.rs::write_generated_uia`:
+/// `<home>/profiles/default/agents/fixture-uia/definition.toml` plus
+/// `<home>/profiles/default/config.toml` mit
+/// `active_uia_definition = "<id>"` — das aktive Profil ohne
+/// `active_profile`-Datei ist `"default"` (`harw_home::active_profile_name`).
+/// Nur `Tui`/`OneShot` lesen `active_uia_definition` überhaupt
+/// (`resolve_active_uia`); alle anderen Einstiege bleiben unverändert.
+fn write_fixture_uia(home: &Path) {
+    let profile_dir = home.join("profiles").join("default");
+    let agent_dir = profile_dir.join("agents").join("fixture-uia");
+    std::fs::create_dir_all(&agent_dir).expect("fixture uia dir");
+    std::fs::write(
+        agent_dir.join("definition.toml"),
+        "schema = \"harwness.agent/v1\"\nid = \"harwness.agent.fixture-uia@1\"\nversion = \"1.0.0\"\nrole = \"user-interface\"\nspecialization = \"terminal-ui\"\n",
+    )
+    .expect("fixture uia definition");
+    std::fs::write(
+        profile_dir.join("config.toml"),
+        "active_uia_definition = \"harwness.agent.fixture-uia@1\"\n",
+    )
+    .expect("fixture profile config");
 }
 
 fn spec_for(entry: EntryKind, fixture: &Fixture) -> RuntimeSpec {
@@ -514,10 +549,23 @@ fn a_foreign_session_id_is_refused() {
 
 #[test]
 fn root_activation_matches_the_session_base_activation() {
+    // `EntryKind::Tui` (und `OneShot`) montieren seit dem UIA-Vertrag
+    // ausschließlich über `harness.active_uia_definition`
+    // (`resolve_active_uia`, `harw-runtime/src/assembly.rs`) — dort ersetzt
+    // die UIA jede `active_agent`-Auswahl vollständig (`agent_ir` bleibt
+    // `None`, sobald `uia_ir` gesetzt ist). `EntryKind::Analyze` ist kein
+    // UI-Einstieg: `resolve_active_uia` liefert für ihn immer `Ok(None)`,
+    // also bestimmt `active_agent` hier weiterhin die Wurzelaktivierung.
+    // Zugleich führt `Analyze` — wie `Tui`/`OneShot` — einen
+    // `SpawnerPolicy::BuiltinRoles`-Spawner, den `new_root_session`
+    // braucht, um überhaupt eine Sitzung zu eröffnen (sonst
+    // `RuntimeError::Spawner`). Die Invariante W2A-02 bleibt unverändert:
+    // die Spawner-Fläche, mit der die Wurzel registriert wurde, muss exakt
+    // die Basis-Aktivierung der eröffneten Sitzung sein.
     let fixture = fixture();
     let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEventAlias>();
     let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
-    let mut spec = spec_for(EntryKind::Tui, &fixture);
+    let mut spec = spec_for(EntryKind::Analyze, &fixture);
     spec.active_agent = Some(role_names::EXPLORER.to_owned());
     let assembly = RuntimeAssembly::builder(spec)
         .model(ModelSource::Echo("echo".to_owned()))
@@ -544,6 +592,39 @@ fn root_activation_matches_the_session_base_activation() {
 
 #[test]
 fn an_unknown_active_agent_fails_closed() {
+    // `active_agent` bestimmt die Wurzelaktivierung nur für Nicht-UI-
+    // Einstiege (`resolve_active_uia` in `harw-runtime/src/assembly.rs`
+    // gibt für alles außer `Tui`/`OneShot` `Ok(None)` zurück, also greift
+    // dort `resolve_active_agent(spec.active_agent, ...)`). `Analyze` ist
+    // ein solcher Nicht-UI-Einstieg. Fail-closed bei unbekannter Rolle
+    // bleibt die geprüfte Absicht — nur der Einstieg wechselt.
+    let fixture = fixture();
+    let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEventAlias>();
+    let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
+    let mut spec = spec_for(EntryKind::Analyze, &fixture);
+    spec.active_agent = Some("definitely-not-a-role".to_owned());
+    let built = RuntimeAssembly::builder(spec)
+        .model(ModelSource::Echo("echo".to_owned()))
+        .stores(RuntimeStores {
+            state_store,
+            job_store: None,
+            approval_store: None,
+        })
+        .session_events(events)
+        .build();
+
+    assert!(matches!(built, Err(RuntimeError::Registry { .. })));
+}
+
+#[test]
+fn tui_ignores_an_unknown_active_agent_because_the_uia_governs() {
+    // In `Tui` (und `OneShot`) bestimmt ausschließlich die konfigurierte
+    // UIA die Root-Aktivierung; `resolve_active_agent` wird für
+    // `spec.active_agent` gar nicht erst aufgerufen, sobald `uia_ir`
+    // aufgelöst ist (`agent_ir` bleibt `None`). Eine unbekannte
+    // `active_agent`-Rolle darf die UIA daher weder ersetzen noch die
+    // Montage zu Fall bringen — die Fixture-UIA aus `write_fixture_uia`
+    // montiert unverändert.
     let fixture = fixture();
     let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEventAlias>();
     let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
@@ -559,7 +640,10 @@ fn an_unknown_active_agent_fails_closed() {
         .session_events(events)
         .build();
 
-    assert!(matches!(built, Err(RuntimeError::Registry { .. })));
+    assert!(
+        built.is_ok(),
+        "die UIA muss eine unbekannte active_agent-Rolle in Tui überschatten: {built:?}"
+    );
 }
 
 #[test]

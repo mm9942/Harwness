@@ -421,6 +421,7 @@ fn add_provider(
         models,
         enabled: true,
         origin_allowlist: harw_config::OriginAllowlistToml::default(),
+        rate_limit: None,
     };
     write_provider(home, &provider)
 }

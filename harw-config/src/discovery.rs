@@ -528,6 +528,11 @@ pub fn discover_config_with_restricted(
             if fields.get("onboarding").is_none() {
                 cfg.onboarding = resolved.harness.onboarding.clone();
             }
+            merge_internal_models(
+                &mut cfg,
+                &resolved.harness.internal_models,
+                fields.get("internal_models"),
+            );
             cfg.base_dir = Some(base.clone());
             resolved.harness = cfg;
         }
@@ -709,6 +714,37 @@ fn extract_section<T: serde::de::DeserializeOwned>(
             .try_into::<T>()
             .map(Some)
             .map_err(|e| ConfigError::TomlParse(format!("[{key}]: {e}"))),
+    }
+}
+
+/// Merged `[internal_models]` pro Feld statt pro Datei (Addendum C, Punkt
+/// 3): `cfg.internal_models` kommt bereits aus der vollständigen
+/// Deserialisierung dieser Layer (inkl. deren eigener Feld-Defaults), enthält
+/// also für Felder, die diese Layer nicht selbst setzt, wieder
+/// `InternalModelsToml`-Defaults statt der Werte vorheriger Layer. Diese
+/// Funktion ersetzt solche Defaults durch `previous`, wenn das jeweilige Feld
+/// im rohen TOML-Dokument dieser Layer (`raw`, vor `strip_new_sections`)
+/// tatsächlich fehlt — nur ein Feld, das die Layer selbst schreibt,
+/// überschreibt `previous`.
+fn merge_internal_models(
+    cfg: &mut HarnessConfig,
+    previous: &crate::internal_models::InternalModelsToml,
+    raw: Option<&toml::Value>,
+) {
+    let Some(raw_table) = raw else {
+        // Diese Layer hat gar keine `[internal_models]`-Tabelle: die
+        // vorherigen Layer bleiben vollständig bestehen.
+        cfg.internal_models = previous.clone();
+        return;
+    };
+    if raw_table.get("use_openrouter_defaults").is_none() {
+        cfg.internal_models.use_openrouter_defaults = previous.use_openrouter_defaults;
+    }
+    for point in crate::internal_models::InternalModelPoint::ALL {
+        if raw_table.get(point.key()).is_none() {
+            cfg.internal_models
+                .set_choice(point, previous.choice(point).cloned());
+        }
     }
 }
 
@@ -968,6 +1004,7 @@ fn legacy_provider(name: &str, enabled: bool) -> Option<ProviderToml> {
             // HTTP router. The legacy default remains runnable.
             enabled,
             origin_allowlist: Default::default(),
+            rate_limit: None,
         }),
         _ => None,
     }
@@ -1326,6 +1363,18 @@ validate_write_conflicts = false
     fn restricted_repo_only_narrows_and_never_contributes_catalogs_or_secrets() {
         let home = test_directory("restricted-home");
         let repo = test_directory("restricted-repo");
+        // `PlanSection::enabled`/`persist` (`harw-config/src/plan_toml.rs`)
+        // sind mit `default_true` gepflegt: "Der Planmodus ist standardmäßig
+        // aktiv" (Moduldoku dort). `merge_restricted_harness` mischt für
+        // `[tools.plan]` bewusst nur `validate_dependency_cycles`,
+        // `validate_write_conflicts`, `max_nodes` und `max_expand_depth`
+        // ein -- `enabled`/`persist` sind dort absichtlich nicht
+        // verengbar/erweiterbar aus dem Repo-Layer. Der vertraute Home-Layer
+        // schaltet beide hier deshalb explizit aus, damit diese Prüfung
+        // tatsächlich testet, dass das feindliche `enabled = true` /
+        // `persist = true` des Repos NICHT durchschlägt -- ohne die
+        // explizite Home-Vorgabe würde die Assertion nur zufällig durch den
+        // Serde-Default bestehen, nicht durch die Verengungslogik.
         write_layer_file(
             &home,
             "config.toml",
@@ -1338,6 +1387,8 @@ require_approval_for = ["fs.write"]
 network_allow_hosts = ["docs.rs", "crates.io"]
 
 [tools.plan]
+enabled = false
+persist = false
 max_nodes = 64
 "#,
         );

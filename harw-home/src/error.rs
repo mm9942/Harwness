@@ -61,9 +61,9 @@ pub enum HomeError {
         key: String,
     },
     /// Ein Projekt-Home (`<root>/.harw`) wurde für einen nicht unterstützten
-    /// Root abgelehnt: das Dateisystem-Root (`/`) oder das Home-Verzeichnis
-    /// des Benutzers selbst dürfen kein Projekt-Home bekommen
-    /// ([`crate::project::ProjectHome::ensure`]).
+    /// Root abgelehnt: das Dateisystem-Root (`/`) darf kein Projekt-Home
+    /// bekommen ([`crate::project::ProjectHome::ensure`]). Das Home-Verzeichnis
+    /// des Benutzers ist erlaubt; dort dient `~/.harw` als Projekt-Home.
     UnsupportedProjectHomeRoot {
         /// Der abgelehnte, kanonische Root.
         root: PathBuf,
@@ -113,7 +113,7 @@ impl fmt::Display for HomeError {
             ),
             Self::UnsupportedProjectHomeRoot { root } => write!(
                 f,
-                "refusing to create a project home at {}: this is the filesystem root or the user's home directory",
+                "refusing to create a project home at {}: this is the filesystem root",
                 root.display()
             ),
             Self::Io { path, source } => {

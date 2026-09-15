@@ -12,18 +12,24 @@
 
 pub mod activation;
 pub mod admission;
+pub mod auto_compact;
 pub mod cancel;
+pub mod capture;
 pub mod child_controller;
+pub mod compaction;
 pub mod context_budget;
+pub mod delegation_visibility;
 pub mod durable_job_runner;
 pub mod envelope;
 pub mod error;
 pub mod execution_registry;
+pub mod guard;
 pub mod history;
 pub mod history_tail;
 pub mod mode;
 pub mod model;
 pub mod one_shot;
+pub mod pinned_model;
 pub mod policy;
 pub mod session;
 pub mod session_manager;
@@ -36,15 +42,30 @@ pub use admission::{
     AdmissionContext, JobAdmissionError, JobAdmissionPolicy, JobAdmissionService, JobIntent,
     ResolvedAdmission,
 };
+pub use auto_compact::{
+    AutoCompactPolicy, CompactDecision, DEFAULT_ABSOLUTE_CEILING_TOKENS,
+    DEFAULT_ORCHESTRATOR_TURN_START_TARGET_TOKENS,
+};
+pub use capture::{ToolOutcome, ToolOutcomeObserver, ToolOutcomeStatus};
 pub use child_controller::{
     AgentBudget, BudgetDimension, ChildLimits, ChildRecord, ChildRegistryFactory, ChildRunResult,
-    ExpiredChild, FanoutRequest, JoinSemantics, ManagedAgentSpawner,
+    ExpiredChild, FanoutRequest, JoinSemantics, ManagedAgentSpawner, ParentGrant,
+    RoleEffortWeights, TaskComplexity,
+};
+pub use compaction::{
+    compact_session, deterministic_pass, CompactionObserver, CompactionOutcome, CompactionPlan,
+    SUMMARY_MARKER,
 };
 pub use context_budget::{ContextAssembly, ContextBudget};
+pub use delegation_visibility::{DelegationTarget, DelegationTargetKind, visible_delegation_targets};
 pub use durable_job_runner::{DurableJobRunner, DurableJobRunnerError};
 pub use error::{CoreError, CoreResult};
 pub use execution_registry::{
     CancellationResult, ExecutionControl, ExecutionRegistryError, JobExecutionRegistry,
+};
+pub use guard::{
+    DriftEvent, DriftKind, DriftObserver, GuardPolicy, GuardVerdict, PitfallAdvisor,
+    ProgressObserver, TurnGuard,
 };
 pub use harw_protocol::ToolCallResult;
 pub use history::{ConversationHistory, ModelMessage};
@@ -54,13 +75,16 @@ pub use model::{
     EchoModelProvider, ModelError, ModelFuture, ModelProvider, ModelRequest, ModelResponse,
 };
 pub use one_shot::{OneShotError, complete_text};
+pub use pinned_model::PinnedModelProvider;
 pub use policy::ConfigApprovalPolicy;
 pub use session::{
     AgentSession, PendingApproval, PendingHandoff, SessionState, SpawnContext, TurnHandle,
     TurnRejection,
 };
 pub use session_manager::SessionManager;
-pub use state_store::{InMemoryStateStore, SessionThreadMapper, StateStore, TranscriptStateStore};
+pub use state_store::{
+    InMemoryStateStore, SessionThreadMapper, StateStore, TranscriptStateStore, UsageRound,
+};
 pub use testing::RecordingModelProvider;
 pub use turn_loop::{
     ApprovalResolution, TurnInput, TurnOutcome, resume_after_approval,

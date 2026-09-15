@@ -34,6 +34,7 @@ pub fn run(home_override: Option<PathBuf>, action: AuthAction) -> Result<(), Str
 /// PKCE-Paste-Flow: URL zeigen, Code von `stdin` lesen, Token holen + speichern.
 fn login(home: &Path, provider: &str) -> Result<(), String> {
     require_anthropic_login(provider)?;
+    warn_anthropic_subscription_token();
 
     let pkce = harw_oauth::generate_pkce();
     // `state` wird aus dem Verifier abgeleitet (deterministisch, ausreichend
@@ -73,6 +74,9 @@ fn login(home: &Path, provider: &str) -> Result<(), String> {
 /// Setzt einen bereits vorhandenen Setup-Token direkt (Eingabe über `stdin`).
 fn token(home: &Path, provider: &str) -> Result<(), String> {
     require_token_provider(provider)?;
+    if provider == "anthropic" {
+        warn_anthropic_subscription_token();
+    }
 
     let raw = if std::io::stdin().is_terminal() {
         eprintln!("{}", token_prompt(provider));
@@ -119,6 +123,9 @@ fn import(source: &str) -> Result<(), String> {
             "unbekannte Quelle: {other} (codex | claude-cli | gemini-env | mistral-env)"
         )),
     };
+    if matches!(source, "claude-cli" | "claude-setup-token") {
+        warn_anthropic_subscription_token();
+    }
 
     let detected = harw_model_catalog::detect_local_sources(provider);
     let mut any = false;
@@ -237,6 +244,13 @@ fn require_token_provider(provider: &str) -> Result<(), String> {
             "direkte Secret-Eingabe wird nur für anthropic, openai, gemini oder mistral unterstützt (gegeben: {other})"
         )),
     }
+}
+
+/// Gibt die Abo-OAuth-/Setup-Token-Warnung einmal vor der jeweiligen Aktion
+/// aus (`eprintln!`, bestehender Ausgabestil dieser Datei). Bricht den Ablauf
+/// nicht ab — nur ein Hinweis, keine Blockade.
+fn warn_anthropic_subscription_token() {
+    eprintln!("\n{}\n", harw_provider_http::ANTHROPIC_SUBSCRIPTION_TOKEN_WARNING);
 }
 
 fn token_prompt(provider: &str) -> &'static str {

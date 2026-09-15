@@ -69,6 +69,7 @@ use harw_tool_browser::{
     BrowserOpenGrant, BrowserOpenPolicy, BrowserToolSet, HarwnessBrowserToolProvider,
 };
 
+use crate::agent_definition_tools::{DefinitionAuthorCeiling, DefinitionWriteMode};
 use crate::authority::{permissions_of, tool_permission};
 use crate::error::{RegistryDefaultsError, RegistryDefaultsResult};
 use crate::{AssembledRegistry, DefaultApprovalPolicy};
@@ -182,6 +183,33 @@ pub mod role_names {
     /// [`profile_for_role`] und die Begründung in `agents/executor.toml`.
     pub const EXECUTOR: &str = "executor";
 
+    /// Konsolidiert Projektgedächtnis-Fakten (Memory v3, §5.3): verschmilzt
+    /// Duplikate, löst Widersprüche aus `facts/_conflicts.json` auf, senkt
+    /// oder löscht veraltete Fakten, schreibt `MEMORY.md` neu. Bekommt
+    /// bereits ausgewertete Bestände als Parameter, muss aber selbst
+    /// schreiben können — die einzige eingebaute Rolle mit
+    /// [`RegistryProfile::MemoryStewardship`] (siehe `agents/memory-steward.toml`
+    /// und die Begründung bei [`RegistryProfile::MemoryStewardship`]).
+    pub const MEMORY_STEWARD: &str = "memory-steward";
+
+    /// Dedizierter Netz-Rechercheur der UIA (Addendum D+E, Agent REG-DE): die
+    /// UIA spawnt selbst keine Worker außer diesem, wenn sie ohne Umweg über
+    /// den Root-Orchestrator Netz-Recherche braucht. Gleiches Werkzeugprofil
+    /// wie [`RESEARCHER_WEB`] (`RegistryProfile::Research`), siehe
+    /// `agents/uia-worker.toml`.
+    pub const UIA_WORKER: &str = "uia-worker";
+
+    /// Setzt Agentendefinitionen um (Addendum K + Nachtrag K): die UIA und der
+    /// Root-Orchestrator dürfen ihn spawnen (`AgentRoleId::AgentSteward`,
+    /// `harw-agent-dsl/src/roles.rs`), er selbst spawnt nichts. Validiert
+    /// und schreibt Agentendefinitionen (`agents.validate`,
+    /// `agents.write_definition`) sowie neue UIA-Bündel
+    /// (`agents.write_uia`, Nachtrag K) über
+    /// `crate::agent_definition_tools::AgentDefinitionToolProvider` — die
+    /// einzige eingebaute Rolle mit [`RegistryProfile::AgentStewardship`],
+    /// siehe `agents/agent-steward.toml` und die Begründung dort.
+    pub const AGENT_STEWARD: &str = "agent-steward";
+
     /// Alle bekannten eingebauten Rollen.
     ///
     /// Siehe die Moduldokumentation oben: `context-steward` und
@@ -199,6 +227,9 @@ pub mod role_names {
         SECURITY_STRUCTURE_TRIAGE,
         SECURITY_ENDPOINT_TRIAGE,
         EXECUTOR,
+        MEMORY_STEWARD,
+        UIA_WORKER,
+        AGENT_STEWARD,
     ];
 }
 
@@ -220,6 +251,14 @@ const FS_FULL_TOOLS: &[&str] = &[
     "fs.grep",
 ];
 
+/// Die Werkzeuge von [`RegistryProfile::MemoryStewardship`]: die fünf
+/// lesenden `fs.*`-Werkzeuge plus `fs.write`, in Provider-Reihenfolge —
+/// identisch zu [`FS_FULL_TOOLS`], aber bewusst als eigene Konstante
+/// benannt, weil sie (anders als `FS_FULL_TOOLS`) nie mit `shell.exec`
+/// zusammen registriert werden darf. Siehe `agents/memory-steward.toml`
+/// und die Begründung bei [`RegistryProfile::MemoryStewardship`].
+const MEMORY_STEWARDSHIP_TOOLS: &[&str] = FS_FULL_TOOLS;
+
 /// Die Werkzeuge von `harw-tool-deps`, in Provider-Reihenfolge.
 const DEPS_TOOLS: &[&str] = &[
     "deps.graph",
@@ -240,6 +279,60 @@ pub(crate) const DEPS_SOURCE_TOOLS: &[&str] =
 
 /// Die Werkzeuge von `harw-tool-web`, in Provider-Reihenfolge.
 pub(crate) const WEB_TOOLS: &[&str] = &["web.fetch", "web.docs_rs", "web.crates_io"];
+
+/// Das einzige Netz-Werkzeug von [`RegistryProfile::UiaQuickHelper`]
+/// (Addendum I): nur `web.fetch`, ohne `web.docs_rs`/`web.crates_io` — die
+/// Schnellhelfer-Rolle braucht keinen automatischen Crate-/Doku-Index, nur
+/// gezieltes Nachschlagen einer einzelnen URL.
+pub(crate) const UIA_QUICK_HELPER_WEB_TOOLS: &[&str] = &["web.fetch"];
+
+/// Das lesende Werkzeug von
+/// `crate::agent_definition_tools::AgentDefinitionToolProvider` (K-C,
+/// Addendum K): parst und senkt einen Agentendefinitions-Entwurf über
+/// dieselbe DSL-Pipeline, ohne zu schreiben.
+pub(crate) const AGENT_DEFINITION_READ_TOOLS: &[&str] = &["agents.validate"];
+
+/// Die lesenden Abfragewerkzeuge desselben Providers (Nachtrag K2):
+/// `agents.list_proposals` listet die im Vorschlagsmodus
+/// (`DefinitionWriteMode::ProposalOnly`) unter `<profil>/agents/.proposals/`
+/// abgelegten, noch nicht committeten Entwürfe (Status
+/// `pending_uia_review`).
+pub(crate) const AGENT_DEFINITION_LIST_TOOLS: &[&str] = &["agents.list_proposals"];
+
+/// Die schreibenden Werkzeuge desselben Providers (Addendum K + Nachtrag K):
+/// `agents.write_definition` legt eine validierte Agentendefinition ab
+/// (Projekt- oder Profil-Scope; im Vorschlagsmodus als Vorschlag statt
+/// direkt), `agents.write_uia` legt ein neues UIA-Bündel (`definition.toml`,
+/// `agent.toml`, `Personality.md`, optional `USER.md`) ausschließlich im
+/// Profil-Scope an und aktiviert es nie, `agents.commit_proposal`/
+/// `agents.reject_proposal` übernehmen oder verwerfen einen zuvor
+/// abgelegten Vorschlag — laut Nachtrag K2 registriert
+/// `crate::agent_definition_tools::AgentDefinitionToolProvider` die beiden
+/// letzten nur im Commit-Modus (Elternrolle der UIA); die hier gepflegte
+/// Liste bleibt die **maximale** (Commit-Modus-)Werkzeugmenge, siehe die
+/// Begründung bei [`RegistryProfile::AgentStewardship`] und
+/// `harw-registry-defaults/tests/tool_admission_coverage.rs`.
+pub(crate) const AGENT_DEFINITION_WRITE_TOOLS: &[&str] = &[
+    "agents.write_definition",
+    "agents.write_uia",
+    "agents.commit_proposal",
+    "agents.reject_proposal",
+];
+
+/// Alle Werkzeuge von [`RegistryProfile::AgentStewardship`], in
+/// Registrierungsreihenfolge: erst die lesenden Werkzeuge
+/// (`agents.validate`, `agents.list_proposals`), dann die schreibenden —
+/// dieselbe Reihenfolge, in der
+/// `crate::agent_definition_tools::AgentDefinitionToolProvider` sie im
+/// Commit-Modus (der maximalen Werkzeugmenge) bewirbt.
+const AGENT_DEFINITION_TOOLS: &[&str] = &[
+    "agents.validate",
+    "agents.list_proposals",
+    "agents.write_definition",
+    "agents.write_uia",
+    "agents.commit_proposal",
+    "agents.reject_proposal",
+];
 
 /// Die Werkzeuge von `harw-tool-shell`.
 pub(crate) const SHELL_TOOLS: &[&str] = &["shell.exec"];
@@ -326,6 +419,7 @@ pub(crate) const BROWSER_TOOLS: &[&str] = &[
 ///
 /// # Varianten
 /// - `Full` — voller Coding-Satz: `fs.*`, `shell.exec` (ohne Browser, W5 RD).
+/// - `ShellExecution` — ausschließlich `shell.exec`; kein Dateisystem-Werkzeug.
 /// - `ReadOnlyExplore` — ausschließlich lesend.
 /// - `Research` — **nur** `web.*` (W5 RD, Annahme A5): kein `fs.*`, kein
 ///   `deps.*`, damit die einzige Rolle mit Netz keine Workspace-Daten lesen und
@@ -333,6 +427,11 @@ pub(crate) const BROWSER_TOOLS: &[&str] = &[
 ///   ([`crate::research_web::researcher_web_policy`]).
 /// - `Planning` — `ReadOnlyExplore` plus `lens.ask` (Plan-/Goal-Operationen
 ///   bewirbt es nicht: das Kind besitzt dafür keinen Executor).
+/// - `MemoryStewardship` — genau `fs.*` (alle sechs Werkzeuge, inklusive
+///   `fs.write`), aber **kein** `shell.exec` und kein `web.*`. Einzige
+///   eingebaute Rolle: [`role_names::MEMORY_STEWARD`] (siehe deren
+///   Begründung bei [`RegistryProfile::MemoryStewardship`] unten für den
+///   Grund, warum `Full` dafür zu weit wäre).
 /// - `NoTools` — registriert und bewirbt gar nichts.
 ///
 /// # Warum `NoTools` und nicht `ReadOnlyExplore` für die Triage-Rollen
@@ -375,6 +474,10 @@ pub(crate) const BROWSER_TOOLS: &[&str] = &[
 pub enum RegistryProfile {
     /// Voller Coding-Satz: fs.*, shell.exec. Browser nur über expliziten Grant.
     Full,
+    /// Dedizierter Prozessworker: ausschließlich `shell.exec`. Das Profil ist
+    /// absichtlich kein Fallback und erhält weder `fs.write` noch lesende
+    /// Workspace-Werkzeuge.
+    ShellExecution,
     /// Ausschließlich lesend: fs.read/list/search/glob/grep + deps.*.
     ReadOnlyExplore,
     /// Nur web.* — kein Workspace-Lesen (A5); Netz nur über
@@ -388,6 +491,57 @@ pub enum RegistryProfile {
     /// = []`), etwa die vier `security-*-triage`-Rollen (siehe
     /// [`role_names::SECURITY_EGRESS_TRIAGE`] u. a.).
     NoTools,
+    /// Genau `fs.*` (alle sechs Werkzeuge, inklusive `fs.write`) — kein
+    /// `shell.exec`, kein `web.*`, kein `deps.*`, kein `lens.ask`.
+    ///
+    /// # Warum dieses Profil existiert (Memory v3, §5.3)
+    /// [`role_names::MEMORY_STEWARD`] konsolidiert Projektgedächtnis-Fakten
+    /// und muss dafür Fakten, `MEMORY.md` und ggf. Löschungen tatsächlich
+    /// schreiben — ein reiner Vorschlag ([`RegistryProfile::ReadOnlyExplore`]
+    /// o. ä.) würde jede Konsolidierung wirkungslos machen. [`RegistryProfile::Full`]
+    /// wäre dafür zu weit: es registriert zusammen mit `fs.write` immer auch
+    /// `shell.exec` (siehe dessen Moduldokumentation), obwohl die Rolle laut
+    /// `agents/memory-steward.toml` ausdrücklich keinen Subprozess und keinen
+    /// eigenen `git commit` ausführen darf — die git-Baseline aus §5.3 setzt
+    /// die Composition-Root, nicht der Agent. Ein eigenes, engeres Profil
+    /// trennt „darf Dateien schreiben“ von „darf Prozesse starten“, statt sie
+    /// wie `Full` untrennbar zu bündeln.
+    MemoryStewardship,
+    /// Schnellhelfer der UIA (Addendum I, korrigiert REG-DE): lesender
+    /// Workspace-Zugriff (`FS_READ_ONLY_TOOLS`) plus `shell.exec`
+    /// (`SHELL_TOOLS`, läuft wie überall über Sandbox+Freigabe) plus
+    /// ausschließlich `web.fetch` — kein `fs.write`, kein `deps.*`, kein
+    /// `lens.ask`, kein `browser.*`.
+    ///
+    /// # Warum dieses Profil existiert (Addendum I)
+    /// [`role_names::UIA_WORKER`] war zuvor auf [`RegistryProfile::Research`]
+    /// abgebildet (reine Netz-Recherche der UIA). Die Nutzerentscheidung aus
+    /// Addendum I korrigiert das: `uia-worker` ist der exklusive
+    /// Schnellhelfer der UIA für kleine Schnelleingriffe — eine Frage mit
+    /// einem Aufruf beantworten, schnell etwas in der Shell regeln, eine
+    /// Datei lesen — nicht nur Netz-Recherche. `web.fetch` bleibt die
+    /// einzige Netz-Oberfläche (kein `web.docs_rs`/`web.crates_io`, die für
+    /// tiefere Recherche gedacht sind, siehe `RegistryProfile::Research`).
+    UiaQuickHelper,
+    /// Der lesende `fs.*`-Kern ([`FS_READ_ONLY_TOOLS`]) plus die
+    /// Agentendefinitions-Werkzeuge von
+    /// `crate::agent_definition_tools::AgentDefinitionToolProvider`
+    /// ([`AGENT_DEFINITION_TOOLS`]) — kein `fs.write`, kein `shell.exec`,
+    /// kein `web.*`, kein `deps.*`, kein `lens.ask`.
+    ///
+    /// # Warum dieses Profil existiert (Addendum K + Nachtrag K)
+    /// [`role_names::AGENT_STEWARD`] setzt Agentendefinitionen um, die die
+    /// UIA (beratend) oder der Root-Orchestrator spezifiziert haben: er
+    /// validiert einen Entwurf (`agents.validate`, rein lesend) und schreibt
+    /// ihn erst danach atomar ab (`agents.write_definition`,
+    /// `agents.write_uia`). `RegistryProfile::Full` wäre zu weit (kein
+    /// `shell.exec`, keine ungeprüfte Schreiboberfläche über `fs.write`
+    /// hinaus — jede Schreibung läuft durch die validierende Pipeline des
+    /// Providers, nie über rohen Dateizugriff). `RegistryProfile::
+    /// MemoryStewardship` passt ebenfalls nicht: `fs.write` erlaubt
+    /// beliebige Dateien, während `agent-steward` nur über die geprüften
+    /// Agenten-Werkzeuge schreiben darf.
+    AgentStewardship,
 }
 
 impl RegistryProfile {
@@ -396,10 +550,14 @@ impl RegistryProfile {
     /// Nützlich für erschöpfende Tests und für CLI-Hilfetexte.
     pub const ALL: &'static [RegistryProfile] = &[
         RegistryProfile::Full,
+        RegistryProfile::ShellExecution,
         RegistryProfile::ReadOnlyExplore,
         RegistryProfile::Research,
         RegistryProfile::Planning,
         RegistryProfile::NoTools,
+        RegistryProfile::MemoryStewardship,
+        RegistryProfile::UiaQuickHelper,
+        RegistryProfile::AgentStewardship,
     ];
 
     /// Liefert die Rollenbeschreibung, die im System-Prompt erscheint.
@@ -418,18 +576,28 @@ impl RegistryProfile {
     pub const fn role_description(self) -> &'static str {
         match self {
             RegistryProfile::Full => "coding agent",
+            RegistryProfile::ShellExecution => "sandboxed process execution agent",
             RegistryProfile::ReadOnlyExplore => "read-only exploration agent",
             RegistryProfile::Research => "research agent",
             RegistryProfile::Planning => "planning agent",
             RegistryProfile::NoTools => "parameter-only triage agent",
+            RegistryProfile::MemoryStewardship => "memory consolidation agent",
+            RegistryProfile::UiaQuickHelper => "quick helper of the user interface agent",
+            RegistryProfile::AgentStewardship => "agent definition steward",
         }
     }
 
     /// Gibt an, ob dieses Profil ausschließlich lesende Werkzeuge registriert.
     ///
     /// # Rückgabe
-    /// `false` nur für [`RegistryProfile::Full`]; alle anderen Profile sind
-    /// read-only und dürfen weder `fs.write` noch `shell.exec` sehen.
+    /// `false` für [`RegistryProfile::Full`], das reine Prozessprofil
+    /// [`RegistryProfile::ShellExecution`],
+    /// [`RegistryProfile::MemoryStewardship`] (registriert `fs.write`),
+    /// [`RegistryProfile::UiaQuickHelper`] (registriert `shell.exec`) und
+    /// [`RegistryProfile::AgentStewardship`] (registriert die schreibenden
+    /// Agentendefinitions-Werkzeuge `agents.write_definition`/
+    /// `agents.write_uia`). Alle übrigen Profile sind read-only und dürfen
+    /// weder `fs.write` noch `shell.exec` sehen.
     ///
     /// # Beispiele
     /// ```rust
@@ -437,10 +605,18 @@ impl RegistryProfile {
     ///
     /// assert!(!RegistryProfile::Full.is_read_only());
     /// assert!(RegistryProfile::Planning.is_read_only());
+    /// assert!(!RegistryProfile::MemoryStewardship.is_read_only());
     /// ```
     #[must_use]
     pub const fn is_read_only(self) -> bool {
-        !matches!(self, RegistryProfile::Full)
+        !matches!(
+            self,
+            RegistryProfile::Full
+                | RegistryProfile::ShellExecution
+                | RegistryProfile::MemoryStewardship
+                | RegistryProfile::UiaQuickHelper
+                | RegistryProfile::AgentStewardship
+        )
     }
 
     /// Die Werkzeuge, die **dieses Crate** für das Profil registriert.
@@ -473,6 +649,7 @@ impl RegistryProfile {
                 .chain(SHELL_TOOLS.iter())
                 .copied()
                 .collect(),
+            RegistryProfile::ShellExecution => SHELL_TOOLS.to_vec(),
             RegistryProfile::ReadOnlyExplore => FS_READ_ONLY_TOOLS
                 .iter()
                 .chain(DEPS_TOOLS.iter())
@@ -493,6 +670,34 @@ impl RegistryProfile {
             // Siehe die Begründung bei `RegistryProfile::NoTools`: keine
             // Werkzeuge registriert, keine beworben.
             RegistryProfile::NoTools => Vec::new(),
+            // Alle sechs `fs.*`-Werkzeuge (inklusive `fs.write`), aber kein
+            // `shell.exec` — siehe die Begründung bei
+            // `RegistryProfile::MemoryStewardship`.
+            RegistryProfile::MemoryStewardship => MEMORY_STEWARDSHIP_TOOLS.to_vec(),
+            // Schnellhelfer der UIA (Addendum I): lesender fs.*-Kern plus
+            // `shell.exec` plus ausschließlich `web.fetch` — siehe die
+            // Begründung bei `RegistryProfile::UiaQuickHelper`.
+            RegistryProfile::UiaQuickHelper => FS_READ_ONLY_TOOLS
+                .iter()
+                .chain(SHELL_TOOLS.iter())
+                .chain(UIA_QUICK_HELPER_WEB_TOOLS.iter())
+                .copied()
+                .collect(),
+            // `agent-steward` (Addendum K + Nachtrag K2): lesender fs.*-Kern
+            // plus die Agentendefinitions-Werkzeuge in ihrer maximalen
+            // (Commit-Modus-)Ausprägung — siehe die Begründung bei
+            // `RegistryProfile::AgentStewardship`. Bewusst weiterhin die
+            // **maximale** Vertrags-Obermenge, unabhängig davon, dass der
+            // tatsächlich montierte Provider ohne `AgentDefinitionAccess`
+            // fail-closed nur zwei dieser Werkzeuge registriert (Nachtrag
+            // K3) — siehe [`agent_definition_tool_names_for_access`] und
+            // [`assemble_registry_for_sandbox_with_definition_access`] für
+            // den tatsächlichen Laufzeitzustand.
+            RegistryProfile::AgentStewardship => FS_READ_ONLY_TOOLS
+                .iter()
+                .chain(AGENT_DEFINITION_TOOLS.iter())
+                .copied()
+                .collect(),
         }
     }
 
@@ -630,14 +835,27 @@ pub fn profile_for_role(role: &str) -> Option<RegistryProfile> {
         | role_names::SECURITY_BASELINE_TRIAGE
         | role_names::SECURITY_STRUCTURE_TRIAGE
         | role_names::SECURITY_ENDPOINT_TRIAGE => Some(RegistryProfile::NoTools),
-        // Einzige eingebaute Rolle mit dem vollen, schreibenden Coding-Satz
-        // (Slice B7): sie fuehrt Befehls-/Dateioperationen im Auftrag des
-        // Haupt-Agenten aus. Das ist eine ausdrueckliche, dokumentierte
-        // Ausnahme (siehe `agents/executor.toml` und den Test
-        // `test_only_executor_gets_the_full_writable_profile` in
+        // Einzige eingebaute Rolle mit der Prozessoberfläche: sie führt nur
+        // beauftragte Sandbox-Prozesse aus. Das ist eine ausdrückliche,
+        // dokumentierte Ausnahme (siehe `agents/executor.toml` und den Test
+        // `test_only_executor_gets_the_shell_execution_profile` in
         // `embedded_agents.rs`), kein Fallback: jede andere unbekannte Rolle
-        // faellt weiterhin auf `None`, nie auf `Full`.
-        role_names::EXECUTOR => Some(RegistryProfile::Full),
+        // fällt weiterhin auf `None`.
+        role_names::EXECUTOR => Some(RegistryProfile::ShellExecution),
+        // Einzige eingebaute Rolle mit der schmalen fs.*-Schreiboberfläche
+        // ohne shell.exec — siehe die Begründung bei
+        // `RegistryProfile::MemoryStewardship` und `agents/memory-steward.toml`.
+        role_names::MEMORY_STEWARD => Some(RegistryProfile::MemoryStewardship),
+        // `uia-worker` ist der exklusive Schnellhelfer der UIA (Addendum I,
+        // korrigiert REG-DE) — nicht mehr nur Netz-Recherche
+        // (`RegistryProfile::Research`), sondern lesender Workspace-Zugriff
+        // plus `shell.exec` plus `web.fetch`, siehe `agents/uia-worker.toml`
+        // und die Begründung bei `RegistryProfile::UiaQuickHelper`.
+        role_names::UIA_WORKER => Some(RegistryProfile::UiaQuickHelper),
+        // Einzige eingebaute Rolle mit den Agentendefinitions-Werkzeugen —
+        // siehe die Begründung bei `RegistryProfile::AgentStewardship` und
+        // `agents/agent-steward.toml`.
+        role_names::AGENT_STEWARD => Some(RegistryProfile::AgentStewardship),
         _ => None,
     }
 }
@@ -673,6 +891,17 @@ pub struct IdentityOverrides {
     pub role_description: Option<String>,
     /// Zusätzliche Kontextfragmente für [`harw_instructions::AgentIdentity`].
     pub extra_context: Vec<String>,
+    /// Organisatorische Rolle dieses Agenten im Agenten-Baum (Addendum F+G,
+    /// Agent F-FIX; seit Addendum K über
+    /// [`crate::embedded_agents::builtin_organization_knowledge`], das für
+    /// die UIA, `agent-steward`, Root- und Sub-Orchestrator zusätzlich das
+    /// Organisations- und Bauplan-Wissen voranstellt). `Some(role)` hängt den
+    /// zusammengesetzten Text für genau diese Rolle an den System-Prompt an;
+    /// `None` hängt kein Regelwerk an — anders
+    /// als zuvor wird nicht mehr bedingungslos das Worker-Regelwerk vergeben,
+    /// da über diesen Weg auch Nicht-Worker-Knoten (z. B. `Composite`-Knoten
+    /// im Plan-Baum) zusammengestellt werden können.
+    pub organizational_role: Option<harw_agent_dsl::roles::AgentRoleId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -780,10 +1009,106 @@ impl ToolProvider for RestrictedToolProvider {
 // Zusammenbau
 // ---------------------------------------------------------------------------
 
+/// Der geteilte Vertrag für `crate::agent_definition_tools::
+/// AgentDefinitionToolProvider` (Welle FANIN-K, Nachtrag K3): Verzeichnisse,
+/// Schreibmodus und Urheber-Decke in einem Wert.
+///
+/// # Description
+/// Ersetzt das frühere, private `AgentDefinitionDirs` (nur Verzeichnisse) —
+/// mit der Urheber-Decke aus Nachtrag K3 reicht ein reiner Pfadwert nicht
+/// mehr aus, der Aufrufer muss auch Schreibmodus und Rechte-Obergrenze des
+/// Eltern-Aufrufers mitgeben. `project_agents_dir`/`profile_agents_dir`
+/// spiegeln die gleichnamigen Konstruktorargumente von
+/// `AgentDefinitionToolProvider::new`; `mode`/`ceiling` ebenso.
+///
+/// # Bekannte Lücke (ABWEICHUNG, siehe Abschlussbericht dieses Knotens)
+/// Diese Crate hängt nicht von `harw-home` ab (keine `Cargo.toml`-Änderung
+/// in diesem Auftrag) und kennt deshalb kein aktives Profil oder dessen
+/// Home-Verzeichnis — der `None`-Standardpfad
+/// ([`assemble_registry_for_sandbox_with_definition_access`] ohne `access`)
+/// lässt `profile_agents_dir` deshalb `None`. Ebenso kennt dieser Standardpfad
+/// weder Elternrolle noch Elternrechte und setzt `mode =
+/// DefinitionWriteMode::ProposalOnly`, `ceiling = None` (fail-closed,
+/// Nachtrag K2/K3) — die Elternrollen-/Elternrechte-abhängige Wahl ist Sache
+/// des Fan-in an der Montagestelle (`harw-runtime/src/children.rs`), die
+/// diese Werte über `access` explizit übergibt.
+#[derive(Debug, Clone)]
+pub struct AgentDefinitionAccess {
+    /// Ziel für `scope = "project"`/`"run"`; `None`, wenn kein
+    /// Projektkontext bekannt ist.
+    pub project_agents_dir: Option<PathBuf>,
+    /// Ziel für `scope = "profile"`, jedes `agents.write_uia`-Bundle und
+    /// `.proposals/`; `None`, wenn kein Profil bekannt ist.
+    pub profile_agents_dir: Option<PathBuf>,
+    /// Ob diese Instanz `agents.commit_proposal`/`agents.reject_proposal`
+    /// registriert (nur zusammen mit einer gesetzten `ceiling`).
+    pub mode: DefinitionWriteMode,
+    /// Die Urheber-Decke des Eltern-Aufrufers des Stewards (Nachtrag K3);
+    /// `None` ⇒ fail-closed — der Provider registriert dann ausschließlich
+    /// `agents.validate`/`agents.list_proposals`.
+    pub ceiling: Option<DefinitionAuthorCeiling>,
+}
+
+/// Die Agentendefinitions-Werkzeuge, die `AgentDefinitionToolProvider`
+/// tatsächlich registriert, für eine gegebene [`AgentDefinitionAccess`] (oder
+/// den fail-closed Standard `None`) — Nachtrag K3.
+///
+/// # Description
+/// Spiegelt exakt `AgentDefinitionToolProvider::tools()`: erst die beiden
+/// immer registrierten lesenden Werkzeuge, dann — nur wenn `access` gesetzt
+/// ist **und** eine `ceiling` trägt — die beiden Schreib-Werkzeuge, dann —
+/// nur zusätzlich im [`DefinitionWriteMode::Commit`] — die beiden
+/// Freigabe-Werkzeuge. `None` (kein Zugriff konfiguriert) liefert nur die
+/// ersten beiden — der fail-closed Standard, den
+/// [`assemble_registry_for_sandbox_with_definition_access`] ohne `access`
+/// verwendet.
+///
+/// Diese Funktion ist die Quelle für den tatsächlich zur Laufzeit
+/// registrierten Werkzeugsatz von [`RegistryProfile::AgentStewardship`] —
+/// anders als [`RegistryProfile::registered_tool_names`], die für dieses eine
+/// Profil bewusst bei der **maximalen** Vertrags-Obermenge bleibt (siehe
+/// deren Dokumentation und `harw-registry-defaults/tests/
+/// tool_admission_coverage.rs`).
+///
+/// # Arguments
+/// - `access` (`Option<&`[`AgentDefinitionAccess`]`>`): die zu prüfende
+///   Konfiguration; nur `mode` und `ceiling` fließen ein.
+///
+/// # Returns
+/// Die Tool-Namen in Registrierungsreihenfolge.
+#[must_use]
+pub fn agent_definition_tool_names_for_access(
+    access: Option<&AgentDefinitionAccess>,
+) -> Vec<&'static str> {
+    let mut tools: Vec<&'static str> = AGENT_DEFINITION_READ_TOOLS
+        .iter()
+        .chain(AGENT_DEFINITION_LIST_TOOLS.iter())
+        .copied()
+        .collect();
+    if let Some(access) = access {
+        if access.ceiling.is_some() {
+            tools.extend_from_slice(&AGENT_DEFINITION_WRITE_TOOLS[..2]);
+            if access.mode == DefinitionWriteMode::Commit {
+                tools.extend_from_slice(&AGENT_DEFINITION_WRITE_TOOLS[2..]);
+            }
+        }
+    }
+    tools
+}
+
 /// Erzeugt die Tool-Provider eines Profils in Registrierungsreihenfolge.
 ///
+/// # Argumente
+/// - `profile` ([`RegistryProfile`]): das zu bauende Profil.
+/// - `agent_definition_access` ([`AgentDefinitionAccess`]): nur für
+///   [`RegistryProfile::AgentStewardship`] relevant; alle anderen Zweige
+///   ignorieren den Parameter.
+///
 /// Infallibel: seit W5 RD baut kein Profil mehr einen Browser-Host.
-fn profile_tool_providers(profile: RegistryProfile) -> Vec<Arc<dyn ToolProvider>> {
+fn profile_tool_providers(
+    profile: RegistryProfile,
+    agent_definition_access: AgentDefinitionAccess,
+) -> Vec<Arc<dyn ToolProvider>> {
     // Der read-only Anteil ist für drei Profile identisch: der gefilterte
     // FS-Provider plus der vollständig lesende Deps-Provider.
     fn read_only_base() -> Vec<Arc<dyn ToolProvider>> {
@@ -801,6 +1126,7 @@ fn profile_tool_providers(profile: RegistryProfile) -> Vec<Arc<dyn ToolProvider>
             let shell: Arc<dyn ToolProvider> = Arc::new(ShellToolProvider::default());
             vec![filesystem, shell]
         }
+        RegistryProfile::ShellExecution => vec![Arc::new(ShellToolProvider::default())],
         RegistryProfile::ReadOnlyExplore => read_only_base(),
         // `LensToolProvider::new()` ist zustandslos (keine Bau-, Home- oder
         // Indexpfad-Konfiguration nötig): `derive_read_scope` leitet den
@@ -821,6 +1147,58 @@ fn profile_tool_providers(profile: RegistryProfile) -> Vec<Arc<dyn ToolProvider>
         }
         // Keine Provider: siehe die Begründung bei `RegistryProfile::NoTools`.
         RegistryProfile::NoTools => Vec::new(),
+        // Der volle, ungefilterte `FsToolProvider` (alle sechs `fs.*`, inklusive
+        // `fs.write`) — aber kein `ShellToolProvider`. Siehe die Begründung bei
+        // `RegistryProfile::MemoryStewardship`.
+        RegistryProfile::MemoryStewardship => {
+            let filesystem: Arc<dyn ToolProvider> = Arc::new(FsToolProvider::default());
+            vec![filesystem]
+        }
+        // Schnellhelfer der UIA (Addendum I): gefilterter, lesender
+        // FS-Provider + voller Shell-Provider (Sandbox+Freigabe greifen wie
+        // überall) + auf `web.fetch` gefilterter Web-Provider.
+        RegistryProfile::UiaQuickHelper => {
+            let filesystem: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
+                Arc::new(FsToolProvider::default()),
+                FS_READ_ONLY_TOOLS,
+            ));
+            let shell: Arc<dyn ToolProvider> = Arc::new(ShellToolProvider::default());
+            let web: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
+                Arc::new(WebToolProvider::new()),
+                UIA_QUICK_HELPER_WEB_TOOLS,
+            ));
+            vec![filesystem, shell, web]
+        }
+        // `agent-steward` (Addendum K + Nachtrag K/K2/K3): gefilterter,
+        // lesender FS-Provider + der Agentendefinitions-Provider, dessen
+        // Verzeichnisse, Schreibmodus und Urheber-Decke vollständig aus
+        // `agent_definition_access` kommen. Diese Funktion trifft selbst
+        // keine Modus-/Decke-Entscheidung mehr — das ist Sache des Aufrufers
+        // ([`assemble_registry_for_sandbox_with_definition_access`]): ohne
+        // `access` (der Standardpfad über [`assemble_registry_for_sandbox`])
+        // bleibt es beim fail-closed Vorschlagsmodus ohne Decke (Nachtrag K2:
+        // „unbekannt ⇒ ProposalOnly“); die elternrollen-/elternrechte-
+        // abhängige Wahl (`Commit` nur für einen von der UIA gestarteten
+        // Steward, Decke aus den effektiven Elternrechten) ist Sache des
+        // Fan-in an der Montagestelle (`harw-runtime/src/children.rs::
+        // definition_write_mode_for_parent_role`), das seine Wahl über
+        // `access` an [`assemble_registry_for_project_with_definition_access`]
+        // durchreicht (ABWEICHUNG: diese Verdrahtung selbst ist nicht Teil
+        // dieses Knotens, siehe Abschlussbericht).
+        RegistryProfile::AgentStewardship => {
+            let filesystem: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
+                Arc::new(FsToolProvider::default()),
+                FS_READ_ONLY_TOOLS,
+            ));
+            let agent_definitions: Arc<dyn ToolProvider> =
+                Arc::new(crate::agent_definition_tools::AgentDefinitionToolProvider::new(
+                    agent_definition_access.project_agents_dir,
+                    agent_definition_access.profile_agents_dir,
+                    agent_definition_access.mode,
+                    agent_definition_access.ceiling,
+                ));
+            vec![filesystem, agent_definitions]
+        }
     }
 }
 
@@ -1030,12 +1408,63 @@ pub fn assemble_registry_for_project(
     overrides: IdentityOverrides,
     approval_mode: ApprovalModeCell,
 ) -> RegistryDefaultsResult<AssembledRegistry> {
-    assemble_registry_for_sandbox(
+    assemble_registry_for_project_with_definition_access(
+        profile,
+        project,
+        overrides,
+        approval_mode,
+        None,
+    )
+}
+
+/// Wie [`assemble_registry_for_project`], nimmt aber zusätzlich eine
+/// [`AgentDefinitionAccess`] entgegen (Welle FANIN-K, Nachtrag K3).
+///
+/// # Beschreibung
+/// [`assemble_registry_for_project`] ist genau `..._with_definition_access(..,
+/// None)`: ohne `access` bleibt `crate::agent_definition_tools::
+/// AgentDefinitionToolProvider` fail-closed bei
+/// `DefinitionWriteMode::ProposalOnly` ohne Decke — registriert also nur
+/// `agents.validate`/`agents.list_proposals`, unabhängig vom Profil. Wer eine
+/// Kind-Registry für `RegistryProfile::AgentStewardship` montiert und dem
+/// Steward tatsächlich Schreibrechte geben will, übergibt `Some(access)` mit
+/// den Verzeichnissen, dem gewählten Modus (`Commit` nur, wenn der Eltern-
+/// Aufrufer die UIA ist, siehe Nachtrag K2) und der Urheber-Decke des
+/// Eltern-Aufrufers (Nachtrag K3).
+///
+/// # Argumente
+/// - `profile` ([`RegistryProfile`]): das gewünschte Werkzeug-/Identitätsprofil.
+/// - `project` (`&ProjectContext`): bereits erkannter Projektkontext.
+/// - `overrides` ([`IdentityOverrides`]): Überschreibungen für den System-Prompt.
+/// - `approval_mode` ([`ApprovalModeCell`]): Freigabemodus-Zelle der Politik.
+/// - `access` (`Option<`[`AgentDefinitionAccess`]`>`): nur für
+///   [`RegistryProfile::AgentStewardship`] relevant; `None` ist der
+///   fail-closed Standard.
+///
+/// # Rückgabe
+/// `Ok(AssembledRegistry)` mit Registry, dem **übergebenen** Projektkontext und
+/// der Identität.
+///
+/// # Fehler
+/// - [`RegistryDefaultsError::ContextProviderRegistration`]: der Namensraum des
+///   [`ProjectContextProvider`] ist bereits belegt.
+///
+/// # Nebenläufigkeit
+/// Synchron; alle erzeugten Provider sind `Send + Sync`.
+pub fn assemble_registry_for_project_with_definition_access(
+    profile: RegistryProfile,
+    project: &ProjectContext,
+    overrides: IdentityOverrides,
+    approval_mode: ApprovalModeCell,
+    access: Option<AgentDefinitionAccess>,
+) -> RegistryDefaultsResult<AssembledRegistry> {
+    assemble_registry_for_sandbox_with_definition_access(
         profile,
         project,
         overrides,
         approval_mode,
         &profile.required_permissions(),
+        access,
     )
 }
 
@@ -1108,11 +1537,90 @@ pub fn assemble_registry_for_sandbox(
     approval_mode: ApprovalModeCell,
     granted: &PermissionSet,
 ) -> RegistryDefaultsResult<AssembledRegistry> {
-    let allowed = profile.tool_names_for(granted);
-    let providers: Vec<Arc<dyn ToolProvider>> = profile_tool_providers(profile)
-        .into_iter()
-        .filter_map(|provider| restrict_provider(provider, &allowed))
-        .collect();
+    assemble_registry_for_sandbox_with_definition_access(
+        profile,
+        project,
+        overrides,
+        approval_mode,
+        granted,
+        None,
+    )
+}
+
+/// Wie [`assemble_registry_for_sandbox`], nimmt aber zusätzlich eine
+/// [`AgentDefinitionAccess`] entgegen (Welle FANIN-K, Nachtrag K3).
+///
+/// # Beschreibung
+/// [`assemble_registry_for_sandbox`] ist genau `..._with_definition_access(..,
+/// None)`. Ohne `access` leitet sich `project_agents_dir` weiterhin aus dem
+/// bereits erkannten Projektkontext ab (`profile_agents_dir` bleibt `None`,
+/// `mode = DefinitionWriteMode::ProposalOnly`, `ceiling = None` — fail-closed,
+/// siehe [`AgentDefinitionAccess`]).
+///
+/// Für [`RegistryProfile::AgentStewardship`] weicht die beworbene und
+/// registrierte Werkzeugmenge dabei bewusst von
+/// [`RegistryProfile::tool_names_for`] ab: `tool_names_for` bleibt die
+/// statische **maximale** Vertrags-Obergrenze (siehe
+/// [`RegistryProfile::registered_tool_names`]), während diese Funktion über
+/// [`agent_definition_tool_names_for_access`] genau die Werkzeuge bewirbt, die
+/// `AgentDefinitionToolProvider` unter der übergebenen `access` **tatsächlich**
+/// registriert — sonst würde die Identität Werkzeuge ankündigen, an denen ein
+/// Kind mit `allow_pause = false` folgenlos hängen bliebe. Alle anderen
+/// Profile verhalten sich unverändert zu [`assemble_registry_for_sandbox`].
+///
+/// # Argumente
+/// - `profile` ([`RegistryProfile`]): Werkzeug-/Identitätsprofil.
+/// - `project` (`&ProjectContext`): bereits erkannter Projektkontext.
+/// - `overrides` ([`IdentityOverrides`]): Überschreibungen für den System-Prompt.
+/// - `approval_mode` ([`ApprovalModeCell`]): Freigabemodus-Zelle der Politik.
+/// - `granted` (`&PermissionSet`): Rechte der Ziel-Sandbox; nur geliehen.
+/// - `access` (`Option<`[`AgentDefinitionAccess`]`>`): nur für
+///   [`RegistryProfile::AgentStewardship`] relevant; `None` ist der
+///   fail-closed Standard.
+///
+/// # Rückgabe
+/// `Ok(AssembledRegistry)`; `identity.tools_available` ist exakt die Menge der
+/// registrierten Werkzeuge.
+///
+/// # Fehler
+/// - [`RegistryDefaultsError::ContextProviderRegistration`]: der Namensraum des
+///   [`ProjectContextProvider`] ist bereits belegt.
+///
+/// # Nebenläufigkeit
+/// Synchron; alle erzeugten Provider sind `Send + Sync`.
+pub fn assemble_registry_for_sandbox_with_definition_access(
+    profile: RegistryProfile,
+    project: &ProjectContext,
+    overrides: IdentityOverrides,
+    approval_mode: ApprovalModeCell,
+    granted: &PermissionSet,
+    access: Option<AgentDefinitionAccess>,
+) -> RegistryDefaultsResult<AssembledRegistry> {
+    let agent_definition_access = access.unwrap_or_else(|| AgentDefinitionAccess {
+        project_agents_dir: Some(project.project_root.join(".harw").join("agents")),
+        profile_agents_dir: None,
+        mode: DefinitionWriteMode::ProposalOnly,
+        ceiling: None,
+    });
+    // `AgentStewardship` bewirbt/registriert genau die Werkzeuge, die
+    // `AgentDefinitionToolProvider` unter `agent_definition_access`
+    // tatsächlich trägt (Nachtrag K3) — für jedes andere Profil bleibt es
+    // bei der bisherigen, rein statischen Filterung.
+    let allowed: Vec<&'static str> = if profile == RegistryProfile::AgentStewardship {
+        FS_READ_ONLY_TOOLS
+            .iter()
+            .chain(agent_definition_tool_names_for_access(Some(&agent_definition_access)).iter())
+            .copied()
+            .filter(|tool| tool_permission(tool).is_some_and(|needed| granted.contains(needed)))
+            .collect()
+    } else {
+        profile.tool_names_for(granted)
+    };
+    let providers: Vec<Arc<dyn ToolProvider>> =
+        profile_tool_providers(profile, agent_definition_access)
+            .into_iter()
+            .filter_map(|provider| restrict_provider(provider, &allowed))
+            .collect();
 
     let advertised_tools: Vec<String> = allowed.iter().map(|name| (*name).to_owned()).collect();
 
@@ -1120,9 +1628,10 @@ pub fn assemble_registry_for_sandbox(
         agent_name,
         role_description,
         extra_context,
+        organizational_role,
     } = overrides;
 
-    let identity = AgentIdentity::new(
+    let mut identity = AgentIdentity::new(
         agent_name.unwrap_or_else(|| "harw".to_owned()),
         project.cwd.display().to_string(),
     )
@@ -1130,6 +1639,18 @@ pub fn assemble_registry_for_sandbox(
     .with_project_root(project.project_root.display().to_string())
     .with_tools(advertised_tools)
     .with_extra_context(extra_context);
+    // Das Regelwerk wird nur angehängt, wenn der Aufrufer eine organisatorische
+    // Rolle nennt (Addendum F+G, Agent F-FIX). Früher hing hier
+    // bedingungslos das Worker-Regelwerk (`AgentRoleId::Worker`) — das war
+    // falsch für Aufrufer, die über diesen Weg auch Nicht-Worker-Knoten
+    // zusammenstellen (z. B. `PlanNodeKind::Composite` in
+    // `harw-cli/src/job_worker.rs`). `None` hängt bewusst kein Regelwerk an,
+    // statt eines geratenen Rollentexts.
+    if let Some(role) = organizational_role {
+        identity = identity.with_organization_knowledge(
+            crate::embedded_agents::builtin_organization_knowledge(role),
+        );
+    }
 
     let mut builder = ExtensionRegistryBuilder::default()
         .approval_handler(Arc::new(DefaultApprovalPolicy::new(approval_mode)))
@@ -1175,6 +1696,18 @@ mod tests {
     #[test]
     fn test_registered_tool_names_matches_actually_registered_tools_for_every_profile() {
         for profile in RegistryProfile::ALL {
+            // `AgentStewardship` ist die einzige Ausnahme (Nachtrag K3): ohne
+            // `AgentDefinitionAccess` (der Standardpfad über `assemble()`
+            // hier) registriert `AgentDefinitionToolProvider` fail-closed nur
+            // die beiden lesenden Werkzeuge, während `registered_tool_names()`
+            // für dieses eine Profil bewusst die maximale Vertrags-Obermenge
+            // bleibt (siehe deren Dokumentation und
+            // `tests/tool_admission_coverage.rs`). Siehe die dedizierten
+            // Tests unten für den tatsächlichen Laufzeitzustand mit und ohne
+            // Decke.
+            if *profile == RegistryProfile::AgentStewardship {
+                continue;
+            }
             let assembled = assemble(*profile);
             let expected: Vec<String> = profile
                 .registered_tool_names()
@@ -1187,6 +1720,63 @@ mod tests {
                 "{profile:?}: die statische Liste muss der Registry entsprechen"
             );
         }
+    }
+
+    /// Nachtrag K3: ohne eine gesetzte [`AgentDefinitionAccess`] registriert
+    /// `AgentDefinitionToolProvider` fail-closed nur `agents.validate`/
+    /// `agents.list_proposals` — unabhängig davon, dass
+    /// `RegistryProfile::AgentStewardship::registered_tool_names()` weiterhin
+    /// die volle Vertrags-Obermenge zurückgibt (siehe der Test oben).
+    #[test]
+    fn test_agent_stewardship_registers_only_read_and_list_without_access() {
+        let assembled = assemble(RegistryProfile::AgentStewardship);
+        let mut expected: Vec<String> =
+            FS_READ_ONLY_TOOLS.iter().map(|name| (*name).to_owned()).collect();
+        expected.push("agents.validate".to_owned());
+        expected.push("agents.list_proposals".to_owned());
+        assert_eq!(registered_names(&assembled), expected);
+        assert_eq!(assembled.identity.tools_available, expected);
+    }
+
+    /// Nachtrag K3: mit einer gesetzten Decke und `DefinitionWriteMode::Commit`
+    /// registriert derselbe Provider die volle Vertrags-Obermenge — genau die
+    /// Werkzeugmenge, die `agent-steward.toml` admittiert (siehe
+    /// `tests/tool_admission_coverage.rs`).
+    #[test]
+    fn test_agent_stewardship_registers_all_six_tools_with_a_commit_ceiling() {
+        use crate::agent_definition_tools::DefinitionAuthorCeiling;
+        use harw_agent_dsl::roles::AgentRoleId;
+
+        let cwd = std::env::current_dir().expect("cwd");
+        let project =
+            discover_project(&cwd, &DiscoveryConfig::default()).expect("Discovery im Workspace");
+        let access = AgentDefinitionAccess {
+            project_agents_dir: Some(project.project_root.join(".harw").join("agents")),
+            profile_agents_dir: None,
+            mode: DefinitionWriteMode::Commit,
+            ceiling: Some(DefinitionAuthorCeiling {
+                role: AgentRoleId::UserInterface,
+                tools: std::collections::BTreeSet::new(),
+                permissions: PermissionSet::empty(),
+                max_depth: 0,
+                budget_tokens: 0,
+                effort_cap: None,
+            }),
+        };
+        let assembled = assemble_registry_for_project_with_definition_access(
+            RegistryProfile::AgentStewardship,
+            &project,
+            IdentityOverrides::default(),
+            ApprovalModeCell::default(),
+            Some(access),
+        )
+        .expect("assemble");
+
+        let mut expected: Vec<String> =
+            FS_READ_ONLY_TOOLS.iter().map(|name| (*name).to_owned()).collect();
+        expected.extend(AGENT_DEFINITION_TOOLS.iter().map(|name| (*name).to_owned()));
+        assert_eq!(registered_names(&assembled), expected);
+        assert_eq!(assembled.identity.tools_available, expected);
     }
 
     #[test]
@@ -1425,6 +2015,20 @@ mod tests {
     #[test]
     fn test_identity_advertises_exactly_the_profile_tool_names() {
         for profile in RegistryProfile::ALL {
+            // `AgentStewardship` ist auch hier die einzige Ausnahme (Nachtrag
+            // K3, wie bei `test_registered_tool_names_matches_actually_
+            // registered_tools_for_every_profile` oben): der beworbene Satz
+            // folgt dem access-abhängigen Laufzeitsatz aus
+            // `agent_definition_tool_names_for_access` — ohne `AgentDefinition
+            // Access` (der Standardpfad über `assemble()` hier) ist das fail-
+            // closed nur `agents.validate`/`agents.list_proposals`, während
+            // `RegistryProfile::tool_names()` bewusst die maximale
+            // Commit-Modus-Obermenge bleibt (siehe deren Dokumentation). Der
+            // dedizierte Test `test_agent_stewardship_registers_only_read_
+            // and_list_without_access` prüft diesen Fall bereits exakt.
+            if *profile == RegistryProfile::AgentStewardship {
+                continue;
+            }
             let assembled = assemble(*profile);
             let expected: Vec<String> = profile
                 .tool_names()
@@ -1456,6 +2060,7 @@ mod tests {
                 agent_name: Some("explorer-3".to_owned()),
                 role_description: Some("focused explorer".to_owned()),
                 extra_context: vec!["Antworte nur mit JSON.".to_owned()],
+                organizational_role: None,
             },
         )
         .expect("assemble");
@@ -1578,9 +2183,9 @@ mod tests {
         );
         assert_eq!(
             profile_for_role(role_names::EXECUTOR),
-            Some(RegistryProfile::Full),
-            "executor ist die einzige eingebaute Rolle mit dem vollen, \
-             schreibenden Coding-Satz (Slice B7)"
+            Some(RegistryProfile::ShellExecution),
+            "executor ist die einzige eingebaute Rolle mit der schmalen \
+             Prozessoberfläche"
         );
         for role in [
             role_names::SECURITY_EGRESS_TRIAGE,
@@ -1605,44 +2210,50 @@ mod tests {
         assert_eq!(profile_for_role(""), None);
     }
 
-    /// Nachfolger von `test_default_profile_is_full`: `RegistryProfile`
-    /// implementiert `Default` nicht mehr (R4/G-071), es gibt also kein
-    /// Profil, auf das ein unbekannter Name zurückfallen könnte. Geprüft wird
-    /// die verbliebene Zusage — `Full` ist das einzige nicht-read-only Profil
-    /// und muss ausdrücklich gewählt werden.
-    ///
-    /// Seit Slice B7 ist `executor` die eine ausdrückliche, dokumentierte
-    /// Ausnahme (siehe `agents/executor.toml` und
-    /// [`role_names::EXECUTOR`]) — jede **andere** eingebaute Rolle bleibt
-    /// weiterhin ausgeschlossen. Der Test benennt die Ausnahme explizit
-    /// (kein Wildcard-`filter`), damit eine künftige zweite schreibende
-    /// Rolle diesen Test bewusst anfassen muss statt stillschweigend
-    /// durchzurutschen.
+    /// Ein unbekannter Rollenname darf nie auf einen Prozess- oder
+    /// Schreibzugriff zurückfallen. Das schmale Prozessprofil ist ausschließlich
+    /// für den dokumentierten Executor erreichbar.
     #[test]
-    fn test_full_is_the_only_writable_profile_and_never_an_unnamed_fallback() {
+    fn test_privileged_profiles_are_never_unnamed_fallbacks() {
         assert!(!RegistryProfile::Full.is_read_only());
-        for profile in RegistryProfile::ALL
-            .iter()
-            .filter(|p| **p != RegistryProfile::Full)
-        {
-            assert!(
-                profile.is_read_only(),
-                "{profile:?} ist weder Full noch read-only"
-            );
+        assert!(!RegistryProfile::ShellExecution.is_read_only());
+        assert!(!RegistryProfile::MemoryStewardship.is_read_only());
+        assert!(!RegistryProfile::UiaQuickHelper.is_read_only());
+        assert!(!RegistryProfile::AgentStewardship.is_read_only());
+        for profile in RegistryProfile::ALL.iter().filter(|profile| {
+            !matches!(
+                **profile,
+                RegistryProfile::Full
+                    | RegistryProfile::ShellExecution
+                    | RegistryProfile::MemoryStewardship
+                    | RegistryProfile::UiaQuickHelper
+                    | RegistryProfile::AgentStewardship
+            )
+        }) {
+            assert!(profile.is_read_only(), "{profile:?} muss read-only sein");
         }
-        // Keine eingebaute Rolle außer der ausdrücklichen Ausnahme
-        // `executor` bekommt `Full`: der einzige Weg dorthin ist eine
-        // ausdrückliche Wahl in `profile_for_role`, nie ein Fallback.
         for role in role_names::ALL {
             if role == &role_names::EXECUTOR {
-                continue;
+                assert_eq!(profile_for_role(role), Some(RegistryProfile::ShellExecution));
+            } else if role == &role_names::MEMORY_STEWARD {
+                assert_eq!(profile_for_role(role), Some(RegistryProfile::MemoryStewardship));
+            } else if role == &role_names::UIA_WORKER {
+                // Addendum I: `uia-worker` ist die einzige Rolle mit
+                // `RegistryProfile::UiaQuickHelper` — nicht mehr `Research`.
+                assert_eq!(profile_for_role(role), Some(RegistryProfile::UiaQuickHelper));
+            } else if role == &role_names::AGENT_STEWARD {
+                // Addendum K: `agent-steward` ist die einzige Rolle mit
+                // `RegistryProfile::AgentStewardship`.
+                assert_eq!(profile_for_role(role), Some(RegistryProfile::AgentStewardship));
+            } else {
+                assert_ne!(profile_for_role(role), Some(RegistryProfile::Full));
+                assert_ne!(profile_for_role(role), Some(RegistryProfile::ShellExecution));
+                assert_ne!(profile_for_role(role), Some(RegistryProfile::MemoryStewardship));
+                assert_ne!(profile_for_role(role), Some(RegistryProfile::UiaQuickHelper));
+                assert_ne!(profile_for_role(role), Some(RegistryProfile::AgentStewardship));
             }
-            assert_ne!(
-                profile_for_role(role),
-                Some(RegistryProfile::Full),
-                "Rolle {role} darf nicht den vollen Coding-Satz bekommen"
-            );
         }
+        assert_eq!(profile_for_role("unbekannt"), None);
     }
 
     #[test]
@@ -1677,14 +2288,12 @@ mod tests {
         /// Rollendateien, die die Verzeichnis-Sammlung bereits findet, deren
         /// Aufnahme in `role_names::ALL` aber ein eigener, noch offener
         /// Befund ist (siehe Moduldokumentation von `role_names`).
-        /// `memory-steward` (Memory v3, §5.3) hat eine Rollendatei, aber noch
-        /// kein Profil: die Konsolidierung braucht genau `fs.*` **ohne**
-        /// `shell.exec`, und ein solches Profil gibt es bisher nicht.
-        /// `RegistryProfile::Full` wäre zu weit — die Deckungsprüfung in
-        /// `tests/tool_admission_coverage.rs` würde die Rolle dann zwingen,
-        /// auch `shell.exec` zuzulassen. Bis das schmale Profil existiert,
-        /// bleibt die Rolle eine dokumentierte Ausnahme statt still gesenkt.
-        const PENDING_EXCLUSIONS: &[&str] = &["context-steward", "intel-scout", "memory-steward"];
+        /// `memory-steward` (Memory v3, §5.3) stand hier bis zur Einführung
+        /// von `RegistryProfile::MemoryStewardship`: die Konsolidierung
+        /// braucht genau `fs.*` **ohne** `shell.exec`, und ein solches
+        /// Profil gab es vorher nicht. Jetzt hat sie ein Profil und einen
+        /// Eintrag in `role_names::ALL` — keine Ausnahme mehr.
+        const PENDING_EXCLUSIONS: &[&str] = &["context-steward", "intel-scout"];
 
         let discovered: BTreeSet<&str> = crate::embedded_agents::builtin_agent_toml()
             .iter()

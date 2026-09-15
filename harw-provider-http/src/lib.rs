@@ -58,7 +58,10 @@
 
 pub mod anthropic;
 mod anthropic_caps;
+pub mod cache_strategy;
+pub mod discovery;
 mod error;
+pub mod rate_limiter;
 pub mod retry;
 pub mod routing;
 mod tool_names;
@@ -82,8 +85,9 @@ use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 pub use anthropic::{
-    AnthropicCredential, AnthropicMessagesProvider, DEFAULT_ANTHROPIC_BASE_URL,
-    anthropic_messages_url, build_messages_body, extract_anthropic_text,
+    ANTHROPIC_SUBSCRIPTION_TOKEN_WARNING, AnthropicCredential, AnthropicMessagesProvider,
+    DEFAULT_ANTHROPIC_BASE_URL, anthropic_messages_url, build_messages_body,
+    extract_anthropic_text,
 };
 pub use error::{HttpProviderError, HttpProviderResult};
 pub use retry::{
@@ -358,12 +362,14 @@ fn build_named_provider(
             provider_name,
             configured_headers(provider_name, &provider.headers, sources)?,
         );
+        backend.configure_rate_limit(provider.rate_limit.clone());
         return Ok(Box::new(backend));
     }
 
     Ok(Box::new(OpenAiResponsesProvider::from_named_config(
         provider_name,
         provider,
+        config,
         model,
         sources,
     )?))
@@ -644,6 +650,15 @@ pub struct OpenAiResponsesProvider {
     transport: Transport,
     request_timeout: Duration,
     reasoning_replay: ReasoningReplay,
+    /// Modell-ID → Prompt-Caching-Override (`ModelToml::prompt_caching`),
+    /// befüllt aus `config.models` beim Bau über [`Self::from_named_config`].
+    /// Leer, wenn der Provider über [`Self::new`]/[`Self::with_transport`]
+    /// gebaut wurde — dann entscheidet [`cache_strategy::resolve_cache_strategy`]
+    /// allein anhand von Provider-Name/Modell.
+    cache_overrides: std::collections::HashMap<String, harw_config::PromptCachingMode>,
+    /// Client-seitiger Rate-Limiter (siehe [`rate_limiter::ProviderRateLimiter`]);
+    /// standardmäßig deaktiviert (`ProviderRateLimiter::new(None)`).
+    rate_limiter: std::sync::Arc<rate_limiter::ProviderRateLimiter>,
 }
 
 /// Eine gemerkte Reasoning-Runde der Responses-API (W4a / A-OAI).
@@ -763,6 +778,8 @@ impl OpenAiResponsesProvider {
             transport,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             reasoning_replay: ReasoningReplay::default(),
+            cache_overrides: std::collections::HashMap::new(),
+            rate_limiter: std::sync::Arc::new(rate_limiter::ProviderRateLimiter::new(None)),
         }
     }
 
@@ -819,13 +836,19 @@ impl OpenAiResponsesProvider {
             home: None,
             endpoint: Some(&provider.base_url),
         };
-        Self::from_named_config(provider_name, provider, model, sources)
+        Self::from_named_config(provider_name, provider, config, model, sources)
     }
 
     /// Builds one OpenAI-compatible provider from its named configuration.
+    ///
+    /// `config` liefert `config.models` zum Befüllen von `cache_overrides`
+    /// (jedes Modell dieses Providers mit gesetztem `prompt_caching`, unter
+    /// seiner `id` **und** all seinen `aliases`) sowie `provider.rate_limit`
+    /// zum Bau des [`rate_limiter::ProviderRateLimiter`].
     fn from_named_config(
         provider_name: &str,
         provider: &harw_config::ProviderToml,
+        config: &harw_config::ResolvedConfig,
         model: &str,
         sources: SecretSources<'_>,
     ) -> HttpProviderResult<Self> {
@@ -882,6 +905,19 @@ impl OpenAiResponsesProvider {
         }
         http_provider.provider_id = provider_name.to_owned();
         http_provider.headers = configured_headers(provider_name, &provider.headers, sources)?;
+        for model_entry in config.models.values().filter(|m| m.provider == provider_name) {
+            if let Some(mode) = model_entry.prompt_caching {
+                http_provider
+                    .cache_overrides
+                    .insert(model_entry.id.clone(), mode);
+                for alias in &model_entry.aliases {
+                    http_provider.cache_overrides.insert(alias.clone(), mode);
+                }
+            }
+        }
+        http_provider.rate_limiter = std::sync::Arc::new(rate_limiter::ProviderRateLimiter::new(
+            provider.rate_limit.clone(),
+        ));
         Ok(http_provider)
     }
 
@@ -2193,18 +2229,20 @@ fn extract_openai_tool_calls(
 /// Eine vollständig befüllte [`TokenUsage`]; nie ein Fehler.
 fn extract_openai_usage(body: &Value, transport: Transport) -> TokenUsage {
     let usage = body.get("usage");
-    let (input_key, output_key, reasoning_path, cached_path) = match transport {
+    let (input_key, output_key, reasoning_path, cached_path, cache_write_path) = match transport {
         Transport::Responses => (
             "input_tokens",
             "output_tokens",
             ["output_tokens_details", "reasoning_tokens"],
             ["input_tokens_details", "cached_tokens"],
+            ["input_tokens_details", "cache_creation_input_tokens"],
         ),
         Transport::Chat => (
             "prompt_tokens",
             "completion_tokens",
             ["completion_tokens_details", "reasoning_tokens"],
             ["prompt_tokens_details", "cached_tokens"],
+            ["prompt_tokens_details", "cache_creation_input_tokens"],
         ),
     };
 
@@ -2224,12 +2262,20 @@ fn extract_openai_usage(body: &Value, transport: Transport) -> TokenUsage {
         .and_then(|value| value.get(cached_path[0]))
         .and_then(|nested| nested.get(cached_path[1]))
         .and_then(Value::as_u64);
+    // DashScope liefert `cache_creation_input_tokens` unter
+    // `prompt_tokens_details`; die Responses-API kennt das Feld nach
+    // aktuellem Stand nicht (bleibt dann `None`, siehe Kontrakt).
+    let cache_write_tokens = usage
+        .and_then(|value| value.get(cache_write_path[0]))
+        .and_then(|nested| nested.get(cache_write_path[1]))
+        .and_then(Value::as_u64);
 
     TokenUsage {
         input_tokens,
         output_tokens,
         reasoning_tokens,
         cached_tokens,
+        cache_write_tokens,
     }
 }
 
@@ -2272,14 +2318,23 @@ impl ModelProvider for OpenAiResponsesProvider {
                     )
                 }
                 Transport::Chat => {
-                    tracing::debug!(model, "sending chat request");
-                    (
-                        format!("{}/chat/completions", self.base_url),
-                        build_chat_body(&request, model),
-                    )
+                    let strategy = cache_strategy::resolve_cache_strategy(
+                        &self.provider_id,
+                        model,
+                        self.cache_overrides.get(model).copied(),
+                    );
+                    let mut body = build_chat_body(&request, model);
+                    cache_strategy::apply_chat_cache_control(&mut body, strategy);
+                    tracing::debug!(
+                        model,
+                        strategy = strategy.label(),
+                        "sending chat request"
+                    );
+                    (format!("{}/chat/completions", self.base_url), body)
                 }
             };
 
+            self.rate_limiter.wait_for_slot().await;
             let builder = self.authorized_request(&url)?;
             let response = builder
                 .json(&wire)
@@ -2288,6 +2343,7 @@ impl ModelProvider for OpenAiResponsesProvider {
                 .await
                 .map_err(|error| model_error_for_transport(error, false))?;
 
+            self.rate_limiter.observe_headers(response.headers());
             let status = response.status();
             let retry_after = header_string(response.headers(), "retry-after");
             let retry_after_ms = header_string(response.headers(), "retry-after-ms");
@@ -2333,6 +2389,15 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc::{self, Receiver};
     use std::thread;
+
+    #[test]
+    fn anthropic_subscription_token_warning_is_non_empty_and_cites_source() {
+        assert!(!ANTHROPIC_SUBSCRIPTION_TOKEN_WARNING.trim().is_empty());
+        assert!(
+            ANTHROPIC_SUBSCRIPTION_TOKEN_WARNING
+                .contains("https://code.claude.com/docs/en/legal-and-compliance")
+        );
+    }
 
     fn mock_chat_server(request_count: usize) -> (String, Receiver<Value>, thread::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
@@ -2457,6 +2522,7 @@ mod tests {
             models: models.into_iter().map(str::to_owned).collect(),
             enabled: true,
             origin_allowlist: harw_config::OriginAllowlistToml::default(),
+            rate_limit: None,
         }
     }
 
@@ -3208,6 +3274,7 @@ mod tests {
                 output_tokens: 34,
                 reasoning_tokens: Some(7),
                 cached_tokens: Some(3),
+                cache_write_tokens: None,
             }
         );
     }
@@ -3230,8 +3297,26 @@ mod tests {
                 output_tokens: 5,
                 reasoning_tokens: Some(2),
                 cached_tokens: Some(1),
+                cache_write_tokens: None,
             }
         );
+    }
+
+    #[test]
+    fn test_extract_openai_usage_dashscope_cache_creation_tokens() {
+        let body = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 40,
+                "prompt_tokens_details": {
+                    "cached_tokens": 0,
+                    "cache_creation_input_tokens": 1024
+                }
+            }
+        });
+        let usage = extract_openai_usage(&body, Transport::Chat);
+        assert_eq!(usage.cache_write_tokens, Some(1024));
+        assert_eq!(usage.cached_tokens, Some(0));
     }
 
     #[test]
@@ -4242,6 +4327,7 @@ mod tests {
             models: vec!["claude-test".to_owned()],
             enabled: true,
             origin_allowlist: harw_config::OriginAllowlistToml::default(),
+            rate_limit: None,
         }
     }
 

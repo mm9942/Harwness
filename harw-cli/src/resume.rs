@@ -4,11 +4,13 @@
 //! in-TUI `/resume` handoff. Terminal prompting stays here: callers outside the
 //! CLI receive only session IDs or selectors, never stdin/stdout ownership.
 
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 use harw_session_store::meta::{self, SessionMeta};
@@ -166,12 +168,14 @@ pub fn discover_sessions(sessions_dir: &Path) -> ResumeResult<Vec<DiscoveredSess
             }
         };
 
-        sessions.push(DiscoveredSession {
+        let mut session = DiscoveredSession {
             id,
             path,
             modified_at,
             meta,
-        });
+        };
+        backfill_project_key(sessions_dir, &mut session);
+        sessions.push(session);
     }
 
     sort_sessions(&mut sessions);
@@ -324,20 +328,242 @@ fn effective_last_active(session: &DiscoveredSession) -> SystemTime {
 /// Prüft, ob eine entdeckte Session zum aktuellen Projekt gehört.
 ///
 /// # Beschreibung
-/// Vergleicht `session.meta.project_key` mit `current_project_key`; beide
-/// `None` gelten als Treffer (eine Session ohne Projekt-Zuordnung erscheint
-/// dann nur, wenn auch das aktuelle Arbeitsverzeichnis keinem Projekt
-/// zugeordnet werden konnte). Wird von `ProfileResumeSelector::available_sessions`
-/// (`chat.rs`) sowie vom Non-TTY-Fallback in `chat.rs` verwendet, damit beide
-/// Auswahlwege denselben Projektfilter anwenden (Contract §4: "`harw -r`
-/// zeigt standardmäßig die Sessions des aktuellen Projekts").
+/// Vergleicht `session.meta.project_key` mit `current_project_key`. Eine
+/// Session **ohne** Projekt-Zuordnung matcht nur, wenn auch das aktuelle
+/// Projekt keinen Schlüssel hat (`current_project_key == None`) — andernfalls
+/// tauchte jede Alt-Session (vor `tag_session_project` in `chat.rs`, oder vor
+/// [`backfill_project_key`]) in jedem Projekt auf, was `harw -r` ohne
+/// `--all` faktisch zu einem globalen Picker machte (Bugreport: fremde
+/// Projekt-Sessions erschienen ohne `Ctrl+A`). [`discover_sessions`] versucht
+/// vorher bereits, fehlende `project_key`s aus dem Transcript nachzutragen
+/// ([`backfill_project_key`]); nur echt unbestimmbare Alt-Sessions bleiben
+/// hier untagged und sind dann ausschließlich über `--all` erreichbar. Wird
+/// von `ProfileResumeSelector::available_sessions` (`chat.rs`) sowie vom
+/// Non-TTY-Fallback in `chat.rs` verwendet, damit beide Auswahlwege denselben
+/// Projektfilter anwenden (Contract §4: "`harw -r` zeigt standardmäßig die
+/// Sessions des aktuellen Projekts").
 #[must_use]
 pub fn session_matches_project(session: &DiscoveredSession, current_project_key: Option<&str>) -> bool {
-    session
+    match session
         .meta
         .as_ref()
         .and_then(|meta| meta.project_key.as_deref())
-        == current_project_key
+    {
+        None => current_project_key.is_none(),
+        Some(session_key) => Some(session_key) == current_project_key,
+    }
+}
+
+/// Obergrenze für den Transcript-Scan in [`backfill_project_key`]: nur der
+/// Anfang der Datei wird gelesen, damit ein Backfill-Versuch auf einem
+/// riesigen Transcript nicht spürbar Zeit kostet.
+const BACKFILL_SCAN_CAP_BYTES: usize = 5 * 1024 * 1024;
+
+/// Höchstzahl der Pfad-Kandidaten (nach Häufigkeit sortiert), für die
+/// [`backfill_project_key`] tatsächlich `discover_project` aufruft.
+const BACKFILL_MAX_CANDIDATES: usize = 5;
+
+/// Verzeichnispräfixe, die nie als Backfill-Kandidat zählen (temporäre,
+/// virtuelle oder systemweite Pfade, nie ein Projekt-Root).
+const BACKFILL_IGNORED_PREFIXES: &[&str] = &["/tmp", "/proc", "/dev", "/usr", "/etc"];
+
+/// Prozessweiter Merker bereits versuchter Backfills, damit
+/// [`backfill_project_key`] pro Session nur einmal je Prozesslauf einen
+/// Transcript-Scan durchführt (siehe Funktionsdoku: `SessionMeta` bekommt
+/// bewusst kein neues Feld für einen persistenten Marker).
+fn attempted_backfills() -> &'static Mutex<HashSet<SessionId>> {
+    static ATTEMPTED: OnceLock<Mutex<HashSet<SessionId>>> = OnceLock::new();
+    ATTEMPTED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Markiert `id` als "Backfill versucht"; liefert `true`, wenn dies der
+/// erste Versuch in diesem Prozesslauf ist (Aufrufer soll dann scannen).
+fn mark_backfill_attempted(id: &SessionId) -> bool {
+    let mutex = attempted_backfills();
+    let mut attempted = mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    attempted.insert(id.clone())
+}
+
+/// Trägt best-effort einen fehlenden `meta.project_key` für Alt-Sessions
+/// nach, indem absolute Pfade im Transcript auf einen wahrscheinlichen
+/// Projekt-Root zurückgeführt werden.
+///
+/// # Beschreibung
+/// Läuft nur, wenn `session.meta` existiert, `project_key` fehlt und dieser
+/// Prozess für `session.id` noch keinen Versuch unternommen hat (siehe
+/// [`mark_backfill_attempted`]). Liest höchstens
+/// [`BACKFILL_SCAN_CAP_BYTES`] des Transcripts und extrahiert absolute
+/// Pfad-Kandidaten (siehe [`extract_path_candidates`]); zählt, wie oft jedes
+/// übergeordnete Verzeichnis vorkommt, und probiert die bis zu
+/// [`BACKFILL_MAX_CANDIDATES`] häufigsten Verzeichnisse — nach Häufigkeit
+/// absteigend — mit `harw_home::project::discover_project`. Der erste
+/// Treffer, dessen Root weder das Home-Verzeichnis der Nutzerin noch `/` ist,
+/// gewinnt und wird über `harw_session_store::meta::set_project`
+/// gespeichert; `session.meta` wird danach in-place aktualisiert, damit der
+/// aufrufende `discover_sessions`-Lauf den neuen Schlüssel sofort für die
+/// Sortierung/Filterung sieht.
+///
+/// # Fehlerverhalten
+/// Jeder Fehler (Transcript nicht lesbar, kein Kandidat gefunden, Speichern
+/// schlägt fehl) wird höchstens mit `tracing` geloggt; `discover_sessions`
+/// darf nie an einem Backfill-Versuch scheitern.
+pub fn backfill_project_key(sessions_dir: &Path, session: &mut DiscoveredSession) {
+    let needs_backfill = session
+        .meta
+        .as_ref()
+        .is_some_and(|meta| meta.project_key.is_none());
+    if !needs_backfill {
+        return;
+    }
+    if !mark_backfill_attempted(&session.id) {
+        return;
+    }
+
+    let Some(text) = read_transcript_prefix(&session.path) else {
+        return;
+    };
+
+    let candidates = rank_directory_candidates(&text);
+    let home_dir = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|home| fs::canonicalize(&home).ok());
+
+    for candidate in candidates.into_iter().take(BACKFILL_MAX_CANDIDATES) {
+        let Some(existing_ancestor) = nearest_existing_ancestor(&candidate) else {
+            continue;
+        };
+        let project = match harw_home::project::discover_project(&existing_ancestor, &[]) {
+            Ok(project) => project,
+            Err(_) => continue,
+        };
+        if project.root == Path::new("/") {
+            continue;
+        }
+        if home_dir.as_deref() == Some(project.root.as_path()) {
+            continue;
+        }
+
+        let key = harw_home::project::project_key(&project.root);
+        match meta::set_project(sessions_dir, &session.id, None, Some(&project.root), Some(&key)) {
+            Ok(updated_meta) => {
+                tracing::debug!(
+                    session = %session.id,
+                    project = %key,
+                    "resume.backfill_project"
+                );
+                session.meta = Some(updated_meta);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session = %session.id,
+                    %error,
+                    "resume: Projekt-Backfill konnte nicht gespeichert werden"
+                );
+            }
+        }
+        return;
+    }
+}
+
+/// Liest bis zu [`BACKFILL_SCAN_CAP_BYTES`] am Anfang eines Transcripts als
+/// verlustfrei-lossy UTF-8. `None` bei jedem Lesefehler.
+fn read_transcript_prefix(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut limited = file.take(BACKFILL_SCAN_CAP_BYTES as u64);
+    let mut buffer = Vec::new();
+    limited.read_to_end(&mut buffer).ok()?;
+    Some(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+/// Extrahiert absolute Pfad-Kandidaten aus Rohtext: Teilstrings, die mit `/`
+/// beginnen, mindestens drei nicht-leere Segmente haben und an `"`, `'`,
+/// Whitespace, `:` oder `,` enden.
+fn extract_path_candidates(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut candidates = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'/' {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let mut end = index;
+        while end < bytes.len() {
+            let byte = bytes[end];
+            let is_stop = byte == b'"'
+                || byte == b'\''
+                || byte == b':'
+                || byte == b','
+                || byte.is_ascii_whitespace();
+            if is_stop {
+                break;
+            }
+            end += 1;
+        }
+        let candidate = &text[start..end];
+        if candidate.split('/').filter(|segment| !segment.is_empty()).count() >= 3 {
+            candidates.push(candidate);
+        }
+        index = if end > start { end } else { index + 1 };
+    }
+    candidates
+}
+
+/// `true`, wenn `path` unter einem der [`BACKFILL_IGNORED_PREFIXES`] oder
+/// unter `$HOME/.harw`/`$HOME/.cargo` liegt und damit nie ein
+/// Backfill-Kandidat sein darf.
+fn is_ignored_backfill_path(path: &str) -> bool {
+    if BACKFILL_IGNORED_PREFIXES
+        .iter()
+        .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+    {
+        return true;
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        let home = home.to_string_lossy().into_owned();
+        if path.starts_with(&format!("{home}/.harw")) || path.starts_with(&format!("{home}/.cargo")) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Zählt für jeden extrahierten Pfad-Kandidaten das übergeordnete
+/// Verzeichnis und liefert die Verzeichnisse nach Häufigkeit absteigend
+/// (bei Gleichstand alphabetisch, für deterministische Reihenfolge).
+fn rank_directory_candidates(text: &str) -> Vec<PathBuf> {
+    let mut counts: HashMap<PathBuf, usize> = HashMap::new();
+    for candidate in extract_path_candidates(text) {
+        if is_ignored_backfill_path(candidate) {
+            continue;
+        }
+        let path = Path::new(candidate);
+        let directory = path.parent().unwrap_or(path);
+        if directory.as_os_str().is_empty() {
+            continue;
+        }
+        *counts.entry(directory.to_path_buf()).or_insert(0) += 1;
+    }
+
+    let mut ranked: Vec<(PathBuf, usize)> = counts.into_iter().collect();
+    ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    ranked.into_iter().map(|(path, _)| path).collect()
+}
+
+/// Läuft von `path` aufwärts bis zum ersten tatsächlich existierenden
+/// Vorfahren (`discover_project` kanonisiert intern und scheitert an einem
+/// nicht existierenden Startverzeichnis). `None`, wenn selbst `/` fehlt
+/// (praktisch unerreichbar).
+fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        if candidate.exists() {
+            return Some(candidate.to_path_buf());
+        }
+        current = candidate.parent();
+    }
+    None
 }
 
 fn output_error(source: std::io::Error) -> ResumeError {
@@ -386,6 +612,9 @@ mod tests {
             project_key: None,
             first_user_message: None,
             turns: 0,
+            usage_rounds: 0,
+            total_usage: harw_types::TokenUsage::default(),
+            drift_events: std::collections::BTreeMap::new(),
         }
     }
 
@@ -553,12 +782,175 @@ mod tests {
     // `ProfileResumeSelector::available_sessions` (`chat.rs`) weiterhin nutzt.
 
     #[test]
-    fn session_matches_project_treats_both_none_as_a_match() {
+    fn session_matches_project_shows_untagged_sessions_only_without_a_current_project() {
         let session_without_project = session_with_meta("x", 1, fresh_meta("x"));
         assert!(session_matches_project(&session_without_project, None));
         assert!(!session_matches_project(
             &session_without_project,
             Some("harwness-abc123")
         ));
+    }
+
+    #[test]
+    fn test_session_matches_project_tagged_session_with_different_key_does_not_match() {
+        let mut meta = fresh_meta("tagged");
+        meta.project_key = Some("harwness-abc123".to_owned());
+        let tagged_session = session_with_meta("tagged", 1, meta);
+
+        assert!(!session_matches_project(
+            &tagged_session,
+            Some("harwness-different")
+        ));
+        assert!(!session_matches_project(&tagged_session, None));
+    }
+
+    #[test]
+    fn test_session_matches_project_tagged_session_with_same_key_matches() {
+        let mut meta = fresh_meta("tagged");
+        meta.project_key = Some("harwness-abc123".to_owned());
+        let tagged_session = session_with_meta("tagged", 1, meta);
+
+        assert!(session_matches_project(
+            &tagged_session,
+            Some("harwness-abc123")
+        ));
+    }
+
+    // -- Backfill fehlender `project_key`s aus dem Transcript --------------
+
+    #[test]
+    fn backfill_project_key_tags_session_from_repeated_project_paths_in_transcript() {
+        let sessions_dir = tempfile::tempdir().expect("temporary sessions directory");
+        // Nicht unter `/tmp` anlegen: `BACKFILL_IGNORED_PREFIXES` verwirft
+        // genau solche Pfade als Kandidaten (Rauschen aus Editor-/Build-Tools),
+        // also braucht dieser Test einen Projekt-Root außerhalb davon.
+        let project_dir = tempfile::Builder::new()
+            .prefix("harw-backfill-project-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .expect("temporary project directory outside /tmp");
+        fs::create_dir(project_dir.path().join(".git")).expect("fake git marker");
+        let src_dir = project_dir.path().join("harw-core").join("src");
+        fs::create_dir_all(&src_dir).expect("project source directory");
+        let file_a = src_dir.join("lib.rs");
+        let file_b = src_dir.join("state_store.rs");
+
+        let id = SessionId::try_from("backfill-hit".to_owned()).expect("valid session id");
+        let store = harw_session_store::store::TranscriptStore::new(sessions_dir.path());
+        let thread = harw_types::ThreadRef::from_str("root");
+        // Reale Transcript-Datensätze tragen `session_id`/`thread`/`sequence`
+        // (`TranscriptRecord`, `deny_unknown_fields`) — von Hand geschriebenes
+        // JSON ohne diese Felder scheitert an `meta::load_or_derive` mit
+        // "missing field `session_id`". Über `TranscriptStore::append` bleibt
+        // die Fixture an das echte Schema gebunden.
+        store
+            .append(&harw_session_store::record::TranscriptRecord::new(
+                id.clone(),
+                thread.clone(),
+                0,
+                jiff::Timestamp::now(),
+                harw_session_store::record::RecordKind::Item,
+                serde_json::json!({
+                    "type": "tool_call",
+                    "arguments": { "path": file_a.display().to_string() },
+                }),
+            ))
+            .expect("append fake tool_call record for file_a");
+        store
+            .append(&harw_session_store::record::TranscriptRecord::new(
+                id.clone(),
+                thread.clone(),
+                1,
+                jiff::Timestamp::now(),
+                harw_session_store::record::RecordKind::Item,
+                serde_json::json!({
+                    "type": "tool_result",
+                    "output": format!("read {} and {}", file_a.display(), file_b.display()),
+                }),
+            ))
+            .expect("append fake tool_result record referencing both files");
+        store
+            .append(&harw_session_store::record::TranscriptRecord::new(
+                id.clone(),
+                thread,
+                2,
+                jiff::Timestamp::now(),
+                harw_session_store::record::RecordKind::Item,
+                serde_json::json!({
+                    "type": "tool_call",
+                    "arguments": { "path": file_b.display().to_string() },
+                }),
+            ))
+            .expect("append fake tool_call record for file_b");
+        let transcript_path = store
+            .transcript_path(&id)
+            .expect("transcript path for a valid session id");
+
+        let meta = meta::load_or_derive(sessions_dir.path(), &id).expect("derive fresh meta");
+        assert_eq!(meta.project_key, None);
+        let mut session = DiscoveredSession {
+            id: id.clone(),
+            path: transcript_path,
+            modified_at: SystemTime::now(),
+            meta: Some(meta),
+        };
+
+        backfill_project_key(sessions_dir.path(), &mut session);
+
+        let expected_root = fs::canonicalize(project_dir.path()).expect("canonical project root");
+        let expected_key = harw_home::project::project_key(&expected_root);
+        let updated_meta = session
+            .meta
+            .as_ref()
+            .expect("meta stays present after backfill");
+        assert_eq!(updated_meta.project_key.as_deref(), Some(expected_key.as_str()));
+
+        // Erneutes `load_or_derive` bestätigt, dass der Sidecar persistiert wurde.
+        let reloaded = meta::load_or_derive(sessions_dir.path(), &id).expect("reload persisted meta");
+        assert_eq!(reloaded.project_key.as_deref(), Some(expected_key.as_str()));
+    }
+
+    #[test]
+    fn backfill_project_key_leaves_session_untagged_when_only_ignored_paths_are_present() {
+        let sessions_dir = tempfile::tempdir().expect("temporary sessions directory");
+        let id = SessionId::try_from("backfill-miss".to_owned()).expect("valid session id");
+        let store = harw_session_store::store::TranscriptStore::new(sessions_dir.path());
+        // Siehe Kommentar im Hit-Test oben: echte Transcript-Datensätze
+        // brauchen `session_id`/`thread`/`sequence`, sonst scheitert
+        // `meta::load_or_derive` mit "missing field `session_id`".
+        store
+            .append(&harw_session_store::record::TranscriptRecord::new(
+                id.clone(),
+                harw_types::ThreadRef::from_str("root"),
+                0,
+                jiff::Timestamp::now(),
+                harw_session_store::record::RecordKind::Item,
+                serde_json::json!({
+                    "type": "tool_call",
+                    "arguments": { "path": "/tmp/scratch/output.txt" },
+                }),
+            ))
+            .expect("append fake tool_call record with only an ignored path");
+        let transcript_path = store
+            .transcript_path(&id)
+            .expect("transcript path for a valid session id");
+
+        let meta = meta::load_or_derive(sessions_dir.path(), &id).expect("derive fresh meta");
+        let mut session = DiscoveredSession {
+            id: id.clone(),
+            path: transcript_path,
+            modified_at: SystemTime::now(),
+            meta: Some(meta),
+        };
+
+        backfill_project_key(sessions_dir.path(), &mut session);
+
+        assert_eq!(
+            session
+                .meta
+                .as_ref()
+                .expect("meta stays present")
+                .project_key,
+            None
+        );
     }
 }

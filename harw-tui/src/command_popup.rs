@@ -53,6 +53,28 @@ fn make_description(domain_str: &str, permission_str: &str) -> String {
     format!("{domain_label} · Berechtigung: {perm_label}")
 }
 
+/// Längstes gemeinsames Präfix aller `strings` (case-sensitiv, auf
+/// Zeichenbasis — Befehlsnamen sind ASCII, daher entspricht die
+/// Zeichenanzahl der Byte-Länge).
+///
+/// # Rückgabe
+/// `String::new()` für eine leere Eingabe.
+fn longest_common_prefix(strings: &[&str]) -> String {
+    let Some(first) = strings.first() else {
+        return String::new();
+    };
+    let mut prefix_len = first.chars().count();
+    for other in &strings[1..] {
+        let shared = first
+            .chars()
+            .zip(other.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        prefix_len = prefix_len.min(shared);
+    }
+    first.chars().take(prefix_len).collect()
+}
+
 // ---------------------------------------------------------------------------
 // Öffentliche Typen
 // ---------------------------------------------------------------------------
@@ -77,6 +99,19 @@ pub(crate) enum PopupAction {
     Accept(String),
 }
 
+/// Ergebnis von [`CommandPopup::tab_outcome`] — shell-artige
+/// Tab-Vervollständigung statt bloßer Übernahme der Markierung.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TabOutcome {
+    /// Keine Treffer; Tab tut nichts (kein Tab-Zeichen einfügen).
+    None,
+    /// Der getippte Suchtext wird auf das längste gemeinsame Präfix aller
+    /// Prefix-Treffer erweitert; das Popup bleibt offen.
+    ExtendQuery(String),
+    /// Ein einzelner Befehl wird übernommen (Popup schließt).
+    Accept(String),
+}
+
 /// Zustand des `/command`-Popups mit Filterlogik und Tastaturnavigation.
 #[derive(Debug, Clone)]
 pub(crate) struct CommandPopup {
@@ -86,8 +121,20 @@ pub(crate) struct CommandPopup {
     selected: usize,
     /// Aktueller Suchtext (ohne führendes `/`).
     query: String,
-    /// Indizes in `items`, die dem aktuellen `query` entsprechen.
+    /// Indizes in `items`, sortiert nach Rang: exakter Treffer > Präfix-Treffer
+    /// > Teilstring-Treffer; innerhalb eines Rangs nach Namenslänge, dann
+    /// alphabetisch (stabil, deterministisch — Registrierungsreihenfolge
+    /// entscheidet nie über die Anzeigereihenfolge).
     filtered: Vec<usize>,
+    /// Anzahl der führenden Einträge in `filtered`, die exakte oder
+    /// Präfix-Treffer sind (Rang 0/1). Da `filtered` nach Rang sortiert ist,
+    /// bilden sie stets einen zusammenhängenden Anfangsabschnitt.
+    prefix_count: usize,
+    /// `true`, seit der letzten `on_query_change`, wenn der Nutzer die
+    /// Markierung per Pfeiltaste/Ziffer bewegt hat. Steuert
+    /// [`Self::tab_outcome`]: eine bewusst bewegte Markierung hat Vorrang vor
+    /// der automatischen Rang-/Präfix-Logik.
+    selection_moved: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -116,34 +163,73 @@ impl CommandPopup {
             })
             .collect();
 
-        let len = items.len();
-        Self {
+        let mut popup = Self {
             items,
             selected: 0,
             query: String::new(),
-            filtered: (0..len).collect(),
-        }
+            filtered: Vec::new(),
+            prefix_count: 0,
+            selection_moved: false,
+        };
+        // Baut `filtered`/`prefix_count` über dieselbe Rang-Logik wie jede
+        // spätere Eingabe auf, statt Registrierungsreihenfolge zu
+        // übernehmen — ein leerer Suchtext ist für `starts_with`/`contains`
+        // ohnehin bei jedem Namen wahr, ergibt also alle Einträge im
+        // Rang „Präfix-Treffer".
+        popup.on_query_change("");
+        popup
     }
 
-    /// Aktualisiert den Suchtext und berechnet die gefilterte Liste neu.
+    /// Aktualisiert den Suchtext und berechnet die gerankte, gefilterte
+    /// Liste neu.
+    ///
+    /// # Beschreibung
+    /// Case-insensitive Drei-Rang-Klassifikation je Eintrag: exakter Treffer
+    /// (Rang 0) > Präfix-Treffer (Rang 1) > Teilstring-Treffer (Rang 2, nur
+    /// wenn `query` irgendwo im Namen vorkommt). Einträge ohne Treffer
+    /// entfallen. Innerhalb eines Rangs sortiert stabil nach Namenslänge,
+    /// dann alphabetisch — deterministisch unabhängig von der
+    /// Registrierungsreihenfolge. Setzt `selected` auf `0` und
+    /// `selection_moved` auf `false`.
     pub(crate) fn on_query_change(&mut self, query: &str) {
         self.query = query.to_owned();
+        self.selection_moved = false;
         let q_lower = query.to_ascii_lowercase();
-        self.filtered = self
+
+        let mut ranked: Vec<(usize, u8)> = self
             .items
             .iter()
             .enumerate()
-            .filter(|(_, item)| item.name.to_ascii_lowercase().contains(&q_lower))
-            .map(|(idx, _)| idx)
+            .filter_map(|(idx, item)| {
+                let name_lower = item.name.to_ascii_lowercase();
+                if name_lower == q_lower {
+                    Some((idx, 0))
+                } else if name_lower.starts_with(&q_lower) {
+                    Some((idx, 1))
+                } else if name_lower.contains(&q_lower) {
+                    Some((idx, 2))
+                } else {
+                    None
+                }
+            })
             .collect();
-        if self.selected >= self.filtered.len() {
-            self.selected = self.filtered.len().saturating_sub(1);
-        }
+        let items = &self.items;
+        ranked.sort_by(|(idx_a, tier_a), (idx_b, tier_b)| {
+            tier_a
+                .cmp(tier_b)
+                .then_with(|| items[*idx_a].name.len().cmp(&items[*idx_b].name.len()))
+                .then_with(|| items[*idx_a].name.cmp(&items[*idx_b].name))
+        });
+
+        self.prefix_count = ranked.iter().take_while(|(_, tier)| *tier <= 1).count();
+        self.filtered = ranked.into_iter().map(|(idx, _)| idx).collect();
+        self.selected = 0;
     }
 
     /// Bewegt die Markierung um einen Schritt nach oben.
     pub(crate) fn move_up(&mut self) {
         if !self.filtered.is_empty() {
+            self.selection_moved = true;
             self.selected = self.selected.saturating_sub(1);
         }
     }
@@ -151,6 +237,7 @@ impl CommandPopup {
     /// Bewegt die Markierung um einen Schritt nach unten.
     pub(crate) fn move_down(&mut self) {
         if !self.filtered.is_empty() {
+            self.selection_moved = true;
             self.selected = (self.selected + 1).min(self.filtered.len() - 1);
         }
     }
@@ -164,6 +251,48 @@ impl CommandPopup {
     /// Gibt `true` zurück wenn keine Items in der gefilterten Liste vorhanden sind.
     pub(crate) fn is_empty(&self) -> bool {
         self.filtered.is_empty()
+    }
+
+    /// Berechnet das shell-artige Tab-Vervollständigungsergebnis für den
+    /// aktuellen Such-/Filterzustand.
+    ///
+    /// # Beschreibung
+    /// - Keine Treffer → [`TabOutcome::None`].
+    /// - Die Markierung wurde seit der letzten `on_query_change` per
+    ///   Pfeiltaste/Ziffer bewegt (`selection_moved`) → übernimmt die
+    ///   Markierung ([`TabOutcome::Accept`]), unabhängig vom Rang.
+    /// - Sonst, ohne Präfix-Treffer (nur Teilstring-Treffer) → übernimmt den
+    ///   bestplatzierten Teilstring-Treffer.
+    /// - Sonst, mit genau einem Präfix-Treffer → übernimmt ihn.
+    /// - Sonst berechnet das längste gemeinsame Präfix aller Präfix-Treffer:
+    ///   ist es länger als der getippte Suchtext, wird die Eingabe darauf
+    ///   erweitert ([`TabOutcome::ExtendQuery`], Popup bleibt offen); ist es
+    ///   nicht länger (entspricht bereits dem Suchtext), übernimmt den
+    ///   bestplatzierten Präfix-Treffer.
+    ///
+    /// # Rückgabe
+    /// Das anzuwendende [`TabOutcome`].
+    pub(crate) fn tab_outcome(&self) -> TabOutcome {
+        if self.filtered.is_empty() {
+            return TabOutcome::None;
+        }
+        if self.selection_moved {
+            return TabOutcome::Accept(self.items[self.filtered[self.selected]].name.clone());
+        }
+        if self.prefix_count <= 1 {
+            return TabOutcome::Accept(self.items[self.filtered[0]].name.clone());
+        }
+
+        let prefix_names: Vec<&str> = self.filtered[..self.prefix_count]
+            .iter()
+            .map(|&idx| self.items[idx].name.as_str())
+            .collect();
+        let common = longest_common_prefix(&prefix_names);
+        if common.chars().count() > self.query.chars().count() {
+            TabOutcome::ExtendQuery(common)
+        } else {
+            TabOutcome::Accept(self.items[self.filtered[0]].name.clone())
+        }
     }
 
     /// Bestimmt den sichtbaren Ausschnitt der Trefferliste.
@@ -354,6 +483,56 @@ mod tests {
         assert!(popup.selected > 0);
         popup.on_query_change("help");
         assert_eq!(popup.selected, 0);
+    }
+
+    /// Case-insensitive Rang-Klassifikation: Präfix-Treffer stehen vor
+    /// reinen Teilstring-Treffern, unabhängig von Registrierungsreihenfolge
+    /// oder alphabetischer Substring-Position.
+    ///
+    /// Regression: `/mo` listete vorher `/model`, `/research-web`, `/mode`
+    /// … in Registrierungsreihenfolge mit `contains`-Filter — ein Teilstring-
+    /// Treffer wie `/memory` (enthält „mo", beginnt aber nicht damit) konnte
+    /// vor einem echten Präfix-Treffer stehen. `/mode` und `/model` sind
+    /// beide Präfix-Treffer für `mo`; `/memory` ist nur ein Teilstring-Treffer
+    /// und muss dahinter einsortiert werden.
+    #[test]
+    fn ranking_prefers_prefix_matches_over_substring_matches() {
+        let mut popup = built_in_popup();
+        popup.on_query_change("mo");
+
+        assert_eq!(
+            popup.prefix_count, 2,
+            "expected exactly two prefix matches ('mode', 'model') for 'mo'"
+        );
+        let leading: Vec<&str> = popup.filtered[..popup.prefix_count]
+            .iter()
+            .map(|&idx| popup.items[idx].name.as_str())
+            .collect();
+        assert_eq!(
+            leading,
+            vec!["mode", "model"],
+            "prefix matches must lead, sorted by length then alphabetically"
+        );
+
+        assert!(
+            popup.prefix_count < popup.filtered.len(),
+            "fixture must also contain a substring-only match for 'mo' (/memory)"
+        );
+        let trailing: Vec<&str> = popup.filtered[popup.prefix_count..]
+            .iter()
+            .map(|&idx| popup.items[idx].name.as_str())
+            .collect();
+        assert!(
+            trailing.contains(&"memory"),
+            "substring-only match '/memory' must rank below the prefix matches, got {trailing:?}"
+        );
+        for &idx in &popup.filtered[popup.prefix_count..] {
+            assert!(
+                !popup.items[idx].name.to_ascii_lowercase().starts_with("mo"),
+                "trailing rank must not contain prefix matches, got {:?}",
+                popup.items[idx].name
+            );
+        }
     }
 
     #[test]

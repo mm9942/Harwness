@@ -28,11 +28,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use harw_config::{InternalModelPoint, ResolvedConfig, resolve_internal_model};
+use harw_core::PinnedModelProvider;
 use harw_core::model::ModelProvider;
 use harw_core::one_shot::complete_text;
 use harw_macros::HarwError;
 use harw_session_store::{SessionMeta, SessionStoreError, TitleSource, meta};
-use harw_types::SessionId;
+use harw_types::{ModelId, ProviderId, SessionId};
 
 /// Obergrenze für die vom Modell angeforderten Ausgabe-Tokens.
 const TITLE_MAX_OUTPUT_TOKENS: u32 = 30;
@@ -189,6 +191,36 @@ pub async fn ensure_title(
     }
 }
 
+/// Wählt Provider/Modell-Pin für die Titel-Generierung nach den internen
+/// Modellstellen (Addendum C, [`InternalModelPoint::SessionTitle`]).
+///
+/// # Description
+/// Löst die Stelle über [`resolve_internal_model`] auf. Der Resolver deckt
+/// das Legacy-`[session] title_model` bereits selbst als Regel (c) ab, ein
+/// gesondertes Nachschlagen entfällt hier also. Ist die aufgelöste Stelle
+/// das Hauptmodell ([`ResolvedInternalModel::is_main_model`](harw_config::ResolvedInternalModel::is_main_model)),
+/// bleibt der Aufrufer unverändert bei seinem eigenen Modell (z. B. dem
+/// aktiven Sitzungsmodell) — genau das bisherige Verhalten vor Addendum C.
+///
+/// # Arguments
+/// - `config` (`&ResolvedConfig`): die aufgelöste Konfiguration, aus der die
+///   Stelle aufgelöst wird.
+///
+/// # Returns
+/// `Some((provider_id, model_id))`, wenn [`spawn_title_job`] den
+/// Modell-Anbieter über [`PinnedModelProvider`] fest verdrahten soll (Regel
+/// (a)/(d) aus Addendum C: `Explicit` oder `OpenRouterDefault`); `None` für
+/// `MainModel` (Legacy-Pfad, kein Pin).
+pub fn title_model_selection(config: &ResolvedConfig) -> Option<(Option<ProviderId>, ModelId)> {
+    let resolved = resolve_internal_model(config, InternalModelPoint::SessionTitle);
+    if resolved.is_main_model() {
+        return None;
+    }
+    let provider_id = resolved.provider.as_deref().map(ProviderId::from);
+    let model_id = resolved.model.as_deref().map(ModelId::from)?;
+    Some((provider_id, model_id))
+}
+
 /// Startet [`ensure_title`] als abgekoppelten `tokio::spawn`-Task.
 ///
 /// # Description
@@ -198,13 +230,24 @@ pub async fn ensure_title(
 /// damit derselbe Root-Provider ohne Klon in den `'static`-Task wandert
 /// (siehe Moduldoku „Nebenläufigkeit").
 ///
+/// Ist `pin` gesetzt (siehe [`title_model_selection`]), wird `provider` vor
+/// dem Aufruf in einen [`PinnedModelProvider`] gehüllt und `model` durch die
+/// aufgelöste Modell-ID ersetzt — die interne Modellstelle
+/// [`InternalModelPoint::SessionTitle`] gewinnt dann über das vom Aufrufer
+/// übergebene `model` (Addendum C, Regel 4: „Explizite Wahl gewinnt immer").
+/// Ist `pin` `None`, bleibt das bisherige Verhalten unverändert: `provider`
+/// und `model` gehen unverändert an [`ensure_title`].
+///
 /// # Arguments
 /// - `store_root` (`PathBuf`): Wurzel des Session-Stores; wird in den Task
 ///   verschoben.
 /// - `id` (`SessionId`): die zu betitelnde Session; wird in den Task
 ///   verschoben.
 /// - `provider` (`Arc<dyn ModelProvider>`): geteilter Root-Provider.
-/// - `model` (`String`): Modell-ID für den Titel-Aufruf.
+/// - `model` (`String`): Modell-ID für den Titel-Aufruf (Legacy-Pfad, wenn
+///   `pin` `None` ist).
+/// - `pin` (`Option<(Option<ProviderId>, ModelId)>`): das Ergebnis von
+///   [`title_model_selection`], vom Aufrufer einmal pro Job aufgelöst.
 ///
 /// # Concurrency
 /// Spawnt einen `tokio`-Task auf dem aktuellen Runtime-Handle; erfordert
@@ -216,9 +259,23 @@ pub fn spawn_title_job(
     id: SessionId,
     provider: Arc<dyn ModelProvider>,
     model: String,
+    pin: Option<(Option<ProviderId>, ModelId)>,
 ) {
     let _handle = tokio::spawn(async move {
-        if let Err(error) = ensure_title(&store_root, &id, provider.as_ref(), &model).await {
+        let (effective_provider, effective_model): (Arc<dyn ModelProvider>, String) = match pin {
+            Some((provider_id, model_id)) => {
+                let pinned = PinnedModelProvider::new(
+                    Arc::clone(&provider),
+                    provider_id,
+                    Some(model_id.clone()),
+                );
+                (Arc::new(pinned), model_id.as_str().to_owned())
+            }
+            None => (Arc::clone(&provider), model),
+        };
+        if let Err(error) =
+            ensure_title(&store_root, &id, effective_provider.as_ref(), &effective_model).await
+        {
             tracing::warn!(
                 session = %id,
                 error = %error,

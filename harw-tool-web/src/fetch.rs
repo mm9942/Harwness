@@ -146,7 +146,10 @@ pub struct FetchArgs {
     pub format: Option<String>,
     /// Byte-Obergrenze der Antwort (kann das konfigurierte Limit nur senken).
     #[tool(default = 1048576)]
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "harw_extension_api::lenient::lenient_opt_usize"
+    )]
     pub max_bytes: Option<usize>,
 }
 

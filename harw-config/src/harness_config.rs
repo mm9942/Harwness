@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::auth_toml::SecretRef;
+use crate::internal_models::InternalModelsToml;
 use crate::mode_toml::ModeSection;
 use crate::permissions_toml::PermissionsSection;
 use crate::plan_toml::ToolsSection;
@@ -60,8 +61,100 @@ pub struct HarnessConfig {
     /// nicht gesetzt.
     #[serde(default)]
     pub project_root_markers: Option<Vec<String>>,
+    /// `[internal_models]` — pro-Stelle wählbares Modell für interne
+    /// Hilfsaufgaben (Sitzungstitel, Verdichtung, Gedächtnis-Konsolidierung,
+    /// Traum-Reflexion, Explorer, Recherche), siehe `internal_models.rs`
+    /// (Addendum C). Legacy `session.title_model` bleibt unverändert
+    /// bestehen und wird vom Resolver als Fallback für `SessionTitle`
+    /// gelesen.
+    #[serde(default)]
+    pub internal_models: InternalModelsToml,
+    /// `[compaction]` — Verdichtungs-Obergrenzen (Addendum D+E). Siehe
+    /// [`CompactionToml`].
+    #[serde(default)]
+    pub compaction: CompactionToml,
+    /// `[reasoning]` — Rollen-Reasoning-Effort-Gewichtung (Addendum F+G).
+    /// Siehe [`ReasoningWeightsToml`].
+    #[serde(default)]
+    pub reasoning: ReasoningWeightsToml,
+    /// `[guards]` — Wächter-Schwellen für Drift/Zombies/Schleifen
+    /// (Addendum F+G). Siehe [`GuardsToml`].
+    #[serde(default)]
+    pub guards: GuardsToml,
     #[serde(skip)]
     pub base_dir: Option<std::path::PathBuf>,
+}
+
+/// `[compaction]` — Verdichtungs-Konfiguration (Addendum D+E,
+/// `CONTRACT.md`). Überschreibt die absolute Obergrenze der
+/// UIA/Root-Sitzung, die sonst `harw_core::DEFAULT_ABSOLUTE_CEILING_TOKENS`
+/// verwendet.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionToml {
+    /// Feste Obergrenze in Tokens für `AutoCompactPolicy::with_absolute_ceiling`
+    /// der Root-/UIA-Sitzung. `None` → Standard
+    /// (`harw_core::DEFAULT_ABSOLUTE_CEILING_TOKENS`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absolute_ceiling_tokens: Option<u64>,
+}
+
+/// `[reasoning]` — Rollen-Reasoning-Effort-Gewichtung (Addendum F+G,
+/// `CONTRACT.md`). Jedes Feld überschreibt, sofern gesetzt und gültig
+/// (`"minimal"|"low"|"medium"|"high"|"xhigh"|"max"`), das entsprechende Feld
+/// aus `harw_core::RoleEffortWeights::default()`; ein ungültiges Label wird
+/// von `harw-runtime::guard_wiring::role_effort_weights_from_config` nur
+/// `tracing::warn!`-gemeldet und fällt auf den Vorgabewert zurück.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningWeightsToml {
+    /// Effort des Benutzeroberflächen-Agenten. Vorgabe `high`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uia: Option<String>,
+    /// Effort eines Wurzel-Orchestrators ohne Sub-Orchestrator-Freigaben.
+    /// Vorgabe `high`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_orchestrator: Option<String>,
+    /// Effort eines Wurzel-Orchestrators mit Sub-Orchestrator-Freigaben.
+    /// Vorgabe `medium`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_orchestrator_with_subs: Option<String>,
+    /// Effort eines Sub-Orchestrators. Vorgabe `medium`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sub_orchestrator: Option<String>,
+    /// Effort eines komplexen Workers. Vorgabe `medium`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_complex: Option<String>,
+    /// Effort eines einfachen Workers. Vorgabe `low`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_simple: Option<String>,
+}
+
+/// `[guards]` — Wächter-Schwellen für Drift/Zombies/Schleifen (Addendum F+G,
+/// `CONTRACT.md`). Jedes `None`-Feld fällt auf
+/// `harw_core::GuardPolicy::default()` zurück (siehe
+/// `harw-runtime::guard_wiring::guard_policy_from_config`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardsToml {
+    /// Wächter global ein-/ausschalten. Vorgabe `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Fehlerwiederholungen derselben Signatur bis zur Warnung. Vorgabe `2`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeated_failure_warn: Option<u32>,
+    /// Fehlerwiederholungen derselben Signatur bis zum Abbruch. Vorgabe `3`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeated_failure_abort: Option<u32>,
+    /// Runden ohne Fortschritt bis zur Warnung. Vorgabe `4`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_progress_rounds_warn: Option<u32>,
+    /// Runden ohne Fortschritt bis zum Abbruch. Vorgabe `8`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_progress_rounds_abort: Option<u32>,
+    /// Runden ohne `plan.*`-Aufruf bis zur Stale-Warnung. Vorgabe `6`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_stale_rounds: Option<u32>,
 }
 
 /// `[onboarding]` — First-Run-Fortschritt (Hermes-Muster `onboarding.seen.*`).

@@ -49,6 +49,14 @@ pub struct AgentIdentity {
     pub tools_available: Vec<String>,
     /// Optional free-form fragments appended to [`LoadedInstructions::fragments`].
     pub extra_context: Vec<String>,
+    /// Optionales Regelwerk-Wissen nach organisatorischer Rolle (uia,
+    /// root-orchestrator, sub-orchestrator, worker — Addendum D+E).
+    ///
+    /// `None` bedeutet: der Prompt führt keinen Organisations-Abschnitt. Wird
+    /// gesetzt über [`AgentIdentity::with_organization_knowledge`] und in
+    /// [`AgentIdentity::render_system_prompt`] nach `## Context blocks` und
+    /// vor `## Interaction mode` eingefügt.
+    pub organization_knowledge: Option<String>,
     /// Optionaler Modus-Abschnitt, üblicherweise aus `InteractionMode::prompt_section`.
     ///
     /// `None` bedeutet: der Prompt führt keinen Modus-Abschnitt. Der Wert wird
@@ -106,6 +114,7 @@ impl AgentIdentity {
             cwd: cwd_str,
             tools_available: Vec::new(),
             extra_context: Vec::new(),
+            organization_knowledge: None,
             mode_section: None,
             return_contract: None,
             trust_boundary_notice_enabled: false,
@@ -218,6 +227,39 @@ impl AgentIdentity {
     /// ```
     pub fn with_mode_section(mut self, section: impl Into<String>) -> Self {
         self.mode_section = Some(section.into());
+        self
+    }
+
+    /// Ergänzt das Regelwerk-Wissen nach organisatorischer Rolle (Addendum
+    /// D+E: uia, root-orchestrator, sub-orchestrator, worker).
+    ///
+    /// # Beschreibung
+    /// Der Text ist typischerweise eine der eingebauten
+    /// `harw-registry-defaults/knowledge/roles/*.md`-Dateien, wie
+    /// `harw_registry_defaults::embedded_agents::builtin_role_knowledge`
+    /// sie liefert. [`AgentIdentity::render_system_prompt`] hängt ihn unter
+    /// einer eigenen Überschrift an — nach `## Context blocks`, vor
+    /// `## Interaction mode` — weil er wie die Zwei-Block-Konvention
+    /// Grundlagenwissen über die eigene Position im Baum ist, kein Verhalten
+    /// für diesen einen Turn. Ein erneuter Aufruf ersetzt den vorherigen
+    /// Wert.
+    ///
+    /// # Argumente
+    /// - `text` (`impl Into<String>`): der fertig formulierte Regelwerk-Text.
+    ///
+    /// # Rückgabe
+    /// `self` mit gesetztem `organization_knowledge`.
+    ///
+    /// # Beispiele
+    /// ```rust
+    /// use harw_instructions::AgentIdentity;
+    ///
+    /// let id = AgentIdentity::new("harw", "/ws")
+    ///     .with_organization_knowledge("Du spawnst keine dauerhaften Agenten.");
+    /// assert!(id.render_system_prompt().contains("spawnst keine dauerhaften Agenten"));
+    /// ```
+    pub fn with_organization_knowledge(mut self, text: impl Into<String>) -> Self {
+        self.organization_knowledge = Some(text.into());
         self
     }
 
@@ -345,6 +387,27 @@ impl AgentIdentity {
                 .join("\n")
         };
 
+        // W2: Statischer, cachebarer Hinweis-Abschnitt zur effizienten
+        // Werkzeugnutzung (fs.* statt shell.exec, gezielte Reads,
+        // JSON-Zahlen, kein erneutes Lesen unveränderter Dateien, keine
+        // Sondierungs-Reads). Nur eingefügt, wenn mindestens ein
+        // registriertes Tool mit "fs." beginnt — sonst bleibt der Prompt
+        // zeichengleich zur Fassung vor dieser Erweiterung. Der Text ist
+        // rein statisch (keine Daten, keine Zeitstempel), damit er
+        // innerhalb des cachebaren Prompt-Präfixes bleibt.
+        let efficient_tool_use_section = if self.tools_available.iter().any(|t| t.starts_with("fs.")) {
+            "\n\n## Efficient tool use\n\
+- Read files with fs.read/fs.grep/fs.search/fs.glob, not shell.exec (cat, sed, python).\n\
+- Locate first with fs.grep/fs.search, then read only the targeted range via offset/max_bytes.\n\
+- Pass numeric arguments as JSON numbers, not strings.\n\
+- Do not re-read a file you already read unless it changed.\n\
+- Avoid probe reads like max_bytes:1.\n\
+- Keep tool output small."
+                .to_owned()
+        } else {
+            String::new()
+        };
+
         let mut prompt = format!(
             "You are {agent_name}, a {role_description} operating inside a local Rust workspace.\n\
 \n\
@@ -354,7 +417,7 @@ impl AgentIdentity {
 - Operating system: {os_name}\n\
 \n\
 ## Available tools\n\
-{tools_section}\n\
+{tools_section}{efficient_tool_use_section}\n\
 \n\
 ## Behavioral rules\n\
 - You DO have access to the local filesystem via the tools above. Do not tell the user you are just a language model without file access.\n\
@@ -369,6 +432,7 @@ impl AgentIdentity {
             project_root = project_root,
             os_name = os_name,
             tools_section = tools_section,
+            efficient_tool_use_section = efficient_tool_use_section,
         );
 
         // Optionale Abschnitte. Ohne sie bleibt der Prompt zeichengleich zur
@@ -383,6 +447,11 @@ impl AgentIdentity {
         if self.trust_boundary_notice_enabled {
             prompt.push_str("\n\n## Context blocks\n");
             prompt.push_str(&crate::trust_boundary::context_blocks_section());
+        }
+
+        if let Some(organization_knowledge) = &self.organization_knowledge {
+            prompt.push_str("\n\n## Organization rules\n");
+            prompt.push_str(organization_knowledge);
         }
 
         if let Some(mode_section) = &self.mode_section {
@@ -670,6 +739,44 @@ mod tests {
         // Without tools — should produce the fallback marker.
         let prompt_empty = AgentIdentity::new("harw", "/ws").render_system_prompt();
         assert!(prompt_empty.contains("No tools are currently registered."));
+    }
+
+    #[test]
+    fn test_render_includes_efficient_tool_use_section_when_fs_tool_present() {
+        let prompt = AgentIdentity::new("harw", "/ws")
+            .with_tools(vec!["fs.read".to_owned(), "shell.exec".to_owned()])
+            .render_system_prompt();
+
+        assert!(prompt.contains("## Efficient tool use"));
+        assert!(prompt.contains("fs.read/fs.grep/fs.search/fs.glob"));
+
+        let tools_at = prompt.find("## Available tools").expect("tools section");
+        let efficient_at = prompt.find("## Efficient tool use").expect("efficient section");
+        let behavioral_at = prompt.find("## Behavioral rules").expect("behavioral section");
+        assert!(
+            tools_at < efficient_at && efficient_at < behavioral_at,
+            "efficient tool use section must sit right after the tools list and before behavioral rules"
+        );
+
+        let section_start = prompt.find("## Efficient tool use").expect("section start");
+        let section_end = prompt.find("\n\n## Behavioral rules").expect("section end");
+        let section_bytes = &prompt.as_bytes()[section_start..section_end];
+        assert!(
+            section_bytes.len() <= 600,
+            "efficient tool use section must stay within 600 bytes, was {}",
+            section_bytes.len()
+        );
+    }
+
+    #[test]
+    fn test_render_omits_efficient_tool_use_section_without_fs_tool() {
+        let prompt_no_tools = AgentIdentity::new("harw", "/ws").render_system_prompt();
+        assert!(!prompt_no_tools.contains("## Efficient tool use"));
+
+        let prompt_non_fs_tool = AgentIdentity::new("harw", "/ws")
+            .with_tools(vec!["shell.exec".to_owned()])
+            .render_system_prompt();
+        assert!(!prompt_non_fs_tool.contains("## Efficient tool use"));
     }
 
     #[test]

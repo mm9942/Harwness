@@ -159,6 +159,7 @@ struct ShellExecArgs {
     /// The shell command to execute via `/bin/sh -c`.
     command: String,
     /// Optional per-call timeout override. Clamped to the provider's configured maximum.
+    #[serde(default, deserialize_with = "harw_extension_api::lenient::lenient_opt_u64")]
     timeout_secs: Option<u64>,
 }
 

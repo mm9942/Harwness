@@ -111,9 +111,13 @@ use harw_channel_telegram_transport::{
     AdmittedEventConsumer, LongPollConfig, LongPollShutdown, TelegramClient, TelegramOffsetStore,
     TelegramOutbound, TelegramRenderer, spawn_long_poll_thread,
 };
-use harw_config::{ChannelToml, ResolvedConfig, SecretRef, resolve_env_ref};
+use harw_config::{
+    ChannelToml, InternalModelPoint, ResolvedConfig, SecretRef, resolve_env_ref,
+    resolve_internal_model,
+};
 use harw_core::{
-    AgentSession, ModelProvider, TranscriptStateStore, TurnInput, TurnOutcome, run_turn,
+    AgentSession, ModelProvider, PinnedModelProvider, TranscriptStateStore, TurnInput,
+    TurnOutcome, run_turn,
 };
 use harw_extension_api::empty_extension_registry;
 use harw_job_runtime::{Budget, Job, JobKind, RetryPolicy, WorkId};
@@ -711,10 +715,11 @@ async fn supervise(
 
     // Traum-Scheduler: läuft immer (auch ohne Telegram) und träumt bei Idle.
     let dream = dream_scheduler(
-        dream_provider.as_ref(),
+        Arc::clone(&dream_provider),
         knowledge,
         dream_transcript_root,
         &activity,
+        config.as_ref(),
     );
 
     // Audit-Kettenprüfung: läuft immer (siehe `audit_chain_scheduler`s Doku);
@@ -1368,10 +1373,11 @@ fn idle_for(activity: &ActivityClock) -> Duration {
 /// Läuft auf derselben Single-Thread-Runtime wie die Channels; ein Traumlauf und
 /// ein Channel-Turn wechseln sich kooperativ ab (kein echter Parallelismus).
 async fn dream_scheduler(
-    provider: &dyn ModelProvider,
+    provider: Arc<dyn ModelProvider>,
     knowledge: &KnowledgeStore,
     transcript_root: &Path,
     activity: &ActivityClock,
+    config: &ResolvedConfig,
 ) {
     let mut ticker = tokio::time::interval(DREAM_TICK);
     // Erst nach einem vollen Idle-Fenster überhaupt träumen dürfen.
@@ -1390,7 +1396,8 @@ async fn dream_scheduler(
             }
         }
 
-        match run_dream_job(provider, knowledge, transcript_root, idle).await {
+        match run_dream_job(Arc::clone(&provider), knowledge, transcript_root, idle, config).await
+        {
             Ok(path) => {
                 eprintln!("dream: Reflexion abgelegt → {}", path.display());
                 last_dream = Some(Instant::now());
@@ -1538,10 +1545,11 @@ fn build_recent_dream_context(transcript_root: &Path) -> Result<String, String> 
 /// Ein `String`, wenn Job-Governance, der Reflexions-Turn oder das Schreiben
 /// fehlschlägt.
 async fn run_dream_job(
-    provider: &dyn ModelProvider,
+    provider: Arc<dyn ModelProvider>,
     knowledge: &KnowledgeStore,
     transcript_root: &Path,
     idle: Duration,
+    config: &ResolvedConfig,
 ) -> Result<PathBuf, String> {
     let now = Timestamp::now();
     let date = now.strftime("%Y-%m-%d").to_string();
@@ -1599,8 +1607,42 @@ async fn run_dream_job(
         event_tx,
     );
 
+    // Interne Modellstelle (Addendum C): `DreamReflection` nutzt ihr
+    // Standardmodell, sofern konfiguriert und kein explizites Hauptmodell
+    // erzwungen wurde; sonst bleibt es unverändert beim Eltern-Modell des
+    // Gateways.
+    let resolved_dream_model = resolve_internal_model(config, InternalModelPoint::DreamReflection);
+    let effective_provider: Arc<dyn ModelProvider> = if resolved_dream_model.is_main_model() {
+        Arc::clone(&provider)
+    } else {
+        let provider_id = resolved_dream_model
+            .provider
+            .as_deref()
+            .map(harw_types::ProviderId::from);
+        let model_id = resolved_dream_model
+            .model
+            .as_deref()
+            .map(harw_types::ModelId::from);
+        tracing::debug!(
+            point = InternalModelPoint::DreamReflection.key(),
+            model = resolved_dream_model.model.as_deref().unwrap_or(""),
+            "gateway.dream.internal_model"
+        );
+        Arc::new(PinnedModelProvider::new(
+            Arc::clone(&provider),
+            provider_id,
+            model_id,
+        ))
+    };
+
     let reflection_started = Instant::now();
-    let reflection = match run_turn(&mut session, provider, &store, TurnInput::user(&prompt)).await
+    let reflection = match run_turn(
+        &mut session,
+        effective_provider.as_ref(),
+        &store,
+        TurnInput::user(&prompt),
+    )
+    .await
     {
         Ok(TurnOutcome::Completed) => last_assistant_text(&session),
         Ok(_) => "(Traum pausiert)".to_owned(),

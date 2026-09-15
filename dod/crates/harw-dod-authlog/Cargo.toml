@@ -1,0 +1,34 @@
+[package]
+name = "harw-dod-authlog"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+harw-dod-cap = { path = "../harw-dod-cap" }
+harw-dod-netlink = { path = "../harw-dod-netlink" }
+harw-dod-signals = { path = "../harw-dod-signals" }
+harw-macros = { path = "../../../harw-macros" }
+# `SensorId` für `AuthlogSensor` (bildet `AuthRecord` auf `SecurityEvent` ab,
+# siehe src/sensor.rs) und für die Doku-Beispiele.
+harw-types = { path = "../../../harw-types" }
+jiff = { workspace = true }
+
+[dev-dependencies]
+# `harw-dod-fixtures` ist inzwischen (Knoten AW2-05) eine echte Crate mit
+# `sensor_suite!`, nicht mehr das Gerüst, das bei Beginn dieses Knotens
+# vorlag. Sie greift für `AuthlogSensor` trotzdem nicht sinnvoll:
+# `sensor_suite!` verlangt `From<SensorHandle<Bound>>` (ein Griff hinein,
+# ein Sensor heraus) — `AuthlogSensor` braucht zusätzlich ein
+# `Box<dyn AuthBackend>`, das aus einem bloßen Griff nicht ableitbar ist.
+# Und selbst die zugrunde liegenden `harness::assert_*`-Funktionen, die
+# generisch über `F: Fn(SensorHandle<Bound>) -> S` sind, gehen von einem
+# `ReadScope`/`tree/`-Fixture-Modell aus, das `AuthlogSensor` nie berührt
+# (siehe src/sensor.rs für die volle Begründung). Als Pfadabhängigkeit
+# trotzdem aufgenommen, wie im Auftrag verlangt, und damit ein künftiger
+# Knoten sie ohne Cargo.toml-Änderung nutzen kann.
+harw-dod-fixtures = { path = "../harw-dod-fixtures" }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -136,6 +136,19 @@ pub enum ProjectKind {
 /// [`HomeError::Io`], wenn `cwd` nicht kanonisierbar ist (z. B. nicht
 /// existent).
 pub fn discover_project(cwd: &Path, markers: &[String]) -> HomeResult<ProjectRoot> {
+    discover_project_with_home_stop(cwd, markers, user_home_canonical().as_deref())
+}
+
+/// Wie [`discover_project`], aber mit explizit injizierter Home-Grenze.
+///
+/// `home_stop` ist das kanonische Home-Verzeichnis, bei dem die Aufwärtssuche
+/// endet; `None` läuft bis zum Dateisystem-Root. Nur für Tests und für
+/// Aufrufer, die die Home-Auflösung selbst besitzen, öffentlich sichtbar.
+pub fn discover_project_with_home_stop(
+    cwd: &Path,
+    markers: &[String],
+    home_stop: Option<&Path>,
+) -> HomeResult<ProjectRoot> {
     let canonical_cwd = std::fs::canonicalize(cwd).map_err(|error| HomeError::io(cwd, error))?;
     let effective_markers: Vec<&str> = if markers.is_empty() {
         vec![DEFAULT_MARKER]
@@ -143,7 +156,18 @@ pub fn discover_project(cwd: &Path, markers: &[String]) -> HomeResult<ProjectRoo
         markers.iter().map(String::as_str).collect()
     };
 
+    // Das Home-Verzeichnis des Benutzers beendet die Suche nach oben: eine
+    // dotfile-lastige Heimstätte ist selbst nie ein Projekt-Root. Ohne diesen
+    // Stopper würde eine markerlose Sitzung in `$HOME` bis `/` aufsteigen und
+    // `discover_project` auf genau dem Root landen, den `ProjectHome::ensure`
+    // fail-closed ablehnt — die Sitzung wäre ohne Projekt-Home blockiert.
+    // Ein Marker **in** `$HOME` selbst (etwa ein versehentliches `~/.git`)
+    // bindet die Sitzung ebenfalls nicht an das Home: sie fällt dann auf das
+    // ursprüngliche Arbeitsverzeichnis zurück.
     for ancestor in canonical_cwd.ancestors() {
+        if home_stop == Some(ancestor) {
+            break;
+        }
         for marker in &effective_markers {
             let marker_path = ancestor.join(marker);
             if std::fs::symlink_metadata(&marker_path).is_err() {
@@ -162,11 +186,25 @@ pub fn discover_project(cwd: &Path, markers: &[String]) -> HomeResult<ProjectRoo
         }
     }
 
+    // Kein Marker gefunden (oder nur einer im Home-Verzeichnis): das
+    // Arbeitsverzeichnis selbst ist der Projekt-Root, nicht der oberste
+    // besuchte Vorfahr.
     Ok(ProjectRoot {
         trust_key: canonical_cwd.clone(),
         root: canonical_cwd,
         kind: ProjectKind::Directory,
     })
+}
+
+/// Kanonisches Home-Verzeichnis des aktuellen Benutzers als Such-Stopper.
+///
+/// Nur für den Vergleich in [`discover_project`]; `None`, wenn `$HOME` nicht
+/// gesetzt oder nicht kanonisierbar ist — dann läuft die Suche wie bisher bis
+/// zum Dateisystem-Root.
+fn user_home_canonical() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").filter(|value| !value.is_empty())?;
+    let home_path = PathBuf::from(home);
+    Some(std::fs::canonicalize(&home_path).unwrap_or(home_path))
 }
 
 /// Klassifiziert einen gefundenen `.git`-Marker unter `root`.
@@ -384,19 +422,20 @@ impl ProjectHome {
     /// der gesamte Harw-Zustand in der Gitignore des Projektroots steht.
     ///
     /// # Description
-    /// Lehnt Roots ab, für die kein Projekt-Home entstehen darf: das
-    /// Dateisystem-Root (`/`) und das Home-Verzeichnis des Benutzers selbst
-    /// (`$HOME`, kanonisiert). Die Root-`.gitignore` wird idempotent um
-    /// `.harw/` ergänzt. Damit sind Plans, Goals, Memories und der
-    /// Sessionindex zusammen als lokaler Harw-Projektzustand ausgeschlossen.
+    /// Lehnt das Dateisystem-Root (`/`) als Projekt-Root ab. Ist der Root das
+    /// Home-Verzeichnis des Benutzers selbst (`$HOME`, kanonisiert), wird das
+    /// dortige `~/.harw` — der Root-Space — als Projekt-Home verwendet: ein
+    /// Start direkt in `~` hat kein eigenes Projekt, soll aber nicht
+    /// scheitern. In allen anderen Fällen wird die Root-`.gitignore`
+    /// idempotent um `.harw/` ergänzt; im Home-Verzeichnis nicht, weil `~`
+    /// kein Repository ist und keine `~/.gitignore` entstehen soll.
     ///
     /// # Returns
     /// `Ok(())`, wenn alle Verzeichnisse existieren und `.gitignore`
-    /// ergänzt ist (oder die Regel bereits enthielt).
+    /// ergänzt ist (oder die Regel bereits enthielt bzw. der Root `$HOME` ist).
     ///
     /// # Errors
-    /// - [`HomeError::UnsupportedProjectHomeRoot`]: `root` ist `/` oder
-    ///   `$HOME`.
+    /// - [`HomeError::UnsupportedProjectHomeRoot`]: `root` ist `/`.
     /// - [`HomeError::Io`]: `root` nicht kanonisierbar, Anlegen eines
     ///   Verzeichnisses oder Schreiben von `.gitignore` schlägt fehl.
     pub fn ensure(&self) -> HomeResult<()> {
@@ -404,7 +443,7 @@ impl ProjectHome {
             .dir
             .parent()
             .ok_or_else(|| HomeError::io(&self.dir, project_home_without_parent()))?;
-        refuse_unsupported_root(root)?;
+        let root_is_user_home = classify_project_home_root(root)?;
 
         for dir in [
             self.dir.clone(),
@@ -416,7 +455,9 @@ impl ProjectHome {
             create_private_dir(&dir)?;
         }
 
-        ensure_root_gitignore(root)?;
+        if !root_is_user_home {
+            ensure_root_gitignore(root)?;
+        }
         Ok(())
     }
 }
@@ -452,23 +493,22 @@ fn project_home_without_parent() -> std::io::Error {
 }
 
 /// Lehnt `/` und das kanonisierte `$HOME` als Projekt-Root ab.
-fn refuse_unsupported_root(root: &Path) -> HomeResult<()> {
+// Lehnt `/` als Projekt-Root ab und meldet, ob der Root das Home-Verzeichnis
+// des Benutzers ist (dort dient `~/.harw` als Projekt-Home, ohne `.gitignore`).
+fn classify_project_home_root(root: &Path) -> HomeResult<bool> {
     let canonical_root = std::fs::canonicalize(root).map_err(|error| HomeError::io(root, error))?;
     if canonical_root == Path::new("/") {
         return Err(HomeError::UnsupportedProjectHomeRoot {
             root: canonical_root,
         });
     }
-    if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
-        let home_path = PathBuf::from(home);
-        let canonical_home = std::fs::canonicalize(&home_path).unwrap_or(home_path);
-        if canonical_root == canonical_home {
-            return Err(HomeError::UnsupportedProjectHomeRoot {
-                root: canonical_root,
-            });
-        }
-    }
-    Ok(())
+    let is_user_home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .is_some_and(|home_path| {
+            std::fs::canonicalize(&home_path).unwrap_or(home_path) == canonical_root
+        });
+    Ok(is_user_home)
 }
 
 /// Legt ein Verzeichnis (rekursiv) mit `0700` an; bestehende Rechte anderer
@@ -567,6 +607,42 @@ mod tests {
     fn write(path: &Path, contents: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn discover_project_stops_at_home_directory_and_falls_back_to_cwd() {
+        // Ohne Stopper stiege eine markerlose Sitzung in `$HOME` bis `/` auf
+        // und lieferte das Home-Verzeichnis selbst als Root — genau der Wert,
+        // den `ProjectHome::ensure` fail-closed ablehnt.
+        let home = TempDir::new("home-stopper");
+        let work = home.path().join("scratch");
+        std::fs::create_dir_all(&work).unwrap();
+        let canonical_home = std::fs::canonicalize(home.path()).unwrap();
+
+        let project =
+            discover_project_with_home_stop(&work, &[], Some(canonical_home.as_path())).unwrap();
+
+        let expected = std::fs::canonicalize(&work).unwrap();
+        assert_eq!(project.root, expected);
+        assert_eq!(project.kind, ProjectKind::Directory);
+    }
+
+    #[test]
+    fn discover_project_ignores_a_marker_inside_the_home_directory() {
+        // Selbst ein versehentliches `~/.git` bindet die Sitzung nicht an das
+        // Home-Verzeichnis: die Suche endet vorher, das Arbeitsverzeichnis
+        // bleibt der Projekt-Root.
+        let home = TempDir::new("home-marker");
+        std::fs::create_dir_all(home.path().join(".git")).unwrap();
+        let work = home.path().join("scratch");
+        std::fs::create_dir_all(&work).unwrap();
+        let canonical_home = std::fs::canonicalize(home.path()).unwrap();
+
+        let project =
+            discover_project_with_home_stop(&work, &[], Some(canonical_home.as_path())).unwrap();
+
+        assert_eq!(project.root, std::fs::canonicalize(&work).unwrap());
+        assert_eq!(project.kind, ProjectKind::Directory);
     }
 
     #[test]

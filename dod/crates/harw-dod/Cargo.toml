@@ -1,0 +1,90 @@
+[package]
+name = "harw-dod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Zugriffsvokabular: Capability, CapabilityClass, ReadScope, SensorHandle,
+# SensorError, Permanence -- ohne das kann kein Aufrufer einen Griff bauen,
+# den einer der Sensor-Typen unten annimmt (siehe `//!`-Block in src/lib.rs).
+harw-dod-cap = { path = "../harw-dod-cap" }
+# Datenvokabular: `trait Sensor`, `SensorReading`, `SecurityEvent`, `EventKind`,
+# `Actor`, `AuthOutcome`, `DriftSeverity`, `HostSample`, `Severity`,
+# `Hardness`, `SecurityEvidence` -- Rückgabe- und Parametertypen von
+# `Sensor::poll`/`Sensor::handle` und von `harw-dod-rules::RuleContext`.
+harw-dod-signals = { path = "../harw-dod-signals" }
+# Der Aggregator: `Sentinel` ruft eine feste Sensorenliste ab, hält
+# Gesundheitszustand pro Sensor und puffert Belege -- der empfohlene
+# Einstiegspunkt für "beobachte den Host", statt jeden Sensor einzeln zu
+# verwalten.
+harw-dod-sentinel = { path = "../harw-dod-sentinel" }
+# "bewerte einen Befund": `Finding<S>`, `triage`, `Verdict`, `run_rules`,
+# `Rule`/`RuleContext`, die drei mitgelieferten Regeln, `Baseline`.
+harw-dod-rules = { path = "../harw-dod-rules" }
+
+# Neun der zehn in `xtask/src/gate_privileges.rs`s `CRATE_PRIVILEGE` als
+# `RequiredPrivilege::Unprivileged` geführten Sensor-Crates (die zehnte,
+# `harw-dod-cgroup`, ist noch Gerüst -- siehe `//!`-Block in src/lib.rs,
+# Abschnitt "Bekannte Lücke"). Jede liefert genau einen konkreten
+# `Sensor`-Typ -- das Werkzeug, mit dem ein Aufrufer tatsächlich etwas
+# beobachten kann, nicht nur das Vokabular dafür.
+harw-dod-cpu = { path = "../harw-dod-cpu" }
+harw-dod-thermal = { path = "../harw-dod-thermal" }
+harw-dod-memory = { path = "../harw-dod-memory" }
+harw-dod-blockio = { path = "../harw-dod-blockio" }
+harw-dod-netcounters = { path = "../harw-dod-netcounters" }
+harw-dod-gpu = { path = "../harw-dod-gpu" }
+harw-dod-listener = { path = "../harw-dod-listener" }
+harw-dod-scanreport = { path = "../harw-dod-scanreport" }
+harw-dod-workspace = { path = "../harw-dod-workspace" }
+
+# Die drei Privilegienklassen (siehe `CRATE_PRIVILEGE`:
+# `harw-dod-authlog` -> `RequiredPrivilege::Netlink`,
+# `harw-dod-fsmon` -> `RequiredPrivilege::FileWatch`,
+# `harw-dod-bpf`/`harw-dod-procmon`/`harw-dod-flow` -> `RequiredPrivilege::Bpf`).
+# `optional = true`, aktiviert ausschließlich über das `privileged`-Feature
+# unten -- siehe `//!`-Block in src/lib.rs, Abschnitt "Die Privilegienfrage",
+# für die Begründung und für die Grenzen dieses Mechanismus (K53/AW5-01).
+harw-dod-authlog = { path = "../harw-dod-authlog", optional = true }
+harw-dod-fsmon = { path = "../harw-dod-fsmon", optional = true }
+harw-dod-bpf = { path = "../harw-dod-bpf", optional = true }
+harw-dod-procmon = { path = "../harw-dod-procmon", optional = true }
+harw-dod-flow = { path = "../harw-dod-flow", optional = true }
+
+[features]
+# Schaltet die fünf Fähigkeits-Crates aus dem vorigen Absatz frei. Kein
+# `default`-Eintrag aktiviert dieses Feature -- ein Konsument, der nur
+# `harw-dod` in seine `[dependencies]` schreibt, bekommt keine der drei
+# Privilegienklassen in seine Abhängigkeitshülle. Siehe `//!`-Block für die
+# Grenzen dieser Zusicherung.
+privileged = [
+    "dep:harw-dod-authlog",
+    "dep:harw-dod-fsmon",
+    "dep:harw-dod-bpf",
+    "dep:harw-dod-procmon",
+    "dep:harw-dod-flow",
+]
+
+[dev-dependencies]
+# Kennungen (`SensorId`) für jedes Beispiel/jeden Test, die einen
+# `SensorHandle` bauen. Dieselbe Konvention wie in jeder Sensor-Crate selbst
+# (z. B. `harw-dod-cpu/src/sensor.rs`-Doctests): eine Fassade re-exportiert
+# `harw-types` nicht, weil jeder Konsument dieses Basisvokabular ohnehin
+# bereits direkt kennt (Vorbild: `harw-lens` re-exportiert `harw-macros`
+# ebenfalls nicht, obwohl `LensError` es intern braucht).
+harw-types = { path = "../../../harw-types" }
+# `NetworkScope::from_hosts` für den Regel-Beispiel-Doctest
+# (`EgressFlowRule`/`RuleContext::network_scope`). `harw-sandbox` ist bereits
+# das gelandete, eigenständige Vokabular für Netzbereiche (siehe
+# `harw-dod-rules/Cargo.toml`-Kommentar) -- diese Fassade re-exportiert es
+# nicht (siehe `//!`-Block).
+harw-sandbox = { path = "../../../harw-sandbox" }
+jiff = { workspace = true }
+# Baut eine synthetische `stat`-Datei für den Sensor-Integrationstest, statt
+# sich auf ein reales `/proc` zu verlassen (Testrichtlinie: kein Dateisystem
+# ohne `#[ignore]`).
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

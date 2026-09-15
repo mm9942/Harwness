@@ -44,6 +44,7 @@ use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use harw_agent_dsl::roles::AgentRoleId;
 use harw_core::{
     AgentSession, DurableJobRunner, ExecutionControl, JobExecutionRegistry, ModelMessage,
     ModelProvider, StateStore, TranscriptStateStore, TurnInput, TurnOutcome, run_turn,
@@ -1052,7 +1053,7 @@ fn plan_node_narrowing(
         JobEntry::PlanNode { kind, may_write },
         RuntimeNarrowing {
             registry_profile: profile,
-            identity: plan_node_identity(payload, profile),
+            identity: plan_node_identity(payload, profile, kind),
             permissions: sandbox.permissions().clone(),
             // R0-F: bind the root sandbox to exactly the derived workspace root,
             // not to the project root discovered above it.
@@ -1696,7 +1697,20 @@ fn report_plan_node_outcome(
 
 // Identity of the plan-node agent. It advertises exactly the profile's tools
 // and says out loud that nobody can be asked anything.
-fn plan_node_identity(payload: &PlanNodePayload, profile: RegistryProfile) -> IdentityOverrides {
+//
+// `organizational_role` (Addendum F+G, Agent F-FIX): every plan-node kind
+// except `Composite` runs its own turn directly against a bounded write/read
+// scope, i.e. it *is* the leaf worker doing the work, so it gets
+// `AgentRoleId::Worker` and the worker rulebook. A `Composite` node never
+// itself executes leaf work — it only completes once all of its expanded
+// child nodes are done (see `harw-plan-bridge/src/controller.rs`, the
+// composite-completion step) — so it carries no organizational role here and
+// gets no attached rulebook.
+fn plan_node_identity(
+    payload: &PlanNodePayload,
+    profile: RegistryProfile,
+    kind: PlanNodeKind,
+) -> IdentityOverrides {
     IdentityOverrides {
         agent_name: Some(format!("plan-node-{}", payload.task_id)),
         role_description: Some(format!(
@@ -1712,6 +1726,11 @@ fn plan_node_identity(payload: &PlanNodePayload, profile: RegistryProfile) -> Id
                 payload.task_id
             ),
         ],
+        organizational_role: if kind == PlanNodeKind::Composite {
+            None
+        } else {
+            Some(AgentRoleId::Worker)
+        },
     }
 }
 
@@ -3195,6 +3214,7 @@ mod prompt_claim_guard_tests {
                 output_tokens: 0,
                 reasoning_tokens: None,
                 cached_tokens: None,
+                cache_write_tokens: None,
             };
             Box::pin(async move { Ok(response) })
         }

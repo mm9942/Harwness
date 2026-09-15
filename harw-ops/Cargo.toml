@@ -61,6 +61,11 @@ harw-web = { path = "../harw-web" }
 # Datei zurück, um Herkunft und Löschziele einer Regel zu bestimmen —
 # `harw_config::ConfigWriter` selbst bietet dafür keine Enumerations-API.
 toml = { workspace = true }
+# `/provider switch`/`/model switch` verankern die zuletzt gewählte
+# Auswahl bestes Bemühen als Profil-Default (`config_util::persist_default_selection`)
+# über denselben kommentarerhaltenden Editor wie `/permissions`.
+# Version bewusst identisch zu harw-config gepinnt (ein einziges resolvtes toml_edit).
+toml_edit = "0.25.13"
 
 [features]
 # Forwards to harw-provider's ChatGPT OAuth flag so `--features chatgpt-oauth`

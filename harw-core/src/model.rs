@@ -705,6 +705,7 @@ impl ModelProvider for EchoModelProvider {
             output_tokens: approx(reply.len()),
             reasoning_tokens: None,
             cached_tokens: None,
+            cache_write_tokens: None,
         };
         Box::pin(async move { Ok(response) })
     }

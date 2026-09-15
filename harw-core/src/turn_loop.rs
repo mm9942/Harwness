@@ -297,10 +297,12 @@
 //!   Feld außerhalb dieses Schreibbereichs, keine weitere Logik hier.
 //!
 use crate::cancel::{CancelReason, CancelToken};
+use crate::capture::{ToolOutcome, ToolOutcomeStatus};
 use crate::error::{CoreError, CoreResult};
+use crate::guard::{DriftEvent, DriftKind, GuardVerdict, TurnGuard};
 use crate::model::{ModelProvider, ModelRequest};
 use crate::session::{AgentSession, SpawnContext, TurnHandle};
-use crate::state_store::{StateStore, StateStoreError};
+use crate::state_store::{StateStore, StateStoreError, UsageRound};
 use harw_extension_api::{
     ApprovalDecision, LoadedInstructions, SpawnInput, ToolExecutor,
     TurnInputContext, TurnStartInput, TurnStopInput,
@@ -316,7 +318,7 @@ use harw_tools::{
 use harw_types::{
     ApprovalActor, Clock, ReviewDecision, SessionId, SystemClock, TokenUsage, ToolCallId,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use tracing::Instrument as _;
@@ -326,7 +328,7 @@ use tracing::Instrument as _;
 pub const HANDOFF_PREFIX: &str = "transfer_to_";
 
 /// Ergebnis-Slot für einen parallelen Tool-Call: (ID, Ergebnis, Wandzeit ms).
-type ParallelCallSlot = Option<(ToolCallId, ToolCallResult, u64)>;
+type ParallelCallSlot = Option<(ToolCallId, ToolCallResult, u64, String, serde_json::Value)>;
 
 /// Grenzwerte eines einzelnen Turns (W4a A-LOOP).
 ///
@@ -758,6 +760,40 @@ pub async fn gather_context(
     fragments
 }
 
+/// Baut den Delegationsziel-Kontextblock (Nachtrag F) aus bereits sortierten
+/// Rollennamen — oder `None`, wenn keine Ziele sichtbar sind.
+///
+/// # Arguments
+/// - `names` (`&[String]`): exakte, sortierte Rollennamen aus
+///   [`harw_extension_api::AgentSpawner::delegation_target_names`].
+///
+/// # Returns
+/// `None` bei leerer Liste oder wenn die (statischen, stets gültigen)
+/// Label-/Sektionsnamen unerwartet nicht konstruierbar wären — dann bleibt
+/// der Turn ohne diesen Block, statt zu scheitern.
+fn delegation_targets_fragment(names: &[String]) -> Option<harw_context::Fragment> {
+    if names.is_empty() {
+        return None;
+    }
+    let body = format!("Delegierbare Ziele (transfer_to_<name>): {}", names.join(", "));
+    let label = harw_context::FragmentLabel::try_new("delegation.targets").ok()?;
+    let section = harw_context::SectionName::try_new("delegation.targets").ok()?;
+    Some(harw_context::Fragment {
+        label,
+        section,
+        trust: harw_context::TrustClass::Instruction,
+        stability: harw_context::Stability::Stable,
+        origin: harw_context::FragmentOrigin {
+            provider: "turn_loop.delegation_targets".to_owned(),
+            namespace: "core".to_owned(),
+            produced_at: jiff::Timestamp::now(),
+        },
+        cost: harw_lens_types::CostEstimate(body.len() as u32),
+        digest: harw_types::ContentDigest::of(body.as_bytes()),
+        body,
+    })
+}
+
 /// Lädt Instructions von allen `InstructionsProvider` und filtert nach der
 /// session-level [`SessionActivation`][crate::activation::SessionActivation].
 ///
@@ -995,6 +1031,10 @@ pub fn collect_tools(session: &AgentSession) -> CoreResult<Vec<ToolSpec>> {
             }
         }
     }
+    // Stabil nach Tool-Namen sortieren: Provider-Prompt-Caches brauchen ein
+    // byte-identisches Tool-Array über Runden hinweg; die Registrierungs-
+    // reihenfolge der `ToolProvider` ist dafür kein verlässliches Kriterium.
+    specs.sort_by(|a, b| a.name().cmp(b.name()));
     Ok(specs)
 }
 
@@ -1154,6 +1194,223 @@ fn output_to_result(output: ToolOutput) -> ToolCallResult {
     }
 }
 
+/// Meldet das Ergebnis eines ausgeführten Tool-Aufrufs an den optionalen
+/// [`crate::capture::ToolOutcomeObserver`] der Session (Projektgedächtnis-
+/// Erfassung, Addendum B).
+///
+/// # Beschreibung
+/// No-op, wenn keine Session einen Beobachter registriert hat (der
+/// Normalfall). Der `Arc` wird vor dem Aufruf geklont, um Borrow-Konflikte
+/// mit dem übrigen `session`-Zugriff an den Aufrufstellen zu vermeiden.
+/// `output_text` ist der reine Text bei einem Text-Erfolg, die kompakte
+/// JSON-Form (`serde_json::to_string`, Fallback leerer String) bei einem
+/// strukturierten Erfolg, und die Fehlermeldung bei `ToolCallResult::Error`.
+/// Wird bewusst **nicht** für abgebrochene (`cancelled`) Turns aufgerufen —
+/// die jeweiligen Aufrufstellen lassen diesen Pfad aus.
+///
+/// # Arguments
+/// - `session` (`&AgentSession`): liefert Session-ID und den optionalen
+///   Beobachter.
+/// - `tool_name` (`&str`): Name des aufgerufenen Tools.
+/// - `arguments` (`&serde_json::Value`): die vom Modell übergebenen Argumente.
+/// - `result` (`&ToolCallResult`): das endgültige, bereits bekannte Ergebnis.
+///
+/// # Concurrency
+/// Synchron; ruft `ToolOutcomeObserver::on_tool_outcome` direkt aus dem
+/// Turn-Loop-Pfad auf. Beobachter müssen billig sein und dürfen nicht
+/// fehlschlagen.
+fn notify_tool_outcome(
+    session: &AgentSession,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    result: &ToolCallResult,
+) {
+    let Some(observer) = session.tool_outcome_observer().cloned() else {
+        return;
+    };
+    let (status, output_text) = tool_outcome_parts(result);
+    observer.on_tool_outcome(
+        session.id(),
+        &ToolOutcome {
+            tool_name,
+            arguments,
+            status,
+            output_text: &output_text,
+        },
+    );
+}
+
+/// Benachrichtigt den optionalen [`crate::guard::ProgressObserver`] der
+/// Session, dass gerade Fortschritt stattgefunden hat (Addendum F+G —
+/// Lease-Erneuerung durch `ManagedAgentSpawner`).
+///
+/// # Beschreibung
+/// Wird nach jeder Modellrunde und nach jedem — auch abgelehnten oder
+/// fehlgeschlagenen — Tool-Ergebnis aufgerufen: schon der Versuch zeigt, dass
+/// die Session noch lebt, unabhängig vom Erfolg des einzelnen Aufrufs.
+fn notify_progress(session: &AgentSession) {
+    if let Some(observer) = session.progress_observer() {
+        observer.on_progress(session.id());
+    }
+}
+
+// Status + Textform eines `ToolCallResult`, wie sie sowohl
+// `notify_tool_outcome` als auch die Turn-Wächter (Addendum F+G) brauchen —
+// gleiche Ableitungsregel wie in `notify_tool_outcome`s Doku beschrieben.
+fn tool_outcome_parts(result: &ToolCallResult) -> (ToolOutcomeStatus, String) {
+    match result {
+        ToolCallResult::Success { value } => {
+            let text = match value {
+                serde_json::Value::String(text) => text.clone(),
+                other => serde_json::to_string(other).unwrap_or_default(),
+            };
+            (ToolOutcomeStatus::Success, text)
+        }
+        ToolCallResult::Error { message } => (ToolOutcomeStatus::Error, message.clone()),
+    }
+}
+
+/// Befragt den optionalen [`crate::guard::PitfallAdvisor`] der Session vor
+/// einer Werkzeugausführung (Addendum F+G).
+///
+/// # Returns
+/// `None`, wenn keine Beratung registriert ist oder kein Pitfall zutrifft.
+/// Sonst ein bereits mit `[harw-Wächter] ` präfixierter Hinweistext, den der
+/// Aufrufer an das Ergebnis **desselben** Aufrufs anhängen soll — der Treffer
+/// selbst ist bereits über [`report_drift`] gemeldet.
+async fn apply_pitfall_advice(
+    session: &AgentSession,
+    store: &dyn StateStore,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+) -> Option<String> {
+    let advisor = session.pitfall_advisor()?.clone();
+    let hint = advisor.advise(tool_name, arguments)?;
+    let event = DriftEvent {
+        kind: DriftKind::PitfallMatch,
+        session_id: session.id().to_string(),
+        detail: format!("Pitfall-Treffer für `{tool_name}`"),
+        tool_name: Some(tool_name.to_owned()),
+        child_role: None,
+    };
+    report_drift(session, store, &event).await;
+    Some(format!("[harw-Wächter] {hint}"))
+}
+
+/// Wendet die Turn-Wächter (Addendum F+G) auf ein einzelnes, bereits
+/// berechnetes Tool-Ergebnis an.
+///
+/// # Beschreibung
+/// No-op (liefert `None`), wenn kein [`TurnGuard`] aktiv ist. Sonst:
+/// vermerkt eine neue erfolgreiche Signatur für die Fortschritts-Erkennung
+/// der Runde (`round_progressed`), wertet
+/// [`TurnGuard::observe_tool_result`] aus und hängt bei `Warn` den
+/// kombinierten Hinweis (ein ggf. aus einer vorherigen Runde übrig
+/// gebliebener `pending_hint` plus der neue Hinweis) über [`append_hint`] an
+/// `result` an. Ein Hinweis, der keinem Aufruf dieser Runde mehr zugeordnet
+/// werden kann, bleibt in `pending_hint` für das nächste Tool-Ergebnis des
+/// Turns stehen.
+///
+/// # Returns
+/// `None`, wenn der Turn weiterläuft; `Some(reason)`, wenn ein `Abort`-Befund
+/// den Turn beenden muss — der Aufrufer beendet ihn dann wie bei
+/// ausgeschöpftem `max_model_rounds` (siehe [`cancel_turn`]/
+/// [`cancel_turn_with_pending_calls`]), ohne eine neue `CoreError`-Variante.
+#[allow(clippy::too_many_arguments)]
+async fn apply_tool_guard(
+    session: &AgentSession,
+    store: &dyn StateStore,
+    guard: Option<&mut TurnGuard>,
+    seen_success_signatures: &mut HashSet<String>,
+    pending_hint: &mut Option<String>,
+    round_progressed: &mut bool,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    result: &mut ToolCallResult,
+) -> Option<CancelReason> {
+    let guard = guard?;
+    let (status, output_text) = tool_outcome_parts(result);
+    if status == ToolOutcomeStatus::Success {
+        let signature = crate::guard::call_signature(tool_name, arguments);
+        if seen_success_signatures.insert(signature) {
+            *round_progressed = true;
+        }
+    }
+    let verdict = guard.observe_tool_result(tool_name, arguments, status, &output_text);
+    let mut hint_to_apply = pending_hint.take();
+    let abort_reason = match verdict {
+        GuardVerdict::Continue => None,
+        GuardVerdict::Warn { event, hint } => {
+            report_drift(session, store, &event).await;
+            hint_to_apply = Some(match hint_to_apply {
+                Some(existing) => format!("{existing}\n\n{hint}"),
+                None => hint,
+            });
+            None
+        }
+        GuardVerdict::Abort { event, hint } => {
+            report_drift(session, store, &event).await;
+            tracing::warn!(hint = %hint, "turn_loop.guard_abort");
+            Some(CancelReason::Budget)
+        }
+    };
+    if let Some(hint) = hint_to_apply {
+        append_hint(result, &hint);
+    }
+    abort_reason
+}
+
+/// Meldet ein einzelnes erkanntes Drift-Ereignis an `StateStore::record_drift`
+/// und den optionalen [`crate::guard::DriftObserver`] der Session (Addendum
+/// F+G).
+///
+/// # Beschreibung
+/// Beide Meldewege laufen unabhängig voneinander: ein fehlschlagender
+/// `record_drift`-Aufruf (Persistenz) wird nur geloggt (`tracing::warn!`) und
+/// verhindert nicht, dass der synchrone [`crate::guard::DriftObserver`]
+/// trotzdem benachrichtigt wird — dieselbe Best-Effort-Haltung wie
+/// `StateStore::record_usage`.
+///
+/// # Concurrency
+/// `async` nur wegen `store.record_drift`; der Beobachter-Aufruf selbst ist
+/// synchron.
+async fn report_drift(session: &AgentSession, store: &dyn StateStore, event: &DriftEvent) {
+    if let Err(error) = store.record_drift(session.id(), event).await {
+        tracing::warn!(%error, kind = event.kind.key(), "turn_loop.record_drift_failed");
+    }
+    if let Some(observer) = session.drift_observer() {
+        observer.on_drift(event);
+    }
+}
+
+/// Hängt einen Wächter-Hinweis (Addendum F+G, Präfix `[harw-Wächter] `) an ein
+/// [`ToolCallResult`] an, statt es zu ersetzen — das Modell sieht das
+/// tatsächliche Tool-Ergebnis weiterhin vollständig.
+///
+/// # Arguments
+/// - `result` (`&mut ToolCallResult`): wird um `hint` erweitert (String-Erfolg
+///   bzw. Fehlermeldung bekommt `hint` angehängt; ein strukturierter
+///   Erfolgswert wird dafür zu seiner kompakten JSON-Textform samt `hint`).
+/// - `hint` (`&str`): bereits fertig formatierter Hinweistext.
+fn append_hint(result: &mut ToolCallResult, hint: &str) {
+    match result {
+        ToolCallResult::Success { value } => match &mut *value {
+            serde_json::Value::String(text) => {
+                text.push_str("\n\n");
+                text.push_str(hint);
+            }
+            other => {
+                let rendered = serde_json::to_string(other).unwrap_or_default();
+                *value = serde_json::Value::String(format!("{rendered}\n\n{hint}"));
+            }
+        },
+        ToolCallResult::Error { message } => {
+            message.push_str("\n\n");
+            message.push_str(hint);
+        }
+    }
+}
+
 /// Builds the authority passed across the final tool-execution boundary.
 ///
 /// This is deliberately derived from session state rather than `TurnInput`
@@ -1293,6 +1550,13 @@ async fn run_turn_with_approvals(
             return Err(error);
         }
     }
+
+    // Addendum D: harte Verdichtung am Beginn eines neuen Auftrags-Turns
+    // (Orchestrator-Schicht) — vor der ersten Modellrunde dieses Turns, aber
+    // nach dem Einspielen des User-Inputs, damit die Schätzung den vollen,
+    // aktuellen Verlauf sieht. `resume_after_child`/`resume_after_approval`
+    // laufen nicht durch diese Funktion und sind damit keine Auftragsgrenze.
+    maybe_hard_compact_at_turn_start(session, model, store).await;
 
     notify_turn_start(
         session,
@@ -1580,11 +1844,17 @@ async fn resume_after_approval_with_store(
 
     match resolution {
         ApprovalResolution::Reject { reason } => {
-            session.history_mut().push_tool_result(
-                pending.call.id,
-                ToolCallResult::error(format!("denied by user: {reason}")),
-                0,
+            let denied_result = ToolCallResult::error(format!("denied by user: {reason}"));
+            notify_tool_outcome(
+                session,
+                pending.call.name.as_str(),
+                &pending.call.arguments,
+                &denied_result,
             );
+            notify_progress(session);
+            session
+                .history_mut()
+                .push_tool_result(pending.call.id, denied_result, 0);
             persist_last(session, store).await?;
             drive_turn(session, model, store, approvals, &ctx, handle, control).await
         }
@@ -1715,6 +1985,8 @@ async fn resume_after_approval_with_store(
                         duration_ms: result.1,
                     },
                 );
+                notify_tool_outcome(session, &tool_name, &pending.call.arguments, &result.0);
+                notify_progress(session);
                 session
                     .history_mut()
                     .push_tool_result(pending.call.id, result.0, result.1);
@@ -1740,10 +2012,40 @@ async fn drive_turn(
     control: TurnControl,
 ) -> CoreResult<TurnOutcome> {
     let mut total_usage = harw_types::TokenUsage::default();
+    // Fortlaufende Modell-Runden-Nummer dieses `drive_turn`-Aufrufs, für
+    // `UsageRound::round` — bei jedem Modellaufruf inkrementiert, bevor die
+    // Runde persistiert wird.
+    let mut round: u32 = 0;
+    // Nutzung der zuletzt abgeschlossenen Modell-Runde — für `maybe_compact`
+    // an beiden Call-Sites (innerhalb der Schleife und nach Turn-Ende, wo
+    // `response` bereits außer Scope ist).
+    let mut last_round_usage = harw_types::TokenUsage::default();
     // Wanduhr-Nullpunkt dieses Aufrufs (siehe Moduldoku „Fünfter Nachtrag").
     // Wiederholte Aufrufe (weiterer Schleifendurchlauf) sind ein No-op — nur
     // der erste zählt.
     control.start();
+
+    // Turn-Wächter (Addendum F+G): nur erzeugt, wenn die Session-Policy sie
+    // einschaltet — `TurnGuard` lebt ausschließlich für die Dauer dieses
+    // `drive_turn`-Aufrufs (siehe Moduldoku „Fünfter Nachtrag" zur analogen
+    // Lücke bei `TurnControl`: ein pausierter und über `resume_*`
+    // fortgesetzter Turn bekommt hier ebenfalls einen frischen Wächter ohne
+    // Turn-übergreifenden Zustand).
+    let guard_policy = session.guard_policy();
+    let mut guard: Option<TurnGuard> = guard_policy
+        .enabled
+        .then(|| TurnGuard::new(guard_policy, session.id()));
+    // Signaturen (Tool-Name + kanonische Argumente) erfolgreicher Aufrufe,
+    // bereits in einer früheren Runde dieses Turns gesehen — für die
+    // Fortschritts-Erkennung „mindestens ein erfolgreicher Tool-Aufruf mit in
+    // diesem Turn neuer Signatur" (Vertrag `TurnGuard::observe_round_end`).
+    let mut turn_seen_success_signatures: HashSet<String> = HashSet::new();
+    // Hinweistext eines `Warn`-Befunds, der keinem eigenen Tool-Ergebnis
+    // dieser Runde mehr zugeordnet werden konnte (z. B. ein
+    // Runden-Ende-Befund nach der letzten Werkzeugausführung der Runde) —
+    // wird dem nächsten Tool-Ergebnis des Turns vorangestellt, sobald eines
+    // entsteht.
+    let mut pending_guard_hint: Option<String> = None;
 
     // Einmal je Turn, vor dem ersten Model-Aufruf: das Kassenbuch des
     // `context.load`-Ausführers vorbelegen, sofern die Sitzung ein
@@ -1764,9 +2066,19 @@ async fn drive_turn(
         }
 
         // 1./2. Context + Instructions.
-        let fragments = gather_context(session, ctx).await;
+        let mut fragments = gather_context(session, ctx).await;
         let instructions = load_instructions(session).await;
         let tools = collect_tools(session)?;
+
+        // Nachtrag F (Delegationsprojektion): EIN deterministischer
+        // Kontextblock, NACH den Tools angehängt (stabiler Teil — die Liste
+        // ändert sich selten, sortiert vom Spawner geliefert). Leer ⇒ nichts.
+        if let Some(spawner) = session.registry().spawner() {
+            let delegation_targets = spawner.delegation_target_names(session.id());
+            if let Some(fragment) = delegation_targets_fragment(&delegation_targets) {
+                fragments.push(fragment);
+            }
+        }
 
         // Programm- und Decken-bewusste Montage (siehe
         // `ModelRequest::with_context_program`s Moduldoku, Abschnitt „Zwei
@@ -1807,7 +2119,24 @@ async fn drive_turn(
         let response = model.respond(request).await?;
         control.record_model_round();
         control.record_usage(&response.usage);
+        notify_progress(session);
         total_usage.add(&response.usage);
+        round += 1;
+        last_round_usage = response.usage.clone();
+
+        // Nutzung dieser Runde persistieren (best effort — ein Store-Fehler
+        // darf den Turn niemals scheitern lassen, siehe Vertrag
+        // `StateStore::record_usage`).
+        let usage_round = UsageRound {
+            round,
+            provider_id: session.active_provider().map(|p| p.as_str().to_owned()),
+            model_id: session.active_model().map(|m| m.as_str().to_owned()),
+            usage: response.usage.clone(),
+            cache_strategy: None,
+        };
+        if let Err(error) = store.record_usage(session.id(), &usage_round).await {
+            tracing::warn!(%error, "turn_loop.record_usage_failed");
+        }
 
         // Emit model.response event: size_bytes from tool_calls JSON +
         // optional message length; tool_call_count for scheduling insight.
@@ -1820,6 +2149,14 @@ async fn drive_turn(
             tool_call_count = response.tool_calls.len(),
             "model.response",
         );
+
+        // Für die Fortschritts-Erkennung des reinen Text-Zweigs unten
+        // („Assistant-Text ohne Tool-Aufrufe") vor dem Move gesichert.
+        let response_had_text = response.message.is_some();
+        let response_had_no_tool_calls = response.tool_calls.is_empty();
+        // Fortschritt durch erfolgreiche Tool-Aufrufe mit neuer Signatur wird
+        // unten im Tool-Call-Loop gesetzt.
+        let mut round_progressed_by_tools = false;
 
         if let Some(text) = response.message {
             let phase = if response.tool_calls.is_empty() {
@@ -1846,7 +2183,32 @@ async fn drive_turn(
         }
 
         // 6. Keine Tool-Calls mehr ⇒ Turn fertig.
-        if response.tool_calls.is_empty() {
+        if response_had_no_tool_calls {
+            // Runden-Ende-Beobachtung (Addendum F+G): diese Runde bestand nur
+            // aus Assistant-Text — Fortschritt genau dann, wenn tatsächlich
+            // Text kam (Vertrag: „Assistant-Text ohne Tool-Aufrufe").
+            if let Some(g) = guard.as_mut() {
+                match g.observe_round_end(response_had_text) {
+                    GuardVerdict::Continue => {}
+                    GuardVerdict::Warn { event, hint } => {
+                        report_drift(session, store, &event).await;
+                        // Keine Werkzeugausführung mehr in dieser Runde, an
+                        // die der Hinweis sofort angehängt werden könnte —
+                        // er wird dem nächsten Tool-Ergebnis des Turns
+                        // vorangestellt, falls noch eines entsteht.
+                        pending_guard_hint = Some(match pending_guard_hint.take() {
+                            Some(existing) => format!("{existing}\n\n{hint}"),
+                            None => hint,
+                        });
+                    }
+                    GuardVerdict::Abort { event, hint } => {
+                        report_drift(session, store, &event).await;
+                        tracing::warn!(hint = %hint, "turn_loop.guard_abort");
+                        return cancel_turn(session, handle, total_usage, CancelReason::Budget)
+                            .await;
+                    }
+                }
+            }
             break;
         }
 
@@ -1872,14 +2234,35 @@ async fn drive_turn(
         // bereits eingeholt haben. Sie leben genau eine Modellantwort lang und
         // werden unten verbraucht, damit kein Handler doppelt gefragt wird.
         let mut prepared = PreparedApprovals::default();
-        if try_execute_parallel_calls(session, store, ctx, &response.tool_calls, &mut prepared)
-            .await?
+        match try_execute_parallel_calls(
+            session,
+            store,
+            ctx,
+            &response.tool_calls,
+            &mut prepared,
+            guard.as_mut(),
+            &mut turn_seen_success_signatures,
+            &mut pending_guard_hint,
+            &mut round_progressed_by_tools,
+        )
+        .await?
         {
-            continue;
+            ParallelOutcome::NotApplicable => {}
+            ParallelOutcome::Executed => continue,
+            ParallelOutcome::Aborted(reason) => {
+                return cancel_turn(session, handle, total_usage, reason).await;
+            }
         }
 
         // 5. Tool-Call-Loop.
-        for (position, call) in response.tool_calls.into_iter().enumerate() {
+        // `while let` statt `for`: bei einem `TurnGuard`-`Abort` mitten in
+        // dieser Runde (Addendum F+G) müssen die noch nicht ausgeführten
+        // Calls — der restliche Iterator-Inhalt — an
+        // `cancel_turn_with_pending_calls` gehen, sonst bliebe ein
+        // `tool_call` ohne `tool_result` im Verlauf zurück (siehe dessen
+        // Doku).
+        let mut tool_call_iter = response.tool_calls.into_iter().enumerate();
+        while let Some((position, call)) = tool_call_iter.next() {
             session.history_mut().push_tool_call(
                 call.id.clone(),
                 call.name.to_string(),
@@ -1906,12 +2289,41 @@ async fn drive_turn(
             match decision {
                 ApprovalDecision::Allow => {}
                 ApprovalDecision::Deny(reason) => {
-                    session.history_mut().push_tool_result(
-                        call.id.clone(),
-                        ToolCallResult::error(format!("denied: {reason}")),
-                        0,
-                    );
+                    let mut denied_result = ToolCallResult::error(format!("denied: {reason}"));
+                    let abort_reason = apply_tool_guard(
+                        session,
+                        store,
+                        guard.as_mut(),
+                        &mut turn_seen_success_signatures,
+                        &mut pending_guard_hint,
+                        &mut round_progressed_by_tools,
+                        call.name.as_str(),
+                        &call.arguments,
+                        &mut denied_result,
+                    )
+                    .await;
+                    notify_tool_outcome(session, call.name.as_str(), &call.arguments, &denied_result);
+                    notify_progress(session);
+                    session
+                        .history_mut()
+                        .push_tool_result(call.id.clone(), denied_result, 0);
                     persist_last(session, store).await?;
+                    // Diesem Call ist bereits ein Tool-Result gepaart — nur
+                    // die noch unangetasteten restlichen Calls des
+                    // Iterators brauchen ein synthetisches Ergebnis.
+                    if let Some(abort_reason) = abort_reason {
+                        let remaining: Vec<ToolCall> =
+                            tool_call_iter.map(|(_, call)| call).collect();
+                        return cancel_turn_with_pending_calls(
+                            session,
+                            store,
+                            handle,
+                            total_usage,
+                            abort_reason,
+                            remaining,
+                        )
+                        .await;
+                    }
                     continue;
                 }
                 ApprovalDecision::AskUser(request) => {
@@ -1971,9 +2383,36 @@ async fn drive_turn(
                 let context = match governed_spawn_context(session) {
                     Ok(context) => context,
                     Err(error) => {
-                        let result = missing_tool_execution_context_result(error)?;
+                        let mut result = missing_tool_execution_context_result(error)?;
+                        let abort_reason = apply_tool_guard(
+                            session,
+                            store,
+                            guard.as_mut(),
+                            &mut turn_seen_success_signatures,
+                            &mut pending_guard_hint,
+                            &mut round_progressed_by_tools,
+                            call.name.as_str(),
+                            &call.arguments,
+                            &mut result,
+                        )
+                        .await;
+                        notify_tool_outcome(session, call.name.as_str(), &call.arguments, &result);
+                        notify_progress(session);
                         session.history_mut().push_tool_result(call.id, result, 0);
                         persist_last(session, store).await?;
+                        if let Some(abort_reason) = abort_reason {
+                            let remaining: Vec<ToolCall> =
+                                tool_call_iter.map(|(_, call)| call).collect();
+                            return cancel_turn_with_pending_calls(
+                                session,
+                                store,
+                                handle,
+                                total_usage,
+                                abort_reason,
+                                remaining,
+                            )
+                            .await;
+                        }
                         continue;
                     }
                 };
@@ -2004,6 +2443,16 @@ async fn drive_turn(
 
             // c. Normale Tool-Ausführung — instrumented with tool.call span.
             let tool_name = call.name.to_string();
+            // Wächter-Beratung vor der Ausführung (Addendum F+G): ein
+            // Treffer wird sofort gemeldet, der Hinweis aber erst an das
+            // Ergebnis DIESES Aufrufs angehängt, sobald es feststeht.
+            if let Some(hint) = apply_pitfall_advice(session, store, &tool_name, &call.arguments).await
+            {
+                pending_guard_hint = Some(match pending_guard_hint.take() {
+                    Some(existing) => format!("{existing}\n\n{hint}"),
+                    None => hint,
+                });
+            }
             let tool_span = tracing::info_span!("tool.call", tool_name = %tool_name);
             let result: (ToolCallResult, u64) = async {
                 match find_executor(session, &call.name) {
@@ -2040,23 +2489,97 @@ async fn drive_turn(
             }
             .instrument(tool_span)
             .await?;
+            let (mut result_value, result_duration_ms) = result;
+            let abort_reason = apply_tool_guard(
+                session,
+                store,
+                guard.as_mut(),
+                &mut turn_seen_success_signatures,
+                &mut pending_guard_hint,
+                &mut round_progressed_by_tools,
+                &tool_name,
+                &call.arguments,
+                &mut result_value,
+            )
+            .await;
             let call_id_for_event = call.id.clone();
             emit(
                 session,
                 TurnEvent::ToolCallCompleted {
                     turn_id: handle.turn_id.clone(),
                     call_id: call_id_for_event,
-                    result: result.0.clone(),
-                    duration_ms: result.1,
+                    result: result_value.clone(),
+                    duration_ms: result_duration_ms,
                 },
             );
             // d. ToolResult in History.
+            notify_tool_outcome(session, &tool_name, &call.arguments, &result_value);
+            notify_progress(session);
             session
                 .history_mut()
-                .push_tool_result(call.id, result.0, result.1);
+                .push_tool_result(call.id, result_value, result_duration_ms);
             persist_last(session, store).await?;
+            if let Some(abort_reason) = abort_reason {
+                let remaining: Vec<ToolCall> = tool_call_iter.map(|(_, call)| call).collect();
+                return cancel_turn_with_pending_calls(
+                    session,
+                    store,
+                    handle,
+                    total_usage,
+                    abort_reason,
+                    remaining,
+                )
+                .await;
+            }
         }
+
+        // Runden-Ende-Beobachtung (Addendum F+G): alle Tool-Ergebnisse dieser
+        // Runde stehen bereits fest (sequenzieller Pfad; der Parallel-Pfad
+        // `try_execute_parallel_calls` springt per `continue` direkt zurück
+        // zu Schritt 4 und überspringt diese Stelle ebenso wie die
+        // Auto-Compaction unten — dieselbe, bereits bestehende Lücke).
+        if let Some(g) = guard.as_mut() {
+            match g.observe_round_end(round_progressed_by_tools) {
+                GuardVerdict::Continue => {}
+                GuardVerdict::Warn { event, hint } => {
+                    report_drift(session, store, &event).await;
+                    pending_guard_hint = Some(match pending_guard_hint.take() {
+                        Some(existing) => format!("{existing}\n\n{hint}"),
+                        None => hint,
+                    });
+                }
+                GuardVerdict::Abort { event, hint } => {
+                    report_drift(session, store, &event).await;
+                    tracing::warn!(hint = %hint, "turn_loop.guard_abort");
+                    return cancel_turn(session, handle, total_usage, CancelReason::Budget).await;
+                }
+            }
+        }
+
+        // Auto-Compaction an einer sicheren Grenze: alle Tool-Ergebnisse
+        // dieser Runde sind bereits in der Historie, der nächste Model-
+        // Request ist aber noch nicht gebaut — hier mutiert `compact_session`
+        // die Historie also nie eine in-flight-Anfrage an. Höchstens einmal
+        // je Runde (dieser Call-Site läuft genau einmal pro Schleifendurchlauf).
+        //
+        // `task_completed` wird vor dem Aufruf in eine eigene Variable
+        // gelegt: `maybe_compact` nimmt `session` mutable entgegen, ein
+        // verschachtelter `turn_completed_a_plan_step(session)`-Aufruf als
+        // Argumentausdruck würde eine gleichzeitige unveränderliche Ausleihe
+        // gegen die bereits laufende veränderliche Ausleihe erzeugen.
+        let task_completed = turn_completed_a_plan_step(session);
+        maybe_compact(session, model, store, &last_round_usage, task_completed).await;
+
         // Zurück zu Schritt 4 (nächster Model-Call).
+    }
+
+    // Welle FANIN-K: ein Wächter-Hinweis, der am Ende der letzten Runde
+    // entstand (`response_had_no_tool_calls`-Zweig oben), aber keinem
+    // weiteren Tool-Ergebnis mehr zugeordnet werden konnte, weil die Runde
+    // ohne Tool-Aufrufe endete, ging bislang spurlos verloren — er wird
+    // stattdessen an das letzte Item der Historie angehängt.
+    if let Some(hint) = pending_guard_hint.take() {
+        session.history_mut().append_hint_to_last(&hint);
     }
 
     // 7. Observer + Turn-Ende.
@@ -2075,6 +2598,21 @@ async fn drive_turn(
             token_usage: total_usage.clone(),
         },
     );
+    // Auto-Compaction am Ende eines erfolgreich abgeschlossenen Turns — die
+    // zweite sichere Grenze neben der innerhalb der Schleife oben: kein
+    // in-flight-Request existiert mehr, der nächste Turn beginnt erst mit
+    // dem nächsten `run_turn`-Aufruf. `task_completed` wird wie oben vor dem
+    // Aufruf ausgewertet (siehe Kommentar an der ersten Call-Site).
+    let task_completed = turn_completed_a_plan_step(session);
+    maybe_compact(session, model, store, &last_round_usage, task_completed).await;
+
+    // Projektgedächtnis: alle Tool-Ergebnisse dieses Turns wurden bereits
+    // über `notify_tool_outcome` gemeldet; hier, am erfolgreichen Turn-Ende,
+    // erfährt der Beobachter, dass die Runde abgeschlossen ist.
+    if let Some(observer) = session.tool_outcome_observer().cloned() {
+        observer.on_turn_finished(session.id());
+    }
+
     // `drive_turn` liefert `CoreResult<TurnOutcome>` — anders als
     // `transition_after_turn_failure` (das nichts zurückgeben kann und deshalb
     // protokolliert) kann dieser Aufrufer den Fehler ehrlich weiterreichen:
@@ -2083,6 +2621,219 @@ async fn drive_turn(
     // Fehler bereits über `transition_after_turn_failure` ab.
     session.complete_turn(handle, total_usage)?;
     Ok(TurnOutcome::Completed)
+}
+
+/// Prüft die [`crate::auto_compact::AutoCompactPolicy`] der Session und
+/// verdichtet bei Bedarf die Historie an einer sicheren Grenze.
+///
+/// # Description
+/// No-op, wenn die Session keine Policy gesetzt hat
+/// ([`AgentSession::auto_compact`] liefert `None` — der Default für jede
+/// Session, die sich nicht explizit für Auto-Compaction entscheidet).
+///
+/// `tokens_used` wird aus `last_round_usage.input_tokens` allein gebildet,
+/// **ohne** `cached_tokens` zusätzlich zu addieren: `extract_openai_usage`
+/// (harw-provider-http/src/lib.rs) liest `prompt_tokens` (Chat) bzw.
+/// `input_tokens` (Responses) direkt aus der Provider-Antwort, und beide
+/// Felder umfassen laut OpenAI-API bereits die zwischengespeicherten
+/// Präfix-Tokens — `cached_tokens`/`cache_creation_input_tokens` sind dort
+/// nur eine Aufschlüsselung desselben Werts, kein zusätzlicher Anteil. Eine
+/// Addition würde die Nutzung also doppelt zählen.
+///
+/// Ist ein Compact laut Policy fällig, läuft [`crate::compaction::compact_session`]
+/// mit einem aus `policy.context_window_tokens()` abgeleiteten
+/// [`crate::compaction::CompactionPlan`]; das Ergebnis wird bei Erfolg über
+/// `store.save_history` persistiert (der Store-Standardimpl **ersetzt** den
+/// gespeicherten Verlauf vollständig, siehe Doku von
+/// [`crate::state_store::StateStore::save_history`] — kein Anhängen, daher
+/// hier sicher verwendbar).
+///
+/// # Arguments
+/// - `session` (`&mut AgentSession`): deren Historie ggf. ersetzt wird.
+/// - `model` (`&dyn ModelProvider`): für den optionalen
+///   Zusammenfassungs-Aufruf innerhalb von `compact_session`.
+/// - `store` (`&dyn StateStore`): Ziel der Persistenz nach erfolgreichem
+///   Compact.
+/// - `last_round_usage` (`&harw_types::TokenUsage`): Nutzung der zuletzt
+///   abgeschlossenen Modell-Runde.
+/// - `task_completed` (`bool`): `true`, wenn der gerade beendete Abschnitt
+///   einen Plan-Schritt abgeschlossen hat (siehe
+///   [`turn_completed_a_plan_step`]).
+///
+/// # Concurrency
+/// `async`; führt höchstens einen Modellaufruf aus (innerhalb von
+/// `compact_session`) und einen Store-Aufruf. Fehler beider Seiten werden
+/// nur geloggt — ein Compact-Fehlschlag darf den Turn nie abbrechen.
+async fn maybe_compact(
+    session: &mut AgentSession,
+    model: &dyn ModelProvider,
+    store: &dyn StateStore,
+    last_round_usage: &harw_types::TokenUsage,
+    task_completed: bool,
+) {
+    let Some(policy) = session.auto_compact().copied() else {
+        return;
+    };
+
+    // Siehe Funktionsdoku: `input_tokens` umfasst bereits die
+    // zwischengespeicherten Tokens, `cached_tokens` wird bewusst nicht
+    // addiert.
+    let tokens_used = last_round_usage.input_tokens;
+    let decision = policy.decide(tokens_used, task_completed);
+    if !decision.should_compact() {
+        return;
+    }
+
+    let mut plan = crate::compaction::CompactionPlan::for_context_window(policy.context_window_tokens());
+    let (summary_provider, summary_model) = session.compaction_summary_model();
+    plan.summary_provider = summary_provider.cloned();
+    plan.summary_model = summary_model.cloned();
+    match crate::compaction::compact_session(session, model, &plan, Some(decision)).await {
+        Ok(outcome) => {
+            tracing::info!(
+                bytes_before = outcome.bytes_before,
+                bytes_after = outcome.bytes_after,
+                items_dropped = outcome.items_dropped,
+                summarized = outcome.summarized,
+                "turn_loop.auto_compact_applied",
+            );
+            if let Err(error) = store.save_history(session.id(), session.history()).await {
+                tracing::warn!(%error, "turn_loop.auto_compact_save_history_failed");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "turn_loop.auto_compact_failed");
+        }
+    }
+}
+
+/// Harte Verdichtung am Beginn eines neuen Auftrags-Turns einer bestehenden
+/// Orchestrator-Session (Addendum D).
+///
+/// # Description
+/// No-op, wenn die Session keine Policy trägt oder
+/// [`crate::auto_compact::AutoCompactPolicy::turn_start_target_tokens`]
+/// `None` ist (der Default; nur Root-/Sub-Orchestrator-Sessions setzen ihn,
+/// siehe `child_controller.rs`). Sonst wird die Verlaufs-Token-Zahl aus
+/// [`crate::compaction::estimated_history_tokens`] geschätzt; überschreitet
+/// sie das Ziel, läuft [`crate::compaction::compact_session`] mit einem
+/// [`crate::compaction::CompactionPlan::for_target_tokens`]-Plan und
+/// [`crate::auto_compact::CompactDecision::TurnStart`] als Grund, bevor die
+/// erste Modellrunde dieses Turns beginnt. Das Ergebnis wird bei Erfolg über
+/// `store.save_history` persistiert, wie bei [`maybe_compact`].
+///
+/// # Arguments
+/// - `session` (`&mut AgentSession`): deren Historie ggf. ersetzt wird.
+/// - `model` (`&dyn ModelProvider`): für den optionalen
+///   Zusammenfassungs-Aufruf innerhalb von `compact_session`.
+/// - `store` (`&dyn StateStore`): Ziel der Persistenz nach erfolgreichem
+///   Compact.
+///
+/// # Concurrency
+/// `async`; höchstens ein Modellaufruf und ein Store-Aufruf. Fehler beider
+/// Seiten werden nur geloggt — ein Fehlschlag darf den Turn nie abbrechen.
+async fn maybe_hard_compact_at_turn_start(
+    session: &mut AgentSession,
+    model: &dyn ModelProvider,
+    store: &dyn StateStore,
+) {
+    let Some(policy) = session.auto_compact().copied() else {
+        return;
+    };
+    let Some(target_tokens) = policy.turn_start_target_tokens() else {
+        return;
+    };
+    let estimated_tokens = crate::compaction::estimated_history_tokens(session.history());
+    if estimated_tokens <= target_tokens {
+        return;
+    }
+
+    let mut plan = crate::compaction::CompactionPlan::for_target_tokens(target_tokens);
+    let (summary_provider, summary_model) = session.compaction_summary_model();
+    plan.summary_provider = summary_provider.cloned();
+    plan.summary_model = summary_model.cloned();
+    match crate::compaction::compact_session(
+        session,
+        model,
+        &plan,
+        Some(crate::auto_compact::CompactDecision::TurnStart),
+    )
+    .await
+    {
+        Ok(outcome) => {
+            tracing::info!(
+                bytes_before = outcome.bytes_before,
+                bytes_after = outcome.bytes_after,
+                items_dropped = outcome.items_dropped,
+                summarized = outcome.summarized,
+                "turn_loop.turn_start_hard_compact_applied",
+            );
+            if let Err(error) = store.save_history(session.id(), session.history()).await {
+                tracing::warn!(%error, "turn_loop.turn_start_hard_compact_save_history_failed");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "turn_loop.turn_start_hard_compact_failed");
+        }
+    }
+}
+
+/// Prüft, ob der aktuelle Turn (alles ab der letzten `UserMessage`) einen
+/// Plan-Schritt abgeschlossen hat.
+///
+/// # Description
+/// Sucht rückwärts durch die Historie bis zur letzten `UserMessage` und
+/// prüft jeden darin enthaltenen `ToolCall`, dessen `tool_name` mit `"plan"`
+/// beginnt: gilt als „Plan-Schritt abgeschlossen", wenn die JSON-Argumente
+/// (beliebig verschachtelt) ein Feld `"status"` mit dem Wert `"completed"`
+/// oder `"done"` enthalten.
+///
+/// Zum Zeitpunkt dieser Implementierung existiert im Repository noch kein
+/// konkretes Plan-Tool (`harw-plan`/`harw-plan-bridge` definieren bislang
+/// keinen `ToolProvider`, siehe Bericht des Aufrufers) — Namenspräfix und
+/// Argument-Form folgen daher wörtlich dem Vertrag, nicht einer bestehenden
+/// Implementierung.
+///
+/// # Arguments
+/// - `session` (`&AgentSession`): dessen Historie geprüft wird.
+///
+/// # Returns
+/// `true`, wenn mindestens ein passender `ToolCall` im aktuellen Turn
+/// gefunden wurde.
+fn turn_completed_a_plan_step(session: &AgentSession) -> bool {
+    let items = session.history().items();
+    let turn_start = items
+        .iter()
+        .rposition(|item| matches!(item, TurnItem::UserMessage(_)))
+        .unwrap_or(0);
+    items[turn_start..].iter().any(|item| {
+        let TurnItem::ToolCall(call) = item else {
+            return false;
+        };
+        if !call.tool_name.starts_with("plan") {
+            return false;
+        }
+        json_contains_completed_status(&call.arguments)
+    })
+}
+
+/// Sucht rekursiv in einem `serde_json::Value` nach einem Feld `"status"`
+/// mit dem Wert `"completed"` oder `"done"`.
+fn json_contains_completed_status(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => map.iter().any(|(key, nested)| {
+            if key == "status" {
+                if let serde_json::Value::String(status) = nested {
+                    if status == "completed" || status == "done" {
+                        return true;
+                    }
+                }
+            }
+            json_contains_completed_status(nested)
+        }),
+        serde_json::Value::Array(items) => items.iter().any(json_contains_completed_status),
+        _ => false,
+    }
 }
 
 /// Beendet einen Turn nach einem [`TurnControl`]-Prüfpunkt-Treffer (Abbruch
@@ -2201,20 +2952,40 @@ async fn cancel_turn_with_pending_calls(
 /// # Returns
 /// `true`, wenn die Antwort vollständig parallel ausgeführt und persistiert
 /// wurde; `false`, wenn der Aufrufer den sequenziellen Pfad nehmen muss.
+/// Ergebnis von [`try_execute_parallel_calls`] für die Turn-Wächter-Anbindung
+/// (Addendum F+G): der Aufrufer (`drive_turn`) kennt `handle`/`total_usage`
+/// und beendet einen `Aborted`-Turn deshalb selbst über [`cancel_turn`].
+enum ParallelOutcome {
+    /// Der Parallel-Pfad war nicht anwendbar — der Aufrufer muss den
+    /// sequenziellen Pfad nehmen.
+    NotApplicable,
+    /// Alle Calls wurden parallel ausgeführt und persistiert.
+    Executed,
+    /// Ein `TurnGuard`-`Abort` ist mitten in der Ergebnisauslieferung
+    /// aufgetreten; alle Ergebnisse sind bereits (ggf. synthetisch) im
+    /// Verlauf gepaart.
+    Aborted(CancelReason),
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn try_execute_parallel_calls(
     session: &mut AgentSession,
     store: &dyn StateStore,
     ctx: &TurnInputContext,
     calls: &[ToolCall],
     prepared: &mut PreparedApprovals,
-) -> CoreResult<bool> {
+    mut guard: Option<&mut TurnGuard>,
+    seen_success_signatures: &mut HashSet<String>,
+    pending_hint: &mut Option<String>,
+    round_progressed: &mut bool,
+) -> CoreResult<ParallelOutcome> {
     if calls.len() < 2 || calls.iter().any(|call| handoff_role(&call.name).is_some()) {
-        return Ok(false);
+        return Ok(ParallelOutcome::NotApplicable);
     }
     let mut jobs = Vec::with_capacity(calls.len());
     for call in calls {
         let Some(executor) = find_parallel_executor(session, &call.name) else {
-            return Ok(false);
+            return Ok(ParallelOutcome::NotApplicable);
         };
         jobs.push((call.clone(), executor));
     }
@@ -2222,11 +2993,11 @@ async fn try_execute_parallel_calls(
         Ok(context) => context,
         Err(error) => {
             missing_tool_execution_context_result(error)?;
-            return Ok(false);
+            return Ok(ParallelOutcome::NotApplicable);
         }
     };
     if !preflight_approvals(session, calls, prepared).await {
-        return Ok(false);
+        return Ok(ParallelOutcome::NotApplicable);
     }
 
     for (call, _) in &jobs {
@@ -2252,6 +3023,8 @@ async fn try_execute_parallel_calls(
         let execution_context = execution_context.clone();
         let tool_name = call.name.to_string();
         let tool_span = tracing::info_span!("tool.call", tool_name = %tool_name);
+        let arguments_for_capture = call.arguments.clone();
+        let tool_name_for_capture = tool_name.clone();
         joins.spawn(
             async move {
                 let started = std::time::Instant::now();
@@ -2265,21 +3038,47 @@ async fn try_execute_parallel_calls(
                     status = if result.is_success() { "ok" } else { "err" },
                     "tool.execute",
                 );
-                (position, call.id, result, duration_ms)
+                (
+                    position,
+                    call.id,
+                    result,
+                    duration_ms,
+                    tool_name_for_capture,
+                    arguments_for_capture,
+                )
             }
             .instrument(tool_span),
         );
     }
     let mut results: Vec<ParallelCallSlot> = vec![None; calls.len()];
     while let Some(joined) = joins.join_next().await {
-        let (position, call_id, result, duration_ms) =
+        let (position, call_id, result, duration_ms, tool_name, arguments) =
             joined.map_err(|error| CoreError::ToolFailed(error.to_string()))?;
-        results[position] = Some((call_id, result, duration_ms));
+        results[position] = Some((call_id, result, duration_ms, tool_name, arguments));
     }
-    for result in results {
-        let (call_id, value, duration_ms) = result.ok_or_else(|| {
+    // `while let` über den Positions-Iterator statt `for`: bei einem
+    // `TurnGuard`-`Abort` mitten in der Auslieferung (Addendum F+G) brauchen
+    // die noch nicht ausgelieferten, aber bereits abgeschlossenen Ergebnisse
+    // weiterhin ein synthetisches `tool_result` — ihr `tool_call` steht schon
+    // im Verlauf (oben, vor dem Start der parallelen Ausführung).
+    let mut results_iter = results.into_iter();
+    let mut aborted: Option<CancelReason> = None;
+    for result in results_iter.by_ref() {
+        let (call_id, mut value, duration_ms, tool_name, arguments) = result.ok_or_else(|| {
             CoreError::ToolFailed("parallel tool scheduler lost a completed call".to_owned())
         })?;
+        let abort_reason = apply_tool_guard(
+            session,
+            store,
+            guard.as_deref_mut(),
+            seen_success_signatures,
+            pending_hint,
+            round_progressed,
+            &tool_name,
+            &arguments,
+            &mut value,
+        )
+        .await;
         emit(
             session,
             TurnEvent::ToolCallCompleted {
@@ -2289,12 +3088,32 @@ async fn try_execute_parallel_calls(
                 duration_ms,
             },
         );
+        notify_tool_outcome(session, &tool_name, &arguments, &value);
+        notify_progress(session);
         session
             .history_mut()
             .push_tool_result(call_id, value, duration_ms);
         persist_last(session, store).await?;
+        if let Some(reason) = abort_reason {
+            aborted = Some(reason);
+            break;
+        }
     }
-    Ok(true)
+    if let Some(reason) = aborted {
+        for result in results_iter {
+            let (call_id, _value, _duration_ms, _tool_name, _arguments) = result.ok_or_else(|| {
+                CoreError::ToolFailed("parallel tool scheduler lost a completed call".to_owned())
+            })?;
+            session.history_mut().push_tool_result(
+                call_id,
+                ToolCallResult::error(format!("turn cancelled before delivery ({reason:?})")),
+                0,
+            );
+            persist_last(session, store).await?;
+        }
+        return Ok(ParallelOutcome::Aborted(reason));
+    }
+    Ok(ParallelOutcome::Executed)
 }
 
 /// Holt für jeden Call die Guardrail-Entscheidung ein, bis eine davon nicht
@@ -2764,6 +3583,17 @@ mod tests {
             !names.contains(&"fs.write".to_owned()),
             "fs.write must be hidden by override"
         );
+    }
+
+    #[test]
+    fn test_collect_tools_sorted_by_name() {
+        // Absichtlich unsortiert registriert — die Provider-Reihenfolge darf
+        // die Reihenfolge im Tool-Array nicht bestimmen (Prompt-Cache).
+        let provider = StubToolProvider::with_names(&["zeta.tool", "alpha.tool", "mid.tool"]);
+        let session = make_session(provider, SessionActivation::new(ToolProfile::Full));
+        let tools = collect_tools(&session).expect("collect_tools should not fail");
+        let names: Vec<_> = tools.iter().map(ToolSpec::name).collect();
+        assert_eq!(names, vec!["alpha.tool", "mid.tool", "zeta.tool"]);
     }
 
     // ------------------------------------------------------------------
@@ -3416,6 +4246,76 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Addendum B: Projektgedächtnis-Erfassung (`ToolOutcomeObserver`)
+    // ------------------------------------------------------------------
+
+    /// Zeichnet jedes gemeldete Tool-Ergebnis auf, statt es irgendwo
+    /// abzulegen — genügt, um zu prüfen, dass `run_turn` den Beobachter
+    /// tatsächlich mit Name und Status erreicht.
+    struct RecordingObserver {
+        outcomes: Mutex<Vec<(String, crate::capture::ToolOutcomeStatus)>>,
+        turns_finished: AtomicUsize,
+    }
+
+    impl RecordingObserver {
+        fn new() -> Self {
+            Self {
+                outcomes: Mutex::new(Vec::new()),
+                turns_finished: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl crate::capture::ToolOutcomeObserver for RecordingObserver {
+        fn on_tool_outcome(
+            &self,
+            _session_id: &harw_types::SessionId,
+            outcome: &crate::capture::ToolOutcome<'_>,
+        ) {
+            self.outcomes
+                .lock()
+                .expect("test outcome lock is not poisoned")
+                .push((outcome.tool_name.to_owned(), outcome.status));
+        }
+
+        fn on_turn_finished(&self, _session_id: &harw_types::SessionId) {
+            self.turns_finished.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_outcome_observer_sees_a_successful_tool_call() {
+        let only = ToolCallId::new();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(CountingApproval::allow_everything());
+        let provider = StubParallelProvider::instant(&["lookup"], Arc::clone(&executions));
+        let observer = Arc::new(RecordingObserver::new());
+        let mut session =
+            guarded_session(provider, Arc::clone(&handler)).with_tool_outcome_observer(Some(
+                Arc::clone(&observer) as Arc<dyn crate::capture::ToolOutcomeObserver>
+            ));
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![
+            response_with(vec![call(&only, "lookup")]),
+            crate::model::ModelResponse::text("erledigt"),
+        ]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("single"))
+            .await
+            .expect("ein einzelner Call läuft seriell");
+
+        assert!(matches!(outcome, TurnOutcome::Completed));
+        let recorded = observer
+            .outcomes
+            .lock()
+            .expect("test outcome lock is not poisoned");
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].0, "lookup");
+        assert_eq!(recorded[0].1, crate::capture::ToolOutcomeStatus::Success);
+        assert_eq!(observer.turns_finished.load(Ordering::SeqCst), 1);
+    }
+
+    // ------------------------------------------------------------------
     // W1-05: Aggregation Deny > AskUser > Allow über alle Handler
     // ------------------------------------------------------------------
 
@@ -3817,5 +4717,208 @@ mod tests {
             1,
             "drive_turn must record the one model round it actually ran"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // maybe_compact tests
+    // ------------------------------------------------------------------
+
+    /// Sammelt den letzten `CompactionOutcome`, den `maybe_compact` über
+    /// `compact_session` erzeugt hat — Test-Double für
+    /// [`crate::compaction::CompactionObserver`].
+    struct RecordingCompactionObserver {
+        last: Mutex<Option<crate::compaction::CompactionOutcome>>,
+    }
+
+    impl RecordingCompactionObserver {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                last: Mutex::new(None),
+            })
+        }
+    }
+
+    impl crate::compaction::CompactionObserver for RecordingCompactionObserver {
+        fn on_compacted(&self, _session_id: &SessionId, outcome: &crate::compaction::CompactionOutcome) {
+            *self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome.clone());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_maybe_compact_noop_without_policy() {
+        // `AgentSession::auto_compact` ist standardmäßig `None` — bestehende
+        // Sessions, die nie opt-in, dürfen von `maybe_compact` nicht berührt
+        // werden.
+        let provider = StubToolProvider::with_names(&[]);
+        let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
+        session.history_mut().push_user_text("hallo");
+        let observer = RecordingCompactionObserver::new();
+        session = session.with_compaction_observer(Some(observer.clone()));
+        let store = crate::state_store::InMemoryStateStore::new();
+        let usage = harw_types::TokenUsage {
+            input_tokens: u64::MAX,
+            output_tokens: 0,
+            reasoning_tokens: None,
+            cached_tokens: None,
+            cache_write_tokens: None,
+        };
+
+        maybe_compact(
+            &mut session,
+            &crate::model::EchoModelProvider::default(),
+            &store,
+            &usage,
+            true,
+        )
+        .await;
+
+        assert!(
+            observer
+                .last
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "no policy set ⇒ compact_session must never run"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_maybe_compact_triggers_and_shrinks_history_with_tiny_policy() {
+        // Winziges Kontextfenster ⇒ winzige Schwellen (70/30 Tokens), leicht
+        // von einer kleinen künstlichen Nutzung überschritten.
+        let policy = crate::auto_compact::AutoCompactPolicy::for_context_window(100);
+        let provider = StubToolProvider::with_names(&[]);
+        let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full))
+            .with_auto_compact(Some(policy));
+        let observer = RecordingCompactionObserver::new();
+        session = session.with_compaction_observer(Some(observer.clone()));
+        // Genug wiederholte, deterministisch deduplizierbare Items, damit
+        // `deterministic_pass` die Historie sichtbar schrumpft.
+        for i in 0..20 {
+            session.history_mut().push_user_text("frage");
+            session.history_mut().push_assistant_text(
+                format!("wiederholte, ausführliche Antwort Nummer {i} mit etwas mehr Text"),
+                None,
+            );
+        }
+        let bytes_before: usize = session
+            .history()
+            .items()
+            .iter()
+            .map(|item| serde_json::to_vec(item).map(|v| v.len()).unwrap_or(0))
+            .sum();
+        let store = crate::state_store::InMemoryStateStore::new();
+        // Über der Task-Ende-Schwelle (30), unter der Budget-Schwelle (70)
+        // ⇒ `CompactDecision::TaskCompleted`.
+        let usage = harw_types::TokenUsage {
+            input_tokens: 40,
+            output_tokens: 0,
+            reasoning_tokens: None,
+            cached_tokens: None,
+            cache_write_tokens: None,
+        };
+
+        maybe_compact(
+            &mut session,
+            &crate::model::EchoModelProvider::default(),
+            &store,
+            &usage,
+            true,
+        )
+        .await;
+
+        let outcome = observer
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("policy set and thresholds exceeded ⇒ compact_session must run");
+        assert_eq!(
+            outcome.reason,
+            Some(crate::auto_compact::CompactDecision::TaskCompleted)
+        );
+        let bytes_after: usize = session
+            .history()
+            .items()
+            .iter()
+            .map(|item| serde_json::to_vec(item).map(|v| v.len()).unwrap_or(0))
+            .sum();
+        assert!(
+            bytes_after <= bytes_before,
+            "compaction must not grow the history (before={bytes_before}, after={bytes_after})"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // maybe_hard_compact_at_turn_start tests (Addendum D)
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_turn_start_hard_compact_noop_without_target() {
+        // Policy ohne `with_turn_start_target` ⇒ kein Turn-Start-Compact,
+        // unabhängig von der Verlaufsgröße (Worker-Kinder betrifft das).
+        let policy = crate::auto_compact::AutoCompactPolicy::for_context_window(200_000);
+        let provider = StubToolProvider::with_names(&[]);
+        let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full))
+            .with_auto_compact(Some(policy));
+        let observer = RecordingCompactionObserver::new();
+        session = session.with_compaction_observer(Some(observer.clone()));
+        for i in 0..20 {
+            session.history_mut().push_user_text("frage");
+            session.history_mut().push_assistant_text(format!("antwort {i}"), None);
+        }
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        maybe_hard_compact_at_turn_start(
+            &mut session,
+            &crate::model::EchoModelProvider::default(),
+            &store,
+        )
+        .await;
+
+        assert!(
+            observer
+                .last
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "no turn_start_target ⇒ compact_session must never run"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_turn_start_hard_compact_triggers_above_target() {
+        // Winziges Ziel ⇒ die künstlich aufgeblähte Historie liegt sicher
+        // darüber und löst die harte Verdichtung aus.
+        let policy = crate::auto_compact::AutoCompactPolicy::for_context_window(200_000)
+            .with_turn_start_target(Some(10));
+        let provider = StubToolProvider::with_names(&[]);
+        let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full))
+            .with_auto_compact(Some(policy));
+        let observer = RecordingCompactionObserver::new();
+        session = session.with_compaction_observer(Some(observer.clone()));
+        for i in 0..20 {
+            session.history_mut().push_user_text("frage");
+            session.history_mut().push_assistant_text(
+                format!("wiederholte, ausführliche Antwort Nummer {i} mit etwas mehr Text"),
+                None,
+            );
+        }
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        maybe_hard_compact_at_turn_start(
+            &mut session,
+            &crate::model::EchoModelProvider::default(),
+            &store,
+        )
+        .await;
+
+        let outcome = observer
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect("history far above the tiny target ⇒ compact_session must run");
+        assert_eq!(outcome.reason, Some(crate::auto_compact::CompactDecision::TurnStart));
     }
 }
