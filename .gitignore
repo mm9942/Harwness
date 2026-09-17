@@ -47,3 +47,9 @@ harw-export-*
 
 # lokale/experimentelle Räume, nicht Teil des Projekts
 /spaces/
+
+# Zu grosse Codex-Session-Transkripte (bleiben lokal in docs/sessions/, nie tracken)
+/docs/sessions/codex-session-01a0afe0-*.md
+
+# Temporäre Arbeitsdateien im Root
+.tmp_*
