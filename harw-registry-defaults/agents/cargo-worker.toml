@@ -1,0 +1,75 @@
+# Cargo-Worker — Bubblewrap-Sandbox mit aktiviertem Cargo-Modul.
+#
+# Dieser Worker führt Cargo-Befehle (build, check, test, fetch) in einer
+# isolierten Bubblewrap-Sandbox aus, die eine vertrauenswürdige Cargo-Toolchain
+# (cargo, rustup, CARGO_HOME) bindet. Die Toolchain wird beim Runtime-Aufbau
+# aus der `[sandbox.cargo]`-Konfiguration validiert und als `SandboxProfile::Cargo`
+# an die Registry weitergegeben.
+#
+# ── Abgrenzung zum `sandbox-shell-worker` ──────────────────────────────────
+# Der `sandbox-shell-worker` trägt `Strict` und hat keinen Zugriff auf eine
+# Toolchain. Dieser Worker trägt `Cargo` — er kann `cargo build`, `cargo test`
+# etc. ausführen, aber nur gegen die konfigurierte Toolchain. Netzwerkzugriff
+# wird durch das `CargoSandboxProfile`-Modul geregelt (`Inspect`, `BuildOffline`,
+# `Fetch`).
+#
+# ── `admitted` deckt `ShellExecution` vollständig ab ───────────────────────
+# Genau wie `executor` und `sandbox-shell-worker`: `shell.exec` ist das
+# einzige zugelassene Werkzeug. Der Unterschied liegt nicht in der
+# Werkzeugoberfläche, sondern im Sandbox-Profil, das der Runtime-Aufbau setzt.
+#
+# ── Rückgabevertrag ──────────────────────────────────────────────────────
+# `harwness.return.execution-summary@1`: kurze Zusammenfassung, keine Rohausgaben.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.cargo-worker@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "cargo-worker"
+
+name = "Cargo Worker"
+description = "Führt Cargo-Befehle in einer isolierten Sandbox mit vertrauenswürdiger Toolchain aus."
+
+[work]
+mode = "delegated-execution"
+may_write_code = false
+may_research_web = false
+
+[tools]
+admitted = ["shell.exec"]
+forbidden = [
+  "fs.read",
+  "fs.search",
+  "fs.list",
+  "fs.glob",
+  "fs.grep",
+  "fs.write",
+  "web.fetch",
+  "web.docs_rs",
+  "web.crates_io",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+  "lens.ask",
+  "browser.open",
+  "browser.observe",
+  "browser.find",
+  "browser.act",
+  "browser.wait",
+  "browser.events",
+  "browser.close",
+]
+
+[spawn]
+max_depth = 0
+
+[spawn.budget]
+max_tokens = 80000
+max_tool_calls = 50
+max_wall_secs = 300
+
+[return]
+contract = "harwness.return.execution-summary@1"

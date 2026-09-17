@@ -35,7 +35,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 
-use crate::{CargoExecutionMode, CargoSandboxProfile, NetworkMode, Permission, RelaySpec, SandboxError, SandboxResult, SandboxSpec};
+use crate::{CargoExecutionMode, CargoSandboxProfile, NetworkMode, Permission, RelaySpec, SandboxError, SandboxResult, SandboxSpec, TmuxSandboxProfile, SANDBOX_TMUX_SOCKET_PATH, SandboxProfile};
 
 /// Feste Suchpfade für Bubblewrap in Prioritätsreihenfolge. `PATH` wird nie
 /// ausgewertet.
@@ -78,6 +78,10 @@ pub struct BwrapLauncher {
     /// Netzmodus; Default [`NetworkMode::None`]. Nie Host-netns.
     network_mode: NetworkMode,
     cargo_profile: Option<CargoSandboxProfile>,
+    /// Optionales tmux-Inspektionsprofil; bindet nur einen einzelnen,
+    /// beim Aufbau validierten Socket unter
+    /// [`SANDBOX_TMUX_SOCKET_PATH`] in die Sandbox.
+    tmux_profile: Option<TmuxSandboxProfile>,
 }
 
 impl Default for BwrapLauncher {
@@ -100,6 +104,7 @@ impl BwrapLauncher {
             tmpfs_size: None,
             network_mode: NetworkMode::None,
             cargo_profile: None,
+            tmux_profile: None,
         }
     }
 
@@ -200,6 +205,54 @@ impl BwrapLauncher {
         self
     }
 
+    /// Bindet ein zuvor validiertes tmux-Inspektionsprofil an diesen Launcher.
+    /// Das Profil kann nur beim Aufbau des Launchers gesetzt werden; Tool-Aufrufe
+    /// können es nicht liefern oder überschreiben.
+    #[must_use]
+    pub fn with_tmux_profile(mut self, profile: TmuxSandboxProfile) -> Self {
+        self.tmux_profile = Some(profile);
+        self
+    }
+
+    /// Das konfigurierte tmux-Profil, falls die Sandbox tmux anbietet.
+    #[must_use]
+    pub fn tmux_profile(&self) -> Option<&TmuxSandboxProfile> {
+        self.tmux_profile.as_ref()
+    }
+
+    /// Setzt ein gebündeltes [`SandboxProfile`] und konfiguriert damit alle
+    /// Module in einem Schritt. `Strict` löscht Cargo/tmux; `Cargo` und `Tmux`
+    /// setzen das jeweilige Profil; `Host` ist ein Marker, der hier keine
+    /// Sandbox-Bindungen aktiviert (Host-Ausführung wird separat behandelt).
+    ///
+    /// Diese Methode ist der bevorzugte Weg, ein Profil zu setzen. Sie ersetzt
+    /// nicht die individuellen Builder, erlaubt aber dem Runtime-Aufbau, ein
+    /// komplettes Profil in einem Aufruf zu übernehmen.
+    #[must_use]
+    pub fn with_profile(mut self, profile: &SandboxProfile) -> Self {
+        match profile {
+            SandboxProfile::Strict => {
+                self.cargo_profile = None;
+                self.tmux_profile = None;
+            }
+            SandboxProfile::Cargo(cargo) => {
+                self.cargo_profile = Some(cargo.clone());
+                self.tmux_profile = None;
+            }
+            SandboxProfile::Tmux(tmux) => {
+                self.cargo_profile = None;
+                self.tmux_profile = Some(tmux.clone());
+            }
+            SandboxProfile::Host => {
+                // Host-Modus aktiviert keine Sandbox-Bindungen.
+                // Die eigentliche Host-Ausführung wird separat behandelt.
+                self.cargo_profile = None;
+                self.tmux_profile = None;
+            }
+        }
+        self
+    }
+
     /// Das konfigurierte Cargo-Profil, falls die Sandbox Rust-Builds anbietet.
     #[must_use]
     pub fn cargo_profile(&self) -> Option<&CargoSandboxProfile> {
@@ -294,6 +347,16 @@ impl BwrapLauncher {
             if profile.mode().offline() {
                 args.extend([OsString::from("--setenv"), OsString::from("CARGO_NET_OFFLINE"), OsString::from("true")]);
             }
+        }
+
+        if let Some(tmux) = &self.tmux_profile {
+            let socket_writable = tmux.mode().socket_writable();
+            append_destination_dirs(&mut args, Path::new(SANDBOX_TMUX_SOCKET_PATH).parent().expect("fixed tmux socket path has a parent"))?;
+            args.push(if socket_writable { OsString::from("--bind") } else { OsString::from("--ro-bind") });
+            args.extend([
+                tmux.socket_path().as_os_str().to_owned(),
+                OsString::from(SANDBOX_TMUX_SOCKET_PATH),
+            ]);
         }
 
         for directory in ["/usr", "/bin", "/lib", "/lib64"] {
@@ -1178,5 +1241,61 @@ mod tests {
             error,
             SandboxError::SandboxProcessSpawn { ref reason, .. } if reason.contains("absolute")
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_profile_binds_socket_readonly_in_inspect_mode() {
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("harwness-bwrap-tmux-inspect-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("tmux.sock");
+        let _listener = UnixListener::bind(&sock).unwrap();
+        let profile = crate::TmuxSandboxProfile::new(crate::TmuxOperationMode::Inspect, &sock).unwrap();
+        let launcher = BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
+            .with_tmux_profile(profile);
+        let args = strings(
+            &launcher.plan(&execute_sandbox(), &[OsString::from("/bin/true")]).unwrap(),
+        );
+        // Socket wird ge-binded (ro-bind im Inspect-Modus)
+        assert_eq!(
+            count_window(&args, &["--ro-bind", sock.to_str().unwrap(), SANDBOX_TMUX_SOCKET_PATH]),
+            1,
+            "tmux socket must be bound read-only in inspect mode: {args:?}"
+        );
+        // Kein --bind fuer den Socket
+        assert_eq!(
+            count_window(&args, &["--bind", sock.to_str().unwrap(), SANDBOX_TMUX_SOCKET_PATH]),
+            0
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_profile_binds_socket_writable_in_write_mode() {
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("harwness-bwrap-tmux-write-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("tmux-write.sock");
+        let _listener = UnixListener::bind(&sock).unwrap();
+        let profile = crate::TmuxSandboxProfile::new(crate::TmuxOperationMode::Write, &sock).unwrap();
+        let launcher = BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
+            .with_tmux_profile(profile);
+        let args = strings(
+            &launcher.plan(&execute_sandbox(), &[OsString::from("/bin/true")]).unwrap(),
+        );
+        assert_eq!(
+            count_window(&args, &["--bind", sock.to_str().unwrap(), SANDBOX_TMUX_SOCKET_PATH]),
+            1,
+            "tmux socket must be bound writable in write mode: {args:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn tmux_profile_absent_by_default() {
+        let launcher = BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"));
+        assert!(launcher.tmux_profile().is_none());
     }
 }

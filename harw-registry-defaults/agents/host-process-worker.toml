@@ -1,0 +1,76 @@
+# Host-Process-Worker — lokale Host-Ausführung, nur nach UI-Approval.
+#
+# Dieser Worker führt Befehle direkt auf dem Host aus, ohne Bubblewrap-Sandbox.
+# Er trägt `SandboxProfile::Host` und benötigt zwingend einen gültigen
+# `ProcessPermit` — ein sitzungsgebundener, vom Modell nicht formulierbarer
+# Freigabeschein, der über die lokale UI ausgelöst wird.
+#
+# ── Fail-closed ──────────────────────────────────────────────────────────
+# Ohne gültigen Permit lehnt der `ShellExecutor` die Ausführung ab. Der Worker
+# kann die Sandbox nicht selbst lockern, das Profil nicht setzen und keinen
+# Permit selbst ausstellen.
+#
+# ── Abgrenzung ────────────────────────────────────────────────────────────
+# Dieser Worker ist die einzige Möglichkeit zur Host-Ausführung. Alle anderen
+# Worker tragen `Strict`, `Cargo` oder `Tmux` und bleiben innerhalb der
+# Bubblewrap-Sandbox. Ein Kind-Agent kann niemals ein Host-Profil beantragen
+# oder erzwingen.
+#
+# ── `admitted` deckt `ShellExecution` vollständig ab ───────────────────────
+# `shell.exec` ist das einzige zugelassene Werkzeug.
+#
+# ── Rückgabevertrag ──────────────────────────────────────────────────────
+# `harwness.return.execution-summary@1`.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.host-process-worker@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "host-process-worker"
+
+name = "Host Process Worker"
+description = "Führt Befehle auf dem Host aus — nur mit gültigem ProcessPermit, sonst fail-closed."
+
+[work]
+mode = "delegated-execution"
+may_write_code = false
+may_research_web = false
+
+[tools]
+admitted = ["shell.exec"]
+forbidden = [
+  "fs.read",
+  "fs.search",
+  "fs.list",
+  "fs.glob",
+  "fs.grep",
+  "fs.write",
+  "web.fetch",
+  "web.docs_rs",
+  "web.crates_io",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+  "lens.ask",
+  "browser.open",
+  "browser.observe",
+  "browser.find",
+  "browser.act",
+  "browser.wait",
+  "browser.events",
+  "browser.close",
+]
+
+[spawn]
+max_depth = 0
+
+[spawn.budget]
+max_tokens = 60000
+max_tool_calls = 40
+max_wall_secs = 180
+
+[return]
+contract = "harwness.return.execution-summary@1"

@@ -1,0 +1,73 @@
+# tmux-Inspector-Worker — Bubblewrap-Sandbox mit einem einzelnen tmux-Socket.
+#
+# Dieser Worker führt lesende (und optional schreibende) tmux-Operationen
+# (`list-sessions`, `capture-pane`, `send-keys`) in einer isolierten Bubblewrap-
+# Sandbox aus, die ausschließlich einen einzigen, beim Aufbau validierten
+# lokalen tmux-Socket bindet. Kein pauschales `/tmp` oder `$HOME`.
+#
+# ── Abgrenzung ────────────────────────────────────────────────────────────
+# Der `sandbox-shell-worker` trägt `Strict` und hat keinen Socket. Dieser Worker
+# trägt `Tmux` — er kann mit einem laufenden tmux-Server kommunizieren, aber
+# nur über den konfigurierten Socket. Der Modus (`Inspect`/`Write`) wird vom
+# `TmuxSandboxProfile` vorgegeben; `Write` erfordert eine separate, zustim-
+# mungspflichtige Freigabe.
+#
+# ── `admitted` deckt `ShellExecution` vollständig ab ───────────────────────
+# `shell.exec` ist das einzige zugelassene Werkzeug. Der tmux-Socket ist ein
+# Sandbox-Binding, kein Werkzeug.
+#
+# ── Rückgabevertrag ──────────────────────────────────────────────────────
+# `harwness.return.execution-summary@1`.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.tmux-inspector-worker@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "tmux-inspector-worker"
+
+name = "tmux Inspector Worker"
+description = "Führt tmux-Operationen über einen einzelnen validierten Socket in isolierter Sandbox aus."
+
+[work]
+mode = "delegated-execution"
+may_write_code = false
+may_research_web = false
+
+[tools]
+admitted = ["shell.exec"]
+forbidden = [
+  "fs.read",
+  "fs.search",
+  "fs.list",
+  "fs.glob",
+  "fs.grep",
+  "fs.write",
+  "web.fetch",
+  "web.docs_rs",
+  "web.crates_io",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+  "lens.ask",
+  "browser.open",
+  "browser.observe",
+  "browser.find",
+  "browser.act",
+  "browser.wait",
+  "browser.events",
+  "browser.close",
+]
+
+[spawn]
+max_depth = 0
+
+[spawn.budget]
+max_tokens = 40000
+max_tool_calls = 30
+max_wall_secs = 120
+
+[return]
+contract = "harwness.return.execution-summary@1"

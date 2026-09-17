@@ -1,0 +1,73 @@
+# Sandbox-Shell-Worker — strikte Bubblewrap-Sandbox, kein Cargo, kein tmux.
+#
+# Dieser Worker ersetzt den breiten `executor` für Standard-Prozesse: er führt
+# ausschließlich eng beauftragte Befehle in der strikten Bubblewrap-Sandbox aus
+# (kein Cargo, kein tmux-Socket, kein Host-Zugriff). Der Standard bleibt
+# hermetisch.
+#
+# ── Warum ein eigener Worker statt `executor` ─────────────────────────────────
+# Die modulare Sandbox teilt die Ausführung in Profile: Standard, Cargo, tmux
+# und Host. Dieser Worker trägt das `Strict`-Profil — er hat keinen Zugriff auf
+# eine Toolchain oder einen tmux-Socket und braucht deshalb auch keine
+# entsprechenden Werkzeuge. Ein `cargo-worker` übernimmt Build-Aufträge, ein
+# `tmux-inspector-worker` übernimmt tmux-Abfragen.
+#
+# ── `admitted` deckt `ShellExecution` vollständig ab ───────────────────────
+# Genau wie `executor`: `shell.exec` ist das einzige zugelassene Werkzeug.
+# Die Deckungsprüfung `tests/tool_admission_coverage.rs` verlangt Gleichheit.
+#
+# ── Rückgabevertrag ──────────────────────────────────────────────────────
+# `harwness.return.execution-summary@1`: kurze Zusammenfassung, keine Rohausgaben.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.sandbox-shell-worker@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "worker"
+specialization = "sandbox-shell-worker"
+
+name = "Sandbox Shell Worker"
+description = "Führt Befehle in der strikten Bubblewrap-Sandbox aus — kein Cargo, kein tmux, kein Host."
+
+[work]
+mode = "delegated-execution"
+may_write_code = false
+may_research_web = false
+
+[tools]
+admitted = ["shell.exec"]
+forbidden = [
+  "fs.read",
+  "fs.search",
+  "fs.list",
+  "fs.glob",
+  "fs.grep",
+  "fs.write",
+  "web.fetch",
+  "web.docs_rs",
+  "web.crates_io",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+  "lens.ask",
+  "browser.open",
+  "browser.observe",
+  "browser.find",
+  "browser.act",
+  "browser.wait",
+  "browser.events",
+  "browser.close",
+]
+
+[spawn]
+max_depth = 0
+
+[spawn.budget]
+max_tokens = 60000
+max_tool_calls = 40
+max_wall_secs = 180
+
+[return]
+contract = "harwness.return.execution-summary@1"

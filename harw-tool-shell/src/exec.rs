@@ -36,7 +36,10 @@
 use crate::capture::{BoundedCapture, DrainEnd};
 use crate::limits::{ShellLimits, ShellLimitsError, launch_command};
 use harw_extension_api::contributors::ToolProvider;
-use harw_sandbox::{BwrapLauncher, Permission, SandboxSpec};
+use harw_sandbox::{
+    BwrapLauncher, HostApprovalScope, HostPermitSessionRegistry, Permission, ProcessEnvironment,
+    ProcessPermitLedger, ProcessPermitRequest, SandboxProfile, SandboxSpec,
+};
 use harw_tools::{
     schema::{AdditionalProperties, JsonSchema, JsonSchemaType},
     spec::{FunctionToolSpec, ToolName, ToolSpec},
@@ -66,6 +69,16 @@ const TRUNCATION_MARKER: &str = "\n[...truncated...]";
 /// Obergrenze für das Einsammeln des Exit-Status nach SIGKILL. `kill_on_drop` bleibt
 /// als Rückfallebene, falls der Kernel den Prozess nicht rechtzeitig freigibt.
 const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Einzige heute existierende Worker-Definition, die [`SandboxProfile::Host`]
+/// aktiviert (siehe `harw-registry-defaults/agents/host-process-worker.toml`).
+/// Sobald ein zweiter Host-fähiger Worker entsteht, muss dieser Konstante ein
+/// echtes, aus der Worker-Konfiguration gespeistes Feld auf
+/// [`ShellToolProvider`]/[`ShellExecutor`] folgen.
+const HOST_WORKER_DEFINITION: &str = "host-process-worker@1";
+/// Dauer einer per lokaler UI bestätigten Host-Sitzungsfreigabe, bevor sie
+/// ohne explizites Sitzungsende automatisch verfällt (Verteidigungslinie
+/// gegen eine vergessene, nie beendete Sitzung).
+const HOST_SESSION_LEASE_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 
 // ── ShellExecError ────────────────────────────────────────────────────────────
 
@@ -194,6 +207,18 @@ pub struct ShellExecutor {
     timeout_secs: u64,
     max_output_bytes: usize,
     limits: ShellLimits,
+    /// Vertrauenswürdiges Sandbox-Profil, vom Runtime-Aufbau gesetzt.
+    /// Tool-Aufrufe können es nicht setzen oder überschreiben.
+    sandbox_profile: SandboxProfile,
+    /// Optionaler Permit-Ledger; vorhanden, wenn die Runtime Permit-
+    /// geschützte Ausführung aktiviert hat. Fehlt er, ist die Ausführung
+    /// nur mit ExecuteProcess-Berechtigung erlaubt (keine Host-Ausführung).
+    permit_ledger: Option<Arc<ProcessPermitLedger>>,
+    /// Sitzungsseitige Zuordnung von UI-Zustimmungen zu bereits ausgestellten
+    /// Permits (siehe [`harw_sandbox::HostPermitSessionRegistry`]). Fehlt sie,
+    /// verhält sich Host-Ausführung wie ohne jede Sitzungs-Vorgeschichte:
+    /// jeder Befehl braucht einen frisch über die UI ausgestellten Permit.
+    host_permit_registry: Option<Arc<HostPermitSessionRegistry>>,
 }
 
 impl ShellExecutor {
@@ -274,12 +299,95 @@ impl ShellExecutor {
         (stdout, stderr, stdout_truncated || stderr_truncated)
     }
 
+    /// Prüft für Host-Profil-Ausführung, dass ein gültiger Permit
+    /// den konkreten Antrag trägt, und stellt bei Bedarf einen neuen Permit
+    /// für einen bereits sitzungsweit zugestimmten Auftrag aus.
+    ///
+    /// # Description
+    /// Baut zunächst den kanonischen [`ProcessPermitRequest`] aus Sitzung,
+    /// Worker-Definition, dem exakten Befehlstext und der aufgelösten
+    /// Workspace-Wurzel. Drei Fälle:
+    /// 1. Für genau diesen Antrag existiert bereits ein gemerkter Permit
+    ///    (siehe [`HostPermitSessionRegistry::lookup_permit`]): er wird über
+    ///    [`ProcessPermitLedger::authorize`] direkt verwendet.
+    /// 2. Kein gemerkter Permit, aber die Sitzung hat der lokalen UI bereits
+    ///    einmalig zugestimmt (siehe [`HostPermitSessionRegistry::is_session_approved`]):
+    ///    ein neuer Permit wird für genau diesen Antrag über
+    ///    [`ProcessPermitLedger::issue_after_local_approval`] ausgestellt,
+    ///    gemerkt und sofort autorisiert. So muss die lokale UI nur einmal je
+    ///    Sitzung fragen, nicht für jeden neuen Befehlstext erneut.
+    /// 3. Weder ein gemerkter Permit noch eine Sitzungszustimmung: Ablehnung.
+    ///
+    /// # Errors
+    /// Liefert eine für das Modell lesbare Ablehnungsnachricht als `Err(String)`,
+    /// niemals interne Details über andere Permits oder Sitzungen.
+    fn authorize_host_command(
+        &self,
+        args: &ShellExecArgs,
+        sandbox: &SandboxSpec,
+        session_id: &str,
+    ) -> Result<(), String> {
+        let Some(ledger) = &self.permit_ledger else {
+            return Err(
+                "shell.exec: host execution requires a process permit,                  but no permit ledger is configured"
+                    .to_owned(),
+            );
+        };
+        let request = ProcessPermitRequest {
+            session: session_id.to_owned(),
+            worker_definition: HOST_WORKER_DEFINITION.to_owned(),
+            command: args.command.clone(),
+            workspace: sandbox.workspace().canonical_root().to_path_buf(),
+            environment: ProcessEnvironment::LocalHost,
+        };
+
+        let Some(registry) = &self.host_permit_registry else {
+            return Err(
+                "shell.exec: host execution requires a process permit,                  but no permit ledger is configured"
+                    .to_owned(),
+            );
+        };
+
+        if let Some(id) = registry.lookup_permit(&request) {
+            if ledger.authorize(id, &request).is_ok() {
+                return Ok(());
+            }
+            // Gemerkter Permit ist abgelaufen oder wurde widerrufen; fällt
+            // unten zur Neubeantragung durch, falls die Sitzung weiterhin
+            // zugestimmt hat.
+        }
+
+        if !registry.is_session_approved(session_id) {
+            return Err(
+                "shell.exec: host execution requires local UI approval for this session"
+                    .to_owned(),
+            );
+        }
+
+        let id = ledger
+            .issue_after_local_approval(
+                request.clone(),
+                HostApprovalScope::SessionLease,
+                HOST_SESSION_LEASE_TTL,
+            )
+            .map_err(|err| format!("shell.exec: host execution not authorized: {err}"))?;
+        registry.remember_permit(request.clone(), id);
+        ledger
+            .authorize(id, &request)
+            .map(|_granted| ())
+            .map_err(|err| format!("shell.exec: host execution not authorized: {err}"))
+    }
+
     /// Executes the shell command described by `args` in the given sandbox.
     ///
     /// # Description
     /// Core async logic extracted for readability. Resolves the pinned `bwrap`/`prlimit`
     /// binaries, spawns the subprocess with stdin `/dev/null`, streams stdout/stderr under
     /// one byte budget and applies the timeout to reading and waiting together.
+    ///
+    /// For [`SandboxProfile::Host`] this first calls [`Self::authorize_host_command`];
+    /// Strict/Cargo/Tmux profiles are unaffected because the sandbox itself is
+    /// their enforcement boundary, not a permit.
     ///
     /// # Errors
     /// Returns `Ok(ToolOutput::error(...))` for denied-permission, missing sandbox binaries,
@@ -296,8 +404,16 @@ impl ShellExecutor {
         &self,
         args: &ShellExecArgs,
         sandbox: &SandboxSpec,
+        session_id: &str,
     ) -> Result<ToolOutput, ToolsError> {
         let effective_timeout = self.effective_timeout(args)?;
+
+        if self.sandbox_profile.is_host() {
+            if let Err(message) = self.authorize_host_command(args, sandbox, session_id) {
+                warn!(session_id, "shell.exec denied: host permit authorization failed");
+                return Ok(ToolOutput::error(message));
+            }
+        }
 
         debug!(
             command_len = args.command.len(),
@@ -319,7 +435,9 @@ impl ShellExecutor {
         }
 
         let launcher = match BwrapLauncher::discover() {
-            Ok(launcher) => launcher.with_tmpfs_size(tmpfs_size),
+            Ok(launcher) => launcher
+                .with_tmpfs_size(tmpfs_size)
+                .with_profile(&self.sandbox_profile),
             Err(err) => {
                 warn!(error = %err, "shell.exec bubblewrap unavailable");
                 return Ok(ToolOutput::error(format!(
@@ -579,8 +697,16 @@ impl ToolExecutor for ShellExecutor {
                 return Ok(err);
             }
 
-            // 4 + 5 + 6. Build an isolated launch plan, spawn, and collect.
-            self.run_command(&args, context.sandbox()).await
+            // 4. Permit-Prüfung für Host-Profil erfolgt vollständig in
+            //    `run_command` (`Self::authorize_host_command`), sobald der
+            //    Befehlstext und die aufgelöste Workspace-Wurzel für den
+            //    konkreten `ProcessPermitRequest` vorliegen. Strict/Cargo/Tmux
+            //    ohne Ledger laufen unverändert weiter (die Sandbox ist die
+            //    Grenze, nicht der Permit).
+
+            // 5 + 6. Build an isolated launch plan, spawn, and collect.
+            self.run_command(&args, context.sandbox(), context.session_id().as_str())
+                .await
         })
     }
 }
@@ -618,6 +744,13 @@ pub struct ShellToolProvider {
     pub max_output_bytes: usize,
     /// rlimits und tmpfs-Größe für jeden Aufruf (siehe [`ShellLimits`]).
     pub limits: ShellLimits,
+    /// Vertrauenswürdiges Sandbox-Profil vom Runtime-Aufbau.
+    pub sandbox_profile: SandboxProfile,
+    /// Optionaler Permit-Ledger für Permit-geschützte Ausführung.
+    pub permit_ledger: Option<Arc<ProcessPermitLedger>>,
+    /// Sitzungsseitige Zuordnung von UI-Zustimmungen zu bereits ausgestellten
+    /// Permits; von der Runtime beim Aufbau des Host-Profil-Workers gesetzt.
+    pub host_permit_registry: Option<Arc<HostPermitSessionRegistry>>,
 }
 
 impl ShellToolProvider {
@@ -640,6 +773,29 @@ impl ShellToolProvider {
     /// ```
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Setzt das vertrauenswürdige Sandbox-Profil vom Runtime-Aufbau.
+    /// Tool-Aufrufe können das Profil nicht setzen oder überschreiben.
+    #[must_use]
+    pub fn with_sandbox_profile(mut self, profile: SandboxProfile) -> Self {
+        self.sandbox_profile = profile;
+        self
+    }
+
+    /// Setzt den Permit-Ledger für Permit-geschützte Ausführung.
+    #[must_use]
+    pub fn with_permit_ledger(mut self, ledger: Arc<ProcessPermitLedger>) -> Self {
+        self.permit_ledger = Some(ledger);
+        self
+    }
+
+    /// Setzt die sitzungsseitige Zuordnung von UI-Zustimmungen zu bereits
+    /// ausgestellten Host-Permits.
+    #[must_use]
+    pub fn with_host_permit_registry(mut self, registry: Arc<HostPermitSessionRegistry>) -> Self {
+        self.host_permit_registry = Some(registry);
+        self
     }
 
     /// Builds the [`JsonSchema`] for the `shell.exec` parameters.
@@ -706,6 +862,9 @@ impl Default for ShellToolProvider {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             limits: ShellLimits::default(),
+            sandbox_profile: SandboxProfile::Strict,
+            permit_ledger: None,
+            host_permit_registry: None,
         }
     }
 }
@@ -775,6 +934,9 @@ impl ToolProvider for ShellToolProvider {
                 timeout_secs: self.timeout_secs,
                 max_output_bytes: self.max_output_bytes,
                 limits: self.limits,
+                sandbox_profile: self.sandbox_profile.clone(),
+                permit_ledger: self.permit_ledger.clone(),
+                host_permit_registry: self.host_permit_registry.clone(),
             }))
         } else {
             None
@@ -898,6 +1060,9 @@ mod tests {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             limits: ShellLimits::default(),
+            sandbox_profile: SandboxProfile::Strict,
+            permit_ledger: None,
+            host_permit_registry: None,
         };
 
         for command in ["", " ", "\t\n"] {
@@ -920,6 +1085,9 @@ mod tests {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             limits: ShellLimits::default(),
+            sandbox_profile: SandboxProfile::Strict,
+            permit_ledger: None,
+            host_permit_registry: None,
         };
         let args = ShellExecArgs {
             command: "echo valid".to_owned(),
@@ -940,6 +1108,9 @@ mod tests {
             timeout_secs: 5,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             limits: ShellLimits::default(),
+            sandbox_profile: SandboxProfile::Strict,
+            permit_ledger: None,
+            host_permit_registry: None,
         };
         let args = ShellExecArgs {
             command: "echo valid".to_owned(),
@@ -1066,6 +1237,9 @@ mod tests {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             max_output_bytes: 16,
             limits: ShellLimits::default(),
+            sandbox_profile: SandboxProfile::Strict,
+            permit_ledger: None,
+            host_permit_registry: None,
         };
         let capture = BoundedCapture::new(16);
 
@@ -1085,6 +1259,9 @@ mod tests {
             timeout_secs: 1,
             max_output_bytes: 8 + TRUNCATION_MARKER.len(),
             limits: ShellLimits::default(),
+            sandbox_profile: SandboxProfile::Strict,
+            permit_ledger: None,
+            host_permit_registry: None,
         };
         let (mut writer, mut stdout) = tokio::io::duplex(1024);
         let (_stderr_writer, mut stderr) = tokio::io::duplex(1024);
@@ -1121,13 +1298,16 @@ mod tests {
                 nofile: 0,
                 ..ShellLimits::default()
             },
+            sandbox_profile: SandboxProfile::Strict,
+            permit_ledger: None,
+            host_permit_registry: None,
         };
         let args = ShellExecArgs {
             command: "echo must_not_run".to_owned(),
             timeout_secs: None,
         };
 
-        match executor.run_command(&args, &sandbox).await.expect("run") {
+        match executor.run_command(&args, &sandbox, "test-session").await.expect("run") {
             ToolOutput::Error { message } => {
                 assert!(message.contains("resource limits"), "{message}");
                 assert!(message.contains("nofile"), "{message}");
@@ -1281,6 +1461,9 @@ mod tests {
             timeout_secs: 1,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             limits: ShellLimits::default(),
+            sandbox_profile: SandboxProfile::Strict,
+            permit_ledger: None,
+            host_permit_registry: None,
         };
         let call = make_call_with_timeout("echo partial_before_timeout; sleep 5", 1);
         let started = std::time::Instant::now();
@@ -1354,6 +1537,9 @@ mod tests {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             max_output_bytes: TRUNCATION_MARKER.len() + 10,
             limits: ShellLimits::default(),
+            sandbox_profile: SandboxProfile::Strict,
+            permit_ledger: None,
+            host_permit_registry: None,
         };
         // Generate more than the configured output cap.
         let call = make_call("echo 'this_is_a_longer_string_than_ten_bytes'");
@@ -1384,6 +1570,9 @@ mod tests {
             timeout_secs: DEFAULT_TIMEOUT_SECS,
             max_output_bytes: 1024,
             limits: ShellLimits::default(),
+            sandbox_profile: SandboxProfile::Strict,
+            permit_ledger: None,
+            host_permit_registry: None,
         };
         let started = std::time::Instant::now();
 
@@ -1416,6 +1605,9 @@ mod tests {
             timeout_secs: 10,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             limits: ShellLimits::default(),
+            sandbox_profile: SandboxProfile::Strict,
+            permit_ledger: None,
+            host_permit_registry: None,
         };
         // Mit geerbtem Terminal-stdin würde `cat` bis zum Timeout blockieren.
         let call = make_call("cat; echo stdin_reached_eof");
@@ -1474,4 +1666,310 @@ mod tests {
         test_exec_rlimits_and_tmpfs_size_apply_required,
         rlimits_and_tmpfs_size_apply_inside_sandbox
     );
+
+    // ── Permit-/Profil-Tests ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_host_profile_without_ledger_is_denied() {
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let ctx = make_ctx(sandbox);
+        let call = make_call("echo should_not_run");
+
+        let provider = ShellToolProvider::default()
+            .with_sandbox_profile(SandboxProfile::Host);
+        let executor = provider
+            .executor(&ToolName::new(TOOL_NAME))
+            .expect("executor must be returned");
+
+        let output = executor
+            .execute(&ctx, &call)
+            .await
+            .expect("execute must not return Err");
+
+        match output {
+            ToolOutput::Error { message } => {
+                assert!(
+                    message.contains("host execution requires a process permit"),
+                    "expected permit denial, got: {message:?}"
+                );
+            }
+            other => panic!("expected Error output for host without ledger, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_host_profile_with_ledger_but_without_session_approval_is_denied() {
+        // Ledger und Registry sind konfiguriert, aber die Sitzung hat der
+        // lokalen UI noch nicht zugestimmt: fail-closed.
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let ctx = make_ctx(sandbox);
+        let call = make_call("echo should_not_run");
+
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        let provider = ShellToolProvider::default()
+            .with_sandbox_profile(SandboxProfile::Host)
+            .with_permit_ledger(ledger)
+            .with_host_permit_registry(registry);
+        let executor = provider
+            .executor(&ToolName::new(TOOL_NAME))
+            .expect("executor must be returned");
+
+        let output = executor
+            .execute(&ctx, &call)
+            .await
+            .expect("execute must not return Err");
+
+        match output {
+            ToolOutput::Error { message } => {
+                assert!(
+                    message.contains("requires local UI approval"),
+                    "expected local-approval denial, got: {message:?}"
+                );
+            }
+            other => panic!("expected Error output without session approval, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_host_profile_with_session_approval_authorizes_via_real_ledger() {
+        // Nach einer (simulierten) lokalen UI-Zustimmung für die Sitzung muss
+        // `authorize_host_command` tatsächlich über den echten Ledger einen
+        // neuen Permit ausstellen und autorisieren, statt nur dessen
+        // Existenz zu prüfen.
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let ctx = make_ctx(sandbox);
+        let call = make_call("echo host_ok");
+
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        registry.mark_session_approved(ctx.session_id().as_str(), Duration::from_secs(60));
+
+        let provider = ShellToolProvider::default()
+            .with_sandbox_profile(SandboxProfile::Host)
+            .with_permit_ledger(Arc::clone(&ledger))
+            .with_host_permit_registry(Arc::clone(&registry));
+        let executor = provider
+            .executor(&ToolName::new(TOOL_NAME))
+            .expect("executor must be returned");
+
+        let output = executor
+            .execute(&ctx, &call)
+            .await
+            .expect("execute must not return Err");
+
+        // Die Permit-Prüfung muss durchlaufen sein: eine verbleibende
+        // Fehlermeldung darf nur noch vom fehlenden Bubblewrap-Binary in der
+        // Testumgebung stammen, nicht von der Permit-Grenze.
+        match &output {
+            ToolOutput::Error { message } => {
+                assert!(
+                    !message.contains("process permit") && !message.contains("UI approval"),
+                    "host command with session approval must pass the permit boundary: {message:?}"
+                );
+            }
+            ToolOutput::Json { .. } | ToolOutput::Text { .. } => {}
+        }
+
+        // Der Permit wurde tatsächlich über den Ledger ausgestellt und
+        // gemerkt; ein zweiter identischer Aufruf muss ihn wiederverwenden
+        // können, statt erneut auszustellen.
+        let request = ProcessPermitRequest {
+            session: ctx.session_id().as_str().to_owned(),
+            worker_definition: HOST_WORKER_DEFINITION.to_owned(),
+            command: "echo host_ok".to_owned(),
+            workspace: sandbox_root(&tmp),
+            environment: ProcessEnvironment::LocalHost,
+        };
+        let remembered_id = registry
+            .lookup_permit(&request)
+            .expect("permit must have been remembered after issuance");
+        assert!(ledger.authorize(remembered_id, &request).is_ok());
+    }
+
+    // Baut denselben kanonischen Workspace-Pfad wie `make_sandbox`, damit der
+    // in einem Test unabhängig zusammengesetzte `ProcessPermitRequest` genau
+    // dem entspricht, den `authorize_host_command` tatsächlich verwendet.
+    fn sandbox_root(dir: &TempDir) -> PathBuf {
+        dir.path()
+            .join("project")
+            .canonicalize()
+            .expect("project subdir must be canonicalizable")
+    }
+
+    #[tokio::test]
+    async fn test_strict_profile_without_ledger_still_works() {
+        // Strict-Profil ohne Ledger: Sandbox ist die Grenze, nicht der Permit.
+        // Dies darf nicht fehlschlagen, weil der Ledger fehlt.
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let ctx = make_ctx(sandbox);
+        let call = make_call("echo strict_mode_ok");
+
+        let provider = ShellToolProvider::default()
+            .with_sandbox_profile(SandboxProfile::Strict);
+        let executor = provider
+            .executor(&ToolName::new(TOOL_NAME))
+            .expect("executor must be returned");
+
+        // Wir prüfen nur, dass nicht mit einem Permit-Fehler abgelehnt wird;
+        // ein Sandbox-Setup-Fehler (kein bwrap) ist hier nicht der Punkt.
+        let output = executor
+            .execute(&ctx, &call)
+            .await
+            .expect("execute must not return Err");
+
+        // Die Ausgabe darf eine Sandbox-Fehlermeldung sein, aber keine
+        // Permit-Fehlermeldung.
+        match &output {
+            ToolOutput::Error { message } => {
+                assert!(
+                    !message.contains("host execution requires a process permit"),
+                    "strict profile must not trigger permit denial: {message:?}"
+                );
+            }
+            ToolOutput::Json { .. } | ToolOutput::Text { .. } => {}
+        }
+    }
+
+    #[test]
+    fn test_provider_with_sandbox_profile_builder() {
+        let provider = ShellToolProvider::default()
+            .with_sandbox_profile(SandboxProfile::Strict);
+        assert!(provider.sandbox_profile.is_strict());
+        assert!(provider.permit_ledger.is_none());
+    }
+
+    #[test]
+    fn test_provider_with_permit_ledger_builder() {
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let provider = ShellToolProvider::default()
+            .with_permit_ledger(ledger);
+        assert!(provider.permit_ledger.is_some());
+    }
+
+    // ── authorize_host_command: gemerkter Permit / mehrere Anträge ─────────
+
+    fn host_executor(
+        ledger: &Arc<ProcessPermitLedger>,
+        registry: &Arc<HostPermitSessionRegistry>,
+    ) -> ShellExecutor {
+        ShellExecutor {
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            limits: ShellLimits::default(),
+            sandbox_profile: SandboxProfile::Host,
+            permit_ledger: Some(Arc::clone(ledger)),
+            host_permit_registry: Some(Arc::clone(registry)),
+        }
+    }
+
+    fn args_for(command: &str) -> ShellExecArgs {
+        ShellExecArgs {
+            command: command.to_owned(),
+            timeout_secs: None,
+        }
+    }
+
+    #[test]
+    fn test_authorize_host_command_reuses_remembered_permit_after_session_approval_expires() {
+        // Die Sitzungszustimmung selbst darf verfallen (kurze TTL), ohne dass
+        // ein bereits ausgestellter, gemerkter Permit für exakt denselben
+        // Antrag verloren geht: `authorize_host_command` prüft `lookup_permit`
+        // zuerst und braucht dann keine erneute Zustimmung.
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        registry.mark_session_approved("s1", Duration::from_millis(20));
+
+        let executor = host_executor(&ledger, &registry);
+        let args = args_for("echo repeat_me");
+
+        assert!(
+            executor.authorize_host_command(&args, &sandbox, "s1").is_ok(),
+            "first call must succeed via a fresh local-approval issuance"
+        );
+
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(
+            !registry.is_session_approved("s1"),
+            "the session-level approval must have expired by now"
+        );
+
+        assert!(
+            executor.authorize_host_command(&args, &sandbox, "s1").is_ok(),
+            "an identical repeated request must succeed via the remembered permit, \
+             without requiring a fresh session approval"
+        );
+    }
+
+    #[test]
+    fn test_authorize_host_command_different_commands_same_session_both_succeed() {
+        // Eine einmalige Sitzungszustimmung deckt beliebig viele
+        // *unterschiedliche* Befehlstexte derselben Sitzung ab; jeder bekommt
+        // seinen eigenen, getrennt gemerkten Permit.
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        registry.mark_session_approved("s1", Duration::from_secs(60));
+
+        let executor = host_executor(&ledger, &registry);
+        let first = args_for("echo first_command");
+        let second = args_for("echo second_command");
+
+        assert!(executor.authorize_host_command(&first, &sandbox, "s1").is_ok());
+        assert!(executor.authorize_host_command(&second, &sandbox, "s1").is_ok());
+
+        let first_request = ProcessPermitRequest {
+            session: "s1".to_owned(),
+            worker_definition: HOST_WORKER_DEFINITION.to_owned(),
+            command: first.command.clone(),
+            workspace: sandbox_root(&tmp),
+            environment: ProcessEnvironment::LocalHost,
+        };
+        let second_request = ProcessPermitRequest {
+            session: "s1".to_owned(),
+            worker_definition: HOST_WORKER_DEFINITION.to_owned(),
+            command: second.command.clone(),
+            workspace: sandbox_root(&tmp),
+            environment: ProcessEnvironment::LocalHost,
+        };
+        let first_id = registry
+            .lookup_permit(&first_request)
+            .expect("first command must have a remembered permit");
+        let second_id = registry
+            .lookup_permit(&second_request)
+            .expect("second command must have a remembered permit");
+        assert_ne!(
+            first_id, second_id,
+            "distinct command texts must remember distinct permit ids"
+        );
+    }
+
+    #[test]
+    fn test_authorize_host_command_different_session_does_not_reuse_remembered_permit() {
+        // Ein für Sitzung `s1` gemerkter Permit darf nicht für eine andere
+        // Sitzung `s2` gefunden werden, selbst bei identischem Befehlstext.
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        registry.mark_session_approved("s1", Duration::from_secs(60));
+
+        let executor = host_executor(&ledger, &registry);
+        let args = args_for("echo shared_command_text");
+
+        assert!(executor.authorize_host_command(&args, &sandbox, "s1").is_ok());
+
+        let result = executor.authorize_host_command(&args, &sandbox, "s2");
+        assert!(
+            result.is_err(),
+            "session s2 has no approval and must not benefit from session s1's remembered permit"
+        );
+    }
 }

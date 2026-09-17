@@ -41,6 +41,12 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 mod cargo;
 pub use cargo::{CargoExecutionMode, CargoProfileError, CargoSandboxProfile};
 
+mod tmux;
+pub use tmux::{TmuxOperationMode, TmuxProfileError, TmuxSandboxProfile, SANDBOX_TMUX_SOCKET_PATH};
+
+mod profile;
+pub use profile::SandboxProfile;
+
 mod bwrap;
 pub use bwrap::{
     BwrapCommandPlan, BwrapLauncher, SANDBOX_PROXY_SOCKET_PATH, SANDBOX_RELAY_PATH, SandboxChild,
@@ -57,6 +63,9 @@ pub use process_permit::{
     GrantedProcessPermit, HostApprovalScope, ProcessEnvironment, ProcessPermitError,
     ProcessPermitId, ProcessPermitLedger, ProcessPermitRequest, request_for_workspace,
 };
+
+mod host_permit_session;
+pub use host_permit_session::HostPermitSessionRegistry;
 
 /// Operationsklassen, die eine Sandbox autorisieren kann.
 ///
