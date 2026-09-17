@@ -1603,6 +1603,15 @@ async fn run_turn_with_approvals(
 /// so a caller can submit the same valid session again. All other failures are
 /// terminal because they may indicate a broken invariant or unsafe execution
 /// boundary.
+///
+/// # Description
+/// Retryability is delegated to [`crate::model::ModelError::is_retryable`]
+/// rather than hardcoded here: any [`CoreError::Model`] whose inner
+/// [`crate::model::ModelError`] reports itself as retryable (currently
+/// `Transient`, `Timeout`, `RateLimited`) returns the session to `Idle`.
+/// Everything else — including non-`Model` `CoreError` variants and
+/// non-retryable `ModelError` variants such as `Refusal` or `Auth` — calls
+/// [`AgentSession::fail`], moving the session to the terminal `Failed` state.
 fn transition_after_turn_failure(
     session: &mut AgentSession,
     ctx: &TurnInputContext,
@@ -1610,7 +1619,7 @@ fn transition_after_turn_failure(
 ) {
     let retryable = matches!(
         error,
-        CoreError::Model(crate::model::ModelError::RateLimited { .. })
+        CoreError::Model(model_error) if model_error.is_retryable()
     );
 
     if retryable {
@@ -3389,7 +3398,7 @@ mod tests {
         FunctionToolSpec, JsonSchema, ToolCall, ToolExecutionContext, ToolExecutor,
         ToolExecutorFuture, ToolName, ToolOutput, ToolSpec, ToolsError,
     };
-    use harw_types::AgentRole;
+    use harw_types::{AgentRole, TurnId};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
@@ -3438,6 +3447,8 @@ mod tests {
         }
     }
 
+    // Always fails with a retryable `ModelError::RateLimited`, so tests can
+    // assert `transition_after_turn_failure` returns the session to `Idle`.
     struct RateLimitedModel;
 
     impl ModelProvider for RateLimitedModel {
@@ -3446,6 +3457,70 @@ mod tests {
                 Err(crate::model::ModelError::RateLimited {
                     retry_after_secs: 30,
                     message: "test provider limit".to_owned(),
+                })
+            })
+        }
+    }
+
+    // Always fails with a retryable `ModelError::Transient` (HTTP 500), the
+    // real-world Cloudflare AI Gateway guardrails case that exposed the bug
+    // in `transition_after_turn_failure`; tests assert it also resolves to
+    // `Idle`, not just `RateLimited`.
+    struct TransientModel;
+
+    impl ModelProvider for TransientModel {
+        fn respond<'a>(&'a self, _request: ModelRequest) -> crate::model::ModelFuture<'a> {
+            Box::pin(async {
+                Err(crate::model::ModelError::Transient {
+                    status: Some(500),
+                    retry_after_secs: None,
+                    message: "gateway guardrails block".to_owned(),
+                })
+            })
+        }
+    }
+
+    // Always fails with a retryable `ModelError::Timeout`, so tests can
+    // assert `transition_after_turn_failure` returns the session to `Idle`.
+    struct TimeoutModel;
+
+    impl ModelProvider for TimeoutModel {
+        fn respond<'a>(&'a self, _request: ModelRequest) -> crate::model::ModelFuture<'a> {
+            Box::pin(async {
+                Err(crate::model::ModelError::Timeout {
+                    message: "test provider timeout".to_owned(),
+                })
+            })
+        }
+    }
+
+    // Always fails with a non-retryable `ModelError::Refusal`, so tests can
+    // assert `transition_after_turn_failure` moves the session to the
+    // terminal `Failed` state instead of `Idle`.
+    struct RefusalModel;
+
+    impl ModelProvider for RefusalModel {
+        fn respond<'a>(&'a self, _request: ModelRequest) -> crate::model::ModelFuture<'a> {
+            Box::pin(async {
+                Err(crate::model::ModelError::Refusal {
+                    detail: Some("policy violation".to_owned()),
+                })
+            })
+        }
+    }
+
+    // Always fails with a non-retryable `ModelError::QuotaExceeded`, so tests
+    // can assert `transition_after_turn_failure` moves the session to the
+    // terminal `Failed` state, not `Idle` — a provider exhausting its
+    // contingent is not a transient condition a retry can fix, and this is
+    // an easy variant to accidentally make retryable later.
+    struct QuotaExceededModel;
+
+    impl ModelProvider for QuotaExceededModel {
+        fn respond<'a>(&'a self, _request: ModelRequest) -> crate::model::ModelFuture<'a> {
+            Box::pin(async {
+                Err(crate::model::ModelError::QuotaExceeded {
+                    message: "test provider quota exhausted".to_owned(),
                 })
             })
         }
@@ -3836,6 +3911,182 @@ mod tests {
         .await
         .expect("the same session accepts a later retry");
         assert!(matches!(outcome, TurnOutcome::Completed));
+    }
+
+    #[tokio::test]
+    async fn transient_model_failure_leaves_the_session_retryable() {
+        let provider = StubToolProvider::with_names(&[]);
+        let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        let error = run_turn(
+            &mut session,
+            &TransientModel,
+            &store,
+            TurnInput::user("retry me"),
+        )
+        .await
+        .expect_err("a transient provider failure reaches the caller");
+
+        assert!(matches!(
+            error,
+            CoreError::Model(crate::model::ModelError::Transient { .. })
+        ));
+        assert!(
+            matches!(session.state(), crate::session::SessionState::Idle),
+            "a transient (e.g. HTTP 500 guardrails block) provider failure must not terminalize the session"
+        );
+
+        let outcome = run_turn(
+            &mut session,
+            &crate::model::EchoModelProvider::new("recovered"),
+            &store,
+            TurnInput::user("try again"),
+        )
+        .await
+        .expect("the same session accepts a later retry");
+        assert!(matches!(outcome, TurnOutcome::Completed));
+    }
+
+    #[tokio::test]
+    async fn timeout_model_failure_leaves_the_session_retryable() {
+        let provider = StubToolProvider::with_names(&[]);
+        let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        let error = run_turn(
+            &mut session,
+            &TimeoutModel,
+            &store,
+            TurnInput::user("retry me"),
+        )
+        .await
+        .expect_err("a provider timeout reaches the caller");
+
+        assert!(matches!(
+            error,
+            CoreError::Model(crate::model::ModelError::Timeout { .. })
+        ));
+        assert!(
+            matches!(session.state(), crate::session::SessionState::Idle),
+            "a provider timeout must not terminalize the session"
+        );
+
+        let outcome = run_turn(
+            &mut session,
+            &crate::model::EchoModelProvider::new("recovered"),
+            &store,
+            TurnInput::user("try again"),
+        )
+        .await
+        .expect("the same session accepts a later retry");
+        assert!(matches!(outcome, TurnOutcome::Completed));
+    }
+
+    #[tokio::test]
+    async fn refusal_model_failure_terminalizes_the_session() {
+        let provider = StubToolProvider::with_names(&[]);
+        let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        let error = run_turn(
+            &mut session,
+            &RefusalModel,
+            &store,
+            TurnInput::user("do the thing"),
+        )
+        .await
+        .expect_err("a refusal reaches the caller");
+
+        assert!(matches!(
+            error,
+            CoreError::Model(crate::model::ModelError::Refusal { .. })
+        ));
+        assert!(
+            matches!(session.state(), crate::session::SessionState::Failed(_)),
+            "a non-retryable provider failure (Refusal) must still terminalize the session"
+        );
+    }
+
+    // `transition_after_turn_failure`'s retryable branch calls
+    // `session.complete_turn(...)` to return the session to `Idle`. That call
+    // itself can be rejected (e.g. a `TurnHandle` that no longer names the
+    // session's active turn) — a rare, best-effort case per the function's
+    // doc comment: the session is left in its prior state rather than
+    // inventing a state transition the caller never asked for. Driving this
+    // through the public `run_turn` API isn't practical (nothing in that
+    // path can make the turn handle stale mid-flight), so this test calls
+    // the private function directly with a `TurnInputContext` whose
+    // `turn_id` deliberately does not match the session's actual active
+    // turn, forcing `complete_turn` to reject it.
+    #[test]
+    fn transition_after_turn_failure_logs_but_does_not_panic_when_complete_turn_itself_fails() {
+        let provider = StubToolProvider::with_names(&[]);
+        let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
+
+        let real_handle = session
+            .try_start_turn()
+            .expect("a freshly created session starts Idle and accepts a turn");
+        assert!(matches!(
+            session.state(),
+            crate::session::SessionState::Running
+        ));
+
+        // Same session, but a turn id that is not the one `try_start_turn`
+        // actually activated — `complete_turn` must reject this handle.
+        let stale_ctx = harw_extension_api::TurnInputContext {
+            session_id: real_handle.session_id.clone(),
+            turn_id: TurnId::new(),
+            metadata: serde_json::Value::Null,
+        };
+        let retryable_error =
+            CoreError::Model(crate::model::ModelError::RateLimited {
+                retry_after_secs: 1,
+                message: "test provider limit".to_owned(),
+            });
+
+        transition_after_turn_failure(&mut session, &stale_ctx, &retryable_error);
+
+        // The original error was surfaced (via `tracing::error!` inside
+        // `transition_after_turn_failure`, not asserted here directly), and
+        // the session was neither corrupted nor silently marked `Idle` or
+        // `Failed` — it stays exactly where `complete_turn` left it: still
+        // `Running`, still owning its real, original turn.
+        assert!(
+            matches!(session.state(), crate::session::SessionState::Running),
+            "a failed best-effort completion must leave the session in its prior state"
+        );
+        assert_eq!(
+            session.current_turn(),
+            Some(&real_handle.turn_id),
+            "the session's real active turn must be untouched by the rejected completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn quota_exceeded_model_failure_terminalizes_the_session() {
+        let provider = StubToolProvider::with_names(&[]);
+        let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
+        let store = crate::state_store::InMemoryStateStore::new();
+
+        let error = run_turn(
+            &mut session,
+            &QuotaExceededModel,
+            &store,
+            TurnInput::user("do the thing"),
+        )
+        .await
+        .expect_err("a quota-exceeded failure reaches the caller");
+
+        assert!(matches!(
+            error,
+            CoreError::Model(crate::model::ModelError::QuotaExceeded { .. })
+        ));
+        assert!(
+            matches!(session.state(), crate::session::SessionState::Failed(_)),
+            "an exhausted quota is not a transient condition a retry can fix, \
+             so the session must terminalize instead of staying Idle"
+        );
     }
 
     #[tokio::test]

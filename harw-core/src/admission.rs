@@ -22,11 +22,27 @@
 //!
 //! Admitted jobs are persisted `Ready`, i.e. immediately claimable.
 //!
+//! # Capacity queue (opt-in)
+//! [`JobAdmissionService::submit_queued_async`] is an additive, opt-in
+//! alternative to [`JobAdmissionService::submit_async`] for callers that
+//! would rather wait for rate-limit capacity than fail outright (e.g. a
+//! `UserInterface`-role delegation). It never changes the rate limiter
+//! itself — [`JobAdmissionService::submit`]/`submit_async`/`admit` keep
+//! rejecting exactly as before — it only adds a background retry loop that
+//! is woken early via [`tokio::sync::Notify`] whenever a slot frees up, or
+//! otherwise sleeps out the estimated retry delay, until it succeeds, a
+//! non-capacity error occurs, or a caller-supplied `max_wait` elapses. See
+//! [`QueuedAdmission`].
+//!
 //! # Concurrency
 //! The service is `Send + Sync` when `P` is. The rate limiter uses one
 //! `std::sync::Mutex` held only for window bookkeeping. [`JobAdmissionService::submit`]
 //! performs blocking store I/O; async callers use
 //! [`JobAdmissionService::submit_async`], which runs it on `spawn_blocking`.
+//! [`JobAdmissionService::submit_queued_async`] additionally spawns at most
+//! one background `tokio::task` per call, holding only an `Arc` clone of the
+//! service; the caller-side `oneshot::Receiver` may be dropped without
+//! cancelling that task.
 //!
 //! # Errors
 //! [`JobAdmissionError`].
@@ -63,6 +79,7 @@ use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, info, warn};
+use tokio::sync::{oneshot, Notify};
 
 /// Maximum length of an [`IdempotencyKey`] in bytes.
 pub const IDEMPOTENCY_KEY_MAX_LEN: usize = 128;
@@ -477,6 +494,116 @@ impl<P: JobAdmissionPolicy + 'static> JobAdmissionService<P> {
             .await
             .map_err(|error| JobAdmissionError::Blocking(error.to_string()))?
     }
+
+    /// Admits a job, queueing instead of rejecting when the submitter's
+    /// window is exhausted.
+    ///
+    /// # Description
+    /// A capacity-queue addendum to [`Self::submit_async`] (development task
+    /// "UIA-Delegation nicht mehr blockierend"): the sliding-window rate
+    /// limiter (`SubmissionLimiter::try_acquire`) is left completely
+    /// unchanged (`submit`/`submit_async`/`admit` keep rejecting exactly as
+    /// before). This method only adds a second, opt-in path for callers that
+    /// would rather wait for capacity than fail outright — e.g. a
+    /// `UserInterface`-role delegation, which wants to tell its user "queued,
+    /// will start once capacity frees" instead of a hard error.
+    ///
+    /// One attempt is made immediately. If it is rejected for any reason
+    /// other than [`JobAdmissionError::RateLimited`], that error is returned
+    /// unchanged — queueing only ever applies to capacity pressure, never to
+    /// a scope/budget/idempotency rejection. On `RateLimited`, a background
+    /// task is spawned that keeps retrying [`Self::submit_async`] (with a
+    /// fresh timestamp on every attempt) until it succeeds, a different
+    /// error occurs, or `max_wait` elapses; the caller gets the estimated
+    /// wait immediately and a receiver for the eventual outcome.
+    ///
+    /// # Arguments
+    /// - `intent` (`JobIntent`): see [`Self::submit`].
+    /// - `options` (`SubmitOptions`): see [`Self::submit`].
+    /// - `context` (`AdmissionContext`): see [`Self::submit`].
+    /// - `now` (`Timestamp`): clock for the first attempt.
+    /// - `max_wait` (`std::time::Duration`): upper bound on total queued
+    ///   waiting time; the background task gives up and reports the last
+    ///   [`JobAdmissionError::RateLimited`] once exceeded.
+    ///
+    /// # Returns
+    /// [`QueuedAdmission::Admitted`] if the first attempt succeeded, or
+    /// [`QueuedAdmission::Queued`] with the estimated retry delay and a
+    /// [`oneshot::Receiver`] that resolves once the background retry
+    /// finishes (successfully or not).
+    ///
+    /// # Errors
+    /// Any [`JobAdmissionError`] other than `RateLimited` from the first
+    /// attempt is returned immediately without queueing.
+    ///
+    /// # Concurrency
+    /// Requires a Tokio runtime. Spawns at most one background task per
+    /// call; that task holds only an `Arc` clone of `self`.
+    pub async fn submit_queued_async(
+        self: &Arc<Self>,
+        intent: JobIntent,
+        options: SubmitOptions,
+        context: AdmissionContext,
+        now: Timestamp,
+        max_wait: std::time::Duration,
+    ) -> Result<QueuedAdmission, JobAdmissionError> {
+        match self
+            .submit_async(intent.clone(), options.clone(), context.clone(), now)
+            .await
+        {
+            Ok(outcome) => Ok(QueuedAdmission::Admitted(Box::new(outcome))),
+            Err(JobAdmissionError::RateLimited { retry_after }) => {
+                let (tx, rx) = oneshot::channel();
+                let service = Arc::clone(self);
+                tokio::spawn(async move {
+                    let deadline = tokio::time::Instant::now() + max_wait;
+                    let mut last_retry_after = retry_after;
+                    let outcome = loop {
+                        service.limiter.wait_before_retry(last_retry_after).await;
+                        let attempt = service
+                            .submit_async(intent.clone(), options.clone(), context.clone(), Timestamp::now())
+                            .await;
+                        match attempt {
+                            Err(JobAdmissionError::RateLimited { retry_after }) => {
+                                last_retry_after = retry_after;
+                                if tokio::time::Instant::now() >= deadline {
+                                    break Err(JobAdmissionError::RateLimited { retry_after });
+                                }
+                            }
+                            other => break other,
+                        }
+                    };
+                    // Best-effort: nothing to do if the caller dropped `rx`
+                    // (e.g. the UIA session ended before capacity freed).
+                    let _ = tx.send(outcome);
+                });
+                Ok(QueuedAdmission::Queued {
+                    estimated_retry_after: retry_after,
+                    result: rx,
+                })
+            }
+            Err(other) => Err(other),
+        }
+    }
+}
+
+/// Outcome of [`JobAdmissionService::submit_queued_async`].
+pub enum QueuedAdmission {
+    /// Capacity was available on the first attempt; behaves exactly like
+    /// [`JobAdmissionService::submit_async`].
+    Admitted(Box<AdmissionOutcome>),
+    /// No capacity yet. The submission was handed to a background retry
+    /// loop; `result` resolves once it finishes.
+    Queued {
+        /// Estimate from the first rejected attempt, for an immediate
+        /// user-facing "starts in about Xs" message. The background retry
+        /// may finish sooner (an earlier release woke it) or later (the
+        /// window stayed contended).
+        estimated_retry_after: SignedDuration,
+        /// Resolves to the eventual [`Self::Admitted`]-equivalent outcome or
+        /// the terminal error. Dropping it does not cancel the retry.
+        result: oneshot::Receiver<Result<AdmissionOutcome, JobAdmissionError>>,
+    },
 }
 
 // Accepts an existing record only if it is the same logical submission.
@@ -545,6 +672,11 @@ type SubmitterKey = (TenantId, ApprovalActor);
 struct SubmissionLimiter {
     limits: AdmissionLimits,
     windows: Mutex<HashMap<SubmitterKey, VecDeque<Timestamp>>>,
+    // Additive queueing support (development-orchestrator task: UIA
+    // delegation must wait for capacity instead of being rejected outright).
+    // Woken on every `release` so a waiter does not have to sleep out the
+    // full window when a slot frees up early.
+    freed: Notify,
 }
 
 impl SubmissionLimiter {
@@ -552,6 +684,7 @@ impl SubmissionLimiter {
         Self {
             limits,
             windows: Mutex::new(HashMap::new()),
+            freed: Notify::new(),
         }
     }
 
@@ -597,6 +730,24 @@ impl SubmissionLimiter {
             && let Some(position) = entries.iter().rposition(|entry| *entry == at)
         {
             entries.remove(position);
+        }
+        drop(windows);
+        // A slot may now be free; wake anyone waiting in `acquire_or_wait`.
+        self.freed.notify_waiters();
+    }
+
+    // Sleeps until either `retry_after` elapses or `release` woke a waiter
+    // early, whichever comes first. Used by `AdmissionQueue`'s background
+    // retry loop between attempts; does not itself touch the window, so it
+    // never double-charges a slot the way calling `try_acquire` twice would.
+    async fn wait_before_retry(&self, retry_after: SignedDuration) {
+        let sleep_for = retry_after
+            .unsigned_abs()
+            .max(std::time::Duration::from_millis(50));
+        let notified = self.freed.notified();
+        tokio::select! {
+            () = tokio::time::sleep(sleep_for) => {},
+            () = notified => {},
         }
     }
 }
@@ -1050,5 +1201,197 @@ mod tests {
             .await
             .expect("async submit");
         assert_eq!(outcome.disposition, AdmissionDisposition::Admitted);
+    }
+
+    // ── SubmissionLimiter::wait_before_retry / Notify wake ──────────────────
+
+    #[tokio::test]
+    async fn test_wait_before_retry_wakes_early_on_release() {
+        let key: SubmitterKey = (TenantId::from_str("tenant"), ApprovalActor::Operator { id: "op".into() });
+
+        // Shared so `release()` (called from this task) reaches the same
+        // `Notify` that the spawned task's `wait_before_retry` awaits on.
+        let limiter = Arc::new(SubmissionLimiter::new(AdmissionLimits::default()));
+        let waiter_limiter = Arc::clone(&limiter);
+        let started = std::time::Instant::now();
+        let waiter = tokio::spawn(async move {
+            waiter_limiter
+                .wait_before_retry(SignedDuration::from_secs(30))
+                .await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        limiter.release(&key, Timestamp::now());
+        waiter.await.expect("waiter task does not panic");
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "release() must wake wait_before_retry long before the 30s retry_after elapses, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wait_before_retry_sleeps_out_retry_after_without_release() {
+        let limiter = SubmissionLimiter::new(AdmissionLimits::default());
+        let started = std::time::Instant::now();
+        limiter
+            .wait_before_retry(SignedDuration::from_millis(80))
+            .await;
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(70),
+            "without a release(), wait_before_retry must sleep out retry_after, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wait_before_retry_enforces_minimum_sleep_floor() {
+        let limiter = SubmissionLimiter::new(AdmissionLimits::default());
+        let started = std::time::Instant::now();
+        // A non-positive retry_after must still sleep the 50ms floor, not
+        // return instantly.
+        limiter.wait_before_retry(SignedDuration::ZERO).await;
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(45),
+            "a zero retry_after must still respect the minimum sleep floor, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    // ── JobAdmissionService::submit_queued_async ────────────────────────────
+
+    #[tokio::test]
+    async fn test_submit_queued_async_admits_immediately_when_capacity_is_free() {
+        let root = tempdir().expect("tempdir");
+        let svc = Arc::new(service(root.path()));
+        let outcome = svc
+            .submit_queued_async(
+                intent(Value::Null),
+                SubmitOptions::default(),
+                operator_context("queue-immediate"),
+                Timestamp::now(),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("first attempt succeeds outright");
+
+        match outcome {
+            QueuedAdmission::Admitted(admission) => {
+                assert_eq!(admission.disposition, AdmissionDisposition::Admitted);
+            }
+            QueuedAdmission::Queued { .. } => panic!("free capacity must not be queued"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_submit_queued_async_returns_non_rate_limit_errors_immediately() {
+        let root = tempdir().expect("tempdir");
+        let svc = Arc::new(service(root.path()));
+        let result = svc
+            .submit_queued_async(
+                JobIntent {
+                    workspace: "unknown-workspace".into(),
+                    task: Value::Null,
+                },
+                SubmitOptions::default(),
+                operator_context("queue-scope-error"),
+                Timestamp::now(),
+                std::time::Duration::from_secs(5),
+            )
+            .await;
+
+        assert!(matches!(result, Err(JobAdmissionError::Sandbox(_))));
+    }
+
+    #[tokio::test]
+    async fn test_submit_queued_async_queues_and_resolves_once_capacity_frees() {
+        let root = tempdir().expect("tempdir");
+        let svc = Arc::new(service(root.path()).with_limits(
+            AdmissionLimits::new(1, SignedDuration::from_millis(150)).expect("limits"),
+        ));
+        let alice = operator_context("queue-resolves");
+        svc.submit(intent(Value::Null), &SubmitOptions::default(), &alice, Timestamp::now())
+            .expect("fills the single-slot window");
+
+        let queued = svc
+            .submit_queued_async(
+                intent(Value::Null),
+                SubmitOptions::default(),
+                alice,
+                Timestamp::now(),
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("second attempt is rejected only by rate limiting");
+
+        let QueuedAdmission::Queued {
+            estimated_retry_after,
+            result,
+        } = queued
+        else {
+            panic!("an exhausted window must be queued, not rejected outright");
+        };
+        assert!(estimated_retry_after > SignedDuration::ZERO);
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), result)
+            .await
+            .expect("background retry finishes well within the window + margin")
+            .expect("the sender side is not dropped without sending");
+        match outcome {
+            Ok(admission) => assert_eq!(admission.disposition, AdmissionDisposition::Admitted),
+            Err(error) => panic!("expected the retry to succeed once the window elapsed: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_submit_queued_async_gives_up_after_max_wait() {
+        let root = tempdir().expect("tempdir");
+        let svc = Arc::new(service(root.path()).with_limits(
+            AdmissionLimits::new(1, SignedDuration::from_secs(30)).expect("limits"),
+        ));
+        let alice = operator_context("queue-timeout");
+        svc.submit(intent(Value::Null), &SubmitOptions::default(), &alice, Timestamp::now())
+            .expect("fills the single-slot window for the whole test");
+
+        let queued = svc
+            .submit_queued_async(
+                intent(Value::Null),
+                SubmitOptions::default(),
+                alice.clone(),
+                Timestamp::now(),
+                std::time::Duration::from_millis(80),
+            )
+            .await
+            .expect("second attempt is rejected only by rate limiting");
+
+        let QueuedAdmission::Queued { result, .. } = queued else {
+            panic!("an exhausted window must be queued, not rejected outright");
+        };
+
+        // The 30s window never naturally frees within this test. Repeatedly
+        // wake the background retry loop early (as a real `release()` from
+        // an unrelated submission would) so it re-checks `max_wait` quickly
+        // instead of sleeping out the full (30s) retry_after once.
+        let waker_service = Arc::clone(&svc);
+        let waker = tokio::spawn(async move {
+            let unrelated_key: SubmitterKey = (
+                TenantId::from_str("tenant"),
+                ApprovalActor::Operator {
+                    id: "unrelated-waker".into(),
+                },
+            );
+            for _ in 0..60 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                waker_service.limiter.release(&unrelated_key, Timestamp::now());
+            }
+        });
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(3), result)
+            .await
+            .expect("the retry loop must give up once max_wait elapses")
+            .expect("the sender side is not dropped without sending");
+        waker.abort();
+
+        assert!(matches!(outcome, Err(JobAdmissionError::RateLimited { .. })));
     }
 }

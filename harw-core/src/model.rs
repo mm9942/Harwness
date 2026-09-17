@@ -87,9 +87,9 @@
 //! [`ModelError`] bekommt einen erweiterten, provider-neutralen
 //! Fehlervertrag (`Refusal`, `Truncated`, `Transient`, `Auth`,
 //! `QuotaExceeded`, `ContextLength`, `Timeout`, `Cancelled`) plus
-//! [`ModelError::is_retryable`]. Nur `Transient` und `Timeout` gelten als
-//! retryable — insbesondere `QuotaExceeded` **nicht** (ein erschöpftes
-//! Kontingent behebt ein erneuter Versuch nicht).
+//! [`ModelError::is_retryable`]. `Transient`, `Timeout` und `RateLimited`
+//! gelten als retryable — insbesondere `QuotaExceeded` **nicht** (ein
+//! erschöpftes Kontingent behebt ein erneuter Versuch nicht).
 
 use crate::context_budget::{Assembly, ContextAssembly, ContextAssemblyError, ContextBudget, assemble};
 use crate::history::ConversationHistory;
@@ -644,19 +644,34 @@ impl ModelError {
     /// `true`, wenn ein erneuter Versuch derselben Anfrage sinnvoll erscheint.
     ///
     /// # Description
-    /// Nur [`Self::Transient`] und [`Self::Timeout`] gelten als retryable.
+    /// [`Self::Transient`], [`Self::Timeout`] und [`Self::RateLimited`]
+    /// gelten als retryable: ein HTTP-429 ist per Definition ein
+    /// vorübergehender Zustand, der nach Ablauf des vom Provider gemeldeten
+    /// Zeitfensters (`retry_after_secs`) i. d. R. wieder erfolgreich ist.
     /// Insbesondere [`Self::QuotaExceeded`] ist **nicht** retryable: ein
     /// erschöpftes Kontingent behebt sich nicht durch Wiederholung, sondern
     /// erst durch Zeitablauf oder Eingriff des Betreibers. Alle übrigen
-    /// Varianten (`RequestFailed`, `EmptyResponse`, `RateLimited`,
-    /// `SerdeJson`, `ContextAssembly`, `Refusal`, `Truncated`, `Auth`,
-    /// `ContextLength`, `Cancelled`) sind ebenfalls nicht retryable.
+    /// Varianten (`RequestFailed`, `EmptyResponse`, `SerdeJson`,
+    /// `ContextAssembly`, `Refusal`, `Truncated`, `Auth`, `ContextLength`,
+    /// `Cancelled`) sind ebenfalls nicht retryable.
+    ///
+    /// `crate::turn_loop::transition_after_turn_failure` (privat) konsultiert
+    /// diese Methode als kanonische Quelle für die Session-Zustandsentscheidung
+    /// nach einem fehlgeschlagenen Turn (`Idle` vs. terminal `Failed`). Diese
+    /// Methode ist damit nicht mehr rein informativ: eine Änderung an dieser
+    /// Klassifikation (z. B. eine neue Variante als retryable markieren)
+    /// ändert unmittelbar das Session-Recovery-Verhalten, nicht nur die
+    /// Dokumentation.
     ///
     /// # Returns
-    /// `true` für [`Self::Transient`]/[`Self::Timeout`], sonst `false`.
+    /// `true` für [`Self::Transient`]/[`Self::Timeout`]/[`Self::RateLimited`],
+    /// sonst `false`.
     #[must_use]
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Transient { .. } | Self::Timeout { .. })
+        matches!(
+            self,
+            Self::Transient { .. } | Self::Timeout { .. } | Self::RateLimited { .. }
+        )
     }
 }
 
@@ -714,6 +729,7 @@ impl ModelProvider for EchoModelProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harw_context::{CeilingViolation, FragmentLabel};
     use harw_extension_api::LoadedInstructions;
     use harw_types::{ModelId, ProviderId, ReasoningEffort};
 
@@ -1026,8 +1042,9 @@ mod tests {
         assert_eq!(json, "\"context_window_exceeded\"");
     }
 
-    /// Tabellentest: nur `Transient`/`Timeout` sind retryable — insbesondere
-    /// `QuotaExceeded` ausdrücklich nicht (siehe [`ModelError::is_retryable`]).
+    /// Tabellentest: `Transient`/`Timeout`/`RateLimited` sind retryable —
+    /// insbesondere `QuotaExceeded` ausdrücklich nicht (siehe
+    /// [`ModelError::is_retryable`]).
     #[test]
     fn test_model_error_is_retryable_table() {
         let cases: Vec<(ModelError, bool)> = vec![
@@ -1038,7 +1055,7 @@ mod tests {
                     retry_after_secs: 30,
                     message: "429".to_owned(),
                 },
-                false,
+                true,
             ),
             (
                 ModelError::Refusal {
@@ -1093,6 +1110,24 @@ mod tests {
                 true,
             ),
             (ModelError::Cancelled, false),
+            (
+                ModelError::SerdeJson(
+                    serde_json::from_str::<serde_json::Value>("not json")
+                        .expect_err("malformed JSON must fail to parse"),
+                ),
+                false,
+            ),
+            (
+                ModelError::ContextAssembly(ContextAssemblyError::MustIncludeRejectedByCeiling {
+                    label: FragmentLabel::try_new("turn-42")
+                        .expect("non-empty label without control chars is valid"),
+                    violation: CeilingViolation::SectionNotAllowed {
+                        section: SectionName::try_new("history.tail")
+                            .expect("non-empty section name without control chars is valid"),
+                    },
+                }),
+                false,
+            ),
         ];
 
         for (error, expected) in cases {

@@ -36,6 +36,16 @@
 //!   `TurnOutcome::Completed` innerhalb des Budgets gesetzt, nie bei Fehler,
 //!   Budget-Verletzung oder Abbruch.
 //!
+//! # Rollenerkennung für nicht mehr blockierende Delegation
+//! [`ManagedAgentSpawner::parent_organizational_role`] liest die
+//! organisatorische Rolle (§3 DSL-Spawn-Matrix) der Elternsitzung eines
+//! admittierten Kindes, ohne die interne Admission-Prüfung zu duplizieren.
+//! Aufrufer außerhalb dieser Crate (z. B. eine Approval-Schicht) nutzen das, um eine
+//! `UserInterface`-Delegation zu erkennen und stattdessen die nicht
+//! blockierende Warteschlangen-Admission
+//! (`JobAdmissionService::submit_queued_async` in `harw-core::admission`) zu
+//! wählen, statt bei Kapazitätsdruck hart abzulehnen.
+//!
 //! # Nebenläufigkeit
 //! `ManagedAgentSpawner` ist `Send + Sync`. Alle Sperren sind `std::sync::Mutex`
 //! und werden **nie** über ein `.await` gehalten. [`ManagedAgentSpawner::admit`]
@@ -1863,10 +1873,10 @@ impl ManagedAgentSpawner {
                 .into_iter()
                 .filter(|id| {
                     !manager.contains(&SessionId::from_str(id.as_str()))
-                        && !self
+                        && self
                             .external_root_parent
                             .as_ref()
-                            .is_some_and(|root| root.session_id.as_str() == id)
+                            .is_none_or(|root| root.session_id.as_str() != id)
                 })
                 .collect(),
             Err(_) => return,
@@ -2035,6 +2045,68 @@ impl ManagedAgentSpawner {
             .lock()
             .ok()
             .and_then(|active| active.get(child.as_str()).cloned())
+    }
+
+    /// Liefert die organisatorische Rolle (§3 DSL-Spawn-Matrix) der Session,
+    /// die `child` delegiert hat.
+    ///
+    /// # Beschreibung
+    /// Ergänzung für die nicht mehr blockierende UIA-Delegation (Development-
+    /// Auftrag "UIA-Delegation asynchron"): eine Approval-Schicht muss vor dem
+    /// Antreiben eines Kindes wissen, ob dessen Elternsitzung die
+    /// `UserInterface`-Rolle trägt, ohne dafür `Self::admit`s interne
+    /// Prüfungen zu duplizieren. Liest denselben vertrauenswürdigen
+    /// `SpawnContext`, den `Self::admit` bereits für `can_delegate_to`
+    /// konsultiert — kein zweiter, potenziell abweichender Quelltext für
+    /// dieselbe Information.
+    ///
+    /// # Argumente
+    /// - `child` (`&SessionId`): das admittierte Kind, dessen Elternteil
+    ///   befragt wird.
+    ///
+    /// # Rückgabe
+    /// `Some(role)`, wenn `child` bekannt ist und sein Elternteil (noch)
+    /// einen vertrauenswürdigen `SpawnContext` trägt (laufende Session oder
+    /// der externe Wurzel-Elternteil). `None`, wenn das Kind unbekannt ist,
+    /// der Elternteil nicht (mehr) auffindbar ist oder der Manager-Lock
+    /// vergiftet ist — in jedem dieser Fälle behandelt der Aufrufer die
+    /// Delegation konservativ wie eine Nicht-UIA-Delegation (unverändertes,
+    /// synchrones Verhalten).
+    ///
+    /// # Panics
+    /// Nie.
+    ///
+    /// # Nebenläufigkeit
+    /// Nimmt kurz den `active`-Lock (über [`Self::child_record`]) und danach
+    /// kurz den `manager`-Lock, jeweils nur für die Dauer der Abfrage; keine
+    /// Sperre wird über den Rückgabewert hinaus gehalten oder über ein
+    /// `.await` gehalten. Sicher aus mehreren Threads aufrufbar.
+    ///
+    /// # Examples
+    /// ```rust,no_run
+    /// # fn demo(spawner: &harw_core::child_controller::ManagedAgentSpawner, child: &harw_types::SessionId) {
+    /// if let Some(role) = spawner.parent_organizational_role(child) {
+    ///     // role == harw_agent_dsl::roles::AgentRoleId::UserInterface → UIA-Delegation
+    ///     let _ = role;
+    /// }
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn parent_organizational_role(
+        &self,
+        child: &SessionId,
+    ) -> Option<harw_agent_dsl::roles::AgentRoleId> {
+        let record = self.child_record(child)?;
+        if let Ok(manager) = self.manager.lock()
+            && let Ok(parent) = manager.get(&record.parent)
+            && let Some(context) = parent.spawn_context()
+        {
+            return Some(context.organizational_role);
+        }
+        self.external_root_parent
+            .as_ref()
+            .filter(|root| root.session_id == record.parent)
+            .map(|root| root.spawn_context.organizational_role)
     }
 
     /// Liefert den bei der Admission festgelegten Budget-Deckel eines Kindes.
@@ -6250,5 +6322,139 @@ admitted = ["fs.read", "shell.exec"]
             .expect("known child clamps cleanly");
 
         assert_eq!(effective, Some(ReasoningEffort::High));
+    }
+
+    // ── parent_organizational_role ──────────────────────────────────────
+
+    /// Trägt einen [`ChildRecord`] mit `parent` direkt in `spawner.active`
+    /// ein, ohne den üblichen `admit`-Pfad zu durchlaufen — für Tests von
+    /// [`ManagedAgentSpawner::parent_organizational_role`], die nur die
+    /// Eltern-Auflösung isoliert prüfen wollen.
+    fn install_child_record(spawner: &ManagedAgentSpawner, parent: SessionId) -> SessionId {
+        let child = SessionId::new();
+        let now = Timestamp::now();
+        spawner.active.lock().expect("test child registry lock").insert(
+            child.as_str().to_owned(),
+            ChildRecord {
+                child: child.clone(),
+                parent,
+                handoff_call_id: ToolCallId::new(),
+                role: "worker".to_owned(),
+                depth: 1,
+                admitted_at: now,
+                lease_expires_at: now,
+                budget: AgentBudget::default(),
+                allow_pause: false,
+                depth_ceiling: ChildLimits::conservative().max_depth,
+                trace: None,
+                status: ChildStatus::Admitted,
+                task_complexity: None,
+            },
+        );
+        child
+    }
+
+    #[test]
+    fn test_parent_organizational_role_manager_owned_parent_returns_role() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events.clone())));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let parent_session = AgentSession::new(
+            AgentRole::Agent {
+                name: "root".to_owned(),
+            },
+            None,
+            ExtensionRegistryBuilder::default().build(),
+            events,
+        )
+        .with_spawn_context(external_root_context(
+            sandbox,
+            harw_agent_dsl::roles::AgentRoleId::UserInterface,
+        ));
+        let parent_id = parent_session.id().clone();
+        manager
+            .lock()
+            .expect("test session manager lock")
+            .restore(parent_session)
+            .expect("parent session restores");
+
+        let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative());
+        let child = install_child_record(&spawner, parent_id);
+
+        assert_eq!(
+            spawner.parent_organizational_role(&child),
+            Some(harw_agent_dsl::roles::AgentRoleId::UserInterface)
+        );
+    }
+
+    #[test]
+    fn test_parent_organizational_role_manager_parent_without_spawn_context_returns_none() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events.clone())));
+        // No `.with_spawn_context(...)`: a manager-owned parent that never
+        // received trusted admission metadata.
+        let parent_session = AgentSession::new(
+            AgentRole::Agent {
+                name: "root".to_owned(),
+            },
+            None,
+            ExtensionRegistryBuilder::default().build(),
+            events,
+        );
+        let parent_id = parent_session.id().clone();
+        manager
+            .lock()
+            .expect("test session manager lock")
+            .restore(parent_session)
+            .expect("parent session restores");
+
+        let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative());
+        let child = install_child_record(&spawner, parent_id);
+
+        assert_eq!(spawner.parent_organizational_role(&child), None);
+    }
+
+    #[test]
+    fn test_parent_organizational_role_external_root_parent_returns_role() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let parent = SessionId::new();
+        let spawner = worker_spawner(manager)
+            .with_external_root_parent(
+                parent.clone(),
+                external_root_context(
+                    sandbox.clone(),
+                    harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+                ),
+                None,
+                SessionActivation::default(),
+            )
+            .expect("trusted external root registers during construction");
+
+        let child = spawner
+            .admit("worker", spawn_input(parent), sandbox, None)
+            .expect("registered external root admits a direct child");
+
+        assert_eq!(
+            spawner.parent_organizational_role(&child),
+            Some(harw_agent_dsl::roles::AgentRoleId::RootOrchestrator)
+        );
+    }
+
+    #[test]
+    fn test_parent_organizational_role_orphaned_parent_returns_none() {
+        // `spawner_with_admitted_child` records a random, never-registered
+        // parent and registers no external root parent either.
+        let (spawner, child) = spawner_with_admitted_child();
+
+        assert_eq!(spawner.parent_organizational_role(&child), None);
+    }
+
+    #[test]
+    fn test_parent_organizational_role_unknown_child_returns_none() {
+        let (spawner, _child) = spawner_with_admitted_child();
+
+        assert_eq!(spawner.parent_organizational_role(&SessionId::new()), None);
     }
 }
