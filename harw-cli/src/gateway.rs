@@ -116,8 +116,8 @@ use harw_config::{
     resolve_internal_model,
 };
 use harw_core::{
-    AgentSession, ModelProvider, PinnedModelProvider, TranscriptStateStore, TurnInput,
-    TurnOutcome, run_turn,
+    AgentSession, ModelProvider, PinnedModelProvider, TranscriptStateStore, TurnInput, TurnOutcome,
+    run_turn,
 };
 use harw_extension_api::empty_extension_registry;
 use harw_job_runtime::{Budget, Job, JobKind, RetryPolicy, WorkId};
@@ -231,7 +231,11 @@ enum TelegramIngressMode {
 /// are still admitted by the channel; discard them here so they cannot trigger
 /// an arbitrary model answer.
 fn is_telegram_pairing_command(text: &str) -> bool {
-    let command = text.trim().split_ascii_whitespace().next().unwrap_or_default();
+    let command = text
+        .trim()
+        .split_ascii_whitespace()
+        .next()
+        .unwrap_or_default();
     command.eq_ignore_ascii_case("/pair")
         || command
             .strip_prefix("/pair@")
@@ -377,7 +381,10 @@ type ActivityClock = Arc<Mutex<Instant>>;
 ///
 /// Ein nicht freigegebenes repo-lokales `.harw` ist **kein** Fehler, sondern
 /// nur eine `tracing::warn!`-Meldung (verengende Übernahme).
-pub fn run(home_override: Option<PathBuf>, telemetry: crate::cli::TelemetryArgs) -> Result<(), String> {
+pub fn run(
+    home_override: Option<PathBuf>,
+    telemetry: crate::cli::TelemetryArgs,
+) -> Result<(), String> {
     let home = resolve_home(home_override)?;
     harw_home::ensure_home(&home).map_err(|error| error.to_string())?;
     let cwd = std::env::current_dir()
@@ -404,11 +411,9 @@ pub fn run(home_override: Option<PathBuf>, telemetry: crate::cli::TelemetryArgs)
     };
 
     let telemetry_sinks = crate::observe::build(&home, &telemetry)?;
-    telemetry_sinks.sink.record(
-        &GATEWAY_STARTED,
-        harw_observe::MetricValue::Count(1),
-        &[],
-    );
+    telemetry_sinks
+        .sink
+        .record(&GATEWAY_STARTED, harw_observe::MetricValue::Count(1), &[]);
 
     // Intervall der periodischen Audit-Kettenprüfung (siehe
     // `audit_chain_check_interval_secs`-Doku für die Begründung, warum dies
@@ -524,8 +529,7 @@ fn open_gateway_secret_resolver(
     cwd: &Path,
     principal: &Principal,
 ) -> Result<Option<GatewaySecretResolver>, String> {
-    let spec =
-        crate::runtime_entry::runtime_spec(entry.entry_kind(), home, cwd, principal.clone());
+    let spec = crate::runtime_entry::runtime_spec(entry.entry_kind(), home, cwd, principal.clone());
     let (preliminary_config, _trust_report) =
         harw_runtime::load_config(&spec).map_err(|error| format!("gateway: {error}"))?;
     let resolver = crate::secret_store::open_configured_secret_resolver(home, &preliminary_config)
@@ -1169,10 +1173,7 @@ async fn start_telegram_long_poll(
     plan: &TelegramIngressPlan,
     provider: Arc<dyn ModelProvider>,
     profile: PathBuf,
-) -> Result<
-    std::thread::JoinHandle<harw_channel_telegram_transport::TransportResult<()>>,
-    String,
-> {
+) -> Result<std::thread::JoinHandle<harw_channel_telegram_transport::TransportResult<()>>, String> {
     let channel_id = ChannelId::try_from(plan.binding.id.clone())
         .map_err(|_| "Telegram channel id is invalid".to_owned())?;
     let mut channel_config = TelegramChannelConfig::new(channel_id.clone());
@@ -1251,7 +1252,8 @@ async fn start_telegram_long_poll(
         ingress_tx,
         shutdown,
     );
-    spawn_long_poll_thread(long_poll).map_err(|_| "Telegram long-poll thread could not start".to_owned())
+    spawn_long_poll_thread(long_poll)
+        .map_err(|_| "Telegram long-poll thread could not start".to_owned())
 }
 
 /// Treibt [`start_telegram_long_poll`] mit Neustart-Backoff an.
@@ -1396,7 +1398,14 @@ async fn dream_scheduler(
             }
         }
 
-        match run_dream_job(Arc::clone(&provider), knowledge, transcript_root, idle, config).await
+        match run_dream_job(
+            Arc::clone(&provider),
+            knowledge,
+            transcript_root,
+            idle,
+            config,
+        )
+        .await
         {
             Ok(path) => {
                 eprintln!("dream: Reflexion abgelegt → {}", path.display());
@@ -2404,7 +2413,10 @@ pinned_identities = [123456789]
     fn describe_audit_chain_check_reports_absent_as_neither_intact_nor_broken() {
         let result: AuditResult<PersistedChainStatus> = Ok(PersistedChainStatus::Absent);
 
-        assert_eq!(describe_audit_chain_check(&result), AuditChainCheckReport::Absent);
+        assert_eq!(
+            describe_audit_chain_check(&result),
+            AuditChainCheckReport::Absent
+        );
     }
 
     #[test]
@@ -2548,11 +2560,19 @@ pinned_identities = [123456789]
         };
 
         assert_eq!(
-            assemblies.telegram.config().harness.default_provider.as_deref(),
+            assemblies
+                .telegram
+                .config()
+                .harness
+                .default_provider
+                .as_deref(),
             Some("sealed")
         );
         let telegram_rights = assemblies.telegram.rights_snapshot();
-        assert_eq!(telegram_rights.entry, harw_runtime::EntryKind::GatewayTelegram);
+        assert_eq!(
+            telegram_rights.entry,
+            harw_runtime::EntryKind::GatewayTelegram
+        );
         assert_eq!(telegram_rights.principal.id(), "telegram:gateway");
         let dream_rights = assemblies.dream.rights_snapshot();
         assert_eq!(dream_rights.entry, harw_runtime::EntryKind::GatewayDream);

@@ -231,8 +231,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        ConfiguredSecretResolver, SecretResolver, configured_secret_store_persisted_audit_chain_status,
-        open_configured_secret_resolver,
+        ConfiguredSecretResolver, SecretResolver,
+        configured_secret_store_persisted_audit_chain_status, open_configured_secret_resolver,
     };
 
     #[test]
@@ -383,7 +383,7 @@ mod tests {
     /// Speicher gibt es nichts zu prüfen.
     #[test]
     fn configured_secret_store_persisted_audit_chain_status_returns_none_without_a_sealed_provider()
-     {
+    {
         let config = harw_config::ResolvedConfig::default();
         let home = TempDir::new().expect("temporary home");
 

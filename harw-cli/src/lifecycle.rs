@@ -222,11 +222,14 @@ pub fn service(home_override: Option<PathBuf>, action: ServiceAction) -> Result<
                     println!("Unit geschrieben: {}", path.display());
                 }
                 activate_systemd_units(&specs)?;
-                println!("Dienste aktiviert und gestartet: {}", specs
-                    .iter()
-                    .map(|spec| format!("{}.service", spec.name))
-                    .collect::<Vec<_>>()
-                    .join(" "));
+                println!(
+                    "Dienste aktiviert und gestartet: {}",
+                    specs
+                        .iter()
+                        .map(|spec| format!("{}.service", spec.name))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
             } else {
                 for spec in &specs {
                     manager.install(spec).map_err(|error| error.to_string())?;
@@ -258,11 +261,16 @@ pub fn service(home_override: Option<PathBuf>, action: ServiceAction) -> Result<
 ///
 /// Die Kurzform unter `harw gateway` ist für den täglichen Betrieb gedacht;
 /// `harw service` bleibt die Verwaltung beider Hintergrunddienste.
-pub fn gateway_service(home_override: Option<PathBuf>, action: GatewayAction) -> Result<(), String> {
+pub fn gateway_service(
+    home_override: Option<PathBuf>,
+    action: GatewayAction,
+) -> Result<(), String> {
     let home = resolve_home(home_override)?;
     let platform = Platform::detect();
     if detect_service_manager(&platform).kind() != ServiceKind::Systemd {
-        return Err("Gateway-Service-Steuerung wird auf dieser Plattform noch nicht unterstützt".to_owned());
+        return Err(
+            "Gateway-Service-Steuerung wird auf dieser Plattform noch nicht unterstützt".to_owned(),
+        );
     }
     let [_serve, gateway] = service_specs(
         &std::env::current_exe().map_err(|error| error.to_string())?,
@@ -271,16 +279,19 @@ pub fn gateway_service(home_override: Option<PathBuf>, action: GatewayAction) ->
     match action {
         GatewayAction::Install => {
             let manager = harw_install::service_systemd::SystemdServiceManager::new();
-            let unit_dir = systemd_user_unit_dir(std::env::var_os("XDG_CONFIG_HOME"), std::env::var_os("HOME"))?;
+            let unit_dir = systemd_user_unit_dir(
+                std::env::var_os("XDG_CONFIG_HOME"),
+                std::env::var_os("HOME"),
+            )?;
             write_systemd_units(&unit_dir, &manager, std::slice::from_ref(&gateway))?;
             systemctl_gateway(&["daemon-reload"])?;
             systemctl_gateway(&["enable", "--now", "harw-gateway.service"])?;
         }
-        GatewayAction::Start => systemctl_gateway(&["start", "harw-gateway.service"] )?,
-        GatewayAction::Stop => systemctl_gateway(&["stop", "harw-gateway.service"] )?,
-        GatewayAction::Restart => systemctl_gateway(&["restart", "harw-gateway.service"] )?,
-        GatewayAction::Enable => systemctl_gateway(&["enable", "harw-gateway.service"] )?,
-        GatewayAction::Disable => systemctl_gateway(&["disable", "harw-gateway.service"] )?,
+        GatewayAction::Start => systemctl_gateway(&["start", "harw-gateway.service"])?,
+        GatewayAction::Stop => systemctl_gateway(&["stop", "harw-gateway.service"])?,
+        GatewayAction::Restart => systemctl_gateway(&["restart", "harw-gateway.service"])?,
+        GatewayAction::Enable => systemctl_gateway(&["enable", "harw-gateway.service"])?,
+        GatewayAction::Disable => systemctl_gateway(&["disable", "harw-gateway.service"])?,
     }
     Ok(())
 }
@@ -295,7 +306,11 @@ fn systemctl_gateway(args: &[&str]) -> Result<(), String> {
     if output.status.success() {
         Ok(())
     } else {
-        Err(format!("systemctl --user {} fehlgeschlagen: {}", args.join(" "), String::from_utf8_lossy(&output.stderr).trim()))
+        Err(format!(
+            "systemctl --user {} fehlgeschlagen: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
     }
 }
 
@@ -613,8 +628,7 @@ mod tests {
         )
         .expect("write policy config into temporary HARW home");
 
-        let evidence =
-            runtime_composition_evidence(home.path()).expect("assemble CLI composition");
+        let evidence = runtime_composition_evidence(home.path()).expect("assemble CLI composition");
 
         // Die Liste ist bewusst vollständig ausgeschrieben und nicht auf eine
         // Mindestmenge geprüft: eine Änderung der Werkzeugfläche der Standard-
@@ -821,7 +835,10 @@ mod tests {
             service_specs(Path::new("/usr/bin/harw"), Path::new("/home/tester/.harw"));
 
         let serve_unit = manager.render_unit(&serve);
-        assert!(serve_unit.contains("ExecStart=/usr/bin/harw serve\n"), "{serve_unit}");
+        assert!(
+            serve_unit.contains("ExecStart=/usr/bin/harw serve\n"),
+            "{serve_unit}"
+        );
         assert!(serve_unit.contains("Restart=always\n"), "{serve_unit}");
         assert!(serve_unit.contains("RestartSec=5\n"), "{serve_unit}");
         assert!(
@@ -831,7 +848,10 @@ mod tests {
         assert!(serve_unit.contains("Environment=HARW_HOME=/home/tester/.harw\n"));
 
         let gateway_unit = manager.render_unit(&gateway);
-        assert!(gateway_unit.contains("ExecStart=/usr/bin/harw gateway\n"), "{gateway_unit}");
+        assert!(
+            gateway_unit.contains("ExecStart=/usr/bin/harw gateway\n"),
+            "{gateway_unit}"
+        );
         assert!(gateway_unit.contains("Restart=always\n"), "{gateway_unit}");
         assert!(gateway_unit.contains("WorkingDirectory=/home/tester/.harw\n"));
     }
@@ -884,7 +904,6 @@ mod tests {
             .expect_err("no usable environment must fail");
         assert!(error.contains("HOME"), "{error}");
     }
-
 
     #[test]
     fn test_shutdown_reason_signal_name_matches_signal() {

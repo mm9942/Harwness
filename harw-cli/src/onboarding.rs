@@ -216,6 +216,7 @@ Weiteres das Hauptmodell; änderbar mit `harw models internal`."
         enabled: true,
         origin_allowlist: harw_config::OriginAllowlistToml::default(),
         rate_limit: None,
+        max_concurrency: None,
     };
     let providers_dir = profile.join("providers");
     create_dir_all(&providers_dir)?;
@@ -223,9 +224,7 @@ Weiteres das Hauptmodell; änderbar mit `harw models internal`."
         &providers_dir.join("openrouter.toml"),
         &toml::to_string_pretty(&provider).map_err(|e| format!("provider serialisieren: {e}"))?,
     )?;
-    println!(
-        "OpenRouter eingerichtet. Interne Modellstellen verwalten: `harw models internal`."
-    );
+    println!("OpenRouter eingerichtet. Interne Modellstellen verwalten: `harw models internal`.");
     Ok(())
 }
 
@@ -279,6 +278,7 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
         enabled: true,
         origin_allowlist: harw_config::OriginAllowlistToml::default(),
         rate_limit: None,
+        max_concurrency: None,
     };
     let providers_dir = profile.join("providers");
     create_dir_all(&providers_dir)?;

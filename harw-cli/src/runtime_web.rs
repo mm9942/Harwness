@@ -65,7 +65,9 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use harw_runtime::{EntryKind, ModelSource, PlanServices, RuntimeAssembly, RuntimeSpec, RuntimeStores};
+use harw_runtime::{
+    EntryKind, ModelSource, PlanServices, RuntimeAssembly, RuntimeSpec, RuntimeStores,
+};
 use harw_sandbox::SandboxSpec;
 use harw_session_store::ApprovalStore;
 use harw_types::{IngressSurface, PermissionTier, Principal, PrincipalKind, SessionId, ThreadRef};
@@ -88,7 +90,12 @@ use harw_types::{IngressSurface, PermissionTier, Principal, PrincipalKind, Sessi
 /// Ein [`Principal`] mit [`PrincipalKind::Human`] auf [`IngressSurface::Web`].
 #[must_use]
 pub(crate) fn web_principal(uid: u32, tier: PermissionTier) -> Principal {
-    Principal::trusted_ingress(PrincipalKind::Human, format!("uid:{uid}"), IngressSurface::Web, tier)
+    Principal::trusted_ingress(
+        PrincipalKind::Human,
+        format!("uid:{uid}"),
+        IngressSurface::Web,
+        tier,
+    )
 }
 
 /// Leitet den Transkript-Thread einer Web-Sitzung deterministisch aus ihrer
@@ -295,8 +302,14 @@ mod tests {
         let home = tempfile::TempDir::new().expect("temp home");
         let cwd = tempfile::TempDir::new().expect("temp cwd");
         let store = Arc::new(ApprovalStore::new(home.path()));
-        let assembly = web_assembly(home.path(), cwd.path(), 1000, Some(Arc::clone(&store)), None)
-            .expect("web assembly builds from an empty home");
+        let assembly = web_assembly(
+            home.path(),
+            cwd.path(),
+            1000,
+            Some(Arc::clone(&store)),
+            None,
+        )
+        .expect("web assembly builds from an empty home");
         let held = assembly.approval_store().expect("approval store is kept");
         assert!(Arc::ptr_eq(held, &store));
     }

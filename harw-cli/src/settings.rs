@@ -69,7 +69,10 @@ pub enum SettingsError {
     /// Laden, Schreiben oder Validieren einer Config-Datei schlug fehl.
     Config(harw_config::ConfigError),
     /// Ein Dateisystemzugriff schlug fehl; `path` benennt das Ziel.
-    Io { path: PathBuf, source: std::io::Error },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     /// Eine Config- oder Provider-Datei ist kein gültiges bzw. serialisierbares TOML.
     Toml { path: PathBuf, reason: String },
     /// Ein Provider-Name enthält unzulässige Zeichen.
@@ -98,7 +101,11 @@ impl fmt::Display for SettingsError {
             Self::Home(source) => write!(f, "{source}"),
             Self::Config(source) => write!(f, "{source}"),
             Self::Io { path, source } => {
-                write!(f, "dateizugriff auf {} fehlgeschlagen: {source}", path.display())
+                write!(
+                    f,
+                    "dateizugriff auf {} fehlgeschlagen: {source}",
+                    path.display()
+                )
             }
             Self::Toml { path, reason } => {
                 write!(f, "toml-dokument {} ist ungültig: {reason}", path.display())
@@ -107,7 +114,9 @@ impl fmt::Display for SettingsError {
                 f,
                 "ungültiger Provider-Name {name:?}: nur ASCII-Buchstaben, Ziffern, '-' und '_' sind erlaubt"
             ),
-            Self::ProviderNotFound { name } => write!(f, "Provider {name:?} ist nicht konfiguriert"),
+            Self::ProviderNotFound { name } => {
+                write!(f, "Provider {name:?} ist nicht konfiguriert")
+            }
             Self::UnsupportedApi { api } => write!(
                 f,
                 "nicht unterstützte Provider-API {api:?} (erwartet: openai-chat, openai-responses, anthropic-messages, ollama)"
@@ -404,7 +413,9 @@ fn add_provider(
         api,
         "openai-chat" | "openai-responses" | "anthropic-messages" | "ollama"
     ) {
-        return Err(SettingsError::UnsupportedApi { api: api.to_owned() });
+        return Err(SettingsError::UnsupportedApi {
+            api: api.to_owned(),
+        });
     }
     harw_provider_http::validate_endpoint(base_url)
         .map_err(|error| SettingsError::InvalidBaseUrl(error.to_string()))?;
@@ -422,22 +433,27 @@ fn add_provider(
         enabled: true,
         origin_allowlist: harw_config::OriginAllowlistToml::default(),
         rate_limit: None,
+        max_concurrency: None,
     };
     write_provider(home, &provider)
 }
 
 /// Parst `--auth` strikt als [`SecretRef`]; ein Klartext-Wert wird
 /// abgelehnt (siehe [`SettingsError::PlaintextAuthRejected`]).
-fn parse_auth_ref(provider_name: &str, auth: Option<&str>) -> Result<Option<SecretRef>, SettingsError> {
+fn parse_auth_ref(
+    provider_name: &str,
+    auth: Option<&str>,
+) -> Result<Option<SecretRef>, SettingsError> {
     match auth {
         None => Ok(None),
         Some(raw) if raw.trim().is_empty() => Ok(None),
-        Some(raw) => raw
-            .parse::<SecretRef>()
-            .map(Some)
-            .map_err(|_| SettingsError::PlaintextAuthRejected {
-                name: provider_name.to_owned(),
-            }),
+        Some(raw) => {
+            raw.parse::<SecretRef>()
+                .map(Some)
+                .map_err(|_| SettingsError::PlaintextAuthRejected {
+                    name: provider_name.to_owned(),
+                })
+        }
     }
 }
 
@@ -765,7 +781,10 @@ fn interactive_provider(home: &Path) -> Result<(), SettingsError> {
 
 fn interactive_add_provider(home: &Path) -> Result<(), SettingsError> {
     let name = prompt_required("Provider-Name")?;
-    let api = prompt_default("API (openai-chat/openai-responses/anthropic-messages/ollama)", "openai-chat")?;
+    let api = prompt_default(
+        "API (openai-chat/openai-responses/anthropic-messages/ollama)",
+        "openai-chat",
+    )?;
     let base_url = prompt_required("Basis-URL")?;
     let auth = prompt_optional("Secret-Referenz (env:VAR/secrets:NAME, leer = keine)")?;
     let models_raw = prompt_optional("Modell-IDs, kommagetrennt (leer = keine)")?;
@@ -782,7 +801,14 @@ fn interactive_add_provider(home: &Path) -> Result<(), SettingsError> {
         auth.as_deref().unwrap_or("(keine)")
     );
     confirm_and_run("Provider so anlegen", || {
-        add_provider(home, &name, &api, &base_url, auth.as_deref(), models.clone())
+        add_provider(
+            home,
+            &name,
+            &api,
+            &base_url,
+            auth.as_deref(),
+            models.clone(),
+        )
     })?;
     print_validation_result(home);
     Ok(())
@@ -810,9 +836,10 @@ fn interactive_permissions(home: &Path) -> Result<(), SettingsError> {
         "2" => {
             let mode = prompt_required("Modus (ask/auto/full)")?;
             let scope = prompt_scope()?;
-            confirm_and_run(&format!("Standardmodus auf {mode:?} setzen ({scope})"), || {
-                set_permissions_mode(home, &mode, scope)
-            })
+            confirm_and_run(
+                &format!("Standardmodus auf {mode:?} setzen ({scope})"),
+                || set_permissions_mode(home, &mode, scope),
+            )
         }
         "3" => {
             let tool = prompt_required("Werkzeug")?;
@@ -843,7 +870,12 @@ fn interactive_permissions(home: &Path) -> Result<(), SettingsError> {
 fn interactive_title_model(home: &Path) -> Result<(), SettingsError> {
     let id = prompt_required("Modell-ID für Session-Titel")?;
     confirm_and_run(&format!("Session-Titel-Modell auf {id:?} setzen"), || {
-        run_set(home, "session.title_model", Some(id.clone()), SettingScope::Global)
+        run_set(
+            home,
+            "session.title_model",
+            Some(id.clone()),
+            SettingScope::Global,
+        )
     })
 }
 
@@ -1003,8 +1035,15 @@ mod tests {
     #[test]
     fn test_add_provider_rejects_plaintext_auth() {
         let (_guard, home) = temp_home();
-        let error = add_provider(&home, "acme", "openai-chat", "https://api.acme.test/v1", Some("sk-plain"), vec![])
-            .expect_err("plaintext auth must be rejected");
+        let error = add_provider(
+            &home,
+            "acme",
+            "openai-chat",
+            "https://api.acme.test/v1",
+            Some("sk-plain"),
+            vec![],
+        )
+        .expect_err("plaintext auth must be rejected");
         assert!(matches!(error, SettingsError::PlaintextAuthRejected { .. }));
         assert!(error.to_string().contains("harw auth"));
     }
@@ -1012,16 +1051,30 @@ mod tests {
     #[test]
     fn test_add_provider_rejects_invalid_name() {
         let (_guard, home) = temp_home();
-        let error = add_provider(&home, "../escape", "openai-chat", "https://api.acme.test/v1", None, vec![])
-            .expect_err("invalid provider name must be rejected");
+        let error = add_provider(
+            &home,
+            "../escape",
+            "openai-chat",
+            "https://api.acme.test/v1",
+            None,
+            vec![],
+        )
+        .expect_err("invalid provider name must be rejected");
         assert!(matches!(error, SettingsError::InvalidProviderName { .. }));
     }
 
     #[test]
     fn test_add_provider_rejects_unsupported_api() {
         let (_guard, home) = temp_home();
-        let error = add_provider(&home, "acme", "made-up-api", "https://api.acme.test/v1", None, vec![])
-            .expect_err("unsupported api must be rejected");
+        let error = add_provider(
+            &home,
+            "acme",
+            "made-up-api",
+            "https://api.acme.test/v1",
+            None,
+            vec![],
+        )
+        .expect_err("unsupported api must be rejected");
         assert!(matches!(error, SettingsError::UnsupportedApi { .. }));
     }
 
@@ -1047,13 +1100,25 @@ mod tests {
         assert_eq!(provider.models, vec!["acme-large".to_owned()]);
 
         set_provider_enabled(&home, "acme", false).expect("disable provider");
-        assert!(!read_provider(&home, "acme").expect("reread provider").enabled);
+        assert!(
+            !read_provider(&home, "acme")
+                .expect("reread provider")
+                .enabled
+        );
 
         set_provider_enabled(&home, "acme", true).expect("enable provider");
-        assert!(read_provider(&home, "acme").expect("reread provider").enabled);
+        assert!(
+            read_provider(&home, "acme")
+                .expect("reread provider")
+                .enabled
+        );
 
         remove_provider(&home, "acme").expect("remove provider");
-        assert!(discover_provider_names(&home).expect("list after remove").is_empty());
+        assert!(
+            discover_provider_names(&home)
+                .expect("list after remove")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1124,14 +1189,22 @@ mod tests {
         let (_guard, home) = temp_home();
         let error = remove_permissions_rule(&home, RuleKind::Allow, 3, SettingScope::Global)
             .expect_err("out-of-range index must be rejected");
-        assert!(matches!(error, SettingsError::InvalidRuleIndex { index: 3, len: 0 }));
+        assert!(matches!(
+            error,
+            SettingsError::InvalidRuleIndex { index: 3, len: 0 }
+        ));
     }
 
     #[test]
     fn test_get_set_generic_dotted_key_round_trips_at_global_scope() {
         let (_guard, home) = temp_home();
-        run_set(&home, "policy_profile", Some("strict".to_owned()), SettingScope::Global)
-            .expect("set dotted key");
+        run_set(
+            &home,
+            "policy_profile",
+            Some("strict".to_owned()),
+            SettingScope::Global,
+        )
+        .expect("set dotted key");
 
         let path = global_config_path(&home).expect("global config path");
         let writer = ConfigWriter::open(&path).expect("reopen");
@@ -1158,6 +1231,9 @@ mod tests {
         // Aufruf immer einen Pfad liefern.
         let path = project_settings_path(&home).expect("resolve project settings path");
         assert!(path.starts_with(home.join("profiles")));
-        assert_eq!(path.file_name().and_then(|n| n.to_str()), Some("settings.toml"));
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("settings.toml")
+        );
     }
 }

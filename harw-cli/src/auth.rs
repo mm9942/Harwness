@@ -124,25 +124,17 @@ fn persist_and_hint(home: &Path, provider: &str, token: &SecretString) -> Result
 ///
 /// Ein ChatGPT-Login der Codex-CLI enthält einen kurzlebigen OAuth-Access-Token.
 /// Dieser ist kein OpenAI-Platform-API-Key und darf nie an `api.openai.com`
-/// weitergereicht werden. Harw importiert aus der Codex-Datei daher ausschließlich
-/// den dort gegebenenfalls vorhandenen `OPENAI_API_KEY`.
+/// weitergereicht werden. `codex` wählt den Platform-Key; `codex-oauth` nutzt
+/// die nur lesende, an das Codex-Backend gebundene Login-Route.
 fn import(source: &str) -> Result<(), String> {
     let provider = match source {
-        "codex" => "openai",
-        "codex-oauth" => {
-            return Err(
-                "Codex-ChatGPT-OAuth-Tokens können nicht als OpenAI-API-Key importiert werden. \
-                 Verwende einen OpenAI-Platform-API-Key mit `harw auth token openai` oder \
-                 importiere `codex` nur, wenn ~/.codex/auth.json einen OPENAI_API_KEY enthält."
-                    .to_owned(),
-            );
-        }
+        "codex" | "codex-oauth" => "openai",
         "claude-cli" | "claude-setup-token" => "anthropic",
         "gemini-env" => "gemini",
         "mistral-env" => "mistral",
         other => {
             return Err(format!(
-                "unbekannte Quelle: {other} (codex | claude-cli | gemini-env | mistral-env)"
+                "unbekannte Quelle: {other} (codex | codex-oauth | claude-cli | gemini-env | mistral-env)"
             ));
         }
     };
@@ -170,10 +162,13 @@ fn import(source: &str) -> Result<(), String> {
         if source == "codex" {
             return Err(
                 "kein OpenAI-Platform-API-Key in ~/.codex/auth.json gefunden. Ein \
-                 ChatGPT-Codex-Login-Token wird absichtlich nicht importiert; verwende \
+                 ChatGPT-Codex-Login nutzt `harw auth import codex-oauth`; alternativ \
                  `harw auth token openai` mit einem Platform-API-Key."
                     .to_owned(),
             );
+        }
+        if source == "codex-oauth" {
+            return Err("kein Codex-Login gefunden; zuerst `codex login` ausführen".into());
         }
         return Err(format!(
             "keine lokale Quelle für '{source}' gefunden (Provider {provider})"
@@ -183,6 +178,11 @@ fn import(source: &str) -> Result<(), String> {
         "\nTrage die gewünschte Referenz als `auth = \"…\"` in \
          `providers/{provider}.toml` ein, um sie zu nutzen."
     );
+    if source == "codex-oauth" {
+        eprintln!(
+            "Codex-Route: api = \"openai-responses\", base_url = \"https://chatgpt.com/backend-api/codex\". Login/Refresh bleiben bei Codex; Harw liest die Datei pro Request neu."
+        );
+    }
     Ok(())
 }
 

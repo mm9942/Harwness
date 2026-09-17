@@ -29,12 +29,12 @@
 //! Zustandslos; `harw models scan` baut für die Dauer des Befehls eine
 //! Single-Thread-`tokio`-Laufzeit (wie `crate::connect`/`crate::auth`).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
 use std::fmt;
+use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use toml_edit::value;
@@ -59,18 +59,38 @@ pub enum ModelsError {
     /// Laden oder Validieren einer Config-Datei schlug fehl.
     Config(harw_config::ConfigError),
     /// Ein Dateisystemzugriff schlug fehl; `path` benennt das Ziel.
-    Io { path: PathBuf, source: std::io::Error },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     /// Eine TOML-Datei ist kein gültiges bzw. serialisierbares Dokument.
-    Toml { path: PathBuf, reason: String },
+    Toml {
+        path: PathBuf,
+        reason: String,
+    },
     /// Der angegebene Provider existiert nicht in der aufgelösten Konfiguration.
-    ProviderNotFound { name: String },
+    ProviderNotFound {
+        name: String,
+    },
     /// Ein unbekannter Stellen-Schlüssel wurde an `harw models internal` übergeben.
-    UnknownPoint { point: String, valid: String },
+    UnknownPoint {
+        point: String,
+        valid: String,
+    },
     /// Der versiegelte Secret-Store konnte für eine Modellabfrage nicht geöffnet werden.
-    SecretStore { reason: String },
-    InvalidModelTarget { target: String },
-    ModelNotLive { provider: String, model: String },
-    ProviderDisabled { provider: String },
+    SecretStore {
+        reason: String,
+    },
+    InvalidModelTarget {
+        target: String,
+    },
+    ModelNotLive {
+        provider: String,
+        model: String,
+    },
+    ProviderDisabled {
+        provider: String,
+    },
 }
 
 impl fmt::Display for ModelsError {
@@ -79,7 +99,11 @@ impl fmt::Display for ModelsError {
             Self::Home(source) => write!(f, "{source}"),
             Self::Config(source) => write!(f, "{source}"),
             Self::Io { path, source } => {
-                write!(f, "dateizugriff auf {} fehlgeschlagen: {source}", path.display())
+                write!(
+                    f,
+                    "dateizugriff auf {} fehlgeschlagen: {source}",
+                    path.display()
+                )
             }
             Self::Toml { path, reason } => {
                 write!(f, "toml-dokument {} ist ungültig: {reason}", path.display())
@@ -92,11 +116,21 @@ impl fmt::Display for ModelsError {
                 "unbekannte interne Modellstelle {point:?}; gültige Schlüssel: {valid}"
             ),
             Self::SecretStore { reason } => {
-                write!(f, "Secret-Store für Modellabfrage nicht verfügbar: {reason}")
+                write!(
+                    f,
+                    "Secret-Store für Modellabfrage nicht verfügbar: {reason}"
+                )
             }
-            Self::InvalidModelTarget { target } => write!(f, "Modellziel muss `provider/modell` sein: {target:?}"),
-            Self::ModelNotLive { provider, model } => write!(f, "Modell {provider}/{model} ist nicht live entdeckt; zuerst `harw models scan {provider}` ausführen"),
-            Self::ProviderDisabled { provider } => write!(f, "Provider {provider:?} ist deaktiviert"),
+            Self::InvalidModelTarget { target } => {
+                write!(f, "Modellziel muss `provider/modell` sein: {target:?}")
+            }
+            Self::ModelNotLive { provider, model } => write!(
+                f,
+                "Modell {provider}/{model} ist nicht live entdeckt; zuerst `harw models scan {provider}` ausführen"
+            ),
+            Self::ProviderDisabled { provider } => {
+                write!(f, "Provider {provider:?} ist deaktiviert")
+            }
         }
     }
 }
@@ -155,7 +189,9 @@ fn execute(home: &Path, action: Option<ModelsAction>) -> Result<(), ModelsError>
             add,
             free_only,
         }) => run_scan(home, provider, add, free_only),
-        Some(ModelsAction::Add { target: Some(target) }) => add_model(home, &target),
+        Some(ModelsAction::Add {
+            target: Some(target),
+        }) => add_model(home, &target),
         Some(ModelsAction::Add { target: None }) => run_model_picker(home),
         Some(ModelsAction::Delete { target }) => delete_model(home, &target),
         Some(ModelsAction::Internal { action }) => run_internal(home, action),
@@ -209,9 +245,10 @@ fn run_list(home: &Path) -> Result<(), ModelsError> {
     }
     for name in provider_names {
         let provider = &config.providers[name];
-        let auth_ok = discovery::resolve_provider_api_key(name, provider, &config, Some(home), resolver)
-            .is_some()
-            || provider.auth_header.as_deref() == Some("none");
+        let auth_ok =
+            discovery::resolve_provider_api_key(name, provider, &config, Some(home), resolver)
+                .is_some()
+                || provider.auth_header.as_deref() == Some("none");
         println!(
             "{name}\tapi={}\thost={}\tauth={}\tenabled={}",
             provider.api,
@@ -228,7 +265,10 @@ fn run_list(home: &Path) -> Result<(), ModelsError> {
     let mut by_provider: std::collections::BTreeMap<&str, Vec<&harw_config::ModelToml>> =
         std::collections::BTreeMap::new();
     for model in config.models.values() {
-        by_provider.entry(model.provider.as_str()).or_default().push(model);
+        by_provider
+            .entry(model.provider.as_str())
+            .or_default()
+            .push(model);
     }
     for (provider_name, mut models) in by_provider {
         models.sort_by(|left, right| left.id.cmp(&right.id));
@@ -306,7 +346,8 @@ fn run_scan(
         println!("--add ist nicht mehr nötig: erfolgreiche Scans synchronisieren Modell-Dateien.");
     }
     for (name, provider) in targets {
-        let api_key = discovery::resolve_provider_api_key(name, provider, &config, Some(home), resolver);
+        let api_key =
+            discovery::resolve_provider_api_key(name, provider, &config, Some(home), resolver);
         match runtime.block_on(discovery::list_models(name, provider, api_key.as_deref())) {
             Ok(models) => {
                 let filtered: Vec<DiscoveredModel> = if free_only {
@@ -344,13 +385,24 @@ fn sync_provider_model_list(
             reason: "ungültiger Provider-Name für Modell-Synchronisation".to_owned(),
         });
     }
-    let path = profile.join("providers").join(format!("{provider_name}.toml"));
+    let path = profile
+        .join("providers")
+        .join(format!("{provider_name}.toml"));
     let document = open_document(&path)?;
-    let provider: harw_config::ProviderToml = toml::from_str(&document.to_string()).map_err(|error| {
-        ModelsError::Toml { path: path.clone(), reason: error.to_string() }
-    })?;
-    let live = discovered.iter().map(|model| model.id.as_str()).collect::<BTreeSet<_>>();
-    let ids = provider.models.iter().filter(|id| live.contains(id.as_str())).collect::<BTreeSet<_>>();
+    let provider: harw_config::ProviderToml =
+        toml::from_str(&document.to_string()).map_err(|error| ModelsError::Toml {
+            path: path.clone(),
+            reason: error.to_string(),
+        })?;
+    let live = discovered
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let ids = provider
+        .models
+        .iter()
+        .filter(|id| live.contains(id.as_str()))
+        .collect::<BTreeSet<_>>();
     write_provider_model_list(&path, ids.into_iter().map(ToString::to_string))
 }
 
@@ -369,10 +421,14 @@ fn write_provider_model_list(
 
 fn parse_model_target(target: &str) -> Result<(&str, &str), ModelsError> {
     let Some((provider, model)) = target.split_once('/') else {
-        return Err(ModelsError::InvalidModelTarget { target: target.to_owned() });
+        return Err(ModelsError::InvalidModelTarget {
+            target: target.to_owned(),
+        });
     };
     if provider.is_empty() || model.is_empty() {
-        return Err(ModelsError::InvalidModelTarget { target: target.to_owned() });
+        return Err(ModelsError::InvalidModelTarget {
+            target: target.to_owned(),
+        });
     }
     Ok((provider, model))
 }
@@ -384,12 +440,27 @@ fn provider_path(profile: &Path, provider: &str) -> PathBuf {
 fn add_model(home: &Path, target: &str) -> Result<(), ModelsError> {
     let (provider_name, model_id) = parse_model_target(target)?;
     let (config, profile) = load_config_and_profile(home)?;
-    let provider = config.providers.get(provider_name).ok_or_else(|| ModelsError::ProviderNotFound { name: provider_name.to_owned() })?;
+    let provider =
+        config
+            .providers
+            .get(provider_name)
+            .ok_or_else(|| ModelsError::ProviderNotFound {
+                name: provider_name.to_owned(),
+            })?;
     if !provider.enabled {
-        return Err(ModelsError::ProviderDisabled { provider: provider_name.to_owned() });
+        return Err(ModelsError::ProviderDisabled {
+            provider: provider_name.to_owned(),
+        });
     }
-    if !config.models.values().any(|model| model.provider == provider_name && model.id == model_id) {
-        return Err(ModelsError::ModelNotLive { provider: provider_name.to_owned(), model: model_id.to_owned() });
+    if !config
+        .models
+        .values()
+        .any(|model| model.provider == provider_name && model.id == model_id)
+    {
+        return Err(ModelsError::ModelNotLive {
+            provider: provider_name.to_owned(),
+            model: model_id.to_owned(),
+        });
     }
     let mut selected = provider.models.iter().cloned().collect::<BTreeSet<_>>();
     selected.insert(model_id.to_owned());
@@ -401,7 +472,13 @@ fn add_model(home: &Path, target: &str) -> Result<(), ModelsError> {
 fn delete_model(home: &Path, target: &str) -> Result<(), ModelsError> {
     let (provider_name, model_id) = parse_model_target(target)?;
     let (config, profile) = load_config_and_profile(home)?;
-    let provider = config.providers.get(provider_name).ok_or_else(|| ModelsError::ProviderNotFound { name: provider_name.to_owned() })?;
+    let provider =
+        config
+            .providers
+            .get(provider_name)
+            .ok_or_else(|| ModelsError::ProviderNotFound {
+                name: provider_name.to_owned(),
+            })?;
     let mut selected = provider.models.iter().cloned().collect::<BTreeSet<_>>();
     selected.remove(model_id);
     write_provider_model_list(&provider_path(&profile, provider_name), selected)?;
@@ -425,11 +502,15 @@ fn run_model_picker(home: &Path) -> Result<(), ModelsError> {
         .iter()
         .filter(|(_, provider)| provider.enabled)
         .map(|(name, provider)| {
-            let mut models = config.models.values()
+            let mut models = config
+                .models
+                .values()
                 .filter(|model| model.provider == *name)
                 .map(|model| model.id.clone())
                 .collect::<Vec<_>>();
-            if models.is_empty() { models = provider.models.clone(); }
+            if models.is_empty() {
+                models = provider.models.clone();
+            }
             harw_tui::ModelPickerProvider {
                 id: name.clone(),
                 models,
@@ -442,9 +523,12 @@ fn run_model_picker(home: &Path) -> Result<(), ModelsError> {
         println!("Keine aktivierten Provider konfiguriert.");
         return Ok(());
     }
-    if let Some(outcome) = harw_tui::run_model_picker(providers).map_err(|error| ModelsError::Toml {
-        path: profile.join("providers"), reason: error.to_string()
-    })? {
+    if let Some(outcome) =
+        harw_tui::run_model_picker(providers).map_err(|error| ModelsError::Toml {
+            path: profile.join("providers"),
+            reason: error.to_string(),
+        })?
+    {
         let count = outcome.models.len();
         write_provider_model_list(&provider_path(&profile, &outcome.provider), outcome.models)?;
         println!("{}: {count} Modelle gewählt.", outcome.provider);
@@ -457,7 +541,9 @@ fn run_model_picker(home: &Path) -> Result<(), ModelsError> {
 fn is_free_model(model: &DiscoveredModel) -> bool {
     model.id.ends_with(":free")
         || model.input_price_per_mtok.is_some_and(|price| price <= 0.0)
-        || model.output_price_per_mtok.is_some_and(|price| price <= 0.0)
+        || model
+            .output_price_per_mtok
+            .is_some_and(|price| price <= 0.0)
 }
 
 fn print_discovered_model(model: &DiscoveredModel) {
@@ -518,7 +604,10 @@ fn sync_discovered_model_files(
                 let model: harw_config::ModelToml = match toml::from_str(&raw) {
                     Ok(model) => model,
                     Err(_) => {
-                        println!("  übersprungen (ungültiges Modell-TOML): {}", path.display());
+                        println!(
+                            "  übersprungen (ungültiges Modell-TOML): {}",
+                            path.display()
+                        );
                         continue;
                     }
                 };
@@ -537,7 +626,12 @@ fn sync_discovered_model_files(
             }
         }
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-        Err(source) => return Err(ModelsError::Io { path: models_dir.to_path_buf(), source }),
+        Err(source) => {
+            return Err(ModelsError::Io {
+                path: models_dir.to_path_buf(),
+                source,
+            });
+        }
     }
 
     for model in live.values() {
@@ -713,7 +807,10 @@ fn set_internal_choice(
 /// Erzwingt das Hauptmodell für `point`: legt eine leere
 /// `[internal_models.<point>]`-Tabelle an (`model`/`provider` entfernt),
 /// die `harw_config::resolve_internal_model` als `MainModel` liest.
-fn set_internal_main(home: &Path, point: harw_config::InternalModelPoint) -> Result<(), ModelsError> {
+fn set_internal_main(
+    home: &Path,
+    point: harw_config::InternalModelPoint,
+) -> Result<(), ModelsError> {
     mutate_internal_models_table(home, |table| {
         let sub = ensure_table(table, point.key());
         sub.remove("model");
@@ -774,10 +871,12 @@ fn open_document(path: &Path) -> Result<toml_edit::DocumentMut, ModelsError> {
             });
         }
     };
-    content.parse::<toml_edit::DocumentMut>().map_err(|error| ModelsError::Toml {
-        path: path.to_path_buf(),
-        reason: error.to_string(),
-    })
+    content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| ModelsError::Toml {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        })
 }
 
 /// Stellt sicher, dass `table[key]` eine Tabelle ist, und gibt eine
@@ -907,8 +1006,11 @@ mod tests {
             capabilities: harw_config::ModelCapabilitiesToml::default(),
         };
         let cache_path = models.join(model_filename(&live.id));
-        std::fs::write(&cache_path, toml::to_string(&live).expect("serialize model"))
-            .expect("model cache");
+        std::fs::write(
+            &cache_path,
+            toml::to_string(&live).expect("serialize model"),
+        )
+        .expect("model cache");
 
         add_model(&home, "acme/model/with-slash").expect("add live model");
         let provider: harw_config::ProviderToml = toml::from_str(
@@ -973,11 +1075,17 @@ mod tests {
             input_types: Vec::new(),
             capabilities: harw_config::ModelCapabilitiesToml::default(),
         };
-        let other = harw_config::ModelToml { provider: "other".to_owned(), ..old.clone() };
+        let other = harw_config::ModelToml {
+            provider: "other".to_owned(),
+            ..old.clone()
+        };
         std::fs::write(models_dir.join("gone.toml"), toml::to_string(&old).unwrap())
             .expect("write stale model");
-        std::fs::write(models_dir.join("other.toml"), toml::to_string(&other).unwrap())
-            .expect("write other provider model");
+        std::fs::write(
+            models_dir.join("other.toml"),
+            toml::to_string(&other).unwrap(),
+        )
+        .expect("write other provider model");
 
         let live = DiscoveredModel {
             id: "current".to_owned(),
@@ -1012,8 +1120,20 @@ mod tests {
         )
         .expect("write provider");
         let models = [
-            DiscoveredModel { id: "zeta".to_owned(), context_length: None, input_price_per_mtok: None, output_price_per_mtok: None, supports_tools: None },
-            DiscoveredModel { id: "alpha".to_owned(), context_length: None, input_price_per_mtok: None, output_price_per_mtok: None, supports_tools: None },
+            DiscoveredModel {
+                id: "zeta".to_owned(),
+                context_length: None,
+                input_price_per_mtok: None,
+                output_price_per_mtok: None,
+                supports_tools: None,
+            },
+            DiscoveredModel {
+                id: "alpha".to_owned(),
+                context_length: None,
+                input_price_per_mtok: None,
+                output_price_per_mtok: None,
+                supports_tools: None,
+            },
         ];
 
         sync_provider_model_list(&profile, "acme", &models).expect("sync provider list");
@@ -1040,7 +1160,10 @@ mod tests {
 
         let path = global_config_path(&home).expect("global config path");
         let writer = ConfigWriter::open(&path).expect("reopen");
-        assert_eq!(writer.get_value("default_model"), Some("gpt-5.4".to_owned()));
+        assert_eq!(
+            writer.get_value("default_model"),
+            Some("gpt-5.4".to_owned())
+        );
     }
 
     #[test]
@@ -1048,8 +1171,13 @@ mod tests {
         let (_guard, home) = temp_home();
         let point = harw_config::InternalModelPoint::Explorer;
 
-        set_internal_choice(&home, point, "nvidia/nemotron-3-super-120b-a12b", Some("openrouter"))
-            .expect("set internal choice");
+        set_internal_choice(
+            &home,
+            point,
+            "nvidia/nemotron-3-super-120b-a12b",
+            Some("openrouter"),
+        )
+        .expect("set internal choice");
         let path = global_config_path(&home).expect("global config path");
         let writer = ConfigWriter::open(&path).expect("reopen after set");
         assert_eq!(

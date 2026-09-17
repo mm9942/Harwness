@@ -343,7 +343,10 @@ fn effective_last_active(session: &DiscoveredSession) -> SystemTime {
 /// Projektfilter anwenden (Contract §4: "`harw -r` zeigt standardmäßig die
 /// Sessions des aktuellen Projekts").
 #[must_use]
-pub fn session_matches_project(session: &DiscoveredSession, current_project_key: Option<&str>) -> bool {
+pub fn session_matches_project(
+    session: &DiscoveredSession,
+    current_project_key: Option<&str>,
+) -> bool {
     match session
         .meta
         .as_ref()
@@ -380,7 +383,9 @@ fn attempted_backfills() -> &'static Mutex<HashSet<SessionId>> {
 /// erste Versuch in diesem Prozesslauf ist (Aufrufer soll dann scannen).
 fn mark_backfill_attempted(id: &SessionId) -> bool {
     let mutex = attempted_backfills();
-    let mut attempted = mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut attempted = mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     attempted.insert(id.clone())
 }
 
@@ -444,7 +449,13 @@ pub fn backfill_project_key(sessions_dir: &Path, session: &mut DiscoveredSession
         }
 
         let key = harw_home::project::project_key(&project.root);
-        match meta::set_project(sessions_dir, &session.id, None, Some(&project.root), Some(&key)) {
+        match meta::set_project(
+            sessions_dir,
+            &session.id,
+            None,
+            Some(&project.root),
+            Some(&key),
+        ) {
             Ok(updated_meta) => {
                 tracing::debug!(
                     session = %session.id,
@@ -502,7 +513,12 @@ fn extract_path_candidates(text: &str) -> Vec<&str> {
             end += 1;
         }
         let candidate = &text[start..end];
-        if candidate.split('/').filter(|segment| !segment.is_empty()).count() >= 3 {
+        if candidate
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .count()
+            >= 3
+        {
             candidates.push(candidate);
         }
         index = if end > start { end } else { index + 1 };
@@ -522,7 +538,8 @@ fn is_ignored_backfill_path(path: &str) -> bool {
     }
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         let home = home.to_string_lossy().into_owned();
-        if path.starts_with(&format!("{home}/.harw")) || path.starts_with(&format!("{home}/.cargo")) {
+        if path.starts_with(&format!("{home}/.harw")) || path.starts_with(&format!("{home}/.cargo"))
+        {
             return true;
         }
     }
@@ -588,7 +605,11 @@ mod tests {
         }
     }
 
-    fn session_with_meta(id: &str, modified_after_epoch: u64, meta: SessionMeta) -> DiscoveredSession {
+    fn session_with_meta(
+        id: &str,
+        modified_after_epoch: u64,
+        meta: SessionMeta,
+    ) -> DiscoveredSession {
         DiscoveredSession {
             meta: Some(meta),
             ..session(id, modified_after_epoch)
@@ -902,10 +923,14 @@ mod tests {
             .meta
             .as_ref()
             .expect("meta stays present after backfill");
-        assert_eq!(updated_meta.project_key.as_deref(), Some(expected_key.as_str()));
+        assert_eq!(
+            updated_meta.project_key.as_deref(),
+            Some(expected_key.as_str())
+        );
 
         // Erneutes `load_or_derive` bestätigt, dass der Sidecar persistiert wurde.
-        let reloaded = meta::load_or_derive(sessions_dir.path(), &id).expect("reload persisted meta");
+        let reloaded =
+            meta::load_or_derive(sessions_dir.path(), &id).expect("reload persisted meta");
         assert_eq!(reloaded.project_key.as_deref(), Some(expected_key.as_str()));
     }
 

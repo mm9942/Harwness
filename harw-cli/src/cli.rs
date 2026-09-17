@@ -108,6 +108,23 @@ pub struct TelemetryArgs {
     pub metrics_otlp_endpoint: Option<String>,
 }
 
+/// Aktionen für die Cloudflare-MCP-Integration.
+#[derive(Debug, Subcommand)]
+pub enum McpAction {
+    /// Legt die deklarative Cloudflare-MCP-Konfiguration im aktiven Profil an.
+    Setup {
+        /// MCP-Servername; derzeit wird `cloudflare` unterstützt.
+        #[arg(default_value = "cloudflare")]
+        server: String,
+    },
+    /// Führt MCP initialize und tools/list gegen den konfigurierten Server aus.
+    Check {
+        /// MCP-Servername; derzeit wird `cloudflare` unterstützt.
+        #[arg(default_value = "cloudflare")]
+        server: String,
+    },
+}
+
 /// Alle Subcommands von `harw`.
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -135,6 +152,12 @@ pub enum Command {
         /// Statt der Home-Layer genau dieses Verzeichnis verwenden.
         #[arg(long, value_name = "DIR")]
         config_dir: Option<PathBuf>,
+    },
+    /// Cloudflare-MCP-Verbindung einrichten oder prüfen.
+    Mcp {
+        /// Auszuführende MCP-Aktion.
+        #[command(subcommand)]
+        action: McpAction,
     },
     /// Persistenter Hintergrund-Daemon: Gateway + Agenten + Channels
     /// (Telegram) + Knowledge (Workbench/Dream/Diary). Ohne Aktion läuft der
@@ -243,6 +266,98 @@ pub enum Command {
         /// Nicht rückfragen (nicht-interaktiv erforderlich).
         #[arg(long)]
         yes: bool,
+    },
+    /// Benutzeroberflächen-Agentin (UIA) verwalten.
+    ///
+    /// Der interaktive Chat-Einstieg richtet ohne konfigurierte UIA bereits
+    /// automatisch eine ein (siehe `crate::uia_bootstrap`); dieser Befehl
+    /// erlaubt, den Einrichtungsdialog gezielt erneut aufzurufen, z. B. um
+    /// eine zusätzliche UIA neben einer bereits aktiven anzulegen.
+    Uia {
+        /// Auszuführende UIA-Aktion.
+        #[command(subcommand)]
+        action: UiaAction,
+    },
+    /// Host-Profil-Permit-Ledger prüfen und verwalten (siehe
+    /// [`harw_sandbox::ProcessPermitLedger`], `host-process-worker.toml`).
+    /// Ohne Unterbefehl entspricht dies `harw sandbox status`.
+    ///
+    /// **Achtung**: Ledger und Sitzungs-Registry leben ausschließlich im
+    /// Speicher der laufenden Sitzung (`harw`-Chat/-TUI-Prozess), die sie
+    /// ausgestellt hat — wie jede In-Memory-Freigabe in dieser Harness gibt
+    /// es keine Persistenz über Prozessgrenzen. Dieser Befehl ist deshalb
+    /// die Konfigurations-/Audit-Fläche (analog zu `harw settings`/
+    /// `harw models`), kein Fenster in eine fremde, bereits laufende
+    /// Sitzung: `leases`/`revoke` wirken nur auf den Ledger **dieses**
+    /// Prozesses.
+    Sandbox {
+        /// Auszuführende Sandbox-Aktion; ohne Angabe wird der Status gezeigt.
+        #[command(subcommand)]
+        action: Option<SandboxAction>,
+    },
+    /// Speichert einen lokalen Bug-Report unter `<home>/bug-report/`.
+    ///
+    /// Rein lokal — kein Netzwerk-Versand. Fehlende Pflichtfelder
+    /// (`--type`, `--title`, `--area`, `--failure-mode`, `--what-happened`)
+    /// werden interaktiv nachgefragt. Die automatische Incident-Erkennung
+    /// (gekillte Kinder, erschöpfte Retries, Panics) ist ein separates, noch
+    /// ausstehendes Arbeitspaket — dieser Befehl ist der manuelle Fallback.
+    BugReport {
+        /// Berichtsart (z. B. `manual`, `crash`).
+        #[arg(long = "type")]
+        report_type: Option<String>,
+        /// Kurztitel des Berichts.
+        #[arg(long)]
+        title: Option<String>,
+        /// Betroffener Bereich/Modul.
+        #[arg(long)]
+        area: Option<String>,
+        /// Beobachteter Fehlermodus.
+        #[arg(long = "failure-mode")]
+        failure_mode: Option<String>,
+        /// Optionale Aufgabenkategorie.
+        #[arg(long = "task-category")]
+        task_category: Option<String>,
+        /// Freitext-Beschreibung des Vorfalls.
+        #[arg(long = "what-happened")]
+        what_happened: Option<String>,
+        /// Optionaler, bereits redigierter Nutzer-O-Ton.
+        #[arg(long = "what-user-said")]
+        what_user_said: Option<String>,
+        /// Optionale Reproduktionsschritte.
+        #[arg(long)]
+        repro: Option<String>,
+        /// Optionale Beleg-Ausschnitte.
+        #[arg(long)]
+        evidence: Option<String>,
+    },
+}
+
+/// Aktionen des `harw uia`-Subcommands.
+#[derive(Debug, Subcommand)]
+pub enum UiaAction {
+    /// Richtet interaktiv eine neue UIA ein (Name, Persönlichkeit,
+    /// Nutzerkontext), zeigt eine Vorschau, fragt Bestätigung ab und
+    /// aktiviert die neue UIA anschließend als
+    /// `active_uia_definition` im aktiven Profil.
+    New,
+}
+
+/// Aktionen des `harw sandbox`-Subcommands.
+#[derive(Debug, Subcommand)]
+pub enum SandboxAction {
+    /// Zeigt, welche Worker-Definitionen Host-Profil-Ausführung deklarieren
+    /// und ob die Permit-Ledger-Kette dafür in diesem Prozess verdrahtet ist.
+    Status,
+    /// Listet aktive Host-Permit-Leases **dieses Prozesses** (siehe Hinweis
+    /// bei [`Command::Sandbox`] zur fehlenden Persistenz über Prozesse hinweg).
+    Leases,
+    /// Widerruft alle Leases und gemerkten Permits einer Sitzung **in
+    /// diesem Prozess**.
+    Revoke {
+        /// Sitzungs-ID, deren Zustimmung und Permits widerrufen werden.
+        #[arg(long)]
+        session: String,
     },
 }
 
@@ -635,8 +750,15 @@ mod tests {
 
     #[test]
     fn connect_telegram_pairing_parses() {
-        let cli = Cli::try_parse_from(["harw", "connect", "--channel", "telegram", "--pair", "ABCD-EFGH"])
-            .expect("Telegram connect must parse");
+        let cli = Cli::try_parse_from([
+            "harw",
+            "connect",
+            "--channel",
+            "telegram",
+            "--pair",
+            "ABCD-EFGH",
+        ])
+        .expect("Telegram connect must parse");
         let Some(Command::Connect { channel, pair }) = cli.command else {
             panic!("expected connect command");
         };
@@ -780,7 +902,10 @@ mod tests {
             action: ProjectAction::Trust { path },
         }) = trust.command
         else {
-            panic!("erwartete Command::Project(Trust), bekam {:?}", trust.command);
+            panic!(
+                "erwartete Command::Project(Trust), bekam {:?}",
+                trust.command
+            );
         };
         assert_eq!(path, Some(PathBuf::from("/tmp/proj")));
 
@@ -881,13 +1006,14 @@ mod tests {
         let Some(Command::Settings {
             action:
                 Some(SettingsAction::Provider {
-                    action: SettingsProviderAction::Add {
-                        name,
-                        api,
-                        base_url,
-                        auth,
-                        models,
-                    },
+                    action:
+                        SettingsProviderAction::Add {
+                            name,
+                            api,
+                            base_url,
+                            auth,
+                            models,
+                        },
                 }),
         }) = cli.command
         else {
@@ -914,7 +1040,10 @@ mod tests {
                 }),
         }) = cli.command
         else {
-            panic!("erwartete Settings(Model(Default)), bekam {:?}", cli.command);
+            panic!(
+                "erwartete Settings(Model(Default)), bekam {:?}",
+                cli.command
+            );
         };
         assert_eq!(id, "gpt-5.4");
     }
@@ -961,10 +1090,20 @@ mod tests {
     #[test]
     fn test_settings_scope_flags_conflict_in_both_orders() {
         let forward = Cli::try_parse_from([
-            "harw", "settings", "get", "default_model", "--global", "--project",
+            "harw",
+            "settings",
+            "get",
+            "default_model",
+            "--global",
+            "--project",
         ]);
         let backward = Cli::try_parse_from([
-            "harw", "settings", "get", "default_model", "--project", "--global",
+            "harw",
+            "settings",
+            "get",
+            "default_model",
+            "--project",
+            "--global",
         ]);
 
         match (forward, backward) {
@@ -996,16 +1135,11 @@ mod tests {
             })
         ));
 
-        let deny = match Cli::try_parse_from([
-            "harw",
-            "settings",
-            "permissions",
-            "deny",
-            "fs.write",
-        ]) {
-            Ok(cli) => cli,
-            Err(err) => panic!("`harw settings permissions deny ...` sollte parsen: {err}"),
-        };
+        let deny =
+            match Cli::try_parse_from(["harw", "settings", "permissions", "deny", "fs.write"]) {
+                Ok(cli) => cli,
+                Err(err) => panic!("`harw settings permissions deny ...` sollte parsen: {err}"),
+            };
         assert!(matches!(
             deny.command,
             Some(Command::Settings {
@@ -1022,19 +1156,32 @@ mod tests {
             Ok(cli) => cli,
             Err(err) => panic!("`harw models` sollte parsen: {err}"),
         };
-        assert!(matches!(cli.command, Some(Command::Models { action: None })));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Models { action: None })
+        ));
     }
 
     #[test]
     fn test_models_scan_parses_provider_and_flags() {
         let cli = match Cli::try_parse_from([
-            "harw", "models", "scan", "openrouter", "--add", "--free-only",
+            "harw",
+            "models",
+            "scan",
+            "openrouter",
+            "--add",
+            "--free-only",
         ]) {
             Ok(cli) => cli,
             Err(err) => panic!("`harw models scan ...` sollte parsen: {err}"),
         };
         let Some(Command::Models {
-            action: Some(ModelsAction::Scan { provider, add, free_only }),
+            action:
+                Some(ModelsAction::Scan {
+                    provider,
+                    add,
+                    free_only,
+                }),
         }) = cli.command
         else {
             panic!("erwartete Models(Scan), bekam {:?}", cli.command);
@@ -1051,7 +1198,12 @@ mod tests {
             Err(err) => panic!("`harw models scan` sollte parsen: {err}"),
         };
         let Some(Command::Models {
-            action: Some(ModelsAction::Scan { provider, add, free_only }),
+            action:
+                Some(ModelsAction::Scan {
+                    provider,
+                    add,
+                    free_only,
+                }),
         }) = cli.command
         else {
             panic!("erwartete Models(Scan), bekam {:?}", cli.command);
@@ -1063,8 +1215,7 @@ mod tests {
 
     #[test]
     fn test_models_add_and_delete_parse_targets_and_picker_mode() {
-        let cli = Cli::try_parse_from(["harw", "models", "add"])
-            .expect("picker mode should parse");
+        let cli = Cli::try_parse_from(["harw", "models", "add"]).expect("picker mode should parse");
         assert!(matches!(
             cli.command,
             Some(Command::Models {
@@ -1134,9 +1285,15 @@ mod tests {
             Err(err) => panic!("`harw models internal set ...` sollte parsen: {err}"),
         };
         let Some(Command::Models {
-            action: Some(ModelsAction::Internal {
-                action: Some(InternalAction::Set { point, model, provider }),
-            }),
+            action:
+                Some(ModelsAction::Internal {
+                    action:
+                        Some(InternalAction::Set {
+                            point,
+                            model,
+                            provider,
+                        }),
+                }),
         }) = cli.command
         else {
             panic!("erwartete Models(Internal(Set)), bekam {:?}", cli.command);
@@ -1161,8 +1318,7 @@ mod tests {
             })
         ));
 
-        let reset = match Cli::try_parse_from(["harw", "models", "internal", "reset", "research"])
-        {
+        let reset = match Cli::try_parse_from(["harw", "models", "internal", "reset", "research"]) {
             Ok(cli) => cli,
             Err(err) => panic!("`harw models internal reset ...` sollte parsen: {err}"),
         };
@@ -1189,13 +1345,8 @@ mod tests {
             })
         ));
 
-        let invalid = Cli::try_parse_from([
-            "harw",
-            "models",
-            "internal",
-            "openrouter-defaults",
-            "maybe",
-        ]);
+        let invalid =
+            Cli::try_parse_from(["harw", "models", "internal", "openrouter-defaults", "maybe"]);
         assert!(invalid.is_err(), "ungültiger Zustand muss scheitern");
     }
 
@@ -1222,5 +1373,26 @@ mod tests {
             result.is_err(),
             "`harw web --config-dir` darf nicht mehr parsen, bekam {result:?}"
         );
+    }
+
+    #[test]
+    fn test_cloudflare_mcp_setup_and_check_parse() {
+        let setup = Cli::try_parse_from(["harw", "mcp", "setup", "cloudflare"])
+            .expect("Cloudflare MCP setup muss parsen");
+        assert!(matches!(
+            setup.command,
+            Some(Command::Mcp {
+                action: McpAction::Setup { server }
+            }) if server == "cloudflare"
+        ));
+
+        let check = Cli::try_parse_from(["harw", "mcp", "check"])
+            .expect("Cloudflare MCP check muss parsen");
+        assert!(matches!(
+            check.command,
+            Some(Command::Mcp {
+                action: McpAction::Check { server }
+            }) if server == "cloudflare"
+        ));
     }
 }

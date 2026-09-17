@@ -29,6 +29,7 @@ mod gateway;
 mod home;
 mod job_worker;
 mod lifecycle;
+mod mcp;
 mod mcp_auth;
 mod models;
 mod observe;
@@ -39,11 +40,12 @@ mod runtime_entry;
 mod runtime_gateway;
 mod runtime_jobs;
 mod runtime_web;
+mod sandbox_cmd;
 mod secret_store;
 mod settings;
+mod uia_bootstrap;
 mod web;
 mod worker_cancellation;
-mod uia_bootstrap;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -280,12 +282,19 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             doctor(layers, home_override.clone(), config_dir)?;
             lifecycle::health(home_override)
         }
-        Some(Command::Gateway { action: Some(action), .. }) => lifecycle::gateway_service(home_override, action),
-        Some(Command::Gateway { action: None, telemetry }) => gateway::run(home_override, telemetry),
+        Some(Command::Gateway {
+            action: Some(action),
+            ..
+        }) => lifecycle::gateway_service(home_override, action),
+        Some(Command::Gateway {
+            action: None,
+            telemetry,
+        }) => gateway::run(home_override, telemetry),
         Some(Command::Serve { config_dir }) => {
             let (layers, storage_root, home) = resolve_serve_paths(home_override, config_dir)?;
             serve_mcp(layers, storage_root, home)
         }
+        Some(Command::Mcp { action }) => mcp::run(home_override, action),
         Some(Command::Web { socket }) => {
             // `harw web` kennt kein `--config-dir` mehr: der Root-Space kommt
             // ausschließlich aus `--home` bzw. `HARW_HOME` (siehe `crate::web`).
@@ -314,11 +323,37 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Service { action }) => lifecycle::service(home_override, action),
         Some(Command::Catalog { refresh }) => lifecycle::catalog(home_override, refresh),
         Some(Command::Models { action }) => models::run(home_override, action),
+        Some(Command::Sandbox { action }) => sandbox_cmd::run(action),
+        Some(Command::BugReport {
+            report_type,
+            title,
+            area,
+            failure_mode,
+            task_category,
+            what_happened,
+            what_user_said,
+            repro,
+            evidence,
+        }) => cmd_bug_report(
+            home_override,
+            report_type,
+            title,
+            area,
+            failure_mode,
+            task_category,
+            what_happened,
+            what_user_said,
+            repro,
+            evidence,
+        ),
         Some(Command::Uninstall {
             scope,
             dry_run,
             yes,
         }) => lifecycle::uninstall(home_override, &scope, dry_run, yes),
+        Some(Command::Uia { action }) => match action {
+            cli::UiaAction::New => uia_bootstrap::run_new_uia_command(home_override),
+        },
         Some(Command::Analyze(args)) => cmd_analyze(
             home_override,
             requested_mode.as_deref(),
@@ -346,6 +381,7 @@ fn run_startup_migrations(
         | Some(Command::Gateway { .. })
         | Some(Command::Settings { .. })
         | Some(Command::Models { .. })
+        | Some(Command::Uia { .. })
         | Some(Command::Analyze(_)) => {
             let home = home::resolve_home(home_override)?;
             harw_home::ensure_home(&home).map_err(|error| error.to_string())?;
@@ -376,7 +412,10 @@ fn run_startup_migrations(
             | Command::Catalog { .. }
             | Command::Auth { .. }
             | Command::Project { .. }
-            | Command::Uninstall { .. },
+            | Command::Uninstall { .. }
+            | Command::Sandbox { .. }
+            | Command::Mcp { .. }
+            | Command::BugReport { .. },
         ) => return Ok(()),
     };
 
@@ -399,9 +438,8 @@ fn run_startup_migrations(
 /// # Errors
 /// Returns the resolver's error prefixed with a hint to `--home` / `HARW_HOME`.
 fn web_home(resolved: Result<PathBuf, String>) -> Result<PathBuf, String> {
-    resolved.map_err(|error| {
-        format!("harw web requires a HARW home (--home or HARW_HOME): {error}")
-    })
+    resolved
+        .map_err(|error| format!("harw web requires a HARW home (--home or HARW_HOME): {error}"))
 }
 
 /// Runs the installer-owned migration runner for each discovered config layer.
@@ -438,22 +476,115 @@ fn cmd_init(home_override: Option<PathBuf>) -> Result<(), String> {
     println!("neu geschriebene Dateien: {}", report.written_files.len());
 
     let cwd = std::env::current_dir().map_err(|error| format!("cwd: {error}"))?;
-    let project = harw_home::project::discover_project(&cwd, &[])
-        .map_err(|error| error.to_string())?;
+    let project =
+        harw_home::project::discover_project(&cwd, &[]).map_err(|error| error.to_string())?;
     if !project.root.join(".git").exists() {
         let status = ProcessCommand::new("git")
             .arg("init")
             .current_dir(&project.root)
             .status()
-            .map_err(|error| format!("could not run git init in {}: {error}", project.root.display()))?;
+            .map_err(|error| {
+                format!(
+                    "could not run git init in {}: {error}",
+                    project.root.display()
+                )
+            })?;
         if !status.success() {
-            return Err(format!("git init failed in {} with status {status}", project.root.display()));
+            return Err(format!(
+                "git init failed in {} with status {status}",
+                project.root.display()
+            ));
         }
         println!("Git-Repository angelegt: {}", project.root.display());
     }
     let project_home = harw_home::project::ProjectHome::at(&project);
     project_home.ensure().map_err(|error| error.to_string())?;
-    println!("Harw-Projektzustand angelegt: {}", project_home.dir.display());
+    println!(
+        "Harw-Projektzustand angelegt: {}",
+        project_home.dir.display()
+    );
+    Ok(())
+}
+
+/// Fragt eine Pflichtangabe für `harw bug-report` interaktiv ab, falls sie
+/// nicht bereits per Flag übergeben wurde.
+///
+/// Spiegelt den `prompt_line`-Stil aus `crate::uia_bootstrap`: schreibt das
+/// Label auf `stderr` (damit `stdout` für das Ergebnis frei bleibt), liest
+/// eine Zeile von `stdin` und behandelt EOF als Abbruch statt als leere
+/// Eingabe.
+fn prompt_bug_report_field(label: &str) -> Result<String, String> {
+    use std::io::Write as _;
+    eprint!("{label}: ");
+    std::io::stderr()
+        .flush()
+        .map_err(|error| format!("Bug-Report-Eingabe ausgeben: {error}"))?;
+    let mut answer = String::new();
+    let bytes_read = std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|error| format!("Bug-Report-Eingabe lesen: {error}"))?;
+    if bytes_read == 0 {
+        return Err("Bug-Report-Eingabe abgebrochen (Eingabe beendet)".to_owned());
+    }
+    Ok(answer.trim().to_owned())
+}
+
+/// Speichert einen lokalen Bug-Report unter `<home>/bug-report/` (siehe
+/// [`harw_ops::bug_report`]). Fehlende Pflichtfelder (`report_type`, `title`,
+/// `area`, `failure_mode`, `what_happened`) werden interaktiv nachgefragt;
+/// optionale Felder bleiben `None`, wenn nicht per Flag gesetzt.
+#[allow(clippy::too_many_arguments)]
+fn cmd_bug_report(
+    home_override: Option<PathBuf>,
+    report_type: Option<String>,
+    title: Option<String>,
+    area: Option<String>,
+    failure_mode: Option<String>,
+    task_category: Option<String>,
+    what_happened: Option<String>,
+    what_user_said: Option<String>,
+    repro: Option<String>,
+    evidence: Option<String>,
+) -> Result<(), String> {
+    let home = home::resolve_home(home_override)?;
+
+    let report_type = match report_type {
+        Some(value) => value,
+        None => prompt_bug_report_field("Type")?,
+    };
+    let title = match title {
+        Some(value) => value,
+        None => prompt_bug_report_field("Title")?,
+    };
+    let area = match area {
+        Some(value) => value,
+        None => prompt_bug_report_field("Area")?,
+    };
+    let failure_mode = match failure_mode {
+        Some(value) => value,
+        None => prompt_bug_report_field("Failure mode")?,
+    };
+    let what_happened = match what_happened {
+        Some(value) => value,
+        None => prompt_bug_report_field("What happened")?,
+    };
+
+    let report = harw_ops::bug_report::BugReport {
+        id: harw_ops::bug_report::new_report_id(),
+        report_type,
+        title,
+        area,
+        failure_mode,
+        task_category,
+        what_happened,
+        what_user_said,
+        repro,
+        evidence,
+    };
+
+    let path = harw_ops::bug_report::write_bug_report(&home, &report)
+        .map_err(|error| error.to_string())?;
+    println!("Bug report saved: {}", path.display());
     Ok(())
 }
 
@@ -550,8 +681,7 @@ fn serve_mcp(
     let plan_node_services = match home.as_deref() {
         Some(home_path) => {
             let plan_config = plan_tool_config_from_section(&config.harness.tools.plan)?;
-            let project_root =
-                std::env::current_dir().map_err(|error| error.to_string())?;
+            let project_root = std::env::current_dir().map_err(|error| error.to_string())?;
             build_plan_node_services(&plan_config, &project_root)?
         }
         // Ohne HARW-Home gibt es kein `plans/`-Verzeichnis. `plan-node`-Jobs
@@ -913,6 +1043,7 @@ fn open_serve_secret_resolver(
             enabled: true,
             origin_allowlist: OriginAllowlistToml::default(),
             rate_limit: None,
+            max_concurrency: None,
         },
     );
     secret_store::open_configured_secret_resolver(home, &resolver_config)
@@ -1230,7 +1361,9 @@ fn parse_plan_node_kind(name: &str) -> Result<PlanNodeKind, String> {
 ///
 /// Ein `String` mit der Begründung aus [`PlanSection::validate`] oder aus
 /// [`parse_plan_node_kind`].
-pub(crate) fn plan_tool_config_from_section(section: &PlanSection) -> Result<PlanToolConfig, String> {
+pub(crate) fn plan_tool_config_from_section(
+    section: &PlanSection,
+) -> Result<PlanToolConfig, String> {
     section.validate()?;
     let require_exploration_for = section
         .require_exploration_for
@@ -1635,7 +1768,12 @@ fn build_plan_node_services(
     let project = harw_home::project::discover_project(project_root, &[])
         .map_err(|error| error.to_string())?;
     let project_home = harw_home::project::ProjectHome::at(&project);
-    let services = build_plan_services(&project_home, config, DEFAULT_PLAN_SPACE, DEFAULT_GOAL_SPACE)?;
+    let services = build_plan_services(
+        &project_home,
+        config,
+        DEFAULT_PLAN_SPACE,
+        DEFAULT_GOAL_SPACE,
+    )?;
     let Some(plan) = services.plan else {
         return Ok(None);
     };
@@ -1732,8 +1870,8 @@ fn prepare_planning_startup(
     );
 
     let plan_config = plan_tool_config_from_section(&config.harness.tools.plan)?;
-    let project = harw_home::project::discover_project(&spec.cwd, &[])
-        .map_err(|error| error.to_string())?;
+    let project =
+        harw_home::project::discover_project(&spec.cwd, &[]).map_err(|error| error.to_string())?;
     let project_home = harw_home::project::ProjectHome::at(&project);
     let services = build_plan_services(
         &project_home,
@@ -1744,10 +1882,8 @@ fn prepare_planning_startup(
 
     let goal_context = match (services.goal.as_ref(), services.plan.as_ref()) {
         (Some(goal), Some(plan)) => {
-            let provider: Arc<dyn ContextProvider> = Arc::new(GoalContextProvider::new(
-                Arc::clone(goal),
-                Arc::clone(plan),
-            ));
+            let provider: Arc<dyn ContextProvider> =
+                Arc::new(GoalContextProvider::new(Arc::clone(goal), Arc::clone(plan)));
             Some(provider)
         }
         _ => None,
@@ -2337,6 +2473,7 @@ mod tests {
             enabled: true,
             origin_allowlist: OriginAllowlistToml::default(),
             rate_limit: None,
+            max_concurrency: None,
         };
         let mut config = ResolvedConfig::default();
         config.harness.default_provider = Some("gateway".to_owned());
@@ -2356,7 +2493,10 @@ mod tests {
                 "file credential must stay fail-closed without a home, got a provider instead"
             ),
         };
-        assert!(!error.contains("gateway-file-key"), "leaked secret: {error}");
+        assert!(
+            !error.contains("gateway-file-key"),
+            "leaked secret: {error}"
+        );
         assert!(!error.contains("gateway.key"), "leaked path: {error}");
 
         std::fs::remove_dir_all(&home).expect("remove temporary home");
@@ -2395,7 +2535,10 @@ mod tests {
             persist: true,
             ..PlanToolConfig::default()
         };
-        assert!(!config.is_enabled(), "explizit deaktivierte Konfiguration bleibt aus");
+        assert!(
+            !config.is_enabled(),
+            "explizit deaktivierte Konfiguration bleibt aus"
+        );
 
         let (home, services) = plan_services_over_temp_home(&config);
 
@@ -2551,8 +2694,14 @@ mod tests {
         };
         assert!(Arc::ptr_eq(&runtime.plan, plan), "derselbe Plan-Store");
         assert!(Arc::ptr_eq(&runtime.goal, goal), "derselbe Goal-Store");
-        assert!(Arc::ptr_eq(&runtime.findings, findings), "derselbe Finding-Store");
-        assert!(runtime.plan_config.is_enabled(), "die Konfiguration reist mit");
+        assert!(
+            Arc::ptr_eq(&runtime.findings, findings),
+            "derselbe Finding-Store"
+        );
+        assert!(
+            runtime.plan_config.is_enabled(),
+            "die Konfiguration reist mit"
+        );
         assert_eq!(runtime.plan_config.max_nodes, complete.config.max_nodes);
     }
 
@@ -3232,7 +3381,9 @@ mod tests {
                     break;
                 }
             }
-            worker_done_tx.send(()).expect("serve_until awaits the worker");
+            worker_done_tx
+                .send(())
+                .expect("serve_until awaits the worker");
         });
 
         let serve = serve_until(
@@ -3327,7 +3478,9 @@ mod tests {
                     break;
                 }
             }
-            worker_done_tx.send(()).expect("serve_until awaits the worker");
+            worker_done_tx
+                .send(())
+                .expect("serve_until awaits the worker");
         });
 
         let outcome = serve_until(

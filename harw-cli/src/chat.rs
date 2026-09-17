@@ -54,6 +54,7 @@ use std::{
     sync::Arc,
 };
 
+use harw_agent_dsl::roles::AgentRoleId;
 use harw_config::ResolvedConfig;
 use harw_core::{
     ApprovalResolution, InteractionMode, ModelMessage, StateStore, TurnInput, TurnOutcome,
@@ -64,8 +65,8 @@ use harw_memory::facts::{FactScope, FactStore};
 use harw_protocol::{SessionEvent, TurnEvent};
 use harw_runtime::{
     AssemblyContributor, AssemblyInputs, AssemblyParts, EntryKind, ModelSource, PlanServices,
-    RootSession, RuntimeAssembly, RuntimeAssemblyBuilder, RuntimeError, RuntimeResult,
-    RuntimeSpec, RuntimeStores,
+    RootSession, RuntimeAssembly, RuntimeAssemblyBuilder, RuntimeError, RuntimeResult, RuntimeSpec,
+    RuntimeStores,
 };
 use harw_session_store::JobStore;
 use harw_tui::{TuiAssemblyFactory, TuiResume, TuiRunOptions, TuiSessionWiring};
@@ -222,11 +223,20 @@ pub fn run_chat(
         config = load_chat_config(&spec)?;
     }
 
-    let inputs = ChatRuntimeInputs::new(spec, &config, startup, verbose)?;
-
     match initial_prompt {
-        Some(prompt) => run_one_shot(&inputs, &prompt, &add_dirs),
+        Some(prompt) => {
+            // One-shot path: reads the real `default_provider`/`default_model`
+            // unmodified — the UIA model pin never applies here.
+            let inputs = ChatRuntimeInputs::new(spec, &config, startup, verbose)?;
+            run_one_shot(&inputs, &prompt, &add_dirs)
+        }
         None => {
+            // The interactive root receives its UIA provider/model selection
+            // through `TuiSessionController`; keep the assembly config's
+            // generic defaults untouched so one-shot and worker paths retain
+            // their intentional defaults.
+            let inputs = ChatRuntimeInputs::new(spec, &config, startup, verbose)?;
+
             let sessions_root = profile_sessions_root(&home)?;
             let project_key = current_project_key(&cwd);
             // `-r` ohne Selektor am Terminal: die Auflösung liefert bewusst
@@ -357,7 +367,7 @@ impl ChatRuntimeInputs {
         let state_store =
             transcript_state_store(&profile_sessions_root(&home)?, cli_thread_for_session);
         let job_store = Arc::new(JobStore::new(&active_profile_job_store_root(&home)?));
-        let memory = build_memory(&home);
+        let memory = build_memory(&home, config);
         let secret_resolver = configured_secret_resolver(&home, config)?;
         let (project_facts, global_facts) = open_fact_stores(&home, &spec.cwd);
 
@@ -395,10 +405,7 @@ fn chat_builder(inputs: &ChatRuntimeInputs, model: ModelSource) -> RuntimeAssemb
     if let Some(memory) = inputs.memory.as_ref() {
         builder = builder.memory(Arc::clone(memory));
     }
-    builder = builder.fact_stores(
-        inputs.project_facts.clone(),
-        inputs.global_facts.clone(),
-    );
+    builder = builder.fact_stores(inputs.project_facts.clone(), inputs.global_facts.clone());
     if let Some(provider) = inputs.startup.goal_context.as_ref() {
         builder = builder.contributor(Arc::new(GoalContextContributor {
             provider: Arc::clone(provider),
@@ -701,19 +708,31 @@ fn resolve_startup_resume_selection(
 /// Baut das persistente Memory-Backend für die Chat-Session.
 ///
 /// # Beschreibung
-/// Öffnet einen [`harw_memory::FileMemoryStore`] unter
-/// `<home>/profiles/<active-profile>/memories/` und gibt ihn als
-/// `Arc<dyn harw_memory::Memory>` zurück. Schlägt die Profilauflösung oder das
-/// Öffnen fehl (Rechte, ungültiger Pfad), fällt die Funktion auf `None` zurück
-/// — die `/memory`-Op meldet dann `NotAvailable`, der restliche Chat läuft
-/// weiter.
-fn build_memory(home: &Path) -> Option<Arc<dyn harw_memory::Memory>> {
-    let root = match active_profile_memories_root(home) {
-        Ok(root) => root,
-        Err(error) => {
-            tracing::warn!(%error, "harw-memory: konnte Profilverzeichnis nicht auflösen");
-            return None;
-        }
+/// Ist eine aktive UIA konfiguriert (`config.harness.active_uia_definition`
+/// löst über `config.agent_definition_dirs`/`config.executable_agents` auf
+/// eine Definition mit `role = "user-interface"` auf), öffnet diese Funktion
+/// einen [`harw_memory::FileMemoryStore`] unter `<agent_dir>/memory/` — dem
+/// **eigenen** Gedächtnis dieser UIA (Structure Plan §3: "jede UIA-Identität
+/// hat ihr eigenes Gedächtnis"). Sonst (kein aktiver Agent, Agent nicht
+/// auflösbar, oder eine andere Rolle) fällt sie auf die bisherige globale
+/// Wurzel `<home>/profiles/<active-profile>/memories/` zurück
+/// ([`active_profile_memories_root`]) — unverändertes Verhalten für
+/// Root-Orchestrator-/Worker-Einstiege.
+///
+/// Gibt in beiden Fällen einen `Arc<dyn harw_memory::Memory>` zurück.
+/// Schlägt die Verzeichnisauflösung oder das Öffnen fehl (Rechte, ungültiger
+/// Pfad), fällt die Funktion auf `None` zurück — die `/memory`-Op meldet dann
+/// `NotAvailable`, der restliche Chat läuft weiter.
+fn build_memory(home: &Path, config: &ResolvedConfig) -> Option<Arc<dyn harw_memory::Memory>> {
+    let root = match uia_agent_memory_root(config) {
+        Some(root) => root,
+        None => match active_profile_memories_root(home) {
+            Ok(root) => root,
+            Err(error) => {
+                tracing::warn!(%error, "harw-memory: konnte Profilverzeichnis nicht auflösen");
+                return None;
+            }
+        },
     };
 
     match harw_memory::FileMemoryStore::open(&root) {
@@ -723,6 +742,31 @@ fn build_memory(home: &Path) -> Option<Arc<dyn harw_memory::Memory>> {
             None
         }
     }
+}
+
+/// Liefert `<agent_dir>/memory/`, wenn eine aktive UIA konfiguriert ist,
+/// sonst `None`.
+///
+/// # Beschreibung
+/// Löst `config.harness.active_uia_definition` (dieselbe Konfiguration, die
+/// `harw-runtime`s `resolve_active_uia` für die Registry-Montage verwendet)
+/// über `config.agent_definition_dirs` auf den Agentenordner auf. Zur
+/// Vorsicht wird zusätzlich über `config.executable_agents` die Rolle
+/// geprüft: nur `role = AgentRoleId::UserInterface` liefert einen Pfad — ein
+/// Root-Orchestrator- oder Worker-Einstieg (keine `active_uia_definition`,
+/// oder eine unerwartet andere Rolle) behält die globale Profil-Root.
+fn uia_agent_memory_root(config: &ResolvedConfig) -> Option<PathBuf> {
+    let definition_id = config.harness.active_uia_definition.as_deref()?;
+    let is_uia = config
+        .executable_agents
+        .get(definition_id)
+        .map(|ir| ir.role() == AgentRoleId::UserInterface)
+        .unwrap_or(false);
+    if !is_uia {
+        return None;
+    }
+    let agent_dir = config.agent_definition_dirs.get(definition_id)?;
+    Some(agent_dir.join("memory"))
 }
 
 /// Öffnet die projekt- und profilweiten Fakten-Wurzeln (Memory v3,
@@ -853,7 +897,11 @@ fn one_shot_assembly(
 }
 
 // Führt genau einen Turn über die One-shot-Montage aus und druckt die Antwort.
-fn run_one_shot(inputs: &ChatRuntimeInputs, prompt: &str, add_dirs: &[PathBuf]) -> Result<(), String> {
+fn run_one_shot(
+    inputs: &ChatRuntimeInputs,
+    prompt: &str,
+    add_dirs: &[PathBuf],
+) -> Result<(), String> {
     let runtime = Builder::new_current_thread()
         .enable_all()
         .build()
@@ -944,7 +992,9 @@ fn run_one_shot(inputs: &ChatRuntimeInputs, prompt: &str, add_dirs: &[PathBuf]) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harw_core::{ModelError, ModelFuture, ModelProvider, ModelRequest, ModelResponse, ToolCallResult};
+    use harw_core::{
+        ModelError, ModelFuture, ModelProvider, ModelRequest, ModelResponse, ToolCallResult,
+    };
     use harw_extension_api::{ContextFragment, ExtFuture, ToolCall, ToolName, TurnInputContext};
     use harw_protocol::TurnItem;
     use harw_session_store::TranscriptStore;
@@ -1164,7 +1214,10 @@ mod tests {
         )
         .expect_err("no session matches the current project");
 
-        assert!(error.contains("keine dauerhaften Sessions gefunden"), "{error}");
+        assert!(
+            error.contains("keine dauerhaften Sessions gefunden"),
+            "{error}"
+        );
     }
 
     // `ProfileResumeSelector::available_sessions` ist der reale Abnehmer des
@@ -1182,8 +1235,8 @@ mod tests {
         std::fs::File::create(sessions_dir.path().join("other-project.jsonl"))
             .expect("create empty transcript for meta derivation");
 
-        let current_key =
-            current_project_key(project_dir.path()).expect("a real directory always yields a project key");
+        let current_key = current_project_key(project_dir.path())
+            .expect("a real directory always yields a project key");
         harw_session_store::meta::set_project(
             sessions_dir.path(),
             &SessionId::from_str("in-project"),
@@ -1207,7 +1260,9 @@ mod tests {
             false,
         );
         assert_eq!(
-            filtered.available_sessions().expect("list filtered sessions"),
+            filtered
+                .available_sessions()
+                .expect("list filtered sessions"),
             vec![SessionId::from_str("in-project")]
         );
 
@@ -1216,7 +1271,9 @@ mod tests {
             project_dir.path().to_path_buf(),
             true,
         );
-        let mut all_ids = unfiltered.available_sessions().expect("list all sessions with --all");
+        let mut all_ids = unfiltered
+            .available_sessions()
+            .expect("list all sessions with --all");
         all_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         assert_eq!(
             all_ids,
@@ -1297,7 +1354,8 @@ mod tests {
     // (hier: leeres Transcript), bleibt jetzt nur noch über `--all`
     // erreichbar — analog zu einer Session mit einem fremden `project_key`.
     #[test]
-    fn test_profile_resume_selector_available_sessions_excludes_untagged_legacy_session_without_all() {
+    fn test_profile_resume_selector_available_sessions_excludes_untagged_legacy_session_without_all()
+     {
         use harw_tui::app::ResumeSessionSelector;
 
         let project_dir = tempfile::tempdir().expect("create project directory");
@@ -1348,7 +1406,9 @@ mod tests {
             project_dir.path().to_path_buf(),
             true,
         );
-        let mut all_ids = all.available_sessions().expect("list all sessions with --all");
+        let mut all_ids = all
+            .available_sessions()
+            .expect("list all sessions with --all");
         all_ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
         assert_eq!(
             all_ids,
@@ -1427,7 +1487,10 @@ mod tests {
             .iter()
             .filter(|provider| provider.namespace() == TEST_GOAL_NAMESPACE)
             .count();
-        assert_eq!(registered, 1, "the goal context must be registered exactly once");
+        assert_eq!(
+            registered, 1,
+            "the goal context must be registered exactly once"
+        );
 
         let without_goal = fixture_inputs(
             &fixture,
@@ -1485,7 +1548,10 @@ mod tests {
             "[policy] require_approval_for must reach the one-shot chain: {:?}",
             snapshot.config_policy_tools
         );
-        assert_eq!(assembly.spec().mode_override, Some(InteractionMode::Explore));
+        assert_eq!(
+            assembly.spec().mode_override,
+            Some(InteractionMode::Explore)
+        );
 
         let root = assembly
             .new_root_session(assembly.root_session_id().clone(), event_tx, turn_tx, None)

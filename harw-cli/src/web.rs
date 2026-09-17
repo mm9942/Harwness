@@ -207,8 +207,8 @@ pub(crate) fn serve_web(
     );
 
     let plan_config = crate::plan_tool_config_from_section(&config.harness.tools.plan)?;
-    let project = harw_home::project::discover_project(&cwd, &[])
-        .map_err(|error| error.to_string())?;
+    let project =
+        harw_home::project::discover_project(&cwd, &[]).map_err(|error| error.to_string())?;
     let project_home = harw_home::project::ProjectHome::at(&project);
     let plan = crate::build_plan_services(
         &project_home,
@@ -231,8 +231,8 @@ pub(crate) fn serve_web(
     )?);
     // `operations()` liefert `&Arc<OperationRegistry>`; Deref-Koerzion auf
     // `&OperationRegistry` für `from_registry`.
-    let routes = WebRouteTable::from_registry(assembly.operations())
-        .map_err(|error| error.to_string())?;
+    let routes =
+        WebRouteTable::from_registry(assembly.operations()).map_err(|error| error.to_string())?;
     tracing::info!(
         total = assembly.operations().len(),
         "web.registry.assembled"
@@ -245,7 +245,10 @@ pub(crate) fn serve_web(
     // genau einen Genehmiger abgebildet — ohne Rückfallwert für jede andere
     // `uid` (siehe Moduldoc, Abschnitt „Die Genehmiger-Tabelle").
     let approver: Arc<dyn ApprovalActorResolver> =
-        Arc::new(StaticUidApprovalActorMap::new(vec![(uid, "owner".to_owned())]));
+        Arc::new(StaticUidApprovalActorMap::new(vec![(
+            uid,
+            "owner".to_owned(),
+        )]));
 
     // F-W/W4: aus der Montage übernommen statt ein zweites Mal gebaut.
     // `assembly.sandbox()` ist dieselbe Web-Wurzel-Sandbox, die
@@ -270,7 +273,8 @@ pub(crate) fn serve_web(
         .build()
         .map_err(|error| format!("could not start web runtime: {error}"))?;
     runtime.block_on(async move {
-        let events = Arc::new(WebEventBus::new(EVENT_BUS_CAPACITY).map_err(|error| error.to_string())?);
+        let events =
+            Arc::new(WebEventBus::new(EVENT_BUS_CAPACITY).map_err(|error| error.to_string())?);
         let server = BoundWebServer::bind(
             WebServerConfig {
                 socket_path: socket_path.clone(),
@@ -451,8 +455,9 @@ mod tests {
     fn test_web_context_for_observer_sandbox_has_only_read_workspace() {
         let (_home, _cwd, assembly) = test_assembly(true);
         let (_root_dir, root) = test_root_sandbox();
-        let approver: Arc<dyn ApprovalActorResolver> =
-            Arc::new(StaticUidApprovalActorMap::new(vec![(1000, "owner".to_owned())]));
+        let approver: Arc<dyn ApprovalActorResolver> = Arc::new(StaticUidApprovalActorMap::new(
+            vec![(1000, "owner".to_owned())],
+        ));
         let peer = PeerCredentials::new(1, 1000, 1000);
 
         let ctx = web_context_for(&assembly, &root, &approver, peer, PermissionTier::Observer);
@@ -516,8 +521,9 @@ mod tests {
         };
         let approval_store = Arc::new(ApprovalStore::new(store_root.path()));
         let peer = PeerCredentials::new(1, 1000, 1000);
-        let approver: Arc<dyn ApprovalActorResolver> =
-            Arc::new(StaticUidApprovalActorMap::new(vec![(1000, "owner".to_owned())]));
+        let approver: Arc<dyn ApprovalActorResolver> = Arc::new(StaticUidApprovalActorMap::new(
+            vec![(1000, "owner".to_owned())],
+        ));
 
         let op = Arc::clone(
             registry
@@ -533,7 +539,9 @@ mod tests {
             PermissionTier::Owner,
         );
 
-        let result = op.run(&ctx, OpInput::model_tool(serde_json::json!({}))).await;
+        let result = op
+            .run(&ctx, OpInput::model_tool(serde_json::json!({})))
+            .await;
 
         assert!(
             !matches!(result, Err(OpError::NotAvailable(_))),
@@ -559,8 +567,9 @@ mod tests {
         let approval_store = Arc::new(ApprovalStore::new(store_root.path()));
         // Dieselbe Komposition wie in `serve_web`: nur die eigene uid (hier
         // 1000) ist eingetragen — 9999 bleibt bewusst ohne Eintrag.
-        let approver: Arc<dyn ApprovalActorResolver> =
-            Arc::new(StaticUidApprovalActorMap::new(vec![(1000, "owner".to_owned())]));
+        let approver: Arc<dyn ApprovalActorResolver> = Arc::new(StaticUidApprovalActorMap::new(
+            vec![(1000, "owner".to_owned())],
+        ));
         let unknown_peer = PeerCredentials::new(2, 9999, 9999);
 
         let op = Arc::clone(
@@ -624,8 +633,9 @@ mod tests {
             .expect("issue succeeds against a fresh store");
 
         let peer = PeerCredentials::new(1, 1000, 1000);
-        let approver: Arc<dyn ApprovalActorResolver> =
-            Arc::new(StaticUidApprovalActorMap::new(vec![(1000, "owner".to_owned())]));
+        let approver: Arc<dyn ApprovalActorResolver> = Arc::new(StaticUidApprovalActorMap::new(
+            vec![(1000, "owner".to_owned())],
+        ));
 
         let op = Arc::clone(
             registry

@@ -260,8 +260,9 @@ pub(crate) fn configured_secret_resolver(
     config: &ResolvedConfig,
 ) -> Result<Option<Arc<dyn harw_provider_http::SecretResolver + Send + Sync>>, String> {
     let resolver = crate::secret_store::open_configured_secret_resolver(home, config)?;
-    Ok(resolver
-        .map(|resolver| Arc::new(resolver) as Arc<dyn harw_provider_http::SecretResolver + Send + Sync>))
+    Ok(resolver.map(|resolver| {
+        Arc::new(resolver) as Arc<dyn harw_provider_http::SecretResolver + Send + Sync>
+    }))
 }
 
 /// Montiert die Runtime für `harw doctor`.
@@ -358,7 +359,12 @@ mod tests {
         let home = TempDir::new().expect("home tempdir");
         let cwd = TempDir::new().expect("cwd tempdir");
 
-        let spec = runtime_spec(EntryKind::LocalEcho, home.path(), cwd.path(), test_principal());
+        let spec = runtime_spec(
+            EntryKind::LocalEcho,
+            home.path(),
+            cwd.path(),
+            test_principal(),
+        );
         let sessions_root =
             profile_sessions_root(home.path()).expect("sessions root resolves and is created");
         let state_store = transcript_state_store(&sessions_root, test_thread_for_session);

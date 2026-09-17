@@ -33,6 +33,7 @@ harw-types = { path = "../harw-types" }
 harw-extension-api = { path = "../harw-extension-api" }
 harw-registry-defaults = { path = "../harw-registry-defaults" }
 harw-mcp-server = { path = "../harw-mcp-server" }
+harw-mcp-client = { path = "../harw-mcp-client" }
 harw-session-store = { path = "../harw-session-store" }
 harw-secrets = { path = "../harw-secrets", features = ["keyring"] }
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }

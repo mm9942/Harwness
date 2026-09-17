@@ -143,8 +143,12 @@ pub(crate) struct TelemetrySinks {
 /// heraus aufgerufen werden (siehe Moduldoc).
 pub(crate) fn build(home: &Path, args: &TelemetryArgs) -> Result<TelemetrySinks, String> {
     let telemetry_dir = harw_home::paths::telemetry_dir(home);
-    std::fs::create_dir_all(&telemetry_dir)
-        .map_err(|error| format!("Telemetrie-Verzeichnis {}: {error}", telemetry_dir.display()))?;
+    std::fs::create_dir_all(&telemetry_dir).map_err(|error| {
+        format!(
+            "Telemetrie-Verzeichnis {}: {error}",
+            telemetry_dir.display()
+        )
+    })?;
     let file_sink: Arc<dyn TelemetrySink> = Arc::new(
         FileSink::open(&telemetry_dir, FILE_SINK_MAX_BYTES)
             .map_err(|error| format!("File-Sink unter {}: {error}", telemetry_dir.display()))?,
@@ -191,7 +195,12 @@ pub(crate) fn build(home: &Path, args: &TelemetryArgs) -> Result<TelemetrySinks,
             }
         }
         _ => {
-            routing.route("app.", Arc::new(FanoutSink { targets: extra_targets }));
+            routing.route(
+                "app.",
+                Arc::new(FanoutSink {
+                    targets: extra_targets,
+                }),
+            );
         }
     }
 
@@ -329,7 +338,10 @@ mod tests {
         let file = Arc::new(RecordingSink::default());
         let additional_target = Arc::new(RecordingSink::default());
         let mut routing = RoutingSink::new(Arc::clone(&file) as Arc<dyn TelemetrySink>);
-        routing.route("app.", Arc::clone(&additional_target) as Arc<dyn TelemetrySink>);
+        routing.route(
+            "app.",
+            Arc::clone(&additional_target) as Arc<dyn TelemetrySink>,
+        );
 
         const SECURITY_KEY: MetricKey = MetricKey {
             name: "security.finding_total",
@@ -373,7 +385,11 @@ mod tests {
         routing.record(&APP_KEY, MetricValue::Count(1), &[]);
 
         assert_eq!(
-            target.records.lock().unwrap_or_else(|p| p.into_inner()).len(),
+            target
+                .records
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .len(),
             1
         );
     }

@@ -451,8 +451,7 @@ async fn execute_prompt_claim(
 ) -> JobOutcome {
     let work_id = claim.job.id.as_str().to_owned();
 
-    if let Err(reason) = check_prompt_claim_scope(&claim, &input, &context.configured_submitters)
-    {
+    if let Err(reason) = check_prompt_claim_scope(&claim, &input, &context.configured_submitters) {
         tracing::warn!(work_id = %work_id, reason = %reason, "prompt job rejected before any model call");
         return JobOutcome::Failed { reason };
     }
@@ -473,8 +472,12 @@ async fn execute_prompt_claim(
     };
 
     let budget = effective_prompt_budget(&claim.job.budget);
-    let wall = match prompt_wall_allowance(&budget, &claim.job.usage, &claim.lease, Timestamp::now())
-    {
+    let wall = match prompt_wall_allowance(
+        &budget,
+        &claim.job.usage,
+        &claim.lease,
+        Timestamp::now(),
+    ) {
         Ok(wall) => wall,
         Err(reason) => {
             tracing::warn!(work_id = %work_id, reason = %reason, "prompt job has no wall-clock budget left");
@@ -540,7 +543,9 @@ async fn execute_prompt_claim(
             control.force_abort();
             control.clear_abort_handle();
             tracing::warn!(work_id = %work_id, reason = %wall.reason, "prompt job exceeded its wall-clock window");
-            JobOutcome::Failed { reason: wall.reason }
+            JobOutcome::Failed {
+                reason: wall.reason,
+            }
         }
     }
 }
@@ -666,11 +671,9 @@ fn is_scope_identifier(value: &str) -> bool {
 fn effective_prompt_budget(stored: &harw_job_runtime::Budget) -> harw_job_runtime::Budget {
     let ceiling = harw_mcp_server::supervisor::McpJobBudgetLimits::server_default();
     harw_job_runtime::Budget {
-        max_tokens: Some(
-            stored
-                .max_tokens
-                .map_or(ceiling.max_tokens(), |limit| limit.min(ceiling.max_tokens())),
-        ),
+        max_tokens: Some(stored.max_tokens.map_or(ceiling.max_tokens(), |limit| {
+            limit.min(ceiling.max_tokens())
+        })),
         max_wall: Some(
             stored
                 .max_wall
@@ -712,9 +715,11 @@ fn prompt_wall_allowance(
     if budget_left <= SignedDuration::ZERO {
         return Err("budget: the wall-clock budget is already exhausted".to_owned());
     }
-    let lease_left = now
-        .duration_until(lease.expires_at)
-        .saturating_sub(SignedDuration::from_secs(PROMPT_LEASE_COMMIT_MARGIN_SECONDS));
+    let lease_left =
+        now.duration_until(lease.expires_at)
+            .saturating_sub(SignedDuration::from_secs(
+                PROMPT_LEASE_COMMIT_MARGIN_SECONDS,
+            ));
     if lease_left <= SignedDuration::ZERO {
         return Err("lease: too little lease time is left to run the job".to_owned());
     }
@@ -790,9 +795,8 @@ impl PromptTokenLedger {
         }
         if let Some(limit) = self.budget.max_tokens {
             if state.usage.tokens >= limit {
-                let reason = format!(
-                    "budget: token limit of {limit} is exhausted; no further model round"
-                );
+                let reason =
+                    format!("budget: token limit of {limit} is exhausted; no further model round");
                 state.exceeded = Some(reason.clone());
                 return Err(reason);
             }
@@ -933,23 +937,20 @@ async fn execute_plan_node_claim(
     // The derived sandbox is a *check* and the source of the narrowed
     // permissions; the session's sandbox itself is built by the assembly.
     let requests_write = !payload.contract.allowed_paths.is_empty();
-    let sandbox = match derive_plan_node_sandbox(
-        services.sandbox(),
-        &payload.contract,
-        kind,
-        requests_write,
-    ) {
-        Ok(sandbox) => sandbox,
-        Err(reason) => {
-            tracing::error!(
-                task = %payload.task_id,
-                work_id = %work_id,
-                reason = %reason,
-                "plan-node contract demands more authority than the job holds"
-            );
-            return fail_plan_node(&services, &payload.task_id, &work_id, reason);
-        }
-    };
+    let sandbox =
+        match derive_plan_node_sandbox(services.sandbox(), &payload.contract, kind, requests_write)
+        {
+            Ok(sandbox) => sandbox,
+            Err(reason) => {
+                tracing::error!(
+                    task = %payload.task_id,
+                    work_id = %work_id,
+                    reason = %reason,
+                    "plan-node contract demands more authority than the job holds"
+                );
+                return fail_plan_node(&services, &payload.task_id, &work_id, reason);
+            }
+        };
 
     let Some(runtime_root) = context.runtime_root.as_ref() else {
         tracing::error!(
@@ -1131,6 +1132,10 @@ fn assemble_job_turn(
 ) -> Result<(TurnSetup, Arc<dyn ModelProvider>), String> {
     let session_id = inputs.session_id.clone();
     let state_store = Arc::clone(&inputs.state_store);
+    // Jobs intentionally never read `uia_provider`/`uia_model`: those pin the
+    // interactive TUI's root session only (see `chat::apply_uia_model_pin`),
+    // and `job_assembly` below reads the real `default_provider`/
+    // `default_model` unmodified.
     let assembly: RuntimeAssembly = job_assembly(inputs).map_err(|error| {
         tracing::error!(
             job_id = %session_id.as_str(),
@@ -1922,9 +1927,9 @@ mod tests {
     use super::*;
     use harw_core::{EchoModelProvider, JobExecutionRegistry, RecordingModelProvider};
     use harw_job_runtime::{Budget, Job, JobScope, RetryPolicy, StoredJob};
-    use harw_plan::{InMemoryPlanStore, PlanAction, PlanId, PlanNodeStatus};
     use harw_plan::admission::RepoRevision;
     use harw_plan::ids::RevisionId;
+    use harw_plan::{InMemoryPlanStore, PlanAction, PlanId, PlanNodeStatus};
     use harw_sandbox::{WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{ApprovalActor, ItemId, TenantId, ToolCallId, WorkId, WorkspaceId};
 
@@ -2180,15 +2185,11 @@ mod tests {
         );
         let contract = contract_for("t-1", &[PathRule::DirectoryPrefix("src".to_owned())]);
 
-        let derived = match derive_plan_node_sandbox(
-            &inherited,
-            &contract,
-            PlanNodeKind::Coding,
-            true,
-        ) {
-            Ok(derived) => derived,
-            Err(error) => panic!("derivation must succeed: {error}"),
-        };
+        let derived =
+            match derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Coding, true) {
+                Ok(derived) => derived,
+                Err(error) => panic!("derivation must succeed: {error}"),
+            };
 
         assert!(derived.permissions().contains(Permission::ReadWorkspace));
         assert!(derived.permissions().contains(Permission::WriteWorkspace));
@@ -2206,15 +2207,11 @@ mod tests {
         );
         let contract = contract_for("t-1", &[]);
 
-        let derived = match derive_plan_node_sandbox(
-            &inherited,
-            &contract,
-            PlanNodeKind::Coding,
-            false,
-        ) {
-            Ok(derived) => derived,
-            Err(error) => panic!("derivation must succeed: {error}"),
-        };
+        let derived =
+            match derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Coding, false) {
+                Ok(derived) => derived,
+                Err(error) => panic!("derivation must succeed: {error}"),
+            };
         assert!(derived.permissions().contains(Permission::ReadWorkspace));
         assert!(!derived.permissions().contains(Permission::WriteWorkspace));
     }
@@ -2226,15 +2223,11 @@ mod tests {
         let inherited = sandbox_with(dir.path(), &[Permission::ReadWorkspace]);
         let contract = contract_for("t-1", &[PathRule::Exact("src/lib.rs".to_owned())]);
 
-        let error = match derive_plan_node_sandbox(
-            &inherited,
-            &contract,
-            PlanNodeKind::Coding,
-            true,
-        ) {
-            Ok(_) => panic!("a contract may never widen the inherited sandbox"),
-            Err(error) => error,
-        };
+        let error =
+            match derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Coding, true) {
+                Ok(_) => panic!("a contract may never widen the inherited sandbox"),
+                Err(error) => error,
+            };
         assert!(error.contains("WriteWorkspace"), "unclear message: {error}");
     }
 
@@ -2253,12 +2246,7 @@ mod tests {
         ] {
             let pattern = rule_pattern(&escaping).to_owned();
             let contract = contract_for("t-1", &[escaping]);
-            match derive_plan_node_sandbox(
-                &inherited,
-                &contract,
-                PlanNodeKind::Coding,
-                true,
-            ) {
+            match derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Coding, true) {
                 Ok(_) => panic!("write scope '{pattern}' must be rejected"),
                 Err(error) => assert!(
                     error.contains("leaves the workspace"),
@@ -2279,12 +2267,7 @@ mod tests {
         let contract = contract_for("t-1", &[PathRule::DirectoryPrefix("src".to_owned())]);
 
         let derived =
-            match derive_plan_node_sandbox(
-                &inherited,
-                &contract,
-                PlanNodeKind::Research,
-                true,
-            ) {
+            match derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Research, true) {
                 Ok(derived) => derived,
                 Err(error) => panic!("derivation must succeed: {error}"),
             };
@@ -2329,9 +2312,7 @@ mod tests {
                             Err(error) => panic!("derivation for {kind:?} must succeed: {error}"),
                         };
                     assert!(
-                        derived
-                            .permissions()
-                            .is_subset_of(inherited.permissions()),
+                        derived.permissions().is_subset_of(inherited.permissions()),
                         "{kind:?}/{may_write}: result exceeds the inherited sandbox"
                     );
                     assert!(derived.ensure_child_of(&inherited).is_ok());
@@ -2743,15 +2724,11 @@ mod tests {
             Ok(payload) => payload,
             Err(error) => panic!("bridge payload must parse: {error}"),
         };
-        let derived = match derive_plan_node_sandbox(
-            &inherited,
-            &contract,
-            PlanNodeKind::Research,
-            true,
-        ) {
-            Ok(derived) => derived,
-            Err(error) => panic!("derivation must succeed: {error}"),
-        };
+        let derived =
+            match derive_plan_node_sandbox(&inherited, &contract, PlanNodeKind::Research, true) {
+                Ok(derived) => derived,
+                Err(error) => panic!("derivation must succeed: {error}"),
+            };
 
         let (entry, narrowing) = plan_node_narrowing(&payload, PlanNodeKind::Research, &derived);
         assert_eq!(
@@ -2781,7 +2758,10 @@ mod tests {
         };
 
         let tools = assembly.rights_snapshot().tools;
-        assert!(tools.iter().any(|tool| tool == "fs.read"), "tools: {tools:?}");
+        assert!(
+            tools.iter().any(|tool| tool == "fs.read"),
+            "tools: {tools:?}"
+        );
         for forbidden in ["fs.write", "shell.exec"] {
             assert!(
                 !tools.iter().any(|tool| tool == forbidden),
@@ -3047,7 +3027,11 @@ mod tests {
             "the assembly binds the workspace root, not the marked parent"
         );
         assert_eq!(
-            assembly.spawn_context().sandbox.workspace().canonical_root(),
+            assembly
+                .spawn_context()
+                .sandbox
+                .workspace()
+                .canonical_root(),
             derived.workspace().canonical_root()
         );
         assert_eq!(
@@ -3260,7 +3244,12 @@ mod prompt_claim_guard_tests {
         );
         let provider = Arc::new(RecordingModelProvider::new());
 
-        run_once(&store, temp.path(), Arc::clone(&provider) as Arc<dyn ModelProvider>).await;
+        run_once(
+            &store,
+            temp.path(),
+            Arc::clone(&provider) as Arc<dyn ModelProvider>,
+        )
+        .await;
 
         assert!(
             provider.recorded().is_empty(),
@@ -3269,7 +3258,10 @@ mod prompt_claim_guard_tests {
         for id in ["foreign-workspace", "foreign-scope"] {
             let reason = failure_reason(&store, id);
             assert!(reason.starts_with("scope:"), "{id}: {reason}");
-            assert!(!reason.contains("other-"), "reason must not echo input: {reason}");
+            assert!(
+                !reason.contains("other-"),
+                "reason must not echo input: {reason}"
+            );
         }
     }
 
@@ -3292,7 +3284,12 @@ mod prompt_claim_guard_tests {
         );
         let provider = Arc::new(RecordingModelProvider::new());
 
-        run_once(&store, temp.path(), Arc::clone(&provider) as Arc<dyn ModelProvider>).await;
+        run_once(
+            &store,
+            temp.path(),
+            Arc::clone(&provider) as Arc<dyn ModelProvider>,
+        )
+        .await;
 
         assert_eq!(provider.recorded().len(), 1);
         let stored = match store.get(&WorkId::from_str("matching-scope")) {
@@ -3344,7 +3341,12 @@ mod prompt_claim_guard_tests {
         );
         let provider = Arc::new(RecordingModelProvider::new());
 
-        run_once(&store, temp.path(), Arc::clone(&provider) as Arc<dyn ModelProvider>).await;
+        run_once(
+            &store,
+            temp.path(),
+            Arc::clone(&provider) as Arc<dyn ModelProvider>,
+        )
+        .await;
 
         assert!(provider.recorded().is_empty());
         for id in ["channel-peer", "padded-workspace"] {
@@ -3403,7 +3405,12 @@ mod prompt_claim_guard_tests {
         let input = serde_json::json!({"task": "summarize"});
         admit(
             &store,
-            &record("unconfigured", input.clone(), Budget::unbounded(), operator_scope()),
+            &record(
+                "unconfigured",
+                input.clone(),
+                Budget::unbounded(),
+                operator_scope(),
+            ),
         );
         let claim = claim_as_worker(&store, "unconfigured");
 
@@ -3428,12 +3435,20 @@ mod prompt_claim_guard_tests {
         let input = serde_json::json!({"task": "summarize"});
         admit(
             &store,
-            &record("configured", input.clone(), Budget::unbounded(), operator_scope()),
+            &record(
+                "configured",
+                input.clone(),
+                Budget::unbounded(),
+                operator_scope(),
+            ),
         );
         let claim = claim_as_worker(&store, "configured");
         let submitters = BTreeSet::from(["alpha".to_owned(), "operator".to_owned()]);
 
-        assert_eq!(check_prompt_claim_scope(&claim, &input, &submitters), Ok(()));
+        assert_eq!(
+            check_prompt_claim_scope(&claim, &input, &submitters),
+            Ok(())
+        );
     }
 
     #[tokio::test]
@@ -3497,7 +3512,12 @@ mod prompt_claim_guard_tests {
 
         // `EchoModelProvider` meldet je Aufruf mindestens 1 Input- und 1
         // Output-Token (`approx(..).max(1)`), also mehr als das Limit 1.
-        run_once(&store, temp.path(), Arc::new(EchoModelProvider::new("done"))).await;
+        run_once(
+            &store,
+            temp.path(),
+            Arc::new(EchoModelProvider::new("done")),
+        )
+        .await;
 
         let reason = failure_reason(&store, "token-overrun");
         assert!(reason.starts_with("budget:"), "{reason}");
@@ -3682,12 +3702,8 @@ mod prompt_claim_guard_tests {
             wall: SignedDuration::from_secs(10),
             tool_calls: 0,
         };
-        let exhausted = prompt_wall_allowance(
-            &budget(SignedDuration::from_secs(10)),
-            &spent,
-            &lease,
-            now,
-        );
+        let exhausted =
+            prompt_wall_allowance(&budget(SignedDuration::from_secs(10)), &spent, &lease, now);
         assert!(matches!(exhausted, Err(ref reason) if reason.starts_with("budget:")));
 
         let expired = prompt_wall_allowance(
