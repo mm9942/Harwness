@@ -164,6 +164,80 @@ fn try_persist_default_selection(
     writer.save().map_err(|error| error.to_string())
 }
 
+/// Verankert `uia_provider`/`uia_model` bestes Bemühen in der
+/// Profil-`config.toml`, unabhängig von `default_provider`/`default_model`.
+///
+/// # Description
+/// Struktureller Zwilling von [`persist_default_selection`]: wird nach einer
+/// (künftigen) UIA-spezifischen Provider-/Modell-Auswahl aufgerufen und
+/// schreibt die Schlüssel `uia_provider`/`uia_model` statt
+/// `default_provider`/`default_model`. `None`-Argumente werden nicht
+/// geschrieben; sind beide `None`, geschieht nichts. Ebenfalls **niemals
+/// fehlschlagend** für den Aufrufer — Persistenzfehler werden als
+/// deutschsprachige Notiz zurückgegeben statt propagiert.
+///
+/// # Arguments
+/// - `uia_provider` (`Option<&str>`): kanonische Provider-ID für die
+///   UIA-Sitzung, oder `None`, um den Schlüssel unverändert zu lassen.
+/// - `uia_model` (`Option<&str>`): kanonische Modell-ID; `None` entfernt einen
+///   bestehenden UIA-Modell-Pin, damit ein Providerwechsel kein inkompatibles
+///   Modell wiederbelebt.
+///
+/// # Returns
+/// `None` bei Erfolg oder wenn beide Argumente `None` sind; `Some(note)` mit
+/// einer für Menschen lesbaren Notiz, wenn die Persistenz fehlschlug.
+///
+/// # Panics
+/// Nie.
+///
+/// # Concurrency
+/// Rein synchron; kein Datei-Lock, analog zu [`persist_default_selection`].
+///
+/// # Examples
+/// ```rust,ignore
+/// if let Some(note) = crate::config_util::persist_uia_selection(Some("anthropic"), None) {
+///     text.push('\n');
+///     text.push_str(&note);
+/// }
+/// ```
+pub(crate) fn persist_uia_selection(
+    uia_provider: Option<&str>,
+    uia_model: Option<&str>,
+) -> Option<String> {
+    if uia_provider.is_none() && uia_model.is_none() {
+        return None;
+    }
+    match try_persist_uia_selection(uia_provider, uia_model) {
+        Ok(()) => None,
+        Err(reason) => Some(format!(
+            "Hinweis: konnte UIA-Auswahl nicht dauerhaft speichern ({reason})."
+        )),
+    }
+}
+
+/// Interner, fehlschlagender Kern von [`persist_uia_selection`].
+fn try_persist_uia_selection(
+    uia_provider: Option<&str>,
+    uia_model: Option<&str>,
+) -> Result<(), String> {
+    let home = harw_home::home_dir().map_err(|error| error.to_string())?;
+    let profile = harw_home::active_profile_name(&home);
+    let profile_dir = harw_home::profile_dir(&home, &profile).map_err(|error| error.to_string())?;
+    let config_path = profile_dir.join("config.toml");
+
+    let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(|error| error.to_string())?;
+    if let Some(provider) = uia_provider {
+        writer.set_value("uia_provider", toml_edit::value(provider));
+    }
+    match uia_model {
+        Some(model) => writer.set_value("uia_model", toml_edit::value(model)),
+        None => {
+            writer.remove_value("uia_model");
+        }
+    }
+    writer.save().map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{OpError, execution_error};
@@ -189,4 +263,30 @@ mod tests {
         ));
     }
 
+    // ── UIA-Auswahl-Persistenz-Rundlauf, ohne echte HARW_HOME-Env-Mutation ──
+    // Analog zum Muster in `harw-ops/src/permissions.rs`
+    // (`test_permissions_persistence_round_trip_default_mode_and_rules`):
+    // `try_persist_uia_selection` selbst löst `HARW_HOME` über
+    // `harw_home::home_dir()` auf, was den Prozess-weiten Zustand mutieren
+    // würde (nicht thread-sicher, würde parallel laufende Tests gefährden).
+    // Der Rundlauf testet daher denselben `ConfigWriter`-Schreibpfad direkt
+    // gegen ein temporäres Verzeichnis.
+    #[test]
+    fn test_uia_selection_persistence_round_trip_writes_uia_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        let mut writer = harw_config::ConfigWriter::open(&config_path).expect("open");
+        writer.set_value("uia_provider", toml_edit::value("anthropic"));
+        writer.set_value("uia_model", toml_edit::value("claude-x"));
+        writer.save().expect("save");
+
+        let reopened = harw_config::ConfigWriter::open(&config_path).expect("reopen");
+        assert_eq!(reopened.get_value("uia_provider"), Some("anthropic".to_owned()));
+        assert_eq!(reopened.get_value("uia_model"), Some("claude-x".to_owned()));
+
+        let content = std::fs::read_to_string(&config_path).expect("read back");
+        assert!(content.contains("uia_provider"));
+        assert!(content.contains("uia_model"));
+    }
 }

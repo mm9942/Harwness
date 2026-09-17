@@ -14,11 +14,19 @@
 //!   registriert (z. B. via `inventory::submit!` durch Extension-Crate).
 //!
 //! # Op-Set
-//! **Grundausstattung** ([`register_all`], 25 Ops): `help`, `status`, `quit`,
+//! **Grundausstattung** ([`register_all`], 28 Ops): `help`, `status`, `quit`,
 //! `new`, `work`, `ps`, `attach`, `stop`, `diff`, `agent`, `skills`, `plugins`,
-//! `model`, `provider`, `permissions`, `compact`, `memory`, `effort`, `mode`,
-//! `context-proposal`, `approval.pending`, `approval.resolve`, `add-workdir`,
-//! `export`, `usage`.
+//! `model`, `provider`, `uia-model`, `uia-provider`, `permissions`, `compact`,
+//! `memory`, `effort`, `mode`, `context-proposal`, `approval.pending`,
+//! `approval.resolve`, `add-workdir`, `export`, `usage`, `bug-report`.
+//! `bug-report` schreibt einen minimalen, manuell ausgelösten lokalen
+//! Bug-Report nach `<home>/bug-report/` (kein Netzwerk-Versand) — die
+//! automatische Incident-Erkennung ist ein separates, noch ausstehendes
+//! Arbeitspaket, siehe `crate::bug_report`-Moduldoku.
+//! `uia-model`/`uia-provider` are structural twins of `model`/`provider` that
+//! read/write `uia_model`/`uia_provider` instead of
+//! `default_model`/`default_provider`, so the UIA can pin its own selection
+//! independent of the session default.
 //! `usage` liest `harw_core::state_store::SessionStateSnapshot::total_usage`
 //! über `harw_core_bridge::OpContextCoreExt::state_store` — reine
 //! Session-Introspektion wie `mode`/`context-proposal`, deshalb ebenfalls
@@ -107,6 +115,7 @@ pub mod agent;
 pub mod analyze;
 pub mod approval;
 pub mod attach;
+pub mod bug_report;
 pub mod compact;
 pub(crate) mod config_util;
 pub mod context_proposal;
@@ -180,15 +189,15 @@ fn compact_unavailable_output() -> OpOutput {
     OpOutput::from(crate::compact::COMPACT_HINT.to_owned())
 }
 
-/// Registriert alle 25 in dieser Crate definierten Kern-Operationen in der Registry.
+/// Registriert alle 28 in dieser Crate definierten Kern-Operationen in der Registry.
 ///
 /// # Beschreibung
 /// Fügt der übergebenen [`OperationRegistry`] eine `Arc<dyn Operation>`-Instanz
 /// jeder konkreten Op-Struct hinzu — jeweils genau einmal, in fester Reihenfolge:
 /// `help, status, quit, new, work, ps, attach, stop, diff, agent, skills,
-/// plugins, model, provider, permissions, compact, memory, effort, mode,
-/// context-proposal, approval.pending, approval.resolve, add-workdir, export,
-/// usage`.
+/// plugins, model, provider, uia-model, uia-provider, permissions, compact,
+/// memory, effort, mode, context-proposal, approval.pending, approval.resolve,
+/// add-workdir, export, usage, bug-report`.
 ///
 /// Die Reihenfolge steuert nur die `iter()`-Reihenfolge und den Fallback-Namens-
 /// Vorschlag; die eigentliche Auflösung erfolgt über `find_by_name` /
@@ -208,8 +217,10 @@ fn compact_unavailable_output() -> OpOutput {
 ///
 /// let mut registry = OperationRegistry::new();
 /// harw_ops::register_all(&mut registry);
-/// assert_eq!(registry.len(), 25);
+/// assert_eq!(registry.len(), 28);
 /// assert!(registry.find_by_name("help").is_some());
+/// assert!(registry.find_by_command("/uia-provider").is_some());
+/// assert!(registry.find_by_command("/uia-model").is_some());
 /// assert!(registry.find_by_command("/status").is_some());
 /// assert!(registry.find_by_command("/effort").is_some());
 /// assert!(registry.find_by_command("/mode").is_some());
@@ -219,9 +230,10 @@ fn compact_unavailable_output() -> OpOutput {
 /// assert!(registry.find_by_command("/add-workdir").is_some());
 /// assert!(registry.find_by_command("/export").is_some());
 /// assert!(registry.find_by_command("/usage").is_some());
+/// assert!(registry.find_by_command("/bug-report").is_some());
 /// ```
 pub fn register_all(registry: &mut OperationRegistry) {
-    let ops: [Arc<dyn Operation>; 25] = [
+    let ops: [Arc<dyn Operation>; 28] = [
         Arc::new(help::HelpOperation),
         Arc::new(status::StatusOperation),
         Arc::new(quit::QuitOperation),
@@ -236,6 +248,12 @@ pub fn register_all(registry: &mut OperationRegistry) {
         Arc::new(plugins::PluginsOperation),
         Arc::new(model::ModelOperation),
         Arc::new(provider::ProviderOperation),
+        // UIA-specific pinned provider/model selection (`uia_provider`/
+        // `uia_model`), independent of `default_provider`/`default_model` —
+        // structural twins of `model`/`provider` above, registered next to
+        // them for the same reason.
+        Arc::new(model::UiaModelOperation),
+        Arc::new(provider::UiaProviderOperation),
         Arc::new(permissions::PermissionsOperation),
         Arc::new(UnavailableCompactOperation),
         Arc::new(memory::MemoryOperation),
@@ -265,6 +283,10 @@ pub fn register_all(registry: &mut OperationRegistry) {
         // `mode`/`context-proposal` oben, deshalb Grundausstattung statt
         // Planungsfläche.
         Arc::new(usage::UsageOperation),
+        // Manueller lokaler Bug-Report-Fallback (siehe `crate::bug_report`-
+        // Moduldoku): reine Session-/Diagnose-Fläche wie `usage` oben,
+        // deshalb Grundausstattung statt Planungsfläche.
+        Arc::new(bug_report::BugReportOperation),
     ];
     for op in ops {
         registry.register(op);
@@ -570,10 +592,10 @@ mod tests {
     }
 
     #[test]
-    fn register_all_adds_twenty_five_operations() {
+    fn register_all_adds_twenty_eight_operations() {
         let mut reg = OperationRegistry::new();
         register_all(&mut reg);
-        assert_eq!(reg.len(), 25);
+        assert_eq!(reg.len(), 28);
     }
 
     #[test]
@@ -782,8 +804,8 @@ mod tests {
         register_all(&mut reg);
         assert_eq!(
             reg.len(),
-            25,
-            "first register_all must produce exactly 25 ops"
+            28,
+            "first register_all must produce exactly 28 ops"
         );
 
         // Attempt to register HelpOperation a second time via the fallible path.
@@ -797,8 +819,8 @@ mod tests {
         // Registry must not have grown — the rejected op was not inserted.
         assert_eq!(
             reg.len(),
-            25,
-            "registry must stay at 25 after a rejected duplicate"
+            28,
+            "registry must stay at 28 after a rejected duplicate"
         );
     }
 }

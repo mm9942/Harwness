@@ -42,7 +42,8 @@
 //! ```
 
 use harw_macros::operation;
-use harw_operations::{OpContext, OpError, OpOutput};
+use harw_operations::{OpContext, OpError, OpOutput, SessionController};
+use harw_operations::session_control::UiaSelection;
 
 /// Argumente für die `/model`-Operation.
 ///
@@ -275,6 +276,32 @@ pub(crate) fn configured_model<'a>(
     })
 }
 
+/// Liefert den effektiven UIA-Zustand aus Live-Auswahl und UIA-Config.
+///
+/// Generische Live-Felder und `default_*` sind absichtlich kein Fallback: Die
+/// UIA-Auswahl muss unabhängig vom generischen Controller bleiben.
+pub(crate) fn effective_uia_selection(
+    controller: Option<&harw_operations::SharedSessionController>,
+    config: &harw_config::ResolvedConfig,
+) -> UiaSelection {
+    let live = controller
+        .map(|controller| controller.uia_selection())
+        .unwrap_or_else(UiaSelection::empty);
+
+    // Eine nicht-leere Live-Auswahl ist atomar. Insbesondere bedeutet
+    // `provider: Some(..), model: None`, dass ein inkompatibler alter
+    // Modell-Pin beim Providerwechsel bewusst gelöscht wurde — sie darf nicht
+    // achsenweise aus der Konfiguration wieder ergänzt werden.
+    if live.is_empty() {
+        UiaSelection::new(
+            config.harness.uia_provider.clone(),
+            config.harness.uia_model.clone(),
+        )
+    } else {
+        live
+    }
+}
+
 // ── Operation Handler ─────────────────────────────────────────────────────────
 
 /// Verarbeitet die `/model`-Operation.
@@ -350,62 +377,7 @@ async fn model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError> {
             }
         };
 
-        let config = crate::config_util::load_default_config("Config-Discovery fehlgeschlagen")?;
-        if config.models.is_empty() {
-            return Err(OpError::Execution(
-                "configured model catalog is unavailable; refusing to switch models".into(),
-            ));
-        }
-
-        // Step C-a: validate against the configured catalog, never the static bootstrap.
-        let configured = configured_model(&config, &target)
-            .ok_or_else(|| OpError::InvalidArguments(format!("unknown model: {target}")))?;
-        let configured_id = configured.id.clone();
-
-        // Step C-b: check provider compatibility if an active provider is set.
-        let controller = ctx
-            .service::<harw_operations::SharedSessionController>()
-            .ok_or_else(|| OpError::Execution("SessionController not available".into()))?;
-
-        let snap = controller.snapshot();
-        if let Some(active_p) = snap
-            .active_provider
-            .as_deref()
-            .or(config.harness.default_provider.as_deref())
-        {
-            if configured.provider != active_p {
-                let model_provider = configured.provider.as_str();
-                return Err(OpError::InvalidArguments(format!(
-                    "model {target} requires provider {model_provider}, \
-                     but active provider is {active_p}; \
-                     use `/provider switch {model_provider}` first"
-                )));
-            }
-        }
-
-        // Step C-c: only mutate if compatible.
-        controller
-            .set_active_model(configured_id.clone())
-            .map_err(|e| OpError::Execution(e.to_string()))?;
-
-        // Step C-d: persist as the profile's default for future sessions,
-        // best-effort. The active provider is read back from the controller
-        // (rather than re-derived) so a still-unknown provider never gets
-        // written as a stale default.
-        let snap_after = controller.snapshot();
-        let mut text = format!("model switched to {configured_id}; next turn will use it");
-        match crate::config_util::persist_default_selection(
-            snap_after.active_provider.as_deref(),
-            Some(configured_id.as_str()),
-        ) {
-            Some(note) => {
-                text.push('\n');
-                text.push_str(&note);
-            }
-            None => text.push_str("\n(als Standard für künftige Sitzungen gespeichert)"),
-        }
-
-        return Ok(OpOutput::from(text));
+        return handle_switch_core(ctx, target, crate::config_util::persist_default_selection);
     }
 
     // ── TASK A/B: show + list read live state then fall back to config ────────
@@ -413,13 +385,318 @@ async fn model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError> {
     let snap = controller
         .map(|c| c.snapshot())
         .unwrap_or_else(harw_operations::SessionControlSnapshot::empty);
-
     let config = crate::config_util::load_default_config("Config-Discovery fehlgeschlagen")?;
 
     let text = if action == "list" {
         format_list(&snap, &config)
     } else {
         format_show(&snap, &config)
+    };
+
+    Ok(OpOutput::from(text))
+}
+
+/// Shared core of the validated, atomic model switch.
+///
+/// # Beschreibung
+/// Extracted from `/model switch` so both `/model switch` and
+/// `/uia-model switch` share the exact same validation/mutation sequence —
+/// they differ only in which config key the resulting selection persists to.
+/// `/model switch` passes [`crate::config_util::persist_default_selection`];
+/// `/uia-model switch` passes [`crate::config_util::persist_uia_selection`].
+///
+/// Validates `target` against the configured model catalog (never the static
+/// bootstrap catalog), checks provider compatibility against the live active
+/// provider (falling back to `default_provider`), mutates the controller only
+/// once both checks pass, then persists via `persist`.
+///
+/// # Argumente
+/// - `ctx` (`&OpContext`): Ausführungskontext.
+/// - `target` (`String`): die zu setzende Modell-ID oder ein konfigurierter Alias.
+/// - `persist` (`impl FnOnce(Option<&str>, Option<&str>) -> Option<String>`):
+///   wird nach erfolgreicher Controller-Mutation einmal mit
+///   `(active_provider_nach_mutation, Some(canonical_model_id))` aufgerufen.
+///   `None` bei Erfolg, `Some(note)` mit einer Fehlernotiz.
+///
+/// # Rückgabe
+/// [`OpOutput`] mit Bestätigungstext inklusive Persistenz-Notiz.
+///
+/// # Fehler
+/// - [`OpError::Execution`]: `SessionController` nicht verfügbar, Katalog leer,
+///   oder Config-Discovery fehlgeschlagen.
+/// - [`OpError::InvalidArguments`]: unbekannte Modell-ID, Provider-Mismatch.
+///
+/// # Spec
+/// harwness Plan v2 — Task C; `/uia-model`-Folgeauftrag (UIA-spezifische gepinnte Auswahl).
+fn handle_switch_core(
+    ctx: &OpContext,
+    target: String,
+    persist: impl FnOnce(Option<&str>, Option<&str>) -> Option<String>,
+) -> Result<OpOutput, OpError> {
+    let config = crate::config_util::load_default_config("Config-Discovery fehlgeschlagen")?;
+    if config.models.is_empty() {
+        return Err(OpError::Execution(
+            "configured model catalog is unavailable; refusing to switch models".into(),
+        ));
+    }
+
+    // Step a: validate against the configured catalog, never the static bootstrap.
+    let configured = configured_model(&config, &target)
+        .ok_or_else(|| OpError::InvalidArguments(format!("unknown model: {target}")))?;
+    let configured_id = configured.id.clone();
+
+    // Step b: check provider compatibility if an active provider is set.
+    let controller = ctx
+        .service::<harw_operations::SharedSessionController>()
+        .ok_or_else(|| OpError::Execution("SessionController not available".into()))?;
+
+    let snap = controller.snapshot();
+    if let Some(active_p) = snap
+        .active_provider
+        .as_deref()
+        .or(config.harness.default_provider.as_deref())
+    {
+        if configured.provider != active_p {
+            let model_provider = configured.provider.as_str();
+            return Err(OpError::InvalidArguments(format!(
+                "model {target} requires provider {model_provider}, \
+                 but active provider is {active_p}; \
+                 use `/provider switch {model_provider}` first"
+            )));
+        }
+    }
+
+    // Step c: only mutate if compatible.
+    controller
+        .set_active_model(configured_id.clone())
+        .map_err(|e| OpError::Execution(e.to_string()))?;
+
+    // Step d: persist, best-effort. The active provider is read back from the
+    // controller (rather than re-derived) so a still-unknown provider never
+    // gets written as a stale default.
+    let snap_after = controller.snapshot();
+    let mut text = format!("model switched to {configured_id}; next turn will use it");
+    match persist(
+        snap_after.active_provider.as_deref(),
+        Some(configured_id.as_str()),
+    ) {
+        Some(note) => {
+            text.push('\n');
+            text.push_str(&note);
+        }
+        None => text.push_str("\n(als Standard für künftige Sitzungen gespeichert)"),
+    }
+
+    Ok(OpOutput::from(text))
+}
+
+/// Wechselt ausschließlich das UIA-Modell und validiert gegen den effektiven
+/// UIA-Provider (Live-Auswahl, sonst `harness.uia_provider`).
+fn handle_uia_model_switch(ctx: &OpContext, target: String) -> Result<OpOutput, OpError> {
+    let config = crate::config_util::load_default_config("Config-Discovery fehlgeschlagen")?;
+    if config.models.is_empty() {
+        return Err(OpError::Execution(
+            "configured model catalog is unavailable; refusing to switch UIA models".into(),
+        ));
+    }
+
+    let controller = ctx
+        .service::<harw_operations::SharedSessionController>()
+        .ok_or_else(|| OpError::Execution("SessionController not available".into()))?;
+    let selection = effective_uia_selection(Some(controller), &config);
+    let configured = configured_model(&config, &target)
+        .ok_or_else(|| OpError::InvalidArguments(format!("unknown model: {target}")))?;
+
+    if let Some(uia_provider) = selection.provider() {
+        let model_provider = config
+            .providers
+            .iter()
+            .find(|(key, provider)| {
+                key.as_str() == configured.provider || provider.name == configured.provider
+            })
+            .map(|(_, provider)| provider.name.as_str())
+            .unwrap_or(configured.provider.as_str());
+        if model_provider != uia_provider {
+            return Err(OpError::InvalidArguments(format!(
+                "UIA model {target} requires provider {model_provider}, but effective UIA provider is {uia_provider}; \
+                 use `/uia-provider switch {model_provider}` first"
+            )));
+        }
+    }
+
+    let configured_id = configured.id.clone();
+    controller
+        .set_uia_model(configured_id.clone())
+        .map_err(|e| OpError::Execution(e.to_string()))?;
+
+    let after = controller.uia_selection();
+    let mut text = format!(
+        "UIA model switched to {configured_id}; next UIA turn will use it"
+    );
+    match crate::config_util::persist_uia_selection(
+        after.provider.as_deref().or(selection.provider()),
+        Some(configured_id.as_str()),
+    ) {
+        Some(note) => {
+            text.push('\n');
+            text.push_str(&note);
+        }
+        None => text.push_str("\n(UIA-Auswahl für künftige Sitzungen gespeichert)"),
+    }
+
+    Ok(OpOutput::from(text))
+}
+
+/// Formatiert das `/uia-model show`-Sub-Kommando: zeigt das für die UIA
+/// gepinnte Modell (`harness.uia_model`), unabhängig von `default_model`.
+///
+/// # Beschreibung
+/// Liest `config.harness.uia_model` direkt (persistenter Config-Wert, nicht
+/// Laufzeit-umgeschalteter Zustand — der UIA-Pin wird durch `/model switch`
+/// nicht mutiert). Fehlt der Wert, wird der Fallback auf `default_model`
+/// gemeldet.
+///
+/// # Argumente
+/// - `config` (`&harw_config::ResolvedConfig`): geladene Config.
+///
+/// # Rückgabe
+/// Fertig formatierter `String`.
+///
+/// # Spec
+/// harwness Plan v2 — UIA-spezifische gepinnte Provider-/Modell-Auswahl.
+fn format_uia_show(
+    selection: &UiaSelection,
+    config: &harw_config::ResolvedConfig,
+) -> String {
+    let model_line = match selection.model() {
+        Some(id) => {
+            let display = configured_model(config, id)
+                .and_then(|model| model.name.as_deref())
+                .map(str::to_owned)
+                .unwrap_or_else(|| id.to_owned());
+            format!("UIA model    : {display} [{id}]")
+        }
+        None => "UIA model    : (nicht gesetzt)".to_owned(),
+    };
+    let provider_line = selection
+        .provider()
+        .map(|provider| format!("UIA provider : {provider}"))
+        .unwrap_or_else(|| "UIA provider : (nicht gesetzt)".to_owned());
+    format!("{model_line}\n{provider_line}")
+}
+
+fn format_uia_list(
+    selection: &UiaSelection,
+    config: &harw_config::ResolvedConfig,
+) -> String {
+    let active_model = selection.model();
+    let active_provider = selection.provider();
+    let mut models: Vec<_> = config.models.values().collect();
+    models.sort_by(|left, right| left.id.cmp(&right.id));
+
+    let mut lines = vec![
+        format!("UIA model      : {}", active_model.unwrap_or("(none)")),
+        format!("UIA provider   : {}", active_provider.unwrap_or("(none)")),
+        String::new(),
+        "Catalog:".to_owned(),
+    ];
+    for model in models {
+        if active_provider.is_some_and(|provider| model.provider != provider) {
+            continue;
+        }
+        let marker = if active_model == Some(model.id.as_str()) {
+            " *"
+        } else {
+            "  "
+        };
+        let compat = match active_provider {
+            None => "unfiltered",
+            Some(provider) if model.provider == provider => "compatible",
+            Some(_) => "other-provider",
+        };
+        lines.push(format!(
+            "{marker} {} / {}  [{compat}]",
+            model.provider, model.id
+        ));
+    }
+    lines.push("  (* = current UIA model)".to_owned());
+    lines.join("\n")
+}
+
+/// Verarbeitet die `/uia-model`-Operation — zeigt/wechselt das für die UIA
+/// gepinnte Modell (`uia_model`), unabhängig von `default_model`.
+///
+/// # Beschreibung
+/// Wiederverwendet [`ModelArgs`] und dieselbe `show|list|switch`-Grammatik
+/// wie `/model`:
+///
+/// | Sub-Kommando | Verhalten |
+/// |---|---|
+/// | `show` (Standard) | Meldet die effektive UIA-Auswahl |
+/// | `list` | Listet den Katalog mit UIA-Kompatibilität |
+/// | `switch <id>` | Wechselt nur das UIA-Modell |
+/// | *(sonstiges)* | [`OpError::InvalidArguments`] |
+///
+/// # Sicherheitsregel — kein ModelTool
+/// Diese Funktion darf niemals als LLM-aufrufbares Tool exponiert werden.
+///
+/// # Argumente
+/// - `ctx` (`&OpContext`): Ausführungskontext.
+/// - `args` (`ModelArgs`): geparstes Sub-Kommando.
+///
+/// # Rückgabe
+/// `Ok(OpOutput)` mit menschenlesbarem Text.
+///
+/// # Fehler
+/// - [`OpError::Execution`]: `SessionController` nicht verfügbar (nur `switch`),
+///   Config-Discovery fehlgeschlagen.
+/// - [`OpError::InvalidArguments`]: unbekannte ID, Provider-Mismatch, unbekanntes Sub-Kommando.
+///
+/// # Spec
+/// harwness Plan v2 — UIA-spezifische gepinnte Provider-/Modell-Auswahl.
+#[operation(
+    name = "uia-model",
+    summary = "Zeigt/wechselt das für die UIA gepinnte Modell (uia_model), unabhängig vom Default.",
+    domain = "catalog_config",
+    permission = "operator",
+    category = "model",
+    command(path = "/uia-model", visibility = "tui_only"),
+)]
+async fn uia_model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError> {
+    let action = args.action.as_deref().unwrap_or("show");
+
+    match action {
+        "show" | "list" | "switch" => {}
+        other => {
+            return Err(OpError::InvalidArguments(format!(
+                "Unknown /uia-model subcommand: '{other}'. \
+                 Valid subcommands: show, list, switch <model-id>."
+            )));
+        }
+    }
+
+    if action == "switch" {
+        let target = match args.target.as_deref().map(str::trim) {
+            Some(t) if !t.is_empty() => t.to_owned(),
+            _ => {
+                return Err(OpError::InvalidArguments(
+                    "switch requires a model id: /uia-model switch <id>".into(),
+                ));
+            }
+        };
+
+        return handle_uia_model_switch(ctx, target);
+    }
+
+    let controller = ctx.service::<harw_operations::SharedSessionController>();
+
+    let config = crate::config_util::load_default_config("Config-Discovery fehlgeschlagen")?;
+
+    let selection = effective_uia_selection(controller, &config);
+    let text = if action == "list" {
+        format_uia_list(&selection, &config)
+    } else {
+        format_uia_show(&selection, &config)
     };
 
     Ok(OpOutput::from(text))
@@ -686,5 +963,55 @@ mod tests {
             text.contains("other-provider"),
             "list output must contain 'other-provider' label: {text}"
         );
+    }
+
+    #[test]
+    fn effective_uia_selection_prefers_live_uia_and_never_generic_state() {
+        let ctrl = Arc::new(NullSessionController::new());
+        ctrl.set_active_provider("generic-provider".to_owned())
+            .expect("generic provider selection must succeed");
+        ctrl.set_active_model("generic-model".to_owned())
+            .expect("generic model selection must succeed");
+
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.default_provider = Some("default-provider".to_owned());
+        config.harness.default_model = Some("default-model".to_owned());
+        config.harness.uia_provider = Some("config-uia-provider".to_owned());
+        config.harness.uia_model = Some("config-uia-model".to_owned());
+
+        let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
+        let selection = super::effective_uia_selection(Some(&shared), &config);
+        assert_eq!(selection.provider(), Some("config-uia-provider"));
+        assert_eq!(selection.model(), Some("config-uia-model"));
+
+        ctrl.set_uia_selection(harw_operations::session_control::UiaSelection::new(
+            Some("live-uia-provider".to_owned()),
+            Some("live-uia-model".to_owned()),
+        ))
+        .expect("UIA selection must succeed");
+        let live = super::effective_uia_selection(Some(&shared), &config);
+        assert_eq!(live.provider(), Some("live-uia-provider"));
+        assert_eq!(live.model(), Some("live-uia-model"));
+        assert_ne!(live.provider(), Some("generic-provider"));
+        assert_ne!(live.model(), Some("generic-model"));
+    }
+
+    #[test]
+    fn effective_uia_selection_does_not_revive_a_cleared_model_after_provider_switch() {
+        let ctrl = Arc::new(NullSessionController::new());
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.uia_provider = Some("kimi".to_owned());
+        config.harness.uia_model = Some("@cf/zai-org/glm-5.3-flash".to_owned());
+
+        ctrl.set_uia_selection(harw_operations::session_control::UiaSelection::new(
+            Some("fireworks".to_owned()),
+            None,
+        ))
+        .expect("UIA provider switch must succeed");
+
+        let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
+        let selection = super::effective_uia_selection(Some(&shared), &config);
+        assert_eq!(selection.provider(), Some("fireworks"));
+        assert_eq!(selection.model(), None);
     }
 }

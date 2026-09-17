@@ -36,7 +36,10 @@
 //! harwness Plan v2 — `/provider` meta-definition + Wave 5 runtime-truthful ops.
 
 use harw_macros::operation;
-use harw_operations::{OpContext, OpError, OpOutput, SharedSessionController};
+use harw_operations::{
+    OpContext, OpError, OpOutput, SessionController, SharedSessionController,
+};
+use harw_operations::session_control::UiaSelection;
 use std::sync::Arc;
 
 /// Argument struct for the `/provider` command.
@@ -391,6 +394,46 @@ fn handle_switch(
     target: String,
     model: Option<String>,
 ) -> Result<OpOutput, OpError> {
+    handle_switch_core(ctx, target, model, crate::config_util::persist_default_selection)
+}
+
+/// Shared core of the atomic, validated provider (and optional model) switch.
+///
+/// # Description
+/// Identical validation/mutation sequence as documented on [`handle_switch`],
+/// factored out so both `/provider switch` and `/uia-provider switch` share
+/// it — the two differ only in which config key the resulting selection is
+/// persisted under. `/provider switch` passes
+/// [`crate::config_util::persist_default_selection`]; `/uia-provider switch`
+/// passes [`crate::config_util::persist_uia_selection`].
+///
+/// # Arguments
+/// - `ctx` (`&OpContext`): used to obtain the controller.
+/// - `target` (`String`): the provider ID to switch to (already trimmed).
+/// - `model` (`Option<String>`): an optional model ID/alias to switch to in
+///   the same call.
+/// - `persist` (`impl FnOnce(Option<&str>, Option<&str>) -> Option<String>`):
+///   called once, after the controller mutation succeeds, with
+///   `(Some(canonical_provider), resolved_model.as_deref())`. Returns `None`
+///   on successful persistence or `Some(note)` with a human-readable failure
+///   note to append to the output.
+///
+/// # Returns
+/// [`OpOutput`] confirming the switch, with a trailing persistence note.
+///
+/// # Errors
+/// - [`OpError::Execution`]: controller not in context, or controller mutation failed.
+/// - [`OpError::InvalidArguments`]: unknown provider, missing credentials, unknown
+///   model, or provider/model incompatibility.
+///
+/// # Spec Reference
+/// harwness Plan v2 — Task C; `/uia-provider` follow-up (UIA-specific pinned selection).
+fn handle_switch_core(
+    ctx: &OpContext,
+    target: String,
+    model: Option<String>,
+    persist: impl FnOnce(Option<&str>, Option<&str>) -> Option<String>,
+) -> Result<OpOutput, OpError> {
     let config = resolved_config(ctx)?;
     if config.providers.is_empty() {
         return Err(OpError::Execution(
@@ -486,7 +529,7 @@ fn handle_switch(
         ),
         None => format!("provider switched to {canonical_target}; next turn will use it"),
     };
-    match crate::config_util::persist_default_selection(
+    match persist(
         Some(canonical_target.as_str()),
         snap_after.active_model.as_deref(),
     ) {
@@ -495,6 +538,116 @@ fn handle_switch(
             text.push_str(&note);
         }
         None => text.push_str("\n(als Standard für künftige Sitzungen gespeichert)"),
+    }
+
+    Ok(OpOutput::from(text))
+}
+
+/// Wechselt ausschließlich die UIA-Auswahl.
+///
+/// Das aktuelle UIA-Modell stammt aus der Live-Auswahl oder aus
+/// `harness.uia_model`; generische `active_*`-Werte werden nie übernommen.
+fn handle_uia_switch_core(
+    ctx: &OpContext,
+    target: String,
+    model: Option<String>,
+) -> Result<OpOutput, OpError> {
+    let config = resolved_config(ctx)?;
+    if config.providers.is_empty() {
+        return Err(OpError::Execution(
+            "configured provider catalog is unavailable; refusing to switch UIA providers".into(),
+        ));
+    }
+
+    let (canonical_target, provider) = configured_provider(&config, &target)
+        .ok_or_else(|| OpError::InvalidArguments(format!("unknown provider: {target}")))?;
+    let canonical_target = canonical_target.to_owned();
+    if !provider.enabled {
+        return Err(OpError::InvalidArguments(format!(
+            "provider {canonical_target}: disabled in configuration"
+        )));
+    }
+    if !configured_auth_is_present(provider) {
+        return Err(OpError::InvalidArguments(format!(
+            "provider {canonical_target}: credentials not available \
+             (provider has no configured auth — configure auth before switching)"
+        )));
+    }
+
+    let controller = ctx
+        .service::<SharedSessionController>()
+        .ok_or_else(|| OpError::Execution("SessionController not available".into()))?;
+    let current = crate::model::effective_uia_selection(Some(controller), &config);
+
+    let mut cleared_incompatible_model = None;
+    let resolved_model = match model {
+        Some(requested_model) => {
+            let configured = crate::model::configured_model(&config, &requested_model)
+                .ok_or_else(|| OpError::InvalidArguments(format!("unknown model: {requested_model}")))?;
+            let model_provider = configured_provider(&config, &configured.provider)
+                .map(|(canonical, _)| canonical)
+                .unwrap_or(configured.provider.as_str());
+            if model_provider != canonical_target {
+                return Err(OpError::InvalidArguments(format!(
+                    "model '{requested_model}' is not available on UIA provider '{canonical_target}' \
+                     (model belongs to provider '{model_provider}'); \
+                     use `/uia-model switch <id>` for a compatible UIA model"
+                )));
+            }
+            Some(configured.id.clone())
+        }
+        None => match current.model() {
+            None => None,
+            Some(current_model) => match crate::model::configured_model(&config, current_model) {
+                Some(configured) => {
+                    let model_provider = configured_provider(&config, &configured.provider)
+                        .map(|(canonical, _)| canonical)
+                        .unwrap_or(configured.provider.as_str());
+                    if model_provider == canonical_target {
+                        Some(configured.id.clone())
+                    } else {
+                        cleared_incompatible_model = Some(current_model.to_owned());
+                        None
+                    }
+                }
+                None => {
+                    cleared_incompatible_model = Some(current_model.to_owned());
+                    None
+                }
+            }
+        },
+    };
+
+    let selection = UiaSelection::new(Some(canonical_target.clone()), resolved_model.clone());
+    controller
+        .set_uia_selection(selection.clone())
+        .map_err(|e| OpError::Execution(e.to_string()))?;
+
+    let mut text = match &resolved_model {
+        Some(model_id) => format!(
+            "UIA provider switched to {canonical_target}; UIA model is {model_id}; \
+             next UIA turn will use it"
+        ),
+        None => match cleared_incompatible_model {
+            Some(previous_model) => format!(
+                "UIA provider switched to {canonical_target}; incompatible UIA model \
+                 {previous_model} was cleared; use `/uia-model list` to choose a compatible model"
+            ),
+            None => format!(
+                "UIA provider switched to {canonical_target}; no UIA model selected; \
+                 use `/uia-model list` to choose one"
+            ),
+        },
+    };
+    match crate::config_util::persist_uia_selection(
+        selection.provider.as_deref(),
+        selection.model.as_deref(),
+    ) {
+        Some(note) => {
+            text.push('\n');
+            text.push_str(&note);
+        }
+        None => text.push_str("\n(UIA-Auswahl für künftige Sitzungen gespeichert)"),
     }
 
     Ok(OpOutput::from(text))
@@ -568,6 +721,209 @@ fn handle_test(ctx: &OpContext) -> Result<OpOutput, OpError> {
          Note: live connection test (HTTP ping) not yet wired — \
          re-run after harw-provider-http integration.",
         api = provider_toml.api,
+    )))
+}
+
+/// Implements `/uia-provider` — shows, lists, tests and switches the UIA's
+/// own pinned provider selection (`harness.uia_provider`), independent of
+/// `default_provider`.
+///
+/// # Description
+/// Reuses [`ProviderArgs`] and the same `switch <id> [<model-id>]` parsing as
+/// `/provider`, since the sub-command grammar is unchanged:
+///
+/// - **`show`** (default): reports the effective UIA provider/model from the
+///   live UIA selection, otherwise `uia_provider`/`uia_model` config.
+/// - **`list`**: lists the provider catalog and marks the effective UIA provider.
+/// - **`switch <id> [<model-id>]`**: delegates to [`handle_switch_core`] with
+///   [`crate::config_util::persist_uia_selection`], so the runtime switch is
+///   identical to `/provider switch` but the persisted default is
+///   `uia_provider`/`uia_model` instead of `default_provider`/`default_model`.
+/// - **`test`**: tests the effective UIA provider's configured auth variant.
+///
+/// # Arguments
+/// - `ctx` (`&OpContext`): execution context.
+/// - `args` (`ProviderArgs`): contains the optional sub-command.
+///
+/// # Returns
+/// [`OpOutput`] with compact, multi-line text.
+///
+/// # Errors
+/// - [`OpError::Execution`]: controller not in context, or config discovery failed.
+/// - [`OpError::InvalidArguments`]: unknown sub-command; `switch` without ID;
+///   unknown provider ID; missing credentials; incompatible active model.
+///
+/// # Panics
+/// None.
+///
+/// # Concurrency
+/// Same as `/provider` — stateless reads, interior-mutable switch path.
+///
+/// # Spec Reference
+/// harwness Plan v2 — UIA-specific pinned provider/model selection.
+#[operation(
+    name = "uia-provider",
+    summary = "Zeigt/wechselt den für die UIA gepinnten Provider (uia_provider), unabhängig vom Default.",
+    domain = "catalog_config",
+    permission = "operator",
+    category = "model",
+    command(path = "/uia-provider", visibility = "tui_only"),
+)]
+async fn uia_provider(ctx: &OpContext, args: ProviderArgs) -> Result<OpOutput, OpError> {
+    let sub = args.cmd.as_deref().unwrap_or("show");
+
+    if let Some(target) = sub.strip_prefix("switch ") {
+        let target = target.trim();
+        if target.is_empty() {
+            return Err(OpError::InvalidArguments(
+                "switch requires a provider ID: /uia-provider switch <id> [<model-id>]".into(),
+            ));
+        }
+        let mut tokens = target.split_whitespace();
+        let provider_target = tokens.next().unwrap_or_default().to_owned();
+        let model_target = tokens.next().map(str::to_owned);
+        if tokens.next().is_some() {
+            return Err(OpError::InvalidArguments(
+                "switch accepts at most a provider ID and a model ID: \
+                 /uia-provider switch <id> [<model-id>]"
+                    .into(),
+            ));
+        }
+        return handle_uia_switch_core(ctx, provider_target, model_target);
+    }
+
+    match sub {
+        "show" => handle_uia_show(ctx),
+        "list" => handle_uia_list(ctx),
+        "test" => handle_uia_test(ctx),
+        other => Err(OpError::InvalidArguments(format!(
+            "Unknown /uia-provider sub-command: '{other}'. \
+             Supported: show, list, switch <id> [<model-id>], test."
+        ))),
+    }
+}
+
+/// Implements `/uia-provider show` — reports the UIA's pinned provider.
+///
+/// # Description
+/// Reads `config.harness.uia_provider` directly (a persisted config value,
+/// not runtime-switched state — the UIA pin is not mutated by
+/// `/provider switch`). If unset, reports the fallback to `default_provider`
+/// (or the absence of any configured default).
+///
+/// # Arguments
+/// - `ctx` (`&OpContext`): used to resolve the configuration.
+///
+/// # Returns
+/// [`OpOutput`] with the pinned provider ID, name, and credential status, or
+/// a fallback note.
+///
+/// # Errors
+/// - [`OpError::Execution`]: config discovery failed, or the configured
+///   provider catalog is unavailable.
+///
+/// # Spec Reference
+/// harwness Plan v2 — UIA-specific pinned provider/model selection.
+fn handle_uia_show(ctx: &OpContext) -> Result<OpOutput, OpError> {
+    let config = resolved_config(ctx)?;
+    if config.providers.is_empty() {
+        return Err(OpError::Execution(
+            "configured provider catalog is unavailable; refusing to select a provider".into(),
+        ));
+    }
+
+    let controller = ctx.service::<SharedSessionController>();
+    let selection = crate::model::effective_uia_selection(controller, &config);
+    let provider_line = match selection.provider() {
+        Some(provider) => match configured_provider(&config, provider) {
+            Some((canonical_id, resolved_provider)) => format!(
+                "UIA provider : {canonical_id}\nName         : {}\nCredentials  : {}",
+                resolved_provider.name,
+                configured_auth_status_label(resolved_provider),
+            ),
+            None => format!(
+                "UIA provider : {provider}\nWARNING: provider '{provider}' is not present in the configured provider catalog. \
+                 Use `/uia-provider list` to see configured providers."
+            ),
+        },
+        None => "UIA provider : (nicht gesetzt)".to_owned(),
+    };
+    let text = format!(
+        "{provider_line}\nUIA model    : {}",
+        selection.model().unwrap_or("(nicht gesetzt)")
+    );
+    Ok(OpOutput::from(text))
+}
+
+/// Implements `/uia-provider list` — marks the effective UIA provider.
+fn handle_uia_list(ctx: &OpContext) -> Result<OpOutput, OpError> {
+    let config = resolved_config(ctx)?;
+    let controller = ctx.service::<SharedSessionController>();
+    let selection = crate::model::effective_uia_selection(controller, &config);
+    let active = selection.provider();
+
+    let mut lines = vec!["Registered providers (UIA):".to_owned()];
+    let mut providers: Vec<_> = config.providers.values().collect();
+    providers.sort_by(|left, right| left.name.cmp(&right.name));
+    for provider in providers {
+        let status = if active == Some(provider.name.as_str()) {
+            "[uia-active]"
+        } else if configured_auth_is_present(provider) {
+            "[auth-ok]"
+        } else {
+            "[auth-missing]"
+        };
+        lines.push(format!("  {}  id={}  {status}", provider.name, provider.name));
+    }
+    lines.push(format!(
+        "\nEffective UIA provider: {}",
+        active.unwrap_or("(none)")
+    ));
+    lines.push(format!(
+        "Effective UIA model: {}",
+        selection.model().unwrap_or("(none)")
+    ));
+    Ok(OpOutput::from(lines.join("\n")))
+}
+
+/// Implements `/uia-provider test` — tests the effective UIA provider.
+fn handle_uia_test(ctx: &OpContext) -> Result<OpOutput, OpError> {
+    let config = resolved_config(ctx)?;
+    let controller = ctx.service::<SharedSessionController>();
+    let selection = crate::model::effective_uia_selection(controller, &config);
+
+    let Some(provider_name) = selection.provider() else {
+        return Ok(OpOutput::from(
+            "No effective UIA provider configured — no test possible. \
+             Use `/uia-provider switch <id>` to set one."
+                .to_owned(),
+        ));
+    };
+    let Some((canonical, provider)) = configured_provider(&config, provider_name) else {
+        return Ok(OpOutput::from(format!(
+            "Effective UIA provider '{provider_name}' is not present in the configured provider catalog."
+        )));
+    };
+
+    let auth_info = match &provider.auth {
+        Some(secret_ref) => {
+            let ref_string = secret_ref.as_ref_string();
+            let ref_type = ref_string
+                .split_once(':')
+                .map(|(prefix, _)| prefix)
+                .unwrap_or("unknown");
+            format!("Auth method: {ref_type}:  [ref present — value not shown]")
+        }
+        None if provider.has_plaintext_secret() => {
+            "Auth method: api_key (plaintext) — WARNING: insecure; use an `auth` SecretRef instead."
+                .to_owned()
+        }
+        None => "Auth method: (none) — provider has no `auth` field configured.".to_owned(),
+    };
+    let status = if provider.enabled { "enabled" } else { "disabled" };
+    Ok(OpOutput::from(format!(
+        "Effective UIA provider : {canonical}  [{status}]\nAPI type                : {}\n{}\nNote: live connection test (HTTP ping) not yet wired.",
+        provider.api, auth_info
     )))
 }
 
@@ -706,6 +1062,7 @@ mod tests {
                 enabled: true,
                 origin_allowlist: Default::default(),
                 rate_limit: None,
+                max_concurrency: None,
             },
         );
 

@@ -24,6 +24,7 @@
 
 use harw_macros::operation;
 use harw_operations::{OpContext, OpError, OpOutput};
+use harw_operations::session_control::SharedSessionController;
 
 /// Leerer Argument-Container für die `/status`-Operation.
 ///
@@ -85,9 +86,33 @@ async fn status(ctx: &OpContext, _args: StatusArgs) -> Result<OpOutput, OpError>
     let tenant_id = sandbox.workspace().tenant();
     let permission_count = sandbox.permissions().iter().count();
 
-    let text = format!(
-        "Session: {session_id}\nTurn:    {turn_id}\nSandbox: {workspace_id} ({tenant_id})\nPermissions: {permission_count} aktiv",
-    );
+    // Provider und Modell aus dem Session-Controller abfragen, falls in der
+    // ServiceMap registriert. `None` bedeutet: kein Controller in dieser
+    // Ausfuehrungsumgebung (z. B. Test oder CLI-Echo-Pfad).
+    let (provider, model) = match ctx.service::<SharedSessionController>() {
+        Some(controller) => {
+            let snap = controller.snapshot();
+            (snap.active_provider, snap.active_model)
+        }
+        None => (None, None),
+    };
+
+    let mut lines = vec![
+        format!("Session: {session_id}"),
+        format!("Turn:    {turn_id}"),
+        format!("Sandbox: {workspace_id} ({tenant_id})"),
+        format!("Permissions: {permission_count} aktiv"),
+    ];
+
+    // Provider- und Modellzeile nur anzeigen, wenn Informationen vorhanden.
+    if let Some(p) = &provider {
+        lines.push(format!("Provider: {p}"));
+    }
+    if let Some(m) = &model {
+        lines.push(format!("Modell: {m}"));
+    }
+
+    let text = lines.join("\n");
 
     Ok(OpOutput::from(text))
 }
