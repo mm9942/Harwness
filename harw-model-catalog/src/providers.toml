@@ -13,7 +13,7 @@ default_model = "gpt-5.4"
 featured = true
 auth = [
   { method = "api-key", env_vars = ["OPENAI_API_KEY"] },
-  { method = "local-import", sources = ["codex"] },
+  { method = "local-import", sources = ["codex", "codex-oauth"] },
 ]
 models = [
   "chatgpt-image-latest",
@@ -695,6 +695,36 @@ featured = true
 default_model = "kimi-k3"
 auth = [{ method = "api-key", env_vars = ["MOONSHOT_API_KEY", "KIMI_API_KEY"] }]
 models = ["kimi-k2.6", "kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k3"]
+
+[[provider]]
+# Eigener Cloudflare Worker vor Workers AI: OpenAI-Chat-kompatibles Gateway,
+# Auth per Bearer-Token gegen ein worker-seitiges Secret (kein Zusammenhang
+# mit dem offiziellen Moonshot-Provider oben). Discovery via
+# `{base_url}/models` funktioniert, sofern der Worker `GET /v1/models`
+# implementiert (wie unser Referenz-Worker es tut).
+#
+# `base_url` ist absichtlich ein Platzhalter: der Worker-Hostname ist pro
+# Cloudflare-Account individuell (Custom Domain oder *.workers.dev) und
+# gehört deshalb nicht fest in den eingebetteten Katalog — analog zu
+# `foundry` (Azure-Ressourcen-URL) und `custom`. Die konkrete URL und der
+# Secret-Verweis leben in der Profil-Provider-Datei, z. B.
+# `~/.harw/profiles/<profil>/providers/cf-worker.toml`.
+id = "cf-worker"
+name = "Cloudflare Worker (eigenes Gateway)"
+base_url = "https://<dein-worker>.example/v1"
+api = "openai-chat"
+default_model = "@cf/moonshotai/kimi-k2.7-code"
+auth = [{ method = "custom" }]
+models = [
+  "@cf/moonshotai/kimi-k2.7-code",
+  "@cf/qwen/qwen2.5-coder-32b-instruct",
+  "@cf/openai/gpt-oss-120b",
+  "@cf/openai/gpt-oss-20b",
+  "@cf/deepseek-ai/deepseek-r1-distill-qwen-32b",
+  "@cf/qwen/qwen3-30b-a3b-fp8",
+  "@cf/qwen/qwq-32b",
+  "@cf/zai-org/glm-5.2",
+]
 
 [[provider]]
 id = "zhipu"
