@@ -315,6 +315,7 @@ async fn slice9_incompatible_provider_switch_is_atomic() {
             enabled: true,
             origin_allowlist: Default::default(),
             rate_limit: None,
+            max_concurrency: None,
         },
     );
     config.providers.insert(
@@ -331,6 +332,7 @@ async fn slice9_incompatible_provider_switch_is_atomic() {
             enabled: true,
             origin_allowlist: Default::default(),
             rate_limit: None,
+            max_concurrency: None,
         },
     );
     config.models.insert(

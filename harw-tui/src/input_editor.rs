@@ -312,6 +312,24 @@ impl InputEditor {
         debug_assert!(self.buffer.is_char_boundary(self.cursor));
     }
 
+    /// Löscht die komplette aktuelle Zeile (nicht nur bis Zeilenende) —
+    /// nachfolgende Zeilen rücken automatisch nach oben. Anders als
+    /// `delete_to_end` (Kürzung ab Cursor) wird hier der ganze Zeilenbereich
+    /// entfernt, unabhängig von der Cursor-Position innerhalb der Zeile.
+    pub fn delete_current_line(&mut self) {
+        let line_start = self.current_line_start();
+        // Ende der Zeile inklusive des nachfolgenden `\n`, damit die
+        // nächste Zeile nach oben rückt. Gibt es keinen weiteren `\n`
+        // (letzte Zeile), reicht das Ende bis zum Puffer-Ende.
+        let line_end = match self.buffer[self.cursor..].find('\n') {
+            Some(nl_offset) => self.cursor + nl_offset + 1,
+            None => self.buffer.len(),
+        };
+        self.buffer.replace_range(line_start..line_end, "");
+        self.cursor = line_start;
+        debug_assert!(self.buffer.is_char_boundary(self.cursor));
+    }
+
     /// Löscht das Zeichen rechts vom Cursor (Vorwärts-Delete).
     ///
     /// Ist der Cursor am Ende, ist die Operation ein No-Op.
@@ -1053,6 +1071,55 @@ mod tests {
         ed.move_right(); // cursor=1
         ed.delete();
         assert_eq!(ed.text(), "ac");
+    }
+
+    // 5b. delete_current_line: removes only the line the cursor is on and
+    // shifts subsequent lines up.
+    #[test]
+    fn test_delete_current_line_removes_only_that_line_and_shifts_up() {
+        let mut ed = InputEditor::new();
+        ed.insert_str("erste\nzweite\ndritte");
+        // Cursor steht nach insert_str am Ende (Byte 19). Auf Byte 9 bewegen,
+        // das liegt mitten in "zweite" (nach "erste\nzwe").
+        for _ in 0..10 {
+            ed.move_left();
+        }
+        assert_eq!(ed.cursor(), 9);
+        ed.delete_current_line();
+        assert_eq!(ed.text(), "erste\ndritte");
+        assert_eq!(ed.cursor(), 6); // Anfang der (jetzt zweiten) Zeile "dritte"
+    }
+
+    // 5c. delete_current_line on the last line with no trailing newline: only
+    // that line's content is removed, the preceding newline is untouched.
+    #[test]
+    fn test_delete_current_line_on_last_line_with_no_trailing_newline() {
+        let mut ed = InputEditor::new();
+        ed.insert_str("eins\nzwei");
+        // Cursor irgendwo in "zwei" (letzte Zeile, kein abschließendes \n).
+        // insert_str lässt den Cursor am Ende (Byte 9); zwei Schritte zurück
+        // landen auf Byte 7, mitten in "zwei".
+        ed.move_left();
+        ed.move_left();
+        assert_eq!(ed.cursor(), 7);
+        ed.delete_current_line();
+        assert_eq!(ed.text(), "eins\n");
+        assert_eq!(ed.cursor(), 5); // Anfang der (nun leeren) letzten Zeile
+    }
+
+    // 5d. delete_current_line on a single-line buffer clears everything.
+    #[test]
+    fn test_delete_current_line_single_line_buffer() {
+        let mut ed = InputEditor::new();
+        ed.insert_str("nur eine zeile");
+        // Cursor irgendwo innerhalb der einzigen Zeile positionieren.
+        ed.move_left();
+        ed.move_left();
+        ed.move_left();
+        assert_eq!(ed.cursor(), 11);
+        ed.delete_current_line();
+        assert_eq!(ed.text(), "");
+        assert_eq!(ed.cursor(), 0);
     }
 
     // 6. move_left_right

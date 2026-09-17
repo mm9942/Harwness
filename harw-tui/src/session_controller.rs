@@ -34,7 +34,9 @@
 
 use std::sync::{Arc, Mutex};
 
+use harw_agent_dsl::roles::AgentRoleId;
 use harw_core::{AgentSession, InteractionMode};
+use harw_operations::session_control::UiaSelection;
 use harw_operations::{SessionControlError, SessionControlSnapshot, SessionController};
 use harw_types::{ModelId, ProviderId, ReasoningEffort};
 
@@ -58,6 +60,10 @@ struct Inner {
     active_model: Option<String>,
     /// Aktiv gewählter Provider (in Controller gespeichert; wie `active_model`).
     active_provider: Option<String>,
+    /// UIA-Provider-/Modell-Paar. `None` bedeutet, dass noch keine UIA-Auswahl
+    /// initialisiert wurde; dann bleibt für die Root-Session der generische
+    /// Live-State wirksam.
+    uia_selection: Option<UiaSelection>,
     /// Ausstehender Interaktionsmodus; `None` = nie einer angefordert, die
     /// Session behält ihren eigenen (`InteractionMode::Chat` als Default).
     ///
@@ -128,6 +134,24 @@ impl TuiSessionController {
         }
     }
 
+    /// Initialisiert den UIA-State für den nächsten Apply an der
+    /// UIA-Root-Session. Generische `active_*`-Werte bleiben unberührt.
+    pub fn initialize_uia_selection(
+        &self,
+        selection: UiaSelection,
+    ) -> Result<(), SessionControlError> {
+        self.set_uia_selection(selection)
+    }
+
+    /// Erzeugt einen Controller mit bereits initialisiertem UIA-State.
+    #[must_use]
+    pub fn with_uia_selection(selection: UiaSelection) -> Self {
+        let controller = Self::new();
+        // Ein frisch erzeugter Controller kann diesen Mutex nicht vergiften.
+        let _ = controller.initialize_uia_selection(selection);
+        controller
+    }
+
     /// Erzeugt einen Controller, der mit einem Snapshot vorbelegt ist (für Tests).
     ///
     /// # Argumente
@@ -145,6 +169,7 @@ impl TuiSessionController {
             reasoning_effort: snap.reasoning_effort,
             active_model: snap.active_model,
             active_provider: snap.active_provider,
+            uia_selection: (!snap.uia_selection.is_empty()).then_some(snap.uia_selection),
             // Ein unbekannter Modusname im Snapshot wird verworfen statt zu
             // raten — `parse` ist die einzige Stelle, die Namen anerkennt.
             interaction_mode: snap
@@ -215,8 +240,23 @@ impl TuiSessionController {
             return false;
         }
         session.set_reasoning_effort(inner.reasoning_effort);
-        session.set_active_model(inner.active_model.as_deref().map(ModelId::from));
-        session.set_active_provider(inner.active_provider.as_deref().map(ProviderId::from));
+        let selection = if is_uia_root_session(session) {
+            inner.uia_selection.as_ref()
+        } else {
+            None
+        };
+        session.set_active_model(
+            selection
+                .and_then(|selection| selection.model())
+                .or(inner.active_model.as_deref())
+                .map(ModelId::from),
+        );
+        session.set_active_provider(
+            selection
+                .and_then(|selection| selection.provider())
+                .or(inner.active_provider.as_deref())
+                .map(ProviderId::from),
+        );
         if let Some(mode) = inner.interaction_mode {
             if session.mode() != mode {
                 session.set_mode(mode);
@@ -242,6 +282,7 @@ impl std::fmt::Debug for TuiSessionController {
                 .field("reasoning_effort", &inner.reasoning_effort)
                 .field("active_model", &inner.active_model)
                 .field("active_provider", &inner.active_provider)
+                .field("uia_selection", &inner.uia_selection)
                 .field("generation", &inner.generation)
                 .field("applied_generation", &inner.applied_generation)
                 .finish(),
@@ -317,6 +358,49 @@ impl SessionController for TuiSessionController {
         Ok(())
     }
 
+    /// Setzt Provider und Modell der UIA-Auswahl gemeinsam.
+    fn set_uia_selection(&self, selection: UiaSelection) -> Result<(), SessionControlError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| SessionControlError::Disconnected)?;
+        inner.uia_selection = Some(selection);
+        inner.generation = inner.generation.saturating_add(1);
+        Ok(())
+    }
+
+    /// Setzt nur den Provider der UIA-Auswahl.
+    fn set_uia_provider(&self, provider_id: String) -> Result<(), SessionControlError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| SessionControlError::Disconnected)?;
+        let selection = inner.uia_selection.get_or_insert_with(UiaSelection::empty);
+        selection.provider = Some(provider_id);
+        inner.generation = inner.generation.saturating_add(1);
+        Ok(())
+    }
+
+    /// Setzt nur das Modell der UIA-Auswahl.
+    fn set_uia_model(&self, model_id: String) -> Result<(), SessionControlError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|_| SessionControlError::Disconnected)?;
+        let selection = inner.uia_selection.get_or_insert_with(UiaSelection::empty);
+        selection.model = Some(model_id);
+        inner.generation = inner.generation.saturating_add(1);
+        Ok(())
+    }
+
+    /// Liefert die UIA-Auswahl als lockfreie Kopie.
+    fn uia_selection(&self) -> UiaSelection {
+        self.inner
+            .lock()
+            .map(|inner| inner.uia_selection.clone().unwrap_or_default())
+            .unwrap_or_default()
+    }
+
     /// Merkt den angeforderten Interaktionsmodus für die nächste Turn-Grenze vor.
     ///
     /// # Beschreibung
@@ -359,6 +443,7 @@ impl SessionController for TuiSessionController {
                 reasoning_effort: inner.reasoning_effort,
                 active_model: inner.active_model.clone(),
                 active_provider: inner.active_provider.clone(),
+                uia_selection: inner.uia_selection.clone().unwrap_or_default(),
                 interaction_mode: inner
                     .interaction_mode
                     .map(|mode| mode.as_str().to_owned()),
@@ -380,6 +465,23 @@ impl SessionController for TuiSessionController {
 /// # Spec
 /// harw-tui Design §session_controller — SharedTuiSessionController.
 pub type SharedTuiSessionController = Arc<TuiSessionController>;
+
+/// Eine Session ist UIA-Root genau dann, wenn sie keine Eltern-Session hat und
+/// ihr vertrauenswürdiger Spawn-Kontext die Organisationsrolle `UserInterface`
+/// trägt. Die Prüfung nutzt absichtlich keine globalen Defaults und behandelt
+/// Child-/Worker-Sessions niemals als UIA-Root.
+fn is_uia_root_session(session: &AgentSession) -> bool {
+    is_uia_root_identity(
+        session.parent_session_id().is_none(),
+        session
+            .spawn_context()
+            .map(|context| context.organizational_role),
+    )
+}
+
+fn is_uia_root_identity(has_no_parent: bool, role: Option<AgentRoleId>) -> bool {
+    has_no_parent && role == Some(AgentRoleId::UserInterface)
+}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -466,6 +568,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_uia_selection_is_separate_and_prioritized_only_for_uia_root() {
+        let ctrl = TuiSessionController::new();
+        ctrl.set_active_model("generic-model".to_owned())
+            .expect("generic model setter should succeed");
+        ctrl.set_uia_selection(UiaSelection::new(
+            Some("uia-provider".to_owned()),
+            Some("uia-model".to_owned()),
+        ))
+        .expect("UIA selection setter should succeed");
+
+        let snap = ctrl.snapshot();
+        assert_eq!(snap.active_model.as_deref(), Some("generic-model"));
+        assert_eq!(snap.uia_selection.model(), Some("uia-model"));
+        assert!(is_uia_root_identity(true, Some(AgentRoleId::UserInterface)));
+    }
+
+    #[test]
+    fn test_uia_selection_is_not_applied_to_child_sessions() {
+        let ctrl = TuiSessionController::new();
+        ctrl.set_active_model("generic-model".to_owned())
+            .expect("generic model setter should succeed");
+        ctrl.set_uia_selection(UiaSelection::new(
+            Some("uia-provider".to_owned()),
+            Some("uia-model".to_owned()),
+        ))
+        .expect("UIA selection setter should succeed");
+
+        let (event_tx, _rx) = mpsc::unbounded_channel();
+        let mut child = AgentSession::new(
+            AgentRole::Assistant,
+            Some(harw_types::SessionId::new()),
+            ExtensionRegistryBuilder::default().build(),
+            event_tx,
+        );
+        ctrl.apply_to_session(&mut child);
+        assert_eq!(child.active_model(), Some(&ModelId::from("generic-model")));
+        assert!(!is_uia_root_identity(false, Some(AgentRoleId::UserInterface)));
+    }
+
     // ── 5. apply_to_session überträgt reasoning_effort auf AgentSession ──────
 
     #[test]
@@ -549,6 +691,7 @@ mod tests {
             reasoning_effort: Some(ReasoningEffort::Minimal),
             active_model: Some("test-model".to_owned()),
             active_provider: Some("test-provider".to_owned()),
+            uia_selection: UiaSelection::empty(),
             interaction_mode: Some("explore".to_owned()),
         };
         let ctrl = TuiSessionController::with_snapshot(snap.clone());
@@ -671,6 +814,7 @@ mod tests {
             reasoning_effort: None,
             active_model: None,
             active_provider: None,
+            uia_selection: UiaSelection::empty(),
             interaction_mode: None,
         };
         let ctrl2 = TuiSessionController::with_snapshot(snap_none);

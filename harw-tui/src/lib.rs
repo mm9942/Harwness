@@ -11,6 +11,7 @@
 pub mod app;
 pub mod approval;
 pub mod approval_dialog;
+pub mod host_permit_dialog;
 pub(crate) mod chat_scroll;
 pub(crate) mod input_history;
 mod command;

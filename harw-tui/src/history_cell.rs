@@ -1419,6 +1419,22 @@ impl ToolCell {
         }
     }
 
+    /// Übernimmt die echten Aufrufdaten für eine beim Resume zunächst
+    /// synthetisch angelegte Result-Zelle.
+    pub(crate) fn resume_call(&mut self, call: &ToolCall) {
+        self.tool_name = call.name.as_str().to_owned();
+        self.label = tool_label(call);
+        self.arguments_json = call.arguments.to_string();
+    }
+
+    /// Markiert einen beim Resume offenen Aufruf sichtbar als unvollständig.
+    pub(crate) fn mark_incomplete(&mut self) {
+        if self.state == ToolState::Running {
+            self.state = ToolState::Failed;
+            self.summary = Some("unvollständig (Resume-Abbruch)".to_owned());
+        }
+    }
+
     /// Schreibt das Ergebnis eines abgeschlossenen Werkzeugaufrufs fort.
     ///
     /// # Beschreibung

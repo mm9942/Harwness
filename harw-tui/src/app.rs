@@ -121,17 +121,20 @@ use harw_extension_api::allow_rules::{ApprovalRule, RuleDecision, RuleScope, der
 use harw_extension_api::approval_mode::ApprovalMode;
 use harw_extension_api::registry::ContextProviderRegistrationError;
 use harw_extension_api::{ToolCall, ToolName};
-use harw_operations::SessionController;
+use harw_operations::{OpOutput, SessionController};
 use harw_operations::adapter::CommandAdapter;
 use harw_plan::PlanStore;
 use harw_plan::goal::{GoalStore, evaluate_goal};
 use harw_protocol::events::{SessionEvent, TurnEvent};
-use harw_protocol::items::{ContentPart, TurnItem};
+use harw_protocol::items::{ContentPart, ResultTrust, ToolCallResult, TurnItem};
 use harw_sandbox::SandboxSpec;
 use harw_types::SessionId;
 use harw_types::TokenUsage;
 
-use crate::CommandRegistry;
+use crate::{
+    CapabilitySet, CommandAction, CommandRegistry, DispatchContext, Invocation,
+    InvocationSurface, ShellCapability,
+};
 use crate::approval::{
     ApprovalDriver, ApprovalDriverError, ApprovalPrompt, ApprovalPromptReceiver, ChildTurnDriver,
 };
@@ -142,12 +145,15 @@ use crate::clipboard::{self, ClipboardTarget};
 use crate::command_exec::execute_command_as;
 use crate::command_popup::{CommandPopup, PopupAction, TabOutcome};
 use crate::events::{HarwEvent, HarwEventSender};
-use crate::export::{self, ExportEntry, ExportMeta, ExportOptions};
+use crate::export::{
+    self, ExportAgentEntry, ExportAgentRef, ExportEntry, ExportErrorEntry, ExportMeta,
+    ExportMetaExtensions, ExportOptions, ExportPlanEntry, ExportStatus,
+};
 use crate::frame_requester::{FrameRequester, MIN_FRAME_INTERVAL};
 use crate::history_cell::{
     AssistantHistoryCell, GoalCell, HistoryCell, PlainHistoryCell, PlanGraphCell,
     ReasoningHistoryCell, SharedToolCell, SubAgentCell, SubAgentStatus, ToolCell, ToolGroupCell,
-    ToolVerbosity, UserHistoryCell,
+    ToolState, ToolVerbosity, UserHistoryCell, truncate_chars,
 };
 use crate::input_editor::{InputAction, InputEditor};
 use crate::input_history::InputHistoryStore;
@@ -263,6 +269,13 @@ impl<T: HistoryCell> HistoryCell for SharedHistoryCell<T> {
 struct TurnEventState {
     /// `call_id` → die eine geteilte Werkzeugzelle dieses Aufrufs.
     pending_tool_cells: HashMap<harw_types::ToolCallId, SharedToolCell>,
+    /// `call_id` → Position des strukturierten `ExportEntry::ToolCall`.
+    /// Dadurch können Dauer und Trust nach dem Abschluss am Call ergänzt
+    /// werden, ohne den geordneten Strom in Call/Result aufzuspalten.
+    export_tool_calls: HashMap<harw_types::ToolCallId, usize>,
+    /// Bereits als unvollständig markierte Calls; verhindert doppelte
+    /// Resume-/Abbruch-Resultate.
+    export_incomplete_tools: HashMap<harw_types::ToolCallId, ()>,
     /// `child_id` → die eine Verlaufszelle dieses Kindes.
     child_cells: HashMap<String, Arc<Mutex<SubAgentCell>>>,
 }
@@ -424,11 +437,54 @@ impl PermissionCycleStage {
 
 // ── Vollflächige Overlays (Schritt 6/7) ──────────────────────────────────────
 
+/// Format, das ein strukturierter `/export`-Marker für den anschließenden
+/// Renderer auswählt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExportOutputFormat {
+    Markdown,
+    Json,
+}
+
 /// Vollflächiges Overlay, das den normalen Eingabe-/Popup-Pfad ersetzt.
 ///
 /// # Beschreibung
 /// Analog zum `/command`-Popup, aber exklusiv: solange ein Overlay offen ist,
 /// gehen Tasten ausschließlich an das Overlay (siehe `handle_overlay_key`).
+/// Geteilter Zustand für "Provider-förmige" Auswahl-Overlays
+/// ([`Overlay::ProviderChoice`], [`Overlay::UiaProviderChoice`]).
+///
+/// `ids[i]` ist die kanonische Provider-ID der `i`-ten Zeile in `dialog` —
+/// getrennt vom Anzeigetext gehalten, statt aus dem Label zurückgeparst zu
+/// werden.
+#[derive(Debug)]
+struct ProviderChoiceState {
+    /// Kanonische Provider-IDs in derselben Reihenfolge wie die Optionen
+    /// des Dialogs.
+    ids: Vec<String>,
+    /// Der eigentliche Auswahldialog (Titel, Optionen, Markierung).
+    dialog: ChoiceDialog,
+}
+
+/// Geteilter Zustand für "Modell-förmige" Auswahl-Overlays
+/// ([`Overlay::ModelChoice`], [`Overlay::UiaModelChoice`]).
+#[derive(Debug)]
+struct ModelChoiceState {
+    /// Kanonische Provider-ID, auf die der Katalog gefiltert wurde.
+    provider: String,
+    /// Kanonische Modell-IDs in derselben Reihenfolge wie die Optionen
+    /// des Dialogs.
+    ids: Vec<String>,
+    /// Der eigentliche Auswahldialog.
+    dialog: ChoiceDialog,
+    /// `true`, wenn diese Auswahl die zweite Stufe von `/provider` ist
+    /// (Enter emittiert `/provider switch <provider> <model>`); `false`
+    /// für die direkte `/model`-Auswahl (Enter emittiert
+    /// `/model switch <model>`) und immer `false` für
+    /// [`Overlay::UiaModelChoice`] (die UIA-Pin-Auswahl kennt keinen
+    /// kombinierten Zwischenschritt).
+    combined: bool,
+}
+
 #[derive(Debug)]
 enum Overlay {
     /// `/resume` ohne Argument öffnet eine filterbare Liste vergangener
@@ -438,34 +494,20 @@ enum Overlay {
     /// (Contract „Nachträgliche Entscheidungen", Slice E1).
     ExportChoice(ChoiceDialog),
     /// `/provider` ohne Argument öffnet die interaktive Provider-Auswahl.
-    ///
-    /// `ids[i]` ist die kanonische Provider-ID der `i`-ten Zeile in `dialog`
-    /// — getrennt vom Anzeigetext gehalten, statt aus dem Label
-    /// zurückgeparst zu werden.
-    ProviderChoice {
-        /// Kanonische Provider-IDs in derselben Reihenfolge wie die Optionen
-        /// des Dialogs.
-        ids: Vec<String>,
-        /// Der eigentliche Auswahldialog (Titel, Optionen, Markierung).
-        dialog: ChoiceDialog,
-    },
+    ProviderChoice(ProviderChoiceState),
     /// `/model` ohne Argument (oder die zweite Stufe nach einer
     /// Providerwahl, deren aktives Modell nicht kompatibel ist) öffnet die
     /// Modell-Auswahl, gefiltert auf `provider`.
-    ModelChoice {
-        /// Kanonische Provider-ID, auf die der Katalog gefiltert wurde.
-        provider: String,
-        /// Kanonische Modell-IDs in derselben Reihenfolge wie die Optionen
-        /// des Dialogs.
-        ids: Vec<String>,
-        /// Der eigentliche Auswahldialog.
-        dialog: ChoiceDialog,
-        /// `true`, wenn diese Auswahl die zweite Stufe von `/provider` ist
-        /// (Enter emittiert `/provider switch <provider> <model>`); `false`
-        /// für die direkte `/model`-Auswahl (Enter emittiert
-        /// `/model switch <model>`).
-        combined: bool,
-    },
+    ModelChoice(ModelChoiceState),
+    /// `/uia-provider` ohne Argument öffnet die interaktive Auswahl des
+    /// UIA-Pin-Providers (`config.harness.uia_provider`). Anders als
+    /// [`Overlay::ProviderChoice`] gibt es keine kombinierte Modell-Stufe:
+    /// die Kompatibilitätsprüfung bleibt ops-seitig.
+    UiaProviderChoice(ProviderChoiceState),
+    /// `/uia-model` ohne Argument öffnet die interaktive Auswahl des
+    /// UIA-Pin-Modells, gefiltert auf den aktuell gepinnten oder aktiven
+    /// Provider. `combined` ist hier immer `false`.
+    UiaModelChoice(ModelChoiceState),
 }
 
 /// Plan- und Ziel-Dienste, die der Renderer für [`PlanGraphCell`] und
@@ -696,6 +738,13 @@ pub struct ChatApp {
     /// Kooperativer Abbruchgriff für den gerade laufenden Turn. `Ctrl+C`
     /// löst ihn auch dann aus, wenn kein Freigabe-Dialog sichtbar ist.
     active_cancel: Option<CancelToken>,
+    /// Zeitpunkt, zu dem `Ctrl+C` zuletzt einen Abbruch angefordert hat,
+    /// solange dieser noch aussteht. Rein transienter Statuszeilen-Hinweis
+    /// (siehe [`render_viewport`]) — im Gegensatz zu `push_line` erzeugt das
+    /// KEINE dauerhafte Verlaufszeile. Wird beim Start eines neuen Turns
+    /// (`active_cancel` wird neu gesetzt) und beim Ende des laufenden Turns
+    /// (`active_cancel = None`) wieder gelöscht.
+    cancel_requested_at: Option<Instant>,
     /// Ein erstes Escape schließt nur Popup/History-Navigation; ein zweites
     /// Escape leert den Composer.
     escape_armed: bool,
@@ -804,6 +853,16 @@ pub struct ChatApp {
     /// abgeschlossenen Turn (Plan Schritt 7); wird beim ersten Gebrauch über
     /// `take()` konsumiert.
     title_job_context: Option<TitleJobContext>,
+    /// Startzeit des aktuellen TUI-/Resume-Laufs für Exportmetadaten.
+    export_started_at: Option<String>,
+    /// Zuletzt aus `SessionConfigured` bzw. der Laufzeit bekannte Modell-ID.
+    export_session_model: Option<String>,
+    /// Bekannte, nicht-sensitive Erweiterungsmetadaten des Laufs.
+    export_meta_extensions: ExportMetaExtensions,
+    /// Optionen/Format des letzten Marker-Exports, solange dessen Zielauswahl
+    /// geöffnet ist.
+    pending_export_options: Option<ExportOptions>,
+    pending_export_format: ExportOutputFormat,
 }
 
 /// Handgeschriebene `Debug`-Implementierung, da [`CommandAdapter`] (enthält
@@ -906,6 +965,7 @@ impl ChatApp {
             deferred_input: std::collections::VecDeque::new(),
             pending_turns: std::collections::VecDeque::new(),
             active_cancel: None,
+            cancel_requested_at: None,
             escape_armed: false,
             scroll: ChatScroll::new(),
             input_history,
@@ -936,6 +996,11 @@ impl ChatApp {
             export_entries: Vec::new(),
             session_title: None,
             title_job_context: None,
+            export_started_at: Some(export_timestamp_now()),
+            export_session_model: None,
+            export_meta_extensions: ExportMetaExtensions::new(),
+            pending_export_options: None,
+            pending_export_format: ExportOutputFormat::Markdown,
         }
     }
 
@@ -1096,6 +1161,15 @@ impl ChatApp {
         self.session_title = Some(title.into());
     }
 
+    /// Übernimmt ein im Session-Lifecycle bekannt gewordenes Modell für den
+    /// Exportkopf. Ein vorhandener, explizit gesetzter Wert bleibt erhalten.
+    fn set_export_session_model(&mut self, model: impl Into<String>) {
+        let model = model.into();
+        if !model.trim().is_empty() {
+            self.export_session_model = Some(model);
+        }
+    }
+
     /// Gibt den aktuellen Anzeigetitel der Sitzung zurück, falls bekannt.
     #[must_use]
     pub(crate) fn session_title(&self) -> Option<&str> {
@@ -1238,7 +1312,72 @@ impl ChatApp {
         }
 
         let dialog = ChoiceDialog::new("Provider wählen", None, options).with_selected(selected);
-        self.overlay = Some(Overlay::ProviderChoice { ids, dialog });
+        self.overlay = Some(Overlay::ProviderChoice(ProviderChoiceState { ids, dialog }));
+    }
+
+    /// Öffnet die interaktive Auswahl des UIA-Pin-Providers (`/uia-provider`
+    /// ohne Argument).
+    ///
+    /// # Beschreibung
+    /// Spiegelt [`Self::open_provider_choice`], markiert die aktive Zeile
+    /// aber bevorzugt anhand von `config.harness.uia_provider` (dem
+    /// bestehenden UIA-Pin aus `harw-config`), statt anhand des
+    /// `/provider switch`-Snapshots — der reflektiert nur die reguläre
+    /// Session, nicht den UIA-Pin. Ist `uia_provider` `None`, fällt die
+    /// Markierung auf dieselbe Live-Snapshot-Logik zurück wie
+    /// [`Self::open_provider_choice`]. Eine getroffene Wahl emittiert direkt
+    /// `/uia-provider switch <id>` — ohne die Provider/Modell-Kompatibilitäts-
+    /// Atomarität von [`Self::resolve_provider_choice`], da diese Prüfung
+    /// beim UIA-Pin ops-seitig erfolgt.
+    pub(crate) fn open_uia_provider_choice(&mut self) {
+        let Some(config) = self.resolved_config() else {
+            self.push_line(
+                Role::System,
+                "UIA-Provider-Auswahl nicht verfügbar: keine Konfiguration geladen.",
+            );
+            return;
+        };
+        if config.providers.is_empty() {
+            self.push_line(
+                Role::System,
+                "UIA-Provider-Auswahl nicht verfügbar: keine Provider konfiguriert.",
+            );
+            return;
+        }
+
+        let active = config
+            .harness
+            .uia_provider
+            .clone()
+            .or_else(|| self.active_or_default_provider(&config));
+
+        let mut providers: Vec<&harw_config::ProviderToml> = config.providers.values().collect();
+        providers.sort_by(|left, right| left.name.cmp(&right.name));
+
+        let mut ids = Vec::with_capacity(providers.len());
+        let mut options = Vec::with_capacity(providers.len());
+        let mut selected = 0usize;
+        for (index, provider) in providers.iter().enumerate() {
+            let is_active = active.as_deref() == Some(provider.name.as_str());
+            if is_active {
+                selected = index;
+            }
+            let marker = if is_active {
+                "aktiv"
+            } else if !provider.enabled {
+                "deaktiviert"
+            } else if provider.auth.is_none() && !provider.has_plaintext_secret() {
+                "Auth fehlt"
+            } else {
+                "bereit"
+            };
+            options.push(format!("{} [{marker}]", provider.name));
+            ids.push(provider.name.clone());
+        }
+
+        let dialog =
+            ChoiceDialog::new("UIA-Provider wählen", None, options).with_selected(selected);
+        self.overlay = Some(Overlay::UiaProviderChoice(ProviderChoiceState { ids, dialog }));
     }
 
     /// Löst eine getroffene Providerwahl auf (zweite Stufe von
@@ -1351,12 +1490,89 @@ impl ChatApp {
             options,
         )
         .with_selected(selected);
-        self.overlay = Some(Overlay::ModelChoice {
+        self.overlay = Some(Overlay::ModelChoice(ModelChoiceState {
             provider,
             ids,
             dialog,
             combined,
-        });
+        }));
+    }
+
+    /// Öffnet die interaktive Auswahl des UIA-Pin-Modells, gefiltert auf
+    /// `provider` (`/uia-model` ohne Argument).
+    ///
+    /// # Beschreibung
+    /// Spiegelt [`Self::open_model_choice`] (`combined` ist hier immer
+    /// `false` — die UIA-Pin-Auswahl kennt keinen kombinierten
+    /// Provider+Modell-Zwischenschritt), markiert die aktive Zeile aber
+    /// bevorzugt anhand von `config.harness.uia_model`, statt anhand des
+    /// Laufzeit-Snapshots. Ist `uia_model` `None`, fällt die Markierung auf
+    /// dieselbe Live-Snapshot-Logik zurück wie [`Self::open_model_choice`].
+    /// Eine getroffene Wahl emittiert `/uia-model switch <model>`.
+    ///
+    /// # Argumente
+    /// - `provider` (`String`): kanonische Provider-ID, auf die gefiltert wird
+    ///   (der aktuell gepinnte oder aktive Provider — vom Aufrufer bestimmt).
+    pub(crate) fn open_uia_model_choice(&mut self, provider: String) {
+        let Some(config) = self.resolved_config() else {
+            self.push_line(
+                Role::System,
+                "UIA-Modell-Auswahl nicht verfügbar: keine Konfiguration geladen.",
+            );
+            return;
+        };
+
+        let active_model = config
+            .harness
+            .uia_model
+            .clone()
+            .or_else(|| self.session_controller.snapshot().active_model);
+
+        let mut models: Vec<&harw_config::ModelToml> = config
+            .models
+            .values()
+            .filter(|model| {
+                Self::canonical_provider_name(&config, &model.provider) == Some(provider.as_str())
+            })
+            .collect();
+        models.sort_by(|left, right| left.id.cmp(&right.id));
+
+        if models.is_empty() {
+            self.push_line(
+                Role::System,
+                format!(
+                    "UIA-Modell-Auswahl nicht verfügbar: keine Modelle für Provider '{provider}' konfiguriert."
+                ),
+            );
+            return;
+        }
+
+        let mut ids = Vec::with_capacity(models.len());
+        let mut options = Vec::with_capacity(models.len());
+        let mut selected = 0usize;
+        for (index, model) in models.iter().enumerate() {
+            let is_active = active_model.as_deref() == Some(model.id.as_str());
+            if is_active {
+                selected = index;
+            }
+            let marker = if is_active { " [aktiv]" } else { "" };
+            let label = model.name.as_deref().unwrap_or(model.id.as_str());
+            options.push(format!("{label} ({}){marker}", model.id));
+            ids.push(model.id.clone());
+        }
+
+        let dialog = ChoiceDialog::new(
+            format!("UIA-Modell wählen ({provider})"),
+            None,
+            options,
+        )
+        .with_selected(selected);
+        self.overlay = Some(Overlay::UiaModelChoice(ModelChoiceState {
+            provider,
+            ids,
+            dialog,
+            combined: false,
+        }));
     }
 
     /// Gibt `true` zurück, wenn gerade ein Vollflächen-Overlay geöffnet ist.
@@ -1997,7 +2213,73 @@ fn visible_message_text(content: &[ContentPart]) -> String {
     visible
 }
 
+fn export_tool_result_value(result: &ToolCallResult) -> serde_json::Value {
+    serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({
+        "status": "error",
+        "message": "tool result could not be serialized",
+    }))
+}
+
+fn export_tool_status(result: &ToolCallResult) -> ExportStatus {
+    if result.is_success() {
+        ExportStatus::Success
+    } else {
+        ExportStatus::Error
+    }
+}
+
+fn export_tool_error(result: &ToolCallResult) -> Option<String> {
+    match result {
+        ToolCallResult::Success { .. } => None,
+        ToolCallResult::Error { message } => Some(message.clone()),
+    }
+}
+
+fn export_trust(trust: ResultTrust) -> String {
+    match trust {
+        ResultTrust::Untrusted => "untrusted".to_owned(),
+        ResultTrust::Runtime => "runtime".to_owned(),
+    }
+}
+
+fn export_tool_call_entry(
+    call_id: &harw_types::ToolCallId,
+    tool_name: &str,
+    arguments: serde_json::Value,
+) -> ExportEntry {
+    ExportEntry::ToolCall {
+        call_id: call_id.to_string(),
+        tool_name: tool_name.to_owned(),
+        arguments,
+        duration_ms: None,
+        trust: None,
+        agent: None,
+    }
+}
+
+fn export_tool_result_entry(
+    call_id: &harw_types::ToolCallId,
+    tool_name: Option<String>,
+    result: &ToolCallResult,
+    duration_ms: u64,
+    trust: Option<ResultTrust>,
+) -> ExportEntry {
+    ExportEntry::ToolResult {
+        call_id: call_id.to_string(),
+        tool_name,
+        result: export_tool_result_value(result),
+        status: export_tool_status(result),
+        error: export_tool_error(result),
+        duration_ms: Some(duration_ms),
+        trust: trust.map(export_trust),
+        agent: None,
+    }
+}
+
 fn hydrate_visible_history(app: &mut ChatApp, history: &ConversationHistory) {
+    let mut tool_cells: HashMap<harw_types::ToolCallId, SharedToolCell> = HashMap::new();
+    let mut tool_export_indices: HashMap<harw_types::ToolCallId, usize> = HashMap::new();
+    let mut tool_export_order: Vec<harw_types::ToolCallId> = Vec::new();
     for item in history.items() {
         match item {
             TurnItem::UserMessage(message) => {
@@ -2006,12 +2288,182 @@ fn hydrate_visible_history(app: &mut ChatApp, history: &ConversationHistory) {
             TurnItem::AssistantMessage(message) => {
                 app.push_line(Role::Assistant, visible_message_text(&message.content));
             }
-            TurnItem::ToolCall(_) => app.push_line(Role::System, "[tool call]"),
-            TurnItem::ToolResult(_) => app.push_line(Role::System, "[tool result]"),
-            TurnItem::Reasoning(_) => app.push_line(Role::System, "[reasoning]"),
-            TurnItem::Error(_) => app.push_line(Role::System, "[error]"),
+            TurnItem::ToolCall(call_item) => {
+                let call = ToolCall {
+                    id: call_item.call_id.clone(),
+                    name: ToolName::new(call_item.tool_name.clone()),
+                    arguments: call_item.arguments.clone(),
+                };
+                match tool_cells.get(&call_item.call_id) {
+                    Some(cell) => {
+                        if let Ok(mut guard) = cell.lock() {
+                            guard.resume_call(&call);
+                            if let Some(index) = tool_export_indices.get(&call_item.call_id)
+                                && let Some(ExportEntry::ToolCall {
+                                    tool_name,
+                                    arguments,
+                                    ..
+                                }) = app.export_entries.get_mut(*index)
+                            {
+                                *tool_name = call_item.tool_name.clone();
+                                *arguments = call_item.arguments.clone();
+                            }
+                        }
+                    }
+                    None => {
+                        let cell = Arc::new(Mutex::new(ToolCell::started(&call)));
+                        tool_cells.insert(call_item.call_id.clone(), Arc::clone(&cell));
+                        app.append_tool_cell(call_item.tool_name.as_str(), Arc::clone(&cell));
+                        app.export_entries.push(export_tool_call_entry(
+                            &call_item.call_id,
+                            &call_item.tool_name,
+                            call_item.arguments.clone(),
+                        ));
+                        tool_export_order.push(call_item.call_id.clone());
+                        tool_export_indices.insert(
+                            call_item.call_id.clone(),
+                            app.export_entries.len().saturating_sub(1),
+                        );
+                    }
+                }
+            }
+            TurnItem::ToolResult(result_item) => {
+                let cell = match tool_cells.get(&result_item.call_id) {
+                    Some(cell) => Arc::clone(cell),
+                    None => {
+                        let call = ToolCall {
+                            id: result_item.call_id.clone(),
+                            name: ToolName::new("tool.result"),
+                            arguments: serde_json::json!({
+                                "call_id": result_item.call_id.to_string(),
+                                "orphaned": true,
+                            }),
+                        };
+                        let cell = Arc::new(Mutex::new(ToolCell::started(&call)));
+                        tool_cells.insert(result_item.call_id.clone(), Arc::clone(&cell));
+                        app.append_tool_cell("tool.result", Arc::clone(&cell));
+                        app.export_entries.push(export_tool_call_entry(
+                            &result_item.call_id,
+                            "tool.result",
+                            serde_json::json!({
+                                "call_id": result_item.call_id.to_string(),
+                                "orphaned": true,
+                            }),
+                        ));
+                        tool_export_order.push(result_item.call_id.clone());
+                        tool_export_indices.insert(
+                            result_item.call_id.clone(),
+                            app.export_entries.len().saturating_sub(1),
+                        );
+                        cell
+                    }
+                };
+                if let Ok(mut guard) = cell.lock() {
+                    guard.complete(&result_item.result, result_item.duration_ms);
+                    if let Some(index) = tool_export_indices.get(&result_item.call_id)
+                        && let Some(ExportEntry::ToolCall { duration_ms, trust, .. }) =
+                            app.export_entries.get_mut(*index)
+                    {
+                        *duration_ms = Some(result_item.duration_ms);
+                        *trust = Some(export_trust(result_item.trust));
+                    }
+                    let tool_name = match tool_export_indices
+                        .get(&result_item.call_id)
+                        .and_then(|index| app.export_entries.get(*index))
+                    {
+                        Some(ExportEntry::ToolCall { tool_name, .. }) => Some(tool_name.clone()),
+                        _ => None,
+                    };
+                    app.export_entries.push(export_tool_result_entry(
+                        &result_item.call_id,
+                        tool_name,
+                        &result_item.result,
+                        result_item.duration_ms,
+                        Some(result_item.trust),
+                    ));
+                }
+            }
+            TurnItem::Reasoning(reasoning) => {
+                let summary = reasoning.summary_text.join(" ");
+                if !summary.trim().is_empty() {
+                    app.export_entries.push(ExportEntry::Reasoning(summary.clone()));
+                    app.push_cell(Box::new(ReasoningHistoryCell { summary }));
+                }
+            }
+            TurnItem::Error(error) => {
+                app.push_line(Role::System, format!("⚠ {}", error.message));
+                app.export_entries.push(ExportEntry::Error(ExportErrorEntry {
+                    code: Some(if error.retryable {
+                        "retryable".to_owned()
+                    } else {
+                        "error".to_owned()
+                    }),
+                    message: error.message.clone(),
+                    details: Some(serde_json::json!({ "retryable": error.retryable })),
+                    agent: None,
+                }));
+            }
         }
     }
+
+    // Persistierte Aufrufe ohne Result bleiben sichtbar, aber werden nicht als
+    // erfolgreich ausgegeben. Das ist insbesondere bei abgebrochenen Turns
+    // nach einem Prozess- oder Agentenabbruch wichtig.
+    for call_id in &tool_export_order {
+        let Some(cell) = tool_cells.get(call_id) else {
+            continue;
+        };
+        if let Ok(mut guard) = cell.lock() {
+            if guard.state == ToolState::Running {
+                guard.mark_incomplete();
+                if let Some(index) = tool_export_indices.get(call_id)
+                    && let Some(ExportEntry::ToolCall { tool_name, .. }) =
+                        app.export_entries.get(*index)
+                {
+                    app.export_entries.push(export_tool_result_entry(
+                        call_id,
+                        Some(tool_name.clone()),
+                        &ToolCallResult::error("unvollständig (Resume-Abbruch)"),
+                        0,
+                        Some(ResultTrust::Runtime),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn incident_hint(error: &TuiError, provider_error_streak: u32) -> Option<&'static str> {
+    let TuiError::Core(message) = error else {
+        return None;
+    };
+    let message = message.to_ascii_lowercase();
+    let provider_error = [
+        "provider", "model", "rate limit", "429", "timeout", "timed out",
+        "connection", "http",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle));
+    if provider_error && provider_error_streak >= 2 {
+        return Some("Hinweis: Wiederholter Providerfehler. Mit /bug-report kannst du einen Incident melden.");
+    }
+    if ["panic", "panicked", "thread '"].iter().any(|needle| message.contains(needle)) {
+        return Some("Hinweis: Panikhinweis erkannt. Mit /bug-report kannst du einen Incident melden.");
+    }
+    if ["agent", "child"].iter().any(|needle| message.contains(needle))
+        && ["killed", "terminated", "aborted", "cancelled", "canceled"]
+            .iter()
+            .any(|needle| message.contains(needle))
+    {
+        return Some("Hinweis: Ein Agent wurde beendet. Mit /bug-report kannst du einen Incident melden.");
+    }
+    if ["lock contention", "contention", "deadlock", "lock poisoned"]
+        .iter()
+        .any(|needle| message.contains(needle))
+    {
+        return Some("Hinweis: Lock-Contention erkannt. Mit /bug-report kannst du einen Incident melden.");
+    }
+    None
 }
 
 pub(crate) fn install_loaded_history(
@@ -2143,6 +2595,7 @@ pub(crate) async fn run_loop(
 
     let mut pending_quit: Option<QuitArm> = None;
     let mut spinner = Spinner::new();
+    let mut provider_error_streak = 0_u32;
 
     loop {
         // Eine während des vorherigen Turns abgeschickte Eingabe hat Vorrang.
@@ -2248,6 +2701,47 @@ pub(crate) async fn run_loop(
                             frame_req.schedule_frame();
                             continue;
                         }
+                        // `/uia-provider`/`/uia-model` ohne Argument öffnen
+                        // dieselbe interaktive Auswahl wie `/provider`/
+                        // `/model`, pinnen aber den UIA-Worker statt der
+                        // aktiven Session (Ops-Handler dafür werden parallel
+                        // in `harw-ops` ergänzt; bis dahin ist die
+                        // emittierte `/uia-provider switch`/`/uia-model
+                        // switch`-Zeile ein erwarteter "unbekannter Befehl").
+                        if is_bare_command(&raw, "/uia-provider") {
+                            app.open_uia_provider_choice();
+                            frame_req.schedule_frame();
+                            continue;
+                        }
+                        if is_bare_command(&raw, "/uia-model") {
+                            match app.resolved_config() {
+                                // Der UIA-Pin-Provider hat Vorrang vor dem
+                                // regulären aktiven/Standard-Provider, damit
+                                // die Modell-Liste zum tatsächlich gepinnten
+                                // Provider passt.
+                                Some(config) => {
+                                    let provider = config
+                                        .harness
+                                        .uia_provider
+                                        .clone()
+                                        .or_else(|| app.active_or_default_provider(&config));
+                                    match provider {
+                                        Some(provider) => app.open_uia_model_choice(provider),
+                                        None => app.push_line(
+                                            Role::System,
+                                            "UIA-Modell-Auswahl nicht verfügbar: kein UIA-Pin-, \
+                                             aktiver oder Standard-Provider bekannt.",
+                                        ),
+                                    }
+                                }
+                                None => app.push_line(
+                                    Role::System,
+                                    "UIA-Modell-Auswahl nicht verfügbar: keine Konfiguration geladen.",
+                                ),
+                            }
+                            frame_req.schedule_frame();
+                            continue;
+                        }
                         // `/tools` — handled locally via `tools_command` module;
                         // does NOT go through the Operation-Adapter pipeline so
                         // that it can mutate the session's `SessionActivation`
@@ -2314,7 +2808,7 @@ pub(crate) async fn run_loop(
                             // frühere Not-available-Stub erreichbar. Der gekürzte Verlauf
                             // wird sofort persistiert, damit ein anschließendes `/resume`
                             // denselben Kontext erhält.
-                            let output = if raw.trim() == "/compact" {
+                            let (output, output_data) = if raw.trim() == "/compact" {
                                 let (session, store, model) = gateway.borrow_turn_ctx();
                                 let context_window_tokens = session
                                     .auto_compact()
@@ -2325,7 +2819,7 @@ pub(crate) async fn run_loop(
                                     session.compaction_summary_model();
                                 plan.summary_provider = summary_provider.cloned();
                                 plan.summary_model = summary_model.cloned();
-                                match compact_session(session, model, &plan, None).await {
+                                let output = match compact_session(session, model, &plan, None).await {
                                     Ok(outcome) => {
                                         if let Err(error) =
                                             store.save_history(session.id(), session.history()).await
@@ -2350,7 +2844,8 @@ pub(crate) async fn run_loop(
                                         )
                                     }
                                     Err(error) => format!("Verdichtung fehlgeschlagen: {error}"),
-                                }
+                                };
+                                (output, None)
                             } else {
                             // `/command`-Zeile asynchron über die Operation-Adapter-
                             // Pipeline ausführen; identischer Render-/Redraw-Pfad wie
@@ -2358,23 +2853,42 @@ pub(crate) async fn run_loop(
                             // aufteilen). Berechtigungsstufe und Slash-Dienste
                             // stammen aus der Runtime-Montage; die Dienste werden
                             // erst nach erfolgreicher Admission gebaut.
-                            match app.runtime() {
-                                Some(rt) => {
-                                    execute_command_as(
-                                        app.adapters(),
-                                        app.sandbox(),
-                                        app.session_id(),
-                                        runtime_commands::caller_tier(rt.principal()),
-                                        &raw,
-                                        || runtime_commands::slash_service_map(rt.services()),
-                                    )
-                                    .await
+                                match app.runtime() {
+                                    Some(rt) => {
+                                        let caller_tier = runtime_commands::caller_tier(rt.principal());
+                                        match execute_export_command_with_data(
+                                            app.adapters(),
+                                            app.sandbox(),
+                                            app.session_id(),
+                                            caller_tier,
+                                            &raw,
+                                            || runtime_commands::slash_service_map(rt.services()),
+                                        )
+                                        .await
+                                        {
+                                            Some(Ok(output)) => (output.text, output.data),
+                                            Some(Err(error)) => (error, None),
+                                            None => (
+                                                execute_command_as(
+                                                    app.adapters(),
+                                                    app.sandbox(),
+                                                    app.session_id(),
+                                                    caller_tier,
+                                                    &raw,
+                                                    || runtime_commands::slash_service_map(
+                                                        rt.services(),
+                                                    ),
+                                                )
+                                                .await,
+                                                None,
+                                            ),
+                                        }
+                                    }
+                                    None => {
+                                        tracing::error!("tui.command.no_runtime_assembly");
+                                        ("Fehler: keine Runtime-Montage".to_owned(), None)
+                                    }
                                 }
-                                None => {
-                                    tracing::error!("tui.command.no_runtime_assembly");
-                                    "Fehler: keine Runtime-Montage".to_owned()
-                                }
-                            }
                             };
                             let lines: Vec<Line<'static>> = output
                                 .split('\n')
@@ -2395,30 +2909,12 @@ pub(crate) async fn run_loop(
                             }
                             // `/export`: bei `--datei <pfad>` direkt schreiben,
                             // sonst die Zielauswahl öffnen (Slice E1).
-                            if let Some(request) = export_request_for_command(&raw) {
-                                match request.path {
-                                    Some(path) => {
-                                        let opts = ExportOptions {
-                                            include_tool_calls: request.include_tool_calls,
-                                            ..ExportOptions::default()
-                                        };
-                                        let markdown = build_export_markdown(app, &opts);
-                                        match export::write_export(
-                                            std::path::Path::new(&path),
-                                            &markdown,
-                                        ) {
-                                            Ok(()) => app.push_line(
-                                                Role::System,
-                                                format!("Export gespeichert: {path}"),
-                                            ),
-                                            Err(error) => app.push_line(
-                                                Role::System,
-                                                format!("Export fehlgeschlagen: {error}"),
-                                            ),
-                                        }
-                                    }
-                                    None => app.open_export_choice(),
-                                }
+                            if let Some(request) = output_data
+                                .as_ref()
+                                .and_then(export_request_from_data)
+                                .or_else(|| export_request_for_command(&raw))
+                            {
+                                resolve_export_request(app, &request);
                             }
                             frame_req.schedule_frame();
                         }
@@ -2509,7 +3005,14 @@ pub(crate) async fn run_loop(
         )
         .await
         {
-            match error {
+            let provider_error = matches!(
+                &error,
+                TuiError::Core(message)
+                    if ["provider", "model", "rate limit", "429", "timeout", "timed out", "connection", "http"]
+                        .iter()
+                        .any(|needle| message.to_ascii_lowercase().contains(needle))
+            );
+            match &error {
                 TuiError::Io(_) => return Err(error),
                 // Die Registrierung von Kontextanbietern geschieht beim
                 // Aufbau der Sitzung, lange vor dieser Schleife -- die
@@ -2526,8 +3029,18 @@ pub(crate) async fn run_loop(
                     // sicherstellen, dass der Spinner nicht hängen bleibt.
                     spinner.stop();
                     app.push_line(Role::System, format!("⚠ {error}"));
+                    provider_error_streak = if provider_error {
+                        provider_error_streak.saturating_add(1)
+                    } else {
+                        0
+                    };
+                    if let Some(hint) = incident_hint(&error, provider_error_streak) {
+                        app.push_line(Role::System, hint);
+                    }
                 }
             }
+        } else {
+            provider_error_streak = 0;
         }
         frame_req.schedule_frame();
     }
@@ -2617,10 +3130,31 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             let already_known = state.pending_tool_cells.contains_key(&call_id);
             let call = ToolCall {
                 id: call_id.clone(),
-                name: ToolName::new(tool_name),
-                arguments,
+                name: ToolName::new(tool_name.clone()),
+                arguments: arguments.clone(),
             };
-            ensure_tool_cell(app, state, call_id, &call);
+            ensure_tool_cell(app, state, call_id.clone(), &call);
+            if let Some(index) = state.export_tool_calls.get(&call_id).copied() {
+                if let Some(ExportEntry::ToolCall {
+                    tool_name: exported_name,
+                    arguments: exported_arguments,
+                    ..
+                }) = app.export_entries.get_mut(index)
+                {
+                    *exported_name = tool_name;
+                    *exported_arguments = arguments;
+                }
+            } else {
+                app.export_entries.push(export_tool_call_entry(
+                    &call_id,
+                    call.name.as_str(),
+                    call.arguments.clone(),
+                ));
+                state.export_tool_calls.insert(
+                    call_id.clone(),
+                    app.export_entries.len().saturating_sub(1),
+                );
+            }
             // Bereits während einer Freigabefrage angelegt (Wettlauf zwischen
             // den beiden Kanälen, siehe `ensure_tool_cell`-Doku): kein neuer
             // sichtbarer Zustand, kein Redraw nötig.
@@ -2632,17 +3166,59 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             duration_ms,
             ..
         } => {
-            let Some(cell) = state.pending_tool_cells.get(&call_id).cloned() else {
-                tracing::warn!(call_id = %call_id, "tui.tool_cell.completed_without_request");
-                return false;
+            let cell = match state.pending_tool_cells.get(&call_id).cloned() {
+                Some(cell) => cell,
+                None => {
+                    tracing::warn!(call_id = %call_id, "tui.tool_cell.completed_without_request");
+                    let orphan = ToolCall {
+                        id: call_id.clone(),
+                        name: ToolName::new("tool.result"),
+                        arguments: serde_json::json!({
+                            "call_id": call_id.to_string(),
+                            "orphaned": true,
+                        }),
+                    };
+                    let cell = Arc::new(Mutex::new(ToolCell::started(&orphan)));
+                    state.pending_tool_cells.insert(call_id.clone(), Arc::clone(&cell));
+                    app.append_tool_cell("tool.result", Arc::clone(&cell));
+                    cell
+                }
             };
+            let tool_name = state
+                .export_tool_calls
+                .get(&call_id)
+                .and_then(|index| app.export_entries.get(*index))
+                .and_then(|entry| match entry {
+                    ExportEntry::ToolCall { tool_name, .. } => Some(tool_name.clone()),
+                    _ => None,
+                });
+            if !state.export_tool_calls.contains_key(&call_id) {
+                app.export_entries.push(export_tool_call_entry(
+                    &call_id,
+                    tool_name.as_deref().unwrap_or("tool.result"),
+                    serde_json::json!({ "call_id": call_id.to_string(), "orphaned": true }),
+                ));
+                state.export_tool_calls.insert(
+                    call_id.clone(),
+                    app.export_entries.len().saturating_sub(1),
+                );
+            }
+            if let Some(index) = state.export_tool_calls.get(&call_id).copied()
+                && let Some(ExportEntry::ToolCall { duration_ms: call_duration, .. }) =
+                    app.export_entries.get_mut(index)
+            {
+                *call_duration = Some(duration_ms);
+            }
             let export_entry = match cell.lock() {
                 Ok(mut guard) => {
                     guard.complete(&result, duration_ms);
-                    Some(ExportEntry::Tool {
-                        label: guard.label.clone(),
-                        summary: guard.summary.clone(),
-                    })
+                    Some(export_tool_result_entry(
+                        &call_id,
+                        tool_name,
+                        &result,
+                        duration_ms,
+                        None,
+                    ))
                 }
                 Err(_) => {
                     tracing::error!(call_id = %call_id, "tui.tool_cell.lock_poisoned");
@@ -2667,6 +3243,19 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             app.push_cell(Box::new(ReasoningHistoryCell { summary }));
             true
         }
+        TurnEvent::ItemAdded {
+            item: TurnItem::Error(error),
+            ..
+        } => {
+            app.export_entries.push(ExportEntry::Error(ExportErrorEntry {
+                code: Some("item_error".to_owned()),
+                message: error.message.clone(),
+                details: Some(serde_json::json!({ "retryable": error.retryable })),
+                agent: None,
+            }));
+            app.push_line(Role::System, format!("⚠ {}", error.message));
+            true
+        }
         TurnEvent::ChildSpawned {
             child,
             role,
@@ -2677,8 +3266,8 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             let child_id = child.as_str().to_owned();
             let cell = Arc::new(Mutex::new(SubAgentCell {
                 child_id: child_id.clone(),
-                role,
-                question,
+                role: role.clone(),
+                question: question.clone(),
                 tool_calls: 0,
                 tokens: 0,
                 status: SubAgentStatus::Running,
@@ -2686,6 +3275,13 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             state
                 .child_cells
                 .insert(child_id.clone(), Arc::clone(&cell));
+            app.export_entries.push(ExportEntry::Agent(ExportAgentEntry {
+                agent_id: child_id.clone(),
+                role: Some(role.clone()),
+                parent_id: None,
+                status: Some("running".to_owned()),
+                summary: question.clone(),
+            }));
             app.push_shared_cell(cell);
             tracing::debug!(child = %child_id, "tui.child_cell.created");
             true
@@ -2695,17 +3291,41 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             tool_calls,
             tokens,
             ..
-        } => state.update_child(child.as_str(), |cell| {
-            cell.apply_progress(tool_calls, tokens);
-        }),
+        } => {
+            let updated = state.update_child(child.as_str(), |cell| {
+                cell.apply_progress(tool_calls, tokens);
+            });
+            if updated {
+                app.export_entries.push(ExportEntry::Agent(ExportAgentEntry {
+                    agent_id: child.as_str().to_owned(),
+                    role: None,
+                    parent_id: None,
+                    status: Some("running".to_owned()),
+                    summary: Some(format!("{tool_calls} Tool-Aufrufe, {tokens} Tokens")),
+                }));
+            }
+            updated
+        }
         TurnEvent::ChildCompleted {
             child,
             outcome,
             duration_ms,
             ..
-        } => state.update_child(child.as_str(), |cell| {
-            cell.apply_completion(outcome, duration_ms);
-        }),
+        } => {
+            let updated = state.update_child(child.as_str(), |cell| {
+                cell.apply_completion(outcome.clone(), duration_ms);
+            });
+            if updated {
+                app.export_entries.push(ExportEntry::Agent(ExportAgentEntry {
+                    agent_id: child.as_str().to_owned(),
+                    role: None,
+                    parent_id: None,
+                    status: Some(outcome),
+                    summary: Some(format!("Dauer: {duration_ms} ms")),
+                }));
+            }
+            updated
+        }
         TurnEvent::PlanUpdated {
             plan_id,
             revision,
@@ -2720,6 +3340,18 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             match current_plan {
                 Some(Ok(plan)) => {
                     app.close_tool_group();
+                    // Der Graph wird sichtbar über `push_cell` gezeigt, aber
+                    // `/export` liest ausschließlich aus `export_entries` mit —
+                    // ohne diesen Push würde der häufigste Fall (Plan-Dienste
+                    // vorhanden, Plan lesbar) beim Export komplett fehlen.
+                    app.export_entries.push(ExportEntry::Plan(ExportPlanEntry {
+                        plan_id: Some(plan_id.clone()),
+                        revision: Some(revision),
+                        summary: summary.clone(),
+                        steps: Vec::new(),
+                        status: None,
+                        agent: None,
+                    }));
                     app.push_cell(Box::new(PlanGraphCell { plan }));
                 }
                 Some(Err(error)) => {
@@ -2733,6 +3365,14 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                         Role::System,
                         format!("Plan {plan_id} @{revision}: {summary} (Plan nicht lesbar)"),
                     );
+                    app.export_entries.push(ExportEntry::Plan(ExportPlanEntry {
+                        plan_id: Some(plan_id.clone()),
+                        revision: Some(revision),
+                        summary: format!("{summary} (Plan nicht lesbar: {error})"),
+                        steps: Vec::new(),
+                        status: None,
+                        agent: None,
+                    }));
                 }
                 // Keine Plan-Dienste durchgereicht: die Information geht nicht
                 // verloren, sie wird nur einzeilig statt als Graph gezeigt.
@@ -2741,6 +3381,14 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                         Role::System,
                         format!("Plan {plan_id} @{revision}: {summary}"),
                     );
+                    app.export_entries.push(ExportEntry::Plan(ExportPlanEntry {
+                        plan_id: Some(plan_id),
+                        revision: Some(revision),
+                        summary,
+                        steps: Vec::new(),
+                        status: None,
+                        agent: None,
+                    }));
                 }
             }
             true
@@ -2820,11 +3468,76 @@ fn is_goal_check_command(raw: &str) -> bool {
 
 /// Eine erkannte `/export`-Anfrage.
 struct ExportRequest {
+    /// Kanonisches Ausgabeformat aus dem Operation-Marker.
+    format: ExportOutputFormat,
     /// `--tools`: Werkzeugaufrufe im Export einschließen.
     include_tool_calls: bool,
+    /// Sichere Reasoning-Summaries einschließen.
+    include_reasoning_summary: bool,
     /// `--datei <pfad>`: `Some(pfad)` überspringt die Auswahl und schreibt
     /// direkt dorthin; `None` öffnet [`Overlay::ExportChoice`].
     path: Option<String>,
+}
+
+/// Führt den strukturierten `/export`-Command bis zum `OpOutput` aus.
+///
+/// `execute_command_as` liefert aus Kompatibilitätsgründen nur den
+/// Anzeigetext zurück. Für `/export` muss die TUI zusätzlich `data` behalten;
+/// deshalb wird hier ausschließlich dieser eine Command über dieselbe
+/// Registry-/Admission-/Adapter-Pipeline ausgeführt. Für alle anderen Commands
+/// gibt die Funktion `None` zurück, sodass der bestehende Pfad unverändert
+/// verwendet werden kann.
+async fn execute_export_command_with_data<F>(
+    adapters: &[CommandAdapter],
+    sandbox: &SandboxSpec,
+    session_id: &SessionId,
+    caller_tier: crate::PermissionTier,
+    raw_line: &str,
+    services: F,
+) -> Option<Result<OpOutput, String>>
+where
+    F: FnOnce() -> harw_operations::ServiceMap,
+{
+    let invocation = crate::classify_input(raw_line).ok()?;
+    let Invocation::Command { name, .. } = &invocation else {
+        return None;
+    };
+    if name != "export" {
+        return None;
+    }
+
+    let registry = CommandRegistry::from_command_adapters(adapters);
+    let action = match registry.dispatch(
+        DispatchContext {
+            caller_tier,
+            surface: InvocationSurface::Tui,
+            capabilities: CapabilitySet::with(ShellCapability::CommandsShell),
+        },
+        invocation,
+    ) {
+        Ok(action) => action,
+        Err(error) => return Some(Err(format!("Eingabe abgelehnt: {error}"))),
+    };
+
+    let CommandAction::Command(spec, raw_args) = action else {
+        return Some(Err("Eingabe abgelehnt: /export ist kein ausführbarer Command.".to_owned()));
+    };
+    let path = format!("/{}", spec.name.as_str());
+    let Some(adapter) = adapters.iter().find(|adapter| adapter.path() == path) else {
+        return Some(Err(format!("Unbekannter Command: /{}", spec.name.as_str())));
+    };
+    let ctx = harw_operations::OpContext::new(
+        session_id.clone(),
+        harw_types::TurnId::new(),
+        sandbox.clone(),
+        services(),
+    );
+    Some(
+        adapter
+            .dispatch(&ctx, raw_args)
+            .await
+            .map_err(|error| format!("Fehler: {error}")),
+    )
 }
 
 /// Erkennt `/export [--tools] [--datei <pfad>]` in der rohen Befehlszeile.
@@ -2855,7 +3568,9 @@ fn export_request_for_command(raw: &str) -> Option<ExportRequest> {
     }
     let tail: Vec<String> = tokens.collect();
 
-    let mut include_tool_calls = false;
+    let mut include_tool_calls = true;
+    let mut include_reasoning_summary = false;
+    let mut format = ExportOutputFormat::Markdown;
     let mut path = None;
     let mut index = 0;
     while index < tail.len() {
@@ -2869,12 +3584,34 @@ fn export_request_for_command(raw: &str) -> Option<ExportRequest> {
                     // Fehlender Pfad: der reguläre Dispatch meldet den Fehler
                     // über `OpError::InvalidArguments`; hier keine Auswahl öffnen.
                     return Some(ExportRequest {
+                        format,
                         include_tool_calls,
+                        include_reasoning_summary,
                         path: None,
                     });
                 };
                 path = Some(value.clone());
                 index += 2;
+            }
+            "--format" => {
+                if let Some(value) = tail.get(index + 1) {
+                    format = match value.as_str() {
+                        "json" => ExportOutputFormat::Json,
+                        "md" | "markdown" => ExportOutputFormat::Markdown,
+                        _ => format,
+                    };
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            "--no-tools" => {
+                include_tool_calls = false;
+                index += 1;
+            }
+            "--reasoning-summary" => {
+                include_reasoning_summary = true;
+                index += 1;
             }
             _ => {
                 // Unbekanntes Token: der reguläre Dispatch meldet den Fehler.
@@ -2883,7 +3620,48 @@ fn export_request_for_command(raw: &str) -> Option<ExportRequest> {
         }
     }
     Some(ExportRequest {
+        format,
         include_tool_calls,
+        include_reasoning_summary,
+        path,
+    })
+}
+
+/// Liest den kanonischen `export.request`-Marker aus `OpOutput.data`.
+///
+/// Fehlende optionale Felder werden auf die Vertragsdefaults gesetzt. Ein
+/// falscher Feldtyp oder ein unbekanntes Format verwirft den Marker; der
+/// Aufrufer kann dann den Legacy-Fallback über die Rohzeile verwenden.
+fn export_request_from_data(data: &serde_json::Value) -> Option<ExportRequest> {
+    let object = data.as_object()?;
+    if object.get("kind").and_then(serde_json::Value::as_str) != Some("export.request") {
+        return None;
+    }
+    let format = match object
+        .get("format")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("markdown")
+    {
+        "json" => ExportOutputFormat::Json,
+        "md" | "markdown" => ExportOutputFormat::Markdown,
+        _ => return None,
+    };
+    let include_tool_calls = match object.get("include_tool_calls") {
+        None => true,
+        Some(value) => value.as_bool()?,
+    };
+    let include_reasoning_summary = match object.get("include_reasoning_summary") {
+        None => false,
+        Some(value) => value.as_bool()?,
+    };
+    let path = match object.get("path") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(value.as_str()?.to_owned()),
+    };
+    Some(ExportRequest {
+        format,
+        include_tool_calls,
+        include_reasoning_summary,
         path,
     })
 }
@@ -2917,19 +3695,82 @@ fn export_timestamp_now() -> String {
 /// # Argumente
 /// - `app` (`&ChatApp`): liefert Titel, Projekt-Root, Session-ID und Verlauf.
 /// - `opts` (`&ExportOptions`): Inhaltsauswahl (siehe [`export_request_for_command`]).
-fn build_export_markdown(app: &ChatApp, opts: &ExportOptions) -> String {
+fn build_export(app: &ChatApp, opts: &ExportOptions, format: ExportOutputFormat) -> String {
+    let controller = SessionController::snapshot(app.session_controller.as_ref());
+    let config = app.resolved_config();
+    let provider = controller
+        .active_provider
+        .or_else(|| config.as_ref().and_then(|config| config.harness.default_provider.clone()));
+    let model = controller
+        .active_model
+        .or_else(|| app.export_session_model.clone())
+        .or_else(|| config.as_ref().and_then(|config| config.harness.default_model.clone()));
+    let model = match (provider, model) {
+        (Some(provider), Some(model)) => Some(format!("{provider}/{model}")),
+        (None, Some(model)) => Some(model),
+        (Some(provider), None) => Some(provider),
+        (None, None) => None,
+    };
     let meta = ExportMeta {
         title: app.session_title().map(str::to_owned),
         session_id: app.session_id().to_string(),
-        started_at: None,
+        started_at: app.export_started_at.clone(),
         cwd: if app.project_root().is_empty() {
             None
         } else {
             Some(app.project_root().to_owned())
         },
-        model: None,
+        model,
     };
-    export::render_markdown(&meta, &app.export_entries, opts)
+    match format {
+        ExportOutputFormat::Markdown => export::render_markdown_with_extensions(
+            &meta,
+            &app.export_entries,
+            opts,
+            &app.export_meta_extensions,
+        ),
+        ExportOutputFormat::Json => export::render_json_with_extensions(
+            &meta,
+            &app.export_entries,
+            opts,
+            &app.export_meta_extensions,
+        ),
+    }
+}
+
+fn build_export_markdown(app: &ChatApp, opts: &ExportOptions) -> String {
+    build_export(app, opts, ExportOutputFormat::Markdown)
+}
+
+/// Führt eine erkannte Exportanfrage mit genau deren Format und Optionen aus.
+///
+/// Bei einem Datei-Export wird der von `write_export_path` tatsächlich
+/// gewählte Pfad gemeldet; dadurch bleibt auch ein Kollisionssuffix (`-2`, …)
+/// in der Erfolgsmeldung sichtbar.
+fn resolve_export_request(app: &mut ChatApp, request: &ExportRequest) {
+    let opts = ExportOptions {
+        include_tool_calls: request.include_tool_calls,
+        include_reasoning: request.include_reasoning_summary,
+        ..ExportOptions::default()
+    };
+    if let Some(path) = request.path.as_deref() {
+        app.pending_export_options = None;
+        let content = build_export(app, &opts, request.format);
+        match export::write_export_path(std::path::Path::new(path), &content) {
+            Ok(written_path) => app.push_line(
+                Role::System,
+                format!("Export gespeichert: {}", written_path.display()),
+            ),
+            Err(error) => app.push_line(
+                Role::System,
+                format!("Export fehlgeschlagen: {error}"),
+            ),
+        }
+    } else {
+        app.pending_export_options = Some(opts);
+        app.pending_export_format = request.format;
+        app.open_export_choice();
+    }
 }
 
 /// Löst eine getroffene `/export`-Auswahl ein (Zwischenablage/Datei/Abbrechen).
@@ -2940,7 +3781,7 @@ fn build_export_markdown(app: &ChatApp, opts: &ExportOptions) -> String {
 /// (kein Systemwerkzeug erreichbar), wird sie roh auf `stdout` geschrieben —
 /// denselben Deskriptor, den auch `TerminalGuard` für das Terminal verwendet;
 /// ein `TerminalGuard` ist an dieser Stelle (Overlay-Tastenbehandlung) nicht
-/// erreichbar. Index `1` schreibt über [`export::write_export`] in das
+/// erreichbar. Index `1` schreibt über [`export::write_export_path`] in das
 /// aktuelle Arbeitsverzeichnis. Jeder andere Index (insbesondere „Abbrechen")
 /// tut nichts. Das Ergebnis erscheint als Systemzeile.
 ///
@@ -2950,10 +3791,15 @@ fn build_export_markdown(app: &ChatApp, opts: &ExportOptions) -> String {
 ///   [`handle_overlay_key`], falls ein künftiger Export-Pfad asynchron wird.
 /// - `index` (`usize`): der von [`ChoiceDialog`] gemeldete Auswahlindex.
 fn resolve_export_choice(app: &mut ChatApp, _bus: &HarwEventSender, index: usize) {
+    let opts = app
+        .pending_export_options
+        .take()
+        .unwrap_or_else(ExportOptions::default);
+    let format = app.pending_export_format;
     match index {
         0 => {
-            let markdown = build_export_markdown(app, &ExportOptions::default());
-            match clipboard::copy_or_sequence(&markdown) {
+            let content = build_export(app, &opts, format);
+            match clipboard::copy_or_sequence(&content) {
                 Ok((ClipboardTarget::Osc52, Some(sequence))) => {
                     let mut stdout = io::stdout();
                     let written = stdout
@@ -2986,14 +3832,15 @@ fn resolve_export_choice(app: &mut ChatApp, _bus: &HarwEventSender, index: usize
             }
         }
         1 => {
-            let markdown = build_export_markdown(app, &ExportOptions::default());
+            let content = build_export(app, &opts, format);
             let now = export_timestamp_now();
             let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
             let path = export::default_export_path(&now, &dir);
-            match export::write_export(&path, &markdown) {
-                Ok(()) => {
-                    app.push_line(Role::System, format!("Export gespeichert: {}", path.display()))
-                }
+            match export::write_export_path(&path, &content) {
+                Ok(written_path) => app.push_line(
+                    Role::System,
+                    format!("Export gespeichert: {}", written_path.display()),
+                ),
                 Err(error) => {
                     app.push_line(Role::System, format!("Export fehlgeschlagen: {error}"))
                 }
@@ -3055,11 +3902,61 @@ pub(crate) async fn frame_scheduler(
 ///   Eine getroffene Wahl schließt das Overlay und synthetisiert je nach
 ///   `combined` entweder `/provider switch <provider> <model>` oder
 ///   `/model switch <model>` über [`HarwEvent::Command`].
+/// - [`Overlay::UiaProviderChoice`] / [`Overlay::UiaModelChoice`]: dieselbe
+///   Ablaufsteuerung wie ihre nicht-UIA-Pendants (via den lokalen Makros
+///   `handle_provider_choice_overlay!`/`handle_model_choice_overlay!`),
+///   emittieren aber direkt `/uia-provider switch <id>` bzw.
+///   `/uia-model switch <id>` — ohne kombinierte Zwischenstufe.
 ///
 /// # Rückgabe
 /// `true` (jede Taste verändert entweder den Overlay-Zustand oder schließt
 /// ihn — in beiden Fällen ist ein Redraw nötig).
 fn handle_overlay_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -> bool {
+    // Gemeinsame Ablaufsteuerung für "provider-förmige" Auswahl-Overlays
+    // ([`Overlay::ProviderChoice`], [`Overlay::UiaProviderChoice`]):
+    // delegiert an [`ChoiceDialog::handle_key`], löst bei `Chosen` die
+    // kanonische ID auf und schließt das Overlay, bevor `$action` läuft —
+    // dieselbe Borrow-Reihenfolge wie im vormaligen Handcode, damit
+    // `$action` (das oft `app`/`bus` erneut borgt) erst nach dem letzten
+    // Zugriff auf `$state` läuft.
+    macro_rules! handle_provider_choice_overlay {
+        ($state:expr, $id:ident => $action:expr) => {
+            match $state.dialog.handle_key(key) {
+                ChoiceAction::Stay => {}
+                ChoiceAction::Cancel => app.overlay = None,
+                ChoiceAction::Chosen(index) => {
+                    let $id = $state.ids.get(index).cloned();
+                    app.overlay = None;
+                    if let Some($id) = $id {
+                        $action
+                    }
+                }
+            }
+        };
+    }
+
+    // Gegenstück für "modell-förmige" Auswahl-Overlays ([`Overlay::ModelChoice`],
+    // [`Overlay::UiaModelChoice`]) — zusätzlich zur gewählten Modell-ID
+    // stehen `$provider` (`state.provider.clone()`) und `$combined`
+    // (`state.combined`) für `$action` zur Verfügung.
+    macro_rules! handle_model_choice_overlay {
+        ($state:expr, $model:ident, $provider:ident, $combined:ident => $action:expr) => {
+            match $state.dialog.handle_key(key) {
+                ChoiceAction::Stay => {}
+                ChoiceAction::Cancel => app.overlay = None,
+                ChoiceAction::Chosen(index) => {
+                    let $model = $state.ids.get(index).cloned();
+                    let $provider = $state.provider.clone();
+                    let $combined = $state.combined;
+                    app.overlay = None;
+                    if let Some($model) = $model {
+                        $action
+                    }
+                }
+            }
+        };
+    }
+
     match app.overlay.as_mut() {
         Some(Overlay::SessionPicker(picker)) => match picker.handle_key(key) {
             PickerAction::Stay => {}
@@ -3071,41 +3968,40 @@ fn handle_overlay_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -
         },
         Some(Overlay::ExportChoice(dialog)) => match dialog.handle_key(key) {
             ChoiceAction::Stay => {}
-            ChoiceAction::Cancel => app.overlay = None,
+            ChoiceAction::Cancel => {
+                app.overlay = None;
+                app.pending_export_options = None;
+            }
             ChoiceAction::Chosen(index) => {
                 app.overlay = None;
                 resolve_export_choice(app, bus, index);
             }
         },
-        Some(Overlay::ProviderChoice { ids, dialog }) => match dialog.handle_key(key) {
-            ChoiceAction::Stay => {}
-            ChoiceAction::Cancel => app.overlay = None,
-            ChoiceAction::Chosen(index) => {
-                let provider = ids.get(index).cloned();
-                app.overlay = None;
-                if let Some(provider) = provider {
-                    app.resolve_provider_choice(bus, provider);
-                }
-            }
-        },
-        Some(Overlay::ModelChoice { provider, ids, dialog, combined }) => match dialog.handle_key(key) {
-            ChoiceAction::Stay => {}
-            ChoiceAction::Cancel => app.overlay = None,
-            ChoiceAction::Chosen(index) => {
-                let model = ids.get(index).cloned();
-                let provider = provider.clone();
-                let combined = *combined;
-                app.overlay = None;
-                if let Some(model) = model {
-                    let command = if combined {
-                        format!("/provider switch {provider} {model}")
-                    } else {
-                        format!("/model switch {model}")
-                    };
-                    bus.send(HarwEvent::Command(command));
-                }
-            }
-        },
+        Some(Overlay::ProviderChoice(state)) => {
+            handle_provider_choice_overlay!(state, provider => {
+                app.resolve_provider_choice(bus, provider);
+            });
+        }
+        Some(Overlay::UiaProviderChoice(state)) => {
+            handle_provider_choice_overlay!(state, provider => {
+                bus.send(HarwEvent::Command(format!("/uia-provider switch {provider}")));
+            });
+        }
+        Some(Overlay::ModelChoice(state)) => {
+            handle_model_choice_overlay!(state, model, provider, combined => {
+                let command = if combined {
+                    format!("/provider switch {provider} {model}")
+                } else {
+                    format!("/model switch {model}")
+                };
+                bus.send(HarwEvent::Command(command));
+            });
+        }
+        Some(Overlay::UiaModelChoice(state)) => {
+            handle_model_choice_overlay!(state, model, _provider, _combined => {
+                bus.send(HarwEvent::Command(format!("/uia-model switch {model}")));
+            });
+        }
         None => {}
     }
     true
@@ -3215,10 +4111,10 @@ fn handle_key(
         return true;
     }
 
-    // Ctrl+K löscht nur bis zum Ende der aktuellen Zeile, auch bei offenem
-    // Command-Popup. Mehrzeilige Entwürfe unterhalb des Cursors bleiben stehen.
+    // Ctrl+K löscht die komplette aktuelle Zeile (nicht nur bis Zeilenende),
+    // auch bei offenem Command-Popup — nachfolgende Zeilen rücken nach oben.
     if ctrl && matches!(key.code, KeyCode::Char('k' | 'K')) {
-        app.input.delete_to_end();
+        app.input.delete_current_line();
         app.sync_popup();
         return true;
     }
@@ -3424,6 +4320,10 @@ async fn run_turn_streaming(
     // cooperative checkpoints instead of merely queuing a character.
     let cancel = CancelToken::new();
     app.active_cancel = Some(cancel.clone());
+    // Ein neuer Turn startet: ein evtl. noch angezeigter "Abbruch
+    // angefordert …"-Hinweis aus einem vorherigen, jetzt abgeschlossenen Turn
+    // gehört nicht mehr zum aktuellen Zustand.
+    app.cancel_requested_at = None;
     spinner.start();
     let reply = drive_turn_animated(
         guard,
@@ -3440,6 +4340,9 @@ async fn run_turn_streaming(
     .await;
     spinner.stop();
     app.active_cancel = None;
+    // Turn ist beendet (egal ob normal, per Fehler oder per Abbruch) — der
+    // transiente Abbruch-Hinweis hat damit ausgedient.
+    app.cancel_requested_at = None;
 
     let reply = reply?;
 
@@ -4247,7 +5150,11 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> bool {
         {
             if let Some(cancel) = &app.active_cancel {
                 cancel.cancel(CancelReason::User);
-                app.push_line(Role::System, "Abbruch angefordert …");
+                // Nur ein transienter Statuszeilen-Hinweis (siehe
+                // `render_viewport`) — keine dauerhafte `push_line`-Zeile, da
+                // dieser Hinweis mit dem Turn-Ende oder einem neuen Turn
+                // automatisch wieder verschwinden muss.
+                app.cancel_requested_at = Some(Instant::now());
                 return true;
             }
             false
@@ -4348,8 +5255,10 @@ fn render_viewport(
             return;
         }
         Some(Overlay::ExportChoice(dialog))
-        | Some(Overlay::ProviderChoice { dialog, .. })
-        | Some(Overlay::ModelChoice { dialog, .. }) => {
+        | Some(Overlay::ProviderChoice(ProviderChoiceState { dialog, .. }))
+        | Some(Overlay::UiaProviderChoice(ProviderChoiceState { dialog, .. }))
+        | Some(Overlay::ModelChoice(ModelChoiceState { dialog, .. }))
+        | Some(Overlay::UiaModelChoice(ModelChoiceState { dialog, .. })) => {
             frame.render_widget(Clear, area);
             dialog.render(area, frame.buffer_mut(), theme);
             return;
@@ -4396,8 +5305,58 @@ fn render_viewport(
     } else {
         String::new()
     };
+    // Spinner-Präfix: solange ein Turn läuft, zeigt die Statuszeile das
+    // animierte Glyph plus Label — vorher wurde `spinner`/`quit_hint` zwar
+    // berechnet und weitergereicht, aber nie tatsächlich gerendert. Die
+    // Statuszeile ist die einzige dauerhaft sichtbare Zeile außerhalb der
+    // History, deshalb landet die Animation hier statt am Input-Präfix.
+    let spinner_prefix = if spinner.is_active() {
+        format!("{} denkt… | ", spinner.glyph())
+    } else {
+        String::new()
+    };
+    // Transienter "Abbruch angefordert …"-Hinweis (siehe `cancel_requested_at`
+    // an [`ChatApp`]) — bewusst NICHT über `push_line`, damit er nie in der
+    // permanenten Verlaufshistorie landet und automatisch verschwindet,
+    // sobald der Turn beendet ist oder ein neuer Turn startet.
+    let cancel_suffix = if app.cancel_requested_at.is_some() {
+        " · Abbruch angefordert…"
+    } else {
+        ""
+    };
+    // `quit_hint` (z. B. "Ctrl+C"/"Ctrl+D") signalisiert die Scharfstellung
+    // des zweistufigen Beenden-Hinweises (`QuitArm`) und wurde bisher
+    // stillschweigend verworfen.
+    let quit_suffix = match quit_hint {
+        Some(label) => format!(" · nochmal {label} zum Beenden"),
+        None => String::new(),
+    };
+    // Sichtbarkeit für bereits eingereihte, aber noch nicht gesendete
+    // Nachrichten (`pending_turns`, siehe [`ChatApp`]): ohne diesen Hinweis
+    // verschwindet eine während eines laufenden Turns abgeschickte Nachricht
+    // scheinbar spurlos, bis sie beim Drainen der Queue plötzlich auftaucht.
+    let queue_suffix = if app.pending_turns.is_empty() {
+        String::new()
+    } else if app.pending_turns.len() <= 2 {
+        let preview: String = app
+            .pending_turns
+            .front()
+            .map(|text| {
+                let trimmed = text.trim();
+                if trimmed.chars().count() > 30 {
+                    let truncated: String = trimmed.chars().take(30).collect();
+                    format!("{truncated}…")
+                } else {
+                    trimmed.to_owned()
+                }
+            })
+            .unwrap_or_default();
+        format!(" · wartet: \"{preview}\"")
+    } else {
+        format!(" · {n} Nachricht(en) warten", n = app.pending_turns.len())
+    };
     let status = format!(
-        " Shift+Tab: {permission} | Modus: {} | Tokens: {} (in {}, out {}{cache_suffix})",
+        " {spinner_prefix}Shift+Tab: {permission} | Modus: {} | Tokens: {} (in {}, out {}{cache_suffix}){cancel_suffix}{quit_suffix}{queue_suffix}",
         app.active_mode.as_str(), app.total_usage.total(),
         app.total_usage.input_tokens, app.total_usage.output_tokens,
     );
@@ -4683,6 +5642,102 @@ mod tests {
         let mut app = ChatApp::new(Vec::new(), test_sandbox(), SessionId::new());
         app.command_registry = CommandRegistry::built_in();
         app
+    }
+
+    #[test]
+    fn export_request_marker_reads_format_options_and_path() {
+        let request = export_request_from_data(&json!({
+            "kind": "export.request",
+            "format": "json",
+            "include_tool_calls": false,
+            "include_reasoning_summary": true,
+            "path": "exports/session with spaces.json",
+        }))
+        .expect("valid export marker");
+
+        assert_eq!(request.format, ExportOutputFormat::Json);
+        assert!(!request.include_tool_calls);
+        assert!(request.include_reasoning_summary);
+        assert_eq!(
+            request.path.as_deref(),
+            Some("exports/session with spaces.json")
+        );
+    }
+
+    #[test]
+    fn structured_export_request_feeds_json_renderer_options() {
+        let mut app = test_chat_app();
+        app.push_line(Role::User, "Frage");
+        app.export_entries
+            .push(ExportEntry::Reasoning("sichere Zusammenfassung".to_owned()));
+        app.export_entries.push(ExportEntry::Tool {
+            label: "shell.exec".to_owned(),
+            summary: Some("Ergebnis".to_owned()),
+        });
+
+        let request = export_request_from_data(&json!({
+            "kind": "export.request",
+            "format": "json",
+            "include_tool_calls": false,
+            "include_reasoning_summary": true,
+            "path": null,
+        }))
+        .expect("valid export marker");
+        let opts = ExportOptions {
+            include_tool_calls: request.include_tool_calls,
+            include_reasoning: request.include_reasoning_summary,
+            ..ExportOptions::default()
+        };
+        let document: Value = serde_json::from_str(&build_export(&app, &opts, request.format))
+            .expect("valid JSON export");
+        let events = document["events"].as_array().expect("events array");
+
+        assert!(
+            events
+                .iter()
+                .any(|event| event["type"] == "reasoning_summary")
+        );
+        assert!(!events.iter().any(|event| event["type"] == "tool"));
+    }
+
+    #[test]
+    fn file_export_reports_the_actual_collision_suffix() {
+        let mut app = test_chat_app();
+        let path = std::env::temp_dir().join(format!(
+            "harw-tui-export-suffix-{}-{}.md",
+            std::process::id(),
+            SessionId::new().to_string()
+        ));
+        let first = export::write_export_path(&path, "first\n").expect("create first export");
+
+        resolve_export_request(
+            &mut app,
+            &ExportRequest {
+                format: ExportOutputFormat::Markdown,
+                include_tool_calls: true,
+                include_reasoning_summary: false,
+                path: Some(path.to_string_lossy().into_owned()),
+            },
+        );
+
+        let message = app
+            .export_entries
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                ExportEntry::System(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("export status message");
+        let expected_suffix = format!("{}-2.md", path.with_extension("").display());
+        assert!(message.contains(&expected_suffix), "message: {message}");
+
+        let second = path.with_file_name(format!(
+            "{}-2.md",
+            path.file_stem().and_then(|stem| stem.to_str()).expect("stem")
+        ));
+        std::fs::remove_file(first).ok();
+        std::fs::remove_file(second).ok();
     }
 
     /// Test-lokaler Ersatz für das gelöschte `trusted_tui_spawn_context`
@@ -5334,13 +6389,13 @@ forbidden = [{forbidden}]
         history.push(TurnItem::ToolCall(ToolCallItem {
             id: ItemId::new(),
             call_id: call_id.clone(),
-            tool_name: "read_file".to_owned(),
-            arguments: Default::default(),
+            tool_name: "fs.read".to_owned(),
+            arguments: json!({ "path": "/tmp/visible.txt" }),
         }));
         history.push(TurnItem::ToolResult(ToolResultItem {
             id: ItemId::new(),
             call_id,
-            result: ToolCallResult::error("do-not-render"),
+            result: ToolCallResult::error("not found"),
             duration_ms: 3,
             trust: ResultTrust::Untrusted,
         }));
@@ -5377,20 +6432,91 @@ forbidden = [{forbidden}]
             .join("\n");
         assert!(visible.contains("look [non-text content]"));
         assert!(visible.contains("persisted answer"));
-        assert!(visible.contains("[tool call]"));
-        assert!(visible.contains("[tool result]"));
-        assert!(visible.contains("[reasoning]"));
-        assert!(visible.contains("[error]"));
-        for secret in [
-            "secret.example",
-            "read_file",
-            "do-not-render",
-            "private reasoning",
-            "raw secret",
-            "sensitive backend detail",
-        ] {
+        assert!(visible.contains("1 Datei gelesen"));
+        assert!(visible.contains("1 fehlgeschlagen"));
+        assert!(visible.contains("private reasoning"));
+        assert!(visible.contains("sensitive backend detail"));
+        for secret in ["secret.example", "raw secret"] {
             assert!(!visible.contains(secret));
         }
+    }
+
+    #[test]
+    fn resume_hydration_pairs_orphan_result_and_marks_open_call() {
+        use harw_protocol::items::{ResultTrust, ToolCallItem, ToolCallResult, ToolResultItem};
+        use harw_types::{ItemId, ToolCallId};
+
+        let orphan_id = ToolCallId::new();
+        let open_id = ToolCallId::new();
+        let mut history = ConversationHistory::new();
+        history.push(TurnItem::ToolResult(ToolResultItem {
+            id: ItemId::new(),
+            call_id: orphan_id,
+            result: ToolCallResult::error("orphan result"),
+            duration_ms: 9,
+            trust: ResultTrust::Runtime,
+        }));
+        history.push(TurnItem::ToolCall(ToolCallItem {
+            id: ItemId::new(),
+            call_id: open_id,
+            tool_name: "shell.exec".to_owned(),
+            arguments: json!({ "command": "echo pending" }),
+        }));
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut session = AgentSession::new_with_id(
+            SessionId::from_str("resume-tool-pairs"),
+            AgentRole::Assistant,
+            None,
+            ExtensionRegistry::builder().build(),
+            event_tx,
+        );
+        let mut app = test_chat_app();
+        install_loaded_history(&mut session, &mut app, history);
+
+        let visible = app
+            .cells
+            .iter()
+            .flat_map(|cell| cell.display_lines(200, style::Theme::Dark))
+            .flat_map(|line| line.spans)
+            .map(|span| span.content.into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(visible.contains("tool.result"));
+        assert!(visible.contains("orphan result"));
+        assert!(visible.contains("unvollständig (Resume-Abbruch)"));
+        let tool_entries = app
+            .export_entries
+            .iter()
+            .filter(|entry| {
+                matches!(entry, ExportEntry::ToolCall { .. } | ExportEntry::ToolResult { .. })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_entries.len(), 4);
+        assert!(matches!(
+            tool_entries[0],
+            ExportEntry::ToolCall { tool_name, .. } if tool_name == "tool.result"
+        ));
+        assert!(matches!(tool_entries[1], ExportEntry::ToolResult { .. }));
+        assert!(matches!(
+            tool_entries[2],
+            ExportEntry::ToolCall { tool_name, .. } if tool_name == "shell.exec"
+        ));
+        assert!(matches!(
+            tool_entries[3],
+            ExportEntry::ToolResult { error: Some(error), .. }
+                if error == "unvollständig (Resume-Abbruch)"
+        ));
+    }
+
+    #[test]
+    fn incident_hint_is_small_and_only_suggests_bug_report_on_known_signals() {
+        assert!(incident_hint(&TuiError::Core("provider timeout".to_owned()), 2)
+            .is_some_and(|hint| hint.contains("/bug-report")));
+        assert!(incident_hint(&TuiError::Core("agent killed".to_owned()), 0)
+            .is_some_and(|hint| hint.contains("/bug-report")));
+        assert!(incident_hint(&TuiError::Core("ordinary validation error".to_owned()), 9)
+            .is_none());
     }
 
     // ────────────────────────────────────────────────────────────────────

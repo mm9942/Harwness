@@ -495,6 +495,7 @@ mod tests {
     use harw_types::{SessionId, TenantId, WorkspaceId};
 
     use crate::session_controller::TuiSessionController;
+    use harw_operations::SessionController;
 
     use super::{CommandServices, build_services};
 
@@ -657,6 +658,40 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_status_embeds_provider_and_model() {
+        let adapters = adapters();
+        let (sandbox, tmp) = test_sandbox();
+        let session_id = SessionId::new();
+        let controller = test_controller();
+        controller.set_active_provider("anthropic".to_owned()).unwrap();
+        controller.set_active_model("claude-sonnet".to_owned()).unwrap();
+
+        let output = super::execute_command(
+            &adapters,
+            &sandbox,
+            &session_id,
+            "/status",
+            &CommandServices {
+                runtime_config: None,
+                memory: None,
+                controller: &controller,
+                job_store: None,
+            },
+        )
+        .await;
+        std::fs::remove_dir_all(tmp).ok();
+
+        assert!(
+            output.contains("Provider: anthropic"),
+            "expected provider in status output; got: {output}"
+        );
+        assert!(
+            output.contains("Modell: claude-sonnet"),
+            "expected model in status output; got: {output}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // 3. Unknown command returns an honest "unknown" message
     // -----------------------------------------------------------------------
@@ -741,7 +776,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_with_context_admitted_shell_is_not_available() {
+    async fn test_execute_with_context_admitted_shell_denied_without_execute_permission() {
         let adapters = adapters();
         let (sandbox, tmp) = test_sandbox();
         let session_id = SessionId::new();
@@ -780,7 +815,14 @@ mod tests {
         .await;
         std::fs::remove_dir_all(tmp).ok();
 
-        assert_eq!(shell, "Shell-Ausführung ist noch nicht verfügbar: ls -la");
+        // `test_sandbox()` gewährt nur ReadWorkspace/WriteWorkspace, kein
+        // ExecuteProcess: `execute_shell` läuft jetzt tatsächlich bis zum
+        // echten `shell.exec`-Ausführer durch (kein Platzhalter mehr) und
+        // dieser lehnt fail-closed wegen der fehlenden Berechtigung ab.
+        assert_eq!(
+            shell,
+            "Shell-Ausführung abgelehnt: shell.exec denied: ExecuteProcess permission missing"
+        );
         assert_eq!(repeat, "Shell-Wiederholung ist noch nicht verfügbar.");
     }
 

@@ -79,6 +79,7 @@ use harw_core::{AgentSession, ConversationHistory, ModelMessage, ModelProvider, 
 use harw_extension_api::ApprovalHandler;
 use harw_operations::SharedSessionController;
 use harw_operations::adapter::CommandAdapter;
+use harw_operations::session_control::UiaSelection;
 use harw_plan::PlanNodeStatus;
 use harw_protocol::events::{SessionEvent, TurnEvent};
 use harw_protocol::items::{ContentPart, TurnItem};
@@ -102,6 +103,35 @@ use crate::tui_event::TuiEvent;
 
 /// Erzeugt die einmalige Begrüßung einer TUI-Sitzung aus lokalem Kontext.
 ///
+/// Formatiert Provider- und Modell-Info für die Begrüßungszeile.
+///
+/// Bevorzugt die effektive UIA-Auswahl und fällt je Achse auf
+/// `default_model`/`default_provider` aus der Konfiguration zurück.
+fn provider_model_info(config: &harw_config::ResolvedConfig) -> Option<String> {
+    let selection = uia_selection_from_config(config);
+    let model = selection.model().filter(|m| !m.is_empty());
+    let provider = selection.provider().filter(|p| !p.is_empty());
+    match (provider, model) {
+        (Some(p), Some(m)) => Some(format!("Provider: {p} · Modell: {m}")),
+        (Some(p), None) => Some(format!("Provider: {p}")),
+        (None, Some(m)) => Some(format!("Modell: {m}")),
+        (None, None) => None,
+    }
+}
+
+/// Liest die effektive UIA-Provider-/Modell-Auswahl einer Assembly-Config.
+///
+/// Die UIA-spezifischen Persistenzwerte haben Vorrang; `default_*` dienen nur
+/// als Achsen-Fallback und werden dabei nicht verändert.
+fn uia_selection_from_config(config: &harw_config::ResolvedConfig) -> UiaSelection {
+    UiaSelection::from_config(
+        config.harness.uia_provider.as_deref(),
+        config.harness.uia_model.as_deref(),
+        config.harness.default_provider.as_deref(),
+        config.harness.default_model.as_deref(),
+    )
+}
+
 /// Sie ist reine Anzeige und wird nie als Nutzereingabe oder persistierte
 /// Conversation-History behandelt. Die Uhrzeit wird explizit als UTC markiert,
 /// damit die Ausgabe auch ohne verfügbare lokale Zeitzonendaten eindeutig bleibt.
@@ -109,6 +139,7 @@ fn tui_greeting(
     project_root: &str,
     uia_definition: Option<&str>,
     uia_user_name: Option<&str>,
+    provider_info: Option<&str>,
 ) -> String {
     // Der in USER.md freiwillig hinterlegte Name gehört zum UIA-Kontext und
     // gewinnt deshalb vor dem technischen Login-Namen. Fehlt er, bleibt die
@@ -123,7 +154,7 @@ fn tui_greeting(
                 .filter(|value| !value.trim().is_empty())
         })
         .unwrap_or_else(|| "da".to_owned());
-    tui_greeting_at(project_root, uia_definition, &user, OffsetDateTime::now_utc())
+    tui_greeting_at(project_root, uia_definition, &user, provider_info, OffsetDateTime::now_utc())
 }
 
 /// Liest den optionalen Anzeigenamen der aktiven UIA aus ihrer `USER.md`.
@@ -145,6 +176,7 @@ fn tui_greeting_at(
     project_root: &str,
     uia_definition: Option<&str>,
     user: &str,
+    provider_info: Option<&str>,
     now: OffsetDateTime,
 ) -> String {
     let salutation = match now.hour() {
@@ -162,8 +194,12 @@ fn tui_greeting_at(
         .and_then(|definition| definition.rsplit('.').next())
         .filter(|name| !name.is_empty())
         .unwrap_or("Harw");
+    let model_line = provider_info
+        .filter(|info| !info.is_empty())
+        .map(|info| format!(" · {info}"))
+        .unwrap_or_default();
     format!(
-        "{uia}: {salutation}, {user}! Bereit für »{workspace}« — {} {:02}:{:02} UTC. Womit beginnen wir?",
+        "{uia}: {salutation}, {user}! Bereit für »{workspace}«{model_line} — {} {:02}:{:02} UTC. Womit beginnen wir?",
         now.date(),
         now.hour(),
         now.minute(),
@@ -530,6 +566,7 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
         app.project_root(),
         assembly.config().harness.active_uia_definition.as_deref(),
         uia_user_name.as_deref(),
+        provider_model_info(assembly.config()).as_deref(),
     ))]);
     let mut gateway = ResumableGateway::new(
         session,
@@ -749,6 +786,17 @@ fn build_root_runtime(
             "wiring does not belong to this assembly".to_owned(),
         ));
     }
+    // Die Assembly hat ihre Config beim Bau aus der Persistenz geladen. Die
+    // UIA-Auswahl wird deshalb hier pro Root-Montage neu gesetzt — sowohl beim
+    // frischen Start als auch bei `/resume` — ohne `default_*` umzudeuten.
+    let uia_selection = uia_selection_from_config(assembly.config());
+    controller
+        .initialize_uia_selection(uia_selection)
+        .map_err(|error| {
+            TuiError::Core(format!(
+                "could not initialize the UIA session selection: {error}"
+            ))
+        })?;
     // AP W5-03, Bedingung 2: genau ein Handler, dessen `Arc` gleichzeitig in
     // der Freigabekette der Sitzung und im `ApprovalDriver` liegt.
     let (approval_handler, approvals) = TuiApprovalHandler::new();
@@ -869,6 +917,7 @@ async fn resume_session(
         runtime.app.project_root(),
         assembly.config().harness.active_uia_definition.as_deref(),
         uia_user_name.as_deref(),
+        provider_model_info(assembly.config()).as_deref(),
     ))]);
     Ok(ResumedRuntime { assembly, runtime })
 }
@@ -999,6 +1048,7 @@ mod tests {
     use super::*;
 
     use harw_core::InteractionMode;
+    use harw_operations::SessionController;
     use harw_runtime::{
         EntryKind, ModelSource, RuntimeError, RuntimeSpec, RuntimeStores, ServiceSurface,
     };
@@ -1094,6 +1144,7 @@ mod tests {
     fn test_build_root_runtime_mounts_responder_in_chain() {
         let fixture = fixture();
         let (assembly, wiring) = tui_assembly(&fixture, None);
+        let controller = Arc::clone(&wiring.controller);
         let chain_before = assembly.rights_snapshot().approval_chain;
 
         let runtime = build_root_runtime(&assembly, wiring, None, false).expect("root runtime builds");
@@ -1115,6 +1166,27 @@ mod tests {
         );
         assert_eq!(runtime.session.id(), assembly.root_session_id());
         assert_eq!(runtime.app.session_id(), assembly.root_session_id());
+        assert_eq!(
+            controller.uia_selection(),
+            uia_selection_from_config(assembly.config()),
+            "the root controller must receive the effective persisted UIA selection"
+        );
+    }
+
+    #[test]
+    fn uia_selection_from_config_prefers_uia_values_per_axis() {
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.default_provider = Some("default-provider".to_owned());
+        config.harness.default_model = Some("default-model".to_owned());
+        config.harness.uia_provider = Some("uia-provider".to_owned());
+
+        assert_eq!(
+            uia_selection_from_config(&config),
+            UiaSelection::new(
+                Some("uia-provider".to_owned()),
+                Some("default-model".to_owned())
+            )
+        );
     }
 
     #[test]
@@ -1280,7 +1352,7 @@ mod greeting_tests {
             Time::from_hms(19, 5, 0).unwrap(),
         )
         .assume_utc();
-        let greeting = tui_greeting_at("/work/Harwness", Some("harwness.agent.emily-ui"), "Mia", now);
+        let greeting = tui_greeting_at("/work/Harwness", Some("harwness.agent.emily-ui"), "Mia", None, now);
         assert!(greeting.starts_with("emily-ui: Guten Abend, Mia!"));
         assert!(greeting.contains("»Harwness«"));
         assert!(greeting.contains("2026-09-14 19:05 UTC"));
@@ -1298,9 +1370,45 @@ mod greeting_tests {
             "/work/Harwness",
             Some("harwness.agent.terminal-ui@1"),
             "Mia",
+            None,
             now,
         );
 
         assert!(greeting.starts_with("terminal-ui@1: Guten Morgen, Mia!"));
+    }
+
+    #[test]
+    fn greeting_includes_provider_and_model_when_available() {
+        let now = PrimitiveDateTime::new(
+            Date::from_calendar_date(2026, Month::September, 14).unwrap(),
+            Time::from_hms(10, 0, 0).unwrap(),
+        )
+        .assume_utc();
+        let greeting = tui_greeting_at(
+            "/work/Harwness",
+            Some("harwness.agent.emily-ui"),
+            "Mia",
+            Some("Provider: anthropic · Modell: claude-sonnet"),
+            now,
+        );
+        assert!(greeting.contains("Provider: anthropic · Modell: claude-sonnet"));
+    }
+
+    #[test]
+    fn greeting_omits_provider_info_when_none() {
+        let now = PrimitiveDateTime::new(
+            Date::from_calendar_date(2026, Month::September, 14).unwrap(),
+            Time::from_hms(10, 0, 0).unwrap(),
+        )
+        .assume_utc();
+        let greeting = tui_greeting_at(
+            "/work/Harwness",
+            Some("harwness.agent.emily-ui"),
+            "Mia",
+            None,
+            now,
+        );
+        assert!(!greeting.contains("Provider:"));
+        assert!(!greeting.contains("Modell:"));
     }
 }
