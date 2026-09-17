@@ -1,0 +1,55 @@
+# Eingebauter Root-Orchestrator: die UIA kann ihn als echten Agentenbaum-Root
+# starten. Er plant und delegiert, schreibt aber selbst keinen Code.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.root-orchestrator@1"
+version = "1.0.0"
+role = "root-orchestrator"
+specialization = "root-orchestrator"
+
+name = "Root Orchestrator"
+description = "Koordiniert Child-Orchestrators und Worker, sammelt deren Ergebnisse und liefert der UIA eine belastbare Zusammenfassung."
+
+[work]
+mode = "orchestration"
+may_change_plan = false
+may_write_code = false
+may_research_web = false
+aggregates_child_returns = true
+
+[lifecycle]
+allow_pause = false
+allow_rerun = true
+max_attempts = 2
+
+[context]
+must_include = ["task.objective", "task.read_scope", "new.trigger_return"]
+exclude = ["full_parent_transcript", "sibling_transcripts"]
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+  "lens.ask",
+]
+forbidden = ["fs.write", "shell.exec", "web.fetch", "web.docs_rs", "web.crates_io"]
+
+[spawn]
+max_depth = 2
+child_orchestrators = []
+
+[spawn.budget]
+max_tokens = 120000
+max_tool_calls = 80
+max_wall_secs = 900
+
+[return]
+contract = "harwness.return.execution-summary@1"

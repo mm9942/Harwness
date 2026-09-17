@@ -24,7 +24,9 @@
 # ── Referenzierte Agenten ────────────────────────────────────────────────────
 # `root.agent` und jede `clan.leader`-Referenz zeigt auf eine Rolle, die als
 # eingebettete Agentendefinition existiert und in `role_names::ALL` steht:
-#   * `analyst` — die einzige eingebaute Rolle mit `max_depth = 2`; nur sie darf
+#   * `root-orchestrator` — die eingebaute Root-Rolle; nur sie darf
+#     Child-Orchestrators und Worker koordinieren.
+#   * `analyst` — die eingebaute Recherche-/Verdichtungsrolle.
 #     read-only Kinder starten und deren Rückgaben verdichten. Sie führt
 #     deshalb `research`, `synthesis` UND `security`: die vier
 #     Triage-Rollen tragen `max_depth = 0` und könnten ihre eigene
@@ -32,9 +34,8 @@
 #     `security`-Clan unten).
 #   * `planner` — die einzige eingebaute Rolle mit `plan`/`goal` auf ihrer
 #     Werkzeugoberfläche.
-# Ein Root-Orchestrator-Agent im engeren Sinne existiert (noch) nicht; bis dahin
-# ist der Analyst der einzige ehrliche Kandidat. Der Test
-# `test_organization_references_only_embedded_roles` hält das fest.
+# Der Root-Orchestrator ist als eigene startbare Rolle verdrahtet; der Analyst
+# bleibt der read-only Verdichter für Recherche-Clans.
 
 schema = "harwness.organization/v1"
 id = "harwness.organization.default@1"
@@ -44,7 +45,7 @@ name = "Harwness Default Organization"
 # §22 Invariante 12: die Organisation erzeugt keinen zweiten Root. `root.agent`
 # ist der einzige Einstiegspunkt.
 [root]
-agent = { id = "harwness.agent.analyst@1" }
+agent = { id = "harwness.agent.root-orchestrator@1" }
 family = { id = "harwness.family.research@1" }
 
 # ── Clans (§22 Invariante 10: run-lokale Subtrees) ───────────────────────────

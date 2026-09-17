@@ -55,7 +55,7 @@ use harw_instructions::{AgentIdentity, BaselineInstructionsProvider};
 use harw_project_discovery::{
     DiscoveryConfig, ProjectContext, ProjectContextProvider, discover_project,
 };
-use harw_sandbox::PermissionSet;
+use harw_sandbox::{HostPermitSessionRegistry, PermissionSet, ProcessPermitLedger, SandboxProfile};
 use harw_tool_deps::DepsToolProvider;
 use harw_tool_fs::FsToolProvider;
 use harw_tool_lens::LensToolProvider;
@@ -64,6 +64,8 @@ use harw_tool_web::WebToolProvider;
 
 #[cfg(feature = "browser")]
 use harw_browser_thirtyfour::{config::FirefoxHostConfig, host::FirefoxHost};
+#[cfg(feature = "browser")]
+use harw_browser::policy::{BrowserLimits, OriginPolicy};
 #[cfg(feature = "browser")]
 use harw_tool_browser::{
     BrowserOpenGrant, BrowserOpenPolicy, BrowserToolSet, HarwnessBrowserToolProvider,
@@ -123,7 +125,9 @@ use crate::{AssembledRegistry, DefaultApprovalPolicy};
 /// (unten, `#[cfg(test)]`) prüft sie gegen eine **andere** Quelle — den
 /// verzeichnisbasierten Fund von
 /// [`crate::embedded_agents::builtin_agent_toml`] — statt gegen eine daneben
-/// stehende Zahl. `context-steward` und `intel-scout` (`agents/roles/**`)
+/// stehende Zahl. `context-steward`, `intel-scout`, `cargo-worker`,
+/// `host-process-worker`, `sandbox-shell-worker` und `tmux-inspector-worker`
+/// (`agents/roles/**`)
 /// werden von derselben Verzeichnis-Sammlung ebenfalls gefunden, sind aber
 /// bewusst nicht in `ALL`: ihre Aufnahme ist ein eigener, noch offener Befund
 /// (siehe Abschlussbericht dieses Knotens) und außerhalb des Auftrags, der
@@ -146,6 +150,9 @@ use crate::{AssembledRegistry, DefaultApprovalPolicy};
 /// // im `#[cfg(test)]`-Modul dieser Datei.
 /// ```
 pub mod role_names {
+    /// Startbarer Orchestrator, den die UIA als Wurzel eines Agentenbaums
+    /// einsetzen kann.
+    pub const ROOT_ORCHESTRATOR: &str = "root-orchestrator";
     /// Read-only Erkundung von Workspace und Dependency-Quellen.
     pub const EXPLORER: &str = "explorer";
     /// Dependency-Recherche aus `Cargo.lock` und dem lokalen Registry-Quellcache.
@@ -212,11 +219,14 @@ pub mod role_names {
 
     /// Alle bekannten eingebauten Rollen.
     ///
-    /// Siehe die Moduldokumentation oben: `context-steward` und
-    /// `intel-scout` sind absichtlich nicht enthalten (eigener, offener
+    /// Siehe die Moduldokumentation oben: `context-steward`, `intel-scout`,
+    /// `cargo-worker`, `host-process-worker`, `sandbox-shell-worker` und
+    /// `tmux-inspector-worker` sind absichtlich nicht enthalten (eigener,
+    /// offener
     /// Befund), obwohl ihre Rollendateien bereits existieren und von
     /// [`crate::embedded_agents::builtin_agent_toml`] bereits gefunden werden.
     pub const ALL: &[&str] = &[
+        ROOT_ORCHESTRATOR,
         EXPLORER,
         RESEARCHER_DEPS,
         RESEARCHER_WEB,
@@ -823,6 +833,7 @@ impl RegistryProfile {
 #[must_use]
 pub fn profile_for_role(role: &str) -> Option<RegistryProfile> {
     match role {
+        role_names::ROOT_ORCHESTRATOR => Some(RegistryProfile::Planning),
         role_names::EXPLORER | role_names::RESEARCHER_DEPS | role_names::ANALYST => {
             Some(RegistryProfile::ReadOnlyExplore)
         }
@@ -1108,7 +1119,28 @@ pub fn agent_definition_tool_names_for_access(
 fn profile_tool_providers(
     profile: RegistryProfile,
     agent_definition_access: AgentDefinitionAccess,
+    sandbox_profile: &SandboxProfile,
+    // Nur für Host-Profil-Worker relevant (siehe `host-process-worker.toml`):
+    // die Runtime-Montage reicht hier den einmal instanziierten Permit-Ledger
+    // und die dazugehörige Sitzungs-Registry durch, damit jeder gebaute
+    // `ShellToolProvider` `run_command`s tatsächliche `authorize()`-Prüfung
+    // erreichen kann. `None` verhält sich exakt wie vor dieser Ergänzung
+    // (Host-Ausführung bleibt dann fail-closed ohne Ledger).
+    host_permits: Option<(&Arc<ProcessPermitLedger>, &Arc<HostPermitSessionRegistry>)>,
 ) -> Vec<Arc<dyn ToolProvider>> {
+    // Baut einen `ShellToolProvider` für `sandbox_profile` und hängt bei
+    // Host-Profil (falls übergeben) Ledger + Sitzungs-Registry an.
+    let build_shell_provider = |sandbox_profile: &SandboxProfile| -> Arc<dyn ToolProvider> {
+        let mut provider = ShellToolProvider::default().with_sandbox_profile(sandbox_profile.clone());
+        if sandbox_profile.is_host() {
+            if let Some((ledger, registry)) = host_permits {
+                provider = provider
+                    .with_permit_ledger(Arc::clone(ledger))
+                    .with_host_permit_registry(Arc::clone(registry));
+            }
+        }
+        Arc::new(provider)
+    };
     // Der read-only Anteil ist für drei Profile identisch: der gefilterte
     // FS-Provider plus der vollständig lesende Deps-Provider.
     fn read_only_base() -> Vec<Arc<dyn ToolProvider>> {
@@ -1123,10 +1155,10 @@ fn profile_tool_providers(
     match profile {
         RegistryProfile::Full => {
             let filesystem: Arc<dyn ToolProvider> = Arc::new(FsToolProvider::default());
-            let shell: Arc<dyn ToolProvider> = Arc::new(ShellToolProvider::default());
+            let shell = build_shell_provider(sandbox_profile);
             vec![filesystem, shell]
         }
-        RegistryProfile::ShellExecution => vec![Arc::new(ShellToolProvider::default())],
+        RegistryProfile::ShellExecution => vec![build_shell_provider(sandbox_profile)],
         RegistryProfile::ReadOnlyExplore => read_only_base(),
         // `LensToolProvider::new()` ist zustandslos (keine Bau-, Home- oder
         // Indexpfad-Konfiguration nötig): `derive_read_scope` leitet den
@@ -1162,7 +1194,7 @@ fn profile_tool_providers(
                 Arc::new(FsToolProvider::default()),
                 FS_READ_ONLY_TOOLS,
             ));
-            let shell: Arc<dyn ToolProvider> = Arc::new(ShellToolProvider::default());
+            let shell = build_shell_provider(sandbox_profile);
             let web: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
                 Arc::new(WebToolProvider::new()),
                 UIA_QUICK_HELPER_WEB_TOOLS,
@@ -1260,6 +1292,39 @@ pub fn browser_tool_provider(
     );
     let tool_set = BrowserToolSet::with_open_policy(host, BrowserOpenPolicy::grant(grant));
     Ok(Arc::new(HarwnessBrowserToolProvider::new(tool_set)))
+}
+
+/// Baut den Browser-Provider aus der vertrauenswürdigen `[browser]`-Sektion.
+///
+/// `browser.enabled = false` entfernt die Browser-Oberfläche vollständig.
+/// Bei aktivierter Konfiguration werden die Origins als Navigation-Allowlist
+/// mit privatem Netzwerk-Veto, eine leere Authentifizierungs-Allowlist und das
+/// konfigurierte Aktionslimit in den host-eigenen Grant übernommen. Die
+/// Geckodriver-Pinning-Felder gehören zur Backend-Konfiguration und werden von
+/// dieser Registry-Verdrahtung nicht erweitert.
+///
+/// Jede ungültige Konfiguration bleibt fail-closed und wird als
+/// [`RegistryDefaultsError::BrowserHost`] zurückgegeben.
+#[cfg(feature = "browser")]
+pub fn browser_tool_provider_for_config(
+    section: &harw_config::BrowserSection,
+) -> RegistryDefaultsResult<Option<Arc<dyn ToolProvider>>> {
+    if !section.enabled {
+        return Ok(None);
+    }
+
+    section
+        .validate()
+        .map_err(RegistryDefaultsError::BrowserHost)?;
+    let allowed_origins = OriginPolicy::from_origins(
+        section.allowed_origins.iter().map(String::as_str),
+        true,
+    )
+    .map_err(|error| RegistryDefaultsError::BrowserHost(error.to_string()))?;
+    let grant = BrowserOpenGrant::ephemeral(allowed_origins, OriginPolicy::default())
+        .with_limits(BrowserLimits::default().with_max_actions_per_session(section.max_actions));
+
+    browser_tool_provider(grant).map(Some)
 }
 
 /// Baut eine Registry für das gewünschte Profil.
@@ -1596,6 +1661,131 @@ pub fn assemble_registry_for_sandbox_with_definition_access(
     granted: &PermissionSet,
     access: Option<AgentDefinitionAccess>,
 ) -> RegistryDefaultsResult<AssembledRegistry> {
+    assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile(
+        profile, project, overrides, approval_mode, granted, access,
+        &SandboxProfile::Strict,
+    )
+}
+
+/// Wie [`assemble_registry_for_sandbox_with_definition_access`], nimmt aber
+/// zusätzlich ein [`SandboxProfile`] entgegen, das an jeden konstruierten
+/// [`ShellToolProvider`] weitergegeben wird. Das Profil ist ein
+/// vertrauenswürdiger Runtime-Input: nur der Runtime-Aufbau (nicht ein
+/// Tool-Aufruf) wählt es.
+pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile(
+    profile: RegistryProfile,
+    project: &ProjectContext,
+    overrides: IdentityOverrides,
+    approval_mode: ApprovalModeCell,
+    granted: &PermissionSet,
+    access: Option<AgentDefinitionAccess>,
+    sandbox_profile: &SandboxProfile,
+) -> RegistryDefaultsResult<AssembledRegistry> {
+    assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits(
+        profile,
+        project,
+        overrides,
+        approval_mode,
+        granted,
+        access,
+        sandbox_profile,
+        None,
+    )
+}
+
+/// Wie [`assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile`],
+/// nimmt aber zusätzlich den einmal von der Runtime instanziierten
+/// [`ProcessPermitLedger`] und die dazugehörige [`HostPermitSessionRegistry`]
+/// entgegen (siehe `harw_runtime::assembly::RuntimeAssembly`).
+///
+/// # Beschreibung
+/// Beide werden nur an einen [`ShellToolProvider`] gehängt, dessen
+/// `sandbox_profile` tatsächlich [`SandboxProfile::Host`] ist —
+/// Strict/Cargo/Tmux bleiben unverändert, weil für sie die Sandbox selbst die
+/// Grenze ist, nicht der Permit. Die Runtime muss über beide Aufrufstellen
+/// (Host- und Nicht-Host-Zweig, siehe `harw-runtime/src/assembly.rs`)
+/// **dieselbe** `Arc`-Instanz von Ledger und Registry durchreichen: ein
+/// zweiter, unabhängig instanziierter Ledger hätte keine Kenntnis von den
+/// bereits gemerkten Sitzungszustimmungen und würde jede Host-Ausführung
+/// erneut ablehnen.
+///
+/// `None` verhält sich exakt wie
+/// [`assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile`]:
+/// Host-Ausführung bleibt dann fail-closed, weil kein Ledger konfiguriert ist.
+///
+/// # Argumente
+/// - `profile` ([`RegistryProfile`]): Werkzeug-/Identitätsprofil.
+/// - `project` (`&ProjectContext`): bereits erkannter Projektkontext.
+/// - `overrides` ([`IdentityOverrides`]): Überschreibungen für den System-Prompt.
+/// - `approval_mode` ([`ApprovalModeCell`]): Freigabemodus-Zelle der Politik.
+/// - `granted` (`&PermissionSet`): Rechte der Ziel-Sandbox; nur geliehen.
+/// - `access` (`Option<`[`AgentDefinitionAccess`]`>`): nur für
+///   [`RegistryProfile::AgentStewardship`] relevant; `None` ist der
+///   fail-closed Standard.
+/// - `sandbox_profile` (`&SandboxProfile`): vertrauenswürdiges, von der
+///   Runtime gewähltes Sandbox-Profil; wird an jeden konstruierten
+///   [`ShellToolProvider`] weitergegeben.
+/// - `host_permits` (`Option<(Arc<ProcessPermitLedger>, Arc<HostPermitSessionRegistry>)>`):
+///   der einmal je Lauf instanziierte Permit-Ledger und die zugehörige
+///   Sitzungs-Registry; Eigentum der `Arc`s geht über (nur der Zeiger wird
+///   geteilt, nicht der Zustand kopiert). `None`, wenn diese Montage keine
+///   Permit-geschützte Host-Ausführung anbietet.
+///
+/// # Rückgabe
+/// `Ok(AssembledRegistry)`; `identity.tools_available` ist exakt die Menge der
+/// registrierten Werkzeuge. Für ein Profil ohne `shell.exec`
+/// (`ShellExecution`/`Full`/`UiaQuickHelper` ausgenommen) bleibt
+/// `host_permits` wirkungslos, weil kein [`ShellToolProvider`] entsteht, an
+/// den es gehängt werden könnte.
+///
+/// # Fehler
+/// - [`RegistryDefaultsError::ContextProviderRegistration`]: der Namensraum des
+///   [`ProjectContextProvider`] ist bereits belegt.
+///
+/// # Nebenläufigkeit
+/// Synchron; alle erzeugten Provider sind `Send + Sync`. `host_permits`
+/// bringt bereits `Arc`-geteilten, intern gesperrten Zustand mit
+/// ([`ProcessPermitLedger`]/[`HostPermitSessionRegistry`] kapseln ihre eigene
+/// Synchronisierung); diese Funktion selbst hält keine Sperre.
+///
+/// # Examples
+/// ```rust,no_run
+/// use std::sync::Arc;
+/// use harw_extension_api::approval_mode::ApprovalModeCell;
+/// use harw_project_discovery::ProjectContext;
+/// use harw_registry_defaults::profile::{
+///     IdentityOverrides, RegistryProfile,
+///     assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits,
+/// };
+/// use harw_sandbox::{HostPermitSessionRegistry, PermissionSet, ProcessPermitLedger, SandboxProfile};
+///
+/// # fn demo(project: &ProjectContext) -> Result<(), Box<dyn std::error::Error>> {
+/// let ledger = Arc::new(ProcessPermitLedger::default());
+/// let registry = Arc::new(HostPermitSessionRegistry::default());
+/// let registry_out = assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits(
+///     RegistryProfile::ShellExecution,
+///     project,
+///     IdentityOverrides::default(),
+///     ApprovalModeCell::default(),
+///     &PermissionSet::from_policy([harw_sandbox::Permission::ExecuteProcess]),
+///     None,
+///     &SandboxProfile::Strict,
+///     Some((ledger, registry)),
+/// )?;
+/// let _ = registry_out;
+/// # Ok(())
+/// # }
+/// ```
+pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits(
+    profile: RegistryProfile,
+    project: &ProjectContext,
+    overrides: IdentityOverrides,
+    approval_mode: ApprovalModeCell,
+    granted: &PermissionSet,
+    access: Option<AgentDefinitionAccess>,
+    sandbox_profile: &SandboxProfile,
+    host_permits: Option<(Arc<ProcessPermitLedger>, Arc<HostPermitSessionRegistry>)>,
+) -> RegistryDefaultsResult<AssembledRegistry> {
     let agent_definition_access = access.unwrap_or_else(|| AgentDefinitionAccess {
         project_agents_dir: Some(project.project_root.join(".harw").join("agents")),
         profile_agents_dir: None,
@@ -1616,11 +1806,17 @@ pub fn assemble_registry_for_sandbox_with_definition_access(
     } else {
         profile.tool_names_for(granted)
     };
-    let providers: Vec<Arc<dyn ToolProvider>> =
-        profile_tool_providers(profile, agent_definition_access)
-            .into_iter()
-            .filter_map(|provider| restrict_provider(provider, &allowed))
-            .collect();
+    let providers: Vec<Arc<dyn ToolProvider>> = profile_tool_providers(
+        profile,
+        agent_definition_access,
+        sandbox_profile,
+        host_permits
+            .as_ref()
+            .map(|(ledger, registry)| (ledger, registry)),
+    )
+    .into_iter()
+    .filter_map(|provider| restrict_provider(provider, &allowed))
+    .collect();
 
     let advertised_tools: Vec<String> = allowed.iter().map(|name| (*name).to_owned()).collect();
 
@@ -2276,11 +2472,12 @@ mod tests {
     /// daneben stehenden Zahl (siehe die Kritik an den vier Fundstellen in
     /// `agents/families/security/security.toml`, die genau das getan haben).
     ///
-    /// `context-steward` und `intel-scout` werden von derselben
+    /// `context-steward`, `intel-scout`, `cargo-worker`, `host-process-worker`,
+    /// `sandbox-shell-worker` und `tmux-inspector-worker` werden von derselben
     /// Verzeichnis-Sammlung ebenfalls gefunden, sind aber bewusst nicht in
-    /// `ALL` (siehe Moduldokumentation von [`role_names`]) — ein eigener,
-    /// noch offener Befund außerhalb dieses Knotens. Sie sind deshalb eine
-    /// dokumentierte, keine stillschweigende Ausnahme.
+    /// `ALL` (siehe Moduldokumentation von [`role_names`]) — eigene, noch
+    /// offene Befunde außerhalb dieses Knotens. Sie sind deshalb dokumentierte,
+    /// keine stillschweigenden Ausnahmen.
     #[test]
     fn test_role_names_all_matches_discovered_role_files_minus_pending_exclusions() {
         use std::collections::BTreeSet;
@@ -2293,7 +2490,14 @@ mod tests {
         /// braucht genau `fs.*` **ohne** `shell.exec`, und ein solches
         /// Profil gab es vorher nicht. Jetzt hat sie ein Profil und einen
         /// Eintrag in `role_names::ALL` — keine Ausnahme mehr.
-        const PENDING_EXCLUSIONS: &[&str] = &["context-steward", "intel-scout"];
+        const PENDING_EXCLUSIONS: &[&str] = &[
+            "context-steward",
+            "intel-scout",
+            "cargo-worker",
+            "host-process-worker",
+            "sandbox-shell-worker",
+            "tmux-inspector-worker",
+        ];
 
         let discovered: BTreeSet<&str> = crate::embedded_agents::builtin_agent_toml()
             .iter()
@@ -2311,5 +2515,212 @@ mod tests {
              {PENDING_EXCLUSIONS:?}) — eine neue Rollendatei unter agents/ \
              wird zwar gefunden, aber ohne einen Eintrag hier nie gesenkt"
         );
+    }
+
+    // ── `assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits` ──
+    //
+    // Diese Tests decken die eigentliche Ergänzung dieses Auftrags ab: die
+    // Funktion muss `host_permits` tatsächlich an den gebauten
+    // `ShellToolProvider` durchreichen (statt es nur entgegenzunehmen), und
+    // zwar ausschließlich für `SandboxProfile::Host`. Sie führen den echten
+    // `shell.exec`-Executor aus (wie `harw-tool-shell::exec::tests`), weil nur
+    // die Ausführung selbst beweist, dass der Ledger tatsächlich erreicht
+    // wird — ein Blick auf `registered_tool_names()` allein würde die
+    // Verdrahtung nicht zeigen.
+
+    mod permits_wiring {
+        use super::*;
+        use harw_sandbox::{Permission, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+        use harw_tools::{ToolCall, ToolExecutionContext, ToolOutput};
+        use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
+        use std::time::Duration;
+
+        /// Baut eine eigenständige Workspace-Sandbox (unabhängig vom
+        /// `ProjectContext`, den `discover_project` liefert) mit genau dem
+        /// übergebenen Rechtesatz.
+        fn make_sandbox(dir: &std::path::Path, permissions: Vec<Permission>) -> SandboxSpec {
+            let ws_subdir = dir.join("project");
+            std::fs::create_dir_all(&ws_subdir).expect("project subdir must be created");
+            let registry = WorkspaceRegistry::build(
+                dir,
+                [WorkspaceRegistration {
+                    tenant: TenantId::from_str("test-tenant"),
+                    workspace: WorkspaceId::from_str("project"),
+                    root: ws_subdir,
+                }],
+            )
+            .expect("registry build must succeed");
+            let binding = registry
+                .resolve(&TenantId::from_str("test-tenant"), &WorkspaceId::from_str("project"))
+                .expect("resolve must succeed");
+            SandboxSpec::from_resolved(binding, PermissionSet::from_policy(permissions))
+        }
+
+        fn make_ctx(sandbox: SandboxSpec) -> ToolExecutionContext {
+            ToolExecutionContext::new(SessionId::new(), TurnId::new(), sandbox)
+        }
+
+        fn make_call(command: &str) -> ToolCall {
+            ToolCall {
+                id: ToolCallId::new(),
+                name: ToolName::new("shell.exec"),
+                arguments: serde_json::json!({ "command": command }),
+            }
+        }
+
+        /// Baut eine Registry über `profile_tool_providers` (über den
+        /// öffentlichen Einstiegspunkt) mit `sandbox_profile` und
+        /// `host_permits` und liefert deren `shell.exec`-Executor.
+        fn shell_executor_for(
+            sandbox_profile: &SandboxProfile,
+            host_permits: Option<(Arc<ProcessPermitLedger>, Arc<HostPermitSessionRegistry>)>,
+            project_root: &std::path::Path,
+        ) -> Arc<dyn ToolExecutor> {
+            let project = discover_project(project_root, &DiscoveryConfig::default())
+                .expect("Discovery im Tempdir");
+            let granted = PermissionSet::from_policy([Permission::ExecuteProcess]);
+            let assembled = assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits(
+                RegistryProfile::ShellExecution,
+                &project,
+                IdentityOverrides::default(),
+                ApprovalModeCell::default(),
+                &granted,
+                None,
+                sandbox_profile,
+                host_permits,
+            )
+            .expect("assemble must succeed");
+            assembled
+                .registry
+                .tool_providers()
+                .iter()
+                .find_map(|provider| provider.executor(&ToolName::new("shell.exec")))
+                .expect("shell.exec executor must be registered for ShellExecution")
+        }
+
+        #[tokio::test]
+        async fn test_and_permits_none_denies_host_execution() {
+            let project_root = make_temp_project("permits-none");
+            let executor = shell_executor_for(&SandboxProfile::Host, None, &project_root);
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess]));
+            let call = make_call("echo must_not_run");
+
+            let output = executor
+                .execute(&ctx, &call)
+                .await
+                .expect("execute must not return Err");
+
+            match output {
+                ToolOutput::Error { message } => {
+                    assert!(
+                        message.contains("host execution requires a process permit"),
+                        "without host_permits the Host profile must fail closed, got: {message:?}"
+                    );
+                }
+                other => panic!("expected Error output without permits, got: {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_and_permits_configured_but_session_not_approved_denies() {
+            let project_root = make_temp_project("permits-no-approval");
+            let ledger = Arc::new(ProcessPermitLedger::default());
+            let registry = Arc::new(HostPermitSessionRegistry::default());
+            let executor = shell_executor_for(
+                &SandboxProfile::Host,
+                Some((Arc::clone(&ledger), Arc::clone(&registry))),
+                &project_root,
+            );
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess]));
+            let call = make_call("echo must_not_run");
+
+            let output = executor
+                .execute(&ctx, &call)
+                .await
+                .expect("execute must not return Err");
+
+            match output {
+                ToolOutput::Error { message } => {
+                    assert!(
+                        message.contains("requires local UI approval"),
+                        "with a ledger but no session approval, denial must name the \
+                         missing approval, got: {message:?}"
+                    );
+                }
+                other => panic!("expected Error output without session approval, got: {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_and_permits_configured_and_session_approved_passes_permit_boundary() {
+            let project_root = make_temp_project("permits-approved");
+            let ledger = Arc::new(ProcessPermitLedger::default());
+            let registry = Arc::new(HostPermitSessionRegistry::default());
+            let executor = shell_executor_for(
+                &SandboxProfile::Host,
+                Some((Arc::clone(&ledger), Arc::clone(&registry))),
+                &project_root,
+            );
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess]));
+            registry.mark_session_approved(ctx.session_id().as_str(), Duration::from_secs(60));
+            let call = make_call("echo host_ok");
+
+            let output = executor
+                .execute(&ctx, &call)
+                .await
+                .expect("execute must not return Err");
+
+            // Der Permit-Grenzfehler darf nach der Zustimmung nicht mehr
+            // auftreten; ein verbleibender Fehler darf nur noch von der
+            // fehlenden Bubblewrap-Sandbox in der Testumgebung stammen.
+            match &output {
+                ToolOutput::Error { message } => {
+                    assert!(
+                        !message.contains("process permit") && !message.contains("UI approval"),
+                        "a session-approved host command must pass the permit boundary, \
+                         got: {message:?}"
+                    );
+                }
+                ToolOutput::Json { .. } | ToolOutput::Text { .. } => {}
+            }
+        }
+
+        #[tokio::test]
+        async fn test_and_permits_is_ignored_for_non_host_sandbox_profile() {
+            // Selbst wenn Ledger+Registry übergeben werden, dürfen sie nur an
+            // ein `SandboxProfile::Host`-Provider gehängt werden: für Strict
+            // ist die Sandbox die Grenze, nicht der Permit — die Ausführung
+            // darf deshalb nie mit einer Permit-Fehlermeldung scheitern.
+            let project_root = make_temp_project("permits-strict-ignored");
+            let ledger = Arc::new(ProcessPermitLedger::default());
+            let registry = Arc::new(HostPermitSessionRegistry::default());
+            let executor = shell_executor_for(
+                &SandboxProfile::Strict,
+                Some((ledger, registry)),
+                &project_root,
+            );
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess]));
+            let call = make_call("echo strict_mode_ok");
+
+            let output = executor
+                .execute(&ctx, &call)
+                .await
+                .expect("execute must not return Err");
+
+            match &output {
+                ToolOutput::Error { message } => {
+                    assert!(
+                        !message.contains("host execution requires a process permit")
+                            && !message.contains("requires local UI approval"),
+                        "Strict profile must never trigger a permit denial, got: {message:?}"
+                    );
+                }
+                ToolOutput::Json { .. } | ToolOutput::Text { .. } => {}
+            }
+        }
     }
 }
