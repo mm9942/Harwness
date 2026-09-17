@@ -28,12 +28,14 @@
 //!    [`ApprovalChain::for_child`] in **jede** Kind-Registry.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 
 use harw_agent_dsl::ExecutableAgentIr;
 use harw_config::{InternalModelPoint, ResolvedInternalModel, resolve_internal_model};
-use harw_core::{ChildRegistryFactory, ModelProvider, PinnedModelProvider};
-use harw_extension_api::{AgentSpawnError, ExtensionRegistry, SpawnInput};
+use harw_core::{ChildRegistryFactory, ManagedAgentSpawner, ModelProvider, PinnedModelProvider};
+use harw_extension_api::{
+    AgentSpawnError, AgentSpawner, ExtensionRegistry, SpawnFuture, SpawnInput,
+};
 use harw_project_discovery::ProjectContext;
 use harw_registry_defaults::embedded_agents::builtin_agent_definitions;
 use harw_registry_defaults::profile::{
@@ -191,6 +193,14 @@ pub struct RuntimeChildRegistryFactory {
     /// Profil ermittelbar war; nur für [`role_names::AGENT_STEWARD`]
     /// relevant ([`Self::build_registry_with_capabilities_for_parent`]).
     profile_agents_dir: Option<std::path::PathBuf>,
+    /// Die aufgelöste `[browser]`-Konfiguration des Elternlaufs. Sie wird nur
+    /// für die exklusive `uia-worker`-Registry ausgewertet.
+    browser: harw_config::BrowserSection,
+    /// Rückwärtsreferenz auf den fertigen Managed-Spawner. Sie erlaubt auch
+    /// einem gestarteten Root-Orchestrator, seine eigenen Kinder zu starten,
+    /// obwohl die Kind-Registry gebaut wird, bevor der Spawner selbst in der
+    /// Assembly vollständig konstruiert ist.
+    spawner_slot: Arc<OnceLock<Weak<ManagedAgentSpawner>>>,
 }
 
 impl std::fmt::Debug for RuntimeChildRegistryFactory {
@@ -266,6 +276,8 @@ impl RuntimeChildRegistryFactory {
             chain,
             internal_models: HashMap::new(),
             profile_agents_dir: None,
+            browser: harw_config::BrowserSection::default(),
+            spawner_slot: Arc::new(OnceLock::new()),
         }
     }
 
@@ -311,6 +323,23 @@ impl RuntimeChildRegistryFactory {
     #[must_use]
     pub fn with_profile_agents_dir(mut self, profile_agents_dir: Option<std::path::PathBuf>) -> Self {
         self.profile_agents_dir = profile_agents_dir;
+        self
+    }
+
+    /// Übernimmt die aufgelöste `[browser]`-Konfiguration des Elternlaufs.
+    #[must_use]
+    pub fn with_browser_config(mut self, browser: harw_config::BrowserSection) -> Self {
+        self.browser = browser;
+        self
+    }
+
+    /// Verbindet die Kind-Registries mit dem später fertig gebauten Spawner.
+    #[must_use]
+    pub fn with_spawner_slot(
+        mut self,
+        spawner_slot: Arc<OnceLock<Weak<ManagedAgentSpawner>>>,
+    ) -> Self {
+        self.spawner_slot = spawner_slot;
         self
     }
 
@@ -401,9 +430,25 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         // hat die `DefaultApprovalPolicy` über `child_chain.mode()` bereits
         // registriert (harw-registry-defaults/src/profile.rs:921-922). Eine
         // zweite wäre wirkungsgleich, aber eine Dublette (Befund Z2c-06).
-        let registry = child_chain
+        let mut registry_builder = child_chain
             .install_over_default(assembled.registry)
-            .build();
+            .spawner(Arc::new(DeferredManagedSpawner {
+                slot: Arc::clone(&self.spawner_slot),
+            }));
+        #[cfg(feature = "browser")]
+        if role == role_names::UIA_WORKER {
+            let browser_provider =
+                harw_registry_defaults::profile::browser_tool_provider_for_config(&self.browser)
+                    .map_err(|error| AgentSpawnError {
+                        message: format!(
+                            "could not assemble browser provider for role '{role}': {error}"
+                        ),
+                    })?;
+            if let Some(provider) = browser_provider {
+                registry_builder = registry_builder.tool_provider(provider);
+            }
+        }
+        let registry = registry_builder.build();
         tracing::debug!(
             role,
             profile = ?profile,
@@ -584,7 +629,12 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
                 message: format!("could not assemble child registry for role '{role}': {error}"),
             })?;
         // `install_over_default`: siehe Begründung in `build_registry`.
-        let registry = child_chain.install_over_default(assembled.registry).build();
+        let registry = child_chain
+            .install_over_default(assembled.registry)
+            .spawner(Arc::new(DeferredManagedSpawner {
+                slot: Arc::clone(&self.spawner_slot),
+            }))
+            .build();
         tracing::debug!(
             role,
             profile = ?profile,
@@ -593,6 +643,68 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
             "runtime.child_registry.agent_steward_assembled_for_parent"
         );
         Ok(registry)
+    }
+}
+
+/// Spawner-Adapter für Kind-Registries.
+///
+/// Die Runtime baut die Registry eines Kindes vor dem `ManagedAgentSpawner`,
+/// der diese Registry-Fabrik besitzt. Ein `OnceLock<Weak<_>>` schließt diesen
+/// Zyklus ohne starke Referenzschleife und ohne eine unautorisierte Fallback-
+/// Implementierung. Ist der Spawner noch nicht verbunden, schlägt der Aufruf
+/// explizit fehl.
+struct DeferredManagedSpawner {
+    slot: Arc<OnceLock<Weak<ManagedAgentSpawner>>>,
+}
+
+impl AgentSpawner for DeferredManagedSpawner {
+    fn spawn_child<'a>(
+        &'a self,
+        role: &'a str,
+        input: SpawnInput,
+        sandbox: harw_sandbox::SandboxSpec,
+        suggestions: Option<harw_catalog::AgentSuggestions>,
+    ) -> SpawnFuture<'a> {
+        Box::pin(async move {
+            let spawner = self
+                .slot
+                .get()
+                .and_then(Weak::upgrade)
+                .ok_or_else(|| AgentSpawnError {
+                    message: "managed child spawner is not available".to_owned(),
+                })?;
+            spawner.spawn_child(role, input, sandbox, suggestions).await
+        })
+    }
+
+    fn child_finished(&self, child: &harw_types::SessionId) {
+        if let Some(spawner) = self.slot.get().and_then(Weak::upgrade) {
+            spawner.child_finished(child);
+        }
+    }
+
+    fn child_completed(
+        &self,
+        child: &harw_types::SessionId,
+        completed_at: jiff::Timestamp,
+    ) -> Result<(), AgentSpawnError> {
+        let spawner = self
+            .slot
+            .get()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| AgentSpawnError {
+                message: "managed child spawner is not available".to_owned(),
+            })?;
+        spawner.child_completed(child, completed_at)
+    }
+
+    fn delegation_target_names(&self, parent_session_id: &harw_types::SessionId) -> Vec<String> {
+        self.slot
+            .get()
+            .and_then(Weak::upgrade)
+            .map_or_else(Vec::new, |spawner| {
+                spawner.delegation_target_names(parent_session_id)
+            })
     }
 }
 

@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+default = ["browser"]
+browser = ["harw-registry-defaults/browser"]
+
 [dependencies]
 # Gemeinsame Runtime-Montage (L12): darf nur von `harw-tui` und `harw-cli`
 # genutzt werden, sonst entsteht ein Zyklus.

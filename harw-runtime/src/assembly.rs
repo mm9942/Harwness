@@ -74,7 +74,10 @@ use harw_extension_api::allow_rules::{AllowRuleSet, ApprovalRule, RuleDecision, 
 use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
 use harw_extension_api::contributors::{ApprovalHandlerKind, ContextProvider, ExtFuture};
 use harw_extension_api::types::{ContextFragment, TurnInputContext};
-use harw_extension_api::{ApprovalHandler, ExtensionRegistry, ExtensionRegistryBuilder, ToolName};
+use harw_extension_api::{
+    ApprovalHandler, ExtensionRegistry, ExtensionRegistryBuilder, ToolName,
+    capabilities::AgentSpawner,
+};
 use harw_home::paths::{active_profile_name, profile_dir};
 use harw_home::project::{
     ProjectHome, ProjectRoot, discover_project as discover_home_project, project_key,
@@ -95,8 +98,8 @@ use harw_registry_defaults::profile::{
     IdentityOverrides, RegistryProfile, assemble_registry_for_project, role_names,
 };
 use harw_sandbox::{
-    ExtraRootsCell, NetworkScope, PermissionSet, SandboxSpec, WorkspaceRegistration,
-    WorkspaceRegistry,
+    ExtraRootsCell, HostPermitSessionRegistry, NetworkScope, PermissionSet, ProcessPermitLedger,
+    SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
 };
 use harw_session_store::{ApprovalStore, JobStore};
 use harw_types::{AgentRole, ModelId, Principal, ProviderId, SessionId, TenantId, TurnId, WorkspaceId};
@@ -359,6 +362,66 @@ fn load_project_permissions(home: &Path, profile: &str, key: &str) -> Permission
             PermissionsSection::default()
         }
     }
+}
+
+/// Baut ein [`SandboxProfile`] aus der vertrauenswürdigen
+/// `[sandbox]`-Konfiguration.
+///
+/// # Beschreibung
+/// Standard ist [`SandboxProfile::Strict`]: hermetische Bubblewrap-Sandbox.
+/// Ein konfiguriertes Cargo-Modul wird aktiviert, wenn die Validierung
+/// durchgeht; ein Fehler wird geloggt und das Modul fällt auf Strict zurück
+/// (fail-safe, nicht fail-closed — die Sandbox bleibt hermetisch).
+/// Ein konfiguriertes tmux-Modul verhält sich analog.
+///
+/// Diese Funktion ist der einzige Ort, an dem ein Sandbox-Profil aus
+/// Konfiguration entsteht. Das Profil ist ein vertrauenswürdiger
+/// Runtime-Input und wird an die Registry weitergegeben, nie an ein Tool.
+fn sandbox_profile_from_config(section: &harw_config::SandboxSection) -> harw_sandbox::SandboxProfile {
+    use harw_config::{CargoSandboxModeToml, TmuxOperationModeToml};
+    use harw_sandbox::{CargoExecutionMode, SandboxProfile};
+
+    // Cargo-Modul
+    if let Some(cargo) = &section.cargo {
+        let mode = match cargo.mode {
+            CargoSandboxModeToml::Inspect => CargoExecutionMode::Inspect,
+            CargoSandboxModeToml::BuildOffline => CargoExecutionMode::BuildOffline,
+            CargoSandboxModeToml::Fetch => CargoExecutionMode::Fetch,
+        };
+        match harw_sandbox::CargoSandboxProfile::new(
+            mode,
+            &cargo.cargo_bin,
+            &cargo.rustup_home,
+            &cargo.cargo_home,
+        ) {
+            Ok(profile) => return SandboxProfile::Cargo(profile),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "runtime.sandbox.cargo_profile_invalid"
+                );
+            }
+        }
+    }
+
+    // tmux-Modul
+    if let Some(tmux) = &section.tmux {
+        let mode = match tmux.mode {
+            TmuxOperationModeToml::Inspect => harw_sandbox::TmuxOperationMode::Inspect,
+            TmuxOperationModeToml::Write => harw_sandbox::TmuxOperationMode::Write,
+        };
+        match harw_sandbox::TmuxSandboxProfile::new(mode, &tmux.socket_path) {
+            Ok(profile) => return SandboxProfile::Tmux(profile),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "runtime.sandbox.tmux_profile_invalid"
+                );
+            }
+        }
+    }
+
+    SandboxProfile::Strict
 }
 
 /// Der effektive Vorgabe-Freigabemodus eines Laufs (Contract §2).
@@ -1595,9 +1658,18 @@ impl RuntimeAssemblyBuilder {
         // (Rolle der aktiven UIA-IR bzw. `root_organizational_role(...)`) —
         // beide dürfen nie auseinanderlaufen.
         overrides.organizational_role = Some(spawn_context.organizational_role);
+        // Trägt das Agent-Verzeichnis der aktiven UIA, damit
+        // `uia_self.update_document` (siehe `harw_registry_defaults::
+        // agent_definition_tools::UiaSelfDocumentToolProvider`) nach dem Bau
+        // der Registry an genau dieses Verzeichnis gebunden werden kann.
+        // `None`, solange kein `uia_ir` aktiv ist oder ihr Verzeichnis nicht
+        // auflösbar ist — dann bleibt das Werkzeug ungeregistriert (kein
+        // eigenes `identity.md`/`USER.md`/`Personality.md` ohne UIA-Wurzel).
+        let mut uia_agent_dir_for_self_document: Option<PathBuf> = None;
         if let Some(uia) = uia_ir.as_ref() {
             let definition_id = uia.id().to_string();
             if let Some(agent_dir) = config.agent_definition_dirs.get(&definition_id) {
+                uia_agent_dir_for_self_document = Some(agent_dir.clone());
                 let fragments = harw_config::load_uia_personalization(agent_dir).map_err(|error| {
                     RuntimeError::Registry {
                         detail: format!(
@@ -1624,6 +1696,19 @@ impl RuntimeAssemblyBuilder {
         // [`RoleEffortWeights::uia`](role_effort_weights). `mode` ist immer
         // `Commit`: nur die UIA selbst darf Vorschläge committen/verwerfen
         // (Nachtrag K2).
+        // Sandbox-Profil aus vertrauenswürdiger Host-Konfiguration.
+        // Standard: Strict (hermetisch). Cargo/tmux werden nur aktiviert,
+        // wenn die Konfiguration sie liefert und die Validierung durchgeht.
+        let sandbox_profile = sandbox_profile_from_config(&config.harness.sandbox);
+        // Einmal je Montage instanziiert (siehe `host_permit_session.rs`-Doku
+        // in `harw-sandbox`): trägt jede über die lokale UI bestätigte
+        // Host-Freigabe dieses Laufs. Für Strict/Cargo/Tmux ohne
+        // `SandboxProfile::Host` bleibt beides ungenutzt — `profile_tool_providers`
+        // hängt Ledger/Registry nur an einen tatsächlich Host-profilierten
+        // `ShellToolProvider`.
+        let host_permit_ledger = Arc::new(ProcessPermitLedger::default());
+        let host_permit_registry = Arc::new(HostPermitSessionRegistry::default());
+
         let assembled = if uia_ir.is_some() {
             let default_model_id = config.harness.default_model.as_deref().unwrap_or_default();
             let ceiling = harw_registry_defaults::agent_definition_tools::DefinitionAuthorCeiling {
@@ -1644,20 +1729,36 @@ impl RuntimeAssemblyBuilder {
                 mode: harw_registry_defaults::agent_definition_tools::DefinitionWriteMode::Commit,
                 ceiling: Some(ceiling),
             };
-            harw_registry_defaults::profile::assemble_registry_for_project_with_definition_access(
-                registry_profile,
-                &registry_project_context(&project, &profile, narrowed_root),
-                overrides,
-                chain.mode().clone(),
-                Some(access),
-            )
+            {
+                // Fuer die UIA-Wurzel: Profil weiterreichen.
+                let project_ctx = registry_project_context(&project, &profile, narrowed_root);
+                let granted = registry_profile.required_permissions();
+                harw_registry_defaults::profile::assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits(
+                    registry_profile,
+                    &project_ctx,
+                    overrides,
+                    chain.mode().clone(),
+                    &granted,
+                    Some(access),
+                    &sandbox_profile,
+                    Some((Arc::clone(&host_permit_ledger), Arc::clone(&host_permit_registry))),
+                )
+            }
         } else {
-            assemble_registry_for_project(
-                registry_profile,
-                &registry_project_context(&project, &profile, narrowed_root),
-                overrides,
-                chain.mode().clone(),
-            )
+            {
+                let project_ctx = registry_project_context(&project, &profile, narrowed_root);
+                let granted = registry_profile.required_permissions();
+                harw_registry_defaults::profile::assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits(
+                    registry_profile,
+                    &project_ctx,
+                    overrides,
+                    chain.mode().clone(),
+                    &granted,
+                    None,
+                    &sandbox_profile,
+                    Some((Arc::clone(&host_permit_ledger), Arc::clone(&host_permit_registry))),
+                )
+            }
         }
         .map_err(|error| RuntimeError::Registry {
             detail: format!("could not assemble the root registry: {error}"),
@@ -1666,7 +1767,20 @@ impl RuntimeAssemblyBuilder {
         // `DefaultApprovalPolicy` über `chain.mode()` gerade selbst registriert
         // (harw-registry-defaults/src/profile.rs:921-922) — eine zweite wäre
         // eine Dublette (Befund Z2c-06).
-        let registry_builder = chain.install_over_default(assembled.registry);
+        let mut registry_builder = chain.install_over_default(assembled.registry);
+        // Nur die UIA-Wurzel bekommt `uia_self.update_document` — ein
+        // Root-Orchestrator-/Worker-Einstieg (kein `uia_agent_dir_for_self_document`)
+        // hat kein eigenes `identity.md`/`USER.md`/`Personality.md`, das dieses
+        // Werkzeug pflegen könnte (Structure Plan §4: nur `role =
+        // "user-interface"`).
+        if let Some(agent_dir) = uia_agent_dir_for_self_document {
+            registry_builder = registry_builder.tool_provider(Arc::new(
+                harw_registry_defaults::agent_definition_tools::UiaSelfDocumentToolProvider::new(
+                    agent_dir,
+                    AgentRoleId::UserInterface,
+                ),
+            ));
+        }
 
         // 7b. Plan-Dienste: expliziter Builder-Wert gewinnt; sonst eingebaute
         //     Vorgabe für interaktive TUI-Einstiege, sofern `[tools.plan]`
@@ -1716,6 +1830,15 @@ impl RuntimeAssemblyBuilder {
             },
             session_events,
         )?;
+        // Die Root-Registry erhält den echten ManagedAgentSpawner. Nur
+        // Kind-Registries verwenden den schwachen Deferred-Adapter; dadurch
+        // kann ein Root-Orchestrator weiter delegieren, ohne einen
+        // Referenzzyklus zwischen Registry, Spawner und Factory zu erzeugen.
+        if let Some(spawner) = spawner.as_ref() {
+            let managed_spawner = Arc::clone(spawner);
+            let spawner: Arc<dyn AgentSpawner> = managed_spawner;
+            registry_builder = registry_builder.spawner(spawner);
+        }
         // Addendum F+G ("Zombies"): der periodische Kind-Reaper braucht eine
         // laufende Tokio-Runtime — geprüft **hier**, nicht in
         // `guard_wiring::spawn_child_reaper` selbst (dessen `tokio::task::spawn`
@@ -1908,6 +2031,8 @@ impl RuntimeAssemblyBuilder {
             pitfall_advisor,
             registry: Mutex::new(Some(registry)),
             responder: Mutex::new(None),
+            host_permit_ledger,
+            host_permit_registry,
         })
     }
 }
@@ -2631,6 +2756,7 @@ fn build_spawner(
             .to_owned(),
     })?;
 
+    let spawner_slot = Arc::new(std::sync::OnceLock::new());
     let factory: Arc<dyn ChildRegistryFactory> =
         Arc::new(
             RuntimeChildRegistryFactory::with_definitions(
@@ -2642,7 +2768,9 @@ fn build_spawner(
             .with_internal_models(crate::children::resolve_internal_models_for_children(
                 config,
             ))
-            .with_profile_agents_dir(profile_agents_dir),
+            .with_profile_agents_dir(profile_agents_dir)
+            .with_browser_config(config.browser.clone())
+            .with_spawner_slot(Arc::clone(&spawner_slot)),
         );
 
     let model_id = config.harness.default_model.as_deref().unwrap_or_default();
@@ -2693,7 +2821,14 @@ fn build_spawner(
             detail: format!("could not register the trusted runtime root parent: {error}"),
         })?;
 
-    Ok((Some(Arc::new(spawner)), roles))
+    let spawner = Arc::new(spawner);
+    spawner_slot
+        .set(Arc::downgrade(&spawner))
+        .map_err(|_| RuntimeError::Spawner {
+            detail: "managed child spawner slot was initialized twice".to_owned(),
+        })?;
+
+    Ok((Some(spawner), roles))
 }
 
 /// Die fertige Montage eines Laufs.
@@ -2768,6 +2903,12 @@ pub struct RuntimeAssembly {
     pitfall_advisor: Option<Arc<dyn PitfallAdvisor>>,
     registry: Mutex<Option<ExtensionRegistry>>,
     responder: Mutex<Option<Arc<dyn ApprovalHandler>>>,
+    /// Einmal je Montage instanziierter Permit-Ledger für Host-Profil-Worker
+    /// (siehe [`harw_sandbox::ProcessPermitLedger`], `host-process-worker.toml`).
+    host_permit_ledger: Arc<ProcessPermitLedger>,
+    /// Sitzungsseitige Zuordnung von UI-Zustimmungen zu bereits ausgestellten
+    /// Host-Permits dieses Laufs (siehe [`harw_sandbox::HostPermitSessionRegistry`]).
+    host_permit_registry: Arc<HostPermitSessionRegistry>,
 }
 
 impl std::fmt::Debug for RuntimeAssembly {
@@ -2827,6 +2968,63 @@ impl RuntimeAssembly {
     #[must_use]
     pub fn config(&self) -> &Arc<ResolvedConfig> {
         &self.config
+    }
+
+    /// Der einmal je Montage instanziierte Permit-Ledger für Host-Profil-
+    /// Worker (siehe [`harw_sandbox::ProcessPermitLedger`]).
+    ///
+    /// # Beschreibung
+    /// Wird von [`harw_registry_defaults::profile::assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits`]
+    /// an jeden `ShellToolProvider` gehängt, dessen `sandbox_profile`
+    /// tatsächlich [`harw_sandbox::SandboxProfile::Host`] ist. Konsumenten,
+    /// die außerhalb dieser Montage selbst einen Host-Profil-Worker bauen
+    /// (z. B. eine künftige Sub-Worker-Fanin-Stelle), müssen dieselbe Arc
+    /// verwenden — ein zweiter, unabhängig instanziierter Ledger hätte keine
+    /// Kenntnis von den über [`Self::host_permit_session_registry`]
+    /// gemerkten Sitzungszustimmungen.
+    ///
+    /// # Returns
+    /// Eine Referenz auf den geteilten `Arc<`[`harw_sandbox::ProcessPermitLedger`]`>`
+    /// dieses Laufs — derselbe Zeiger für die gesamte Lebensdauer der
+    /// Montage, nie neu instanziiert.
+    ///
+    /// # Concurrency
+    /// `Send + Sync`; der Ledger selbst kapselt seine eigene Synchronisierung.
+    /// Ein `Arc::clone` dieser Referenz ist die vorgesehene Art, den Ledger an
+    /// einen neu gebauten `ShellToolProvider` weiterzugeben.
+    #[must_use]
+    pub fn host_permit_ledger(&self) -> &Arc<ProcessPermitLedger> {
+        &self.host_permit_ledger
+    }
+
+    /// Die sitzungsseitige Zuordnung von UI-Zustimmungen zu bereits
+    /// ausgestellten Host-Permits dieses Laufs (siehe
+    /// [`harw_sandbox::HostPermitSessionRegistry`]).
+    ///
+    /// # Beschreibung
+    /// Die lokale Bestätigungs-UI (`harw-tui`) ruft
+    /// [`harw_sandbox::HostPermitSessionRegistry::mark_session_approved`] auf
+    /// dieser Instanz auf, sobald ein Nutzer einer Host-Profil-Anfrage
+    /// zustimmt; `harw_tool_shell::ShellExecutor` liest dieselbe Instanz
+    /// über `with_host_permit_registry`, um weitere Befehle derselben Sitzung
+    /// ohne erneute Rückfrage zu autorisieren.
+    ///
+    /// # Returns
+    /// Eine Referenz auf den geteilten `Arc<`[`harw_sandbox::HostPermitSessionRegistry`]`>`
+    /// dieses Laufs — derselbe Zeiger für die gesamte Lebensdauer der
+    /// Montage. Wie der gesamte Permit-Ledger lebt dieser Zustand
+    /// ausschließlich im Speicher dieses Prozesses (kein anderer `harw`-Prozess
+    /// sieht ihn, siehe `harw_sandbox::HostPermitSessionRegistry`-Moduldoku).
+    ///
+    /// # Concurrency
+    /// `Send + Sync`; die Registry kapselt ihre eigene Synchronisierung
+    /// (ein `Mutex` je Registry, siehe `harw_sandbox::HostPermitSessionRegistry`).
+    /// Ein `Arc::clone` dieser Referenz ist die vorgesehene Art, sie an einen
+    /// neu gebauten `ShellToolProvider` oder den Bestätigungsdialog
+    /// weiterzugeben.
+    #[must_use]
+    pub fn host_permit_session_registry(&self) -> &Arc<HostPermitSessionRegistry> {
+        &self.host_permit_registry
     }
 
     /// Der Vertrauensbericht der Konfigurationsschichten.

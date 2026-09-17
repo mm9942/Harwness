@@ -208,6 +208,7 @@ mod tests {
                 enabled: true,
                 origin_allowlist: OriginAllowlistToml::default(),
                 rate_limit: None,
+                max_concurrency: None,
             },
         );
         config
