@@ -1005,6 +1005,7 @@ fn legacy_provider(name: &str, enabled: bool) -> Option<ProviderToml> {
             enabled,
             origin_allowlist: Default::default(),
             rate_limit: None,
+            max_concurrency: None,
         }),
         _ => None,
     }

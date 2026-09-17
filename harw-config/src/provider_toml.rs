@@ -35,6 +35,14 @@ pub struct ProviderToml {
     /// Override (deaktiviert, siehe [`RateLimitToml::default`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimitToml>,
+    /// Harte Obergrenze gleichzeitig in Flug befindlicher Requests an
+    /// diesen Provider; `None` = unbegrenzt. Anders als `rate_limit`
+    /// (reaktives Header-Pacing) ist dies ein rein client-seitiger
+    /// Zähler, der zusätzliche Requests blockiert statt sie fehlschlagen
+    /// zu lassen. `Some(0)` ist ungültig (siehe [`Self::validate`]) und
+    /// würde jeden Request auf ewig blockieren.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<usize>,
 }
 
 impl ProviderToml {
@@ -66,9 +74,13 @@ impl ProviderToml {
     /// (`env:`/`file:`/`file-json:`/`keyring:`/`secrets:`) sein, nie Klartext.
     ///
     /// # Errors
-    /// [`ConfigError::PlaintextSecret`] mit Header-Namen als Feld; der Wert
-    /// erscheint nie im Fehler. Bei mehreren Verstößen wird der lexikographisch
-    /// kleinste Header-Name gemeldet (deterministisch trotz `HashMap`).
+    /// - [`ConfigError::PlaintextSecret`]: Header mit Credential-Namen ist
+    ///   Klartext statt einer [`SecretRef`]; der Wert erscheint nie im
+    ///   Fehler. Bei mehreren Verstößen wird der lexikographisch kleinste
+    ///   Header-Name gemeldet (deterministisch trotz `HashMap`).
+    /// - [`ConfigError::Invalid`]: `max_concurrency` ist auf `Some(0)`
+    ///   gesetzt, was jeden Request an diesen Provider für immer blockieren
+    ///   würde (fast sicher ein Tippfehler statt beabsichtigtes Verhalten).
     pub fn validate(&self) -> ConfigResult<()> {
         let mut headers: Vec<(&String, &String)> = self.headers.iter().collect();
         headers.sort_by(|left, right| left.0.cmp(right.0));
@@ -79,6 +91,12 @@ impl ProviderToml {
                     field: format!("headers.{name}"),
                 });
             }
+        }
+        if self.max_concurrency == Some(0) {
+            return Err(ConfigError::Invalid(format!(
+                "provider '{}': max_concurrency = 0 would block every request forever; omit the field for unlimited concurrency or set it to a positive value",
+                self.name
+            )));
         }
         Ok(())
     }
@@ -266,5 +284,83 @@ mod tests {
         "#;
         let provider: ProviderToml = toml::from_str(src).unwrap();
         assert!(provider.rate_limit.is_none());
+    }
+
+    #[test]
+    fn test_provider_with_max_concurrency_round_trips() {
+        let src = r#"
+            name = "workers-ai"
+            api = "openai-chat"
+            base_url = "https://gateway.example/v1"
+            max_concurrency = 3
+        "#;
+        let provider: ProviderToml = toml::from_str(src).unwrap();
+        assert_eq!(provider.max_concurrency, Some(3));
+        provider.validate().expect("max_concurrency = 3 is valid");
+    }
+
+    #[test]
+    fn test_provider_without_max_concurrency_is_none() {
+        let src = r#"
+            name = "openai"
+            api = "openai-chat"
+            base_url = "https://api.openai.com/v1"
+        "#;
+        let provider: ProviderToml = toml::from_str(src).unwrap();
+        assert!(provider.max_concurrency.is_none());
+        provider.validate().expect("absent max_concurrency is valid (unbounded)");
+    }
+
+    #[test]
+    fn test_provider_with_max_concurrency_one_round_trips() {
+        let src = r#"
+            name = "workers-ai"
+            api = "openai-chat"
+            base_url = "https://gateway.example/v1"
+            max_concurrency = 1
+        "#;
+        let provider: ProviderToml = toml::from_str(src).unwrap();
+        assert_eq!(provider.max_concurrency, Some(1));
+        provider
+            .validate()
+            .expect("max_concurrency = 1 is the strictest valid value (fully serialized)");
+    }
+
+    #[test]
+    fn test_provider_with_max_concurrency_and_rate_limit_both_set_no_interaction() {
+        let src = r#"
+            name = "workers-ai"
+            api = "openai-chat"
+            base_url = "https://gateway.example/v1"
+            max_concurrency = 4
+
+            [rate_limit]
+            enabled = true
+            safety_margin_pct = 20
+        "#;
+        let provider: ProviderToml = toml::from_str(src).unwrap();
+        assert_eq!(provider.max_concurrency, Some(4));
+        let rate_limit = provider
+            .rate_limit
+            .clone()
+            .expect("rate_limit section present alongside max_concurrency");
+        assert!(rate_limit.enabled);
+        assert_eq!(rate_limit.safety_margin_pct, 20);
+        provider
+            .validate()
+            .expect("max_concurrency and rate_limit are independent and both valid together");
+    }
+
+    #[test]
+    fn test_validate_rejects_max_concurrency_zero() {
+        let src = r#"
+            name = "workers-ai"
+            api = "openai-chat"
+            base_url = "https://gateway.example/v1"
+            max_concurrency = 0
+        "#;
+        let provider: ProviderToml = toml::from_str(src).unwrap();
+        let error = provider.validate().unwrap_err();
+        assert!(matches!(error, ConfigError::Invalid(ref msg) if msg.contains("max_concurrency")));
     }
 }

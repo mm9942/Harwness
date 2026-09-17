@@ -8,14 +8,46 @@ pub fn load_system_prompt(agent_dir: &Path, system_file: Option<&str>) -> Config
     read_optional_file(&path)
 }
 
-/// Lädt die beiden benutzerpflegbaren UIA-Kontextdateien aus deren Agentenordner.
+/// Lädt den freien Identitätstext einer UIA aus `identity.md` in ihrem
+/// Agentenordner.
 ///
-/// `Personality.md` prägt ausschließlich Ton, Persönlichkeit und
-/// Antwortverhalten. `USER.md` enthält persönlichen Kontext über den Nutzer.
-/// Beide Dateien bleiben optional und werden als getrennte, gekennzeichnete
-/// Modellkontext-Fragmente zurückgegeben; technische Autorisierung kommt
-/// weiterhin ausschließlich aus `definition.toml`, Runtime und Sandbox.
+/// # Description
+/// `identity.md` beantwortet *wer/was ist der Agent selbst* (Name, Herkunft,
+/// Selbstverständnis, Abgrenzung zu anderen UIAs) — stabil, ändert sich
+/// selten. Das unterscheidet sie von `Personality.md` (Ton/Antwortverhalten)
+/// und von `USER.md` (Kontext über den Nutzer). Analog zu
+/// [`load_system_prompt`]: reiner Volltext-Read über [`configured_file_path`]
+/// + [`read_optional_file`], keine Zeilen-Interpretation (im Gegensatz zu
+/// [`load_uia_user_name`]), weil `identity.md` freie Prosa ist.
+///
+/// # Arguments
+/// - `agent_dir` (`&Path`): der Agentenordner der UIA.
+///
+/// # Returns
+/// Den vollständigen Dateiinhalt, oder einen leeren `String`, wenn
+/// `identity.md` fehlt ("fehlt" ist kein Fehler, siehe `read_optional_file`).
+///
+/// # Errors
+/// - [`ConfigError::Invalid`]: wenn `identity.md` (konstant, kein
+///   Aufrufer-Parameter) dennoch einen Pfad-Traversal-Versuch ergäbe (nur
+///   über einen manipulierten Symlink im Agentenordner erreichbar).
+/// - [`ConfigError::ReadFailed`]: bei jedem I/O-Fehler außer "nicht gefunden".
+pub fn load_uia_identity(agent_dir: &Path) -> ConfigResult<String> {
+    let path = configured_file_path(agent_dir, "identity.md", "identity.md")?;
+    read_optional_file(&path)
+}
+
+/// Lädt die drei benutzerpflegbaren UIA-Kontextdateien aus deren Agentenordner.
+///
+/// `identity.md` beantwortet, wer der Agent selbst ist (siehe
+/// [`load_uia_identity`]). `Personality.md` prägt ausschließlich Ton,
+/// Persönlichkeit und Antwortverhalten. `USER.md` enthält persönlichen
+/// Kontext über den Nutzer. Alle drei Dateien bleiben optional und werden als
+/// getrennte, gekennzeichnete Modellkontext-Fragmente zurückgegeben, in der
+/// Reihenfolge Identität → Ton → Nutzerkontext; technische Autorisierung
+/// kommt weiterhin ausschließlich aus `definition.toml`, Runtime und Sandbox.
 pub fn load_uia_personalization(agent_dir: &Path) -> ConfigResult<Vec<String>> {
+    let identity = load_uia_identity(agent_dir)?;
     let personality = read_optional_file(&configured_file_path(
         agent_dir,
         "Personality.md",
@@ -24,6 +56,9 @@ pub fn load_uia_personalization(agent_dir: &Path) -> ConfigResult<Vec<String>> {
     let user = read_optional_file(&configured_file_path(agent_dir, "USER.md", "USER.md")?)?;
 
     let mut fragments = Vec::new();
+    if !identity.trim().is_empty() {
+        fragments.push(format!("# UIA-Identität\n{identity}"));
+    }
     if !personality.trim().is_empty() {
         fragments.push(format!(
             "# UIA-Persönlichkeit und Antwortverhalten\n{personality}"
@@ -56,7 +91,16 @@ fn user_name_from_line(line: &str) -> Option<String> {
         return None;
     }
 
-    let value = value.trim().trim_matches(['"', '\'']).trim();
+    // Der Wert kann das schließende `**` der Markdown-Hervorhebung tragen
+    // (z. B. `- **Name:** Mia` → Wert `** Mia`, da der erste `:` bereits
+    // innerhalb der Hervorhebung liegt) — deshalb dieselbe `*`-Bereinigung
+    // wie beim Label.
+    let value = value
+        .trim()
+        .trim_matches(['"', '\''])
+        .trim()
+        .trim_matches('*')
+        .trim();
     (!value.is_empty() && !value.chars().any(char::is_control)).then(|| value.to_owned())
 }
 
@@ -266,6 +310,60 @@ mod tests {
         );
         fs::remove_dir_all(&skill_directory).unwrap();
         fs::remove_dir_all(&outside_directory).unwrap();
+    }
+
+    #[test]
+    fn load_uia_identity_missing_file_returns_empty() {
+        let directory = test_directory();
+        assert!(load_uia_identity(&directory).unwrap().is_empty());
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn load_uia_identity_present_returns_content() {
+        let directory = test_directory();
+        fs::write(directory.join("identity.md"), "Ich bin Emily.").unwrap();
+        assert_eq!(load_uia_identity(&directory).unwrap(), "Ich bin Emily.");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_uia_identity_rejects_path_traversal_via_escaping_symlink() {
+        let agent_directory = test_directory();
+        let outside_directory = test_directory();
+        fs::write(outside_directory.join("identity.md"), "outside agent root").unwrap();
+        symlink(&outside_directory, agent_directory.join("identity.md")).unwrap();
+
+        let error = load_uia_identity(&agent_directory)
+            .expect_err("an identity.md symlink must not escape its agent directory");
+
+        assert!(matches!(error, ConfigError::Invalid(message) if message.contains("identity.md")));
+        fs::remove_dir_all(&agent_directory).unwrap();
+        fs::remove_dir_all(&outside_directory).unwrap();
+    }
+
+    #[test]
+    fn uia_personalization_includes_identity_fragment_when_present() {
+        let directory = test_directory();
+        fs::write(directory.join("identity.md"), "Ich bin Emily.").unwrap();
+
+        let fragments = load_uia_personalization(&directory).expect("load UIA files");
+        assert_eq!(fragments.len(), 1);
+        assert!(fragments[0].contains("UIA-Identität"));
+        assert!(fragments[0].contains("Ich bin Emily."));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn uia_personalization_omits_identity_fragment_when_absent() {
+        let directory = test_directory();
+        fs::write(directory.join("Personality.md"), "warm and concise").unwrap();
+
+        let fragments = load_uia_personalization(&directory).expect("load UIA files");
+        assert_eq!(fragments.len(), 1);
+        assert!(!fragments.iter().any(|fragment| fragment.contains("UIA-Identität")));
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

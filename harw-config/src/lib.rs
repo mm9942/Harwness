@@ -44,8 +44,9 @@ pub use dotenv::{
 };
 pub use error::{ConfigError, ConfigResult};
 pub use harness_config::{
-    HarnessConfig, LoggingSection, McpJobCapabilityToml, McpListenerSection, McpPrincipalToml,
-    PolicySection, SessionSection, TuiSection,
+    CargoSandboxModeToml, CargoSandboxToml, HarnessConfig, LoggingSection, McpJobCapabilityToml,
+    McpListenerSection, McpPrincipalToml, PolicySection, SandboxSection, SessionSection,
+    TmuxOperationModeToml, TmuxSandboxToml, TuiSection,
 };
 pub use internal_models::{
     InternalModelChoice, InternalModelPoint, InternalModelSource, InternalModelsToml,

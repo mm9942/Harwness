@@ -192,6 +192,15 @@ impl ConfigWriter {
         set_value_in_table(self.doc.as_table_mut(), &segments, item);
     }
 
+    /// Entfernt einen per Punktnotation adressierten Wert, falls er existiert.
+    ///
+    /// Leere Zwischentabellen bleiben bewusst erhalten: das erhält Kommentare
+    /// und die bestehende Dokumentstruktur besser als ein rekursives Aufräumen.
+    pub fn remove_value(&mut self, dotted_key: &str) -> bool {
+        let segments: Vec<&str> = dotted_key.split('.').collect();
+        remove_value_in_table(self.doc.as_table_mut(), &segments)
+    }
+
     /// Liest einen Wert über einen punktgetrennten Schlüsselpfad als
     /// menschenlesbaren String.
     ///
@@ -317,6 +326,17 @@ fn set_value_in_table(table: &mut Table, segments: &[&str], item: Item) {
             let child = ensure_table(table, head);
             set_value_in_table(child, rest, item);
         }
+    }
+}
+
+fn remove_value_in_table(table: &mut Table, segments: &[&str]) -> bool {
+    match segments {
+        [] => false,
+        [key] => table.remove(key).is_some(),
+        [key, rest @ ..] => table
+            .get_mut(key)
+            .and_then(Item::as_table_mut)
+            .is_some_and(|child| remove_value_in_table(child, rest)),
     }
 }
 
@@ -649,6 +669,20 @@ mod tests {
         );
         assert!(writer.get_value("workspace.missing").is_none());
         assert!(writer.get_value("missing.entirely").is_none());
+    }
+
+    #[test]
+    fn test_remove_value_removes_only_the_requested_dotted_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_config_path(&dir, "config.toml");
+        let mut writer = ConfigWriter::open(&path).expect("open");
+        writer.set_value("harness.uia_provider", value("fireworks"));
+        writer.set_value("harness.uia_model", value("old-model"));
+
+        assert!(writer.remove_value("harness.uia_model"));
+        assert!(!writer.remove_value("harness.uia_model"));
+        assert_eq!(writer.get_value("harness.uia_provider"), Some("fireworks".to_owned()));
+        assert!(writer.get_value("harness.uia_model").is_none());
     }
 
     #[test]

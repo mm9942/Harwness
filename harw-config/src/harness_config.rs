@@ -26,6 +26,17 @@ pub struct HarnessConfig {
     /// Ohne gültige Auswahl wird keine interaktive Runtime gestartet.
     #[serde(default)]
     pub active_uia_definition: Option<String>,
+    /// Pinnt das Modell (Anbieter) der interaktiven UIA-Sitzung unabhängig von
+    /// `default_provider` — im Gegensatz zu `active_uia_definition` (welche
+    /// UIA-Agent-*Definition* aktiv ist), wählt dieses Feld nur, welcher
+    /// bereits konfigurierte Provider-Backend die UIA-Sitzung bedient.
+    /// `None` → die UIA nutzt `default_provider` wie bisher.
+    #[serde(default)]
+    pub uia_provider: Option<String>,
+    /// Pinnt das Modell der interaktiven UIA-Sitzung unabhängig von
+    /// `default_model`. `None` → die UIA nutzt `default_model` wie bisher.
+    #[serde(default)]
+    pub uia_model: Option<String>,
     #[serde(default)]
     pub policy_profile: Option<String>,
     #[serde(default)]
@@ -56,6 +67,12 @@ pub struct HarnessConfig {
     /// `harw-scopes-contract.md` §2/§5 Zeile A2). Siehe `permissions_toml.rs`.
     #[serde(default)]
     pub permissions: PermissionsSection,
+    /// `[sandbox]` — hostseitig vertrauenswürdige Laufzeitvorgaben für
+    /// Prozess-Sandboxes. Eine konfigurierte Cargo-Toolchain oder ein
+    /// tmux-Socket wird ausschließlich beim Aufbau der Runtime gelesen, nie
+    /// aus einem Tool-Aufruf übernommen.
+    #[serde(default)]
+    pub sandbox: SandboxSection,
     /// Marker-Dateinamen für die Projekt-Root-Erkennung (Contract §3),
     /// Default `[".git"]` beim Consumer (`harw-home::project`), sofern hier
     /// nicht gesetzt.
@@ -155,6 +172,60 @@ pub struct GuardsToml {
     /// Runden ohne `plan.*`-Aufruf bis zur Stale-Warnung. Vorgabe `6`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_stale_rounds: Option<u32>,
+}
+
+/// `[sandbox]` — Prozess-Sandbox-Konfiguration. Das Fehlen eines Moduls
+/// lässt die Sandbox unverändert hermetisch, stellt aber bewusst keine
+/// Toolchain und keinen tmux-Socket bereit.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxSection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cargo: Option<CargoSandboxToml>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux: Option<TmuxSandboxToml>,
+}
+
+/// Vertrauenswürdige Host-Wurzeln einer Cargo-Toolchain.
+///
+/// Alle drei Werte müssen absolute Pfade sein. Existenz, Kanonisierung und
+/// Eigentums-/Ausführbarkeitseigenschaften werden erst von
+/// `harw-sandbox::CargoSandboxProfile` beim Runtime-Aufbau geprüft, damit die
+/// Konfigurations-Crate keine Sicherheitsgrenze dupliziert.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CargoSandboxToml {
+    pub mode: CargoSandboxModeToml,
+    pub cargo_bin: String,
+    pub rustup_home: String,
+    pub cargo_home: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CargoSandboxModeToml {
+    Inspect,
+    BuildOffline,
+    Fetch,
+}
+
+/// Vertrauenswürdiger Host-Pfad eines lokalen tmux-Sockets.
+///
+/// Der Pfad muss absolut und normal sein. Existenz und Socket-Eigenschaft
+/// werden erst von `harw-sandbox::TmuxSandboxProfile` beim Runtime-Aufbau
+/// geprüft.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TmuxSandboxToml {
+    pub mode: TmuxOperationModeToml,
+    pub socket_path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TmuxOperationModeToml {
+    Inspect,
+    Write,
 }
 
 /// `[onboarding]` — First-Run-Fortschritt (Hermes-Muster `onboarding.seen.*`).
@@ -436,6 +507,26 @@ mod tests {
     }
 
     #[test]
+    fn test_uia_provider_and_model_default_to_none() {
+        let cfg: HarnessConfig = toml::from_str("default_provider = \"anthropic\"").unwrap();
+        assert_eq!(cfg.uia_provider, None);
+        assert_eq!(cfg.uia_model, None);
+    }
+
+    #[test]
+    fn test_uia_provider_and_model_read_exact_values() {
+        let cfg: HarnessConfig = toml::from_str(
+            r#"
+                uia_provider = "anthropic"
+                uia_model = "claude-x"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.uia_provider.as_deref(), Some("anthropic"));
+        assert_eq!(cfg.uia_model.as_deref(), Some("claude-x"));
+    }
+
+    #[test]
     fn test_active_agent_definition_reads_exact_definition_id() {
         let cfg: HarnessConfig = toml::from_str(
             r#"
@@ -642,6 +733,90 @@ mod tests {
         let src = r#"
             [tools.plan]
             enabeld = true
+        "#;
+        assert!(toml::from_str::<HarnessConfig>(src).is_err());
+    }
+
+    #[test]
+    fn test_sandbox_section_defaults_when_absent() {
+        let cfg: HarnessConfig = toml::from_str(
+            r#"
+                default_provider = "anthropic"
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.sandbox.cargo.is_none());
+        assert!(cfg.sandbox.tmux.is_none());
+    }
+
+    #[test]
+    fn test_sandbox_cargo_section_parses() {
+        let cfg: HarnessConfig = toml::from_str(
+            r#"
+                default_provider = "anthropic"
+
+                [sandbox.cargo]
+                mode = "build_offline"
+                cargo_bin = "/opt/harw/toolchain/bin/cargo"
+                rustup_home = "/opt/harw/rustup"
+                cargo_home = "/var/cache/harw/cargo"
+            "#,
+        )
+        .unwrap();
+        let cargo = cfg.sandbox.cargo.unwrap();
+        assert_eq!(cargo.mode, CargoSandboxModeToml::BuildOffline);
+        assert_eq!(cargo.cargo_bin, "/opt/harw/toolchain/bin/cargo");
+        assert_eq!(cargo.rustup_home, "/opt/harw/rustup");
+        assert_eq!(cargo.cargo_home, "/var/cache/harw/cargo");
+    }
+
+    #[test]
+    fn test_sandbox_tmux_section_parses() {
+        let cfg: HarnessConfig = toml::from_str(
+            r#"
+                default_provider = "anthropic"
+
+                [sandbox.tmux]
+                mode = "inspect"
+                socket_path = "/tmp/tmux-1000/default"
+            "#,
+        )
+        .unwrap();
+        let tmux = cfg.sandbox.tmux.unwrap();
+        assert_eq!(tmux.mode, TmuxOperationModeToml::Inspect);
+        assert_eq!(tmux.socket_path, "/tmp/tmux-1000/default");
+    }
+
+    #[test]
+    fn test_sandbox_section_rejects_unknown_field() {
+        let src = r#"
+            [sandbox]
+            no_such_field = true
+        "#;
+        assert!(toml::from_str::<HarnessConfig>(src).is_err());
+    }
+
+    #[test]
+    fn test_sandbox_cargo_rejects_unknown_field() {
+        let src = r#"
+            [sandbox.cargo]
+            mode = "fetch"
+            cargo_bin = "/cargo"
+            rustup_home = "/rustup"
+            cargo_home = "/cache"
+            extra_field = true
+        "#;
+        assert!(toml::from_str::<HarnessConfig>(src).is_err());
+    }
+
+    #[test]
+    fn test_sandbox_cargo_rejects_invalid_mode() {
+        let src = r#"
+            [sandbox.cargo]
+            mode = "unrestricted"
+            cargo_bin = "/cargo"
+            rustup_home = "/rustup"
+            cargo_home = "/cache"
         "#;
         assert!(toml::from_str::<HarnessConfig>(src).is_err());
     }
