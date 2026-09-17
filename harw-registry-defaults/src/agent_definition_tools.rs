@@ -4,8 +4,12 @@
 //! Steward-Prüfung").
 //!
 //! # Verantwortung
-//! Stellt bis zu sechs Werkzeuge bereit (welche registriert sind, hängt von
-//! [`DefinitionWriteMode`] **und** von [`DefinitionAuthorCeiling`] ab):
+//! `AgentDefinitionToolProvider` selbst stellt bis zu sechs Werkzeuge bereit
+//! (welche registriert sind, hängt von [`DefinitionWriteMode`] **und** von
+//! [`DefinitionAuthorCeiling`] ab); zusätzlich definiert diese Datei den
+//! eigenständigen [`UiaSelfDocumentToolProvider`] für `uia_self.update_document`
+//! (ein siebtes Werkzeug, aber ein eigener Provider mit eigener
+//! Rollen-Gating-Logik, kein siebtes `AgentDefinitionToolProvider`-Werkzeug):
 //! - `agents.validate {toml}`: parst + senkt eine Agentendefinition über
 //!   dieselbe Pipeline wie
 //!   [`crate::embedded_agents::builtin_agent_definitions`] (`parse_toml →
@@ -23,7 +27,15 @@
 //!   identity_md?}`: wie oben, aber für ein vollständiges UIA-Bundle; verlangt
 //!   zusätzlich `role = "user-interface"`, lehnt offensichtliche Geheimnisse
 //!   ab und bekommt immer `review_level = "user_required"` (UIAs werden nie
-//!   automatisch aktiviert). Kein `scope = "run"`.
+//!   automatisch aktiviert). `identity_md`, falls angegeben, landet als eigene
+//!   `identity.md`-Datei im Bundle (siehe [`harw_config::loader::load_uia_identity`]
+//!   in `harw-config`), nicht mehr als Feld in `agent.toml`. Kein `scope = "run"`.
+//! - `uia_self.update_document {target, content, reason}`: pflegt
+//!   `identity.md`/`USER.md`/`Personality.md` der **eigenen** UIA-Sitzung
+//!   nach der Ersteinrichtung; nur registriert, wenn der Provider mit
+//!   `role = AgentRoleId::UserInterface` konstruiert wurde. Freigabepflichtig
+//!   wie `agents.write_uia` (nicht in [`crate::AUTO_APPROVED_TOOLS`]). Kein
+//!   Rechte-Delta nötig (reine Inhaltsdateien, keine Rechteverleihung).
 //! - `agents.commit_proposal {proposal_id, user_confirmed?}` **nur im
 //!   [`DefinitionWriteMode::Commit`] und nur mit gesetzter Decke**: validiert
 //!   den Vorschlag erneut, rechnet beide Deltas erneut — **gegen die Decke
@@ -756,13 +768,15 @@ fn commit_definition(
 }
 
 /// Schreibt ein vollständiges UIA-Bundle (`definition.toml`, `agent.toml`,
-/// `Personality.md`, `USER.md`) atomar je Datei nach `bundle_dir`, sofern ein
-/// dort bereits vorhandenes `definition.toml` dieselbe `id` trägt.
+/// `identity.md` (nur wenn angegeben), `Personality.md`, `USER.md`) atomar je
+/// Datei nach `bundle_dir`, sofern ein dort bereits vorhandenes
+/// `definition.toml` dieselbe `id` trägt.
 fn commit_uia_bundle(
     bundle_dir: &Path,
     new_id: &str,
     definition_toml: &str,
     agent_toml: &str,
+    identity_md: Option<&str>,
     personality_md: &str,
     user_md: &str,
 ) -> Result<(), String> {
@@ -776,12 +790,15 @@ fn commit_uia_bundle(
             ));
         }
     }
-    let files: [(PathBuf, &str); 4] = [
+    let mut files: Vec<(PathBuf, &str)> = vec![
         (definition_path, definition_toml),
         (bundle_dir.join("agent.toml"), agent_toml),
         (bundle_dir.join("Personality.md"), personality_md),
         (bundle_dir.join("USER.md"), user_md),
     ];
+    if let Some(identity_md) = identity_md {
+        files.push((bundle_dir.join("identity.md"), identity_md));
+    }
     for (path, content) in &files {
         write_atomic(path, content.as_bytes(), UIA_FILE_MODE)
             .map_err(|error| format!("Schreiben von {} fehlgeschlagen: {error}", path.display()))?;
@@ -792,24 +809,18 @@ fn commit_uia_bundle(
 /// Baut den Inhalt von `agent.toml` aus der geparsten `definition.toml`.
 ///
 /// Gespiegeltes Feld-Set von `harw-cli/src/uia_bootstrap.rs::write_generated_uia`
-/// (`name`/`role`/`description`), zusätzlich `identity`, wenn `identity_md`
-/// angegeben wurde. Der bestehende Loader (`harw_config::load_uia_personalization`)
-/// liest keine eigene `Identity.md`-Datei (Contract Nachtrag K: "sonst
-/// weglassen") — `identity_md` landet deshalb, wenn angegeben, als
-/// zusätzliches Feld in `agent.toml` statt in einer eigenen, ungelesenen
-/// Datei (ABWEICHUNG, siehe Bericht).
-fn build_agent_toml(raw: &RawAgentDefinition, identity_md: Option<&str>) -> String {
+/// (`name`/`role`/`description`). Trägt seit der Behebung der zuvor hier
+/// dokumentierten Abweichung **kein** `identity`-Feld mehr — der
+/// Identitätstext landet stattdessen in einer eigenen `identity.md`-Datei
+/// (siehe [`commit_uia_bundle`]/[`propose_uia`]), die
+/// `harw_config::loader::load_uia_identity` liest.
+fn build_agent_toml(raw: &RawAgentDefinition) -> String {
     let name = raw
         .name
         .clone()
         .unwrap_or_else(|| raw.specialization.clone());
     let description = raw.description.clone().unwrap_or_default();
-    let mut out =
-        format!("name = {name:?}\nrole = \"user-interface\"\ndescription = {description:?}\n");
-    if let Some(identity) = identity_md {
-        out.push_str(&format!("identity = {identity:?}\n"));
-    }
-    out
+    format!("name = {name:?}\nrole = \"user-interface\"\ndescription = {description:?}\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -918,6 +929,7 @@ fn propose_uia(
     dir_name: &str,
     definition_toml: &str,
     agent_toml: &str,
+    identity_md: Option<&str>,
     personality_md: &str,
     user_md: &str,
     evaluated: &EvaluatedCandidate,
@@ -925,12 +937,15 @@ fn propose_uia(
 ) -> Result<String, String> {
     let proposal_id = generate_proposal_id();
     let dir = proposal_dir(profile_agents_dir, &proposal_id);
-    let files: [(&str, &str); 4] = [
+    let mut files: Vec<(&str, &str)> = vec![
         ("definition.toml", definition_toml),
         ("agent.toml", agent_toml),
         ("Personality.md", personality_md),
         ("USER.md", user_md),
     ];
+    if let Some(identity_md) = identity_md {
+        files.push(("identity.md", identity_md));
+    }
     for (file_name, content) in files {
         write_atomic(&dir.join(file_name), content.as_bytes(), UIA_FILE_MODE)
             .map_err(|error| format!("Vorschlag nicht schreibbar ({file_name}): {error}"))?;
@@ -1312,7 +1327,9 @@ struct WriteUiaArgs {
     /// geschrieben (dieselbe Platzhalterform wie `uia_bootstrap::write_generated_uia`).
     #[serde(default)]
     user_md: Option<String>,
-    /// Optionaler frei formulierter Identitätstext (siehe [`build_agent_toml`]).
+    /// Optionaler frei formulierter Identitätstext; landet, wenn angegeben,
+    /// als eigene `identity.md` im Bundle (siehe [`commit_uia_bundle`]/
+    /// [`propose_uia`]).
     #[serde(default)]
     identity_md: Option<String>,
 }
@@ -1362,7 +1379,9 @@ fn agents_write_uia_spec() -> ToolSpec {
         JsonSchema {
             schema_type: Some(JsonSchemaType::String),
             description: Some(
-                "Optionaler zusätzlicher Identitätstext (wird in agent.toml abgelegt).".to_owned(),
+                "Optionaler Identitätstext (wer/was die UIA selbst ist); wird als eigene \
+                 identity.md im Bundle abgelegt. Ohne Angabe wird identity.md nicht angelegt."
+                    .to_owned(),
             ),
             ..Default::default()
         },
@@ -1476,13 +1495,14 @@ impl AgentsWriteUiaExecutor {
             return author_elevation_rejection(&evaluated.rights_delta_author);
         }
 
-        let agent_toml = build_agent_toml(&evaluated.raw, args.identity_md.as_deref());
+        let agent_toml = build_agent_toml(&evaluated.raw);
         let review_level = review_level_for("uia", &evaluated.rights_delta_base_role);
         match propose_uia(
             profile_agents_dir,
             &args.dir_name,
             &args.definition_toml,
             &agent_toml,
+            args.identity_md.as_deref(),
             &args.personality_md,
             &user_md,
             &evaluated,
@@ -1819,6 +1839,10 @@ impl AgentsCommitProposalExecutor {
                         .unwrap_or_default();
                     let agent_toml =
                         std::fs::read_to_string(dir.join("agent.toml")).unwrap_or_default();
+                    // `identity.md` ist im Vorschlag nur vorhanden, wenn
+                    // `identity_md` beim Ablegen angegeben wurde
+                    // (`propose_uia` lässt die Datei sonst weg).
+                    let identity_md = std::fs::read_to_string(dir.join("identity.md")).ok();
                     let personality_md =
                         std::fs::read_to_string(dir.join("Personality.md")).unwrap_or_default();
                     let user_md = std::fs::read_to_string(dir.join("USER.md")).unwrap_or_default();
@@ -1829,6 +1853,7 @@ impl AgentsCommitProposalExecutor {
                         &new_id,
                         &definition_toml,
                         &agent_toml,
+                        identity_md.as_deref(),
                         &personality_md,
                         &user_md,
                     )
@@ -2029,6 +2054,240 @@ impl ToolExecutor for AgentsRejectProposalExecutor {
         call: &'a ToolCall,
     ) -> ToolExecutorFuture<'a> {
         Box::pin(async move { Ok(self.reject(call)) })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `uia_self.update_document` (Structure Plan §4)
+// ---------------------------------------------------------------------------
+
+/// Ziel-Datei eines `uia_self.update_document`-Aufrufs. Ein geschlossenes
+/// Enum statt eines freien Pfad-Parameters: verhindert Pfad-Traversal
+/// strukturell, ohne eine eigene Prüfung zu benötigen (siehe Structure Plan
+/// §4, "Pfad-Sicherheit").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelfDocumentTarget {
+    Identity,
+    User,
+    Personality,
+}
+
+impl SelfDocumentTarget {
+    /// Parst den `target`-Parameter; `None` für jeden unbekannten Wert.
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "identity" => Some(Self::Identity),
+            "user" => Some(Self::User),
+            "personality" => Some(Self::Personality),
+            _ => None,
+        }
+    }
+
+    /// Der Dateiname im Agentenordner, den dieses Ziel beschreibt.
+    fn file_name(self) -> &'static str {
+        match self {
+            Self::Identity => "identity.md",
+            Self::User => "USER.md",
+            Self::Personality => "Personality.md",
+        }
+    }
+}
+
+/// Deserialisierte Argumente für `uia_self.update_document`.
+#[derive(Debug, Deserialize)]
+struct UpdateDocumentArgs {
+    /// `"identity"`, `"user"` oder `"personality"`.
+    target: String,
+    /// Vollständiger neuer Dateiinhalt (kein Patch/Diff).
+    content: String,
+    /// Kurze Begründung; erscheint im Freigabe-Prompt und im Ergebnis, wird
+    /// aber nicht in die Zieldatei geschrieben.
+    reason: String,
+}
+
+fn uia_self_update_document_spec() -> ToolSpec {
+    let mut props = BTreeMap::new();
+    props.insert(
+        "target".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some(
+                "\"identity\" (identity.md), \"user\" (USER.md) oder \"personality\" \
+                 (Personality.md) — immer im eigenen Agentenordner dieser UIA-Sitzung."
+                    .to_owned(),
+            ),
+            ..Default::default()
+        },
+    );
+    props.insert(
+        "content".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some("Vollständiger neuer Dateiinhalt.".to_owned()),
+            ..Default::default()
+        },
+    );
+    props.insert(
+        "reason".to_owned(),
+        JsonSchema {
+            schema_type: Some(JsonSchemaType::String),
+            description: Some(
+                "Kurze Begründung der Änderung; erscheint im Freigabe-Prompt.".to_owned(),
+            ),
+            ..Default::default()
+        },
+    );
+    ToolSpec::Function(FunctionToolSpec {
+        name: ToolName::new("uia_self.update_document"),
+        description: "Pflegt identity.md, USER.md oder Personality.md der EIGENEN \
+             UIA-Sitzung (kein Fremdzugriff auf andere Agentenordner). Lehnt offensichtliche \
+             Geheimnisse ab und zeigt vor dem Schreiben ein einfaches Zeilen-Diff. Rohe \
+             Gedächtnisnotizen laufen NICHT über dieses Werkzeug, sondern über \
+             Memory::record(Signal). Nur für die Rolle user-interface registriert. \
+             Freigabepflichtig."
+            .to_owned(),
+        parameters: JsonSchema {
+            schema_type: Some(JsonSchemaType::Object),
+            properties: Some(props),
+            required: Some(vec![
+                "target".to_owned(),
+                "content".to_owned(),
+                "reason".to_owned(),
+            ]),
+            additional_properties: Some(Box::new(AdditionalProperties::Bool(false))),
+            ..Default::default()
+        },
+        strict: true,
+    })
+}
+
+/// Rechte-Bits der von `uia_self.update_document` geschriebenen Dateien —
+/// dieselbe Sichtbarkeit wie die übrigen UIA-Bundle-Dateien.
+const SELF_DOCUMENT_FILE_MODE: u32 = UIA_FILE_MODE;
+
+struct UiaSelfUpdateDocumentExecutor {
+    /// Der Agentenordner der aufrufenden UIA-Sitzung selbst — nie ein
+    /// fremder Ordner, nie aus dem Aufrufargument übernommen.
+    agent_dir: PathBuf,
+}
+
+impl UiaSelfUpdateDocumentExecutor {
+    fn write(&self, call: &ToolCall) -> ToolOutput {
+        let args: UpdateDocumentArgs = match serde_json::from_value(call.arguments.clone()) {
+            Ok(args) => args,
+            Err(error) => {
+                return ToolOutput::error(format!(
+                    "uia_self.update_document: ungültige Argumente: {error}"
+                ));
+            }
+        };
+        let Some(target) = SelfDocumentTarget::parse(&args.target) else {
+            return ToolOutput::error(format!(
+                "uia_self.update_document: unbekanntes target '{}' \
+                 (erwartet \"identity\", \"user\" oder \"personality\")",
+                args.target
+            ));
+        };
+        let secret_errors = scan_for_secrets(&[("content", &args.content)]);
+        if !secret_errors.is_empty() {
+            return ToolOutput::json(serde_json::json!({
+                "ok": false,
+                "written": false,
+                "errors": secret_errors,
+            }));
+        }
+
+        let path = self.agent_dir.join(target.file_name());
+        let old_content = std::fs::read_to_string(&path).ok();
+        let diff = simple_line_diff(old_content.as_deref(), &args.content);
+        match write_atomic(&path, args.content.as_bytes(), SELF_DOCUMENT_FILE_MODE) {
+            Ok(()) => ToolOutput::json(serde_json::json!({
+                "ok": true,
+                "written": true,
+                "path": path.display().to_string(),
+                "target": args.target,
+                "reason": args.reason,
+                "diff": diff,
+                "errors": Vec::<String>::new(),
+            })),
+            Err(error) => ToolOutput::json(serde_json::json!({
+                "ok": false,
+                "written": false,
+                "errors": [format!("Schreiben von {} fehlgeschlagen: {error}", path.display())],
+            })),
+        }
+    }
+}
+
+impl ToolExecutor for UiaSelfUpdateDocumentExecutor {
+    fn execute<'a>(
+        &'a self,
+        _context: &'a ToolExecutionContext,
+        call: &'a ToolCall,
+    ) -> ToolExecutorFuture<'a> {
+        Box::pin(async move { Ok(self.write(call)) })
+    }
+}
+
+/// Der Provider für `uia_self.update_document` (Structure Plan §4).
+///
+/// # Description
+/// Registriert das Werkzeug **nur**, wenn [`Self::role`] `role =
+/// "user-interface"` ist — ein Root-Orchestrator oder Worker, der diesen
+/// Provider (versehentlich) mit einer anderen Rolle konstruiert bekäme,
+/// sieht das Werkzeug weder im Inventar noch bekommt er einen Executor dafür
+/// (fail-closed, wie [`AgentDefinitionToolProvider`] ohne Decke). Wirkt
+/// ausschließlich auf [`Self::agent_dir`] — den eigenen Agentenordner der
+/// aufrufenden UIA-Sitzung, nie auf einen fremden.
+///
+/// # Concurrency
+/// `Send + Sync`; zustandslos außer Agentenordner und Rolle.
+pub struct UiaSelfDocumentToolProvider {
+    agent_dir: PathBuf,
+    role: AgentRoleId,
+}
+
+impl UiaSelfDocumentToolProvider {
+    /// Erstellt einen neuen Provider für die gegebene Rolle und den
+    /// gegebenen Agentenordner.
+    ///
+    /// # Arguments
+    /// - `agent_dir` (`PathBuf`): der Agentenordner der aufrufenden Sitzung.
+    /// - `role` ([`AgentRoleId`]): die organisatorische Rolle der aufrufenden
+    ///   Sitzung; nur `AgentRoleId::UserInterface` registriert das Werkzeug.
+    ///
+    /// # Returns
+    /// Den fertig konfigurierten Provider.
+    #[must_use]
+    pub fn new(agent_dir: PathBuf, role: AgentRoleId) -> Self {
+        Self { agent_dir, role }
+    }
+}
+
+impl ToolProvider for UiaSelfDocumentToolProvider {
+    fn tools(&self) -> Vec<ToolSpec> {
+        if self.role == AgentRoleId::UserInterface {
+            vec![uia_self_update_document_spec()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn executor(&self, name: &ToolName) -> Option<std::sync::Arc<dyn ToolExecutor>> {
+        if self.role != AgentRoleId::UserInterface {
+            return None;
+        }
+        match name.as_str() {
+            "uia_self.update_document" => Some(std::sync::Arc::new(UiaSelfUpdateDocumentExecutor {
+                agent_dir: self.agent_dir.clone(),
+            })),
+            _ => None,
+        }
+    }
+
+    /// Schreibend, daher nie commutative.
+    fn parallel_safe(&self, _name: &ToolName) -> bool {
+        false
     }
 }
 
@@ -2312,6 +2571,240 @@ contract = "harwness.return.research-finding@1"
         let future = format_rfc3339(now() + time::Duration::days(1));
         assert!(is_expired(&past));
         assert!(!is_expired(&future));
+    }
+
+    #[test]
+    fn test_build_agent_toml_no_longer_embeds_identity_field() {
+        let raw = parse_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.test-uia@1"
+version = "1.0.0"
+role = "user-interface"
+specialization = "test-uia"
+name = "Test UIA"
+description = "eine Test-UIA"
+
+[tools]
+admitted = []
+
+[return]
+contract = "harwness.return.research-finding@1"
+"#,
+        )
+        .expect("parse fixture definition");
+        let agent_toml = build_agent_toml(&raw);
+        assert!(!agent_toml.contains("identity"));
+        assert!(agent_toml.contains("role = \"user-interface\""));
+    }
+
+    #[test]
+    fn test_commit_uia_bundle_writes_identity_md_when_present() {
+        let directory = std::env::temp_dir().join(format!(
+            "harw-agent-def-tools-commit-with-identity-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        commit_uia_bundle(
+            &directory,
+            "harwness.agent.test-uia@1",
+            "id = \"harwness.agent.test-uia@1\"",
+            "name = \"Test\"",
+            Some("Ich bin Test."),
+            "warm",
+            "# Nutzerkontext",
+        )
+        .expect("commit uia bundle");
+        assert_eq!(
+            std::fs::read_to_string(directory.join("identity.md")).unwrap(),
+            "Ich bin Test."
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn test_commit_uia_bundle_omits_identity_md_when_absent() {
+        let directory = std::env::temp_dir().join(format!(
+            "harw-agent-def-tools-commit-without-identity-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        commit_uia_bundle(
+            &directory,
+            "harwness.agent.test-uia@1",
+            "id = \"harwness.agent.test-uia@1\"",
+            "name = \"Test\"",
+            None,
+            "warm",
+            "# Nutzerkontext",
+        )
+        .expect("commit uia bundle");
+        assert!(!directory.join("identity.md").exists());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn test_update_document_rejects_non_uia_role() {
+        let provider = UiaSelfDocumentToolProvider::new(PathBuf::from("/tmp"), AgentRoleId::Worker);
+        assert!(provider.tools().is_empty());
+        assert!(
+            provider
+                .executor(&ToolName::new("uia_self.update_document"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_update_document_rejects_secret_pattern() {
+        let executor = UiaSelfUpdateDocumentExecutor {
+            agent_dir: std::env::temp_dir(),
+        };
+        let call = ToolCall {
+            id: Default::default(),
+            name: ToolName::new("uia_self.update_document"),
+            arguments: serde_json::json!({
+                "target": "identity",
+                "content": "sk-does-not-belong-here",
+                "reason": "test",
+            }),
+        };
+        let output = executor.write(&call);
+        match output {
+            ToolOutput::Json { content } => {
+                assert_eq!(content["ok"], serde_json::json!(false));
+            }
+            other => panic!("expected a json error output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_update_document_writes_identity_target() {
+        let directory = std::env::temp_dir().join(format!(
+            "harw-agent-def-tools-self-doc-identity-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let executor = UiaSelfUpdateDocumentExecutor {
+            agent_dir: directory.clone(),
+        };
+        let call = ToolCall {
+            id: Default::default(),
+            name: ToolName::new("uia_self.update_document"),
+            arguments: serde_json::json!({
+                "target": "identity",
+                "content": "Ich bin Emily.",
+                "reason": "Erstpflege",
+            }),
+        };
+        let output = executor.write(&call);
+        match output {
+            ToolOutput::Json { content } => assert_eq!(content["ok"], serde_json::json!(true)),
+            other => panic!("expected a json success output, got {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(directory.join("identity.md")).unwrap(),
+            "Ich bin Emily."
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn test_update_document_writes_user_target() {
+        let directory = std::env::temp_dir().join(format!(
+            "harw-agent-def-tools-self-doc-user-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let executor = UiaSelfUpdateDocumentExecutor {
+            agent_dir: directory.clone(),
+        };
+        let call = ToolCall {
+            id: Default::default(),
+            name: ToolName::new("uia_self.update_document"),
+            arguments: serde_json::json!({
+                "target": "user",
+                "content": "Name: Mia",
+                "reason": "Nutzer hat sich vorgestellt",
+            }),
+        };
+        let output = executor.write(&call);
+        assert_eq!(
+            std::fs::read_to_string(directory.join("USER.md")).unwrap(),
+            "Name: Mia"
+        );
+        assert!(matches!(output, ToolOutput::Json { .. }));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn test_update_document_writes_personality_target() {
+        let directory = std::env::temp_dir().join(format!(
+            "harw-agent-def-tools-self-doc-personality-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let executor = UiaSelfUpdateDocumentExecutor {
+            agent_dir: directory.clone(),
+        };
+        let call = ToolCall {
+            id: Default::default(),
+            name: ToolName::new("uia_self.update_document"),
+            arguments: serde_json::json!({
+                "target": "personality",
+                "content": "warm, knapp",
+                "reason": "Ton geschärft",
+            }),
+        };
+        let output = executor.write(&call);
+        assert_eq!(
+            std::fs::read_to_string(directory.join("Personality.md")).unwrap(),
+            "warm, knapp"
+        );
+        assert!(matches!(output, ToolOutput::Json { .. }));
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn test_update_document_never_escapes_agent_dir() {
+        let directory = std::env::temp_dir().join(format!(
+            "harw-agent-def-tools-self-doc-scope-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let executor = UiaSelfUpdateDocumentExecutor {
+            agent_dir: directory.clone(),
+        };
+        // `target` ist ein geschlossenes Enum ohne freien Pfad-Parameter —
+        // selbst ein Traversal-artiger Wert wird als unbekanntes target
+        // abgelehnt, nie als Pfadfragment interpretiert.
+        let call = ToolCall {
+            id: Default::default(),
+            name: ToolName::new("uia_self.update_document"),
+            arguments: serde_json::json!({
+                "target": "../escape",
+                "content": "x",
+                "reason": "x",
+            }),
+        };
+        let output = executor.write(&call);
+        match output {
+            ToolOutput::Error { message } => assert!(message.contains("unbekanntes target")),
+            other => panic!("expected an error output, got {other:?}"),
+        }
+        assert!(!directory.parent().unwrap().join("escape").exists());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn test_update_document_not_in_auto_approved_tools() {
+        assert!(
+            !crate::AUTO_APPROVED_TOOLS.contains(&"uia_self.update_document"),
+            "uia_self.update_document must stay fail-closed and never be auto-approved"
+        );
     }
 
     #[test]

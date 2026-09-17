@@ -1147,9 +1147,10 @@ mod tests {
                     harw_agent_dsl::roles::AgentRoleId::Worker
                         | harw_agent_dsl::roles::AgentRoleId::UiaWorker
                         | harw_agent_dsl::roles::AgentRoleId::AgentSteward
+                        | harw_agent_dsl::roles::AgentRoleId::RootOrchestrator
                 ),
-                "{name}: eingebaute Rollen tragen organisatorisch Worker, UiaWorker oder \
-                 AgentSteward (Addendum J + K)"
+                "{name}: eingebaute Rollen tragen organisatorisch Worker, UiaWorker, \
+                 AgentSteward oder RootOrchestrator (Addenda J + K)"
             );
             assert_eq!(raw.specialization, *name, "{name}");
         }
@@ -1631,7 +1632,7 @@ mod tests {
     }
 
     #[test]
-    fn test_every_builtin_role_is_a_non_pausing_worker_with_a_return_contract() {
+    fn test_every_builtin_role_is_non_pausing_with_a_return_contract() {
         for (role, ir) in builtin() {
             assert!(
                 matches!(
@@ -1639,8 +1640,9 @@ mod tests {
                     harw_agent_dsl::roles::AgentRoleId::Worker
                         | harw_agent_dsl::roles::AgentRoleId::UiaWorker
                         | harw_agent_dsl::roles::AgentRoleId::AgentSteward
+                        | harw_agent_dsl::roles::AgentRoleId::RootOrchestrator
                 ),
-                "{role} muss Rolle 'worker', 'uia-worker' oder 'agent-steward' tragen (Addendum J + K)"
+                "{role} muss eine zulässige organisatorische Rolle tragen"
             );
             assert_eq!(ir.specialization(), role, "{role}");
             assert!(
@@ -1946,23 +1948,22 @@ mod tests {
         );
     }
 
-    /// Der Analyst ist die einzige Rolle, die zwei Ebenen darf.
+    /// Der Analyst und der Root-Orchestrator dürfen zwei Ebenen erzeugen.
     ///
-    /// Diese Aussage ist unverändert; nur ihre Prüfung nennt jetzt die drei
-    /// zulässigen Tiefen **je Rollenklasse** statt einer Ausnahmeliste:
+    /// Die Prüfung nennt die zulässigen Tiefen **je Rollenklasse** statt einer
+    /// Ausnahmeliste:
     ///
-    /// - `2` — ausschließlich `analyst`: der einzige Verdichter, der
-    ///   read-only Kinder starten und deren Rückgaben zusammenfassen darf.
+    /// - `2` — `analyst` und `root-orchestrator`: der Analyst verdichtet
+    ///   read-only Kinder; der Root-Orchestrator bildet die Agentenbaumwurzel.
     /// - `0` — die vier `security-*-triage`-Rollen: sie lesen
     ///   angreiferkontrollierte Sensorfelder und sollen ausdrücklich kein
     ///   Kind erzeugen. `Some(0)` heißt „unter dieser Rolle entsteht keine
     ///   weitere Ebene“, nicht „diese Rolle darf nicht existieren“.
     /// - `1` — jeder übrige Worker.
     ///
-    /// Die abschließende Zusicherung ist dadurch schärfer als vorher: nicht
-    /// nur trägt der Analyst `2`, es trägt auch **keine andere** Rolle diesen
-    /// Wert — und das gilt unabhängig davon, wie viele Rollen mit Tiefe `0`
-    /// oder `1` noch dazukommen.
+    /// Die abschließende Zusicherung stellt sicher, dass genau diese beiden
+    /// organisatorischen Rollen `2` tragen — unabhängig davon, wie viele
+    /// Rollen mit Tiefe `0` oder `1` noch dazukommen.
     ///
     /// Offener Punkt für einen Folgeknoten: `context-steward` und
     /// `intel-scout` tragen ebenfalls `max_depth = 0`, stehen aber (bewusst,
@@ -1976,7 +1977,7 @@ mod tests {
     /// Konsolidierung ist ein einzelner, in sich geschlossener Lauf über
     /// bereits gelieferten Kontext, kein Fan-out.
     #[test]
-    fn test_analyst_is_the_only_role_allowed_to_spawn_two_levels() {
+    fn test_analyst_and_root_orchestrator_are_allowed_to_spawn_two_levels() {
         // Die Tiefe-0-Klasse: Rollen ohne eigene Ebene darunter — die vier
         // Triage-Rollen plus `memory-steward` und `agent-steward` (Addendum
         // K: ein Umsetzungslauf ist ein einzelner, in sich geschlossener
@@ -2001,7 +2002,9 @@ mod tests {
         let definitions = builtin();
         let mut two_level_roles: Vec<&str> = Vec::new();
         for (role, ir) in &definitions {
-            let expected = if role == role_names::ANALYST {
+            let expected = if role == role_names::ANALYST
+                || role == role_names::ROOT_ORCHESTRATOR
+            {
                 2
             } else if ZERO_DEPTH_ROLES.contains(&role.as_str()) {
                 0
@@ -2010,14 +2013,21 @@ mod tests {
             };
             let max_depth = ir.spawn_contract().max_depth();
             assert_eq!(max_depth, Some(expected), "{role}: unerwartete Spawn-Tiefe");
+            if role == role_names::ROOT_ORCHESTRATOR {
+                assert_eq!(
+                    ir.role(),
+                    harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+                    "{role}: muss organisatorisch RootOrchestrator bleiben"
+                );
+            }
             if max_depth == Some(2) {
                 two_level_roles.push(role.as_str());
             }
         }
         assert_eq!(
             two_level_roles,
-            [role_names::ANALYST],
-            "genau eine eingebaute Rolle darf zwei Ebenen — der Analyst"
+            [role_names::ANALYST, role_names::ROOT_ORCHESTRATOR],
+            "genau Analyst und Root-Orchestrator dürfen zwei Ebenen"
         );
         let analyst = &definitions[role_names::ANALYST];
         assert!(

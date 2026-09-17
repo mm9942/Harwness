@@ -261,6 +261,7 @@ pub fn reduce_to_read_network(granted: &PermissionSet) -> PermissionSet {
 #[must_use]
 pub fn authority_reducer_for_role(role: &str) -> Option<AuthorityReducer> {
     match role {
+        role_names::ROOT_ORCHESTRATOR => Some(AuthorityReducer::ReadRegistry),
         role_names::EXPLORER
         | role_names::ANALYST
         | role_names::RESEARCHER_DEPS

@@ -67,3 +67,14 @@ workspace = true
 # Nur für Tests: die Freigabe-Regeln in `DefaultApprovalPolicy::review`
 # bekommen ihre Werkzeug-Argumente als `serde_json::Value`.
 serde_json = { workspace = true }
+# Nur für Tests: `SessionId`/`TurnId`/`TenantId`/`WorkspaceId` zum Bau eines
+# echten `harw_tools::ToolExecutionContext` in den End-to-End-Tests der
+# `_and_permits`-Montage (siehe `profile.rs::tests`).
+harw-types = { path = "../harw-types" }
+# Nur für Tests: temporäre Workspace-Wurzeln für `WorkspaceRegistry::build`
+# in denselben Tests.
+tempfile = { workspace = true }
+# Nur für Tests: `ShellExecutor`s Bwrap-Ausführung läuft unter `tokio`. Die
+# Versionszeile ist bewusst identisch zu harw-tool-shell/Cargo.toml, damit im
+# Workspace nur eine `tokio`-Auflösung existiert.
+tokio = { version = "1", features = ["process", "time", "io-util", "rt", "macros"] }

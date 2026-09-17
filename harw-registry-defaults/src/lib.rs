@@ -78,6 +78,7 @@ use harw_project_discovery::ProjectContext;
 pub use error::{RegistryDefaultsError, RegistryDefaultsResult};
 pub use agent_definition_tools::{
     AgentDefinitionToolProvider, DefinitionAuthorCeiling, DefinitionWriteMode,
+    UiaSelfDocumentToolProvider,
 };
 pub use authority::{AuthorityReducer, authority_reducer_for_role, tool_permission};
 pub use profile::{

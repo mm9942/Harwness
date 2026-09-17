@@ -39,6 +39,13 @@ admitted = [
   "fs.grep",
   "shell.exec",
   "web.fetch",
+  "browser.open",
+  "browser.observe",
+  "browser.find",
+  "browser.act",
+  "browser.wait",
+  "browser.events",
+  "browser.close",
 ]
 forbidden = [
   "fs.write",
@@ -50,13 +57,6 @@ forbidden = [
   "deps.source_search",
   "deps.source_list",
   "lens.ask",
-  "browser.open",
-  "browser.observe",
-  "browser.find",
-  "browser.act",
-  "browser.wait",
-  "browser.events",
-  "browser.close",
 ]
 
 [spawn]
