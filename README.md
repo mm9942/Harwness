@@ -10,6 +10,21 @@ Most agent loops give a model a prompt and a collection of tools. Harwness start
 
 The `harw` binary provides an interactive terminal UI, one-shot runs, durable plans and jobs, an optional local web surface, an MCP listener, and a gateway for external channels. The workspace also includes an embeddable SDK and a Defense-on-Device subsystem for collecting and acting on host-security findings under separate privilege boundaries.
 
+### Cloudflare MCP
+
+The managed Cloudflare API MCP server can be configured and checked from the
+CLI. Set `CLOUDFLARE_API_TOKEN` in the environment, then run:
+
+```text
+harw mcp setup cloudflare
+harw mcp check cloudflare
+```
+
+The setup writes only a declarative `streamable_http` entry under the active
+profile's `mcps/` directory. The check performs MCP `initialize` and
+`tools/list` against `https://mcp.cloudflare.com/mcp` and prints the advertised
+tool names without printing the token.
+
 The current workspace version is **0.3.0**.
 
 ## Core principles
