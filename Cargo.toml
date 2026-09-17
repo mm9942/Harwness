@@ -33,6 +33,7 @@ members = [
     "harw-channel-telegram",
     "harw-channel-telegram-transport",
     "harw-mcp-server",
+    "harw-mcp-client",
     # Wave J — coding-agent tool surface + baseline instructions + project discovery:
     "harw-tool-fs",
     "harw-tool-deps",
