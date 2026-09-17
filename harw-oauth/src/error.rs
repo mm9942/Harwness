@@ -8,7 +8,7 @@ use std::fmt;
 /// Bequemer Ergebnistyp der OAuth-Schicht.
 pub type OAuthResult<T> = Result<T, OAuthError>;
 
-/// Fehler beim Setup-Token-/OAuth-Flow und Token-Store.
+/// Fehler beim Setup-Token-/OAuth-Flow, Token-Store und Codex-Token-Refresh.
 pub enum OAuthError {
     /// Der Token-Exchange-Endpoint antwortete nicht-erfolgreich.
     TokenExchange {
@@ -32,6 +32,13 @@ pub enum OAuthError {
     UnsafeProviderFilenameComponent,
     /// Ein aufgelöster Wert konnte nicht als `SecretRef` geparst werden.
     SecretRef(String),
+    /// Die Codex-Credential-Datei (`~/.codex/auth.json`) ließ sich nicht als
+    /// erwartetes JSON-Dokument lesen oder enthielt kein `tokens`-Objekt.
+    CodexCredentialFile(String),
+    /// Der Datei-Lock für den Codex-Token-Refresh konnte innerhalb des
+    /// Zeitlimits nicht erworben werden (paralleler Refresh eines anderen
+    /// Prozesses/Threads hält ihn vermutlich noch).
+    RefreshLockTimeout(String),
 }
 
 impl fmt::Display for OAuthError {
@@ -53,6 +60,12 @@ impl fmt::Display for OAuthError {
                 )
             }
             Self::SecretRef(reason) => write!(f, "could not build secret reference: {reason}"),
+            Self::CodexCredentialFile(reason) => {
+                write!(f, "Codex credential file is unusable: {reason}")
+            }
+            Self::RefreshLockTimeout(path) => {
+                write!(f, "timed out waiting for Codex refresh lock at {path}")
+            }
         }
     }
 }

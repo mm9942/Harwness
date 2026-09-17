@@ -13,6 +13,10 @@ secrecy = "0.10.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 sha2 = "0.11.0"
+# Für den Datei-Lock-Retry-Backoff des Codex-Refresh-Flows (kein Blocking im
+# Async-Kontext); Version an bereits im Workspace verwendeter tokio-Version
+# ausgerichtet (siehe harw-provider-http/Cargo.toml).
+tokio = { version = "1.52.3", features = ["time"] }
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = ["macros", "rt"] }

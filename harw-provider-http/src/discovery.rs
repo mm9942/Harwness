@@ -102,13 +102,19 @@ impl fmt::Display for DiscoveryError {
                 write!(f, "Netzwerkfehler: {detail}")
             }
             DiscoveryError::Api { status, detail } => {
-                write!(f, "Provider antwortete mit Fehler (HTTP {status}): {detail}")
+                write!(
+                    f,
+                    "Provider antwortete mit Fehler (HTTP {status}): {detail}"
+                )
             }
             DiscoveryError::Decode { detail } => {
                 write!(f, "Antwort konnte nicht gelesen werden: {detail}")
             }
             DiscoveryError::Unsupported { api } => {
-                write!(f, "Modell-Discovery wird für die Provider-API '{api}' nicht unterstützt")
+                write!(
+                    f,
+                    "Modell-Discovery wird für die Provider-API '{api}' nicht unterstützt"
+                )
             }
         }
     }
@@ -150,6 +156,16 @@ pub fn resolve_provider_api_key(
     home: Option<&Path>,
     resolver: Option<&dyn crate::SecretResolver>,
 ) -> Option<String> {
+    match crate::codex::CodexRoute::from_provider(provider) {
+        Ok(Some(route)) => {
+            // Validate the login without exposing it to a caller which might
+            // still use the configured legacy Platform endpoint. list_models
+            // rereads the credential and uses the bound Codex endpoint.
+            return route.validate_login().ok().map(|_| String::new());
+        }
+        Err(_) => return None,
+        Ok(None) => {}
+    }
     let reference = provider.auth.as_ref()?;
     let sources = crate::SecretSources {
         env_layer: &config.env_layer,
@@ -204,7 +220,15 @@ pub async fn list_models(
     provider: &harw_config::ProviderToml,
     api_key: Option<&str>,
 ) -> Result<Vec<DiscoveredModel>, DiscoveryError> {
-    let base = provider.base_url.trim_end_matches('/');
+    let codex_route =
+        crate::codex::CodexRoute::from_provider(provider).map_err(|_| DiscoveryError::Decode {
+            detail: "Invalid Codex credential route".into(),
+        })?;
+    let base = if codex_route.is_some() {
+        crate::codex::BASE_URL
+    } else {
+        provider.base_url.trim_end_matches('/')
+    };
     let url = match provider.api.as_str() {
         "openai-chat" | "openai-responses" => format!("{base}/models"),
         "ollama" => {
@@ -227,19 +251,37 @@ pub async fn list_models(
 
     let client = crate::http_client();
     let mut request = client.get(&url).timeout(DISCOVERY_TIMEOUT);
-    if provider.api == "anthropic-messages" {
+    if let Some(route) = &codex_route {
+        let codex_headers = route.headers(&client).await.map_err(|_| DiscoveryError::Auth {
+            status: 401,
+            detail: "Codex login unavailable; run `codex login` and retry".into(),
+        })?;
+        request = request
+            .query(&[("client_version", env!("CARGO_PKG_VERSION"))])
+            .headers(codex_headers);
+    } else if provider.api == "anthropic-messages" {
         if let Some(key) = api_key {
-            request = request
-                .header("x-api-key", key)
-                .header("anthropic-version", crate::anthropic::ANTHROPIC_VERSION);
+            request = request.header("anthropic-version", crate::anthropic::ANTHROPIC_VERSION);
+            request = match crate::classify_anthropic_secret(key.to_owned()) {
+                crate::AnthropicCredential::OAuth(secret) => request
+                    .bearer_auth(secret.expose_secret())
+                    .header("anthropic-beta", crate::anthropic::ANTHROPIC_OAUTH_BETA),
+                crate::AnthropicCredential::ApiKey(secret) => {
+                    request.header("x-api-key", secret.expose_secret())
+                }
+                crate::AnthropicCredential::Bearer(secret) => request.bearer_auth(secret.expose_secret()),
+            };
         }
     } else if let Some(key) = api_key {
         request = request.bearer_auth(key);
     }
 
-    let response = request.send().await.map_err(|error| DiscoveryError::Network {
-        detail: classify_transport_detail(&error),
-    })?;
+    let response = request
+        .send()
+        .await
+        .map_err(|error| DiscoveryError::Network {
+            detail: classify_transport_detail(&error),
+        })?;
 
     let status = response.status();
     if status.as_u16() == 401 || status.as_u16() == 403 {
@@ -255,10 +297,41 @@ pub async fn list_models(
         });
     }
 
-    let body: Value = response.json().await.map_err(|_error| DiscoveryError::Decode {
-        detail: format!("Antwort von Provider '{provider_name}' ist kein gültiges JSON"),
-    })?;
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|_error| DiscoveryError::Decode {
+            detail: format!("Antwort von Provider '{provider_name}' ist kein gültiges JSON"),
+        })?;
+    if codex_route.is_some() {
+        return parse_codex_models_response(&body);
+    }
     Ok(parse_models_response(&body))
+}
+
+fn parse_codex_models_response(body: &Value) -> Result<Vec<DiscoveredModel>, DiscoveryError> {
+    let entries = body
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| DiscoveryError::Decode {
+            detail: "Codex model response is missing its models array".into(),
+        })?;
+    Ok(entries
+        .iter()
+        .filter_map(|entry| {
+            let id = entry.get("slug")?.as_str()?.trim();
+            if id.is_empty() {
+                return None;
+            }
+            Some(DiscoveredModel {
+                id: id.into(),
+                context_length: entry.get("context_window").and_then(Value::as_u64),
+                input_price_per_mtok: None,
+                output_price_per_mtok: None,
+                supports_tools: None,
+            })
+        })
+        .collect())
 }
 
 /// Beschreibt einen `reqwest`-Transportfehler kurz, ohne die Ziel-URL oder
@@ -307,13 +380,14 @@ fn parse_one_model(entry: &Value) -> Option<DiscoveredModel> {
             (input, output)
         })
         .unwrap_or((None, None));
-    let supports_tools = entry.get("supported_parameters").and_then(Value::as_array).map(
-        |parameters| {
+    let supports_tools = entry
+        .get("supported_parameters")
+        .and_then(Value::as_array)
+        .map(|parameters| {
             parameters
                 .iter()
                 .any(|value| value.as_str() == Some("tools"))
-        },
-    );
+        });
     Some(DiscoveredModel {
         id,
         context_length,
@@ -327,6 +401,19 @@ fn parse_one_model(entry: &Value) -> Option<DiscoveredModel> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn codex_models_use_backend_slugs_without_invented_prices() {
+        let models = parse_codex_models_response(&json!({"models":[
+            {"slug":"gpt-test","context_window":400000}, {"slug":""}, {"id":"wrong-shape"}
+        ]}))
+        .unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gpt-test");
+        assert_eq!(models[0].context_length, Some(400000));
+        assert_eq!(models[0].input_price_per_mtok, None);
+        assert!(parse_codex_models_response(&json!({"data":[]})).is_err());
+    }
 
     #[test]
     fn test_parse_models_response_openai_shape_yields_bare_ids() {

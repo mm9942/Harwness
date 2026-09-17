@@ -82,7 +82,10 @@ impl RoutingModelProvider {
             .get(provider_id)
             .map(|provider| &**provider)
             .ok_or_else(|| {
-                tracing::warn!(provider = provider_id, "model request for unconfigured provider");
+                tracing::warn!(
+                    provider = provider_id,
+                    "model request for unconfigured provider"
+                );
                 ModelError::RequestFailed(format!(
                     "requested model provider '{provider_id}' is not configured"
                 ))
@@ -280,19 +283,26 @@ mod tests {
             registry([
                 (
                     "zeta",
-                    Box::new(RecordingProvider::new("z", Arc::new(Mutex::new(Vec::new()))))
-                        as Box<dyn ModelProvider>,
+                    Box::new(RecordingProvider::new(
+                        "z",
+                        Arc::new(Mutex::new(Vec::new())),
+                    )) as Box<dyn ModelProvider>,
                 ),
                 (
                     "alpha",
-                    Box::new(RecordingProvider::new("a", Arc::new(Mutex::new(Vec::new()))))
-                        as Box<dyn ModelProvider>,
+                    Box::new(RecordingProvider::new(
+                        "a",
+                        Arc::new(Mutex::new(Vec::new())),
+                    )) as Box<dyn ModelProvider>,
                 ),
             ]),
             "zeta",
         )
         .unwrap();
-        assert_eq!(router.provider_ids().collect::<Vec<_>>(), vec!["alpha", "zeta"]);
+        assert_eq!(
+            router.provider_ids().collect::<Vec<_>>(),
+            vec!["alpha", "zeta"]
+        );
     }
 
     #[test]

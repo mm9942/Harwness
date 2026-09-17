@@ -404,14 +404,24 @@ mod tests {
 
         assert!(matches!(
             model_error_for_status(429, None, Some(7), rate),
-            ModelError::Transient { status: Some(429), retry_after_secs: Some(7), .. }
+            ModelError::Transient {
+                status: Some(429),
+                retry_after_secs: Some(7),
+                ..
+            }
         ));
         assert!(matches!(
             model_error_for_status(429, None, Some(7), quota),
             ModelError::QuotaExceeded { .. }
         ));
-        assert!(matches!(model_error_for_status(401, None, None, "{}"), ModelError::Auth { .. }));
-        assert!(matches!(model_error_for_status(403, None, None, "{}"), ModelError::Auth { .. }));
+        assert!(matches!(
+            model_error_for_status(401, None, None, "{}"),
+            ModelError::Auth { .. }
+        ));
+        assert!(matches!(
+            model_error_for_status(403, None, None, "{}"),
+            ModelError::Auth { .. }
+        ));
         assert!(matches!(
             model_error_for_status(400, None, None, context),
             ModelError::ContextLength { .. }
@@ -455,13 +465,19 @@ mod tests {
     fn test_retry_after_hint_sources_and_order() {
         assert_eq!(retry_after_hint(Some("12"), None, ""), Some(12));
         assert_eq!(retry_after_hint(Some("12"), Some("1500"), ""), Some(2));
-        assert_eq!(retry_after_hint(None, None, "Please wait 9 seconds."), Some(9));
+        assert_eq!(
+            retry_after_hint(None, None, "Please wait 9 seconds."),
+            Some(9)
+        );
         assert_eq!(
             retry_after_hint(Some("Tue, 16 Jul 2026 12:00:00 GMT"), None, "no hint"),
             None
         );
         assert_eq!(retry_after_hint(None, None, ""), None);
-        assert_eq!(retry_after_hint(Some("99999999"), None, ""), Some(24 * 60 * 60));
+        assert_eq!(
+            retry_after_hint(Some("99999999"), None, ""),
+            Some(24 * 60 * 60)
+        );
     }
 
     #[test]

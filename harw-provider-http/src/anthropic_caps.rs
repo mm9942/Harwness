@@ -332,17 +332,35 @@ mod tests {
         let opus5 = lookup("claude-opus-5").expect("opus 5 row");
         assert_eq!(effort_wire_value(opus5, ReasoningEffort::Minimal), None);
         assert_eq!(effort_wire_value(opus5, ReasoningEffort::Low), Some("low"));
-        assert_eq!(effort_wire_value(opus5, ReasoningEffort::Medium), Some("medium"));
-        assert_eq!(effort_wire_value(opus5, ReasoningEffort::High), Some("high"));
-        assert_eq!(effort_wire_value(opus5, ReasoningEffort::Xhigh), Some("xhigh"));
+        assert_eq!(
+            effort_wire_value(opus5, ReasoningEffort::Medium),
+            Some("medium")
+        );
+        assert_eq!(
+            effort_wire_value(opus5, ReasoningEffort::High),
+            Some("high")
+        );
+        assert_eq!(
+            effort_wire_value(opus5, ReasoningEffort::Xhigh),
+            Some("xhigh")
+        );
         assert_eq!(effort_wire_value(opus5, ReasoningEffort::Max), Some("max"));
 
         let sonnet46 = lookup("claude-sonnet-4-6").expect("sonnet 4.6 row");
-        assert_eq!(effort_wire_value(sonnet46, ReasoningEffort::Xhigh), Some("high"));
-        assert_eq!(effort_wire_value(sonnet46, ReasoningEffort::Max), Some("max"));
+        assert_eq!(
+            effort_wire_value(sonnet46, ReasoningEffort::Xhigh),
+            Some("high")
+        );
+        assert_eq!(
+            effort_wire_value(sonnet46, ReasoningEffort::Max),
+            Some("max")
+        );
 
         let opus45 = lookup("claude-opus-4-5").expect("opus 4.5 row");
-        assert_eq!(effort_wire_value(opus45, ReasoningEffort::Max), Some("high"));
+        assert_eq!(
+            effort_wire_value(opus45, ReasoningEffort::Max),
+            Some("high")
+        );
 
         let haiku = lookup("claude-haiku-4-5").expect("haiku row");
         assert_eq!(effort_wire_value(haiku, ReasoningEffort::High), None);

@@ -96,6 +96,8 @@ pub use retry::{
 };
 pub use routing::RoutingModelProvider;
 
+mod codex;
+
 /// Synchronously resolves a `secrets:` credential reference.
 ///
 /// Implementations must return a [`SecretString`] on success. On failure, the
@@ -121,8 +123,7 @@ const FILE_CREDENTIAL_OUTSIDE_SECRETS_REASON: &str =
     "file credential must be an absolute path below <home>/secrets";
 const FILE_CREDENTIAL_OPEN_REASON: &str =
     "file credential could not be opened without following symlinks";
-const FILE_CREDENTIAL_NOT_PRIVATE_REASON: &str =
-    "file credential must be a regular file owned by the current user without group or other permissions";
+const FILE_CREDENTIAL_NOT_PRIVATE_REASON: &str = "file credential must be a regular file owned by the current user without group or other permissions";
 const FILE_CREDENTIAL_READ_REASON: &str =
     "file credential is unreadable, larger than 64 KiB or not UTF-8";
 const FILE_CREDENTIAL_JSON_REASON: &str = "file credential is not valid JSON";
@@ -178,6 +179,11 @@ const EXTERNAL_CLI_CREDENTIALS: &[(&str, &[&str], &[&str])] = &[
         ".codex/auth.json",
         &["/OPENAI_API_KEY"],
         &["api.openai.com"],
+    ),
+    (
+        ".codex/auth.json",
+        &["/tokens/access_token"],
+        &["chatgpt.com"],
     ),
     (
         ".claude/.credentials.json",
@@ -315,6 +321,29 @@ impl ModelProvider for UnavailableProvider {
 /// definitions in lexicographic order. This keeps
 /// construction deterministic while [`ModelRequest::model_id`] remains the
 /// request-time override.
+/// Builds the [`RetryPolicy`] applied to every real HTTP-backed provider
+/// (Anthropic and the OpenAI-compatible fallback) constructed by
+/// [`build_named_provider`], so a timed-out or transient/rate-limited model
+/// request is retried after a delay instead of failing the chat turn
+/// immediately (see module doc, "Wiederholung vorübergehender Fehler").
+///
+/// `base_delay = 10s` is chosen because [`RetryPolicy::backoff_delay`] (retry_index
+/// `0`) computes `cap = min(max_delay, base_delay * 2^0) = base_delay`, then
+/// jitters to `half + half*unit` where `half = cap / 2` — i.e. the first
+/// retry actually waits somewhere in `[5s, 10s)`, matching the desired
+/// "retry after ~5 seconds" behaviour. `max_attempts: 3` allows one initial
+/// attempt plus two retries; `max_delay: 20s` caps the (unused, since only
+/// two retries occur) further exponential growth; `max_retry_after: 60s`
+/// still honours a server-provided `Retry-After` header up to a minute.
+fn network_retry_policy() -> RetryPolicy {
+    RetryPolicy {
+        max_attempts: 3,
+        base_delay: Duration::from_secs(10),
+        max_delay: Duration::from_secs(20),
+        max_retry_after: Duration::from_secs(60),
+    }
+}
+
 fn build_named_provider(
     provider_name: &str,
     provider: &harw_config::ProviderToml,
@@ -363,16 +392,16 @@ fn build_named_provider(
             configured_headers(provider_name, &provider.headers, sources)?,
         );
         backend.configure_rate_limit(provider.rate_limit.clone());
-        return Ok(Box::new(backend));
+        return Ok(Box::new(RetryingProvider::new(
+            backend,
+            network_retry_policy(),
+        )));
     }
 
-    Ok(Box::new(OpenAiResponsesProvider::from_named_config(
-        provider_name,
-        provider,
-        config,
-        model,
-        sources,
-    )?))
+    Ok(Box::new(RetryingProvider::new(
+        OpenAiResponsesProvider::from_named_config(provider_name, provider, config, model, sources)?,
+        network_retry_policy(),
+    )))
 }
 
 /// Löst Base-URL + Credential für den nativen Anthropic-Weg auf.
@@ -645,6 +674,7 @@ pub struct OpenAiResponsesProvider {
     provider_id: String,
     model: String,
     api_key: SecretString,
+    codex_route: Option<codex::CodexRoute>,
     auth_header: String,
     headers: reqwest::header::HeaderMap,
     transport: Transport,
@@ -659,6 +689,18 @@ pub struct OpenAiResponsesProvider {
     /// Client-seitiger Rate-Limiter (siehe [`rate_limiter::ProviderRateLimiter`]);
     /// standardmäßig deaktiviert (`ProviderRateLimiter::new(None)`).
     rate_limiter: std::sync::Arc<rate_limiter::ProviderRateLimiter>,
+    /// Harte Nebenläufigkeitsgrenze für diesen Provider (siehe
+    /// [`harw_config::ProviderToml::max_concurrency`]); `None` = unbegrenzt.
+    ///
+    /// Anders als [`Self::rate_limiter`] (reaktives Header-Pacing, wirkt auf
+    /// den *nächsten* Request) blockiert dies zusätzliche Requests rein
+    /// client-seitig, bevor sie überhaupt gesendet werden, sobald bereits
+    /// `max_concurrency` Requests dieses Providers gleichzeitig in Flug
+    /// sind. Gedacht für Backends mit begrenzter Parallelitätskapazität
+    /// (z. B. einen Cloudflare Worker vor Workers AI), die bei zu vielen
+    /// gleichzeitigen Chat-Turn-Requests (etwa durch Tool-Use-Fanout einer
+    /// einzigen User-Runde) ins Stocken geraten.
+    concurrency_limiter: Option<std::sync::Arc<tokio::sync::Semaphore>>,
 }
 
 /// Eine gemerkte Reasoning-Runde der Responses-API (W4a / A-OAI).
@@ -723,7 +765,10 @@ impl ReasoningReplay {
             .filter(|entry| {
                 entry.provider == provider
                     && entry.model == model
-                    && entry.call_ids.iter().any(|id| call_ids.contains(id.as_str()))
+                    && entry
+                        .call_ids
+                        .iter()
+                        .any(|id| call_ids.contains(id.as_str()))
             })
             .cloned()
             .collect()
@@ -773,6 +818,7 @@ impl OpenAiResponsesProvider {
             provider_id: "openai".to_owned(),
             model: model.into(),
             api_key,
+            codex_route: None,
             auth_header: "bearer".into(),
             headers: reqwest::header::HeaderMap::new(),
             transport,
@@ -780,6 +826,7 @@ impl OpenAiResponsesProvider {
             reasoning_replay: ReasoningReplay::default(),
             cache_overrides: std::collections::HashMap::new(),
             rate_limiter: std::sync::Arc::new(rate_limiter::ProviderRateLimiter::new(None)),
+            concurrency_limiter: None,
         }
     }
 
@@ -844,7 +891,11 @@ impl OpenAiResponsesProvider {
     /// `config` liefert `config.models` zum Befüllen von `cache_overrides`
     /// (jedes Modell dieses Providers mit gesetztem `prompt_caching`, unter
     /// seiner `id` **und** all seinen `aliases`) sowie `provider.rate_limit`
-    /// zum Bau des [`rate_limiter::ProviderRateLimiter`].
+    /// zum Bau des [`rate_limiter::ProviderRateLimiter`]. `provider.max_concurrency`
+    /// (siehe [`harw_config::ProviderToml::max_concurrency`]) wird, falls
+    /// `Some(n)`, in [`Self::concurrency_limiter`] als frischen
+    /// `Arc<Semaphore>` mit `n` Permits übersetzt; `None` lässt das Feld
+    /// unverändert `None` (unbegrenzt).
     fn from_named_config(
         provider_name: &str,
         provider: &harw_config::ProviderToml,
@@ -852,6 +903,16 @@ impl OpenAiResponsesProvider {
         model: &str,
         sources: SecretSources<'_>,
     ) -> HttpProviderResult<Self> {
+        let codex_route = codex::CodexRoute::from_provider(provider)?;
+        let base_url = if codex_route.is_some() {
+            codex::BASE_URL
+        } else {
+            &provider.base_url
+        };
+        let sources = SecretSources {
+            endpoint: Some(base_url),
+            ..sources
+        };
         if provider.base_url.trim().is_empty() {
             return Err(HttpProviderError::Decode(format!(
                 "provider '{provider_name}' has an empty base_url"
@@ -878,12 +939,13 @@ impl OpenAiResponsesProvider {
             });
         };
         let mut http_provider = Self::with_transport(
-            provider.base_url.trim_end_matches('/').to_owned(),
+            base_url.trim_end_matches('/').to_owned(),
             model.to_owned(),
             api_key,
             transport_from_api(&provider.api),
         );
         http_provider.auth_header = auth_header.to_owned();
+        http_provider.codex_route = codex_route;
         if !matches!(
             provider.api.as_str(),
             "openai-chat" | "openai-responses" | "ollama"
@@ -905,7 +967,11 @@ impl OpenAiResponsesProvider {
         }
         http_provider.provider_id = provider_name.to_owned();
         http_provider.headers = configured_headers(provider_name, &provider.headers, sources)?;
-        for model_entry in config.models.values().filter(|m| m.provider == provider_name) {
+        for model_entry in config
+            .models
+            .values()
+            .filter(|m| m.provider == provider_name)
+        {
             if let Some(mode) = model_entry.prompt_caching {
                 http_provider
                     .cache_overrides
@@ -918,6 +984,9 @@ impl OpenAiResponsesProvider {
         http_provider.rate_limiter = std::sync::Arc::new(rate_limiter::ProviderRateLimiter::new(
             provider.rate_limit.clone(),
         ));
+        http_provider.concurrency_limiter = provider
+            .max_concurrency
+            .map(|limit| std::sync::Arc::new(tokio::sync::Semaphore::new(limit)));
         Ok(http_provider)
     }
 
@@ -1154,12 +1223,10 @@ fn resolve_secret(
                         Err(reason)
                     }
                 })
-                .map_err(|reason| {
-                HttpProviderError::UnresolvedCredential {
+                .map_err(|reason| HttpProviderError::UnresolvedCredential {
                     reference: reference.clone(),
                     reason: reason.to_owned(),
-                }
-            })?;
+                })?;
             let doc: serde_json::Value =
                 serde_json::from_str(raw.expose_secret()).map_err(|_| {
                     HttpProviderError::UnresolvedCredential {
@@ -1305,16 +1372,23 @@ fn read_external_cli_credential(
     use std::os::fd::AsFd as _;
 
     let endpoint = endpoint?;
+    // ChatGPT credentials are bound to the Codex API path as well as its host.
+    if pointer == "/tokens/access_token" && endpoint.trim_end_matches('/') != codex::BASE_URL {
+        return None;
+    }
     let user_home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
     let user_home = PathBuf::from(user_home);
     let path = Path::new(raw_path);
-    let (relative, _, _) = EXTERNAL_CLI_CREDENTIALS.iter().find(|(relative, pointers, hosts)| {
-        path == user_home.join(relative)
-            && pointers.contains(&pointer)
-            && hosts
-                .iter()
-                .any(|host| endpoint_is_official_host(endpoint, host))
-    })?;
+    let (relative, _, _) =
+        EXTERNAL_CLI_CREDENTIALS
+            .iter()
+            .find(|(relative, pointers, hosts)| {
+                path == user_home.join(relative)
+                    && pointers.contains(&pointer)
+                    && hosts
+                        .iter()
+                        .any(|host| endpoint_is_official_host(endpoint, host))
+            })?;
     let full = user_home.join(relative);
     let (Some(parent), Some(file_name)) = (full.parent(), full.file_name()) else {
         return Some(Err(FILE_CREDENTIAL_OPEN_REASON));
@@ -1643,7 +1717,9 @@ fn build_responses_body(
 fn bounded_reason(reason: &str) -> String {
     reason
         .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
+        .filter(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })
         .take(MAX_STOP_REASON_CHARS)
         .collect()
 }
@@ -1803,7 +1879,10 @@ fn interpret_chat(body: &Value) -> Result<ModelResponse, ModelError> {
             .and_then(Value::as_array)
             .map_or(0, Vec::len);
         if dropped > 0 {
-            tracing::warn!(dropped, "dropping tool calls of a truncated chat completion");
+            tracing::warn!(
+                dropped,
+                "dropping tool calls of a truncated chat completion"
+            );
         }
         Vec::new()
     } else {
@@ -2285,8 +2364,11 @@ impl OpenAiResponsesProvider {
     /// Alle Credential-Header sind sensitiv markiert: `bearer_auth` tut das in
     /// reqwest selbst (`header_sensitive(.., true)`), `api-key`/`x-api-key`
     /// über [`sensitive_header_value`].
-    fn authorized_request(&self, url: &str) -> Result<reqwest::RequestBuilder, ModelError> {
+    async fn authorized_request(&self, url: &str) -> Result<reqwest::RequestBuilder, ModelError> {
         let builder = self.client.post(url).headers(self.headers.clone());
+        if let Some(route) = &self.codex_route {
+            return Ok(builder.headers(route.headers(&self.client).await?));
+        }
         Ok(match self.auth_header.as_str() {
             "none" => builder,
             "api-key" | "x-api-key" => builder.header(
@@ -2299,10 +2381,41 @@ impl OpenAiResponsesProvider {
 }
 
 impl ModelProvider for OpenAiResponsesProvider {
+    /// Sendet einen Modell-Request an diesen Provider und liefert die Antwort.
+    ///
+    /// # Description
+    /// Baut den Wire-Body für den konfigurierten [`Transport`] (Responses
+    /// oder Chat), durchläuft dann zwei unabhängige, in dieser Reihenfolge
+    /// wirkende Gates, bevor der eigentliche HTTP-Request abgesetzt wird:
+    /// 1. `concurrency_limiter` (falls konfiguriert) — hartes,
+    ///    client-seitiges Limit gleichzeitig in Flug befindlicher Requests;
+    ///    blockiert, bis ein Slot frei wird. Der erworbene Permit bleibt bis
+    ///    zum Ende dieses Aufrufs (nach vollständigem Lesen der Antwort) im
+    ///    Scope.
+    /// 2. `rate_limiter` (siehe [`rate_limiter::ProviderRateLimiter`]) —
+    ///    reaktives Pacing anhand zuvor beobachteter
+    ///    Provider-Rate-Limit-Header, wartet ggf. vor dem nächsten Request.
+    ///
+    /// Erst danach wird der HTTP-Request tatsächlich gesendet (inkl.
+    /// Codex-401-Refresh-Retry, siehe Kommentare im Körper).
+    ///
+    /// # Errors
+    /// - [`ModelError::RequestFailed`]: das Nebenläufigkeits-Semaphore wurde
+    ///   geschlossen (interner Fehler), der HTTP-Request selbst schlug fehl,
+    ///   oder die Antwort konnte nicht dekodiert werden.
+    /// - [`ModelError::RateLimited`]: der Provider antwortete mit HTTP 429.
+    /// - [`ModelError::EmptyResponse`]: der Provider lieferte keine nutzbare
+    ///   Antwort.
+    ///
+    /// # Concurrency
+    /// `Send + Sync`; sicher von mehreren Threads/Tasks gleichzeitig
+    /// aufrufbar. Serialisiert zusätzliche Requests ausschließlich über
+    /// `concurrency_limiter` (falls gesetzt), niemals über einen
+    /// exklusiven Lock auf `self`.
     fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
         Box::pin(async move {
             let model = self.selected_model(&request)?;
-            let (url, wire) = match self.transport {
+            let (url, mut wire) = match self.transport {
                 Transport::Responses => {
                     let replay =
                         self.reasoning_replay
@@ -2325,43 +2438,90 @@ impl ModelProvider for OpenAiResponsesProvider {
                     );
                     let mut body = build_chat_body(&request, model);
                     cache_strategy::apply_chat_cache_control(&mut body, strategy);
-                    tracing::debug!(
-                        model,
-                        strategy = strategy.label(),
-                        "sending chat request"
-                    );
+                    tracing::debug!(model, strategy = strategy.label(), "sending chat request");
                     (format!("{}/chat/completions", self.base_url), body)
                 }
             };
 
+            if self.codex_route.is_some() {
+                codex::prepare_body(&mut wire);
+            }
+
+            // Hartes Nebenläufigkeits-Limit (siehe [`Self::concurrency_limiter`]):
+            // blockiert, bis ein Slot frei wird, statt fehlzuschlagen. Der
+            // Guard bleibt bis zum Ende dieses async-Blocks (also bis der
+            // Response-Body vollständig gelesen/geparst ist) im Scope, damit
+            // die Grenze wirklich in Flug befindliche Requests zählt, nicht
+            // nur abgesetzte.
+            let _concurrency_permit = match &self.concurrency_limiter {
+                Some(semaphore) => Some(
+                    std::sync::Arc::clone(semaphore)
+                        .acquire_owned()
+                        .await
+                        .map_err(|_| {
+                            ModelError::RequestFailed(
+                                "internal error: provider concurrency semaphore was closed"
+                                    .to_owned(),
+                            )
+                        })?,
+                ),
+                None => None,
+            };
             self.rate_limiter.wait_for_slot().await;
-            let builder = self.authorized_request(&url)?;
-            let response = builder
-                .json(&wire)
-                .timeout(self.request_timeout)
-                .send()
-                .await
-                .map_err(|error| model_error_for_transport(error, false))?;
+            // Codex-Route: bei einem tatsächlichen 401 genau einmal
+            // reaktiv erneuern und den Request genau einmal wiederholen —
+            // kein zweiter Refresh-Versuch nach erneutem 401 (siehe
+            // `codex::CodexRoute::refresh`).
+            let mut codex_refreshed_after_401 = false;
+            let response = loop {
+                let builder = self.authorized_request(&url).await?;
+                let response = builder
+                    .json(&wire)
+                    .timeout(self.request_timeout)
+                    .send()
+                    .await
+                    .map_err(|error| model_error_for_transport(error, false))?;
+
+                if response.status() == reqwest::StatusCode::UNAUTHORIZED
+                    && !codex_refreshed_after_401
+                    && let Some(route) = &self.codex_route
+                {
+                    codex_refreshed_after_401 = true;
+                    if route.refresh(&self.client).await.is_ok() {
+                        continue;
+                    }
+                }
+                break response;
+            };
 
             self.rate_limiter.observe_headers(response.headers());
             let status = response.status();
             let retry_after = header_string(response.headers(), "retry-after");
             let retry_after_ms = header_string(response.headers(), "retry-after-ms");
             let request_id = provider_request_id(response.headers());
-            let body = response
-                .text()
-                .await
-                .map_err(|error| model_error_for_transport(error, true))?;
+            let value: Value = if status.is_success() && self.codex_route.is_some() {
+                codex::read_response(response).await?
+            } else {
+                let body = response
+                    .text()
+                    .await
+                    .map_err(|error| model_error_for_transport(error, true))?;
 
-            if !status.is_success() {
-                let hint = retry_after_hint(retry_after.as_deref(), retry_after_ms.as_deref(), &body);
-                let error =
-                    model_error_for_status(status.as_u16(), request_id.as_deref(), hint, &body);
-                tracing::debug!(status = status.as_u16(), retryable = error.is_retryable(), "provider returned an error status");
-                return Err(error);
-            }
+                if !status.is_success() {
+                    let hint =
+                        retry_after_hint(retry_after.as_deref(), retry_after_ms.as_deref(), &body);
+                    let error =
+                        model_error_for_status(status.as_u16(), request_id.as_deref(), hint, &body);
+                    tracing::debug!(
+                        status = status.as_u16(),
+                        retryable = error.is_retryable(),
+                        "provider returned an error status"
+                    );
+                    return Err(error);
+                }
 
-            let value: Value = serde_json::from_str(&body)?;
+                serde_json::from_str(&body)?
+            };
             let mut response = match self.transport {
                 Transport::Responses => {
                     let (response, replay) = interpret_responses(&value, &self.provider_id, model)?;
@@ -2480,6 +2640,207 @@ mod tests {
         (base_url, handle)
     }
 
+    /// Startet einen Mock-HTTP-Server, der pro Verbindung einen eigenen
+    /// Thread spawnt (statt seriell zu akzeptieren wie [`mock_chat_server`]),
+    /// die aktuell gleichzeitig offenen Verbindungen zählt, den beobachteten
+    /// Höchststand (`peak`) trackt und jede Anfrage künstlich verzögert,
+    /// bevor sie beantwortet wird. Damit lässt sich beweisen, dass
+    /// `max_concurrency` clientseitig wirklich gleichzeitige Requests
+    /// begrenzt, statt nur Requests seriell abzuarbeiten.
+    fn mock_concurrency_probe_server(
+        request_count: usize,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>, thread::JoinHandle<()>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let base_url = format!("http://{}", listener.local_addr().expect("mock address"));
+        let in_flight = std::sync::Arc::new(AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(AtomicUsize::new(0));
+        let peak_for_thread = std::sync::Arc::clone(&peak);
+        let handle = thread::spawn(move || {
+            let mut connection_handles = Vec::with_capacity(request_count);
+            for _ in 0..request_count {
+                let (mut stream, _) = listener.accept().expect("accept mock request");
+                let in_flight = std::sync::Arc::clone(&in_flight);
+                let peak = std::sync::Arc::clone(&peak_for_thread);
+                connection_handles.push(thread::spawn(move || {
+                    let mut request_buffer = [0_u8; 4096];
+                    let _read = stream.read(&mut request_buffer).expect("read mock request");
+                    let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(current, Ordering::SeqCst);
+                    // Künstliche Latenz, damit gleichzeitig eingehende
+                    // Requests sich zeitlich überlappen können, sofern der
+                    // Client sie überhaupt gleichzeitig absetzt.
+                    thread::sleep(Duration::from_millis(80));
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    let body = br#"{"choices":[{"message":{"content":"mock"}}]}"#;
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream
+                        .write_all(headers.as_bytes())
+                        .expect("write mock response headers");
+                    stream.write_all(body).expect("write mock response body");
+                }));
+            }
+            for handle in connection_handles {
+                handle.join().expect("mock connection handler completes");
+            }
+        });
+        (base_url, peak, handle)
+    }
+
+    #[tokio::test]
+    async fn respond_honors_max_concurrency_hard_cap() {
+        const MAX_CONCURRENCY: usize = 2;
+        const REQUEST_COUNT: usize = 5;
+
+        let (base_url, peak, server) = mock_concurrency_probe_server(REQUEST_COUNT);
+        let mut provider = configured_provider(
+            "capped",
+            base_url,
+            vec!["gpt-test"],
+            "CAPPED_PROVIDER_KEY",
+        );
+        provider.max_concurrency = Some(MAX_CONCURRENCY);
+        provider.validate().expect("max_concurrency = 2 is valid");
+
+        let env_layer = BTreeMap::from([(
+            "CAPPED_PROVIDER_KEY".to_owned(),
+            "sk-secret".to_owned(),
+        )]);
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.default_provider = Some("capped".to_owned());
+        config.harness.default_model = Some("gpt-test".to_owned());
+        config
+            .providers
+            .insert("capped".to_owned(), provider.clone());
+
+        let http_provider = std::sync::Arc::new(
+            OpenAiResponsesProvider::from_named_config(
+                "capped",
+                &provider,
+                &config,
+                "gpt-test",
+                test_sources(&env_layer, None, None),
+            )
+            .expect("provider builds with max_concurrency configured"),
+        );
+
+        let mut handles = Vec::with_capacity(REQUEST_COUNT);
+        for _ in 0..REQUEST_COUNT {
+            let http_provider = std::sync::Arc::clone(&http_provider);
+            handles.push(tokio::spawn(async move {
+                http_provider
+                    .respond(request_with_ids(None, None))
+                    .await
+                    .expect("mock chat response parses")
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("respond task completes");
+        }
+        server.join().expect("mock server completes");
+
+        assert!(
+            peak.load(std::sync::atomic::Ordering::SeqCst) <= MAX_CONCURRENCY,
+            "observed more than {MAX_CONCURRENCY} requests in flight simultaneously"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_transport_never_installs_concurrency_limiter() {
+        let provider = OpenAiResponsesProvider::with_transport(
+            "http://127.0.0.1:0",
+            "gpt-test",
+            SecretString::new("sk-secret".into()),
+            Transport::Chat,
+        );
+        assert!(
+            provider.concurrency_limiter.is_none(),
+            "with_transport() must never configure a hard concurrency cap on its own"
+        );
+
+        // Confirm the absent limiter never blocks/panics on the respond() path:
+        // a plain with_transport() provider must behave exactly as before this
+        // feature existed.
+        let (base_url, receiver, server) = mock_chat_server(1);
+        let provider = OpenAiResponsesProvider::with_transport(
+            base_url,
+            "gpt-test",
+            SecretString::new("sk-secret".into()),
+            Transport::Chat,
+        );
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            provider.respond(request_with_ids(None, None)),
+        )
+        .await
+        .expect("respond() must not block when no concurrency limiter is configured");
+        assert!(response.is_ok(), "unexpected error: {response:?}");
+        let _sent_body = receiver.recv().expect("mock server observed one request");
+        server.join().expect("mock server completes");
+    }
+
+    #[tokio::test]
+    async fn test_respond_releases_permit_after_transport_error() {
+        // A listener that is bound and then immediately dropped frees the
+        // port but leaves nothing accepting connections, so every request
+        // against it fails fast with a connection-refused transport error.
+        // This proves the concurrency permit acquired in `respond()` is
+        // released on the error path (via normal Rust drop semantics on the
+        // early `?` return), not just on the happy path: if it leaked, the
+        // single-slot semaphore below would starve every request after the
+        // first failure and the final successful request would deadlock.
+        let unreachable_listener =
+            TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port for closure");
+        let unreachable_url = format!(
+            "http://{}",
+            unreachable_listener.local_addr().expect("ephemeral address")
+        );
+        drop(unreachable_listener);
+
+        let mut provider = OpenAiResponsesProvider::with_transport(
+            unreachable_url,
+            "gpt-test",
+            SecretString::new("sk-secret".into()),
+            Transport::Chat,
+        );
+        provider.concurrency_limiter = Some(std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
+
+        const FAILED_REQUESTS: usize = 3;
+        for attempt in 0..FAILED_REQUESTS {
+            let error = tokio::time::timeout(
+                Duration::from_secs(5),
+                provider.respond(request_with_ids(None, None)),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("attempt {attempt}: must not deadlock while acquiring the permit"))
+            .expect_err("connecting to a closed port must fail");
+            assert!(
+                matches!(error, ModelError::Transient { .. }),
+                "attempt {attempt}: expected a connect-transient error, got {error:?}"
+            );
+        }
+
+        // The single permit must have been returned after each failure above;
+        // a fresh request against a real mock server must still succeed
+        // promptly instead of hanging on an exhausted semaphore.
+        let (base_url, receiver, server) = mock_chat_server(1);
+        provider.base_url = base_url;
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            provider.respond(request_with_ids(None, None)),
+        )
+        .await
+        .expect("permit must have been released by every prior failed request")
+        .expect("mock chat response parses");
+        assert_eq!(response.message.as_deref(), Some("mock"));
+        let _sent_body = receiver.recv().expect("mock server observed one request");
+        server.join().expect("mock server completes");
+    }
+
     async fn assert_respond_rejects_tool_call(
         transport: Transport,
         response: Value,
@@ -2523,6 +2884,7 @@ mod tests {
             enabled: true,
             origin_allowlist: harw_config::OriginAllowlistToml::default(),
             rate_limit: None,
+            max_concurrency: None,
         }
     }
 
@@ -3491,12 +3853,7 @@ mod tests {
             .expect("required array present");
         let required: Vec<&str> = required.iter().filter_map(Value::as_str).collect();
         assert_eq!(required, vec!["path"]);
-        assert!(
-            defs[0]
-                .parameters
-                .get("additionalProperties")
-                .is_none()
-        );
+        assert!(defs[0].parameters.get("additionalProperties").is_none());
     }
 
     #[test]
@@ -4345,6 +4702,7 @@ mod tests {
             enabled: true,
             origin_allowlist: harw_config::OriginAllowlistToml::default(),
             rate_limit: None,
+            max_concurrency: None,
         }
     }
 
@@ -4556,7 +4914,11 @@ mod tests {
         write_file_with_mode(&outside, "symlinked-secret-value", 0o600);
         let outside_dir = home.path().join("outside-dir");
         std::fs::create_dir(&outside_dir).expect("create outside directory");
-        write_file_with_mode(&outside_dir.join("t.token"), "symlinked-secret-value", 0o600);
+        write_file_with_mode(
+            &outside_dir.join("t.token"),
+            "symlinked-secret-value",
+            0o600,
+        );
 
         let final_link = secrets.join("link.token");
         symlink(&outside, &final_link).expect("create final-component symlink");
@@ -4674,15 +5036,22 @@ mod tests {
         ]);
         let headers =
             configured_headers("gateway", &referenced, sources).expect("secret ref header");
-        let credential = headers.get("cf-aig-authorization").expect("credential header");
+        let credential = headers
+            .get("cf-aig-authorization")
+            .expect("credential header");
         assert_eq!(credential.as_bytes(), b"Bearer resolved-gateway-token");
         assert!(credential.is_sensitive());
-        assert!(!headers.get("x-provider-marker").expect("marker").is_sensitive());
+        assert!(
+            !headers
+                .get("x-provider-marker")
+                .expect("marker")
+                .is_sensitive()
+        );
         assert!(!format!("{headers:?}").contains("resolved-gateway-token"));
     }
 
-    #[test]
-    fn openai_credential_headers_are_marked_sensitive() {
+    #[tokio::test]
+    async fn openai_credential_headers_are_marked_sensitive() {
         for (auth_header, header_name) in [
             ("api-key", "api-key"),
             ("x-api-key", "x-api-key"),
@@ -4696,6 +5065,7 @@ mod tests {
             provider.auth_header = auth_header.to_owned();
             let request = provider
                 .authorized_request("https://example.test/v1/chat/completions")
+                .await
                 .expect("credential header")
                 .build()
                 .expect("request builds");
@@ -4785,7 +5155,10 @@ mod tests {
         );
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind redirecting server");
-        let base_url = format!("http://{}/v1", listener.local_addr().expect("server address"));
+        let base_url = format!(
+            "http://{}/v1",
+            listener.local_addr().expect("server address")
+        );
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept provider request");
             let mut request = [0_u8; 4096];

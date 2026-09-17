@@ -3,16 +3,17 @@
 //! ## Verantwortung (W4a / A-OAI)
 //! [`RetryingProvider`] umhüllt einen beliebigen [`ModelProvider`] und
 //! wiederholt eine Anfrage **nur**, wenn der Fehler laut Vertrag
-//! [`ModelError::is_retryable`] wiederholbar ist (`Transient` – 408/429/5xx/529,
-//! Verbindungsfehler – und `Timeout`). `QuotaExceeded`, `Auth`,
-//! `ContextLength`, `RequestFailed` (z. B. 400) und alle übrigen Varianten
-//! werden sofort zurückgegeben.
+//! [`ModelError::is_retryable`] wiederholbar ist (`Transient` – 408/5xx/529,
+//! Verbindungsfehler –, `Timeout` und `RateLimited` – 429). `QuotaExceeded`,
+//! `Auth`, `ContextLength`, `RequestFailed` (z. B. 400) und alle übrigen
+//! Varianten werden sofort zurückgegeben.
 //!
 //! ## Wartezeit
 //! - Exponentielles Backoff `base · 2^n`, gedeckelt auf `max_delay`, mit
 //!   „equal jitter“: die Hälfte fest, die andere Hälfte zufällig
 //!   ([`RetryPolicy::backoff_delay`]).
-//! - Meldet der Provider `retry_after_secs`, wird **mindestens** so lange
+//! - Meldet der Provider einen Wartehinweis (`Transient::retry_after_secs`
+//!   oder `RateLimited::retry_after_secs`), wird **mindestens** so lange
 //!   gewartet. Liegt der Hinweis über `max_retry_after`, wird nicht
 //!   wiederholt (früher zu senden als der Provider erlaubt, würde nur
 //!   denselben Fehler erneut auslösen und Versuche verbrauchen).
@@ -63,7 +64,8 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 /// Future einer Backoff-Wartezeit.
-pub type SleepFuture = Pin<Box<dyn Future<Output = Result<(), HttpProviderError>> + Send + 'static>>;
+pub type SleepFuture =
+    Pin<Box<dyn Future<Output = Result<(), HttpProviderError>> + Send + 'static>>;
 
 /// Parameter der Wiederholungsstrategie.
 ///
@@ -86,11 +88,12 @@ pub struct RetryPolicy {
 }
 
 impl Default for RetryPolicy {
-    /// 4 Versuche, 500 ms Basis, 30 s Deckel, `retry_after` bis 60 s.
+    /// 4 Versuche, 10 s Basis, 30 s Deckel, `retry_after` bis 60 s. Durch
+    /// Equal-Jitter liegt die erste Wartezeit damit immer bei mindestens 5 s.
     fn default() -> Self {
         Self {
             max_attempts: 4,
-            base_delay: Duration::from_millis(500),
+            base_delay: Duration::from_secs(10),
             max_delay: Duration::from_secs(30),
             max_retry_after: Duration::from_secs(60),
         }
@@ -114,7 +117,11 @@ impl RetryPolicy {
             .checked_mul(factor)
             .unwrap_or(self.max_delay)
             .min(self.max_delay);
-        let unit = if unit.is_nan() { 0.0 } else { unit.clamp(0.0, 1.0) };
+        let unit = if unit.is_nan() {
+            0.0
+        } else {
+            unit.clamp(0.0, 1.0)
+        };
         let half = cap / 2;
         half + half.mul_f64(unit)
     }
@@ -132,8 +139,10 @@ pub enum RetryDecision {
 /// Entscheidet rein funktional, ob und wann nach `error` wiederholt wird.
 ///
 /// # Description
-/// Siehe Moduldoku: nur [`ModelError::is_retryable`]; `retry_after_secs`
-/// ist Untergrenze, über `policy.max_retry_after` → [`RetryDecision::GiveUp`].
+/// Siehe Moduldoku: nur [`ModelError::is_retryable`]; der vom Fehler
+/// gemeldete Wartehinweis (`Transient::retry_after_secs` oder
+/// `RateLimited::retry_after_secs`) ist Untergrenze, über
+/// `policy.max_retry_after` → [`RetryDecision::GiveUp`].
 /// Die Versuchsobergrenze prüft der Aufrufer.
 ///
 /// # Arguments
@@ -160,6 +169,12 @@ pub fn retry_decision(
             retry_after_secs: Some(secs),
             ..
         } => Some(Duration::from_secs(*secs)),
+        // `RateLimited::retry_after_secs` ist – anders als bei `Transient` –
+        // nicht optional (der Provider liefert immer einen Wert, notfalls
+        // einen Fallback; siehe `anthropic.rs::parse_retry_after`).
+        ModelError::RateLimited {
+            retry_after_secs, ..
+        } => Some(Duration::from_secs(*retry_after_secs)),
         _ => None,
     };
     match hint {
@@ -248,9 +263,8 @@ impl RetrySleeper for ThreadSleeper {
             .spawn(move || {
                 if let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(duration) {
                     let waker = {
-                        let mut state = thread_shared
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner);
+                        let mut state =
+                            thread_shared.lock().unwrap_or_else(PoisonError::into_inner);
                         state.done = true;
                         state.waker.take()
                     };
@@ -264,9 +278,11 @@ impl RetrySleeper for ThreadSleeper {
                 shared,
                 _stop: stop,
             }),
-            Err(_) => Box::pin(std::future::ready(Err(HttpProviderError::TimerUnavailable {
-                reason: "backoff thread could not be spawned".to_owned(),
-            }))),
+            Err(_) => Box::pin(std::future::ready(Err(
+                HttpProviderError::TimerUnavailable {
+                    reason: "backoff thread could not be spawned".to_owned(),
+                },
+            ))),
         }
     }
 }
@@ -435,7 +451,10 @@ mod tests {
         assert_eq!(policy.backoff_delay(0, 1.0), Duration::from_millis(100));
         assert_eq!(policy.backoff_delay(2, 1.0), Duration::from_millis(400));
         assert_eq!(policy.backoff_delay(10, 1.0), Duration::from_secs(1));
-        assert_eq!(policy.backoff_delay(u32::MAX, 0.0), Duration::from_millis(500));
+        assert_eq!(
+            policy.backoff_delay(u32::MAX, 0.0),
+            Duration::from_millis(500)
+        );
         assert_eq!(policy.backoff_delay(0, f64::NAN), Duration::from_millis(50));
     }
 
@@ -452,6 +471,22 @@ mod tests {
         );
         assert_eq!(
             retry_decision(&policy, &transient(Some(61)), 0, 1.0),
+            RetryDecision::GiveUp
+        );
+        let rate_limited = ModelError::RateLimited {
+            retry_after_secs: 5,
+            message: "429".to_owned(),
+        };
+        assert_eq!(
+            retry_decision(&policy, &rate_limited, 0, 1.0),
+            RetryDecision::Retry(Duration::from_secs(5))
+        );
+        let rate_limited_over_cap = ModelError::RateLimited {
+            retry_after_secs: 61,
+            message: "429".to_owned(),
+        };
+        assert_eq!(
+            retry_decision(&policy, &rate_limited_over_cap, 0, 1.0),
             RetryDecision::GiveUp
         );
         let timeout = ModelError::Timeout {
@@ -474,7 +509,10 @@ mod tests {
             ModelError::RequestFailed("400".to_owned()),
             ModelError::Cancelled,
         ] {
-            assert_eq!(retry_decision(&policy, &error, 0, 0.5), RetryDecision::GiveUp);
+            assert_eq!(
+                retry_decision(&policy, &error, 0, 0.5),
+                RetryDecision::GiveUp
+            );
         }
     }
 
@@ -500,6 +538,12 @@ mod tests {
     fn test_policy_accessor_returns_configured_policy() {
         let provider = RetryingProvider::new(harw_core::EchoModelProvider::default(), policy());
         assert_eq!(provider.policy(), &policy());
+    }
+
+    #[test]
+    fn default_policy_has_at_least_five_seconds_first_backoff() {
+        let policy = RetryPolicy::default();
+        assert!(policy.backoff_delay(0, 0.0) >= Duration::from_secs(5));
     }
 
     #[tokio::test]

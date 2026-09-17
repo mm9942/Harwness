@@ -150,8 +150,18 @@ impl ProviderRateLimiter {
             Err(poisoned) => poisoned.into_inner(),
         };
 
-        apply_anthropic_family(&mut state.requests, headers, "anthropic-ratelimit-requests", now);
-        apply_anthropic_family(&mut state.tokens, headers, "anthropic-ratelimit-tokens", now);
+        apply_anthropic_family(
+            &mut state.requests,
+            headers,
+            "anthropic-ratelimit-requests",
+            now,
+        );
+        apply_anthropic_family(
+            &mut state.tokens,
+            headers,
+            "anthropic-ratelimit-tokens",
+            now,
+        );
         apply_anthropic_family(
             &mut state.input_tokens,
             headers,
@@ -172,7 +182,11 @@ impl ProviderRateLimiter {
             match value.trim().parse::<u64>() {
                 Ok(secs) => state.retry_after_until = Some(now + Duration::from_secs(secs)),
                 Err(_) => {
-                    tracing::debug!(header = "retry-after", value, "provider.rate_limit.header_parse_failed");
+                    tracing::debug!(
+                        header = "retry-after",
+                        value,
+                        "provider.rate_limit.header_parse_failed"
+                    );
                 }
             }
         }
@@ -245,9 +259,12 @@ impl ProviderRateLimiter {
             ("output_tokens", &state.output_tokens),
             ("tokens", &state.tokens),
         ] {
-            if let (Some(limit), Some(remaining), Some(reset_at)) = (dim.limit, dim.remaining, dim.reset_at) {
+            if let (Some(limit), Some(remaining), Some(reset_at)) =
+                (dim.limit, dim.remaining, dim.reset_at)
+            {
                 if reset_at > now
-                    && remaining.saturating_mul(100) <= limit.saturating_mul(u64::from(self.safety_margin_pct))
+                    && remaining.saturating_mul(100)
+                        <= limit.saturating_mul(u64::from(self.safety_margin_pct))
                 {
                     candidates.push((label, (reset_at - now).min(MAX_WAIT)));
                 }
@@ -283,12 +300,19 @@ fn header_str<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
 
 /// Aktualisiert eine Dimension aus der Anthropic-Header-Familie
 /// (`{prefix}-limit`, `{prefix}-remaining`, `{prefix}-reset`).
-fn apply_anthropic_family(dim: &mut DimensionState, headers: &HeaderMap, prefix: &str, now: Instant) {
+fn apply_anthropic_family(
+    dim: &mut DimensionState,
+    headers: &HeaderMap,
+    prefix: &str,
+    now: Instant,
+) {
     let limit_header = format!("{prefix}-limit");
     if let Some(value) = header_str(headers, &limit_header) {
         match value.trim().parse::<u64>() {
             Ok(n) => dim.limit = Some(n),
-            Err(_) => tracing::debug!(header = %limit_header, value, "provider.rate_limit.header_parse_failed"),
+            Err(_) => {
+                tracing::debug!(header = %limit_header, value, "provider.rate_limit.header_parse_failed")
+            }
         }
     }
 
@@ -296,15 +320,21 @@ fn apply_anthropic_family(dim: &mut DimensionState, headers: &HeaderMap, prefix:
     if let Some(value) = header_str(headers, &remaining_header) {
         match value.trim().parse::<u64>() {
             Ok(n) => dim.remaining = Some(n),
-            Err(_) => tracing::debug!(header = %remaining_header, value, "provider.rate_limit.header_parse_failed"),
+            Err(_) => {
+                tracing::debug!(header = %remaining_header, value, "provider.rate_limit.header_parse_failed")
+            }
         }
     }
 
     let reset_header = format!("{prefix}-reset");
     if let Some(value) = header_str(headers, &reset_header) {
-        match parse_rfc3339_epoch_seconds(value).and_then(|epoch| instant_from_epoch_seconds(epoch, now)) {
+        match parse_rfc3339_epoch_seconds(value)
+            .and_then(|epoch| instant_from_epoch_seconds(epoch, now))
+        {
             Some(instant) => dim.reset_at = Some(instant),
-            None => tracing::debug!(header = %reset_header, value, "provider.rate_limit.header_parse_failed"),
+            None => {
+                tracing::debug!(header = %reset_header, value, "provider.rate_limit.header_parse_failed")
+            }
         }
     }
 }
@@ -317,7 +347,9 @@ fn apply_openai_family(dim: &mut DimensionState, headers: &HeaderMap, kind: &str
     if let Some(value) = header_str(headers, &limit_header) {
         match value.trim().parse::<u64>() {
             Ok(n) => dim.limit = Some(n),
-            Err(_) => tracing::debug!(header = %limit_header, value, "provider.rate_limit.header_parse_failed"),
+            Err(_) => {
+                tracing::debug!(header = %limit_header, value, "provider.rate_limit.header_parse_failed")
+            }
         }
     }
 
@@ -325,7 +357,9 @@ fn apply_openai_family(dim: &mut DimensionState, headers: &HeaderMap, kind: &str
     if let Some(value) = header_str(headers, &remaining_header) {
         match value.trim().parse::<u64>() {
             Ok(n) => dim.remaining = Some(n),
-            Err(_) => tracing::debug!(header = %remaining_header, value, "provider.rate_limit.header_parse_failed"),
+            Err(_) => {
+                tracing::debug!(header = %remaining_header, value, "provider.rate_limit.header_parse_failed")
+            }
         }
     }
 
@@ -333,7 +367,9 @@ fn apply_openai_family(dim: &mut DimensionState, headers: &HeaderMap, kind: &str
     if let Some(value) = header_str(headers, &reset_header) {
         match parse_go_like_duration(value) {
             Some(duration) => dim.reset_at = Some(now + duration),
-            None => tracing::debug!(header = %reset_header, value, "provider.rate_limit.header_parse_failed"),
+            None => {
+                tracing::debug!(header = %reset_header, value, "provider.rate_limit.header_parse_failed")
+            }
         }
     }
 }
@@ -423,7 +459,9 @@ fn parse_rfc3339_epoch_seconds(input: &str) -> Option<f64> {
     let rest = &s[17..];
     let rest_bytes = rest.as_bytes();
     let mut sec_end = 0usize;
-    while sec_end < rest_bytes.len() && (rest_bytes[sec_end].is_ascii_digit() || rest_bytes[sec_end] == b'.') {
+    while sec_end < rest_bytes.len()
+        && (rest_bytes[sec_end].is_ascii_digit() || rest_bytes[sec_end] == b'.')
+    {
         sec_end += 1;
     }
     if sec_end == 0 {
@@ -456,8 +494,9 @@ fn parse_rfc3339_epoch_seconds(input: &str) -> Option<f64> {
     }
 
     let days = days_from_civil(year, month, day);
-    let epoch = (days as f64) * 86400.0 + (hour as f64) * 3600.0 + (minute as f64) * 60.0 + seconds_frac
-        - offset_seconds as f64;
+    let epoch =
+        (days as f64) * 86400.0 + (hour as f64) * 3600.0 + (minute as f64) * 60.0 + seconds_frac
+            - offset_seconds as f64;
     Some(epoch)
 }
 
@@ -480,7 +519,10 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 /// Liegt der Zeitpunkt in der Vergangenheit, wird `now` selbst
 /// zurückgegeben (keine Wartezeit).
 fn instant_from_epoch_seconds(epoch: f64, now: Instant) -> Option<Instant> {
-    let now_epoch = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs_f64();
+    let now_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs_f64();
     let delta = epoch - now_epoch;
     if delta > 0.0 {
         Some(now + Duration::from_secs_f64(delta))
@@ -498,7 +540,8 @@ mod tests {
         let mut headers = HeaderMap::new();
         for (name, value) in pairs {
             headers.insert(
-                reqwest::header::HeaderName::from_bytes(name.as_bytes()).expect("valid header name"),
+                reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                    .expect("valid header name"),
                 HeaderValue::from_str(value).expect("valid header value"),
             );
         }
@@ -508,8 +551,14 @@ mod tests {
     #[test]
     fn test_parse_go_like_duration_cases() {
         assert_eq!(parse_go_like_duration("1s"), Some(Duration::from_secs(1)));
-        assert_eq!(parse_go_like_duration("250ms"), Some(Duration::from_millis(250)));
-        assert_eq!(parse_go_like_duration("6m0s"), Some(Duration::from_secs(360)));
+        assert_eq!(
+            parse_go_like_duration("250ms"),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            parse_go_like_duration("6m0s"),
+            Some(Duration::from_secs(360))
+        );
         assert_eq!(
             parse_go_like_duration("1m30.5s"),
             Some(Duration::from_secs_f64(90.5))
@@ -543,7 +592,10 @@ mod tests {
         ]);
         limiter.observe_headers(&headers);
         let wait = limiter.pending_wait();
-        assert!(wait.is_some(), "remaining 5%% <= safety margin 20%% muss warten ausloesen");
+        assert!(
+            wait.is_some(),
+            "remaining 5%% <= safety margin 20%% muss warten ausloesen"
+        );
     }
 
     #[test]

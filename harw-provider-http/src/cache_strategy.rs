@@ -363,21 +363,14 @@ mod tests {
 
     #[test]
     fn resolve_override_wins_over_provider_default() {
-        let strategy = resolve_cache_strategy(
-            "openai",
-            "gpt-5",
-            Some(PromptCachingMode::Explicit),
-        );
+        let strategy = resolve_cache_strategy("openai", "gpt-5", Some(PromptCachingMode::Explicit));
         assert_eq!(
             strategy,
             CacheStrategy::ExplicitEphemeral { max_breakpoints: 4 }
         );
 
-        let strategy = resolve_cache_strategy(
-            "anthropic",
-            "claude-opus-5",
-            Some(PromptCachingMode::None),
-        );
+        let strategy =
+            resolve_cache_strategy("anthropic", "claude-opus-5", Some(PromptCachingMode::None));
         assert_eq!(strategy, CacheStrategy::None);
 
         let strategy = resolve_cache_strategy(
@@ -455,9 +448,11 @@ mod tests {
             .unwrap()
             .iter()
             .filter(|message| {
-                message["content"]
-                    .as_array()
-                    .is_some_and(|content| content.iter().any(|block| block.get("cache_control").is_some()))
+                message["content"].as_array().is_some_and(|content| {
+                    content
+                        .iter()
+                        .any(|block| block.get("cache_control").is_some())
+                })
             })
             .count();
         assert!(marker_count <= 4);
@@ -505,7 +500,9 @@ mod tests {
         let marker_count = [
             body["system"][0].get("cache_control").is_some(),
             body["tools"][1].get("cache_control").is_some(),
-            body["messages"][0]["content"][0].get("cache_control").is_some(),
+            body["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_some(),
         ]
         .into_iter()
         .filter(|marked| *marked)

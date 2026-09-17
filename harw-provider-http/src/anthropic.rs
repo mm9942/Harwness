@@ -22,6 +22,7 @@
 //! Das Credential liegt in `secrecy::SecretString` und wird ausschließlich beim
 //! Setzen des Auth-Headers via `ExposeSecret` offengelegt — niemals geloggt.
 
+use crate::tool_names::ToolNameCodec;
 use harw_core::model::StopReason;
 use harw_core::{
     ModelError, ModelFuture, ModelProvider, ModelRequest, ModelResponse, ToolCallResult,
@@ -30,7 +31,6 @@ use harw_protocol::OpaqueReasoning;
 use harw_tools::{ToolCall, ToolName, ToolSpec};
 use harw_types::{TokenUsage, ToolCallId};
 use secrecy::{ExposeSecret, SecretString};
-use crate::tool_names::ToolNameCodec;
 use serde_json::Value;
 use std::fmt;
 use std::time::Duration;
@@ -56,20 +56,30 @@ pub const DEFAULT_MAX_TOKENS: u32 = 4096;
 /// # Description
 /// Laut Anthropics Nutzungsbedingungen ist Abo-OAuth für Claude Code und
 /// native Anthropic-Apps vorgesehen; Drittanbieter-Tools sollen API-Keys aus
-/// der Claude Console nutzen. Anthropic hat eine geplante Abrechnungsänderung
-/// für Drittanbieter-Nutzung im Juni 2026 vorerst pausiert, behält sich die
-/// Durchsetzung aber ohne Vorankündigung vor. Diese Konstante dient
-/// ausschließlich der Warnung, nicht der Blockade.
+/// der Claude Console nutzen. Nach Sekundärquellen (Presse/Community, Stand
+/// 2026; keine direkt verifizierbare Anthropic-Primärquelle mit Datum) hat
+/// Anthropic diese Regel zwischen Januar und April 2026 stufenweise
+/// **serverseitig durchgesetzt** — Drittanbieter-Harnesses wie `harw` können
+/// dadurch bereits ohne Vorwarnung mit Ablehnungen/Rate-Limits statt nur
+/// einer ToS-Warnung konfrontiert sein. Diese Konstante beschreibt den
+/// berichteten Durchsetzungsstand so vorsichtig wie die Beleglage es
+/// zulässt, nicht als bestätigte Tatsache.
 ///
 /// Quellen: <https://code.claude.com/docs/en/legal-and-compliance>,
-/// <https://the-decoder.de/anthropic-rudert-bei-claude-abrechnung-zurueck-und-laesst-drittanbieter-nutzung-vorerst-im-abo/>
+/// <https://platform.claude.com/docs/en/api/rate-limits>,
+/// <https://dev.to/mcrolly/anthropic-kills-claude-subscription-access-for-third-party-tools-like-openclaw-what-it-means-for-3ipc>,
+/// <https://gigazine.net/gsc_news/en/20260220-anthropic-third-party-block/>,
+/// <https://www.sovereignmagazine.com/article/anthropic-blocks-openclaw-claude-subscriptions>,
+/// <https://geol.ai/briefing/anthropic-blocks-thirdparty-agent-harnesses-for-claude-subscriptions-apr-4-2026-what-it-changes-for>
 pub const ANTHROPIC_SUBSCRIPTION_TOKEN_WARNING: &str = "Hinweis: Du nutzt ein Abo-OAuth-/Setup-Token (Claude Free/Pro/Max) statt eines API-Keys. \
 Laut Anthropics Nutzungsbedingungen ist Abo-OAuth für Claude Code und native Anthropic-Apps vorgesehen; \
 Drittanbieter-Tools sollen API-Keys aus der Claude Console nutzen. \
-Anthropic hat eine geplante Abrechnungsänderung für Drittanbieter-Nutzung im Juni 2026 vorerst pausiert, \
-behält sich Durchsetzung aber ohne Vorankündigung vor – Anfragen können jederzeit abgelehnt werden. \
+Nach mehreren Presse-/Community-Berichten (Stand 2026, keine bestätigte Anthropic-Primärquelle mit Datum) \
+setzt Anthropic diese Regel seit Anfang 2026 stufenweise serverseitig durch – \
+Drittanbieter-Tools wie harw können daher schon jetzt ohne Vorwarnung abgelehnt oder limitiert werden, \
+nicht erst durch eine künftige Änderung. \
 Nutzung auf eigene Gefahr. Stabil: API-Key (platform.claude.com). \
-Quelle: https://code.claude.com/docs/en/legal-and-compliance";
+Quellen: https://code.claude.com/docs/en/legal-and-compliance, https://platform.claude.com/docs/en/api/rate-limits";
 
 /// Art des Anthropic-Credentials und damit des Auth-Header-Schemas.
 ///
@@ -169,9 +179,8 @@ impl AnthropicMessagesProvider {
     /// `build_named_provider` im Anthropic-Zweig, da `AnthropicMessagesProvider`
     /// selbst keinen `from_named_config`-Konstruktionsweg besitzt.
     pub(crate) fn configure_rate_limit(&mut self, rate_limit: Option<harw_config::RateLimitToml>) {
-        self.rate_limiter = std::sync::Arc::new(crate::rate_limiter::ProviderRateLimiter::new(
-            rate_limit,
-        ));
+        self.rate_limiter =
+            std::sync::Arc::new(crate::rate_limiter::ProviderRateLimiter::new(rate_limit));
     }
 
     /// Resolves the model for one request after checking its provider affinity.
@@ -702,11 +711,8 @@ impl ModelProvider for AnthropicMessagesProvider {
     fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
         Box::pin(async move {
             let model = self.selected_model(&request)?;
-            let strategy = crate::cache_strategy::resolve_cache_strategy(
-                &self.provider_id,
-                model,
-                None,
-            );
+            let strategy =
+                crate::cache_strategy::resolve_cache_strategy(&self.provider_id, model, None);
             let mut wire = build_messages_body(model, self.max_tokens, &request);
             crate::cache_strategy::apply_messages_cache_control(&mut wire, strategy);
             tracing::debug!(
@@ -726,7 +732,12 @@ impl ModelProvider for AnthropicMessagesProvider {
             // `ANTHROPIC_CUSTOM_HEADERS` — kompatibel mit Anthropic's offiziellem
             // Claude-Code-Client. Mehrere Header via `,` getrennt.
             let custom_headers = if let Some(headers) = &self.configured_headers {
-                Some(headers.iter().map(|(name, value)| (name.clone(), value.clone())).collect::<Vec<_>>())
+                Some(
+                    headers
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone()))
+                        .collect::<Vec<_>>(),
+                )
             } else {
                 anthropic_custom_headers()?
             };
@@ -1127,7 +1138,10 @@ mod tests {
 
         assert_eq!(body["thinking"]["type"].as_str(), Some("adaptive"));
         assert_eq!(body["output_config"]["effort"].as_str(), Some("high"));
-        assert_eq!(body.get("max_tokens").and_then(Value::as_u64), Some(128_000));
+        assert_eq!(
+            body.get("max_tokens").and_then(Value::as_u64),
+            Some(128_000)
+        );
     }
 
     #[test]
@@ -1164,7 +1178,10 @@ mod tests {
         assert!(body.get("thinking").is_none());
         assert!(body.get("output_config").is_none());
         // Kein Modell-Limit bekannt → max_tokens bleibt unangetastet.
-        assert_eq!(body.get("max_tokens").and_then(Value::as_u64), Some(900_000));
+        assert_eq!(
+            body.get("max_tokens").and_then(Value::as_u64),
+            Some(900_000)
+        );
     }
 
     #[test]
@@ -1300,7 +1317,10 @@ mod tests {
             .get("tools")
             .and_then(Value::as_array)
             .expect("tools array");
-        assert_eq!(tools[0].get("name").and_then(Value::as_str), Some("fs_read"));
+        assert_eq!(
+            tools[0].get("name").and_then(Value::as_str),
+            Some("fs_read")
+        );
 
         let messages = body
             .get("messages")
@@ -1860,8 +1880,7 @@ mod tests {
                 "authorization",
             ),
         ] {
-            let builder =
-                super::super::http_client().post("https://api.anthropic.com/v1/messages");
+            let builder = super::super::http_client().post("https://api.anthropic.com/v1/messages");
             let request = apply_anthropic_credential(builder, &credential)
                 .expect("credential header")
                 .build()
