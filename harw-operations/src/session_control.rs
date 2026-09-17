@@ -44,6 +44,73 @@
 use harw_types::ReasoningEffort;
 use std::sync::Arc;
 
+// ── UiaSelection ─────────────────────────────────────────────────────────────
+
+/// Atomare Provider-/Modell-Auswahl für die UIA-Wurzelsitzung.
+///
+/// Die Auswahl ist bewusst ein eigener Wert und nicht eine Umdeutung von
+/// [`SessionControlSnapshot::active_provider`] bzw.
+/// [`SessionControlSnapshot::active_model`]. Diese generischen Felder bleiben
+/// für Defaults, Worker und bereits bestehende Aufrufer erhalten; ein UIA-Pin
+/// kann daneben unabhängig davon leben.
+///
+/// `None` in einem Feld bedeutet: Es gibt für diese Achse keinen expliziten
+/// UIA-Wert. Die TUI kann beim Aufbau den jeweiligen Config-Default einsetzen.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UiaSelection {
+    /// Provider-ID der UIA, falls explizit gewählt.
+    pub provider: Option<String>,
+    /// Modell-ID der UIA, falls explizit gewählt.
+    pub model: Option<String>,
+}
+
+impl UiaSelection {
+    /// Erzeugt eine UIA-Auswahl aus einem Provider-/Modell-Paar.
+    #[must_use]
+    pub fn new(provider: Option<String>, model: Option<String>) -> Self {
+        Self { provider, model }
+    }
+
+    /// Erzeugt eine leere UIA-Auswahl.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Erzeugt die effektive UIA-Auswahl: UIA-spezifische Config-Werte haben
+    /// Vorrang, die generischen Defaults dienen als Fallback.
+    #[must_use]
+    pub fn from_config(
+        uia_provider: Option<&str>,
+        uia_model: Option<&str>,
+        default_provider: Option<&str>,
+        default_model: Option<&str>,
+    ) -> Self {
+        Self {
+            provider: uia_provider.or(default_provider).map(str::to_owned),
+            model: uia_model.or(default_model).map(str::to_owned),
+        }
+    }
+
+    /// Liefert die Provider-ID ohne Ownership-Transfer.
+    #[must_use]
+    pub fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
+    }
+
+    /// Liefert die Modell-ID ohne Ownership-Transfer.
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    /// Ob weder Provider noch Modell gesetzt ist.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.provider.is_none() && self.model.is_none()
+    }
+}
+
 // ── SessionControlSnapshot ────────────────────────────────────────────────────
 
 /// Momentaufnahme des aktuell aktiven Session-Control-Zustands.
@@ -66,6 +133,9 @@ pub struct SessionControlSnapshot {
     pub active_model: Option<String>,
     /// ID des aktiv ausgewählten Providers; `None` = Harness-Default.
     pub active_provider: Option<String>,
+    /// UIA-spezifische Provider-/Modell-Auswahl. Sie wird nur auf eine
+    /// elternlose UIA-Root-Session angewandt, nicht auf Child-/Worker-Sessions.
+    pub uia_selection: UiaSelection,
     /// Kanonischer Name des aktiven Interaktionsmodus (`"chat"`, `"plan"`,
     /// `"explore"`, `"work"`); `None` = die Oberfläche führt keinen Modus.
     ///
@@ -96,6 +166,7 @@ impl SessionControlSnapshot {
             reasoning_effort: None,
             active_model: None,
             active_provider: None,
+            uia_selection: UiaSelection::empty(),
             interaction_mode: None,
         }
     }
@@ -214,6 +285,38 @@ pub trait SessionController: Send + Sync {
     /// - [`SessionControlError::UnknownProvider`]: ID nicht im Katalog.
     /// - [`SessionControlError::Disconnected`]: Mutations-Kanal geschlossen.
     fn set_active_provider(&self, provider_id: String) -> Result<(), SessionControlError>;
+
+    /// Setzt Provider und Modell der UIA-Auswahl als zusammengehörigen Wert.
+    ///
+    /// Diese Mutation ist der bevorzugte Pfad für Config-Initialisierung und
+    /// atomare UIA-Pin-Wechsel. Sie verändert die generischen
+    /// `active_*`-Felder nicht.
+    fn set_uia_selection(&self, selection: UiaSelection) -> Result<(), SessionControlError> {
+        let _ = selection;
+        Err(SessionControlError::Disconnected)
+    }
+
+    /// Setzt nur den Provider der UIA-Auswahl und erhält deren Modell.
+    fn set_uia_provider(&self, provider_id: String) -> Result<(), SessionControlError> {
+        let _ = provider_id;
+        Err(SessionControlError::Disconnected)
+    }
+
+    /// Setzt nur das Modell der UIA-Auswahl und erhält deren Provider.
+    fn set_uia_model(&self, model_id: String) -> Result<(), SessionControlError> {
+        let _ = model_id;
+        Err(SessionControlError::Disconnected)
+    }
+
+    /// Liefert die UIA-Auswahl als lockfreie Wertkopie.
+    fn uia_selection(&self) -> UiaSelection {
+        UiaSelection::empty()
+    }
+
+    /// Benannte Snapshot-Variante des UIA-Getters für Ops-/Runtime-Lesepfade.
+    fn snapshot_uia_selection(&self) -> UiaSelection {
+        self.uia_selection()
+    }
 
     /// Fordert einen Wechsel des Interaktionsmodus an (`/mode chat|plan|explore|work`).
     ///
@@ -376,6 +479,44 @@ impl SessionController for NullSessionController {
             .map_err(|_| SessionControlError::Disconnected)
     }
 
+    /// Zeichnet die UIA-Auswahl als zusammengehörigen Wert auf.
+    fn set_uia_selection(&self, selection: UiaSelection) -> Result<(), SessionControlError> {
+        self.inner
+            .lock()
+            .map(|mut guard| {
+                guard.uia_selection = selection;
+            })
+            .map_err(|_| SessionControlError::Disconnected)
+    }
+
+    /// Setzt den UIA-Provider unter demselben Mutex wie das Modell.
+    fn set_uia_provider(&self, provider_id: String) -> Result<(), SessionControlError> {
+        self.inner
+            .lock()
+            .map(|mut guard| {
+                guard.uia_selection.provider = Some(provider_id);
+            })
+            .map_err(|_| SessionControlError::Disconnected)
+    }
+
+    /// Setzt das UIA-Modell unter demselben Mutex wie den Provider.
+    fn set_uia_model(&self, model_id: String) -> Result<(), SessionControlError> {
+        self.inner
+            .lock()
+            .map(|mut guard| {
+                guard.uia_selection.model = Some(model_id);
+            })
+            .map_err(|_| SessionControlError::Disconnected)
+    }
+
+    /// Liefert die aufgezeichnete UIA-Auswahl.
+    fn uia_selection(&self) -> UiaSelection {
+        self.inner
+            .lock()
+            .map(|guard| guard.uia_selection.clone())
+            .unwrap_or_else(|_| UiaSelection::empty())
+    }
+
     /// Zeichnet den angeforderten Interaktionsmodus lokal im internen Snapshot auf.
     ///
     /// Überschreibt den fail-closed Trait-Default: der `NullSessionController` ist
@@ -427,6 +568,7 @@ mod tests {
             snap.active_provider.is_none(),
             "active_provider should be None in empty snapshot"
         );
+        assert!(snap.uia_selection.is_empty());
     }
 
     #[test]
@@ -466,6 +608,37 @@ mod tests {
             Some("anthropic"),
             "snapshot should reflect the recorded active provider"
         );
+    }
+
+    #[test]
+    fn test_uia_selection_prefers_specific_config_and_falls_back_per_axis() {
+        let selection = UiaSelection::from_config(
+            Some("uia-provider"),
+            None,
+            Some("default-provider"),
+            Some("default-model"),
+        );
+        assert_eq!(selection.provider(), Some("uia-provider"));
+        assert_eq!(selection.model(), Some("default-model"));
+    }
+
+    #[test]
+    fn test_null_controller_keeps_uia_selection_separate_from_generic_state() {
+        let ctrl = NullSessionController::new();
+        ctrl.set_active_provider("generic-provider".to_owned())
+            .expect("generic provider setter should succeed");
+        ctrl.set_uia_selection(UiaSelection::new(
+            Some("uia-provider".to_owned()),
+            Some("uia-model".to_owned()),
+        ))
+        .expect("UIA selection setter should succeed");
+
+        assert_eq!(
+            ctrl.snapshot().active_provider.as_deref(),
+            Some("generic-provider")
+        );
+        assert_eq!(ctrl.snapshot_uia_selection().provider(), Some("uia-provider"));
+        assert_eq!(ctrl.snapshot_uia_selection().model(), Some("uia-model"));
     }
 
     #[test]

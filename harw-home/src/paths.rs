@@ -266,6 +266,17 @@ pub fn scan_reports_dir(home: &Path) -> PathBuf {
     home.join("scan_reports")
 }
 
+/// Wurzelverzeichnis für lokal gespeicherte Bug-Reports (`<home>/bug-report`).
+///
+/// Root-bezogen, analog zu [`jobs_dir`]/[`cache_dir`] — nicht profilbezogen,
+/// da ein Bug-Report keiner bestimmten `--profile`-Sitzung zugeordnet ist.
+/// Wird nicht vorab angelegt; der erste Schreibvorgang erstellt das
+/// Verzeichnis (siehe Aufrufer).
+#[must_use]
+pub fn bug_report_dir(home: &Path) -> PathBuf {
+    home.join("bug-report")
+}
+
 /// Verzeichnis des Lens-Content-Stores (Knoten AW3-06).
 ///
 /// # Description
@@ -580,6 +591,15 @@ mod tests {
         assert!(reports.ends_with("scan_reports"));
         assert!(reports.starts_with(&home));
         assert_eq!(reports, home.join("scan_reports"));
+    }
+
+    #[test]
+    fn bug_report_dir_ends_with_bug_report_component_below_home() {
+        let home = PathBuf::from("/tmp/harw-test-home");
+        let bug_report = bug_report_dir(&home);
+        assert!(bug_report.ends_with("bug-report"));
+        assert!(bug_report.starts_with(&home));
+        assert_eq!(bug_report, home.join("bug-report"));
     }
 
     #[test]
