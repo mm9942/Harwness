@@ -149,3 +149,80 @@ Das Aktivieren eines Moduls zeigt vor der Freigabe mindestens:
 Jede Freigabe wird als Sitzungsereignis persistiert. Sie ist nicht auf andere
 Sitzungen, Geschwister oder Remote-Einstiege übertragbar und kann von Kindern
 niemals erweitert werden.
+
+## Umsetzung
+
+Die modulare Sandbox ist wie folgt umgesetzt:
+
+### SandboxProfile (harw-sandbox/src/profile.rs)
+
+`SandboxProfile` ist ein Enum mit vier Varianten:
+
+- `Strict` — hermetische Bubblewrap-Sandbox, Standard.
+- `Cargo(CargoSandboxProfile)` — isolierte Sandbox mit Toolchain.
+- `Tmux(TmuxSandboxProfile)` — isolierte Sandbox mit einem Socket.
+- `Host` — lokale Host-Ausführung, erfordert ProcessPermit.
+
+Das Profil ist ein vertrauenswürdiger Runtime-Input: es wird beim Aufbau der
+Runtime aus Konfiguration und UI-Freigaben gebildet, nie aus einem Tool-Aufruf.
+
+### TmuxSandboxProfile (harw-sandbox/src/tmux.rs)
+
+Validiert einen einzelnen Socket-Pfad (absolut, normal, existent, Unix-Socket).
+Bindet nur diesen Socket unter `/run/harw/tmux.sock` in die Sandbox. `Inspect`
+bindet read-only, `Write` bindet read-write.
+
+### BwrapLauncher (harw-sandbox/src/bwrap.rs)
+
+- `with_profile(&SandboxProfile)` setzt alle Module in einem Aufruf.
+- `with_cargo_profile()` und `with_tmux_profile()` bleiben für einzelnen Zugriff.
+- `plan()` bindet Cargo-Toolchain und/oder tmux-Socket anhand des Profils.
+
+### ShellExecutor/ShellToolProvider (harw-tool-shell/src/exec.rs)
+
+- `sandbox_profile: SandboxProfile` und `permit_ledger: Option<Arc<ProcessPermitLedger>>`
+  als Felder von ShellExecutor und ShellToolProvider.
+- `with_sandbox_profile()` und `with_permit_ledger()` Builder.
+- Host-Profil ohne Ledger → fail-closed.
+- Strict/Cargo/Tmux ohne Ledger → normal (Sandbox ist die Grenze).
+
+### Registry (harw-registry-defaults/src/profile.rs)
+
+- `profile_tool_providers()` erhält `sandbox_profile: &SandboxProfile`.
+- `assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile()`
+  nimmt das Profil explizit entgegen; die bestehende Funktion delegiert mit
+  `Strict` als Default.
+
+### Runtime (harw-runtime/src/assembly.rs)
+
+- `sandbox_profile_from_config()` baut das Profil aus `[sandbox]`-Konfiguration.
+- Cargo → `Cargo(CargoSandboxProfile::new(...))`, Tmux →
+  `Tmux(TmuxSandboxProfile::new(...))`, sonst `Strict`.
+- Bei Validierungsfehler: warn! und Rückfall auf Strict (fail-safe).
+
+### Konfiguration (harw-config/src/harness_config.rs)
+
+```toml
+[sandbox.cargo]
+mode = "build_offline"
+cargo_bin = "/opt/harw/toolchain/bin/cargo"
+rustup_home = "/opt/harw/rustup"
+cargo_home = "/var/cache/harw/cargo"
+
+[sandbox.tmux]
+mode = "inspect"
+socket_path = "/tmp/tmux-1000/default"
+```
+
+Alle Sektionen mit `deny_unknown_fields`. Fehlt eine Sektion, bleibt die Sandbox
+hermetisch.
+
+### Worker-Definitionen (harw-registry-defaults/agents/)
+
+- `sandbox-shell-worker.toml` — Strict-Profil.
+- `cargo-worker.toml` — Cargo-Profil.
+- `tmux-inspector-worker.toml` — Tmux-Profil.
+- `host-process-worker.toml` — Host-Profil, Permit-Pflicht.
+
+Alle extenden `worker-base@1`, haben `shell.exec` als einziges Werkzeug und
+`max_depth = 0`.
