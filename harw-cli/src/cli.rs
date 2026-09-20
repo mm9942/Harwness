@@ -22,7 +22,7 @@ pub struct Cli {
     /// Chat-Flags am Root, damit `harw [PROMPT]` ohne Subcommand funktioniert.
     #[command(flatten)]
     pub chat: ChatArgs,
-    /// Interaktionsmodus beim Start: chat, plan, explore oder work.
+    /// Interaktionsmodus beim Start: chat, plan, explore, work oder shell.
     /// Ohne Angabe gilt der Wert aus `[mode] default` der Harness-Konfiguration.
     ///
     /// Der Wert wird hier bewusst **nicht** validiert und bleibt `Option<String>`:

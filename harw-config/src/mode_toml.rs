@@ -1,8 +1,9 @@
 //! `[mode]` — Standard-Interaktionsmodus der Harness (AP W1-21..24).
 //!
 //! Der Modus steuert, mit welcher Grundhaltung eine neue Session startet
-//! (reines Gespräch, Planungsmodus, Explorationsmodus oder aktive
-//! Arbeitsausführung). Dieses Modul kennt nur den deklarierten String-Wert
+//! (reines Gespräch, Planungsmodus, Explorationsmodus, aktive
+//! Arbeitsausführung oder Host-Shell-Arbeit). Dieses Modul kennt nur den
+//! deklarierten String-Wert
 //! aus `.harw/config.toml`; die Zuordnung zu konkretem Laufzeitverhalten
 //! (z. B. welche Tools sichtbar sind) liegt beim Consumer, der `harw-config`
 //! und die jeweiligen Modus-Implementierungen gemeinsam kennt.
@@ -10,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Erlaubte Werte für [`ModeSection::default`].
-const ALLOWED_MODES: &[&str] = &["chat", "plan", "explore", "work"];
+const ALLOWED_MODES: &[&str] = &["chat", "plan", "explore", "work", "shell"];
 
 /// `[mode]` — Standard-Interaktionsmodus, mit dem eine neue Session
 /// startet, sofern kein Aufruf-Kontext (CLI-Flag, Slash-Command) explizit
@@ -18,8 +19,8 @@ const ALLOWED_MODES: &[&str] = &["chat", "plan", "explore", "work"];
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModeSection {
-    /// Einer von `chat`, `plan`, `explore`, `work`. Default: `plan`, damit
-    /// Sessions mit einer nachvollziehbaren Planung beginnen.
+    /// Einer von `chat`, `plan`, `explore`, `work`, `shell`. Default: `plan`,
+    /// damit Sessions mit einer nachvollziehbaren Planung beginnen.
     #[serde(default = "default_mode")]
     pub default: String,
 }

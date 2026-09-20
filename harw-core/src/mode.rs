@@ -8,12 +8,12 @@
 //! [`crate::session::AgentSession::set_mode`].
 //!
 //! # Schlüsseltypen
-//! - [`InteractionMode`] — `Chat` | `Plan` | `Explore` | `Work`
+//! - [`InteractionMode`] — `Chat` | `Plan` | `Explore` | `Work` | `Shell`
 //!
 //! # Autoritätsmodell
 //! Die Permission-Obergrenze eines Modus ist **monoton**: sie wird stets mit
 //! der Basis-Sandbox der Session geschnitten
-//! ([`harw_sandbox::SandboxSpec::restrict`],
+//! ([`harw_authority::SandboxSpec::restrict`],
 //! [`crate::session::AgentSession::set_mode`]), nie mit dem gerade aktuellen,
 //! bereits verengten Wert — der Schnitt ist deshalb nie kumulativ. Ein Wechsel
 //! von `Explore` zurück nach `Work` stellt entzogene Permissions daher bis zur
@@ -33,7 +33,7 @@
 //! # Beispiele
 //! ```rust
 //! use harw_core::mode::InteractionMode;
-//! use harw_sandbox::Permission;
+//! use harw_authority::Permission;
 //!
 //! let mode = InteractionMode::parse("Explore").expect("bekannter Modus");
 //! assert_eq!(mode, InteractionMode::Explore);
@@ -41,7 +41,7 @@
 //! assert!(!mode.permission_ceiling().contains(Permission::WriteWorkspace));
 //! ```
 
-use harw_sandbox::{Permission, PermissionSet};
+use harw_authority::{Permission, PermissionSet};
 use serde::{Deserialize, Serialize};
 
 use crate::activation::ToolProfile;
@@ -122,6 +122,14 @@ const WORK_PROMPT: &str = "Modus: work. Voller Werkzeugsatz inklusive Schreiben 
 und Shell. Der Modus hebt keine Sandbox-Grenze auf: es gilt weiterhin genau \
 die Autorität, die die Session beim Start bekommen hat.";
 
+/// Prompt-Abschnitt für [`InteractionMode::Shell`].
+const SHELL_PROMPT: &str = "Modus: shell. Der Nutzer will handfeste Hilfe auf \
+seinem echten System, nicht nur im Workspace. Bevorzuge, Host-Befehle an den \
+`uia-shell-worker` zu delegieren, statt sie selbst auszuführen. Erkläre vor \
+jedem vorgeschlagenen Befehl in einfachen Worten, was er tut, bevor du ihn \
+vorschlägst. Du kannst eine Host-Freigabe niemals selbst erteilen — \
+ausschließlich der Nutzer bestätigt sie in der Oberfläche.";
+
 /// Betriebsmodus einer Session. Er bestimmt, welche Werkzeuge das Modell sieht
 /// und welche Autorität die Sandbox höchstens tragen darf.
 ///
@@ -159,6 +167,11 @@ pub enum InteractionMode {
     Explore,
     /// Ausführung: voller Werkzeugsatz inkl. Schreiben und Shell.
     Work,
+    /// Host-Arbeit: voller Werkzeugsatz wie `Work`; das Modell soll Host-Befehle
+    /// bevorzugt an den `uia-shell-worker` delegieren und kann eine
+    /// Host-Freigabe nie selbst erteilen — das bleibt allein dem Nutzer in der
+    /// Oberfläche vorbehalten.
+    Shell,
 }
 
 impl InteractionMode {
@@ -189,7 +202,7 @@ impl InteractionMode {
     pub fn tool_profile(&self) -> ToolProfile {
         match self {
             Self::Plan | Self::Explore => ToolProfile::Minimal,
-            Self::Chat | Self::Work => ToolProfile::Full,
+            Self::Chat | Self::Work | Self::Shell => ToolProfile::Full,
         }
     }
 
@@ -197,7 +210,7 @@ impl InteractionMode {
     ///
     /// # Beschreibung
     /// Die Obergrenze wird **geschnitten**, nie addiert: der Aufrufer reicht
-    /// sie an [`harw_sandbox::SandboxSpec::restrict`] weiter. `Chat` und `Work`
+    /// sie an [`harw_authority::SandboxSpec::restrict`] weiter. `Chat` und `Work`
     /// liefern die vollständige Permission-Menge, wodurch der Schnitt zur
     /// Identität wird — sie sind damit ausdrücklich *kein* Ceiling und können
     /// nichts wiederherstellen, was ein früherer Modus entzogen hat.
@@ -212,7 +225,7 @@ impl InteractionMode {
     /// # Beispiele
     /// ```rust
     /// use harw_core::mode::InteractionMode;
-    /// use harw_sandbox::Permission;
+    /// use harw_authority::Permission;
     ///
     /// let ceiling = InteractionMode::Plan.permission_ceiling();
     /// assert!(ceiling.contains(Permission::NetworkAccess));
@@ -230,7 +243,7 @@ impl InteractionMode {
                 Permission::ReadCargoRegistry,
                 Permission::NetworkAccess,
             ]),
-            Self::Chat | Self::Work => all_permissions(),
+            Self::Chat | Self::Work | Self::Shell => all_permissions(),
         }
     }
 
@@ -251,7 +264,7 @@ impl InteractionMode {
         match self {
             Self::Explore => Some(EXPLORE_TOOLS),
             Self::Plan => Some(PLAN_TOOLS),
-            Self::Chat | Self::Work => None,
+            Self::Chat | Self::Work | Self::Shell => None,
         }
     }
 
@@ -271,6 +284,7 @@ impl InteractionMode {
             Self::Plan => PLAN_PROMPT,
             Self::Explore => EXPLORE_PROMPT,
             Self::Work => WORK_PROMPT,
+            Self::Shell => SHELL_PROMPT,
         }
     }
 
@@ -304,6 +318,7 @@ impl InteractionMode {
             "plan" => Some(Self::Plan),
             "explore" => Some(Self::Explore),
             "work" => Some(Self::Work),
+            "shell" => Some(Self::Shell),
             _ => None,
         }
     }
@@ -316,7 +331,7 @@ impl InteractionMode {
     /// verwendet.
     ///
     /// # Returns
-    /// Einen der Werte `"chat"`, `"plan"`, `"explore"`, `"work"`.
+    /// Einen der Werte `"chat"`, `"plan"`, `"explore"`, `"work"`, `"shell"`.
     #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -324,6 +339,7 @@ impl InteractionMode {
             Self::Plan => "plan",
             Self::Explore => "explore",
             Self::Work => "work",
+            Self::Shell => "shell",
         }
     }
 }
@@ -379,11 +395,12 @@ fn is_known_permission(permission: Permission) -> bool {
 mod tests {
     use super::*;
 
-    const ALL_MODES: [InteractionMode; 4] = [
+    const ALL_MODES: [InteractionMode; 5] = [
         InteractionMode::Chat,
         InteractionMode::Plan,
         InteractionMode::Explore,
         InteractionMode::Work,
+        InteractionMode::Shell,
     ];
 
     #[test]
@@ -402,6 +419,9 @@ mod tests {
             ("explore", InteractionMode::Explore),
             ("Work", InteractionMode::Work),
             ("wOrK", InteractionMode::Work),
+            ("shell", InteractionMode::Shell),
+            ("SHELL", InteractionMode::Shell),
+            ("  Shell  ", InteractionMode::Shell),
         ] {
             assert_eq!(
                 InteractionMode::parse(input),
@@ -476,12 +496,14 @@ mod tests {
         assert_eq!(InteractionMode::Plan.tool_profile(), ToolProfile::Minimal);
         assert_eq!(InteractionMode::Chat.tool_profile(), ToolProfile::Full);
         assert_eq!(InteractionMode::Work.tool_profile(), ToolProfile::Full);
+        assert_eq!(InteractionMode::Shell.tool_profile(), ToolProfile::Full);
     }
 
     #[test]
-    fn test_allowed_tools_is_none_only_for_chat_and_work() {
+    fn test_allowed_tools_is_none_only_for_chat_work_and_shell() {
         assert!(InteractionMode::Chat.allowed_tools().is_none());
         assert!(InteractionMode::Work.allowed_tools().is_none());
+        assert!(InteractionMode::Shell.allowed_tools().is_none());
         assert!(InteractionMode::Plan.allowed_tools().is_some());
         assert!(InteractionMode::Explore.allowed_tools().is_some());
     }
@@ -577,6 +599,24 @@ mod tests {
         assert_eq!(InteractionMode::Chat.permission_ceiling(), full);
         assert_eq!(InteractionMode::Work.permission_ceiling(), full);
         assert_eq!(full.iter().count(), 7);
+    }
+
+    #[test]
+    fn test_shell_ceiling_equals_work_ceiling() {
+        // Shell darf gegenüber Work nichts hinzugewinnen: die Moduldoku
+        // verlangt, dass ein Modus nur schneiden, nie erweitern darf. Shell
+        // ist deshalb bitidentisch mit Work statt einer eigenen (größeren)
+        // Menge.
+        assert_eq!(
+            InteractionMode::Shell.permission_ceiling(),
+            InteractionMode::Work.permission_ceiling()
+        );
+        assert_eq!(InteractionMode::Shell.permission_ceiling(), all_permissions());
+    }
+
+    #[test]
+    fn test_shell_tool_profile_is_full() {
+        assert_eq!(InteractionMode::Shell.tool_profile(), ToolProfile::Full);
     }
 
     #[test]

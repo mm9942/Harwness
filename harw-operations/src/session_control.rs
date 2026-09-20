@@ -318,7 +318,7 @@ pub trait SessionController: Send + Sync {
         self.uia_selection()
     }
 
-    /// Fordert einen Wechsel des Interaktionsmodus an (`/mode chat|plan|explore|work`).
+    /// Fordert einen Wechsel des Interaktionsmodus an (`/mode chat|plan|explore|work|shell`).
     ///
     /// # Beschreibung
     /// Der Modus steuert Tool-Profil, Sandbox-Obergrenze und Prompt-Sektion einer

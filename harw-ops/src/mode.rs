@@ -38,7 +38,8 @@
 //! ```
 //!
 //! # Schlüsseltypen
-//! - [`ModeArgs`] — Subcommand-Enum (`show`, `chat`, `plan`, `explore`, `work`).
+//! - [`ModeArgs`] — Subcommand-Enum (`show`, `chat`, `plan`, `explore`, `work`,
+//!   `shell`).
 //! - `ModeOperation` — vom `#[operation]`-Makro erzeugter Op-Struct.
 //!
 //! # Nebenläufigkeit
@@ -98,6 +99,7 @@ const AVAILABLE_MODES: &[InteractionMode] = &[
     InteractionMode::Plan,
     InteractionMode::Explore,
     InteractionMode::Work,
+    InteractionMode::Shell,
 ];
 
 // ── Argumente ────────────────────────────────────────────────────────────────
@@ -129,6 +131,10 @@ pub enum ModeArgs {
     Explore,
     /// Wechselabsicht: Ausführung — voller Werkzeugsatz.
     Work,
+    /// Wechselabsicht: Host-Arbeit — voller Werkzeugsatz, das Modell soll
+    /// Host-Befehle bevorzugt an den `uia-shell-worker` delegieren; eine
+    /// Host-Freigabe erteilt weiterhin nur der Mensch.
+    Shell,
 }
 
 impl ModeArgs {
@@ -156,6 +162,7 @@ impl ModeArgs {
             Self::Plan => Some(InteractionMode::Plan),
             Self::Explore => Some(InteractionMode::Explore),
             Self::Work => Some(InteractionMode::Work),
+            Self::Shell => Some(InteractionMode::Shell),
         }
     }
 }
@@ -206,7 +213,7 @@ impl ModeArgs {
 /// ```
 #[operation(
     name = "mode",
-    summary = "Zeigt den Interaktionsmodus oder meldet die Wechselabsicht (chat/plan/explore/work).",
+    summary = "Zeigt den Interaktionsmodus oder meldet die Wechselabsicht (chat/plan/explore/work/shell).",
     domain = "session",
     permission = "operator",
     command(path = "/mode", visibility = "tui_only")
@@ -275,7 +282,7 @@ mod tests {
     use harw_core::InteractionMode;
     use harw_operations::context::ServiceMap;
     use harw_operations::{FromRawArgs, OpContext, OpError, Operation, Surface};
-    use harw_sandbox::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -368,6 +375,7 @@ mod tests {
             ("plan", ModeArgs::Plan),
             ("explore", ModeArgs::Explore),
             ("work", ModeArgs::Work),
+            ("shell", ModeArgs::Shell),
         ] {
             match ModeArgs::from_raw_args(&toks(&[token])) {
                 Ok(args) => assert_eq!(args, expected, "Subcommand '{token}'"),
@@ -399,6 +407,10 @@ mod tests {
             Some(InteractionMode::Explore)
         );
         assert_eq!(ModeArgs::Work.requested_mode(), Some(InteractionMode::Work));
+        assert_eq!(
+            ModeArgs::Shell.requested_mode(),
+            Some(InteractionMode::Shell)
+        );
     }
 
     #[test]
@@ -501,7 +513,7 @@ mod tests {
         let report = run(ModeArgs::Show).await;
         assert_eq!(
             report["available_modes"],
-            serde_json::json!(["chat", "plan", "explore", "work"])
+            serde_json::json!(["chat", "plan", "explore", "work", "shell"])
         );
     }
 }

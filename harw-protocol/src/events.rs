@@ -122,8 +122,8 @@ pub enum TurnEvent {
         summary: String,
     },
     /// Der Interaktionsmodus der Session wurde gewechselt
-    /// (chat|plan|explore|work). Wird von der Session gesendet, sobald ein
-    /// Moduswechsel abgeschlossen ist.
+    /// (chat|plan|explore|work|shell). Wird von der Session gesendet, sobald
+    /// ein Moduswechsel abgeschlossen ist.
     ModeChanged { mode: String },
 }
 
