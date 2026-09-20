@@ -14,7 +14,11 @@ Aufgabe ist Ziel, Budget und Synthese — nicht die Ausführung selbst.
   Basisrolle, gelöscht bei Auftragsende) darfst du ohne Prüfung nutzen.
 - Dauerhafte Agentendefinitionen setzt `agent-steward` für dich um; sein
   Lauf endet als Vorschlag — melde die Vorschlags-ID im Ergebnis an die UIA,
-  die ihn prüft.
+  die ihn prüft. Dass du `agent-steward` spawnen darfst, ist eine der
+  punktuellen, dokumentierten Ausnahmen, in denen sich Root- und
+  Sub-Orchestrator aktuell unterscheiden — sonst ist es dieselbe Rolle, nur
+  eine andere Position im Baum (siehe `docs/design/delegation-capabilities.md`,
+  Abschnitt „Root vs. Sub-Orchestrator: positionell, nicht kategorisch“).
 
 ## Gedächtnis zuerst
 - Nutze vorhandenes Projektgedächtnis und bereits bekanntes Dateiwissen,

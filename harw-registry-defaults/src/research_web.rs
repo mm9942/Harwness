@@ -54,7 +54,7 @@ use std::sync::Arc;
 
 use harw_config::NetworkSection;
 use harw_egress::EgressPolicy;
-use harw_sandbox::NetworkScope;
+use harw_authority::NetworkScope;
 
 use crate::error::{RegistryDefaultsError, RegistryDefaultsResult};
 

@@ -44,7 +44,7 @@
 //!     AuthorityReducer, authority_reducer_for_role, reduce_to_read_registry,
 //! };
 //! use harw_registry_defaults::profile::role_names;
-//! use harw_sandbox::{Permission, PermissionSet};
+//! use harw_authority::{Permission, PermissionSet};
 //!
 //! let parent = PermissionSet::from_policy([
 //!     Permission::ReadWorkspace,
@@ -62,7 +62,7 @@
 //! );
 //! ```
 
-use harw_sandbox::{Permission, PermissionSet};
+use harw_authority::{Permission, PermissionSet};
 
 use crate::profile::{
     AGENT_DEFINITION_LIST_TOOLS, AGENT_DEFINITION_READ_TOOLS, AGENT_DEFINITION_WRITE_TOOLS,
@@ -83,7 +83,7 @@ pub const REDUCE_TO_READ_NETWORK: &str = "reduce_to_read_network";
 /// Ein Reducer **gewährt** nichts: [`AuthorityReducer::reduce`] schneidet den
 /// Satz des Elternteils mit [`AuthorityReducer::ceiling`]. Hat der Elternteil
 /// ein Recht nicht, bekommt das Kind es auch über den großzügigsten Reducer
-/// nicht (monoton, wie `PermissionSet::intersection`).
+/// nicht (monoton, durch Schnittmenge der beiden Mengen).
 ///
 /// Keine Obergrenze enthält `WriteWorkspace`, `ExecuteProcess`, `ReadSecrets`
 /// oder `ManagePlugins`. `ReadNetwork` enthält bewusst **kein**
@@ -101,7 +101,7 @@ pub const REDUCE_TO_READ_NETWORK: &str = "reduce_to_read_network";
 /// # Beispiele
 /// ```rust
 /// use harw_registry_defaults::authority::AuthorityReducer;
-/// use harw_sandbox::Permission;
+/// use harw_authority::Permission;
 ///
 /// let ceiling = AuthorityReducer::ReadNetwork.ceiling();
 /// assert!(ceiling.contains(Permission::NetworkAccess));
@@ -167,7 +167,12 @@ impl AuthorityReducer {
     /// `granted ∩ ceiling()` — nie mehr als `granted`, nie mehr als die Obergrenze.
     #[must_use]
     pub fn reduce(self, granted: &PermissionSet) -> PermissionSet {
-        granted.intersection(&self.ceiling())
+        let ceiling = self.ceiling();
+        PermissionSet::from_policy(
+            granted
+                .iter()
+                .filter(|permission| ceiling.contains(*permission)),
+        )
     }
 }
 
@@ -232,6 +237,21 @@ pub fn reduce_to_read_network(granted: &PermissionSet) -> PermissionSet {
 ///   `AgentStewardship`, Addendum K; ebenfalls **Muster `executor`** — die
 ///   Rolle registriert die schreibenden Agentendefinitions-Werkzeuge, kein
 ///   Reducer trägt je `WriteWorkspace` weiter).
+/// - `uia-explorer` → [`AuthorityReducer::ReadOnly`] (Profil
+///   `UiaExplorer`; **Muster `uia-worker`**, dieselbe Ausnahme — die Rolle
+///   registriert `fs.read/list/search/glob/grep` **und** `web.fetch`, kein
+///   Reducer trägt je `NetworkAccess` gemeinsam mit `ReadWorkspace` weiter,
+///   siehe die Ausnahme-Begründung unten).
+/// - `uia-writer` → [`AuthorityReducer::ReadOnly`] (Profil `UiaWriter`;
+///   ebenfalls **Muster `uia-worker`** — die Rolle registriert zusätzlich zu
+///   `fs.write` (`WriteWorkspace`) auch `web.fetch` (`NetworkAccess`), kein
+///   Reducer trägt je `WriteWorkspace` oder `NetworkAccess` gemeinsam mit
+///   `ReadWorkspace` weiter).
+/// - `uia-shell-worker` → [`AuthorityReducer::ReadOnly`] (Profil
+///   `UiaShellWorker`; **Muster `uia-worker`**, dieselbe Ausnahme — die
+///   Rolle registriert `fs.read/list/search/glob/grep` **und** `shell.exec`,
+///   kein Reducer trägt je `ExecuteProcess` gemeinsam mit `ReadWorkspace`
+///   weiter).
 ///
 /// Invariante (Test): Für jede eingebaute Rolle gilt
 /// `profile.required_permissions() ⊆ reducer.ceiling()` — keine Rolle bewirbt
@@ -239,16 +259,23 @@ pub fn reduce_to_read_network(granted: &PermissionSet) -> PermissionSet {
 /// `memory-steward` (braucht `WriteWorkspace` für `fs.write`), `executor`
 /// (braucht `ExecuteProcess` für `shell.exec`), `uia-worker` (braucht
 /// zusätzlich zu `ReadWorkspace` auch `ExecuteProcess` für `shell.exec` und
-/// `NetworkAccess` für `web.fetch`) und `agent-steward` (Addendum K, braucht
+/// `NetworkAccess` für `web.fetch`), `agent-steward` (Addendum K, braucht
 /// `WriteWorkspace` für `agents.write_definition`/`agents.write_uia`/
-/// `agents.commit_proposal`/`agents.reject_proposal`) — kein Reducer trägt je
-/// `WriteWorkspace` oder `ExecuteProcess` (siehe
-/// `test_reduce_never_exceeds_parent_or_ceiling`, das ist Absicht: Delegation
-/// gibt nie Schreib-/Ausführungsrecht weiter). Alle vier Rollen erhalten
-/// diese Rechte nicht über diesen Reducer-Mechanismus, sondern über ihre
-/// feste Profilzuweisung bei der Registry-Montage
-/// ([`crate::profile::assemble_registry_for_sandbox`]); der hier vergebene
-/// Reducer bindet nur die verbleibende, weitergebbare Lese-/Netz-Autorität.
+/// `agents.commit_proposal`/`agents.reject_proposal`), `uia-explorer`
+/// (braucht zusätzlich zu `ReadWorkspace` auch `NetworkAccess` für
+/// `web.fetch`), `uia-writer` (braucht zusätzlich zu `ReadWorkspace` auch
+/// `WriteWorkspace` für `fs.write` und `NetworkAccess` für `web.fetch`) und
+/// `uia-shell-worker` (braucht zusätzlich zu `ReadWorkspace` auch
+/// `ExecuteProcess` für `shell.exec`) — kein Reducer trägt je
+/// `WriteWorkspace`, `ExecuteProcess` oder `NetworkAccess` gemeinsam mit
+/// `ReadWorkspace` (siehe `test_reduce_never_exceeds_parent_or_ceiling`, das
+/// ist Absicht: Delegation gibt nie Schreib-/Ausführungsrecht weiter und
+/// `ReadNetwork` schließt `ReadWorkspace` bewusst aus, Annahme A5). Alle
+/// sieben Rollen erhalten diese Rechte nicht über diesen
+/// Reducer-Mechanismus, sondern über ihre feste Profilzuweisung bei der
+/// Registry-Montage ([`crate::profile::assemble_registry_for_sandbox`]); der
+/// hier vergebene Reducer bindet nur die verbleibende, weitergebbare
+/// Lese-/Netz-Autorität.
 ///
 /// # Argumente
 /// - `role` (`&str`): Rollenname, üblicherweise aus [`role_names`].
@@ -282,6 +309,20 @@ pub fn authority_reducer_for_role(role: &str) -> Option<AuthorityReducer> {
         // Agentendefinitions-Werkzeuge (`WriteWorkspace`), die kein Reducer
         // je zusammen mit `ReadWorkspace` weiterträgt.
         role_names::AGENT_STEWARD => Some(AuthorityReducer::ReadOnly),
+        // Muster `uia-worker`: `UiaExplorer` registriert
+        // `fs.read/list/search/glob/grep` **und** `web.fetch`, kein Reducer
+        // trägt je `NetworkAccess` zusammen mit `ReadWorkspace` weiter.
+        role_names::UIA_EXPLORER => Some(AuthorityReducer::ReadOnly),
+        // Muster `uia-worker`: `UiaWriter` registriert zusätzlich `fs.write`
+        // (`WriteWorkspace`) neben `web.fetch` (`NetworkAccess`), kein
+        // Reducer trägt je `WriteWorkspace` oder `NetworkAccess` zusammen
+        // mit `ReadWorkspace` weiter.
+        role_names::UIA_WRITER => Some(AuthorityReducer::ReadOnly),
+        // Muster `uia-worker`: `UiaShellWorker` registriert
+        // `fs.read/list/search/glob/grep` **und** `shell.exec`, kein
+        // Reducer trägt je `ExecuteProcess` zusammen mit `ReadWorkspace`
+        // weiter.
+        role_names::UIA_SHELL_WORKER => Some(AuthorityReducer::ReadOnly),
         _ => None,
     }
 }
@@ -319,7 +360,7 @@ pub fn authority_reducer_for_role(role: &str) -> Option<AuthorityReducer> {
 /// # Beispiele
 /// ```rust
 /// use harw_registry_defaults::authority::tool_permission;
-/// use harw_sandbox::Permission;
+/// use harw_authority::Permission;
 ///
 /// assert_eq!(tool_permission("deps.source_read"), Some(Permission::ReadCargoRegistry));
 /// assert_eq!(tool_permission("web.fetch"), Some(Permission::NetworkAccess));
@@ -395,14 +436,23 @@ mod tests {
     fn test_tool_permission_covers_every_tool_of_every_profile() {
         for profile in RegistryProfile::ALL {
             for tool in profile.registered_tool_names() {
-                assert!(tool_permission(tool).is_some(), "{profile:?}: {tool} ohne Recht");
+                assert!(
+                    tool_permission(tool).is_some(),
+                    "{profile:?}: {tool} ohne Recht"
+                );
             }
         }
         for tool in BROWSER_TOOLS {
             assert_eq!(tool_permission(tool), Some(Permission::NetworkAccess));
         }
-        assert_eq!(tool_permission("fs.write"), Some(Permission::WriteWorkspace));
-        assert_eq!(tool_permission("shell.exec"), Some(Permission::ExecuteProcess));
+        assert_eq!(
+            tool_permission("fs.write"),
+            Some(Permission::WriteWorkspace)
+        );
+        assert_eq!(
+            tool_permission("shell.exec"),
+            Some(Permission::ExecuteProcess)
+        );
         assert_eq!(tool_permission("plan"), None);
     }
 
@@ -466,19 +516,25 @@ mod tests {
 
     #[test]
     fn test_authority_reducer_for_role_covers_every_role_and_bounds_its_profile() {
-        // `memory-steward` (WriteWorkspace), `executor` (ExecuteProcess) und
-        // `uia-worker` (ExecuteProcess + NetworkAccess, Addendum I) sind
-        // dokumentierte Ausnahmen von der Untermengen-Invariante: kein
-        // Reducer trägt je Schreib-, Ausführungs- oder (zusammen mit
-        // ReadWorkspace) Netzrecht weiter (siehe
-        // `test_reduce_never_exceeds_parent_or_ceiling`); alle drei Rollen
-        // bekommen diese Rechte über ihre feste Profilzuweisung, nicht über
-        // diesen Reducer (siehe Doku bei `authority_reducer_for_role`).
+        // `memory-steward` (WriteWorkspace), `executor` (ExecuteProcess),
+        // `uia-worker` (ExecuteProcess + NetworkAccess, Addendum I),
+        // `agent-steward` (WriteWorkspace, Addendum K), `uia-explorer`
+        // (NetworkAccess), `uia-writer` (WriteWorkspace + NetworkAccess) und
+        // `uia-shell-worker` (ExecuteProcess) sind dokumentierte Ausnahmen
+        // von der Untermengen-Invariante: kein Reducer trägt je Schreib-,
+        // Ausführungs- oder (zusammen mit ReadWorkspace) Netzrecht weiter
+        // (siehe `test_reduce_never_exceeds_parent_or_ceiling`); alle sieben
+        // Rollen bekommen diese Rechte über ihre feste Profilzuweisung,
+        // nicht über diesen Reducer (siehe Doku bei
+        // `authority_reducer_for_role`).
         let exempt_from_subset_bound = [
             role_names::MEMORY_STEWARD,
             role_names::EXECUTOR,
             role_names::UIA_WORKER,
             role_names::AGENT_STEWARD,
+            role_names::UIA_EXPLORER,
+            role_names::UIA_WRITER,
+            role_names::UIA_SHELL_WORKER,
         ];
         for role in role_names::ALL {
             let reducer = authority_reducer_for_role(role)
@@ -489,7 +545,9 @@ mod tests {
                 continue;
             }
             assert!(
-                profile.required_permissions().is_subset_of(&reducer.ceiling()),
+                profile
+                    .required_permissions()
+                    .is_subset_of(&reducer.ceiling()),
                 "{role}: {profile:?} braucht mehr, als {reducer:?} je trägt"
             );
         }
@@ -512,6 +570,18 @@ mod tests {
         );
         assert_eq!(
             authority_reducer_for_role(role_names::AGENT_STEWARD),
+            Some(AuthorityReducer::ReadOnly)
+        );
+        assert_eq!(
+            authority_reducer_for_role(role_names::UIA_EXPLORER),
+            Some(AuthorityReducer::ReadOnly)
+        );
+        assert_eq!(
+            authority_reducer_for_role(role_names::UIA_WRITER),
+            Some(AuthorityReducer::ReadOnly)
+        );
+        assert_eq!(
+            authority_reducer_for_role(role_names::UIA_SHELL_WORKER),
             Some(AuthorityReducer::ReadOnly)
         );
     }

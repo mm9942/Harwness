@@ -113,7 +113,7 @@ use harw_extension_api::{
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName, ToolOutput,
     ToolSpec,
 };
-use harw_sandbox::PermissionSet;
+use harw_authority::PermissionSet;
 use harw_tools::{AdditionalProperties, FunctionToolSpec, JsonSchema, JsonSchemaType};
 use serde::Deserialize;
 
@@ -2367,7 +2367,7 @@ impl ToolProvider for AgentDefinitionToolProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harw_sandbox::Permission;
+    use harw_authority::Permission;
 
     fn empty_ceiling(role: AgentRoleId) -> DefinitionAuthorCeiling {
         DefinitionAuthorCeiling {

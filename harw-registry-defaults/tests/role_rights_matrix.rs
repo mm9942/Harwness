@@ -4,10 +4,11 @@
 //! # Was hier festgehalten wird
 //! 1. **Rollentabelle**: jede Rolle aus `role_names::ALL` hat genau das
 //!    erwartete Profil und den erwarteten Reducer.
-//! 2. **Profil × Rechtesatz** (8 × 2⁷): `tool_names_for(granted)` registriert
-//!    nie ein Werkzeug ohne gewährtes Recht; `fs.write` nur in `Full`/
-//!    `MemoryStewardship`, `shell.exec` nur in `Full`/`ShellExecution`/
-//!    `UiaQuickHelper` (Addendum I), jeweils nur mit dem passenden Recht;
+//! 2. **Profil × Rechtesatz** (`RegistryProfile::ALL.len()` × 2⁷):
+//!    `tool_names_for(granted)` registriert nie ein Werkzeug ohne gewährtes
+//!    Recht; `fs.write` nur in `Full`/`MemoryStewardship`, `shell.exec` nur
+//!    in `Full`/`ShellExecution`/`UiaQuickHelper` (Addendum I)/
+//!    `UiaShellWorker`, jeweils nur mit dem passenden Recht;
 //!    `deps.source_*` nur mit `ReadCargoRegistry`; `web.*` nur in `Research`
 //!    (alle drei Werkzeuge) oder `UiaQuickHelper` (nur `web.fetch`), jeweils
 //!    nur mit `NetworkAccess`; `browser.*` in keinem Profil.
@@ -33,7 +34,7 @@ use harw_registry_defaults::profile::{
     IdentityOverrides, RegistryProfile, assemble_registry_for_sandbox, profile_for_role,
     role_names,
 };
-use harw_sandbox::{Permission, PermissionSet};
+use harw_authority::{Permission, PermissionSet};
 
 /// Alle sieben Rechte in fester Reihenfolge (Bitposition = Index).
 const PERMISSIONS: [Permission; 7] = [
@@ -126,6 +127,14 @@ fn expected_role_table() -> Vec<(&'static str, RegistryProfile, AuthorityReducer
         // `executor`-Muster als Reducer-Ausnahme (siehe
         // `authority_reducer_for_role`).
         (role_names::AGENT_STEWARD, RegistryProfile::AgentStewardship, AuthorityReducer::ReadOnly),
+        // Host-Shell-Spezialisierung der UIA: `RegistryProfile::UiaShellWorker`
+        // mit dem `executor`-Muster als Reducer-Ausnahme (siehe
+        // `authority_reducer_for_role`).
+        (
+            role_names::UIA_SHELL_WORKER,
+            RegistryProfile::UiaShellWorker,
+            AuthorityReducer::ReadOnly,
+        ),
     ]
 }
 
@@ -155,7 +164,8 @@ fn test_profile_by_permission_matrix_never_registers_ungranted_tools() {
             }
             let has = |name: &str| tools.iter().any(|tool| *tool == name);
             // `fs.write` gehört zu `Full` und `MemoryStewardship`; `shell.exec`
-            // zu `Full`, `ShellExecution` und `UiaQuickHelper` (Addendum I).
+            // zu `Full`, `ShellExecution`, `UiaQuickHelper` (Addendum I) und
+            // `UiaShellWorker`.
             let may_write =
                 matches!(*profile, RegistryProfile::Full | RegistryProfile::MemoryStewardship);
             let may_exec = matches!(
@@ -163,6 +173,7 @@ fn test_profile_by_permission_matrix_never_registers_ungranted_tools() {
                 RegistryProfile::Full
                     | RegistryProfile::ShellExecution
                     | RegistryProfile::UiaQuickHelper
+                    | RegistryProfile::UiaShellWorker
             );
             assert_eq!(
                 has("fs.write"),

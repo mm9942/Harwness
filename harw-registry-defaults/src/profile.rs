@@ -47,6 +47,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use harw_authority::PermissionSet;
 use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_extension_api::{
     ExtensionRegistryBuilder, ToolExecutor, ToolName, ToolProvider, ToolSpec,
@@ -55,7 +56,7 @@ use harw_instructions::{AgentIdentity, BaselineInstructionsProvider};
 use harw_project_discovery::{
     DiscoveryConfig, ProjectContext, ProjectContextProvider, discover_project,
 };
-use harw_sandbox::{HostPermitSessionRegistry, PermissionSet, ProcessPermitLedger, SandboxProfile};
+use harw_sandbox::{HostPermitSessionRegistry, ProcessPermitLedger, SandboxProfile};
 use harw_tool_deps::DepsToolProvider;
 use harw_tool_fs::FsToolProvider;
 use harw_tool_lens::LensToolProvider;
@@ -63,9 +64,9 @@ use harw_tool_shell::ShellToolProvider;
 use harw_tool_web::WebToolProvider;
 
 #[cfg(feature = "browser")]
-use harw_browser_thirtyfour::{config::FirefoxHostConfig, host::FirefoxHost};
-#[cfg(feature = "browser")]
 use harw_browser::policy::{BrowserLimits, OriginPolicy};
+#[cfg(feature = "browser")]
+use harw_browser_thirtyfour::{config::FirefoxHostConfig, host::FirefoxHost};
 #[cfg(feature = "browser")]
 use harw_tool_browser::{
     BrowserOpenGrant, BrowserOpenPolicy, BrowserToolSet, HarwnessBrowserToolProvider,
@@ -206,6 +207,41 @@ pub mod role_names {
     /// `agents/uia-worker.toml`.
     pub const UIA_WORKER: &str = "uia-worker";
 
+    /// Read-only Erkundungsspezialisierung der UIA: die Spawn-Matrix
+    /// (`harw-agent-dsl/src/roles.rs::can_spawn`) erlaubt der UIA
+    /// (`AgentRoleId::UserInterface`) ausschließlich
+    /// `RootOrchestrator`/`UiaWorker`/`AgentSteward` als Ziel — niemals den
+    /// regulären `Worker`, unter dem `explorer`/`researcher-web` laufen. Die
+    /// UIA-Werkzeuge `explore`/`research_web` spawnen intern aber genau diese
+    /// beiden `role = "worker"`-Spezialisierungen und scheitern deshalb mit
+    /// „no delegation capability is available for this request“, sobald die
+    /// UIA sie aufruft. `uia-explorer` behebt das: dieselbe read-only
+    /// Werkzeugoberfläche wie [`EXPLORER`]/[`RESEARCHER_WEB`] zusammen
+    /// (`fs.read/list/search/glob/grep` plus `web.fetch`), aber unter der für
+    /// die UIA bereits zugelassenen Organisationsrolle `role = "uia-worker"`
+    /// (`AgentRoleId::UiaWorker`) statt `role = "worker"` — siehe
+    /// `agents/uia-explorer.toml` und [`RegistryProfile::UiaExplorer`].
+    pub const UIA_EXPLORER: &str = "uia-explorer";
+
+    /// Schreibende Erkundungsspezialisierung der UIA: identische Begründung
+    /// wie [`UIA_EXPLORER`], aber mit zusätzlichem `fs.write` — für
+    /// UIA-Aufträge, die eine gefundene Datei auch tatsächlich ändern sollen,
+    /// ohne dafür über `RootOrchestrator`/`AgentSteward` umzuleiten. Siehe
+    /// `agents/uia-writer.toml` und [`RegistryProfile::UiaWriter`].
+    pub const UIA_WRITER: &str = "uia-writer";
+
+    /// Host-Shell-Spezialisierung der UIA: dieselbe Begründung wie
+    /// [`UIA_EXPLORER`]/[`UIA_WRITER`] — die Spawn-Matrix lässt der UIA nie
+    /// den regulären `Worker`, unter dem `host-process-worker` liefe
+    /// (`role = "worker"`). Diese Rolle trägt deshalb `role = "uia-worker"`
+    /// bei derselben Prozessoberfläche wie `host-process-worker`
+    /// (`shell.exec`), ergänzt um den lesenden `fs.*`-Kern. Zweck: die UIA
+    /// soll dem Nutzer bei Aufgaben helfen können, die er selbst nicht auf
+    /// dem Host lösen kann — jede Ausführung bleibt dabei permitpflichtig
+    /// und fail-closed (`SandboxProfile::Host`, siehe
+    /// [`RegistryProfile::UiaShellWorker`] und `agents/uia-shell-worker.toml`).
+    pub const UIA_SHELL_WORKER: &str = "uia-shell-worker";
+
     /// Setzt Agentendefinitionen um (Addendum K + Nachtrag K): die UIA und der
     /// Root-Orchestrator dürfen ihn spawnen (`AgentRoleId::AgentSteward`,
     /// `harw-agent-dsl/src/roles.rs`), er selbst spawnt nichts. Validiert
@@ -239,6 +275,9 @@ pub mod role_names {
         EXECUTOR,
         MEMORY_STEWARD,
         UIA_WORKER,
+        UIA_EXPLORER,
+        UIA_WRITER,
+        UIA_SHELL_WORKER,
         AGENT_STEWARD,
     ];
 }
@@ -294,6 +333,10 @@ pub(crate) const WEB_TOOLS: &[&str] = &["web.fetch", "web.docs_rs", "web.crates_
 /// (Addendum I): nur `web.fetch`, ohne `web.docs_rs`/`web.crates_io` — die
 /// Schnellhelfer-Rolle braucht keinen automatischen Crate-/Doku-Index, nur
 /// gezieltes Nachschlagen einer einzelnen URL.
+///
+/// Dieselbe Begründung gilt für [`RegistryProfile::UiaExplorer`] und
+/// [`RegistryProfile::UiaWriter`] — beide teilen sich diese Konstante statt
+/// eine eigene, wertgleiche Liste zu pflegen.
 pub(crate) const UIA_QUICK_HELPER_WEB_TOOLS: &[&str] = &["web.fetch"];
 
 /// Das lesende Werkzeug von
@@ -552,6 +595,55 @@ pub enum RegistryProfile {
     /// beliebige Dateien, während `agent-steward` nur über die geprüften
     /// Agenten-Werkzeuge schreiben darf.
     AgentStewardship,
+    /// Read-only Erkundungsspezialisierung der UIA: [`FS_READ_ONLY_TOOLS`]
+    /// plus [`UIA_QUICK_HELPER_WEB_TOOLS`] (`web.fetch`) — kein `fs.write`,
+    /// kein `shell.exec`, kein `deps.*`, kein `lens.ask`.
+    ///
+    /// # Warum dieses Profil existiert
+    /// Die Spawn-Matrix (`harw-agent-dsl/src/roles.rs::can_spawn`) lässt die
+    /// UIA (`AgentRoleId::UserInterface`) ausschließlich
+    /// `RootOrchestrator`/`UiaWorker`/`AgentSteward` spawnen — nie den
+    /// regulären `Worker`. Die UIA-Werkzeuge `explore`/`research_web` spawnen
+    /// intern aber `explorer`/`researcher-web`, beide `role = "worker"`, und
+    /// scheitern deshalb an dieser Sperre. [`role_names::UIA_EXPLORER`] trägt
+    /// stattdessen die bereits zugelassene Organisationsrolle
+    /// `role = "uia-worker"` (`AgentRoleId::UiaWorker`) bei derselben
+    /// read-only Werkzeugoberfläche wie
+    /// [`RegistryProfile::ReadOnlyExplore`] plus `web.fetch` (ohne `deps.*`,
+    /// das dort zusätzlich registriert wäre) — siehe
+    /// `agents/uia-explorer.toml`.
+    UiaExplorer,
+    /// Schreibende Erkundungsspezialisierung der UIA: [`UiaExplorer`] plus
+    /// `fs.write` (alle sechs `fs.*`-Werkzeuge, [`FS_FULL_TOOLS`]) plus
+    /// [`UIA_QUICK_HELPER_WEB_TOOLS`] — kein `shell.exec`, kein `deps.*`,
+    /// kein `lens.ask`.
+    ///
+    /// # Warum dieses Profil existiert
+    /// Dieselbe Begründung wie bei [`RegistryProfile::UiaExplorer`]: ein
+    /// UIA-Auftrag, der eine gefundene Datei auch tatsächlich ändern soll,
+    /// braucht `fs.write` unter der für die UIA zugelassenen
+    /// Organisationsrolle `role = "uia-worker"` — siehe
+    /// `agents/uia-writer.toml` und [`role_names::UIA_WRITER`].
+    UiaWriter,
+    /// Host-Shell-Spezialisierung der UIA: [`FS_READ_ONLY_TOOLS`] plus
+    /// [`SHELL_TOOLS`] — kein `fs.write`, kein `web.*`, kein `deps.*`, kein
+    /// `lens.ask`.
+    ///
+    /// # Warum dieses Profil existiert
+    /// Dieselbe Begründung wie bei [`RegistryProfile::UiaExplorer`]/
+    /// [`RegistryProfile::UiaWriter`]: die Spawn-Matrix
+    /// (`harw-agent-dsl/src/roles.rs::can_spawn`) lässt die UIA nie den
+    /// regulären `Worker`, unter dem `host-process-worker` liefe. Diese
+    /// Rolle ist der fehlende Zwilling für Host-Ausführung unter
+    /// `role = "uia-worker"` — die UIA soll dem Nutzer bei Aufgaben helfen
+    /// können, die er selbst nicht auf dem Host lösen kann. Anders als
+    /// [`RegistryProfile::UiaQuickHelper`] (das ebenfalls `shell.exec`
+    /// registriert) hängt dieses Profil seinen `ShellToolProvider`
+    /// ausdrücklich an [`harw_sandbox::SandboxProfile::Host`] statt an das
+    /// von der Runtime übergebene Umgebungsprofil — jede Ausführung bleibt
+    /// damit permitpflichtig und fail-closed, siehe
+    /// `agents/uia-shell-worker.toml` und [`role_names::UIA_SHELL_WORKER`].
+    UiaShellWorker,
 }
 
 impl RegistryProfile {
@@ -568,6 +660,9 @@ impl RegistryProfile {
         RegistryProfile::MemoryStewardship,
         RegistryProfile::UiaQuickHelper,
         RegistryProfile::AgentStewardship,
+        RegistryProfile::UiaExplorer,
+        RegistryProfile::UiaWriter,
+        RegistryProfile::UiaShellWorker,
     ];
 
     /// Liefert die Rollenbeschreibung, die im System-Prompt erscheint.
@@ -594,6 +689,15 @@ impl RegistryProfile {
             RegistryProfile::MemoryStewardship => "memory consolidation agent",
             RegistryProfile::UiaQuickHelper => "quick helper of the user interface agent",
             RegistryProfile::AgentStewardship => "agent definition steward",
+            RegistryProfile::UiaExplorer => {
+                "read-only exploration specialization of the user interface agent"
+            }
+            RegistryProfile::UiaWriter => {
+                "writing exploration specialization of the user interface agent"
+            }
+            RegistryProfile::UiaShellWorker => {
+                "host shell execution specialization of the user interface agent"
+            }
         }
     }
 
@@ -603,11 +707,14 @@ impl RegistryProfile {
     /// `false` für [`RegistryProfile::Full`], das reine Prozessprofil
     /// [`RegistryProfile::ShellExecution`],
     /// [`RegistryProfile::MemoryStewardship`] (registriert `fs.write`),
-    /// [`RegistryProfile::UiaQuickHelper`] (registriert `shell.exec`) und
+    /// [`RegistryProfile::UiaQuickHelper`] (registriert `shell.exec`),
     /// [`RegistryProfile::AgentStewardship`] (registriert die schreibenden
     /// Agentendefinitions-Werkzeuge `agents.write_definition`/
-    /// `agents.write_uia`). Alle übrigen Profile sind read-only und dürfen
-    /// weder `fs.write` noch `shell.exec` sehen.
+    /// `agents.write_uia`), [`RegistryProfile::UiaWriter`] (registriert
+    /// `fs.write`) und [`RegistryProfile::UiaShellWorker`] (registriert
+    /// `shell.exec`). Alle übrigen Profile — inklusive
+    /// [`RegistryProfile::UiaExplorer`] — sind read-only und dürfen weder
+    /// `fs.write` noch `shell.exec` sehen.
     ///
     /// # Beispiele
     /// ```rust
@@ -626,6 +733,8 @@ impl RegistryProfile {
                 | RegistryProfile::MemoryStewardship
                 | RegistryProfile::UiaQuickHelper
                 | RegistryProfile::AgentStewardship
+                | RegistryProfile::UiaWriter
+                | RegistryProfile::UiaShellWorker
         )
     }
 
@@ -708,6 +817,31 @@ impl RegistryProfile {
                 .chain(AGENT_DEFINITION_TOOLS.iter())
                 .copied()
                 .collect(),
+            // Read-only Erkundungsspezialisierung der UIA (siehe die
+            // Begründung bei `RegistryProfile::UiaExplorer`): lesender
+            // fs.*-Kern plus ausschließlich `web.fetch` — kein `deps.*`.
+            RegistryProfile::UiaExplorer => FS_READ_ONLY_TOOLS
+                .iter()
+                .chain(UIA_QUICK_HELPER_WEB_TOOLS.iter())
+                .copied()
+                .collect(),
+            // Schreibende Erkundungsspezialisierung der UIA (siehe die
+            // Begründung bei `RegistryProfile::UiaWriter`): alle sechs
+            // fs.*-Werkzeuge (inklusive `fs.write`) plus ausschließlich
+            // `web.fetch` — kein `deps.*`, kein `shell.exec`.
+            RegistryProfile::UiaWriter => FS_FULL_TOOLS
+                .iter()
+                .chain(UIA_QUICK_HELPER_WEB_TOOLS.iter())
+                .copied()
+                .collect(),
+            // Host-Shell-Spezialisierung der UIA (siehe die Begründung bei
+            // `RegistryProfile::UiaShellWorker`): lesender fs.*-Kern plus
+            // `shell.exec` — kein `web.*`, kein `deps.*`.
+            RegistryProfile::UiaShellWorker => FS_READ_ONLY_TOOLS
+                .iter()
+                .chain(SHELL_TOOLS.iter())
+                .copied()
+                .collect(),
         }
     }
 
@@ -752,7 +886,7 @@ impl RegistryProfile {
     /// # Beispiele
     /// ```rust
     /// use harw_registry_defaults::profile::RegistryProfile;
-    /// use harw_sandbox::Permission;
+    /// use harw_authority::Permission;
     ///
     /// let research = RegistryProfile::Research.required_permissions();
     /// assert!(research.contains(Permission::NetworkAccess));
@@ -781,7 +915,7 @@ impl RegistryProfile {
     /// # Beispiele
     /// ```rust
     /// use harw_registry_defaults::profile::RegistryProfile;
-    /// use harw_sandbox::{Permission, PermissionSet};
+    /// use harw_authority::{Permission, PermissionSet};
     ///
     /// let granted = PermissionSet::from_policy([Permission::ReadWorkspace]);
     /// let tools = RegistryProfile::ReadOnlyExplore.tool_names_for(&granted);
@@ -792,9 +926,7 @@ impl RegistryProfile {
     pub fn tool_names_for(self, granted: &PermissionSet) -> Vec<&'static str> {
         self.registered_tool_names()
             .into_iter()
-            .filter(|tool| {
-                tool_permission(tool).is_some_and(|needed| granted.contains(needed))
-            })
+            .filter(|tool| tool_permission(tool).is_some_and(|needed| granted.contains(needed)))
             .collect()
     }
 }
@@ -863,6 +995,16 @@ pub fn profile_for_role(role: &str) -> Option<RegistryProfile> {
         // plus `shell.exec` plus `web.fetch`, siehe `agents/uia-worker.toml`
         // und die Begründung bei `RegistryProfile::UiaQuickHelper`.
         role_names::UIA_WORKER => Some(RegistryProfile::UiaQuickHelper),
+        // Read-only Erkundungsspezialisierung der UIA — siehe die Begründung
+        // bei `RegistryProfile::UiaExplorer` und `agents/uia-explorer.toml`.
+        role_names::UIA_EXPLORER => Some(RegistryProfile::UiaExplorer),
+        // Schreibende Erkundungsspezialisierung der UIA — siehe die
+        // Begründung bei `RegistryProfile::UiaWriter` und
+        // `agents/uia-writer.toml`.
+        role_names::UIA_WRITER => Some(RegistryProfile::UiaWriter),
+        // Host-Shell-Spezialisierung der UIA — siehe die Begründung bei
+        // `RegistryProfile::UiaShellWorker` und `agents/uia-shell-worker.toml`.
+        role_names::UIA_SHELL_WORKER => Some(RegistryProfile::UiaShellWorker),
         // Einzige eingebaute Rolle mit den Agentendefinitions-Werkzeugen —
         // siehe die Begründung bei `RegistryProfile::AgentStewardship` und
         // `agents/agent-steward.toml`.
@@ -1131,7 +1273,8 @@ fn profile_tool_providers(
     // Baut einen `ShellToolProvider` für `sandbox_profile` und hängt bei
     // Host-Profil (falls übergeben) Ledger + Sitzungs-Registry an.
     let build_shell_provider = |sandbox_profile: &SandboxProfile| -> Arc<dyn ToolProvider> {
-        let mut provider = ShellToolProvider::default().with_sandbox_profile(sandbox_profile.clone());
+        let mut provider =
+            ShellToolProvider::default().with_sandbox_profile(sandbox_profile.clone());
         if sandbox_profile.is_host() {
             if let Some((ledger, registry)) = host_permits {
                 provider = provider
@@ -1222,14 +1365,57 @@ fn profile_tool_providers(
                 Arc::new(FsToolProvider::default()),
                 FS_READ_ONLY_TOOLS,
             ));
-            let agent_definitions: Arc<dyn ToolProvider> =
-                Arc::new(crate::agent_definition_tools::AgentDefinitionToolProvider::new(
+            let agent_definitions: Arc<dyn ToolProvider> = Arc::new(
+                crate::agent_definition_tools::AgentDefinitionToolProvider::new(
                     agent_definition_access.project_agents_dir,
                     agent_definition_access.profile_agents_dir,
                     agent_definition_access.mode,
                     agent_definition_access.ceiling,
-                ));
+                ),
+            );
             vec![filesystem, agent_definitions]
+        }
+        // Read-only Erkundungsspezialisierung der UIA: gefilterter, lesender
+        // FS-Provider + auf `web.fetch` gefilterter Web-Provider — siehe die
+        // Begründung bei `RegistryProfile::UiaExplorer`.
+        RegistryProfile::UiaExplorer => {
+            let filesystem: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
+                Arc::new(FsToolProvider::default()),
+                FS_READ_ONLY_TOOLS,
+            ));
+            let web: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
+                Arc::new(WebToolProvider::new()),
+                UIA_QUICK_HELPER_WEB_TOOLS,
+            ));
+            vec![filesystem, web]
+        }
+        // Schreibende Erkundungsspezialisierung der UIA: voller, ungefilterter
+        // FS-Provider (alle sechs `fs.*`, inklusive `fs.write`) + auf
+        // `web.fetch` gefilterter Web-Provider — kein `ShellToolProvider`.
+        // Siehe die Begründung bei `RegistryProfile::UiaWriter`.
+        RegistryProfile::UiaWriter => {
+            let filesystem: Arc<dyn ToolProvider> = Arc::new(FsToolProvider::default());
+            let web: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
+                Arc::new(WebToolProvider::new()),
+                UIA_QUICK_HELPER_WEB_TOOLS,
+            ));
+            vec![filesystem, web]
+        }
+        // Host-Shell-Spezialisierung der UIA: gefilterter, lesender
+        // FS-Provider + Shell-Provider — anders als `build_shell_provider`
+        // in den übrigen Zweigen hängt dieser Zweig ausdrücklich
+        // `SandboxProfile::Host` an, nicht das von der Runtime übergebene
+        // `sandbox_profile` — siehe die Begründung bei
+        // `RegistryProfile::UiaShellWorker`. Ledger und Sitzungs-Registry
+        // hängt `build_shell_provider` bereits automatisch an, sobald
+        // `is_host()` gilt und `host_permits` übergeben wurde.
+        RegistryProfile::UiaShellWorker => {
+            let filesystem: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
+                Arc::new(FsToolProvider::default()),
+                FS_READ_ONLY_TOOLS,
+            ));
+            let shell = build_shell_provider(&SandboxProfile::Host);
+            vec![filesystem, shell]
         }
     }
 }
@@ -1316,11 +1502,9 @@ pub fn browser_tool_provider_for_config(
     section
         .validate()
         .map_err(RegistryDefaultsError::BrowserHost)?;
-    let allowed_origins = OriginPolicy::from_origins(
-        section.allowed_origins.iter().map(String::as_str),
-        true,
-    )
-    .map_err(|error| RegistryDefaultsError::BrowserHost(error.to_string()))?;
+    let allowed_origins =
+        OriginPolicy::from_origins(section.allowed_origins.iter().map(String::as_str), true)
+            .map_err(|error| RegistryDefaultsError::BrowserHost(error.to_string()))?;
     let grant = BrowserOpenGrant::ephemeral(allowed_origins, OriginPolicy::default())
         .with_limits(BrowserLimits::default().with_max_actions_per_session(section.max_actions));
 
@@ -1581,7 +1765,7 @@ pub fn assemble_registry_for_project_with_definition_access(
 /// use harw_registry_defaults::profile::{
 ///     IdentityOverrides, RegistryProfile, assemble_registry_for_sandbox,
 /// };
-/// use harw_sandbox::{Permission, PermissionSet};
+/// use harw_authority::{Permission, PermissionSet};
 ///
 /// let project = discover_project(Path::new("/workspace"), &DiscoveryConfig::default())?;
 /// let parent = PermissionSet::from_policy([Permission::ReadWorkspace]);
@@ -1662,7 +1846,12 @@ pub fn assemble_registry_for_sandbox_with_definition_access(
     access: Option<AgentDefinitionAccess>,
 ) -> RegistryDefaultsResult<AssembledRegistry> {
     assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile(
-        profile, project, overrides, approval_mode, granted, access,
+        profile,
+        project,
+        overrides,
+        approval_mode,
+        granted,
+        access,
         &SandboxProfile::Strict,
     )
 }
@@ -1734,9 +1923,12 @@ pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile(
 /// # Rückgabe
 /// `Ok(AssembledRegistry)`; `identity.tools_available` ist exakt die Menge der
 /// registrierten Werkzeuge. Für ein Profil ohne `shell.exec`
-/// (`ShellExecution`/`Full`/`UiaQuickHelper` ausgenommen) bleibt
-/// `host_permits` wirkungslos, weil kein [`ShellToolProvider`] entsteht, an
-/// den es gehängt werden könnte.
+/// (`ShellExecution`/`Full`/`UiaQuickHelper`/`UiaShellWorker` ausgenommen)
+/// bleibt `host_permits` wirkungslos, weil kein [`ShellToolProvider`]
+/// entsteht, an den es gehängt werden könnte. `UiaShellWorker` hängt seinen
+/// `ShellToolProvider` zudem immer an `SandboxProfile::Host` (unabhängig vom
+/// übergebenen `sandbox_profile`), sodass `host_permits` für diese Rolle
+/// **immer** greift, sobald es übergeben wird.
 ///
 /// # Fehler
 /// - [`RegistryDefaultsError::ContextProviderRegistration`]: der Namensraum des
@@ -1757,7 +1949,8 @@ pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile(
 ///     IdentityOverrides, RegistryProfile,
 ///     assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits,
 /// };
-/// use harw_sandbox::{HostPermitSessionRegistry, PermissionSet, ProcessPermitLedger, SandboxProfile};
+/// use harw_authority::PermissionSet;
+/// use harw_sandbox::{HostPermitSessionRegistry, ProcessPermitLedger, SandboxProfile};
 ///
 /// # fn demo(project: &ProjectContext) -> Result<(), Box<dyn std::error::Error>> {
 /// let ledger = Arc::new(ProcessPermitLedger::default());
@@ -1767,7 +1960,7 @@ pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile(
 ///     project,
 ///     IdentityOverrides::default(),
 ///     ApprovalModeCell::default(),
-///     &PermissionSet::from_policy([harw_sandbox::Permission::ExecuteProcess]),
+///     &PermissionSet::from_policy([harw_authority::Permission::ExecuteProcess]),
 ///     None,
 ///     &SandboxProfile::Strict,
 ///     Some((ledger, registry)),
@@ -1926,8 +2119,10 @@ mod tests {
     #[test]
     fn test_agent_stewardship_registers_only_read_and_list_without_access() {
         let assembled = assemble(RegistryProfile::AgentStewardship);
-        let mut expected: Vec<String> =
-            FS_READ_ONLY_TOOLS.iter().map(|name| (*name).to_owned()).collect();
+        let mut expected: Vec<String> = FS_READ_ONLY_TOOLS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
         expected.push("agents.validate".to_owned());
         expected.push("agents.list_proposals".to_owned());
         assert_eq!(registered_names(&assembled), expected);
@@ -1968,8 +2163,10 @@ mod tests {
         )
         .expect("assemble");
 
-        let mut expected: Vec<String> =
-            FS_READ_ONLY_TOOLS.iter().map(|name| (*name).to_owned()).collect();
+        let mut expected: Vec<String> = FS_READ_ONLY_TOOLS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
         expected.extend(AGENT_DEFINITION_TOOLS.iter().map(|name| (*name).to_owned()));
         assert_eq!(registered_names(&assembled), expected);
         assert_eq!(assembled.identity.tools_available, expected);
@@ -2014,7 +2211,10 @@ mod tests {
         for profile in RegistryProfile::ALL {
             let names = profile.registered_tool_names();
             for tool in BROWSER_TOOLS {
-                assert!(!names.contains(tool), "{profile:?} registriert {tool} ohne Grant");
+                assert!(
+                    !names.contains(tool),
+                    "{profile:?} registriert {tool} ohne Grant"
+                );
             }
         }
     }
@@ -2032,7 +2232,7 @@ mod tests {
 
     #[test]
     fn test_required_permissions_per_profile() {
-        use harw_sandbox::Permission;
+        use harw_authority::Permission;
 
         let set = |permissions: &[Permission]| PermissionSet::from_policy(permissions.to_vec());
         assert_eq!(
@@ -2055,12 +2255,15 @@ mod tests {
             RegistryProfile::Research.required_permissions(),
             set(&[Permission::NetworkAccess])
         );
-        assert_eq!(RegistryProfile::NoTools.required_permissions(), PermissionSet::empty());
+        assert_eq!(
+            RegistryProfile::NoTools.required_permissions(),
+            PermissionSet::empty()
+        );
     }
 
     #[test]
     fn test_tool_names_for_hides_registry_tools_without_read_cargo_registry() {
-        use harw_sandbox::Permission;
+        use harw_authority::Permission;
 
         let workspace_only = PermissionSet::from_policy([Permission::ReadWorkspace]);
         let tools = RegistryProfile::ReadOnlyExplore.tool_names_for(&workspace_only);
@@ -2091,7 +2294,7 @@ mod tests {
 
     #[test]
     fn test_assemble_registry_for_sandbox_registers_and_advertises_only_granted_tools() {
-        use harw_sandbox::Permission;
+        use harw_authority::Permission;
 
         let cwd = std::env::current_dir().expect("cwd");
         let project =
@@ -2151,8 +2354,18 @@ mod tests {
         // … und beworben wird genau das Registrierte: `plan`/`goal` sind
         // Composition-Root-Operationen ohne Executor im Kind (W1-05).
         assert_eq!(assembled.identity.tools_available, expected);
-        assert!(!assembled.identity.tools_available.contains(&"plan".to_owned()));
-        assert!(!assembled.identity.tools_available.contains(&"goal".to_owned()));
+        assert!(
+            !assembled
+                .identity
+                .tools_available
+                .contains(&"plan".to_owned())
+        );
+        assert!(
+            !assembled
+                .identity
+                .tools_available
+                .contains(&"goal".to_owned())
+        );
     }
 
     #[test]
@@ -2201,7 +2414,10 @@ mod tests {
                     "{profile:?} darf {forbidden} nicht registrieren"
                 );
                 assert!(
-                    !assembled.identity.tools_available.contains(&forbidden.to_owned()),
+                    !assembled
+                        .identity
+                        .tools_available
+                        .contains(&forbidden.to_owned()),
                     "{profile:?} darf {forbidden} nicht bewerben"
                 );
             }
@@ -2242,7 +2458,10 @@ mod tests {
     fn test_identity_uses_profile_role_description_by_default() {
         for profile in RegistryProfile::ALL {
             let assembled = assemble(*profile);
-            assert_eq!(assembled.identity.role_description, profile.role_description());
+            assert_eq!(
+                assembled.identity.role_description,
+                profile.role_description()
+            );
         }
     }
 
@@ -2263,7 +2482,10 @@ mod tests {
 
         assert_eq!(assembled.identity.agent_name, "explorer-3");
         assert_eq!(assembled.identity.role_description, "focused explorer");
-        assert_eq!(assembled.identity.extra_context, vec!["Antworte nur mit JSON."]);
+        assert_eq!(
+            assembled.identity.extra_context,
+            vec!["Antworte nur mit JSON."]
+        );
     }
 
     /// Legt ein leeres Projektverzeichnis unter `std::env::temp_dir()` an und
@@ -2340,10 +2562,8 @@ mod tests {
 
     #[test]
     fn test_restricted_provider_hides_filtered_executor() {
-        let provider = RestrictedToolProvider::new(
-            Arc::new(FsToolProvider::default()),
-            FS_READ_ONLY_TOOLS,
-        );
+        let provider =
+            RestrictedToolProvider::new(Arc::new(FsToolProvider::default()), FS_READ_ONLY_TOOLS);
         assert_eq!(provider.tools().len(), FS_READ_ONLY_TOOLS.len());
         assert!(provider.executor(&ToolName::new("fs.read")).is_some());
         assert!(
@@ -2383,6 +2603,11 @@ mod tests {
             "executor ist die einzige eingebaute Rolle mit der schmalen \
              Prozessoberfläche"
         );
+        assert_eq!(
+            profile_for_role(role_names::UIA_SHELL_WORKER),
+            Some(RegistryProfile::UiaShellWorker),
+            "uia-shell-worker ist die Host-Shell-Spezialisierung der UIA"
+        );
         for role in [
             role_names::SECURITY_EGRESS_TRIAGE,
             role_names::SECURITY_BASELINE_TRIAGE,
@@ -2406,6 +2631,33 @@ mod tests {
         assert_eq!(profile_for_role(""), None);
     }
 
+    /// `uia-shell-worker` bekommt `RegistryProfile::UiaShellWorker`, und dessen
+    /// beworbene/registrierte Werkzeugoberfläche ist exakt `shell.exec` plus
+    /// die fünf lesenden `fs.*`-Werkzeuge — nicht mehr, nicht weniger.
+    #[test]
+    fn test_uia_shell_worker_profile_and_tool_surface() {
+        use std::collections::BTreeSet;
+
+        assert_eq!(
+            profile_for_role(role_names::UIA_SHELL_WORKER),
+            Some(RegistryProfile::UiaShellWorker)
+        );
+        let advertised: BTreeSet<&str> =
+            RegistryProfile::UiaShellWorker.tool_names().into_iter().collect();
+        let expected: BTreeSet<&str> = [
+            "shell.exec",
+            "fs.read",
+            "fs.list",
+            "fs.search",
+            "fs.glob",
+            "fs.grep",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(advertised, expected);
+        assert!(!RegistryProfile::UiaShellWorker.is_read_only());
+    }
+
     /// Ein unbekannter Rollenname darf nie auf einen Prozess- oder
     /// Schreibzugriff zurückfallen. Das schmale Prozessprofil ist ausschließlich
     /// für den dokumentierten Executor erreichbar.
@@ -2416,6 +2668,8 @@ mod tests {
         assert!(!RegistryProfile::MemoryStewardship.is_read_only());
         assert!(!RegistryProfile::UiaQuickHelper.is_read_only());
         assert!(!RegistryProfile::AgentStewardship.is_read_only());
+        assert!(!RegistryProfile::UiaWriter.is_read_only());
+        assert!(!RegistryProfile::UiaShellWorker.is_read_only());
         for profile in RegistryProfile::ALL.iter().filter(|profile| {
             !matches!(
                 **profile,
@@ -2424,29 +2678,55 @@ mod tests {
                     | RegistryProfile::MemoryStewardship
                     | RegistryProfile::UiaQuickHelper
                     | RegistryProfile::AgentStewardship
+                    | RegistryProfile::UiaWriter
+                    | RegistryProfile::UiaShellWorker
             )
         }) {
             assert!(profile.is_read_only(), "{profile:?} muss read-only sein");
         }
         for role in role_names::ALL {
             if role == &role_names::EXECUTOR {
-                assert_eq!(profile_for_role(role), Some(RegistryProfile::ShellExecution));
+                assert_eq!(
+                    profile_for_role(role),
+                    Some(RegistryProfile::ShellExecution)
+                );
             } else if role == &role_names::MEMORY_STEWARD {
-                assert_eq!(profile_for_role(role), Some(RegistryProfile::MemoryStewardship));
+                assert_eq!(
+                    profile_for_role(role),
+                    Some(RegistryProfile::MemoryStewardship)
+                );
             } else if role == &role_names::UIA_WORKER {
                 // Addendum I: `uia-worker` ist die einzige Rolle mit
                 // `RegistryProfile::UiaQuickHelper` — nicht mehr `Research`.
-                assert_eq!(profile_for_role(role), Some(RegistryProfile::UiaQuickHelper));
+                assert_eq!(
+                    profile_for_role(role),
+                    Some(RegistryProfile::UiaQuickHelper)
+                );
             } else if role == &role_names::AGENT_STEWARD {
                 // Addendum K: `agent-steward` ist die einzige Rolle mit
                 // `RegistryProfile::AgentStewardship`.
-                assert_eq!(profile_for_role(role), Some(RegistryProfile::AgentStewardship));
+                assert_eq!(
+                    profile_for_role(role),
+                    Some(RegistryProfile::AgentStewardship)
+                );
             } else {
                 assert_ne!(profile_for_role(role), Some(RegistryProfile::Full));
-                assert_ne!(profile_for_role(role), Some(RegistryProfile::ShellExecution));
-                assert_ne!(profile_for_role(role), Some(RegistryProfile::MemoryStewardship));
-                assert_ne!(profile_for_role(role), Some(RegistryProfile::UiaQuickHelper));
-                assert_ne!(profile_for_role(role), Some(RegistryProfile::AgentStewardship));
+                assert_ne!(
+                    profile_for_role(role),
+                    Some(RegistryProfile::ShellExecution)
+                );
+                assert_ne!(
+                    profile_for_role(role),
+                    Some(RegistryProfile::MemoryStewardship)
+                );
+                assert_ne!(
+                    profile_for_role(role),
+                    Some(RegistryProfile::UiaQuickHelper)
+                );
+                assert_ne!(
+                    profile_for_role(role),
+                    Some(RegistryProfile::AgentStewardship)
+                );
             }
         }
         assert_eq!(profile_for_role("unbekannt"), None);
@@ -2530,7 +2810,7 @@ mod tests {
 
     mod permits_wiring {
         use super::*;
-        use harw_sandbox::{Permission, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+        use harw_authority::{Permission, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
         use harw_tools::{ToolCall, ToolExecutionContext, ToolOutput};
         use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
         use std::time::Duration;
@@ -2551,7 +2831,10 @@ mod tests {
             )
             .expect("registry build must succeed");
             let binding = registry
-                .resolve(&TenantId::from_str("test-tenant"), &WorkspaceId::from_str("project"))
+                .resolve(
+                    &TenantId::from_str("test-tenant"),
+                    &WorkspaceId::from_str("project"),
+                )
                 .expect("resolve must succeed");
             SandboxSpec::from_resolved(binding, PermissionSet::from_policy(permissions))
         }
@@ -2596,6 +2879,104 @@ mod tests {
                 .iter()
                 .find_map(|provider| provider.executor(&ToolName::new("shell.exec")))
                 .expect("shell.exec executor must be registered for ShellExecution")
+        }
+
+        /// Wie [`shell_executor_for`], aber für
+        /// `RegistryProfile::UiaShellWorker` — dessen Shell-Provider hängt sich
+        /// ausdrücklich immer an `SandboxProfile::Host`, unabhängig vom
+        /// übergebenen `sandbox_profile` (siehe die Begründung bei
+        /// `RegistryProfile::UiaShellWorker`). Das übergebene
+        /// `sandbox_profile` bleibt hier deshalb bewusst `SandboxProfile::Strict`
+        /// — der Test beweist damit gerade, dass der Zweig trotzdem den
+        /// Host-Provider baut.
+        fn uia_shell_worker_executor_for(
+            host_permits: Option<(Arc<ProcessPermitLedger>, Arc<HostPermitSessionRegistry>)>,
+            project_root: &std::path::Path,
+        ) -> Arc<dyn ToolExecutor> {
+            let project = discover_project(project_root, &DiscoveryConfig::default())
+                .expect("Discovery im Tempdir");
+            let granted = PermissionSet::from_policy([
+                Permission::ReadWorkspace,
+                Permission::ExecuteProcess,
+            ]);
+            let assembled = assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits(
+                RegistryProfile::UiaShellWorker,
+                &project,
+                IdentityOverrides::default(),
+                ApprovalModeCell::default(),
+                &granted,
+                None,
+                &SandboxProfile::Strict,
+                host_permits,
+            )
+            .expect("assemble must succeed");
+            assembled
+                .registry
+                .tool_providers()
+                .iter()
+                .find_map(|provider| provider.executor(&ToolName::new("shell.exec")))
+                .expect("shell.exec executor must be registered for UiaShellWorker")
+        }
+
+        /// `RegistryProfile::UiaShellWorker` trägt `SandboxProfile::Host` immer
+        /// — auch wenn die aufrufende Montage `SandboxProfile::Strict`
+        /// übergibt — und lehnt deshalb ohne Ledger jede Ausführung ab
+        /// (fail-closed).
+        #[tokio::test]
+        async fn test_uia_shell_worker_always_carries_host_profile_and_denies_without_ledger() {
+            let project_root = make_temp_project("uia-shell-worker-no-ledger");
+            let executor = uia_shell_worker_executor_for(None, &project_root);
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess]));
+            let call = make_call("echo must_not_run");
+
+            let output = executor
+                .execute(&ctx, &call)
+                .await
+                .expect("execute must not return Err");
+
+            match output {
+                ToolOutput::Error { message } => {
+                    assert!(
+                        message.contains("host execution requires a process permit"),
+                        "uia-shell-worker must fail closed without a ledger even though \
+                         sandbox_profile passed to assembly was Strict, got: {message:?}"
+                    );
+                }
+                other => panic!("expected Error output without permits, got: {other:?}"),
+            }
+        }
+
+        /// Mit Ledger, aber ohne Sitzungszustimmung bleibt `uia-shell-worker`
+        /// ebenfalls fail-closed.
+        #[tokio::test]
+        async fn test_uia_shell_worker_denies_without_session_approval() {
+            let project_root = make_temp_project("uia-shell-worker-no-approval");
+            let ledger = Arc::new(ProcessPermitLedger::default());
+            let registry = Arc::new(HostPermitSessionRegistry::default());
+            let executor = uia_shell_worker_executor_for(
+                Some((Arc::clone(&ledger), Arc::clone(&registry))),
+                &project_root,
+            );
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess]));
+            let call = make_call("echo must_not_run");
+
+            let output = executor
+                .execute(&ctx, &call)
+                .await
+                .expect("execute must not return Err");
+
+            match output {
+                ToolOutput::Error { message } => {
+                    assert!(
+                        message.contains("requires local UI approval"),
+                        "with a ledger but no session approval, denial must name the \
+                         missing approval, got: {message:?}"
+                    );
+                }
+                other => panic!("expected Error output without session approval, got: {other:?}"),
+            }
         }
 
         #[tokio::test]

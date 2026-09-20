@@ -1,0 +1,72 @@
+# Read-only Erkundungsspezialisierung der UIA.
+#
+# Grund: die Spawn-Matrix (`harw-agent-dsl/src/roles.rs::can_spawn`) laesst
+# die UIA (`AgentRoleId::UserInterface`) ausschliesslich
+# `RootOrchestrator`/`UiaWorker`/`AgentSteward` spawnen — niemals den
+# regulaeren `Worker`. Die UIA-Werkzeuge `explore`/`research_web` spawnen
+# intern aber `explorer`/`researcher-web`, beide `role = "worker"`, und
+# scheitern deshalb mit "no delegation capability is available for this
+# request", sobald die UIA sie aufruft. Diese Rolle behebt das: dieselbe
+# read-only Werkzeugoberflaeche wie `explorer` plus `researcher-web`
+# zusammen (`fs.read/list/search/glob/grep` plus `web.fetch`), aber unter
+# der fuer die UIA bereits zugelassenen Organisationsrolle
+# `role = "uia-worker"` (`AgentRoleId::UiaWorker`) statt `role = "worker"`.
+#
+# Die Matrix selbst bleibt unveraendert — das ist Absicht, nicht der Bug.
+#
+# ── Werkzeugoberflaeche ─────────────────────────────────────────────────────
+# `RegistryProfile::UiaExplorer` (`harw-registry-defaults/src/profile.rs`):
+# der lesende fs.*-Kern plus ausschliesslich `web.fetch` — kein `fs.write`,
+# kein `shell.exec`, kein `deps.*`, kein `lens.ask`, kein `browser.*`.
+#
+# ── Rueckgabevertrag ─────────────────────────────────────────────────────
+# `harwness.return.research-finding@1`: belegte Funde statt Rohausgaben —
+# derselbe Vertrag wie `explorer`.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.uia-explorer@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "uia-worker"
+specialization = "uia-explorer"
+
+name = "UIA Explorer"
+description = "Read-only Erkundung von Workspace und Netz fuer die UIA, unter der zugelassenen Organisationsrolle uia-worker."
+
+[work]
+mode = "read-only-exploration"
+may_write_code = false
+may_research_web = true
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "web.fetch",
+]
+forbidden = [
+  "fs.write",
+  "shell.exec",
+  "web.docs_rs",
+  "web.crates_io",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+  "lens.ask",
+]
+
+[spawn]
+max_depth = 0
+
+[spawn.budget]
+max_tokens = 60000
+max_tool_calls = 40
+max_wall_secs = 180
+
+[return]
+contract = "harwness.return.research-finding@1"

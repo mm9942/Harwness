@@ -1,0 +1,96 @@
+# Host-Shell-Spezialisierung der UIA.
+#
+# Dieselbe Begründung wie bei `agents/uia-explorer.toml`/`agents/uia-writer.toml`:
+# die Spawn-Matrix (`harw-agent-dsl/src/roles.rs::can_spawn`) laesst die UIA
+# (`AgentRoleId::UserInterface`) ausschliesslich
+# `RootOrchestrator`/`UiaWorker`/`AgentSteward` spawnen — niemals den
+# regulaeren `Worker`, unter dem `host-process-worker.toml` laeuft
+# (`role = "worker"`). Fuer Host-Ausfuehrung fehlte bislang genau der Zwilling,
+# den `uia-explorer`/`uia-writer` fuer Erkundung/Schreiben bereits haben.
+# Diese Rolle traegt deshalb `role = "uia-worker"` statt `role = "worker"`,
+# mit derselben Prozessoberflaeche wie `host-process-worker` (`shell.exec`),
+# ergaenzt um lesenden Workspace-Zugriff, damit sie einen Befund vor der
+# Ausfuehrung tatsaechlich nachschlagen kann.
+#
+# ── Zweck ──────────────────────────────────────────────────────────────────
+# Die UIA soll dem Nutzer bei Dingen helfen koennen, die er selbst nicht
+# weiss — und dafuer bei ausdruecklicher Erlaubnis Befehle **ausserhalb** der
+# Bubblewrap-Sandbox auf dem Host ausfuehren (siehe
+# `docs/design/mediated-process-execution.md`). Diese Rolle ist der
+# Ausfuehrungsarm dieser Faehigkeit unter der fuer die UIA zugelassenen
+# Organisationsrolle.
+#
+# ── Fail-closed, permitpflichtig ────────────────────────────────────────────
+# Jede Host-Ausfuehrung dieser Rolle laeuft ueber `SandboxProfile::Host`
+# (`RegistryProfile::UiaShellWorker`, `harw-registry-defaults/src/profile.rs`)
+# und braucht deshalb zwingend einen gueltigen `ProcessPermit`
+# (`harw-sandbox/src/process_permit.rs::ProcessPermitLedger::
+# issue_after_local_approval`/`authorize`) — ohne Permit lehnt der
+# `ShellExecutor` jede Ausfuehrung ab. Diese Rolle kann die Sandbox nicht
+# selbst lockern, das Profil nicht setzen und keinen Permit selbst ausstellen;
+# sie ist immer spawnbar, aber nie ohne fremde Freigabe wirksam.
+#
+# ── Werkzeugoberflaeche ─────────────────────────────────────────────────────
+# `RegistryProfile::UiaShellWorker`: der lesende fs.*-Kern
+# (`fs.read/list/search/glob/grep`) plus `shell.exec` — kein `fs.write`, kein
+# `web.*`, kein `deps.*`, kein `lens.ask`, kein `browser.*`.
+#
+# ── Rueckgabevertrag ─────────────────────────────────────────────────────
+# `harwness.return.execution-summary@1`: kurze Zusammenfassung der
+# ausgefuehrten Befehle statt Rohausgaben — dasselbe Muster wie
+# `host-process-worker`/`sandbox-shell-worker`.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.uia-shell-worker@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "uia-worker"
+specialization = "uia-shell-worker"
+
+name = "UIA Shell Worker"
+description = "Host-Ausfuehrung fuer die UIA, unter der zugelassenen Organisationsrolle uia-worker — nur mit gueltigem ProcessPermit, sonst fail-closed."
+
+[work]
+mode = "delegated-execution"
+may_write_code = false
+may_research_web = false
+
+[tools]
+admitted = [
+  "shell.exec",
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+]
+forbidden = [
+  "fs.write",
+  "web.fetch",
+  "web.docs_rs",
+  "web.crates_io",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+  "lens.ask",
+  "browser.open",
+  "browser.observe",
+  "browser.find",
+  "browser.act",
+  "browser.wait",
+  "browser.events",
+  "browser.close",
+]
+
+[spawn]
+max_depth = 0
+
+[spawn.budget]
+max_tokens = 60000
+max_tool_calls = 40
+max_wall_secs = 180
+
+[return]
+contract = "harwness.return.execution-summary@1"

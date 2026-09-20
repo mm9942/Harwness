@@ -1680,13 +1680,29 @@ mod tests {
         // admittiert jetzt ebenfalls `shell.exec` — der exklusive
         // Schnellhelfer der UIA braucht die Shell für schnelle
         // Schnelleingriffe. Kein `fs.write` (siehe `agents/uia-worker.toml`).
-        const ALLOWED_TO_WRITE_AND_EXEC: &[&str] =
-            &[role_names::EXECUTOR, role_names::UIA_WORKER];
+        //
+        // `uia-shell-worker` (`RegistryProfile::UiaShellWorker`) admittiert
+        // ebenfalls `shell.exec` — die Host-Shell-Spezialisierung der UIA
+        // (siehe `agents/uia-shell-worker.toml`). Auch kein `fs.write`.
+        const ALLOWED_TO_WRITE_AND_EXEC: &[&str] = &[
+            role_names::EXECUTOR,
+            role_names::UIA_WORKER,
+            role_names::UIA_SHELL_WORKER,
+        ];
         // `memory-steward` (Memory v3, §5.3, `RegistryProfile::MemoryStewardship`)
         // darf `fs.write` zulassen — die Konsolidierung muss Fakten und
         // `MEMORY.md` tatsächlich schreiben können —, muss aber weiterhin
         // `shell.exec` ausdrücklich verbieten (siehe `agents/memory-steward.toml`).
-        const ALLOWED_TO_WRITE_ONLY: &[&str] = &[role_names::MEMORY_STEWARD];
+        //
+        // `uia-writer` (`RegistryProfile::UiaWriter`, siehe
+        // `harw-registry-defaults/src/profile.rs`) admittiert `fs.write`
+        // ebenfalls — die schreibende Erkundungsspezialisierung der UIA soll
+        // eine gefundene Datei tatsächlich ändern können, ohne dafür über
+        // `RootOrchestrator`/`AgentSteward` umzuleiten (siehe
+        // `agents/uia-writer.toml`) —, verbietet aber weiterhin ausdrücklich
+        // `shell.exec`.
+        const ALLOWED_TO_WRITE_ONLY: &[&str] =
+            &[role_names::MEMORY_STEWARD, role_names::UIA_WRITER];
 
         for (role, ir) in builtin() {
             if ALLOWED_TO_WRITE_AND_EXEC.contains(&role.as_str()) {
@@ -1720,8 +1736,10 @@ mod tests {
     /// prüft in beide Richtungen — `executor` ist die EINZIGE Rolle, die
     /// `shell.exec` zulässt und bekommt tatsächlich
     /// [`crate::profile::RegistryProfile::ShellExecution`]; `memory-steward`
-    /// ist die EINZIGE Rolle, die `fs.write` zulässt und bekommt tatsächlich
-    /// [`crate::profile::RegistryProfile::MemoryStewardship`] (nicht nur eine
+    /// und, seit der schreibenden UIA-Erkundungsspezialisierung, `uia-writer`
+    /// sind die einzigen Rollen, die `fs.write` zulassen und bekommen
+    /// tatsächlich [`crate::profile::RegistryProfile::MemoryStewardship`]
+    /// bzw. [`crate::profile::RegistryProfile::UiaWriter`] (nicht nur eine
     /// TOML, die zufällig dieselben Werkzeugnamen admittiert).
     #[test]
     fn test_only_executor_gets_the_shell_execution_profile() {
@@ -1743,16 +1761,34 @@ mod tests {
                     admitted.iter().any(|name| name == "shell.exec"),
                     "uia-worker must admit shell.exec (RegistryProfile::UiaQuickHelper)"
                 );
+            } else if role == role_names::UIA_SHELL_WORKER {
+                // Host-Shell-Spezialisierung der UIA: `shell.exec` plus der
+                // lesende fs.*-Kern (`RegistryProfile::UiaShellWorker`), kein
+                // `web.*`.
+                assert!(
+                    admitted.iter().any(|name| name == "shell.exec"),
+                    "uia-shell-worker must admit shell.exec (RegistryProfile::UiaShellWorker)"
+                );
             } else {
                 assert!(
                     !admitted.iter().any(|name| name == "shell.exec"),
-                    "{role} admits shell.exec, but only executor and uia-worker may do so"
+                    "{role} admits shell.exec, but only executor, uia-worker and \
+                     uia-shell-worker may do so"
                 );
             }
             if role == role_names::MEMORY_STEWARD {
                 assert!(
                     admitted.iter().any(|name| name == "fs.write"),
                     "{role} must admit fs.write to consolidate memory facts"
+                );
+            } else if role == role_names::UIA_WRITER {
+                // `uia-writer` (`RegistryProfile::UiaWriter`) admits fs.write
+                // too — the UIA's writing exploration specialization must be
+                // able to actually change a file it found, see
+                // `agents/uia-writer.toml`.
+                assert!(
+                    admitted.iter().any(|name| name == "fs.write"),
+                    "{role} must admit fs.write (RegistryProfile::UiaWriter)"
                 );
             } else {
                 assert!(
@@ -1911,8 +1947,15 @@ mod tests {
     fn test_researcher_web_is_the_only_role_with_web_tools() {
         // Addendum I: `uia-worker` (`RegistryProfile::UiaQuickHelper`)
         // admittiert seit der Korrektur ebenfalls ein Netz-Werkzeug —
-        // ausschließlich `web.fetch`, siehe `agents/uia-worker.toml`. Er ist
-        // damit die zweite (und einzige weitere) Rolle mit `web.*`.
+        // ausschließlich `web.fetch`, siehe `agents/uia-worker.toml`.
+        //
+        // `uia-explorer` (`RegistryProfile::UiaExplorer`) und `uia-writer`
+        // (`RegistryProfile::UiaWriter`) admittieren dieselbe alleinige
+        // `web.fetch`-Konstante wie `uia-worker`
+        // (`UIA_QUICK_HELPER_WEB_TOOLS`, `harw-registry-defaults/src/profile.rs`)
+        // — beide sind UIA-Erkundungsspezialisierungen mit derselben
+        // Begründung, siehe `agents/uia-explorer.toml` und
+        // `agents/uia-writer.toml`.
         let definitions = builtin();
         for (role, ir) in &definitions {
             let has_web = ir
@@ -1920,11 +1963,13 @@ mod tests {
                 .admitted()
                 .iter()
                 .any(|name| name.starts_with("web."));
-            let expects_web =
-                role == role_names::RESEARCHER_WEB || role == role_names::UIA_WORKER;
+            let expects_web = role == role_names::RESEARCHER_WEB
+                || role == role_names::UIA_WORKER
+                || role == role_names::UIA_EXPLORER
+                || role == role_names::UIA_WRITER;
             assert_eq!(
                 has_web, expects_web,
-                "{role}: web.* darf nur der Web-Rechercheur und der UIA-Schnellhelfer führen"
+                "{role}: web.* darf nur der Web-Rechercheur und die UIA-Erkundungsrollen führen"
             );
         }
     }
@@ -1984,11 +2029,16 @@ mod tests {
         // Validieren-dann-Schreiben-Schritt, kein Fan-out) plus `uia-worker`
         // (Addendum J/I: ein Schnelleingriff ist ein einzelner, in sich
         // geschlossener Lauf, kein Fan-out — siehe `agents/uia-worker.toml`
-        // `[spawn] max_depth = 0`) plus `executor` (Slice B7: ein
+        // `[spawn] max_depth = 0`) plus `uia-explorer`, `uia-writer` und
+        // `uia-shell-worker` (dieselbe Begründung: eine UIA-Erkundung,
+        // -Dateiänderung bzw. -Host-Ausführung ist ein einzelner, in sich
+        // geschlossener Lauf, kein Fan-out — siehe `agents/uia-explorer.toml`,
+        // `agents/uia-writer.toml` und `agents/uia-shell-worker.toml`,
+        // jeweils `[spawn] max_depth = 0`) plus `executor` (Slice B7: ein
         // Ausführungs-Job führt die ihm übergebene Befehlsfolge selbst aus
         // und meldet zurück, statt weiter zu delegieren — siehe
         // `agents/executor.toml` `[spawn] max_depth = 0`).
-        const ZERO_DEPTH_ROLES: [&str; 8] = [
+        const ZERO_DEPTH_ROLES: [&str; 11] = [
             role_names::SECURITY_EGRESS_TRIAGE,
             role_names::SECURITY_BASELINE_TRIAGE,
             role_names::SECURITY_STRUCTURE_TRIAGE,
@@ -1996,6 +2046,9 @@ mod tests {
             role_names::MEMORY_STEWARD,
             role_names::AGENT_STEWARD,
             role_names::UIA_WORKER,
+            role_names::UIA_EXPLORER,
+            role_names::UIA_WRITER,
+            role_names::UIA_SHELL_WORKER,
             role_names::EXECUTOR,
         ];
 

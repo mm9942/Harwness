@@ -1,0 +1,70 @@
+# Schreibende Erkundungsspezialisierung der UIA.
+#
+# Dieselbe Begruendung wie bei `agents/uia-explorer.toml`: die Spawn-Matrix
+# (`harw-agent-dsl/src/roles.rs::can_spawn`) laesst die UIA
+# (`AgentRoleId::UserInterface`) ausschliesslich
+# `RootOrchestrator`/`UiaWorker`/`AgentSteward` spawnen — niemals den
+# regulaeren `Worker`. Diese Rolle traegt deshalb ebenfalls
+# `role = "uia-worker"` statt `role = "worker"`, mit derselben lesenden
+# Werkzeugoberflaeche wie `uia-explorer` plus zusaetzlich `fs.write` — fuer
+# UIA-Auftraege, die eine gefundene Datei auch tatsaechlich aendern sollen,
+# ohne dafuer ueber `RootOrchestrator`/`AgentSteward` umzuleiten.
+#
+# ── Werkzeugoberflaeche ─────────────────────────────────────────────────────
+# `RegistryProfile::UiaWriter` (`harw-registry-defaults/src/profile.rs`):
+# alle sechs fs.*-Werkzeuge (inklusive `fs.write`) plus ausschliesslich
+# `web.fetch` — kein `shell.exec`, kein `deps.*`, kein `lens.ask`, kein
+# `browser.*`.
+#
+# ── Rueckgabevertrag ─────────────────────────────────────────────────────
+# `harwness.return.execution-summary@1`: kurze Zusammenfassung der
+# vorgenommenen Aenderung statt Rohausgaben — anders als `uia-explorer`
+# (`research-finding`), weil diese Rolle tatsaechlich etwas veraendert.
+
+schema = "harwness.agent/v1"
+id = "harwness.agent.uia-writer@1"
+version = "1.0.0"
+extends = { id = "harwness.agent.worker-base@1" }
+role = "uia-worker"
+specialization = "uia-writer"
+
+name = "UIA Writer"
+description = "Erkundung und Dateiaenderung im Workspace fuer die UIA, unter der zugelassenen Organisationsrolle uia-worker."
+
+[work]
+mode = "delegated-execution"
+may_write_code = true
+may_research_web = true
+
+[tools]
+admitted = [
+  "fs.read",
+  "fs.list",
+  "fs.search",
+  "fs.glob",
+  "fs.grep",
+  "fs.write",
+  "web.fetch",
+]
+forbidden = [
+  "shell.exec",
+  "web.docs_rs",
+  "web.crates_io",
+  "deps.graph",
+  "deps.locked",
+  "deps.source_read",
+  "deps.source_search",
+  "deps.source_list",
+  "lens.ask",
+]
+
+[spawn]
+max_depth = 0
+
+[spawn.budget]
+max_tokens = 60000
+max_tool_calls = 40
+max_wall_secs = 180
+
+[return]
+contract = "harwness.return.execution-summary@1"

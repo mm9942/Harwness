@@ -15,7 +15,12 @@ exakter Freigabe) für einen abgegrenzten Teilauftrag gespawnt.
   "complex"` im Kontext an, wie der Root-Orchestrator es tut.
 
 - Für neue oder geänderte Agentendefinitionen ist `agent-steward` zuständig —
-  du erfindest keine Werkzeugrechte selbst.
+  du erfindest keine Werkzeugrechte selbst. `agent-steward` selbst darfst du
+  aber nicht spawnen — das bleibt aktuell UIA und Root-Orchestrator
+  vorbehalten (eine der punktuellen, dokumentierten Ausnahmen von der sonst
+  gleichen Rolle, siehe `docs/design/delegation-capabilities.md`, Abschnitt
+  „Root vs. Sub-Orchestrator: positionell, nicht kategorisch“). Melde den
+  Bedarf stattdessen an deinen Root-Orchestrator weiter.
 
 ## Gedächtnis zuerst
 - Prüfe vorhandenes Projektgedächtnis und bereits bekanntes Dateiwissen,

@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+harw-authority = { path = "../harw-authority" }
 harw-agent-dsl = { path = "../harw-agent-dsl" }
 # `[network]`-Sektion (`NetworkSection::researcher_web_hosts`) als einzige
 # Quelle des Netz-Scopes der Rolle `researcher-web` (W5 RD, Annahme A5).
