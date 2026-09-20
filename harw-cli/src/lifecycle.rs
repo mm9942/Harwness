@@ -634,9 +634,16 @@ mod tests {
         // Mindestmenge geprüft: eine Änderung der Werkzeugfläche der Standard-
         // Zusammenstellung soll auffallen, nicht durchrutschen. `fs.glob` und
         // `fs.grep` kamen mit den Recherche-Werkzeugen hinzu (AP W2-01/02).
-        // `rights_snapshot().tools` liefert sortiert und dublettenfrei
-        // (harw-runtime/src/assembly.rs `rights_snapshot`), deshalb wird hier
-        // als Menge statt per `starts_with`-Präfix verglichen.
+        // `status`/`ps`/`diff`/`stop` sind die vier `harw-ops`-Operationen, die
+        // `model_tool(...)` deklarieren (`harw-ops/src/{status,ps,diff,stop}.rs`)
+        // und über `harw_ops::register_all` (`harw-runtime/src/assembly.rs`)
+        // unbedingt in jede Zusammenstellung eingehängt werden — unabhängig vom
+        // `RegistryProfile` und ohne das `[tools.plan]`-Gate (das nur
+        // `plan`/`goal` hinzufügt, hier nicht aktiv). Sie gehören deshalb zur
+        // Grundausstattung, nicht nur zu einer optionalen Erweiterung wie
+        // `browser.*`. `rights_snapshot().tools` liefert sortiert und
+        // dublettenfrei (harw-runtime/src/assembly.rs `rights_snapshot`),
+        // deshalb wird hier als Menge statt per `starts_with`-Präfix verglichen.
         let base: HashSet<&str> = [
             "fs.read",
             "fs.write",
@@ -645,6 +652,10 @@ mod tests {
             "fs.glob",
             "fs.grep",
             "shell.exec",
+            "status",
+            "ps",
+            "diff",
+            "stop",
         ]
         .into_iter()
         .collect();

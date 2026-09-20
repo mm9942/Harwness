@@ -187,7 +187,7 @@ pub fn run_chat(
     validate_chat_mode(initial_prompt.as_deref(), resume_selection.as_ref())?;
 
     let home = resolve_home(home_override)?;
-    harw_home::ensure_home(&home).map_err(|error| error.to_string())?;
+    crate::home::ensure_home(&home).map_err(|error| error.to_string())?;
     let cwd = std::env::current_dir().map_err(|error| format!("cwd: {error}"))?;
     let ChatOptions {
         all_projects,
@@ -1034,11 +1034,50 @@ mod tests {
         std::fs::create_dir_all(&cwd).expect("create project directory");
         // Projekt-Marker, damit die Projekterkennung genau hier stehen bleibt.
         std::fs::write(cwd.join("Cargo.toml"), "[workspace]\n").expect("write project marker");
+        write_fixture_uia(&home);
         ChatFixture {
             _dir: dir,
             home,
             cwd,
         }
+    }
+
+    /// Legt eine minimale, gültige UIA (`role = "user-interface"`) im
+    /// Standardprofil des Test-`home` an und aktiviert sie über
+    /// `harness.active_uia_definition`.
+    ///
+    /// # Beschreibung
+    /// Seit dem UIA-Vertrag (siehe `resolve_active_uia` in
+    /// `harw-runtime/src/assembly.rs`) montieren `EntryKind::Tui` und
+    /// `EntryKind::OneShot` nur mit einer konfigurierten UIA (fail-closed,
+    /// `RuntimeError::Registry`). `chat_fixture` deckt beide Einstiege ab und
+    /// muss deshalb selbst eine bereitstellen, statt implizit auf einen
+    /// Bootstrap außerhalb dieser Crate (`harw-cli/src/uia_bootstrap.rs`) zu
+    /// vertrauen. Layout und Inhalt spiegeln exakt `write_generated_uia` dort
+    /// sowie `harw-runtime`s eigene Test-Fixtures (`assembly.rs`,
+    /// `tests/rights_matrix.rs`):
+    /// `<home>/profiles/default/agents/fixture-uia/definition.toml` plus eine
+    /// Zeile `active_uia_definition = "<id>"`, an das von `ensure_home`
+    /// geschriebene Profil-`config.toml` angehängt (statt es zu
+    /// überschreiben, damit dessen restlicher Inhalt erhalten bleibt) — das
+    /// aktive Profil ohne `active_profile`-Datei ist `"default"`
+    /// (`harw_home::active_profile_name`).
+    fn write_fixture_uia(home: &Path) {
+        let profile_dir = home.join("profiles").join("default");
+        let agent_dir = profile_dir.join("agents").join("fixture-uia");
+        std::fs::create_dir_all(&agent_dir).expect("fixture uia dir");
+        std::fs::write(
+            agent_dir.join("definition.toml"),
+            "schema = \"harwness.agent/v1\"\nid = \"harwness.agent.fixture-uia@1\"\nversion = \"1.0.0\"\nrole = \"user-interface\"\nspecialization = \"terminal-ui\"\n",
+        )
+        .expect("fixture uia definition");
+        let mut config_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(profile_dir.join("config.toml"))
+            .expect("open profile config for the fixture UIA");
+        config_file
+            .write_all(b"\nactive_uia_definition = \"harwness.agent.fixture-uia@1\"\n")
+            .expect("append active_uia_definition to profile config");
     }
 
     fn fixture_inputs(
