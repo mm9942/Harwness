@@ -533,6 +533,46 @@ mod tests {
         );
     }
 
+    // Provider-Ids, deren `default_model` bewusst nicht über resolve() auflösbar ist.
+    //
+    // - `cf-worker`: `base_url` ist in providers.toml ein bewusster Platzhalter
+    //   (`https://<dein-worker>.example/v1`, siehe Kommentar dort). Das
+    //   `default_model` referenziert einen pro Cloudflare-Account individuellen
+    //   Worker-Modell-Alias und wird nie einen kanonischen Bootstrap-Descriptor
+    //   haben — analog zu `foundry`/`custom`, die deshalb gar kein
+    //   `default_model` setzen.
+    // - `deepseek`: für diesen Provider existiert (Stand dieser Änderung) noch
+    //   kein `docs/research/models/deepseek.json` und somit kein
+    //   `vendor_deepseek.rs`. `deepseek-v4-flash` ist ein dokumentierter,
+    //   bekannter Katalog-Gap — kein stillschweigend übersprungener Fehler.
+    //   Diesen Eintrag entfernen, sobald ein Vendor-Modul für DeepSeek existiert.
+    const PROVIDER_DEFAULT_MODEL_ALLOWLIST: &[&str] = &["cf-worker", "deepseek"];
+
+    // Test 9: Jedes `default_model` aus der eingebetteten providers.toml muss
+    // entweder über resolve() auflösbar sein, oder die Provider-Id steht
+    // explizit (mit Begründung) in PROVIDER_DEFAULT_MODEL_ALLOWLIST. Verhindert
+    // künftige Drift zwischen providers.toml/vendor_*.rs und bootstrap_descriptors().
+    #[test]
+    fn every_provider_default_model_resolves_or_is_allowlisted() {
+        for provider in crate::embedded::embedded_catalog() {
+            let Some(default_model) = provider.default_model.as_deref() else {
+                continue;
+            };
+            if PROVIDER_DEFAULT_MODEL_ALLOWLIST.contains(&provider.id.as_str()) {
+                continue;
+            }
+            assert!(
+                resolve(default_model).is_some(),
+                "default_model '{}' des Providers '{}' ist nicht über resolve() auflösbar \
+                 (Katalog-Drift zwischen providers.toml und bootstrap_descriptors()); \
+                 entweder Descriptor ergänzen oder Provider-Id begründet in \
+                 PROVIDER_DEFAULT_MODEL_ALLOWLIST aufnehmen",
+                default_model,
+                provider.id
+            );
+        }
+    }
+
     // Test 8: Serde JSON Roundtrip eines ResolvedModel.
     #[test]
     fn resolved_serde_roundtrip() {

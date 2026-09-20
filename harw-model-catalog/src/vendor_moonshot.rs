@@ -13,6 +13,11 @@
 //! `docs/research/models/moonshot.json`, Stand 2026-07-16.
 //! Quellen: platform.kimi.ai/docs/models, GitHub MoonshotAI/Kimi-K2, OpenRouter, Cloudflare.
 //!
+//! `kimi-k3` (das `default_model` des Providers `"moonshot"` in `providers.toml`)
+//! ist in `moonshot.json` noch nicht dokumentiert; die Werte sind konservativ vom
+//! nächstälteren GA-Modell `kimi-k2.7-code` übernommen. Siehe TODO-Kommentar bei
+//! der Deklaration.
+//!
 //! ## Wichtigste Typen
 //! - [`ModelDescriptor`] — vollständige Modellbeschreibung (Layer 2)
 //! - [`ObservedModelBehavior`] — Bootstrap-Messwerte (Layer 4)
@@ -76,6 +81,38 @@ use crate::observed::ObservedModelBehavior;
 /// ```
 pub fn moonshot_descriptors() -> Vec<ModelDescriptor> {
     vec![
+        // ── Aktive Kimi-K3-Familie ───────────────────────────────────────────
+        // Quelle: providers.toml führt "kimi-k3" als `default_model` des Providers
+        // "moonshot", aber es existiert noch kein Eintrag in
+        // docs/research/models/moonshot.json für diese Version. Werte sind daher
+        // konservativ vom nächstälteren GA-Modell (kimi-k2.7-code) übernommen, um
+        // Katalog-Drift zwischen providers.toml und bootstrap_descriptors() zu
+        // vermeiden (siehe resolved.rs::every_provider_default_model_resolves_or_is_allowlisted).
+        // TODO: durch verifizierte Werte ersetzen, sobald moonshot.json aktualisiert ist.
+        ModelDescriptor {
+            provider: ProviderId::from("moonshot"),
+            model: ModelId::from("kimi-k3"),
+            context_window: 262_144,
+            max_output_tokens: Some(131_072),
+            modalities: ModalitySet::new(vec![Modality::Text, Modality::Image, Modality::Video]),
+            capabilities: ModelCapabilities {
+                tool_calling: ToolCallingSupport::Parallel,
+                parallel_tools: true,
+                structured_output: StructuredOutputSupport::JsonMode,
+                reasoning: ReasoningSupport::Trace,
+                prompt_caching: PromptCachingSupport::Implicit,
+                streaming: StreamingSupport::ServerSent,
+                image_input: true,
+                native_agent_features: AgentFeatureSet {
+                    computer_use: false,
+                    code_execution: false,
+                    built_in_search: false,
+                    file_search: false,
+                },
+            },
+            pricing: None, // autoritative Preise in harw-provider
+            lifecycle: ModelLifecycle::Ga,
+        },
         // ── Aktive Kimi-K2-Familie ───────────────────────────────────────────
         // Quelle: platform.kimi.ai/docs/guide/kimi-k2-7-code-quickstart
         // release_date: 2026-06-12; thinking_mode: always_on; MoE 1T/32B active
@@ -488,6 +525,17 @@ mod tests {
         assert!(
             descs.iter().any(|d| d.model == "kimi-k2.7-code"),
             "kimi-k2.7-code fehlt in moonshot_descriptors()"
+        );
+    }
+
+    #[test]
+    fn kimi_k3_is_present() {
+        // kimi-k3 ist das `default_model` des Providers "moonshot" in
+        // providers.toml und muss deshalb über resolve() auflösbar sein.
+        let descs = moonshot_descriptors();
+        assert!(
+            descs.iter().any(|d| d.model == "kimi-k3"),
+            "kimi-k3 fehlt in moonshot_descriptors() (providers.toml default_model)"
         );
     }
 
