@@ -1,0 +1,3 @@
+name = "dependency-research"
+description = "Research versions, compatibility, licensing, provenance, and authoritative documentation."
+tools = ["filesystem.read", "web.search", "web.fetch"]

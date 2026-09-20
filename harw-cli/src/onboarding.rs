@@ -163,7 +163,10 @@ fn maybe_recommend_openrouter(home: &Path, interactive: bool) -> Result<(), Stri
     }
     let profile_name = harw_home::active_profile_name(home);
     let profile = harw_home::profile_dir(home, &profile_name).map_err(|e| e.to_string())?;
-    if profile.join("providers").join("openrouter.toml").exists() {
+    // Nur ein *aktiver* OpenRouter zählt als „schon eingerichtet". Seit das
+    // Scaffolding den gesamten Katalog als deaktivierte Dateien vorsät, wäre
+    // die blosse Existenz der Datei kein Signal mehr und der Tipp liefe nie.
+    if openrouter_is_enabled(&profile) {
         return Ok(());
     }
 
@@ -234,6 +237,58 @@ Weiteres das Hauptmodell; änderbar mit `harw models internal`."
 ///
 /// # Errors
 /// Ein `String` bei Schreib-, Serialisierungs- oder Validierungsfehlern.
+/// `true`, wenn im Profil eine OpenRouter-Datei liegt, die auch aktiv ist.
+///
+/// Eine unlesbare oder unparsebare Datei gilt als „nicht aktiv": der Tipp ist
+/// ein Hinweis, kein Sicherheitsentscheid, und darf an einem kaputten
+/// Profileintrag nicht scheitern.
+fn openrouter_is_enabled(profile: &Path) -> bool {
+    let path = profile.join("providers").join("openrouter.toml");
+    let Ok(contents) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    toml::from_str::<ProviderToml>(&contents)
+        .map(|provider| provider.enabled)
+        .unwrap_or(false)
+}
+
+/// Übernimmt eine bereits vorgesäte Provider-Datei, statt sie zu ersetzen.
+///
+/// # Description
+/// Das Scaffolding legt jeden Katalog-Provider deaktiviert und mit voller
+/// Modellliste an. Würde das Onboarding diese Datei stumpf überschreiben, ginge
+/// die Modellliste verloren und der Nutzer sähe nach dem Setup nur noch das
+/// eine gewählte Modell. Deshalb wird eine vorhandene Datei geladen und nur in
+/// den Feldern angefasst, über die das Setup tatsächlich entschieden hat.
+///
+/// # Arguments
+/// - `path` (`&Path`): Zieldatei `providers/<id>.toml`.
+/// - `fresh` (`ProviderToml`): die aus dem Setup-Ergebnis gebaute Fassung.
+///
+/// # Returns
+/// Die zu schreibende Fassung: die zusammengeführte, falls `path` existiert und
+/// parsebar ist, sonst `fresh` unverändert.
+fn merge_with_seeded_provider(path: &Path, fresh: ProviderToml) -> ProviderToml {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return fresh;
+    };
+    let Ok(mut existing) = toml::from_str::<ProviderToml>(&contents) else {
+        return fresh;
+    };
+
+    existing.api = fresh.api;
+    existing.base_url = fresh.base_url;
+    existing.auth = fresh.auth;
+    existing.auth_header = fresh.auth_header;
+    existing.enabled = true;
+    for model in fresh.models {
+        if !existing.models.contains(&model) {
+            existing.models.push(model);
+        }
+    }
+    existing
+}
+
 fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), String> {
     validate_provider_name(&outcome.provider_id)?;
     harw_provider_http::validate_endpoint(&outcome.base_url).map_err(|e| e.to_string())?;
@@ -282,8 +337,10 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
     };
     let providers_dir = profile.join("providers");
     create_dir_all(&providers_dir)?;
+    let provider_path = providers_dir.join(format!("{}.toml", outcome.provider_id));
+    let provider = merge_with_seeded_provider(&provider_path, provider);
     write_file(
-        &providers_dir.join(format!("{}.toml", outcome.provider_id)),
+        &provider_path,
         &toml::to_string_pretty(&provider).map_err(|e| format!("provider serialisieren: {e}"))?,
     )?;
 

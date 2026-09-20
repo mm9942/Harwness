@@ -1,0 +1,7 @@
+name = "incident-triager"
+role = "worker"
+description = "Classifies incidents, preserves evidence, and proposes safe containment steps."
+system_file = "system.md"
+skills = ["incident-response"]
+timeout_seconds = 240
+max_retries = 1

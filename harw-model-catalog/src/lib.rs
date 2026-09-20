@@ -17,6 +17,7 @@ pub mod provenance;
 pub mod resolved;
 pub mod router;
 pub mod runtime;
+pub mod seed;
 pub mod sources;
 pub mod spec;
 pub mod vendor_anthropic;
@@ -39,6 +40,7 @@ pub use resolved::{
 };
 pub use router::{pick, rank, Candidate, ModelRole};
 pub use runtime::{profile_for, ModelRuntimeProfile, RuntimeProfileValidationError};
+pub use seed::seed_profile_providers;
 pub use sources::{
     detect_local_sources, embedded_sources, CredentialSource, DetectedCredential, ExtractRule,
     SourceKind,

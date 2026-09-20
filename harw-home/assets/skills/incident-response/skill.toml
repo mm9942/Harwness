@@ -1,0 +1,3 @@
+name = "incident-response"
+description = "Triage incidents, preserve evidence, and recommend reversible containment."
+tools = ["filesystem.read", "process.inspect"]

@@ -21,7 +21,7 @@ use crate::home::resolve_home;
 /// Netzwerk- oder Store-Fehlern.
 pub fn run(home_override: Option<PathBuf>, action: AuthAction) -> Result<(), String> {
     let home = resolve_home(home_override)?;
-    harw_home::ensure_home(&home).map_err(|error| error.to_string())?;
+    crate::home::ensure_home(&home).map_err(|error| error.to_string())?;
 
     match action {
         AuthAction::Login { provider } => login(&home, &provider),

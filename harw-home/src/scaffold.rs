@@ -106,7 +106,25 @@ fn ensure_home_with_profile(home: &Path, profile: &str) -> HomeResult<Scaffolded
         &mut report,
     )?;
 
+    write_bundle(home, &mut report)?;
+
     Ok(report)
+}
+
+/// Schreibt die mit dem Binary ausgelieferte Agenten-/Skill-Startausstattung
+/// nach `~/.harw/agents` bzw. `~/.harw/skills`.
+///
+/// # Description
+/// Die Dateien landen auf der Home-Ebene, nicht im Profil: sie sind
+/// profilunabhängig und liegen damit im schwächsten Config-Layer
+/// ([`crate::paths::config_layers`]), sodass Profil und Projekt sie überstimmen
+/// können. Jede Datei wird über [`write_if_absent`] geschrieben — eine vom
+/// Nutzer angepasste Definition bleibt bei jedem Re-Run unangetastet.
+fn write_bundle(home: &Path, report: &mut Scaffolded) -> HomeResult<()> {
+    for file in crate::bundle::bundled_files() {
+        write_if_absent(&file.target_in(home), file.contents, report)?;
+    }
+    Ok(())
 }
 
 /// Schreibt `installation_id` mit einer frischen UUID v7, falls sie fehlt.
@@ -344,6 +362,70 @@ mod tests {
             std::fs::read_to_string(&agent_path).expect("read agent.toml after re-run"),
             custom_contents,
             "a re-run must never overwrite an existing agent.toml"
+        );
+
+        std::fs::remove_dir_all(&home).expect("remove temporary scaffold");
+    }
+
+    #[test]
+    fn first_scaffold_writes_the_bundled_agents_and_skills() {
+        let home =
+            std::env::temp_dir().join(format!("harw-home-scaffold-{}", uuid::Uuid::now_v7()));
+
+        let report = ensure_home_with_profile(&home, "foo").expect("scaffold home");
+
+        for file in crate::bundle::bundled_files() {
+            let target = file.target_in(&home);
+            assert!(target.is_file(), "{} fehlt", file.relative_path);
+            assert!(
+                report.written_files.contains(&target),
+                "{} muss als neu geschrieben gemeldet werden",
+                file.relative_path
+            );
+        }
+
+        std::fs::remove_dir_all(&home).expect("remove temporary scaffold");
+    }
+
+    #[test]
+    fn rerun_does_not_overwrite_a_customized_bundled_agent() {
+        let home =
+            std::env::temp_dir().join(format!("harw-home-scaffold-{}", uuid::Uuid::now_v7()));
+
+        ensure_home_with_profile(&home, "foo").expect("scaffold home");
+        let customized = home.join("agents").join("debugger").join("system.md");
+        let contents = "# meine eigene Fassung\n";
+        std::fs::write(&customized, contents).expect("simulate user customization");
+
+        let rerun = ensure_home_with_profile(&home, "foo").expect("re-scaffold home");
+
+        assert!(!rerun.written_files.contains(&customized));
+        assert_eq!(
+            std::fs::read_to_string(&customized).expect("read after re-run"),
+            contents
+        );
+
+        std::fs::remove_dir_all(&home).expect("remove temporary scaffold");
+    }
+
+    /// Das Bundle liegt auf der Home-Ebene und muss über die reguläre
+    /// Layer-Kette gefunden werden — sonst hilft es dem Nutzer nicht.
+    #[test]
+    fn bundled_agents_are_discoverable_over_the_home_layer() {
+        let home =
+            std::env::temp_dir().join(format!("harw-home-scaffold-{}", uuid::Uuid::now_v7()));
+
+        let report = ensure_home_with_profile(&home, "foo").expect("scaffold home");
+
+        let resolved = harw_config::discover_config(&[home.clone(), report.profile_dir.clone()])
+            .expect("discovery over home and profile layer must succeed");
+
+        assert!(resolved.agents.contains_key("coding-orchestrator"));
+        assert!(resolved.agents.contains_key("rust-implementer"));
+        assert_eq!(
+            resolved.agents.len(),
+            18,
+            "17 Bundle-Agenten plus der Profil-Default-Worker"
         );
 
         std::fs::remove_dir_all(&home).expect("remove temporary scaffold");

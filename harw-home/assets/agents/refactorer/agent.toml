@@ -1,0 +1,7 @@
+name = "refactorer"
+role = "worker"
+description = "Performs behavior-preserving, scope-limited structural improvements."
+system_file = "system.md"
+skills = ["implementation"]
+timeout_seconds = 240
+max_retries = 1

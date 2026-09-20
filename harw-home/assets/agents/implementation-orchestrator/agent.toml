@@ -1,0 +1,7 @@
+name = "implementation-orchestrator"
+role = "child-orchestrator"
+description = "Partitions an approved implementation plan into independently verifiable, non-overlapping worker tasks."
+system_file = "system.md"
+skills = ["planning", "implementation", "verification"]
+timeout_seconds = 300
+max_retries = 1

@@ -1,0 +1,3 @@
+name = "debugging"
+description = "Reproduce, diagnose, minimally remediate, and verify failures."
+tools = ["filesystem.read", "process.inspect", "process.execute"]

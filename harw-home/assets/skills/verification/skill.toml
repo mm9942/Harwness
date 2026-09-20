@@ -1,0 +1,3 @@
+name = "verification"
+description = "Run focused tests, checks, and reviews against explicit acceptance criteria."
+tools = ["filesystem.read", "process.execute"]

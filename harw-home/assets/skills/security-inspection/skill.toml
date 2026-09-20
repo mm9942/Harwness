@@ -1,0 +1,3 @@
+name = "security-inspection"
+description = "Perform authorized, non-destructive security inspection and evidence-based reporting."
+tools = ["filesystem.read", "process.inspect"]

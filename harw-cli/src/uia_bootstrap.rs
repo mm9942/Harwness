@@ -170,7 +170,7 @@ pub(crate) fn ensure_active_uia(
 /// ```
 pub(crate) fn run_new_uia_command(home_override: Option<PathBuf>) -> Result<(), String> {
     let home = crate::home::resolve_home(home_override)?;
-    harw_home::ensure_home(&home).map_err(|error| error.to_string())?;
+    crate::home::ensure_home(&home).map_err(|error| error.to_string())?;
     let id = run_uia_setup_dialog(&home, DialogContext::AdditionalUia)?;
     persist_active_uia(&home, &id)?;
     eprintln!("UIA \"{id}\" angelegt und aktiviert.");

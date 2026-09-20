@@ -10,6 +10,9 @@
 //! - **Scaffolding** ([`scaffold`]): idempotentes Anlegen von Verzeichnissen
 //!   und Default-Dateien; existierende Dateien werden nie überschrieben.
 //!   Secrets ausschließlich in `auth.toml` (chmod 600).
+//! - **Startausstattung** ([`bundle`]): die mit dem Binary ausgelieferte
+//!   Agenten-Delegationshierarchie und ihre Skills, die das Scaffolding nach
+//!   `~/.harw/agents` bzw. `~/.harw/skills` schreibt.
 //! - **Layer-Zusammenstellung** ([`paths::config_layers`],
 //!   [`paths::config_layers_report`]): baut die aufsteigende Präzedenzkette
 //!   für `harw_config::discover_config`. Ein repo-lokales `./.harw` ist nur
@@ -41,12 +44,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod bundle;
 pub mod error;
 pub mod paths;
 pub mod project;
 pub mod scaffold;
 pub mod trust;
 
+pub use bundle::{BundledFile, bundled_files};
 pub use error::{HomeError, HomeResult};
 pub use paths::{
     LayerReport, active_profile_name, active_profile_path, auth_path, config_layers,

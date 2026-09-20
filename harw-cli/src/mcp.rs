@@ -35,7 +35,7 @@ pub fn run(home_override: Option<PathBuf>, action: McpAction) -> Result<(), Stri
 
 fn setup(home: &Path, server: &str) -> Result<(), String> {
     ensure_cloudflare_name(server)?;
-    harw_home::ensure_home(home).map_err(|error| error.to_string())?;
+    crate::home::ensure_home(home).map_err(|error| error.to_string())?;
     let profile = harw_home::active_profile_name(home);
     let profile_dir = harw_home::profile_dir(home, &profile).map_err(|error| error.to_string())?;
     let mcp_dir = profile_dir.join("mcps");

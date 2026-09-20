@@ -1,0 +1,7 @@
+name = "dependency-research-orchestrator"
+role = "child-orchestrator"
+description = "Coordinates evidence-based dependency, compatibility, licensing, and upgrade research."
+system_file = "system.md"
+skills = ["dependency-research", "planning"]
+timeout_seconds = 240
+max_retries = 1

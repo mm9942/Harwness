@@ -25,7 +25,7 @@ pub fn run(home: &Path, channel: &str, pair_code: Option<&str>) -> Result<(), St
             "unbekannter Channel {channel:?}; derzeit wird nur 'telegram' unterstützt"
         ));
     }
-    harw_home::ensure_home(home).map_err(|error| error.to_string())?;
+    crate::home::ensure_home(home).map_err(|error| error.to_string())?;
     if let Some(code) = pair_code {
         pair(home, code)
     } else {

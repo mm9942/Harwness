@@ -1,0 +1,7 @@
+name = "dependency-analyst"
+role = "worker"
+description = "Analyzes version compatibility, transitive impact, licenses, and upgrade paths."
+system_file = "system.md"
+skills = ["dependency-research"]
+timeout_seconds = 240
+max_retries = 1

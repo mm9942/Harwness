@@ -1,0 +1,7 @@
+name = "coding-orchestrator"
+role = "root-orchestrator"
+description = "Turns approved software objectives into dependency-aware plans and delegates bounded implementation work."
+system_file = "system.md"
+skills = ["planning", "implementation", "verification"]
+timeout_seconds = 300
+max_retries = 1

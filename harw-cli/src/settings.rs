@@ -185,7 +185,7 @@ impl From<harw_config::ConfigError> for SettingsError {
 /// `harw-cli`-Subcommand-Läufern (siehe `crate::project_trust::run`).
 pub fn run(home_override: Option<PathBuf>, action: Option<SettingsAction>) -> Result<(), String> {
     let home = crate::home::resolve_home(home_override)?;
-    harw_home::ensure_home(&home).map_err(|error| error.to_string())?;
+    crate::home::ensure_home(&home).map_err(|error| error.to_string())?;
     execute(&home, action).map_err(|error| error.to_string())
 }
 

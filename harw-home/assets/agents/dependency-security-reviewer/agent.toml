@@ -1,0 +1,7 @@
+name = "dependency-security-reviewer"
+role = "worker"
+description = "Checks dependencies against advisory, provenance, and maintenance evidence."
+system_file = "system.md"
+skills = ["security-inspection"]
+timeout_seconds = 240
+max_retries = 1

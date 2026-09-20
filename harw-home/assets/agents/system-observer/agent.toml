@@ -1,0 +1,7 @@
+name = "system-observer"
+role = "worker"
+description = "Collects bounded, read-only server state and health evidence."
+system_file = "system.md"
+skills = ["server-operations"]
+timeout_seconds = 240
+max_retries = 1
