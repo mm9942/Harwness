@@ -5,11 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+harw-authority = { path = "../../../harw-authority" }
 # eBPF-Vokabular: `BpfLoader`-Trait, `BpfProgramSpec`/`BpfProgramKind`/
 # `BpfProgramSource`, `BpfHandle`, `RawBpfEvent`, `BpfError`,
 # `fixture::FixtureBpfLoader` (Teil der normalen API, für eigene Tests ohne
 # Kernel, ohne Berechtigung, ohne eBPF-Toolchain).
 harw-dod-bpf = { path = "../harw-dod-bpf" }
+# Der alleinige Systemvertrag fuer Profilwahl und Konfigurationsdigest.
+# Die Probe akzeptiert weder eine implizite Home-Suche noch eigene CIDR- oder
+# Scope-Flags; beides wird aus diesem Vertrag abgeleitet.
+harw-dod-config = { path = "../harw-dod-config" }
 # Prozessstart-Formung: `ProcmonSensor` — implementiert bereits
 # `harw_dod_signals::Sensor`. Siehe `src/sensors.rs`-Moduldoku für das hier
 # gefällte Urteil zur Schnittstellen-Unstimmigkeit gegenüber `harw-dod-flow`.
@@ -59,10 +64,10 @@ landlock = "0.4.7"
 # Sentinel — derselbe Vertrag, den `harw-sentinel::ipc` auf der Empfangsseite
 # voraussetzt (`#[serde(deny_unknown_fields)]`, kebab-case `EventKind`-Tag).
 serde_json = { workspace = true }
+ipnet = { workspace = true }
 # Parsen von `--egress-allow-cidr` in `harw_sandbox::EgressTarget::Cidr`.
 # Dieselbe Fassung, die `harw-sandbox` selbst und `harw-dod-flow` (als
 # Dev-Dependency, für seine eigenen Testfixturen) verwenden.
-ipnet = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

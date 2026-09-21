@@ -4,7 +4,7 @@
 //! # Verantwortung
 //! Dieses Modul ist der sicherheitskritische Teil von `harw-tool-deps`: es ist
 //! die einzige Stelle im Crate, die Pfade *außerhalb* der Workspace-Wurzel
-//! öffnet. Grundlage ist [`harw_sandbox::Permission::ReadCargoRegistry`], die
+//! öffnet. Grundlage ist [`harw_authority::Permission::ReadCargoRegistry`], die
 //! genau einen fest verdrahteten, nur lesbaren Pfadbaum benennt:
 //! `$CARGO_HOME/registry/src`.
 //!

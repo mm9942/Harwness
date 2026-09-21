@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+harw-authority = { path = "../harw-authority" }
 # W3 C-EGRESS: URL-Parsing und Host-Suffix-Regel kommen ausschließlich aus
 # `harw_sandbox::egress` (EgressUrl, EgressHost, host_matches_suffix) — keine
 # zweite Parser- oder Suffix-Implementierung (F-002, F-197).

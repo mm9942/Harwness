@@ -72,7 +72,8 @@ use std::sync::{Arc, Mutex};
 use harw_job_runtime::{
     Budget, BudgetKind, Job, JobKind, JobRuntimeError, JobScope, RetryPolicy, StoredJob,
 };
-use harw_sandbox::{SandboxError, SandboxSpec, WorkspaceBinding, WorkspaceRegistry};
+use harw_authority::{AuthorityError, SandboxSpec, WorkspaceBinding, WorkspaceRegistry};
+use harw_sandbox::SandboxError;
 use harw_session_store::{JobStore, SessionStoreError};
 use harw_types::{ApprovalActor, ContentDigest, TenantId, WorkId, WorkspaceId};
 use jiff::{SignedDuration, Timestamp};
@@ -820,6 +821,8 @@ pub enum JobAdmissionError {
     /// Policy refused the submission.
     PolicyRejected(String),
     /// Workspace resolution failed.
+    Workspace(AuthorityError),
+    /// Sandbox construction or validation failed.
     Sandbox(SandboxError),
     /// Durable persistence failed.
     Store(SessionStoreError),
@@ -851,7 +854,8 @@ impl fmt::Display for JobAdmissionError {
                 f.write_str("policy sandbox is not bound to resolved workspace")
             }
             Self::PolicyRejected(v) => write!(f, "admission policy rejected task: {v}"),
-            Self::Sandbox(v) => write!(f, "workspace resolution failed: {v}"),
+            Self::Workspace(v) => write!(f, "workspace resolution failed: {v}"),
+            Self::Sandbox(v) => write!(f, "sandbox validation failed: {v}"),
             Self::Store(v) => write!(f, "job admission persistence failed: {v}"),
             Self::InvalidIdempotencyKey { length } => write!(
                 f,
@@ -878,11 +882,18 @@ impl fmt::Display for JobAdmissionError {
 impl std::error::Error for JobAdmissionError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Workspace(v) => Some(v),
             Self::Sandbox(v) => Some(v),
             Self::Store(v) => Some(v),
             Self::JobRuntime(v) => Some(v),
             _ => None,
         }
+    }
+}
+
+impl From<AuthorityError> for JobAdmissionError {
+    fn from(v: AuthorityError) -> Self {
+        Self::Workspace(v)
     }
 }
 
@@ -907,7 +918,7 @@ impl From<JobRuntimeError> for JobAdmissionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harw_sandbox::{PermissionSet, WorkspaceRegistration};
+    use harw_authority::{PermissionSet, WorkspaceRegistration};
     use harw_types::{ChannelId, PeerId};
     use std::path::Path;
     use tempfile::tempdir;
@@ -1060,7 +1071,12 @@ mod tests {
                 &context(),
                 Timestamp::now()
             ),
-            Err(JobAdmissionError::Sandbox(_))
+            // Workspace resolution (WorkspaceRegistry::resolve) now rejects an
+            // unbound workspace before the sandbox is ever constructed, so the
+            // fail-closed rejection surfaces as `Workspace` (wrapping
+            // `AuthorityError::WorkspaceNotBound`) rather than `Sandbox`. The
+            // job is still refused — only the error taxonomy moved.
+            Err(JobAdmissionError::Workspace(_))
         ));
     }
 
@@ -1300,7 +1316,10 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(result, Err(JobAdmissionError::Sandbox(_))));
+        // Same fail-closed rejection as `traversal_and_nested_authority_are_rejected`:
+        // an unbound workspace is refused during workspace resolution, so the
+        // error variant is `Workspace`, not `Sandbox`.
+        assert!(matches!(result, Err(JobAdmissionError::Workspace(_))));
     }
 
     #[tokio::test]

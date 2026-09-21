@@ -1734,6 +1734,7 @@ name = "harw"
 version = "0.3.0"
 dependencies = [
  "harw-agent-dsl",
+ "harw-authority",
  "harw-code-graph",
  "harw-core",
  "harw-extension-api",
@@ -1762,6 +1763,17 @@ dependencies = [
  "serde",
  "serde_json",
  "time",
+ "toml 1.1.3+spec-1.1.0",
+]
+
+[[package]]
+name = "harw-authority"
+version = "0.3.0"
+dependencies = [
+ "blake3",
+ "harw-types",
+ "ipnet",
+ "serde",
  "toml 1.1.3+spec-1.1.0",
 ]
 
@@ -1829,12 +1841,18 @@ dependencies = [
 name = "harw-channel-telegram"
 version = "0.3.0"
 dependencies = [
+ "harw-authority",
  "harw-channel",
  "harw-sandbox",
+ "harw-session-store",
  "harw-types",
  "jiff",
  "rand 0.10.2",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -1868,6 +1886,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "harw-agent-dsl",
+ "harw-authority",
  "harw-channel",
  "harw-channel-telegram",
  "harw-channel-telegram-transport",
@@ -1879,6 +1898,7 @@ dependencies = [
  "harw-install",
  "harw-job-runtime",
  "harw-knowledge",
+ "harw-lens",
  "harw-lens-types",
  "harw-mcp-client",
  "harw-mcp-server",
@@ -1900,6 +1920,7 @@ dependencies = [
  "harw-sandbox",
  "harw-secrets",
  "harw-session-store",
+ "harw-tool-lens",
  "harw-tui",
  "harw-types",
  "harw-web",
@@ -1950,6 +1971,7 @@ dependencies = [
 name = "harw-context"
 version = "0.3.0"
 dependencies = [
+ "harw-authority",
  "harw-lens-types",
  "harw-macros",
  "harw-types",
@@ -1963,6 +1985,7 @@ name = "harw-core"
 version = "0.3.0"
 dependencies = [
  "harw-agent-dsl",
+ "harw-authority",
  "harw-catalog",
  "harw-config",
  "harw-context",
@@ -1992,6 +2015,7 @@ name = "harw-core-bridge"
 version = "0.3.0"
 dependencies = [
  "harw-agent-dsl",
+ "harw-authority",
  "harw-catalog",
  "harw-core",
  "harw-dod-signals",
@@ -2009,6 +2033,7 @@ dependencies = [
 name = "harw-dod-cap"
 version = "0.3.0"
 dependencies = [
+ "harw-authority",
  "harw-macros",
  "harw-types",
  "serde",
@@ -2018,6 +2043,7 @@ dependencies = [
 name = "harw-dod-escalate"
 version = "0.3.0"
 dependencies = [
+ "harw-authority",
  "harw-dod-rules",
  "harw-dod-signals",
  "harw-dod-warden-proto",
@@ -2040,12 +2066,13 @@ dependencies = [
 name = "harw-dod-rules"
 version = "0.3.0"
 dependencies = [
+ "harw-authority",
  "harw-code-graph",
  "harw-dod-signals",
  "harw-research",
- "harw-sandbox",
  "harw-types",
  "jiff",
+ "rayon",
  "semver",
  "serde",
 ]
@@ -2080,6 +2107,7 @@ name = "harw-egress"
 version = "0.3.0"
 dependencies = [
  "blake3",
+ "harw-authority",
  "harw-sandbox",
  "reqwest 0.12.28",
  "tempfile",
@@ -2092,6 +2120,7 @@ dependencies = [
 name = "harw-extension-api"
 version = "0.3.0"
 dependencies = [
+ "harw-authority",
  "harw-catalog",
  "harw-context",
  "harw-lens-types",
@@ -2179,6 +2208,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_norway",
+ "toml 1.1.3+spec-1.1.0",
 ]
 
 [[package]]
@@ -2323,6 +2353,7 @@ name = "harw-macros"
 version = "0.3.0"
 dependencies = [
  "blake3",
+ "harw-authority",
  "harw-dod-cap",
  "harw-dod-readfs",
  "harw-dod-signals",
@@ -2422,6 +2453,7 @@ dependencies = [
 name = "harw-observe"
 version = "0.3.0"
 dependencies = [
+ "harw-authority",
  "harw-macros",
  "serde",
  "serde_json",
@@ -2469,6 +2501,7 @@ dependencies = [
 name = "harw-operations"
 version = "0.3.0"
 dependencies = [
+ "harw-authority",
  "harw-extension-api",
  "harw-sandbox",
  "harw-tools",
@@ -2485,6 +2518,7 @@ name = "harw-ops"
 version = "0.3.0"
 dependencies = [
  "harw-agent-dsl",
+ "harw-authority",
  "harw-code-graph",
  "harw-config",
  "harw-core",
@@ -2538,6 +2572,7 @@ name = "harw-plan-bridge"
 version = "0.3.0"
 dependencies = [
  "harw-agent-dsl",
+ "harw-authority",
  "harw-context",
  "harw-core",
  "harw-dod-escalate",
@@ -2581,6 +2616,7 @@ name = "harw-protocol"
 version = "0.3.0"
 dependencies = [
  "harw-types",
+ "jiff",
  "serde",
  "serde_json",
 ]
@@ -2626,6 +2662,7 @@ name = "harw-registry-defaults"
 version = "0.3.0"
 dependencies = [
  "harw-agent-dsl",
+ "harw-authority",
  "harw-browser",
  "harw-browser-thirtyfour",
  "harw-config",
@@ -2667,6 +2704,7 @@ name = "harw-runtime"
 version = "0.3.0"
 dependencies = [
  "harw-agent-dsl",
+ "harw-authority",
  "harw-catalog",
  "harw-config",
  "harw-context",
@@ -2691,6 +2729,7 @@ dependencies = [
  "harw-sandbox",
  "harw-secrets",
  "harw-session-store",
+ "harw-tool-shell",
  "harw-types",
  "jiff",
  "secrecy 0.10.3",
@@ -2705,9 +2744,8 @@ dependencies = [
 name = "harw-sandbox"
 version = "0.3.0"
 dependencies = [
+ "harw-authority",
  "harw-types",
- "ipnet",
- "serde",
  "tracing",
  "url",
 ]
@@ -2755,6 +2793,7 @@ name = "harw-tool-browser"
 version = "0.3.0"
 dependencies = [
  "async-trait",
+ "harw-authority",
  "harw-browser",
  "harw-extension-api",
  "harw-sandbox",
@@ -2770,6 +2809,7 @@ dependencies = [
 name = "harw-tool-deps"
 version = "0.3.0"
 dependencies = [
+ "harw-authority",
  "harw-code-graph",
  "harw-extension-api",
  "harw-macros",
@@ -2787,6 +2827,7 @@ name = "harw-tool-fs"
 version = "0.3.0"
 dependencies = [
  "globset",
+ "harw-authority",
  "harw-extension-api",
  "harw-fsutil",
  "harw-macros",
@@ -2806,6 +2847,7 @@ dependencies = [
 name = "harw-tool-lens"
 version = "0.3.0"
 dependencies = [
+ "harw-authority",
  "harw-extension-api",
  "harw-home",
  "harw-lens",
@@ -2825,6 +2867,7 @@ dependencies = [
 name = "harw-tool-shell"
 version = "0.3.0"
 dependencies = [
+ "harw-authority",
  "harw-extension-api",
  "harw-sandbox",
  "harw-tools",
@@ -2841,6 +2884,7 @@ name = "harw-tool-web"
 version = "0.3.0"
 dependencies = [
  "blake3",
+ "harw-authority",
  "harw-egress",
  "harw-extension-api",
  "harw-fsutil",
@@ -2862,6 +2906,7 @@ name = "harw-tools"
 version = "0.3.0"
 dependencies = [
  "async-trait",
+ "harw-authority",
  "harw-context",
  "harw-lens-types",
  "harw-macros",
@@ -2879,6 +2924,7 @@ version = "0.3.0"
 dependencies = [
  "crossterm 0.29.0",
  "harw-agent-dsl",
+ "harw-authority",
  "harw-catalog",
  "harw-config",
  "harw-context",
@@ -2901,6 +2947,7 @@ dependencies = [
  "harw-tool-shell",
  "harw-tools",
  "harw-types",
+ "jiff",
  "ratatui",
  "secrecy 0.8.0",
  "serde_json",
@@ -4607,6 +4654,26 @@ dependencies = [
  "unicode-segmentation",
  "unicode-truncate",
  "unicode-width 0.2.0",
+]
+
+[[package]]
+name = "rayon"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
+dependencies = [
+ "either",
+ "rayon-core",
+]
+
+[[package]]
+name = "rayon-core"
+version = "1.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
+dependencies = [
+ "crossbeam-deque",
+ "crossbeam-utils",
 ]
 
 [[package]]

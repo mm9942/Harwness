@@ -107,7 +107,7 @@
 //!     EventKind, SecurityEvent, SecurityEvidence, SecurityVerdict, Severity,
 //!     VerdictClassification,
 //! };
-//! use harw_sandbox::NetworkScope;
+//! use harw_authority::NetworkScope;
 //! use harw_types::SensorId;
 //!
 //! let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);
@@ -154,9 +154,13 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use harw_dod_signals::{
-    Hardness, SecurityEvidence, SecurityVerdict, Severity, SignalsError, VerdictClassification,
+    SecurityEvidence, SecurityVerdict, Severity, SignalsError, VerdictClassification,
     validate_verdict,
 };
+// `pub use`, nicht `use`: die konkreten Regeln in `crate::rules` importieren
+// `Hardness` über `crate::finding::Hardness` statt über eine zweite, direkte
+// `harw-dod-signals`-Abhängigkeit derselben Bezeichnung.
+pub use harw_dod_signals::Hardness;
 use harw_types::{ContentDigest, FindingId};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -1186,7 +1190,7 @@ pub fn triage_record(
 /// use harw_dod_rules::rules::EgressFlowRule;
 /// use harw_dod_rules::{run_rules, triage, Verdict};
 /// use harw_dod_signals::{EventKind, SecurityEvent};
-/// use harw_sandbox::NetworkScope;
+/// use harw_authority::NetworkScope;
 /// use harw_types::SensorId;
 ///
 /// let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);

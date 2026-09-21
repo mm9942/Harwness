@@ -953,8 +953,11 @@ mod tests {
     use harw_plan::ids::{PlanId, TaskId};
     use harw_plan::types::{EvidenceKind, EvidenceRef, PlanNode, PlanNodeKind, PlanNodeStatus};
     use harw_plan::{InMemoryGoalStore, InMemoryPlanStore, PlanStore, PlanToolConfig};
-    use harw_sandbox::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
-    use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
+    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_types::{
+        IngressSurface, PermissionTier, Principal, PrincipalKind, SessionId, TenantId, TurnId,
+        WorkspaceId,
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use time::OffsetDateTime;
@@ -970,7 +973,26 @@ mod tests {
 
     // ── Fixtures ─────────────────────────────────────────────────────────────
 
-    fn context_with(services: ServiceMap) -> (OpContext, std::path::PathBuf) {
+    /// Menschlicher Test-Principal, wie ihn `local_principal(Cli)` baut.
+    fn human_principal() -> Principal {
+        Principal::trusted_ingress(
+            PrincipalKind::Human,
+            "uid:1000",
+            IngressSurface::Cli,
+            PermissionTier::Operator,
+        )
+    }
+
+    /// Baut einen `OpContext` mit temporärem Workspace und den übergebenen
+    /// Diensten; ergänzt einen menschlichen Principal, falls keiner darin
+    /// liegt. Seit `require_actor`/`require_principal` an der Eingangsgrenze
+    /// einen authentifizierten Principal verlangen (siehe `plan.rs`), bräuchte
+    /// jeder Testfall sonst individuell einen — dieselbe Konvention wie
+    /// `plan::tests::context_with`.
+    fn context_with(mut services: ServiceMap) -> (OpContext, std::path::PathBuf) {
+        if services.get::<Principal>().is_none() {
+            services.insert(human_principal());
+        }
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!("harw-goal-op-{}-{id}", std::process::id()));

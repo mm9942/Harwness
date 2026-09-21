@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt, clippy, test (root workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo (root workspace)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "."
+
+      # The sandbox tests (harw-sandbox and friends) exec bubblewrap directly,
+      # so it must be present before `cargo test` runs.
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --tests -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+  dod:
+    name: test (dod workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo (dod workspace)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "dod -> target"
+
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+
+      - name: cargo test --workspace --locked
+        working-directory: dod
+        run: cargo test --workspace --locked
+
+  cargo-deny:
+    name: cargo deny check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Uses the repo's existing deny.toml (root of the checkout) — no
+      # separate config needed.
+      - name: cargo deny check
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check

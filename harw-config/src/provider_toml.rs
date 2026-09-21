@@ -43,6 +43,32 @@ pub struct ProviderToml {
     /// würde jeden Request auf ewig blockieren.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrency: Option<usize>,
+    /// Optionaler Wert für den `originator`-HTTP-Header, den `harw` auf der
+    /// Codex-/ChatGPT-Route (`harw-provider-http::codex`) an OpenAI sendet.
+    /// `None` behält den harw-eigenen Default `"harw"` bei.
+    ///
+    /// **Wichtig:** Dieser Wert dient bei OpenAI ausschließlich der
+    /// Client-Identifikation und wird bei jedem Request im Klartext
+    /// mitgeschickt. Ihn auf den Wert des offiziellen Codex-CLI-Clients zu
+    /// setzen, um wie dieser Client zu erscheinen, ist eine bewusste
+    /// Entscheidung der Nutzerin/des Nutzers — sie kann im Widerspruch zu
+    /// OpenAIs Nutzungsbedingungen stehen. `harw` erzwingt hier keine
+    /// bestimmte Wahl, validiert den Wert aber (siehe [`Self::validate`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub originator: Option<String>,
+}
+
+/// Höchstlänge des `originator`-Felds (siehe [`ProviderToml::validate`]).
+const MAX_ORIGINATOR_CHARS: usize = 64;
+
+/// `true`, wenn `value` nicht leer ist und ausschließlich druckbare ASCII-
+/// Zeichen (0x20–0x7E) enthält — also ohne Steuerzeichen (Tab, Zeilenumbruch, …)
+/// und ohne Nicht-ASCII-Zeichen.
+fn is_printable_ascii(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii() && !c.is_ascii_control())
 }
 
 impl ProviderToml {
@@ -81,6 +107,9 @@ impl ProviderToml {
     /// - [`ConfigError::Invalid`]: `max_concurrency` ist auf `Some(0)`
     ///   gesetzt, was jeden Request an diesen Provider für immer blockieren
     ///   würde (fast sicher ein Tippfehler statt beabsichtigtes Verhalten).
+    /// - [`ConfigError::Invalid`]: `originator` ist gesetzt, aber leer, länger
+    ///   als [`MAX_ORIGINATOR_CHARS`] Zeichen oder enthält Nicht-ASCII-/
+    ///   Steuerzeichen (siehe [`is_printable_ascii`]).
     pub fn validate(&self) -> ConfigResult<()> {
         let mut headers: Vec<(&String, &String)> = self.headers.iter().collect();
         headers.sort_by(|left, right| left.0.cmp(right.0));
@@ -97,6 +126,14 @@ impl ProviderToml {
                 "provider '{}': max_concurrency = 0 would block every request forever; omit the field for unlimited concurrency or set it to a positive value",
                 self.name
             )));
+        }
+        if let Some(originator) = &self.originator {
+            if originator.len() > MAX_ORIGINATOR_CHARS || !is_printable_ascii(originator) {
+                return Err(ConfigError::Invalid(format!(
+                    "provider '{}': originator must be non-empty, printable ASCII (no control characters) and at most {MAX_ORIGINATOR_CHARS} characters",
+                    self.name
+                )));
+            }
         }
         Ok(())
     }
@@ -349,6 +386,75 @@ mod tests {
         provider
             .validate()
             .expect("max_concurrency and rate_limit are independent and both valid together");
+    }
+
+    #[test]
+    fn test_provider_without_originator_is_none_and_omitted_on_serialize() {
+        let src = r#"
+            name = "openai"
+            api = "openai-responses"
+            base_url = "https://api.openai.com/v1"
+        "#;
+        let provider: ProviderToml = toml::from_str(src).unwrap();
+        assert!(provider.originator.is_none());
+        provider
+            .validate()
+            .expect("absent originator is valid (keeps the harw default)");
+        assert!(!toml::to_string(&provider).unwrap().contains("originator"));
+    }
+
+    #[test]
+    fn test_provider_with_originator_round_trips() {
+        let src = r#"
+            name = "openai"
+            api = "openai-responses"
+            base_url = "https://chatgpt.com/backend-api/codex"
+            originator = "codex_cli_rs"
+        "#;
+        let provider: ProviderToml = toml::from_str(src).unwrap();
+        assert_eq!(provider.originator.as_deref(), Some("codex_cli_rs"));
+        provider.validate().expect("printable ASCII originator is valid");
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_originator() {
+        let mut provider = provider_with_headers(&[]);
+        provider.originator = Some(String::new());
+        let error = provider.validate().unwrap_err();
+        assert!(matches!(error, ConfigError::Invalid(ref msg) if msg.contains("originator")));
+    }
+
+    #[test]
+    fn test_validate_rejects_originator_with_control_characters() {
+        let mut provider = provider_with_headers(&[]);
+        provider.originator = Some("bad\nvalue".to_owned());
+        let error = provider.validate().unwrap_err();
+        assert!(matches!(error, ConfigError::Invalid(ref msg) if msg.contains("originator")));
+    }
+
+    #[test]
+    fn test_validate_rejects_originator_with_non_ascii() {
+        let mut provider = provider_with_headers(&[]);
+        provider.originator = Some("härw".to_owned());
+        let error = provider.validate().unwrap_err();
+        assert!(matches!(error, ConfigError::Invalid(ref msg) if msg.contains("originator")));
+    }
+
+    #[test]
+    fn test_validate_rejects_originator_over_max_length() {
+        let mut provider = provider_with_headers(&[]);
+        provider.originator = Some("a".repeat(65));
+        let error = provider.validate().unwrap_err();
+        assert!(matches!(error, ConfigError::Invalid(ref msg) if msg.contains("originator")));
+    }
+
+    #[test]
+    fn test_validate_accepts_originator_at_max_length() {
+        let mut provider = provider_with_headers(&[]);
+        provider.originator = Some("a".repeat(64));
+        provider
+            .validate()
+            .expect("originator at exactly the length cap is valid");
     }
 
     #[test]

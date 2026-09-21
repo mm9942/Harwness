@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+harw-authority = { path = "../harw-authority" }
 harw-operations = { path = "../harw-operations" }
 harw-macros = { path = "../harw-macros" }
 harw-types = { path = "../harw-types" }
@@ -20,6 +21,11 @@ harw-job-runtime = { path = "../harw-job-runtime" }
 harw-extension-api = { path = "../harw-extension-api" }
 harw-tool-shell = { path = "../harw-tool-shell" }
 harw-tools = { path = "../harw-tools" }
+# UIA-Delegationsrouting (`explore`/`research_web`): `AgentRoleId` wird
+# gebraucht, um die aufrufende `organizational_role` gegen `UserInterface`
+# zu prüfen. Vormals nur dev-dependency für Test-Fixtures — jetzt auch in
+# Produktionscode benötigt.
+harw-agent-dsl = { path = "../harw-agent-dsl" }
 jiff = { workspace = true }
 # Wellen-Fortschritt des `analyze`-Fan-outs (Spans je Ebene, Events je Kind).
 tracing = "0.1.44"
@@ -82,7 +88,8 @@ tempfile = { workspace = true }
 # AW5-09: `context_proposal.rs`-Tests bauen einen `DefinitionId`
 # (`harwness.context.base@1`) als Fixture. Kein Zyklus: `harw-agent-dsl`
 # hängt nicht von `harw-ops` ab (geprüft).
-harw-agent-dsl = { path = "../harw-agent-dsl" }
+# (harw-agent-dsl ist jetzt eine normale [dependencies]-Zeile oben, da es
+# auch in Produktionscode gebraucht wird — hier keine Dopplung nötig.)
 
 [lints]
 workspace = true

@@ -91,6 +91,66 @@ pub fn open_configured_secret_resolver(
     Ok(Some(ConfiguredSecretResolver::new(store)))
 }
 
+/// Öffnet — falls nötig — den versiegelten Secret-Resolver, ausgewertet nur
+/// für den Provider, den dieser Lauf tatsächlich verwendet
+/// (`config.harness.default_provider`), statt für jeden aktivierten
+/// Provider im ganzen Konfigurationsuniversum.
+///
+/// # Description
+/// [`open_configured_secret_resolver`] verlangt bereits dann ein
+/// konfiguriertes KEK, wenn **irgendein** aktivierter Provider eine
+/// `secrets:`-Referenz nutzt — auch wenn dieser Lauf ihn nie anspricht. Ein
+/// zweiter, für diesen Lauf irrelevanter Provider mit fehlendem KEK würde
+/// damit jeden Start blockieren, der gar nicht auf ihn angewiesen ist
+/// (dasselbe Muster wie die hängenden Katalog-Referenzen, die
+/// `harw_config::ResolvedConfig::validate` inzwischen nicht mehr fatal
+/// behandelt). Diese Funktion wertet die KEK-Pflicht stattdessen
+/// **verzögert** aus: nur, wenn der tatsächlich gewählte Provider
+/// (`config.harness.default_provider`) existiert, aktiviert ist und selbst
+/// eine `secrets:`-Referenz trägt. Fehlt `default_provider`, existiert der
+/// referenzierte Provider nicht (hängende Referenz), ist er deaktiviert
+/// oder nutzt er kein `secrets:`, verlangt diese Funktion kein KEK und öffnet
+/// nichts.
+///
+/// Die No-Fallback-zu-Klartext-Garantie bleibt unverändert: sobald der
+/// tatsächlich genutzte Provider `secrets:` referenziert, delegiert diese
+/// Funktion an [`open_configured_secret_resolver`] — inklusive dessen
+/// Fail-Closed-Verhalten ohne konfiguriertes KEK.
+///
+/// # Arguments
+/// - `home` (`&Path`): Root-Space, siehe [`open_configured_secret_resolver`].
+/// - `config` (`&ResolvedConfig`): aufgelöste Konfiguration dieses Laufs.
+///
+/// # Returns
+/// `Some(resolver)`, wenn der tatsächlich verwendete Provider `secrets:`
+/// nutzt und der versiegelte Speicher geöffnet werden konnte; `None` sonst
+/// — auch dann, wenn ein *anderer*, von diesem Lauf nicht verwendeter
+/// Provider `secrets:` nutzen würde.
+///
+/// # Errors
+/// Wie [`open_configured_secret_resolver`]: `String` ohne Geheimnisinhalt,
+/// wenn KEK-Konfiguration, KEK-Material oder das Öffnen des Speichers
+/// fehlschlägt.
+pub fn open_configured_secret_resolver_for_active_provider(
+    home: &Path,
+    config: &ResolvedConfig,
+) -> Result<Option<ConfiguredSecretResolver>, String> {
+    let Some(provider_id) = config.harness.default_provider.as_deref() else {
+        return Ok(None);
+    };
+    let Some(provider) = config.providers.get(provider_id) else {
+        // Hängende `default_provider`-Referenz: `harw-config` meldet das
+        // inzwischen als nicht-fatale Diagnose (`ConfigDiagnostic`), nicht
+        // als Startabbruch. Ohne einen echten Provider gibt es hier nichts,
+        // das ein KEK verlangen könnte.
+        return Ok(None);
+    };
+    if !(provider.enabled && matches!(&provider.auth, Some(SecretRef::Secrets(_)))) {
+        return Ok(None);
+    }
+    open_configured_secret_resolver(home, config)
+}
+
 /// Prüft die **persistierte** Audit-Kette (`audit.log` auf der Platte) des
 /// konfigurierten Geheimnisspeichers, für die periodische Kettenprüfung in
 /// `crate::gateway::audit_chain_scheduler`.
@@ -233,6 +293,7 @@ mod tests {
     use super::{
         ConfiguredSecretResolver, SecretResolver,
         configured_secret_store_persisted_audit_chain_status, open_configured_secret_resolver,
+        open_configured_secret_resolver_for_active_provider,
     };
 
     #[test]
@@ -538,6 +599,99 @@ mod tests {
             .expect("valid test provider"),
         );
         config
+    }
+
+    /// Wie [`sealed_provider_config`], zusätzlich mit einem `env:`-Provider,
+    /// der als `default_provider` gewählt wird — der versiegelte `sealed`-
+    /// Provider bleibt konfiguriert, aber von diesem Lauf ungenutzt.
+    fn config_with_unused_sealed_provider() -> harw_config::ResolvedConfig {
+        let mut config = sealed_provider_config();
+        config.providers.insert(
+            "plain".to_owned(),
+            toml::from_str::<ProviderToml>(
+                "name = \"plain\"\napi = \"openai-compatible\"\nbase_url = \"https://example.test\"\nauth = \"env:PLAIN_TOKEN\"\n",
+            )
+            .expect("valid test provider"),
+        );
+        config.harness.default_provider = Some("plain".to_owned());
+        config
+    }
+
+    #[test]
+    fn active_provider_scoped_resolver_ignores_an_unused_sealed_provider_without_a_kek() {
+        let config = config_with_unused_sealed_provider();
+        let home = TempDir::new().expect("temporary home");
+
+        let resolver = open_configured_secret_resolver_for_active_provider(home.path(), &config)
+            .expect("an unused sealed provider must not require a KEK");
+        assert!(resolver.is_none());
+    }
+
+    #[test]
+    fn active_provider_scoped_resolver_ignores_a_dangling_default_provider() {
+        let mut config = sealed_provider_config();
+        config.harness.default_provider = Some("missing".to_owned());
+        let home = TempDir::new().expect("temporary home");
+
+        let resolver = open_configured_secret_resolver_for_active_provider(home.path(), &config)
+            .expect("a dangling default_provider must not require a KEK");
+        assert!(resolver.is_none());
+    }
+
+    #[test]
+    fn active_provider_scoped_resolver_returns_none_without_any_default_provider() {
+        let config = sealed_provider_config();
+        let home = TempDir::new().expect("temporary home");
+
+        let resolver = open_configured_secret_resolver_for_active_provider(home.path(), &config)
+            .expect("no default_provider means nothing is selected yet");
+        assert!(resolver.is_none());
+    }
+
+    #[test]
+    fn active_provider_scoped_resolver_fails_closed_when_the_active_provider_is_sealed() {
+        let mut config = sealed_provider_config();
+        config.harness.default_provider = Some("sealed".to_owned());
+        let home = TempDir::new().expect("temporary home");
+
+        let result = open_configured_secret_resolver_for_active_provider(home.path(), &config);
+        let Err(error) = result else {
+            panic!("the actually selected sealed provider must still require a KEK");
+        };
+        assert!(error.contains("requires a configured KEK"));
+    }
+
+    #[test]
+    fn active_provider_scoped_resolver_resolves_when_the_active_provider_is_sealed_and_kek_is_set()
+     {
+        let home = TempDir::new().expect("temporary home");
+        let key_path = write_test_kek(home.path());
+        {
+            let mut store = store_with_test_kek(home.path(), &key_path);
+            store
+                .create(
+                    "provider-token",
+                    "provider authentication",
+                    &SecretBox::new(b"utf8-token".to_vec().into_boxed_slice()),
+                )
+                .expect("seal test token");
+        }
+        let mut config = sealed_provider_config();
+        config.harness.default_provider = Some("sealed".to_owned());
+        config.auth.kek = Some(KekConfig {
+            provenance: ConfigKekProvenance::KeyFile,
+            key_file_path: Some(key_path.to_string_lossy().into_owned()),
+            keyring_entry: None,
+            env_seed_var: None,
+        });
+
+        let resolver = open_configured_secret_resolver_for_active_provider(home.path(), &config)
+            .expect("a configured KEK must open the resolver")
+            .expect("the active provider uses secrets:");
+        let resolved = resolver
+            .resolve("provider-token")
+            .expect("resolve the sealed secret");
+        assert_eq!(resolved.expose_secret(), "utf8-token");
     }
 
     fn store_with_test_kek(home: &Path, key_path: &Path) -> SecretStore {

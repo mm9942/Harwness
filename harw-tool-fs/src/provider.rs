@@ -394,9 +394,7 @@ fn fs_search_spec() -> ToolSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harw_sandbox::{
-        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-    };
+    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::collections::HashSet;
     use std::fs;

@@ -63,8 +63,9 @@
 //! assert_eq!(args.question.as_deref(), Some("wo wird die Sandbox gebaut"));
 //! ```
 
+use harw_agent_dsl::roles::AgentRoleId;
 use harw_core::child_controller::JoinSemantics;
-use harw_core_bridge::{ChildReturnContract, fanout_children, parse_budget_hint};
+use harw_core_bridge::{ChildReturnContract, OpContextCoreExt, fanout_children, parse_budget_hint};
 use harw_macros::operation;
 use harw_operations::args::join_all_optional;
 use harw_operations::{FromRawArgs, OpContext, OpError, OpOutput};
@@ -527,7 +528,22 @@ async fn explore(ctx: &OpContext, args: ExploreArgs) -> Result<OpOutput, OpError
     };
 
     let payload = child_payload(&research_question)?;
-    let finding = run_single_child(ctx, role_names::EXPLORER, payload).await?;
+    // UIA-Chat-Sessions (`organizational_role == AgentRoleId::UserInterface`)
+    // dürfen keine `Worker`-Rolle spawnen — die Spawn-Matrix lässt für sie
+    // nur `AgentRoleId::RootOrchestrator`/`AgentRoleId::UiaWorker` zu, und
+    // `explorer` trägt `organizational_role = AgentRoleId::Worker`. Für
+    // diese Aufrufer weicht der Kind-Lauf deshalb auf `UIA_EXPLORER` aus
+    // (`organizational_role = AgentRoleId::UiaWorker`, deckt denselben
+    // read-only Bedarf ab). Kann die Rolle der aufrufenden Session nicht
+    // ermittelt werden, bleibt das bisherige Verhalten unverändert.
+    let role = match ctx
+        .managed_spawner()
+        .and_then(|spawner| spawner.session_organizational_role(ctx.session_id()))
+    {
+        Some(AgentRoleId::UserInterface) => role_names::UIA_EXPLORER,
+        _ => role_names::EXPLORER,
+    };
+    let finding = run_single_child(ctx, role, payload).await?;
     let locator = persist_finding(ctx, task.as_deref(), &finding, ACTOR_EXPLORE)?;
     finding_output(&finding, locator.as_deref())
 }
@@ -541,7 +557,7 @@ mod tests {
     use harw_operations::context::ServiceMap;
     use harw_operations::{FromRawArgs, OpContext, OpError, Operation, Surface};
     use harw_registry_defaults::profile::role_names;
-    use harw_sandbox::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::sync::atomic::{AtomicU64, Ordering};
 

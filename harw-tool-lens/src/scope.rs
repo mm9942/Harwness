@@ -17,12 +17,12 @@
 //! `harw-tools/src/sandbox_guard.rs` holt die Grenze eines Werkzeugs aus
 //! [`harw_tools::ToolExecutionContext::sandbox`] — einer serverseitig
 //! aufgebauten, vom Modell nicht erreichbaren Autorität
-//! ([`harw_sandbox::SandboxSpec`]). Dieses Modul hat genau dort nachgesehen,
+//! ([`harw_authority::SandboxSpec`]). Dieses Modul hat genau dort nachgesehen,
 //! **bevor** es eine eigene Lösung gebaut hat, wie der Auftrag verlangt. Der
-//! Befund: [`harw_sandbox::SandboxSpec`] trägt zum Zeitpunkt dieses Knotens
-//! genau drei Felder — `workspace` (eine [`harw_sandbox::WorkspaceBinding`]:
+//! Befund: [`harw_authority::SandboxSpec`] trägt zum Zeitpunkt dieses Knotens
+//! genau drei Felder — `workspace` (eine [`harw_authority::WorkspaceBinding`]:
 //! Dateisystempfade), `permissions` (eine geschlossene Menge aus
-//! [`harw_sandbox::Permission::ReadWorkspace`],
+//! [`harw_authority::Permission::ReadWorkspace`],
 //! `WriteWorkspace`, `ExecuteProcess`, `NetworkAccess`, `ReadSecrets`,
 //! `ManagePlugins`, `ReadCargoRegistry`) und `network_scope` (erlaubte
 //! Ziel-Hosts). Keines dieser drei Felder kennt eine Sichtbarkeits- oder
@@ -114,9 +114,7 @@ pub const KNOWN_SELECTORS: &[(&str, &str)] = &[
 /// # Examples
 /// ```rust
 /// use harw_lens::DEFAULT_VISIBILITY;
-/// use harw_sandbox::{
-///     PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-/// };
+/// use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
 /// use harw_tool_lens::scope::derive_read_scope;
 /// use harw_tools::ToolExecutionContext;
 /// use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
@@ -190,7 +188,7 @@ pub fn selectors_in_scope(scope: &ReadScope) -> Vec<IndexSelector> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harw_sandbox::{
+    use harw_authority::{
         Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
     };
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};

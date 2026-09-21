@@ -45,6 +45,6 @@ pub use spec::{FunctionToolSpec, ToolName, ToolSpec};
 /// Re-export der Sandbox-Berechtigungen.
 ///
 /// Von `#[harw_macros::tool]` als `::harw_tools::Permission` referenziert, damit
-/// der generierte Sicherheits-Prolog keine direkte `harw-sandbox`-Dependency im
-/// aufrufenden Crate voraussetzt.
-pub use harw_sandbox::Permission;
+/// der generierte Sicherheits-Prolog keine direkte `harw-authority`-Dependency
+/// im aufrufenden Crate voraussetzt.
+pub use harw_authority::Permission;

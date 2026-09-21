@@ -4,6 +4,14 @@ Status: design draft. No code exists yet for `harw-knowledge`, `harw-session-sto
 `harw-job-runtime`, `harw-catalog`, or `harw-policy` — this document specifies the
 shape they must have before implementation starts.
 
+> **Ist-Stand (2026-09)**: The "no code exists yet" claim above is outdated.
+> `harw-knowledge`, `harw-session-store`, `harw-job-runtime`, and `harw-catalog`
+> all exist in the tree. Store, index, recall, and visibility are implemented.
+> `ArtifactKind` has 12 variants (more than the 8 sketched in §8.1). Diary,
+> workbench, and kanban exist only as types — no callers wire them up yet.
+> `harw-policy` still does not exist as a crate; cross-tree visibility
+> enforcement (referenced throughout §7) remains an open gap.
+
 ## 0. Why one document
 
 Harwness needs six things that look unrelated but share one storage and

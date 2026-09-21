@@ -374,6 +374,31 @@ fn all_registered_ops_are_reachable_by_name() {
         // ebenfalls Grundausstattung statt Planungsfläche und in dieser
         // Liste zu führen.
         "usage",
+        // UIA-spezifische gepinnte Provider-/Modell-Auswahl (`uia-provider`,
+        // `uia-model`, `harw-ops/src/{model,provider}.rs`): strukturelle
+        // Zwillinge von `model`/`provider` oben, ebenfalls
+        // `command(visibility = "tui_only")` und damit Surface::Command.
+        "uia-model",
+        "uia-provider",
+        // Manueller lokaler Bug-Report-Fallback (`harw-ops/src/bug_report.rs`),
+        // `command(visibility = "tui_only")` -- reine Session-/Diagnose-Fläche
+        // wie `usage` oben.
+        "bug-report",
+        // Genehmigungs-Befehlsgruppe (Interaktionsvertrag §2.3/§4,
+        // `harw-ops/src/{approve,deny,review,cancel,retry}.rs`): alle fünf
+        // deklarieren `command(visibility = "channel_parity")`. Anders als
+        // `visibility = "tui_only"` bedeutet `ChannelParity` NICHT "der TUI
+        // unbekannt" -- `command_visibility_to_scope`
+        // (`harw-tui/src/registry.rs`) bildet es auf
+        // `CommandScope::ChannelParity` ab, und diese Ops stehen genau wie
+        // die `TuiOnly`-Ops in `CommandRegistry::built_in()` (siehe Test 1
+        // oben, der das bereits für alle Command-Ops prüft). Sie gehören
+        // deshalb in diese erschöpfende Liste.
+        "approve",
+        "deny",
+        "review",
+        "cancel",
+        "retry",
     ];
 
     // Jede Operation muss mindestens eine Fläche tragen. Eine ohne wäre über

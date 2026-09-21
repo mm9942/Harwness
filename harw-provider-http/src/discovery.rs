@@ -32,6 +32,13 @@ use serde_json::Value;
 
 /// Zeitlimit für eine einzelne Discovery-Anfrage.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(20);
+/// Seitengröße für `GET /v1/models` gegen Anthropic (Anthropic-Maximum ist
+/// `1000`, siehe API-Referenz „List Models").
+const ANTHROPIC_MODELS_PAGE_LIMIT: &str = "1000";
+/// Höchstzahl paginierter Seiten je Anthropic-Modell-Discovery-Aufruf. Schützt
+/// vor einer Endlosschleife, falls ein (kompromittierter/fehlerhafter) Server
+/// dauerhaft `has_more: true` ohne fortschreitende Daten meldet.
+const ANTHROPIC_MODELS_MAX_PAGES: usize = 20;
 
 /// Ein von einem Provider gemeldetes Modell, normalisiert über Provider-APIs
 /// hinweg.
@@ -250,6 +257,13 @@ pub async fn list_models(
     };
 
     let client = crate::http_client();
+
+    if provider.api == "anthropic-messages" {
+        // `codex_route` ist für diese `api` immer `None` (siehe
+        // `CodexRoute::from_provider`, das nur `openai-responses` erkennt).
+        return list_anthropic_models_paginated(&client, &url, api_key, provider_name).await;
+    }
+
     let mut request = client.get(&url).timeout(DISCOVERY_TIMEOUT);
     if let Some(route) = &codex_route {
         let codex_headers = route.headers(&client).await.map_err(|_| DiscoveryError::Auth {
@@ -259,19 +273,6 @@ pub async fn list_models(
         request = request
             .query(&[("client_version", env!("CARGO_PKG_VERSION"))])
             .headers(codex_headers);
-    } else if provider.api == "anthropic-messages" {
-        if let Some(key) = api_key {
-            request = request.header("anthropic-version", crate::anthropic::ANTHROPIC_VERSION);
-            request = match crate::classify_anthropic_secret(key.to_owned()) {
-                crate::AnthropicCredential::OAuth(secret) => request
-                    .bearer_auth(secret.expose_secret())
-                    .header("anthropic-beta", crate::anthropic::ANTHROPIC_OAUTH_BETA),
-                crate::AnthropicCredential::ApiKey(secret) => {
-                    request.header("x-api-key", secret.expose_secret())
-                }
-                crate::AnthropicCredential::Bearer(secret) => request.bearer_auth(secret.expose_secret()),
-            };
-        }
     } else if let Some(key) = api_key {
         request = request.bearer_auth(key);
     }
@@ -303,10 +304,144 @@ pub async fn list_models(
         .map_err(|_error| DiscoveryError::Decode {
             detail: format!("Antwort von Provider '{provider_name}' ist kein gültiges JSON"),
         })?;
-    if codex_route.is_some() {
-        return parse_codex_models_response(&body);
+    if let Some(route) = &codex_route {
+        let models = parse_codex_models_response(&body)?;
+        if models.is_empty() {
+            // 200 mit leerer Modell-Liste ist von "Codex-Route nicht
+            // konfiguriert" zu unterscheiden (dieser Zweig wird nur erreicht,
+            // wenn eine Codex-Route erkannt und ein Request tatsächlich
+            // gesendet wurde) — daher explizit geloggt statt still `Ok(vec![])`
+            // zurückzugeben.
+            tracing::warn!(
+                provider = provider_name,
+                originator = route.originator(),
+                "Codex-Modell-Discovery lieferte eine leere Modell-Liste (HTTP 200)"
+            );
+        }
+        return Ok(models);
     }
     Ok(parse_models_response(&body))
+}
+
+/// Fragt `GET {base_url}` (bereits auf `/v1/models` aufgelöst) mit Anthropic-
+/// Pagination ab und mischt alle Seiten zu einer flachen Liste.
+///
+/// # Description
+/// Startet mit `limit=1000` (Anthropic-Maximum) und folgt `has_more`/`last_id`
+/// aus jeder Antwortseite (siehe [`next_anthropic_page_cursor`]), bis entweder
+/// keine weitere Seite gemeldet wird oder [`ANTHROPIC_MODELS_MAX_PAGES`]
+/// erreicht ist. Die bestehende OAuth-/API-Key-Header-Logik wird unverändert
+/// pro Seite neu aufgebaut (ein `RequestBuilder` wird beim Senden konsumiert).
+///
+/// # Errors
+/// Wie [`list_models`]; der erste fehlschlagende Seiten-Request beendet die
+/// gesamte Abfrage.
+async fn list_anthropic_models_paginated(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: Option<&str>,
+    provider_name: &str,
+) -> Result<Vec<DiscoveredModel>, DiscoveryError> {
+    let mut all_models = Vec::new();
+    let mut after_id: Option<String> = None;
+    for _ in 0..ANTHROPIC_MODELS_MAX_PAGES {
+        let mut query = vec![("limit".to_owned(), ANTHROPIC_MODELS_PAGE_LIMIT.to_owned())];
+        if let Some(after_id) = &after_id {
+            query.push(("after_id".to_owned(), after_id.clone()));
+        }
+        let mut request = client
+            .get(base_url)
+            .timeout(DISCOVERY_TIMEOUT)
+            .query(&query);
+        if let Some(key) = api_key {
+            request = request.header("anthropic-version", crate::anthropic::ANTHROPIC_VERSION);
+            request = match crate::classify_anthropic_secret(key.to_owned()) {
+                crate::AnthropicCredential::OAuth(secret) => request
+                    .bearer_auth(secret.expose_secret())
+                    .header("anthropic-beta", crate::anthropic::ANTHROPIC_OAUTH_BETA),
+                crate::AnthropicCredential::ApiKey(secret) => {
+                    request.header("x-api-key", secret.expose_secret())
+                }
+                crate::AnthropicCredential::Bearer(secret) => {
+                    request.bearer_auth(secret.expose_secret())
+                }
+            };
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|error| DiscoveryError::Network {
+                detail: classify_transport_detail(&error),
+            })?;
+
+        let status = response.status();
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            return Err(DiscoveryError::Auth {
+                status: status.as_u16(),
+                detail: format!("Provider '{provider_name}' hat den API-Schlüssel abgelehnt"),
+            });
+        }
+        if !status.is_success() {
+            return Err(DiscoveryError::Api {
+                status: status.as_u16(),
+                detail: format!("Provider '{provider_name}' antwortete mit Status {status}"),
+            });
+        }
+
+        let body: Value = response
+            .json()
+            .await
+            .map_err(|_error| DiscoveryError::Decode {
+                detail: format!("Antwort von Provider '{provider_name}' ist kein gültiges JSON"),
+            })?;
+
+        let page_models = parse_models_response(&body);
+        let page_had_entries = !page_models.is_empty();
+        all_models.extend(page_models);
+
+        match next_anthropic_page_cursor(&body, page_had_entries) {
+            Some(next_after_id) => after_id = Some(next_after_id),
+            None => break,
+        }
+    }
+    Ok(all_models)
+}
+
+/// Bestimmt anhand einer Anthropic-`/v1/models`-Antwortseite, ob eine weitere
+/// Seite abgerufen werden soll, und liefert ggf. den `after_id`-Wert dafür.
+///
+/// # Description
+/// Reine, netzwerkfreie Hilfsfunktion für Tests und
+/// [`list_anthropic_models_paginated`]. Liefert `None`, wenn `has_more` fehlt
+/// oder `false` ist, wenn die Seite keine Einträge lieferte (verhindert eine
+/// Endlosschleife, falls ein Server dauerhaft `has_more: true` ohne
+/// fortschreitende Daten meldet) oder wenn weder `last_id` noch die `id` des
+/// letzten `data`-Eintrags als Fortsetzungswert taugen.
+///
+/// # Arguments
+/// - `body` (`&Value`): die vollständige JSON-Antwort einer Seite.
+/// - `page_had_entries`: `true`, wenn [`parse_models_response`] für diese
+///   Seite mindestens ein Modell geliefert hat.
+fn next_anthropic_page_cursor(body: &Value, page_had_entries: bool) -> Option<String> {
+    let has_more = body
+        .get("has_more")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !has_more || !page_had_entries {
+        return None;
+    }
+    body.get("last_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            body.get("data")
+                .and_then(Value::as_array)
+                .and_then(|entries| entries.last())
+                .and_then(|entry| entry.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
 }
 
 fn parse_codex_models_response(body: &Value) -> Result<Vec<DiscoveredModel>, DiscoveryError> {
@@ -472,5 +607,49 @@ mod tests {
         let body = json!({"data": [{"id": "x", "supported_parameters": ["temperature"]}]});
         let models = parse_models_response(&body);
         assert_eq!(models[0].supports_tools, Some(false));
+    }
+
+    #[test]
+    fn test_next_anthropic_page_cursor_none_when_has_more_missing_or_false() {
+        assert_eq!(
+            next_anthropic_page_cursor(&json!({"data": [{"id": "a"}]}), true),
+            None
+        );
+        assert_eq!(
+            next_anthropic_page_cursor(&json!({"data": [{"id": "a"}], "has_more": false}), true),
+            None
+        );
+    }
+
+    #[test]
+    fn test_next_anthropic_page_cursor_uses_last_id_when_present() {
+        let body = json!({"data": [{"id": "a"}, {"id": "b"}], "has_more": true, "last_id": "b"});
+        assert_eq!(
+            next_anthropic_page_cursor(&body, true),
+            Some("b".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_next_anthropic_page_cursor_falls_back_to_last_entry_id_without_last_id() {
+        let body = json!({"data": [{"id": "a"}, {"id": "b"}], "has_more": true});
+        assert_eq!(
+            next_anthropic_page_cursor(&body, true),
+            Some("b".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_next_anthropic_page_cursor_none_when_page_had_no_entries() {
+        // `has_more: true` ohne fortschreitende Daten darf keine Endlosschleife
+        // auslösen, selbst wenn `last_id` gesetzt ist.
+        let body = json!({"data": [], "has_more": true, "last_id": "stale"});
+        assert_eq!(next_anthropic_page_cursor(&body, false), None);
+    }
+
+    #[test]
+    fn test_next_anthropic_page_cursor_none_when_no_id_available() {
+        let body = json!({"data": [{"name": "no id"}], "has_more": true});
+        assert_eq!(next_anthropic_page_cursor(&body, true), None);
     }
 }

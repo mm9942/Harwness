@@ -28,9 +28,14 @@
 //! aus `executor()`. Ein Kind kann das Werkzeug damit weder sehen noch durch
 //! Raten seines Namens aufrufen — die Beschränkung ist keine Prompt-Bitte.
 //!
-//! # Browser nur mit Grant (W5 RD, F-073)
-//! Kein Profil registriert `browser.*`. Die Werkzeuge entstehen ausschließlich
-//! über `browser_tool_provider` (Feature `browser`) mit einem ausdrücklichen
+//! # Browser nur mit Grant (W5 RD, F-073) — Ausnahme `UiaQuickHelper`
+//! Kein Profil registriert `browser.*` — mit **einer** dokumentierten
+//! Ausnahme: [`RegistryProfile::UiaQuickHelper`] registriert und bewirbt
+//! statisch `browser.open` (Nutzerentscheidung, siehe die Begründung bei
+//! [`RegistryProfile::UiaQuickHelper`] und [`UIA_QUICK_HELPER_BROWSER_TOOLS`]).
+//! Alle übrigen sechs `browser.*`-Werkzeuge bleiben für jedes Profil verboten.
+//! Der tatsächliche Laufzeit-Provider entsteht weiterhin ausschließlich über
+//! `browser_tool_provider` (Feature `browser`) mit einem ausdrücklichen
 //! `harw_tool_browser::BrowserOpenGrant`; vorher hängte `Full` sie unter dem
 //! Feature still und ohne Grant an.
 //!
@@ -60,7 +65,7 @@ use harw_sandbox::{HostPermitSessionRegistry, ProcessPermitLedger, SandboxProfil
 use harw_tool_deps::DepsToolProvider;
 use harw_tool_fs::FsToolProvider;
 use harw_tool_lens::LensToolProvider;
-use harw_tool_shell::ShellToolProvider;
+use harw_tool_shell::{HostPermitPromptSender, HostPermitVariant, ShellToolProvider};
 use harw_tool_web::WebToolProvider;
 
 #[cfg(feature = "browser")]
@@ -339,6 +344,21 @@ pub(crate) const WEB_TOOLS: &[&str] = &["web.fetch", "web.docs_rs", "web.crates_
 /// eine eigene, wertgleiche Liste zu pflegen.
 pub(crate) const UIA_QUICK_HELPER_WEB_TOOLS: &[&str] = &["web.fetch"];
 
+/// Das einzige Browser-Werkzeug von [`RegistryProfile::UiaQuickHelper`]
+/// (Nutzerentscheidung, ersetzt Addendum I in diesem Punkt): `uia-worker`
+/// darf `browser.open` benutzen — `agents/uia-worker.toml` admittiert es
+/// weiterhin. Statt eines expliziten Laufzeit-Grants
+/// (`browser_tool_provider`, das sonst für **jedes** `browser.*`-Werkzeug der
+/// einzige Weg ist, siehe die Moduldokumentation oben) registriert und
+/// bewirbt `UiaQuickHelper` dieses eine Werkzeug statisch, im selben Muster
+/// wie [`UIA_QUICK_HELPER_WEB_TOOLS`] es für `web.fetch` tut — genau ein
+/// benanntes Werkzeug, nicht die ganze Werkzeugfläche seines Providers.
+/// Bewusst **kein** weiteres Browser-Werkzeug: `browser.observe`/`find`/
+/// `act`/`wait`/`events`/`close` bleiben für jedes Profil (inklusive
+/// `UiaQuickHelper`) verboten, siehe [`BROWSER_TOOLS`] und
+/// `harw-registry-defaults/tests/role_rights_matrix.rs`.
+pub(crate) const UIA_QUICK_HELPER_BROWSER_TOOLS: &[&str] = &["browser.open"];
+
 /// Das lesende Werkzeug von
 /// `crate::agent_definition_tools::AgentDefinitionToolProvider` (K-C,
 /// Addendum K): parst und senkt einen Agentendefinitions-Entwurf über
@@ -436,10 +456,15 @@ pub(crate) const LENS_TOOLS: &[&str] = &["lens.ask"];
 
 /// Die Browser-Werkzeuge, in Provider-Reihenfolge.
 ///
-/// Kein Profil registriert sie (W5 RD): sie entstehen nur über
-/// `browser_tool_provider` (Feature `browser`) mit ausdrücklichem Grant. Die
-/// Liste bleibt ohne Feature bestehen, damit
+/// Kein Profil registriert die vollständige Liste (W5 RD): sie entstehen nur
+/// über `browser_tool_provider` (Feature `browser`) mit ausdrücklichem Grant.
+/// Die Liste bleibt ohne Feature bestehen, damit
 /// [`crate::authority::tool_permission`] und die Rechte-Matrix sie kennen.
+///
+/// Einzige Ausnahme: [`RegistryProfile::UiaQuickHelper`] registriert daraus
+/// statisch das erste Element, `browser.open`, über
+/// [`UIA_QUICK_HELPER_BROWSER_TOOLS`] (Nutzerentscheidung) — die übrigen
+/// sechs bleiben für jedes Profil verboten.
 pub(crate) const BROWSER_TOOLS: &[&str] = &[
     "browser.open",
     "browser.observe",
@@ -563,8 +588,10 @@ pub enum RegistryProfile {
     /// Schnellhelfer der UIA (Addendum I, korrigiert REG-DE): lesender
     /// Workspace-Zugriff (`FS_READ_ONLY_TOOLS`) plus `shell.exec`
     /// (`SHELL_TOOLS`, läuft wie überall über Sandbox+Freigabe) plus
-    /// ausschließlich `web.fetch` — kein `fs.write`, kein `deps.*`, kein
-    /// `lens.ask`, kein `browser.*`.
+    /// ausschließlich `web.fetch` plus ausschließlich `browser.open`
+    /// (Nutzerentscheidung, siehe [`UIA_QUICK_HELPER_BROWSER_TOOLS`]) — kein
+    /// `fs.write`, kein `deps.*`, kein `lens.ask`, keine der übrigen sechs
+    /// `browser.*`-Werkzeuge.
     ///
     /// # Warum dieses Profil existiert (Addendum I)
     /// [`role_names::UIA_WORKER`] war zuvor auf [`RegistryProfile::Research`]
@@ -575,6 +602,17 @@ pub enum RegistryProfile {
     /// Datei lesen — nicht nur Netz-Recherche. `web.fetch` bleibt die
     /// einzige Netz-Oberfläche (kein `web.docs_rs`/`web.crates_io`, die für
     /// tiefere Recherche gedacht sind, siehe `RegistryProfile::Research`).
+    ///
+    /// # Warum `browser.open` (spätere Nutzerentscheidung)
+    /// `uia-worker` darf `browser.open` benutzen — `agents/uia-worker.toml`
+    /// admittiert es weiterhin. Damit die Rolle das Werkzeug tatsächlich im
+    /// System-Prompt-Inventar sieht (sonst hinge sie an einer Rückfrage fest,
+    /// die sie mit `allow_pause = false` nie beantworten könnte, siehe
+    /// `harw-registry-defaults/tests/tool_admission_coverage.rs`), registriert
+    /// und bewirbt `UiaQuickHelper` dieses eine Browser-Werkzeug statisch —
+    /// die übrigen sechs (`browser.observe`/`find`/`act`/`wait`/`events`/
+    /// `close`) bleiben verboten, siehe
+    /// `harw-registry-defaults/tests/role_rights_matrix.rs`.
     UiaQuickHelper,
     /// Der lesende `fs.*`-Kern ([`FS_READ_ONLY_TOOLS`]) plus die
     /// Agentendefinitions-Werkzeuge von
@@ -794,12 +832,14 @@ impl RegistryProfile {
             // `RegistryProfile::MemoryStewardship`.
             RegistryProfile::MemoryStewardship => MEMORY_STEWARDSHIP_TOOLS.to_vec(),
             // Schnellhelfer der UIA (Addendum I): lesender fs.*-Kern plus
-            // `shell.exec` plus ausschließlich `web.fetch` — siehe die
+            // `shell.exec` plus ausschließlich `web.fetch` plus
+            // ausschließlich `browser.open` (Nutzerentscheidung) — siehe die
             // Begründung bei `RegistryProfile::UiaQuickHelper`.
             RegistryProfile::UiaQuickHelper => FS_READ_ONLY_TOOLS
                 .iter()
                 .chain(SHELL_TOOLS.iter())
                 .chain(UIA_QUICK_HELPER_WEB_TOOLS.iter())
+                .chain(UIA_QUICK_HELPER_BROWSER_TOOLS.iter())
                 .copied()
                 .collect(),
             // `agent-steward` (Addendum K + Nachtrag K2): lesender fs.*-Kern
@@ -1249,6 +1289,71 @@ pub fn agent_definition_tool_names_for_access(
     tools
 }
 
+/// Die Verdrahtung für Host-Profil-Permit-Prüfung, die
+/// [`profile_tool_providers`] an jeden tatsächlich mit
+/// [`SandboxProfile::Host`] gebauten [`ShellToolProvider`] hängt.
+///
+/// # Beschreibung
+/// Bündelt die drei Werte, die zusammen die Permit-Kette eines
+/// Host-Profil-`shell.exec`-Aufrufs bilden: den einmal je Lauf
+/// instanziierten [`ProcessPermitLedger`], die dazugehörige
+/// [`HostPermitSessionRegistry`] und die Sendeseite des
+/// Host-Permit-Fragekanals ([`HostPermitPromptSender`],
+/// `harw_tool_shell::host_permit_prompt`). Ohne angehängten Sender lehnt
+/// `harw_tool_shell::exec::ShellExecutor::authorize_host_command` jede
+/// Anfrage ohne bereits gemerkten Permit oder laufende Sitzungsphase sofort
+/// ab — vor dieser Ergänzung erreichte der Sender, den
+/// `harw_runtime::assembly::RuntimeAssembly` bereits baute, nie einen
+/// gebauten `ShellToolProvider`, sodass ein Host-Profil-Shell-Worker nie eine
+/// Rückfrage stellen konnte. Dieser Typ schließt genau diese Lücke, indem er
+/// den Sender zusammen mit Ledger und Registry an [`profile_tool_providers`]
+/// transportiert.
+///
+/// # Vorausgewählte Variante
+/// `preselected_variant` ist reine Anzeige-Vorauswahl für eine offene Frage
+/// (siehe [`HostPermitVariant`]) und ändert nie, was tatsächlich genehmigt
+/// wird. Die Vorgabe über [`Self::new`] ist [`HostPermitVariant::default`]
+/// (`SingleExecution`); [`Self::with_preselected_variant`] wählt bewusst eine
+/// andere Variante.
+#[derive(Debug, Clone)]
+pub struct HostPermitWiring {
+    /// Der einmal je Lauf instanziierte Permit-Ledger.
+    pub ledger: Arc<ProcessPermitLedger>,
+    /// Die dazugehörige Sitzungs-Registry.
+    pub registry: Arc<HostPermitSessionRegistry>,
+    /// Sendeseite des Host-Permit-Fragekanals; ohne sie bleibt Host-Ausführung
+    /// ohne bereits gemerkten Permit oder laufende Sitzungsphase fail-closed.
+    pub prompt_sender: HostPermitPromptSender,
+    /// Anzeige-Vorauswahl für eine neu geöffnete Frage; ändert nie, was
+    /// tatsächlich genehmigt wird.
+    pub preselected_variant: HostPermitVariant,
+}
+
+impl HostPermitWiring {
+    /// Baut die Verdrahtung mit [`HostPermitVariant::default`]
+    /// (`SingleExecution`) als Vorauswahl.
+    #[must_use]
+    pub fn new(
+        ledger: Arc<ProcessPermitLedger>,
+        registry: Arc<HostPermitSessionRegistry>,
+        prompt_sender: HostPermitPromptSender,
+    ) -> Self {
+        Self {
+            ledger,
+            registry,
+            prompt_sender,
+            preselected_variant: HostPermitVariant::default(),
+        }
+    }
+
+    /// Setzt die Anzeige-Vorauswahl einer neu geöffneten Frage.
+    #[must_use]
+    pub fn with_preselected_variant(mut self, variant: HostPermitVariant) -> Self {
+        self.preselected_variant = variant;
+        self
+    }
+}
+
 /// Erzeugt die Tool-Provider eines Profils in Registrierungsreihenfolge.
 ///
 /// # Argumente
@@ -1263,23 +1368,28 @@ fn profile_tool_providers(
     agent_definition_access: AgentDefinitionAccess,
     sandbox_profile: &SandboxProfile,
     // Nur für Host-Profil-Worker relevant (siehe `host-process-worker.toml`):
-    // die Runtime-Montage reicht hier den einmal instanziierten Permit-Ledger
-    // und die dazugehörige Sitzungs-Registry durch, damit jeder gebaute
-    // `ShellToolProvider` `run_command`s tatsächliche `authorize()`-Prüfung
-    // erreichen kann. `None` verhält sich exakt wie vor dieser Ergänzung
-    // (Host-Ausführung bleibt dann fail-closed ohne Ledger).
-    host_permits: Option<(&Arc<ProcessPermitLedger>, &Arc<HostPermitSessionRegistry>)>,
+    // die Runtime-Montage reicht hier die einmal instanziierte
+    // `HostPermitWiring` (Ledger + Sitzungs-Registry + Fragekanal-Sender)
+    // durch, damit jeder gebaute `ShellToolProvider` sowohl
+    // `run_command`s tatsächliche `authorize()`-Prüfung als auch eine
+    // Rückfrage über den Sender erreichen kann. `None` verhält sich exakt wie
+    // vor dieser Ergänzung (Host-Ausführung bleibt dann fail-closed ohne
+    // Ledger).
+    host_permits: Option<&HostPermitWiring>,
 ) -> Vec<Arc<dyn ToolProvider>> {
     // Baut einen `ShellToolProvider` für `sandbox_profile` und hängt bei
-    // Host-Profil (falls übergeben) Ledger + Sitzungs-Registry an.
+    // Host-Profil (falls übergeben) Ledger, Sitzungs-Registry, Fragekanal-
+    // Sender und vorausgewählte Variante an.
     let build_shell_provider = |sandbox_profile: &SandboxProfile| -> Arc<dyn ToolProvider> {
         let mut provider =
             ShellToolProvider::default().with_sandbox_profile(sandbox_profile.clone());
         if sandbox_profile.is_host() {
-            if let Some((ledger, registry)) = host_permits {
+            if let Some(wiring) = host_permits {
                 provider = provider
-                    .with_permit_ledger(Arc::clone(ledger))
-                    .with_host_permit_registry(Arc::clone(registry));
+                    .with_permit_ledger(Arc::clone(&wiring.ledger))
+                    .with_host_permit_registry(Arc::clone(&wiring.registry))
+                    .with_host_permit_prompts(wiring.prompt_sender.clone())
+                    .with_preselected_permit_variant(wiring.preselected_variant);
             }
         }
         Arc::new(provider)
@@ -1883,20 +1993,22 @@ pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile(
 }
 
 /// Wie [`assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile`],
-/// nimmt aber zusätzlich den einmal von der Runtime instanziierten
-/// [`ProcessPermitLedger`] und die dazugehörige [`HostPermitSessionRegistry`]
-/// entgegen (siehe `harw_runtime::assembly::RuntimeAssembly`).
+/// nimmt aber zusätzlich die einmal von der Runtime instanziierte
+/// [`HostPermitWiring`] (Permit-Ledger, Sitzungs-Registry und die Sendeseite
+/// des Host-Permit-Fragekanals) entgegen (siehe
+/// `harw_runtime::assembly::RuntimeAssembly`).
 ///
 /// # Beschreibung
-/// Beide werden nur an einen [`ShellToolProvider`] gehängt, dessen
+/// Alle drei Werte werden nur an einen [`ShellToolProvider`] gehängt, dessen
 /// `sandbox_profile` tatsächlich [`SandboxProfile::Host`] ist —
 /// Strict/Cargo/Tmux bleiben unverändert, weil für sie die Sandbox selbst die
 /// Grenze ist, nicht der Permit. Die Runtime muss über beide Aufrufstellen
 /// (Host- und Nicht-Host-Zweig, siehe `harw-runtime/src/assembly.rs`)
-/// **dieselbe** `Arc`-Instanz von Ledger und Registry durchreichen: ein
-/// zweiter, unabhängig instanziierter Ledger hätte keine Kenntnis von den
-/// bereits gemerkten Sitzungszustimmungen und würde jede Host-Ausführung
-/// erneut ablehnen.
+/// **dieselbe** `Arc`-Instanz von Ledger und Registry sowie denselben
+/// Sender-Klon durchreichen: ein zweiter, unabhängig instanziierter Ledger
+/// hätte keine Kenntnis von den bereits gemerkten Sitzungszustimmungen und
+/// würde jede Host-Ausführung erneut ablehnen; ein anderer Sender ließe die
+/// Frage nie beim Empfänger ankommen, den die Runtime tatsächlich pollt.
 ///
 /// `None` verhält sich exakt wie
 /// [`assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile`]:
@@ -1914,11 +2026,11 @@ pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile(
 /// - `sandbox_profile` (`&SandboxProfile`): vertrauenswürdiges, von der
 ///   Runtime gewähltes Sandbox-Profil; wird an jeden konstruierten
 ///   [`ShellToolProvider`] weitergegeben.
-/// - `host_permits` (`Option<(Arc<ProcessPermitLedger>, Arc<HostPermitSessionRegistry>)>`):
-///   der einmal je Lauf instanziierte Permit-Ledger und die zugehörige
-///   Sitzungs-Registry; Eigentum der `Arc`s geht über (nur der Zeiger wird
-///   geteilt, nicht der Zustand kopiert). `None`, wenn diese Montage keine
-///   Permit-geschützte Host-Ausführung anbietet.
+/// - `host_permits` (`Option<`[`HostPermitWiring`]`>`): der einmal je Lauf
+///   instanziierte Permit-Ledger, die zugehörige Sitzungs-Registry und die
+///   Sendeseite des Host-Permit-Fragekanals; Eigentum geht über (nur Zeiger
+///   und Sender-Handle werden geteilt, nicht der Zustand kopiert). `None`,
+///   wenn diese Montage keine Permit-geschützte Host-Ausführung anbietet.
 ///
 /// # Rückgabe
 /// `Ok(AssembledRegistry)`; `identity.tools_available` ist exakt die Menge der
@@ -1936,9 +2048,11 @@ pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile(
 ///
 /// # Nebenläufigkeit
 /// Synchron; alle erzeugten Provider sind `Send + Sync`. `host_permits`
-/// bringt bereits `Arc`-geteilten, intern gesperrten Zustand mit
-/// ([`ProcessPermitLedger`]/[`HostPermitSessionRegistry`] kapseln ihre eigene
-/// Synchronisierung); diese Funktion selbst hält keine Sperre.
+/// bringt bereits `Arc`-geteilten, intern gesperrten Zustand sowie einen
+/// `Clone + Send + Sync` Sender mit ([`ProcessPermitLedger`]/
+/// [`HostPermitSessionRegistry`] kapseln ihre eigene Synchronisierung, der
+/// Fragekanal ist ein `tokio::sync::mpsc::UnboundedSender`); diese Funktion
+/// selbst hält keine Sperre.
 ///
 /// # Examples
 /// ```rust,no_run
@@ -1946,15 +2060,17 @@ pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile(
 /// use harw_extension_api::approval_mode::ApprovalModeCell;
 /// use harw_project_discovery::ProjectContext;
 /// use harw_registry_defaults::profile::{
-///     IdentityOverrides, RegistryProfile,
+///     HostPermitWiring, IdentityOverrides, RegistryProfile,
 ///     assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits,
 /// };
 /// use harw_authority::PermissionSet;
 /// use harw_sandbox::{HostPermitSessionRegistry, ProcessPermitLedger, SandboxProfile};
+/// use harw_tool_shell::host_permit_prompt_channel;
 ///
 /// # fn demo(project: &ProjectContext) -> Result<(), Box<dyn std::error::Error>> {
 /// let ledger = Arc::new(ProcessPermitLedger::default());
 /// let registry = Arc::new(HostPermitSessionRegistry::default());
+/// let (prompt_sender, _prompt_receiver) = host_permit_prompt_channel();
 /// let registry_out = assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits(
 ///     RegistryProfile::ShellExecution,
 ///     project,
@@ -1963,7 +2079,7 @@ pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile(
 ///     &PermissionSet::from_policy([harw_authority::Permission::ExecuteProcess]),
 ///     None,
 ///     &SandboxProfile::Strict,
-///     Some((ledger, registry)),
+///     Some(HostPermitWiring::new(ledger, registry, prompt_sender)),
 /// )?;
 /// let _ = registry_out;
 /// # Ok(())
@@ -1977,7 +2093,7 @@ pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_
     granted: &PermissionSet,
     access: Option<AgentDefinitionAccess>,
     sandbox_profile: &SandboxProfile,
-    host_permits: Option<(Arc<ProcessPermitLedger>, Arc<HostPermitSessionRegistry>)>,
+    host_permits: Option<HostPermitWiring>,
 ) -> RegistryDefaultsResult<AssembledRegistry> {
     let agent_definition_access = access.unwrap_or_else(|| AgentDefinitionAccess {
         project_agents_dir: Some(project.project_root.join(".harw").join("agents")),
@@ -2003,9 +2119,7 @@ pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_
         profile,
         agent_definition_access,
         sandbox_profile,
-        host_permits
-            .as_ref()
-            .map(|(ledger, registry)| (ledger, registry)),
+        host_permits.as_ref(),
     )
     .into_iter()
     .filter_map(|provider| restrict_provider(provider, &allowed))
@@ -2097,6 +2211,18 @@ mod tests {
             if *profile == RegistryProfile::AgentStewardship {
                 continue;
             }
+            // `UiaQuickHelper` ist eine zweite, ebenso dokumentierte Ausnahme
+            // (Nutzerentscheidung): `browser.open` braucht laut Moduldokumentation
+            // ("Browser nur mit Grant") weiterhin einen tatsächlichen
+            // `harw_tool_browser::BrowserOpenGrant` über `browser_tool_provider`
+            // (Feature `browser`, standardmäßig **aus**), den `profile_tool_providers`
+            // für dieses Profil (noch) nicht baut. `registered_tool_names()`
+            // bleibt bewusst die vollständige, statisch beworbene Vertrags-
+            // Obermenge (siehe `tests/tool_admission_coverage.rs`); der
+            // dedizierte Test unten prüft den tatsächlichen Laufzeitzustand.
+            if *profile == RegistryProfile::UiaQuickHelper {
+                continue;
+            }
             let assembled = assemble(*profile);
             let expected: Vec<String> = profile
                 .registered_tool_names()
@@ -2109,6 +2235,33 @@ mod tests {
                 "{profile:?}: die statische Liste muss der Registry entsprechen"
             );
         }
+    }
+
+    /// Nutzerentscheidung: `RegistryProfile::UiaQuickHelper::registered_tool_names()`
+    /// bewirbt `browser.open` statisch (siehe
+    /// [`UIA_QUICK_HELPER_BROWSER_TOOLS`]), aber `profile_tool_providers` baut
+    /// dafür (noch) keinen tatsächlichen Browser-Provider — der bräuchte einen
+    /// `harw_tool_browser::BrowserOpenGrant`, den nur `browser_tool_provider`
+    /// (Feature `browser`, standardmäßig aus) liefert. Ohne diese Erweiterung
+    /// bleibt die tatsächlich montierte Registry also exakt die vorherige
+    /// Werkzeugmenge ohne `browser.open` — dieser Test macht das explizit,
+    /// statt es stillschweigend an der Ausnahme oben hängen zu lassen.
+    #[test]
+    fn test_uia_quick_helper_does_not_yet_build_a_runtime_browser_provider() {
+        let assembled = assemble(RegistryProfile::UiaQuickHelper);
+        let registered = registered_names(&assembled);
+        assert!(
+            !registered.iter().any(|tool| tool == "browser.open"),
+            "profile_tool_providers baut noch keinen Browser-Provider für \
+             UiaQuickHelper; sobald ein Grant durchgereicht wird, muss dieser \
+             Test zusammen mit der Ausnahme oben entfernt werden"
+        );
+        assert!(
+            RegistryProfile::UiaQuickHelper
+                .registered_tool_names()
+                .contains(&"browser.open"),
+            "die statische Liste muss browser.open weiterhin bewerben"
+        );
     }
 
     /// Nachtrag K3: ohne eine gesetzte [`AgentDefinitionAccess`] registriert
@@ -2211,8 +2364,14 @@ mod tests {
         for profile in RegistryProfile::ALL {
             let names = profile.registered_tool_names();
             for tool in BROWSER_TOOLS {
+                // Einzige dokumentierte Ausnahme (Nutzerentscheidung): nur
+                // `UiaQuickHelper` registriert `browser.open` — statisch, ohne
+                // Laufzeit-Grant. Die übrigen sechs Browser-Werkzeuge bleiben
+                // für jedes Profil, `UiaQuickHelper` eingeschlossen, verboten.
+                let is_the_documented_exception =
+                    *profile == RegistryProfile::UiaQuickHelper && *tool == "browser.open";
                 assert!(
-                    !names.contains(tool),
+                    is_the_documented_exception || !names.contains(tool),
                     "{profile:?} registriert {tool} ohne Grant"
                 );
             }
@@ -2439,6 +2598,17 @@ mod tests {
             // dedizierte Test `test_agent_stewardship_registers_only_read_
             // and_list_without_access` prüft diesen Fall bereits exakt.
             if *profile == RegistryProfile::AgentStewardship {
+                continue;
+            }
+            // `UiaQuickHelper` ist auch hier die zweite Ausnahme
+            // (Nutzerentscheidung, siehe
+            // `test_uia_quick_helper_does_not_yet_build_a_runtime_browser_provider`
+            // oben): `tool_names()` bewirbt `browser.open` statisch, aber ohne
+            // einen `harw_tool_browser::BrowserOpenGrant` (Feature `browser`,
+            // standardmäßig aus) baut `profile_tool_providers` dafür keinen
+            // Provider — der tatsächlich beworbene Prompt-Satz bleibt also
+            // ohne `browser.open`.
+            if *profile == RegistryProfile::UiaQuickHelper {
                 continue;
             }
             let assembled = assemble(*profile);
@@ -2851,12 +3021,28 @@ mod tests {
             }
         }
 
+        /// Baut eine [`HostPermitWiring`] aus Ledger und Registry, deren
+        /// Fragekanal-Empfänger sofort verworfen wird: `sender.send(..)`
+        /// scheitert dadurch synchron (der Kanal ist bereits geschlossen),
+        /// statt bis `host_permit_timeout` auf eine nie kommende Antwort zu
+        /// warten. Repliziert exakt das alte Verhalten „kein Fragekanal
+        /// angehängt" (fail-closed, `requires local UI approval`) für Tests,
+        /// die keine tatsächliche Rückfrage beantworten wollen.
+        fn wiring_with_closed_channel(
+            ledger: Arc<ProcessPermitLedger>,
+            registry: Arc<HostPermitSessionRegistry>,
+        ) -> HostPermitWiring {
+            let (sender, receiver) = harw_tool_shell::host_permit_prompt_channel();
+            drop(receiver);
+            HostPermitWiring::new(ledger, registry, sender)
+        }
+
         /// Baut eine Registry über `profile_tool_providers` (über den
         /// öffentlichen Einstiegspunkt) mit `sandbox_profile` und
         /// `host_permits` und liefert deren `shell.exec`-Executor.
         fn shell_executor_for(
             sandbox_profile: &SandboxProfile,
-            host_permits: Option<(Arc<ProcessPermitLedger>, Arc<HostPermitSessionRegistry>)>,
+            host_permits: Option<HostPermitWiring>,
             project_root: &std::path::Path,
         ) -> Arc<dyn ToolExecutor> {
             let project = discover_project(project_root, &DiscoveryConfig::default())
@@ -2890,7 +3076,7 @@ mod tests {
         /// — der Test beweist damit gerade, dass der Zweig trotzdem den
         /// Host-Provider baut.
         fn uia_shell_worker_executor_for(
-            host_permits: Option<(Arc<ProcessPermitLedger>, Arc<HostPermitSessionRegistry>)>,
+            host_permits: Option<HostPermitWiring>,
             project_root: &std::path::Path,
         ) -> Arc<dyn ToolExecutor> {
             let project = discover_project(project_root, &DiscoveryConfig::default())
@@ -2955,7 +3141,7 @@ mod tests {
             let ledger = Arc::new(ProcessPermitLedger::default());
             let registry = Arc::new(HostPermitSessionRegistry::default());
             let executor = uia_shell_worker_executor_for(
-                Some((Arc::clone(&ledger), Arc::clone(&registry))),
+                Some(wiring_with_closed_channel(ledger, registry)),
                 &project_root,
             );
             let tmp = tempfile::tempdir().expect("tempdir");
@@ -3010,7 +3196,7 @@ mod tests {
             let registry = Arc::new(HostPermitSessionRegistry::default());
             let executor = shell_executor_for(
                 &SandboxProfile::Host,
-                Some((Arc::clone(&ledger), Arc::clone(&registry))),
+                Some(wiring_with_closed_channel(ledger, registry)),
                 &project_root,
             );
             let tmp = tempfile::tempdir().expect("tempdir");
@@ -3041,7 +3227,10 @@ mod tests {
             let registry = Arc::new(HostPermitSessionRegistry::default());
             let executor = shell_executor_for(
                 &SandboxProfile::Host,
-                Some((Arc::clone(&ledger), Arc::clone(&registry))),
+                Some(wiring_with_closed_channel(
+                    Arc::clone(&ledger),
+                    Arc::clone(&registry),
+                )),
                 &project_root,
             );
             let tmp = tempfile::tempdir().expect("tempdir");
@@ -3080,7 +3269,7 @@ mod tests {
             let registry = Arc::new(HostPermitSessionRegistry::default());
             let executor = shell_executor_for(
                 &SandboxProfile::Strict,
-                Some((ledger, registry)),
+                Some(wiring_with_closed_channel(ledger, registry)),
                 &project_root,
             );
             let tmp = tempfile::tempdir().expect("tempdir");
@@ -3098,6 +3287,61 @@ mod tests {
                         !message.contains("host execution requires a process permit")
                             && !message.contains("requires local UI approval"),
                         "Strict profile must never trigger a permit denial, got: {message:?}"
+                    );
+                }
+                ToolOutput::Json { .. } | ToolOutput::Text { .. } => {}
+            }
+        }
+
+        /// Beweist die eigentliche Ergänzung dieses Auftrags: `HostPermitWiring`
+        /// hängt ihren `prompt_sender` tatsächlich an den gebauten
+        /// `ShellToolProvider`, sodass eine Sitzung ohne bereits gemerkten
+        /// Permit und ohne laufende Sitzungsphase eine echte Rückfrage über
+        /// den Fragekanal erhält — statt (wie vor dieser Ergänzung, in der der
+        /// Sender nie an einen Provider gehängt wurde) sofort mit
+        /// `requires local UI approval` fail-closed abzulehnen. Ein
+        /// Hintergrund-Task pollt den Empfänger und stimmt zu; erst danach darf
+        /// die Ausführung die Permit-Grenze passieren.
+        #[tokio::test]
+        async fn test_prompt_sender_reaches_shell_provider_and_a_live_approval_passes_the_permit_boundary()
+        {
+            let project_root = make_temp_project("permits-prompt-sender-wired");
+            let ledger = Arc::new(ProcessPermitLedger::default());
+            let registry = Arc::new(HostPermitSessionRegistry::default());
+            let (sender, mut receiver) = harw_tool_shell::host_permit_prompt_channel();
+            let wiring = HostPermitWiring::new(ledger, registry, sender)
+                .with_preselected_variant(HostPermitVariant::SingleExecution);
+            let executor = shell_executor_for(&SandboxProfile::Host, Some(wiring), &project_root);
+
+            let approver = tokio::spawn(async move {
+                let prompt = receiver.recv().await.expect("prompt must arrive at the receiver");
+                assert_eq!(
+                    prompt.preselected_variant(),
+                    HostPermitVariant::SingleExecution,
+                    "the wiring's preselected variant must reach the prompt unchanged"
+                );
+                assert!(
+                    prompt.approve(HostPermitVariant::SingleExecution),
+                    "the approval must reach the waiting ShellExecutor"
+                );
+            });
+
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess]));
+            let call = make_call("echo prompt_sender_wired");
+
+            let output = executor
+                .execute(&ctx, &call)
+                .await
+                .expect("execute must not return Err");
+            approver.await.expect("approver task must not panic");
+
+            match &output {
+                ToolOutput::Error { message } => {
+                    assert!(
+                        !message.contains("host execution requires a process permit")
+                            && !message.contains("requires local UI approval"),
+                        "a live-approved prompt must pass the permit boundary, got: {message:?}"
                     );
                 }
                 ToolOutput::Json { .. } | ToolOutput::Text { .. } => {}

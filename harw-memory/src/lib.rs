@@ -12,6 +12,10 @@
 //! - [`types::Signal`], [`types::Tier`], [`types::Entry`], [`types::RecallQuery`].
 //! - [`workflow::WorkflowStep`], [`workflow::WorkflowMarker`] — persistente
 //!   Workflow-State-Machine für idempotente `maintain()`-Läufe.
+//! - [`promote::evaluate_signals`], [`promote::apply_promotion`] — gefensterte
+//!   Signal-Promotion-Auswertung (Track A, `docs/design/
+//!   track-a-memory-promotion.md`); bewusst nicht in `FileMemoryStore::maintain`
+//!   verdrahtet, siehe die Moduldoku von [`promote`].
 //!
 //! # Nebenläufigkeit
 //! `FileMemoryStore` ist `Send + Sync`. `record()` und `maintain()` serialisieren
@@ -62,6 +66,7 @@ pub mod file_store;
 pub mod heartbeat;
 pub mod learning;
 pub mod outcome_tracker;
+pub mod promote;
 pub mod short_term;
 pub mod store;
 pub mod summary;
@@ -82,6 +87,7 @@ pub use extraction::{
 pub use facts::{Fact, FactScope, FactStore, FactType, redact, slugify};
 pub use file_index::{FileKnowledge, FileKnowledgeIndex};
 pub use file_store::FileMemoryStore;
+pub use promote::{PromotionCandidate, PromotionOutcome, SignalOccurrence, apply_promotion, evaluate_signals};
 pub use store::Memory;
 pub use types::{Entry, MaintenanceReport, RecallQuery, Signal, Stats, Tier};
 pub use workflow::{WorkflowMarker, WorkflowStep};

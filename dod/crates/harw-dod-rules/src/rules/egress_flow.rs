@@ -5,7 +5,7 @@
 //! Prüft jedes `EventKind::EgressFlow`-Ereignis in
 //! [`crate::rule::RuleContext::events`] gegen
 //! [`crate::rule::RuleContext::network_scope`], über
-//! `harw_sandbox::NetworkScope::allows`/`allows_addr` — nie eine eigene
+//! `harw_authority::NetworkScope::allows`/`allows_addr` — nie eine eigene
 //! Bereichsprüfung, wie im Arbeitsauftrag verlangt.
 //!
 //! # Warum `allows` **und** `allows_addr`
@@ -13,7 +13,7 @@
 //! Hostname (`"docs.rs"`), mal eine literale Adresse
 //! (`"203.0.113.7"`). `NetworkScope::allows` prüft Hostnamen/DNS-Suffixe,
 //! `NetworkScope::allows_addr` prüft `Cidr`-Bereiche gegen eine geparste
-//! `IpAddr` — die beiden Prüfungen sind laut `harw_sandbox`-Moduldoku
+//! `IpAddr` — die beiden Prüfungen sind laut `harw_authority`-Moduldoku
 //! disjunkt (`Host`/`DnsSuffix`-Einträge nehmen nie an `allows_addr` teil,
 //! `Cidr`-Einträge nie an `allows`). [`destination_allowed`] wählt deshalb
 //! anhand von `destination.parse::<IpAddr>()`, welche der beiden Prüfungen
@@ -27,10 +27,10 @@
 //!
 //! # Examples
 //! ```rust
+//! use harw_authority::NetworkScope;
 //! use harw_dod_rules::rule::{Rule, RuleContext};
 //! use harw_dod_rules::rules::EgressFlowRule;
 //! use harw_dod_signals::{EventKind, SecurityEvent};
-//! use harw_sandbox::NetworkScope;
 //! use harw_types::SensorId;
 //!
 //! let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);
@@ -55,8 +55,8 @@
 
 use std::net::IpAddr;
 
+use harw_authority::NetworkScope;
 use harw_dod_signals::{EventKind, Hardness, Severity};
-use harw_sandbox::NetworkScope;
 
 use crate::finding::{Finding, FindingKind, Raw};
 use crate::rule::{Rule, RuleContext};
@@ -183,7 +183,7 @@ mod tests {
     fn test_address_inside_cidr_scope_does_not_trigger() {
         // `NetworkScope` bietet keinen anderen öffentlichen Konstruktor für
         // ein `Cidr`-Ziel als seine `Deserialize`-Implementierung (siehe
-        // `harw_sandbox`-Moduldoku zu `EgressTarget`).
+        // `harw_authority`-Moduldoku zu `EgressTarget`).
         let scope: NetworkScope =
             serde_json::from_str(r#"{"allow_hosts":["203.0.113.0/24"]}"#)
                 .expect("NetworkScope liest ein Cidr-Ziel");

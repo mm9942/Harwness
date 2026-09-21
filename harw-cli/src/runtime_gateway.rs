@@ -53,6 +53,26 @@
 //! unverändert mit dem Präfix `"gateway: "` als `Err` zurückgegeben; es gibt
 //! keinen Echo-Zweig.
 //!
+//! **Gateway-eigenes Vorab-Gate, unabhängig von `harw-runtime`s
+//! Kulanz-Fallback:** `harw_runtime::model::build_root_model_with_resolver`
+//! (Aufbau-interner Schritt von `RuntimeAssemblyBuilder::build`) startet für
+//! interaktive Einstiege (CLI/TUI) inzwischen auch **ohne** nutzbaren
+//! Provider erfolgreich — der Fehler erscheint dort erst beim ersten
+//! tatsächlichen Modell-Aufruf, nicht beim Bau (`DefaultModelResolution::
+//! NoneUsable` → `UnusableModelProvider`, siehe `harw-runtime/src/model.rs`).
+//! Für einen unbeaufsichtigten Hintergrund-Daemon ohne Bedienoberfläche wäre
+//! das kein sichtbarer Fehler, sondern ein Daemon, der lautlos akzeptiert,
+//! aber nie antwortet — das verletzt G-048 in der Sache, auch ohne Echo-Text.
+//! [`gateway_assembly`] lädt deshalb die Konfiguration ein zweites Mal (nach
+//! demselben, bereits an anderer Stelle dieses Moduls etablierten Muster
+//! wiederholten, aber günstigen Lesens einer TOML-Datei) und bricht selbst
+//! mit `Err` ab, wenn [`config_has_usable_provider`] keinen vorhandenen,
+//! **aktivierten** Provider findet, bevor `RuntimeAssemblyBuilder::build`
+//! überhaupt aufgerufen wird. Ein vom Scaffolding vorgesäter, aber
+//! deaktivierter Katalog-Provider (`harw-model-catalog::seed_profile_
+//! providers`, `enabled = false`) zählt dabei ausdrücklich **nicht** als
+//! vorhandene Konfiguration.
+//!
 //! # Nebenläufigkeit
 //! Rein synchron und seiteneffektfrei bis auf das, was der Bau selbst tut
 //! (Konfiguration lesen, Projekt erkennen); kein globaler Zustand.
@@ -176,7 +196,15 @@ pub(crate) fn channel_principal(entry: GatewayEntry, peer: &str) -> Principal {
 /// wird unverändert mit dem Präfix `"gateway: "` zurückgegeben. Es gibt
 /// **keinen** Echo-Fallback (Befund G-048): ein nicht baubarer Provider lässt
 /// den Gateway-Turn fehlschlagen, statt unbemerkt mit Echo-Antworten
-/// weiterzulaufen.
+/// weiterzulaufen. Zusätzlich — noch bevor `RuntimeAssemblyBuilder::build`
+/// aufgerufen wird — bricht diese Funktion mit `Err("gateway: no usable
+/// model/provider is configured; …")` ab, wenn [`config_has_usable_provider`]
+/// keinen vorhandenen, aktivierten Provider findet (siehe Moduldoku,
+/// Abschnitt „Gateway-eigenes Vorab-Gate"): `harw-runtime` selbst lässt
+/// `ModelSource::Configured` in diesem Fall inzwischen erfolgreich, aber mit
+/// einem nur bei tatsächlicher Nutzung fehlschlagenden Platzhalter-Modell
+/// bauen — für einen unbeaufsichtigten Daemon ohne Bedienoberfläche ist das
+/// kein sichtbarer Start-Fehler.
 pub(crate) fn gateway_assembly(
     entry: GatewayEntry,
     home: &Path,
@@ -186,6 +214,22 @@ pub(crate) fn gateway_assembly(
     secret_resolver: Option<Arc<dyn SecretResolver + Send + Sync>>,
 ) -> Result<RuntimeAssembly, String> {
     let spec = crate::runtime_entry::runtime_spec(entry.entry_kind(), home, cwd, principal);
+
+    // Vorab-Gate (siehe Moduldoku und diese Funktions-Doku, Abschnitt
+    // „Gateway-eigenes Vorab-Gate"): dieselbe Konfiguration, die
+    // `RuntimeAssemblyBuilder::build` gleich intern erneut lädt, wird hier
+    // vorab gelesen, ausschließlich um zu prüfen, ob überhaupt ein nutzbarer
+    // Provider referenziert wird — bevor irgendetwas sonst gebaut wird.
+    let (preliminary_config, _preliminary_trust) =
+        harw_runtime::load_config(&spec).map_err(|error| format!("gateway: {error}"))?;
+    if !config_has_usable_provider(&preliminary_config) {
+        return Err(
+            "gateway: no usable model/provider is configured; refusing to mount a gateway \
+             runtime instead of starting with a placeholder model (G-048)"
+                .to_owned(),
+        );
+    }
+
     let stores = RuntimeStores {
         state_store,
         job_store: None,
@@ -198,6 +242,50 @@ pub(crate) fn gateway_assembly(
         builder = builder.secret_resolver(resolver);
     }
     builder.build().map_err(|error| format!("gateway: {error}"))
+}
+
+/// `true`, wenn `config` mindestens einen tatsächlich nutzbaren Provider
+/// ausweist — entweder über `default_provider`/`default_model`, oder über ein
+/// katalogisiertes Modell (`config.models`), dessen Provider vorhanden
+/// **und** aktiviert ist.
+///
+/// # Description
+/// Spiegelt bewusst dieselbe „nutzbar"-Definition wie
+/// `harw_runtime::model::resolve_default_model`/`provider_is_usable`
+/// (`harw-runtime/src/model.rs`, nicht Teil dieses Schreibbereichs): ein in
+/// `config.providers` vorhandener, aber `enabled = false` gesetzter Provider
+/// zählt **nicht** als konfiguriert — insbesondere ein vom Scaffolding
+/// vorgesäter Katalog-Provider (`harw-model-catalog::seed_profile_
+/// providers`), der bis zum Onboarding oder `harw settings provider enable
+/// <id>` immer deaktiviert bleibt.
+///
+/// # Arguments
+/// - `config` (`&harw_config::ResolvedConfig`): die vorab geladene
+///   Konfiguration desselben Laufs (siehe [`gateway_assembly`]).
+///
+/// # Returns
+/// `true`, sobald irgendein Pfad zu einem vorhandenen, aktivierten Provider
+/// führt; sonst `false`.
+fn config_has_usable_provider(config: &harw_config::ResolvedConfig) -> bool {
+    let provider_is_usable = |provider_id: &str| -> bool {
+        config
+            .providers
+            .get(provider_id)
+            .is_some_and(|provider| provider.enabled)
+    };
+    let default_ok = config.harness.default_model.is_some()
+        && config
+            .harness
+            .default_provider
+            .as_deref()
+            .is_some_and(provider_is_usable);
+    if default_ok {
+        return true;
+    }
+    config
+        .models
+        .values()
+        .any(|model| provider_is_usable(&model.provider))
 }
 
 #[cfg(test)]
@@ -258,5 +346,129 @@ mod tests {
             error.starts_with("gateway: "),
             "error must carry the \"gateway: \" prefix, got: {error}"
         );
+    }
+
+    /// Ein Home mit genau einem, aber **deaktivierten** Provider — dieselbe
+    /// Form, die `harw-model-catalog::seed_profile_providers` seit dem
+    /// Scaffolding-Bundle für jeden Katalog-Eintrag vorsät (`enabled =
+    /// false`, kein Schlüssel) — muss ebenso `Err` liefern wie ein Home ganz
+    /// ohne Provider-Datei: ein deaktivierter Provider darf nie als
+    /// „vorhandene Konfiguration" zählen.
+    #[test]
+    fn test_gateway_assembly_with_only_a_disabled_provider_returns_err_not_echo() {
+        let home = tempfile::tempdir().expect("tempdir home");
+        let cwd = tempfile::tempdir().expect("tempdir cwd");
+        std::fs::write(
+            home.path().join("config.toml"),
+            "default_provider = \"seeded\"\ndefault_model = \"seeded-model\"\n",
+        )
+        .expect("write config.toml");
+        std::fs::create_dir_all(home.path().join("providers")).expect("create providers dir");
+        std::fs::write(
+            home.path().join("providers").join("seeded.toml"),
+            "name = \"seeded\"\napi = \"openai-chat\"\nbase_url = \"https://example.test/v1\"\nenabled = false\n",
+        )
+        .expect("write disabled provider");
+        let principal = channel_principal(GatewayEntry::Dream, "unused-peer");
+        let state_store: Arc<dyn StateStore> = Arc::new(InMemoryStateStore::new());
+
+        let result = gateway_assembly(
+            GatewayEntry::Dream,
+            home.path(),
+            cwd.path(),
+            principal,
+            state_store,
+            None,
+        );
+
+        let Err(error) = result else {
+            panic!("a home with only a disabled provider must not build an assembly");
+        };
+        assert!(
+            error.starts_with("gateway: "),
+            "error must carry the \"gateway: \" prefix, got: {error}"
+        );
+        assert!(
+            !error.contains("Echo"),
+            "mount error must not describe an echo fallback, got: {error}"
+        );
+    }
+
+    #[test]
+    fn config_has_usable_provider_true_when_default_provider_is_enabled() {
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.default_provider = Some("plain".to_owned());
+        config.harness.default_model = Some("model".to_owned());
+        config.providers.insert(
+            "plain".to_owned(),
+            enabled_provider_toml("plain", true),
+        );
+
+        assert!(config_has_usable_provider(&config));
+    }
+
+    #[test]
+    fn config_has_usable_provider_false_when_only_provider_is_disabled() {
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.default_provider = Some("seeded".to_owned());
+        config.harness.default_model = Some("seeded-model".to_owned());
+        config.providers.insert(
+            "seeded".to_owned(),
+            enabled_provider_toml("seeded", false),
+        );
+
+        assert!(!config_has_usable_provider(&config));
+    }
+
+    #[test]
+    fn config_has_usable_provider_true_via_catalog_model_when_default_is_dangling() {
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.default_provider = Some("missing".to_owned());
+        config.harness.default_model = Some("missing-model".to_owned());
+        config.providers.insert(
+            "catalog".to_owned(),
+            enabled_provider_toml("catalog", true),
+        );
+        config.models.insert(
+            "catalog-model".to_owned(),
+            harw_config::ModelToml {
+                id: "catalog-model".to_owned(),
+                name: None,
+                provider: "catalog".to_owned(),
+                aliases: Vec::new(),
+                context_window: None,
+                max_tokens: None,
+                prompt_caching: None,
+                reasoning: false,
+                input_types: Vec::new(),
+                capabilities: harw_config::ModelCapabilitiesToml::default(),
+            },
+        );
+
+        assert!(config_has_usable_provider(&config));
+    }
+
+    #[test]
+    fn config_has_usable_provider_false_for_an_entirely_empty_config() {
+        assert!(!config_has_usable_provider(&harw_config::ResolvedConfig::default()));
+    }
+
+    /// Minimaler `ProviderToml`-Testfixture mit explizit gesetztem `enabled`.
+    fn enabled_provider_toml(name: &str, enabled: bool) -> harw_config::ProviderToml {
+        harw_config::ProviderToml {
+            name: name.to_owned(),
+            api: "openai-chat".to_owned(),
+            base_url: "https://example.test/v1".to_owned(),
+            auth: None,
+            auth_header: Some("none".to_owned()),
+            api_key: None,
+            headers: std::collections::HashMap::new(),
+            models: Vec::new(),
+            enabled,
+            origin_allowlist: harw_config::OriginAllowlistToml::default(),
+            rate_limit: None,
+            max_concurrency: None,
+            originator: None,
+        }
     }
 }

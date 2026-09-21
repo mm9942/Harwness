@@ -1,6 +1,13 @@
 //! Quellenbindungen der Indizes: welche Dateien/Artefakte zu welchem Index
 //! gehören, wie sie zerlegt werden, und wie ein Index inkrementell wächst.
 //!
+//! Seit einem späteren Knoten (Schließung der Produktionslücke „nichts baut
+//! je einen Index") besitzt diese Crate zusätzlich [`index_status`]/
+//! [`IndexStatus`] (`crate::status`): die rein lesende Introspektion eines
+//! bereits gebauten Index, erster Konsument `harw lens status` in
+//! `harw-cli`. Siehe `crate::status`s eigenen `//!`-Block für die volle
+//! Begründung.
+//!
 //! # Verantwortungsbereich
 //! Diese Crate bindet vier Quellenarten an vier Indizes (zwei aus Knoten
 //! AW5-08, zwei neu aus Knoten AW7-05):
@@ -223,6 +230,7 @@
 mod build;
 mod document;
 mod error;
+mod status;
 
 pub use build::{build_index, IndexBuildReport, LENS_REMOTE_EMBED_ON_OPERATOR_ONLY};
 pub use document::{
@@ -230,6 +238,7 @@ pub use document::{
     visibility_of_scope, RawDocument,
 };
 pub use error::{SourceError, SourceResult};
+pub use status::{index_status, IndexStatus};
 
 /// Name des Index für Planungs- und Architekturdokumente
 /// ([`collect_design_docs`], zerlegt mit `chunk_markdown`).

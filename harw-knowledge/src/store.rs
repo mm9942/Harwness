@@ -72,6 +72,18 @@ impl KnowledgeStore {
             .join(format!("{date}.md"))
     }
 
+    /// Pfad zu einer monatlichen Diary-Rollup-Datei
+    /// (`diary/<agent-id>/rollup/<YYYY-MM>.md`, §3.3), in die `diary::gc`
+    /// Tages-Dateien komprimiert, die älter als `retention_days` sind.
+    #[must_use]
+    pub fn diary_rollup_path(&self, agent_id: &AgentId, year_month: &str) -> PathBuf {
+        self.root
+            .join("diary")
+            .join(agent_id.as_str())
+            .join("rollup")
+            .join(format!("{year_month}.md"))
+    }
+
     /// Path to a dream output file (`dreams/<YYYY-MM-DD>/<job-id>.md`).
     #[must_use]
     pub fn dream_path(&self, date: &str, job_id: &str) -> PathBuf {

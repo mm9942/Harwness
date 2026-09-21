@@ -60,17 +60,17 @@ use std::collections::HashSet;
 #[cfg(test)]
 use std::sync::Arc;
 
+use harw_authority::SandboxSpec;
 use harw_extension_api::contributors::ToolProvider;
+#[cfg(test)]
+use harw_operations::SharedSessionController;
 use harw_operations::adapter::CommandAdapter;
 #[cfg(test)]
 use harw_operations::registry::OperationRegistry;
 use harw_operations::{OpContext, PermissionTier, ServiceMap};
-#[cfg(test)]
-use harw_operations::SharedSessionController;
-use harw_sandbox::SandboxSpec;
 use harw_tool_shell::ShellToolProvider;
-use harw_tools::{ToolCall, ToolExecutionContext, ToolExecutor, ToolOutput};
 use harw_tools::spec::ToolName;
+use harw_tools::{ToolCall, ToolExecutionContext, ToolOutput};
 use harw_types::{SessionId, ToolCallId, TurnId};
 
 #[cfg(test)]
@@ -236,7 +236,12 @@ where
 /// und benötigen weiterhin ihre eigene `channel.allow_shell`-Freigabe.
 fn tui_dispatch_context(caller_permission: PermissionTier) -> DispatchContext {
     let disabled = std::env::var("HARW_DISABLE_SHELL")
-        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
         .unwrap_or(false);
     DispatchContext {
         caller_tier: caller_permission,
@@ -321,11 +326,7 @@ where
 /// Bubblewrap-gebundenen `shell.exec`-Ausführer aus. Die übergebene TUI-Sandbox
 /// ist die gesamte Autoritätsquelle; weder Arbeitsverzeichnis noch Rechte kommen
 /// aus dem vom Benutzer getippten Text.
-async fn execute_shell(
-    sandbox: &SandboxSpec,
-    session_id: &SessionId,
-    command: String,
-) -> String {
+async fn execute_shell(sandbox: &SandboxSpec, session_id: &SessionId, command: String) -> String {
     let provider = ShellToolProvider::new();
     let tool_name = ToolName::new("shell.exec");
     let Some(executor) = provider.executor(&tool_name) else {
@@ -469,11 +470,14 @@ pub(crate) fn build_services(
     let shared: SharedSessionController = Arc::clone(controller) as SharedSessionController;
     services.insert(shared);
     // Gleiche Fläche wie `RuntimeServices::service_map(ServiceSurface::Slash)`
-    // (harw-runtime/src/services.rs, `assemble`): beide Zellen gehören zur
-    // Produktionsmontage dazu. Leere, frische Zellen genügen hier — Tests
-    // prüfen keinen Regelinhalt, nur dass der Diensttyp auffindbar ist.
+    // (harw-runtime/src/services.rs, `assemble`): alle drei Zellen gehören
+    // zur Produktionsmontage dazu — `assemble` trägt
+    // `self.parts.approval_mode.clone()` unbedingt auf jeder Fläche ein.
+    // Leere, frische Zellen genügen hier — Tests prüfen keinen Regelinhalt,
+    // nur dass der Diensttyp auffindbar ist.
     services.insert(harw_extension_api::allow_rules::AllowRuleSet::new());
     services.insert(harw_sandbox::ExtraRootsCell::new());
+    services.insert(harw_extension_api::approval_mode::ApprovalModeCell::default());
     services
 }
 
@@ -483,14 +487,14 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+    use harw_authority::{
+        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    };
     use harw_operations::adapter::CommandAdapter;
     use harw_operations::registry::OperationRegistry;
     use harw_operations::{
         CommandVisibility, OpContext, OpFuture, OpInput, OpOutput, Operation, OperationCategory,
         OperationDomain, OperationMeta, PermissionTier, Surface,
-    };
-    use harw_sandbox::{
-        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
     };
     use harw_types::{SessionId, TenantId, WorkspaceId};
 
@@ -664,8 +668,12 @@ mod tests {
         let (sandbox, tmp) = test_sandbox();
         let session_id = SessionId::new();
         let controller = test_controller();
-        controller.set_active_provider("anthropic".to_owned()).unwrap();
-        controller.set_active_model("claude-sonnet".to_owned()).unwrap();
+        controller
+            .set_active_provider("anthropic".to_owned())
+            .unwrap();
+        controller
+            .set_active_model("claude-sonnet".to_owned())
+            .unwrap();
 
         let output = super::execute_command(
             &adapters,
@@ -793,26 +801,34 @@ mod tests {
             job_store: None,
         };
 
-        let shell = super::execute_with_context(&adapters, &sandbox, &session_id, context, "!ls -la", || {
-            build_services(
-                &adapters,
-                services.runtime_config,
-                services.memory,
-                services.controller,
-                services.job_store,
-            )
-        })
+        let shell = super::execute_with_context(
+            &adapters,
+            &sandbox,
+            &session_id,
+            context,
+            "!ls -la",
+            || {
+                build_services(
+                    &adapters,
+                    services.runtime_config,
+                    services.memory,
+                    services.controller,
+                    services.job_store,
+                )
+            },
+        )
         .await;
-        let repeat = super::execute_with_context(&adapters, &sandbox, &session_id, context, "!!", || {
-            build_services(
-                &adapters,
-                services.runtime_config,
-                services.memory,
-                services.controller,
-                services.job_store,
-            )
-        })
-        .await;
+        let repeat =
+            super::execute_with_context(&adapters, &sandbox, &session_id, context, "!!", || {
+                build_services(
+                    &adapters,
+                    services.runtime_config,
+                    services.memory,
+                    services.controller,
+                    services.job_store,
+                )
+            })
+            .await;
         std::fs::remove_dir_all(tmp).ok();
 
         // `test_sandbox()` gewährt nur ReadWorkspace/WriteWorkspace, kein
@@ -1059,7 +1075,10 @@ mod tests {
 
         // `stauts` (Länge 6) → gleiche Anfangsbuchstaben-Kandidaten mit minimaler
         // Längendifferenz; `status` ist in `register_all` vor `skills` registriert.
-        assert_eq!(output, "Unbekannter Command: /stauts (meinten Sie /status?)");
+        assert_eq!(
+            output,
+            "Unbekannter Command: /stauts (meinten Sie /status?)"
+        );
     }
 
     // -----------------------------------------------------------------------

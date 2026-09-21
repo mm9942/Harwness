@@ -89,6 +89,7 @@ pub mod event;
 pub mod evidence;
 pub mod sample;
 pub mod sensor;
+pub mod probe;
 pub mod verdict;
 
 pub use error::{SignalsError, SignalsResult};
@@ -96,6 +97,7 @@ pub use event::{DriftSeverity, Actor, AuthOutcome, EventKind, SecurityEvent};
 pub use evidence::{Hardness, SecurityEvidence, Severity};
 pub use sample::HostSample;
 pub use sensor::{Sensor, SensorReading};
+pub use probe::{BpfEventMetadata, BpfLossSnapshot, ProbeHeartbeat, ProbeMessage, ProbeStamp, TimeMappingConfidence};
 pub use verdict::{
     SecurityVerdict, SuggestedResponse, VerdictClassification, parse_and_validate_verdict,
     parse_verdict, validate_verdict,

@@ -4,7 +4,7 @@
 //! [`NetPlan`] ist eine reine Datenstruktur, die beschreibt, welche
 //! Egress-Regeln gelten sollen — eine geordnete Liste von [`NetRule`]s.
 //! [`plan_for_scope`] baut den Plan, der genau einen
-//! `harw_sandbox::NetworkScope` durchsetzt. Diese Crate erzeugt dabei
+//! `harw_authority::NetworkScope` durchsetzt. Diese Crate erzeugt dabei
 //! **keinen** Kernel-Zustand, öffnet **keinen** Netlink-Socket und ruft
 //! **kein** `nft` auf.
 //!
@@ -82,7 +82,7 @@
 //! # Ein zweites, unabhängiges Kopplungsrisiko
 //! [`NetPlan::allows_host`]/[`NetPlan::allows_addr`] reimplementieren
 //! notwendigerweise dieselbe Punktgrenzen-Vergleichsregel wie
-//! `harw_sandbox::NetworkScope::allows` — `harw-sandbox` exportiert diese
+//! `harw_authority::NetworkScope::allows` — `harw-sandbox` exportiert diese
 //! Hilfsfunktionen nicht öffentlich. [`plan_for_scope`] selbst braucht
 //! diese Kopie nicht: sie liest die Zielarten stattdessen über den
 //! öffentlichen `serde`-Wire-Vertrag von `EgressTarget` aus (siehe
@@ -97,7 +97,7 @@
 //! gemeinsamen Codepfad, der das verhindert. Die Eigenschaftstests in
 //! `tests/net_policy_property.rs` sind die einzige Absicherung gegen
 //! dieses Auseinanderlaufen und sollten bei jeder Änderung an
-//! `harw_sandbox::NetworkScope::allows` erneut ausgeführt werden.
+//! `harw_authority::NetworkScope::allows` erneut ausgeführt werden.
 //!
 //! # Nebenläufigkeit
 //! [`NetPlan`] und [`NetRule`] sind reine Werte ohne innere
@@ -112,7 +112,7 @@
 //!
 //! # Examples
 //! ```rust
-//! use harw_sandbox::NetworkScope;
+//! use harw_authority::NetworkScope;
 //! use harw_dod_netpolicy::{plan_for_scope, InspectBackend, NetBackend};
 //!
 //! let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);

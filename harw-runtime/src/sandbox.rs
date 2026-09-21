@@ -20,7 +20,7 @@
 //! # Netz
 //! Jede hier gebaute [`SandboxSpec`] entsteht über
 //! [`SandboxSpec::from_resolved`] und trägt damit den leeren
-//! [`harw_sandbox::NetworkScope`]; [`harw_sandbox::Permission::NetworkAccess`]
+//! [`harw_authority::NetworkScope`]; [`harw_authority::Permission::NetworkAccess`]
 //! ist in keinem Eintrag der Reduktionstabelle enthalten (Vertrag
 //! `docs/remediation/CONTRACTS.md` §runtime-spec: „Netz überall leer bis
 //! Welle W5 (P1.7)").
@@ -32,10 +32,11 @@
 
 use std::path::{Path, PathBuf};
 
-use harw_plan::PlanNodeKind;
-use harw_sandbox::{
-    Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+use harw_authority::{
+    Permission, PermissionRequest, PermissionSet, SandboxSpec, WorkspaceRegistration,
+    WorkspaceRegistry,
 };
+use harw_plan::PlanNodeKind;
 use harw_types::{PermissionTier, TenantId, WorkspaceId};
 
 use crate::error::{RuntimeError, RuntimeResult};
@@ -94,7 +95,7 @@ const fn tenant_name(entry: EntryKind) -> &'static str {
 fn bind_project(
     tenant: &str,
     project_root: &Path,
-) -> RuntimeResult<harw_sandbox::WorkspaceBinding> {
+) -> RuntimeResult<harw_authority::WorkspaceBinding> {
     let tenant = TenantId::from_str(tenant);
     let workspace = WorkspaceId::from_str(PROJECT_WORKSPACE);
     let registry = WorkspaceRegistry::build(
@@ -185,7 +186,7 @@ pub fn root_sandbox(entry: EntryKind, project_root: &Path) -> RuntimeResult<Sand
 /// # Examples
 /// ```rust
 /// use harw_runtime::sandbox::permissions_for_tier;
-/// use harw_sandbox::Permission;
+/// use harw_authority::Permission;
 /// use harw_types::PermissionTier;
 ///
 /// let observer = permissions_for_tier(PermissionTier::Observer);
@@ -263,7 +264,7 @@ pub fn plan_node_sandbox(
     } else {
         PermissionSet::from_policy([Permission::ReadWorkspace])
     };
-    Ok(root.restrict(&ceiling))
+    Ok(root.restrict(&PermissionRequest::from_permissions(ceiling.iter())))
 }
 
 #[cfg(test)]
@@ -352,8 +353,7 @@ mod tests {
         let dir = existing_root();
         let root = dir.path();
         let canonical = root.canonicalize().expect("temp dir is canonicalizable");
-        let sandbox =
-            root_sandbox(EntryKind::Tui, root).expect("temp dir binds as workspace root");
+        let sandbox = root_sandbox(EntryKind::Tui, root).expect("temp dir binds as workspace root");
         assert_eq!(sandbox.workspace().canonical_root(), canonical.as_path());
         assert_eq!(sandbox.workspace().workspace().as_str(), PROJECT_WORKSPACE);
         assert_eq!(sandbox.workspace().tenant().as_str(), "tui");
@@ -418,7 +418,9 @@ mod tests {
         let root = dir.path();
         let sandbox = root_sandbox(EntryKind::Web, root).expect("temp dir binds");
         for tier in ALL_TIERS {
-            let narrowed = sandbox.restrict(&permissions_for_tier(tier));
+            let narrowed = sandbox.restrict(&PermissionRequest::from_permissions(
+                permissions_for_tier(tier).iter(),
+            ));
             narrowed
                 .ensure_child_of(&sandbox)
                 .expect("a tier narrowing is always a reduction");

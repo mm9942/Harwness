@@ -103,6 +103,7 @@ pub fn load_config(spec: &RuntimeSpec) -> RuntimeResult<(ResolvedConfig, ConfigT
     config.validate().map_err(|error| RuntimeError::Config {
         detail: error.to_string(),
     })?;
+    log_config_diagnostics(&config);
 
     let trust = ConfigTrustReport {
         layers,
@@ -110,6 +111,35 @@ pub fn load_config(spec: &RuntimeSpec) -> RuntimeResult<(ResolvedConfig, ConfigT
         trust_status: status,
     };
     Ok((config, trust))
+}
+
+/// Protokolliert nicht-fatale Katalog-Diagnosen (`config.diagnostics`,
+/// [`harw_config::discovery::ConfigDiagnostic`]) als `tracing::warn!`.
+///
+/// # Beschreibung
+/// Eine hängende Modell-/Provider-Referenz (etwa ein `default_model`, das
+/// keinen Katalogeintrag mehr hat — genau der Fall, der zuvor den gesamten
+/// Start mit `"runtime config error: unresolved model reference '…'"`
+/// abbrach) bricht den Lauf nicht länger ab. Sie erscheint stattdessen hier
+/// als Warnzeile, damit sie im Log sichtbar bleibt, und wird an der Stelle
+/// übersprungen, an der das betroffene Modell/der Provider tatsächlich
+/// ausgewählt würde (`crate::model::build_root_model_with_resolver`).
+///
+/// # Argumente
+/// - `config` (`&ResolvedConfig`): die bereits validierte Konfiguration
+///   dieses Laufs.
+///
+/// # Nebenläufigkeit
+/// Rein synchron, kein I/O außer dem `tracing`-Aufruf.
+fn log_config_diagnostics(config: &ResolvedConfig) {
+    for diagnostic in &config.diagnostics {
+        tracing::warn!(
+            site = %diagnostic.site,
+            kind = %diagnostic.kind,
+            reference = %diagnostic.reference,
+            "unresolved catalog reference — affected entry disabled, startup continues"
+        );
+    }
 }
 
 /// Bildet einen [`HomeError`] auf die passende Montagephase ab.
@@ -322,19 +352,28 @@ mod tests {
         );
     }
 
+    /// F-046-style Regression: ein hängender Standard-Provider darf den Start
+    /// nicht mehr abbrechen ("runtime config error: unresolved model
+    /// reference '…'") — er erscheint nur noch als Diagnose auf
+    /// [`harw_config::ResolvedConfig::diagnostics`].
     #[test]
-    fn dangling_default_provider_is_a_config_error() {
+    fn dangling_default_provider_is_a_non_fatal_diagnostic() {
         let home = TempDir::new();
         let cwd = TempDir::new();
         write_layer_file(home.path(), "config.toml", "default_provider = \"missing\"\n");
 
         let result = load_config(&spec_for(home.path(), cwd.path()));
 
-        let Err(error) = result else {
-            panic!("dangling default_provider must not validate");
-        };
-        assert!(matches!(error, RuntimeError::Config { .. }), "{error}");
-        assert!(error.to_string().starts_with("runtime config error:"));
+        let (config, _trust) = result.expect("a dangling default_provider must not abort startup");
+        assert!(
+            config
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.site == "default_provider"
+                    && diagnostic.reference == "missing"),
+            "expected a diagnostic for the dangling default_provider, got {:?}",
+            config.diagnostics
+        );
     }
 
     #[test]

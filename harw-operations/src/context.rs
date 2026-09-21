@@ -33,7 +33,7 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 
-use harw_sandbox::SandboxSpec;
+use harw_authority::SandboxSpec;
 use harw_types::{SessionId, TurnId};
 
 // ── ServiceMap ────────────────────────────────────────────────────────────────

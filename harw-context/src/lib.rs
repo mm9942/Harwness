@@ -16,7 +16,7 @@
 //!   keinem Weg wachsen — das ist eine Typ-Eigenschaft, keine Konvention.
 //! - [`ContextCeiling::intersect`] ist ein Schnitt, keine Vereinigung. Eine
 //!   Decke wird beim Handoff an ein Kind im selben Schritt geschnitten wie
-//!   die Berechtigungen (Vorbild: `harw_sandbox::NetworkScope`) — ein Kind
+//!   die Berechtigungen (Vorbild: `harw_authority::NetworkScope`) — ein Kind
 //!   kann seine Decke nie anheben, weil es keine Methode dafür gibt.
 //! - [`TrustClass`]s Deklarationsreihenfolge (`Instruction < Evidence <
 //!   Data`, aus der abgeleiteten `Ord`-Instanz) ist **nicht** die

@@ -188,7 +188,8 @@ fn execute(home: &Path, action: Option<ModelsAction>) -> Result<(), ModelsError>
             provider,
             add,
             free_only,
-        }) => run_scan(home, provider, add, free_only),
+            prune,
+        }) => run_scan(home, provider, add, free_only, prune),
         Some(ModelsAction::Add {
             target: Some(target),
         }) => add_model(home, &target),
@@ -304,6 +305,7 @@ fn run_scan(
     provider_filter: Option<String>,
     add: bool,
     free_only: bool,
+    prune: bool,
 ) -> Result<(), ModelsError> {
     let (config, profile) = load_config_and_profile(home)?;
     let resolver = crate::secret_store::open_configured_secret_resolver(home, &config)
@@ -359,8 +361,20 @@ fn run_scan(
                 for model in &filtered {
                     print_discovered_model(model);
                 }
-                sync_provider_model_list(&profile, name, &filtered)?;
-                sync_discovered_model_files(&models_dir, name, &filtered)?;
+                if filtered.is_empty() {
+                    // Ein Provider, der 0 Modelle meldet, ist fast immer ein
+                    // Auth-/Endpunkt-Problem (siehe Modul-Doku) — niemals als
+                    // "der Live-Stand ist jetzt leer" interpretieren und
+                    // dementsprechend nichts löschen.
+                    println!(
+                        "  0 Modelle gemeldet — nichts entfernt; Anmeldung/Endpunkt prüfen."
+                    );
+                    add_catalog_fallback_models(&profile, name)?;
+                    continue;
+                }
+                let protected = protected_model_ids(&config, name);
+                sync_provider_model_list(&profile, name, &filtered, prune, &protected)?;
+                sync_discovered_model_files(&models_dir, name, &filtered, prune, &protected)?;
             }
             Err(error) => println!("{name}: {error}"),
         }
@@ -368,14 +382,132 @@ fn run_scan(
     Ok(())
 }
 
-/// Entfernt aus der TUI-Auswahl ausschließlich IDs, die der Provider nicht
-/// mehr meldet. Neue Live-Modelle werden bewusst nicht automatisch gewählt;
-/// dafür dienen `harw models add` und der Picker.
+/// Grund, warum `--prune` eine Modell-ID nicht löschen darf.
+///
+/// Handgeschrieben nach Projektkonvention (kein `anyhow`/`thiserror`);
+/// [`fmt::Display`] liefert den in der CLI-Ausgabe verwendeten Text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProtectionReason {
+    /// Aktiv als `default_model`, `uia_model`, `session.title_model` oder
+    /// eine interne Modellstelle (`internal_models.*`) in Verwendung.
+    InUse,
+    /// Von einem anderen geladenen Provider oder einer Agent-Definition
+    /// referenziert, obwohl die Modell-ID formal einem anderen Provider
+    /// zugeordnet ist (siehe Modul-Doku: `providers/foundry.toml` kann
+    /// `openai/gpt-5.6-terra` referenzieren).
+    Referenced(String),
+}
+
+impl fmt::Display for ProtectionReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProtectionReason::InUse => write!(formatter, "in Verwendung"),
+            ProtectionReason::Referenced(source) => {
+                write!(formatter, "referenziert von {source}")
+            }
+        }
+    }
+}
+
+/// Sammelt die Modell-IDs, die `--prune` niemals löschen darf — unabhängig
+/// davon, ob der gerade gescannte Provider (`provider_name`) sie noch meldet.
+///
+/// Zwei Quellen werden zusammengeführt:
+/// 1. **In Verwendung**: `default_model` (unter `default_provider`),
+///    `uia_model` (unter `uia_provider`, sonst `default_provider`), das
+///    veraltete `session.title_model` (Fallback auf `default_provider`)
+///    sowie jede gesetzte interne Modellstelle (`internal_models.*`, siehe
+///    [`harw_config::InternalModelPoint::ALL`]).
+/// 2. **Cross-Referenz**: jede Modell-ID, die ein *anderer* geladener
+///    Provider in seiner eigenen `models`-Auswahl führt, oder die eine
+///    geladene Agent-Definition (`AgentToml::models`) referenziert. Das
+///    deckt den Fall ab, dass `providers/foundry.toml` `models =
+///    ["gpt-5.6-terra"]` führt, obwohl `models/gpt-5.6-terra.toml` formal
+///    dem Provider `openai` gehört — ein Prune von `openai` darf diese ID
+///    nicht löschen, sonst bricht der Start an der hängenden Referenz.
+///    `provider_name`s eigene Auswahlliste zählt hier bewusst nicht mit,
+///    sonst würde Prune der Auswahlliste selbst nie greifen (siehe
+///    `sync_provider_model_list`, das genau diese Liste durchläuft).
+fn protected_model_ids(
+    config: &harw_config::ResolvedConfig,
+    provider_name: &str,
+) -> BTreeMap<String, ProtectionReason> {
+    let mut protected = BTreeMap::new();
+    let harness = &config.harness;
+    let default_provider = harness.default_provider.as_deref();
+
+    if default_provider == Some(provider_name) {
+        if let Some(id) = &harness.default_model {
+            protected.insert(id.clone(), ProtectionReason::InUse);
+        }
+        if let Some(id) = &harness.session.title_model {
+            protected.insert(id.clone(), ProtectionReason::InUse);
+        }
+    }
+
+    let uia_provider = harness.uia_provider.as_deref().or(default_provider);
+    if uia_provider == Some(provider_name) {
+        if let Some(id) = &harness.uia_model {
+            protected.insert(id.clone(), ProtectionReason::InUse);
+        }
+    }
+
+    for point in harw_config::InternalModelPoint::ALL {
+        let Some(choice) = harness.internal_models.choice(point) else {
+            continue;
+        };
+        let choice_provider = choice.provider.as_deref().or(default_provider);
+        if choice_provider == Some(provider_name) {
+            if let Some(id) = &choice.model {
+                protected.insert(id.clone(), ProtectionReason::InUse);
+            }
+        }
+    }
+
+    let mut other_provider_names: Vec<&String> = config.providers.keys().collect();
+    other_provider_names.sort();
+    for name in other_provider_names {
+        if name == provider_name {
+            continue;
+        }
+        for id in &config.providers[name].models {
+            protected
+                .entry(id.clone())
+                .or_insert_with(|| ProtectionReason::Referenced(name.clone()));
+        }
+    }
+
+    let mut agent_names: Vec<&String> = config.agents.keys().collect();
+    agent_names.sort();
+    for name in agent_names {
+        for id in &config.agents[name].models {
+            protected
+                .entry(id.clone())
+                .or_insert_with(|| ProtectionReason::Referenced(format!("{name} (Agent)")));
+        }
+    }
+
+    protected
+}
+
+/// Ohne `prune`: lässt die TUI-Auswahl unverändert und meldet nur, welche
+/// bereits gewählten IDs der Provider nicht mehr führt ("nicht mehr
+/// gemeldet"). Mit `prune`: entfernt genau diese nicht mehr gemeldeten IDs —
+/// außer sie stehen in `protected` (dann "behalten (in Verwendung)"). Neue
+/// Live-Modelle werden nie automatisch gewählt; dafür dienen `harw models
+/// add` und der Picker. Bei leerem `discovered` (sollte den Aufrufer nie
+/// erreichen, siehe [`run_scan`]) wird zur Sicherheit ebenfalls nichts
+/// verändert.
 fn sync_provider_model_list(
     profile: &Path,
     provider_name: &str,
     discovered: &[DiscoveredModel],
+    prune: bool,
+    protected: &BTreeMap<String, ProtectionReason>,
 ) -> Result<(), ModelsError> {
+    if discovered.is_empty() {
+        return Ok(());
+    }
     if !provider_name
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
@@ -398,12 +530,28 @@ fn sync_provider_model_list(
         .iter()
         .map(|model| model.id.as_str())
         .collect::<BTreeSet<_>>();
-    let ids = provider
-        .models
-        .iter()
-        .filter(|id| live.contains(id.as_str()))
-        .collect::<BTreeSet<_>>();
-    write_provider_model_list(&path, ids.into_iter().map(ToString::to_string))
+
+    if !prune {
+        for id in &provider.models {
+            if !live.contains(id.as_str()) {
+                println!("  nicht mehr gemeldet (Auswahl): {id}");
+            }
+        }
+        return Ok(());
+    }
+
+    let mut ids = BTreeSet::new();
+    for id in &provider.models {
+        if live.contains(id.as_str()) {
+            ids.insert(id.clone());
+        } else if let Some(reason) = protected.get(id.as_str()) {
+            println!("  behalten ({reason}): {id}");
+            ids.insert(id.clone());
+        } else {
+            println!("  entfernt (Auswahl): {id}");
+        }
+    }
+    write_provider_model_list(&path, ids)
 }
 
 fn write_provider_model_list(
@@ -435,6 +583,55 @@ fn parse_model_target(target: &str) -> Result<(&str, &str), ModelsError> {
 
 fn provider_path(profile: &Path, provider: &str) -> PathBuf {
     profile.join("providers").join(format!("{provider}.toml"))
+}
+
+/// `true`, wenn `base_url` erkennbar ein unkonfigurierter Platzhalter ist
+/// (z. B. `cf-worker`: `https://<dein-worker>.example/v1`, `custom`:
+/// `https://example.invalid/v1`, siehe `harw-model-catalog/src/providers.toml`).
+/// Für einen solchen Endpunkt gibt es keinen echten Live-Host, gegen den ein
+/// Katalog-Fallback sinnvoll wäre.
+fn has_placeholder_base_url(base_url: &str) -> bool {
+    base_url.contains('<') || base_url.contains(".example/") || base_url.contains("example.invalid")
+}
+
+/// Ergänzt nach einem Scan mit 0 gemeldeten Live-Modellen (siehe [`run_scan`])
+/// die Provider-Auswahl (`providers/<name>.toml`, Feld `models`) additiv um
+/// die im eingebetteten Katalog (`harw_model_catalog::embedded_catalog`)
+/// geführten Modell-IDs dieses Providers, sofern sie dort noch nicht
+/// enthalten sind. Löscht niemals etwas. Ohne passenden Katalog-Eintrag oder
+/// bei einem erkennbaren Platzhalter-`base_url` (siehe
+/// [`has_placeholder_base_url`]) passiert nichts.
+fn add_catalog_fallback_models(profile: &Path, provider_name: &str) -> Result<(), ModelsError> {
+    let Some(catalog_entry) = harw_model_catalog::embedded_catalog()
+        .into_iter()
+        .find(|entry| entry.id == provider_name)
+    else {
+        return Ok(());
+    };
+
+    let path = provider_path(profile, provider_name);
+    let document = open_document(&path)?;
+    let provider: harw_config::ProviderToml =
+        toml::from_str(&document.to_string()).map_err(|error| ModelsError::Toml {
+            path: path.clone(),
+            reason: error.to_string(),
+        })?;
+    if has_placeholder_base_url(&provider.base_url) {
+        return Ok(());
+    }
+
+    let mut ids = provider.models.iter().cloned().collect::<BTreeSet<_>>();
+    let mut added_any = false;
+    for id in &catalog_entry.models {
+        if ids.insert(id.clone()) {
+            println!("  hinzugefügt (Katalog, nicht live bestätigt): {id}");
+            added_any = true;
+        }
+    }
+    if added_any {
+        write_provider_model_list(&path, ids)?;
+    }
+    Ok(())
 }
 
 fn add_model(home: &Path, target: &str) -> Result<(), ModelsError> {
@@ -564,14 +761,24 @@ fn print_discovered_model(model: &DiscoveredModel) {
 }
 
 /// Synchronisiert die Modell-Dateien eines Providers mit dessen erfolgreicher
-/// Live-Antwort. Nicht mehr gemeldete IDs werden gelöscht; vorhandene und neue
-/// IDs erhalten jeweils eine frisch gerenderte Datei. Fremde Provider, nicht
-/// lesbare TOML-Dateien und Symlinks bleiben absichtlich unangetastet.
+/// Live-Antwort. Vorhandene und neue IDs erhalten immer (auch ohne `prune`)
+/// eine frisch gerenderte Datei — das ist das "ADD". Ohne `prune` bleiben
+/// nicht mehr gemeldete Dateien unangetastet und werden nur als "nicht mehr
+/// gemeldet" ausgegeben. Mit `prune` werden sie gelöscht, außer ihre
+/// Modell-ID steht in `protected` (dann "behalten (in Verwendung)"). Fremde
+/// Provider, nicht lesbare TOML-Dateien und Symlinks bleiben absichtlich
+/// unangetastet. Bei leerem `discovered` (sollte den Aufrufer nie erreichen,
+/// siehe [`run_scan`]) wird zur Sicherheit ebenfalls nichts verändert.
 fn sync_discovered_model_files(
     models_dir: &Path,
     provider_name: &str,
     discovered: &[DiscoveredModel],
+    prune: bool,
+    protected: &BTreeMap<String, ProtectionReason>,
 ) -> Result<(), ModelsError> {
+    if discovered.is_empty() {
+        return Ok(());
+    }
     let live: BTreeMap<&str, &DiscoveredModel> = discovered
         .iter()
         .map(|model| (model.id.as_str(), model))
@@ -616,6 +823,10 @@ fn sync_discovered_model_files(
                 }
                 if live.contains_key(model.id.as_str()) {
                     existing.entry(model.id).or_insert(path);
+                } else if !prune {
+                    println!("  nicht mehr gemeldet: {}", path.display());
+                } else if let Some(reason) = protected.get(model.id.as_str()) {
+                    println!("  behalten ({reason}): {}", path.display());
                 } else {
                     fs::remove_file(&path).map_err(|source| ModelsError::Io {
                         path: path.clone(),
@@ -1094,7 +1305,8 @@ mod tests {
             output_price_per_mtok: None,
             supports_tools: Some(true),
         };
-        sync_discovered_model_files(&models_dir, "acme", &[live]).expect("sync models");
+        sync_discovered_model_files(&models_dir, "acme", &[live], true, &BTreeMap::new())
+            .expect("sync models");
 
         assert!(!models_dir.join("gone.toml").exists());
         assert!(models_dir.join("other.toml").exists());
@@ -1136,13 +1348,388 @@ mod tests {
             },
         ];
 
-        sync_provider_model_list(&profile, "acme", &models).expect("sync provider list");
+        sync_provider_model_list(&profile, "acme", &models, true, &BTreeMap::new())
+            .expect("sync provider list");
 
         let content = std::fs::read_to_string(&path).expect("read provider");
         assert!(content.contains("# keep this comment"));
         assert!(content.contains("auth = \"file:/home/test/.harw/secrets/acme.key\""));
         let provider: harw_config::ProviderToml = toml::from_str(&content).expect("parse provider");
         assert_eq!(provider.models, ["zeta"]);
+    }
+
+    /// Baut das Provider-Datei-Fixture für die `--prune`-Regressionstests:
+    /// eine `models`-Auswahl mit einem veralteten und einem noch verwendeten
+    /// (protected) Eintrag, plus die passenden `models/*.toml`-Caches.
+    fn prune_fixture(home: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let profile = home.join("profiles/default");
+        let providers = profile.join("providers");
+        let models_dir = profile.join("models");
+        std::fs::create_dir_all(&providers).expect("providers dir");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        let provider_path = providers.join("acme.toml");
+        std::fs::write(
+            &provider_path,
+            "name = \"acme\"\napi = \"openai-chat\"\nbase_url = \"https://api.example.test/v1\"\nauth = \"env:ACME_TOKEN\"\nenabled = true\nmodels = [\"stale-model\", \"gpt-5.6-terra\"]\n",
+        )
+        .expect("write provider");
+
+        let stale = harw_config::ModelToml {
+            id: "stale-model".to_owned(),
+            name: None,
+            provider: "acme".to_owned(),
+            aliases: Vec::new(),
+            context_window: None,
+            max_tokens: None,
+            prompt_caching: None,
+            reasoning: false,
+            input_types: Vec::new(),
+            capabilities: harw_config::ModelCapabilitiesToml::default(),
+        };
+        let default_model = harw_config::ModelToml {
+            id: "gpt-5.6-terra".to_owned(),
+            ..stale.clone()
+        };
+        let stale_path = models_dir.join(model_filename(&stale.id));
+        let default_path = models_dir.join(model_filename(&default_model.id));
+        std::fs::write(&stale_path, toml::to_string(&stale).unwrap()).expect("stale cache");
+        std::fs::write(&default_path, toml::to_string(&default_model).unwrap())
+            .expect("default cache");
+
+        (profile, provider_path, stale_path, default_path)
+    }
+
+    #[test]
+    fn test_sync_functions_delete_nothing_when_discovered_is_empty() {
+        // Regression: ein Provider-Scan, der 0 Modelle meldet (z. B. wegen
+        // eines Auth-Problems), darf weder die Auswahl noch den Datei-Cache
+        // leerräumen — selbst wenn `--prune` gesetzt ist.
+        let (_guard, home) = temp_home();
+        let (profile, provider_path, stale_path, default_path) = prune_fixture(&home);
+        let models_dir = profile.join("models");
+        let protected: BTreeMap<String, ProtectionReason> = BTreeMap::new();
+
+        sync_provider_model_list(&profile, "acme", &[], true, &protected)
+            .expect("empty sync of provider list must succeed");
+        sync_discovered_model_files(&models_dir, "acme", &[], true, &protected)
+            .expect("empty sync of model files must succeed");
+
+        let provider: harw_config::ProviderToml = toml::from_str(
+            &std::fs::read_to_string(&provider_path).expect("read provider"),
+        )
+        .expect("parse provider");
+        // Bei leerem `discovered` kehrt `sync_provider_model_list` sofort
+        // zurück (siehe Funktionskommentar), ohne die Datei anzufassen — die
+        // Auswahl bleibt exakt in der Reihenfolge erhalten, in der das
+        // Fixture sie geschrieben hat (nicht alphabetisch sortiert).
+        assert_eq!(provider.models, ["stale-model", "gpt-5.6-terra"]);
+        assert!(stale_path.exists());
+        assert!(default_path.exists());
+    }
+
+    #[test]
+    fn test_sync_without_prune_adds_live_but_deletes_nothing() {
+        let (_guard, home) = temp_home();
+        let (profile, provider_path, stale_path, default_path) = prune_fixture(&home);
+        let models_dir = profile.join("models");
+        let live = [DiscoveredModel {
+            id: "new-model".to_owned(),
+            context_length: None,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            supports_tools: None,
+        }];
+        let protected: BTreeMap<String, ProtectionReason> = BTreeMap::new();
+
+        sync_provider_model_list(&profile, "acme", &live, false, &protected)
+            .expect("sync provider list without prune");
+        sync_discovered_model_files(&models_dir, "acme", &live, false, &protected)
+            .expect("sync model files without prune");
+
+        let provider: harw_config::ProviderToml = toml::from_str(
+            &std::fs::read_to_string(&provider_path).expect("read provider"),
+        )
+        .expect("parse provider");
+        // Ohne `--prune` schreibt `sync_provider_model_list` die Auswahl
+        // nicht zurück (nur "nicht mehr gemeldet"-Meldungen) — die
+        // ursprüngliche, unsortierte Fixture-Reihenfolge bleibt erhalten.
+        assert_eq!(provider.models, ["stale-model", "gpt-5.6-terra"]);
+        assert!(stale_path.exists(), "ohne --prune bleibt Alt-Cache erhalten");
+        assert!(default_path.exists());
+        assert!(models_dir.join(model_filename("new-model")).exists());
+    }
+
+    #[test]
+    fn test_sync_with_prune_removes_unreferenced_but_keeps_protected() {
+        let (_guard, home) = temp_home();
+        let (profile, provider_path, stale_path, default_path) = prune_fixture(&home);
+        let models_dir = profile.join("models");
+        let mut protected = BTreeMap::new();
+        protected.insert("gpt-5.6-terra".to_owned(), ProtectionReason::InUse);
+        // Live-Antwort meldet nur ein drittes, bisher unbekanntes Modell —
+        // "stale-model" fehlt (nicht mehr live) und "gpt-5.6-terra" fehlt
+        // ebenfalls, ist aber `protected` und muss trotzdem überleben.
+        let live = [DiscoveredModel {
+            id: "keep-alive".to_owned(),
+            context_length: None,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            supports_tools: None,
+        }];
+
+        sync_provider_model_list(&profile, "acme", &live, true, &protected)
+            .expect("sync provider list with prune");
+        sync_discovered_model_files(&models_dir, "acme", &live, true, &protected)
+            .expect("sync model files with prune");
+
+        let provider: harw_config::ProviderToml = toml::from_str(
+            &std::fs::read_to_string(&provider_path).expect("read provider"),
+        )
+        .expect("parse provider");
+        assert!(!provider.models.contains(&"stale-model".to_owned()));
+        assert!(provider.models.contains(&"gpt-5.6-terra".to_owned()));
+        assert!(!stale_path.exists(), "unreferenziertes Modell wird entfernt");
+        assert!(default_path.exists(), "default_model bleibt erhalten");
+    }
+
+    #[test]
+    fn test_protected_model_ids_collects_default_uia_session_and_internal_models() {
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.default_provider = Some("acme".to_owned());
+        config.harness.default_model = Some("gpt-5.6-terra".to_owned());
+        config.harness.session.title_model = Some("gpt-5.6-nano".to_owned());
+        config.harness.uia_provider = Some("other".to_owned());
+        config.harness.uia_model = Some("uia-only-model".to_owned());
+        config.harness.internal_models.set_choice(
+            harw_config::InternalModelPoint::Explorer,
+            Some(harw_config::InternalModelChoice {
+                provider: None,
+                model: Some("explorer-model".to_owned()),
+            }),
+        );
+        config.harness.internal_models.set_choice(
+            harw_config::InternalModelPoint::Research,
+            Some(harw_config::InternalModelChoice {
+                provider: Some("other".to_owned()),
+                model: Some("research-model".to_owned()),
+            }),
+        );
+
+        let acme_protected = protected_model_ids(&config, "acme");
+        assert!(acme_protected.contains_key("gpt-5.6-terra"));
+        assert!(acme_protected.contains_key("gpt-5.6-nano"));
+        assert!(acme_protected.contains_key("explorer-model"));
+        assert!(!acme_protected.contains_key("uia-only-model"));
+        assert!(!acme_protected.contains_key("research-model"));
+        assert_eq!(
+            acme_protected.get("gpt-5.6-terra"),
+            Some(&ProtectionReason::InUse)
+        );
+
+        let other_protected = protected_model_ids(&config, "other");
+        assert!(other_protected.contains_key("uia-only-model"));
+        assert!(other_protected.contains_key("research-model"));
+        assert!(!other_protected.contains_key("gpt-5.6-terra"));
+    }
+
+    /// Baut eine minimale `ProviderToml` für Tests, die nur die `models`-Auswahl
+    /// und den `base_url` benötigen.
+    fn test_provider_toml(base_url: &str, models: &[&str]) -> harw_config::ProviderToml {
+        harw_config::ProviderToml {
+            name: "test".to_owned(),
+            api: "openai-chat".to_owned(),
+            base_url: base_url.to_owned(),
+            auth: None,
+            auth_header: None,
+            api_key: None,
+            originator: None,
+            headers: std::collections::HashMap::new(),
+            models: models.iter().map(|id| (*id).to_owned()).collect(),
+            enabled: true,
+            origin_allowlist: harw_config::OriginAllowlistToml::default(),
+            rate_limit: None,
+            max_concurrency: None,
+        }
+    }
+
+    /// Baut eine minimale `AgentToml` für Tests, die nur `models` benötigen.
+    fn test_agent_toml(models: &[&str]) -> harw_config::AgentToml {
+        harw_config::AgentToml {
+            name: "test-agent".to_owned(),
+            role: "worker".to_owned(),
+            description: String::new(),
+            system_file: None,
+            providers: Vec::new(),
+            models: models.iter().map(|id| (*id).to_owned()).collect(),
+            skills: Vec::new(),
+            suggestions: harw_config::AgentSuggestionsToml::default(),
+            primary_provider: None,
+            secondary_providers: Vec::new(),
+            timeout_seconds: 120,
+            max_retries: 2,
+        }
+    }
+
+    #[test]
+    fn test_protected_model_ids_keeps_ids_referenced_by_another_provider() {
+        // Realfall aus der Modul-Doku: `providers/foundry.toml` führt
+        // `models = ["gpt-5.6-terra"]`, obwohl `gpt-5.6-terra.toml` formal
+        // dem Provider `openai` gehört. Ein Prune von `openai` darf diese ID
+        // nicht löschen.
+        let mut config = harw_config::ResolvedConfig::default();
+        config.providers.insert(
+            "foundry".to_owned(),
+            test_provider_toml("https://foundry.example.com/v1", &["gpt-5.6-terra"]),
+        );
+
+        let protected = protected_model_ids(&config, "openai");
+        assert_eq!(
+            protected.get("gpt-5.6-terra"),
+            Some(&ProtectionReason::Referenced("foundry".to_owned()))
+        );
+    }
+
+    #[test]
+    fn test_protected_model_ids_ignores_the_scanned_providers_own_model_list() {
+        // Die eigene Auswahlliste des gerade gescannten Providers darf nicht
+        // als Cross-Referenz zählen, sonst würde Prune der Auswahlliste nie
+        // greifen.
+        let mut config = harw_config::ResolvedConfig::default();
+        config.providers.insert(
+            "openai".to_owned(),
+            test_provider_toml("https://api.openai.com/v1", &["gpt-5.6-terra"]),
+        );
+
+        let protected = protected_model_ids(&config, "openai");
+        assert!(!protected.contains_key("gpt-5.6-terra"));
+    }
+
+    #[test]
+    fn test_protected_model_ids_keeps_ids_referenced_by_an_agent_definition() {
+        let mut config = harw_config::ResolvedConfig::default();
+        config
+            .agents
+            .insert("planner".to_owned(), test_agent_toml(&["gpt-5.6-terra"]));
+
+        let protected = protected_model_ids(&config, "openai");
+        assert_eq!(
+            protected.get("gpt-5.6-terra"),
+            Some(&ProtectionReason::Referenced("planner (Agent)".to_owned()))
+        );
+    }
+
+    #[test]
+    fn test_sync_provider_model_list_reports_referenced_reason_in_output() {
+        let (_guard, home) = temp_home();
+        let profile = home.join("profiles/default");
+        let providers = profile.join("providers");
+        std::fs::create_dir_all(&providers).expect("providers dir");
+        std::fs::write(
+            providers.join("openai.toml"),
+            "name = \"openai\"\napi = \"openai-chat\"\nbase_url = \"https://api.openai.com/v1\"\nauth = \"env:OPENAI_TOKEN\"\nmodels = [\"gpt-5.6-terra\"]\n",
+        )
+        .expect("write provider");
+        let mut protected = BTreeMap::new();
+        protected.insert(
+            "gpt-5.6-terra".to_owned(),
+            ProtectionReason::Referenced("foundry".to_owned()),
+        );
+        // Ein nicht-leeres `discovered` ist Voraussetzung dafür, dass
+        // `sync_provider_model_list` überhaupt in den Prune-Zweig läuft
+        // (leeres `discovered` bricht immer sicherheitshalber früh ab).
+        // "gpt-5.6-terra" selbst ist bewusst NICHT live, um die
+        // Cross-Referenz-Protection zu erzwingen.
+        let live = [DiscoveredModel {
+            id: "some-other-live-model".to_owned(),
+            context_length: None,
+            input_price_per_mtok: None,
+            output_price_per_mtok: None,
+            supports_tools: None,
+        }];
+
+        sync_provider_model_list(&profile, "openai", &live, true, &protected)
+            .expect("sync provider list with cross-reference protection");
+
+        let provider: harw_config::ProviderToml = toml::from_str(
+            &std::fs::read_to_string(providers.join("openai.toml")).expect("read provider"),
+        )
+        .expect("parse provider");
+        assert_eq!(provider.models, ["gpt-5.6-terra"]);
+    }
+
+    #[test]
+    fn test_has_placeholder_base_url_detects_known_placeholder_patterns() {
+        assert!(has_placeholder_base_url(
+            "https://<dein-worker>.example/v1"
+        ));
+        assert!(has_placeholder_base_url("https://example.invalid/v1"));
+        assert!(!has_placeholder_base_url("https://api.openai.com/v1"));
+    }
+
+    #[test]
+    fn test_add_catalog_fallback_models_adds_unconfigured_catalog_ids_without_removing() {
+        let (_guard, home) = temp_home();
+        let profile = home.join("profiles/default");
+        let providers = profile.join("providers");
+        std::fs::create_dir_all(&providers).expect("providers dir");
+        std::fs::write(
+            providers.join("openai.toml"),
+            "name = \"openai\"\napi = \"openai-chat\"\nbase_url = \"https://api.openai.com/v1\"\nauth = \"env:OPENAI_TOKEN\"\nmodels = [\"kept-existing-model\"]\n",
+        )
+        .expect("write provider");
+
+        add_catalog_fallback_models(&profile, "openai").expect("add catalog fallback");
+
+        let provider: harw_config::ProviderToml = toml::from_str(
+            &std::fs::read_to_string(providers.join("openai.toml")).expect("read provider"),
+        )
+        .expect("parse provider");
+        assert!(provider.models.contains(&"kept-existing-model".to_owned()));
+        assert!(
+            provider.models.len() > 1,
+            "Katalog-Modelle für openai müssen additiv ergänzt werden"
+        );
+    }
+
+    #[test]
+    fn test_add_catalog_fallback_models_skips_unknown_provider_and_placeholder_base_url() {
+        let (_guard, home) = temp_home();
+        let profile = home.join("profiles/default");
+        let providers = profile.join("providers");
+        std::fs::create_dir_all(&providers).expect("providers dir");
+        std::fs::write(
+            providers.join("cf-worker.toml"),
+            "name = \"cf-worker\"\napi = \"openai-chat\"\nbase_url = \"https://<dein-worker>.example/v1\"\nauth = \"env:CF_TOKEN\"\nmodels = []\n",
+        )
+        .expect("write provider");
+        std::fs::write(
+            providers.join("ghost.toml"),
+            "name = \"ghost\"\napi = \"openai-chat\"\nbase_url = \"https://ghost.example.com/v1\"\nauth = \"env:GHOST_TOKEN\"\nmodels = []\n",
+        )
+        .expect("write provider");
+
+        add_catalog_fallback_models(&profile, "cf-worker")
+            .expect("placeholder base_url must not error");
+        add_catalog_fallback_models(&profile, "ghost")
+            .expect("unknown catalog entry must not error");
+
+        let cf_worker: harw_config::ProviderToml = toml::from_str(
+            &std::fs::read_to_string(providers.join("cf-worker.toml")).expect("read provider"),
+        )
+        .expect("parse provider");
+        assert!(
+            cf_worker.models.is_empty(),
+            "Platzhalter-base_url darf keine Katalog-Modelle hinzufügen"
+        );
+
+        let ghost: harw_config::ProviderToml = toml::from_str(
+            &std::fs::read_to_string(providers.join("ghost.toml")).expect("read provider"),
+        )
+        .expect("parse provider");
+        assert!(
+            ghost.models.is_empty(),
+            "unbekannter Provider ohne Katalog-Eintrag darf nichts hinzufügen"
+        );
     }
 
     #[test]
@@ -1220,6 +1807,7 @@ mod tests {
                 provider: Some("ghost".to_owned()),
                 add: false,
                 free_only: false,
+                prune: false,
             }),
         )
         .expect_err("unknown provider must error");

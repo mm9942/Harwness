@@ -1,0 +1,29 @@
+[package]
+name = "harw-authority"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+blake3 = { workspace = true }
+harw-types = { path = "../harw-types" }
+ipnet = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+
+[features]
+# Nur für Testfixtures abhängiger Crates (`harw-tools`, `harw-core-bridge`):
+# schaltet `SandboxSpec::from_resolved_for_test` frei, das einen beliebigen
+# (auch nicht-leeren) `NetworkScope` in eine Sandbox einbettet — die reale API
+# erlaubt das sonst nirgends außerhalb dieser Crate (`SandboxSpec::from_resolved`
+# startet stets mit `NetworkScope::empty()`, `restrict` verengt nur per
+# Schnittmenge, und `PolicyBootstrap::issue`/`reissue` akzeptieren ausschließlich
+# die zwei fest verdrahteten Policy-Pfade). Wegen `resolver = "2"`
+# (Workspace-Root) nur aktiv, wenn eine Crate es unter `[dev-dependencies]`
+# anfordert — nie im Build eines produktiven Konsumenten. Siehe
+# `src/lib.rs`-Doku an `SandboxSpec::from_resolved_for_test` für die dadurch
+# unangetastete Invariante (`restrict` bleibt reines Schnittmengen-Verfahren).
+test-support = []
+
+[lints]
+workspace = true

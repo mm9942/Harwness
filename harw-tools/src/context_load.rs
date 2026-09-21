@@ -589,9 +589,7 @@ mod tests {
         Stability, TrustClass,
     };
     use harw_lens_types::{BudgetSpec, CostEstimate};
-    use harw_sandbox::{
-        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-    };
+    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{ContentDigest, SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;

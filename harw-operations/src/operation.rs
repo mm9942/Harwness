@@ -910,9 +910,7 @@ mod tests {
     use crate::context::{OpContext, ServiceMap};
     use crate::error::OpError;
     use crate::op_schema::{OpArgsSchema, object_schema, string_schema};
-    use harw_sandbox::{
-        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-    };
+    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::path::PathBuf;
     use std::sync::OnceLock;

@@ -129,7 +129,7 @@ use harw_extension_api::ExtensionRegistry;
 use harw_observe::TraceContext;
 use harw_protocol::events::SessionEvent;
 use harw_protocol::events::TurnEvent;
-use harw_sandbox::SandboxSpec;
+use harw_authority::{PermissionRequest, SandboxSpec};
 use harw_tools::{ToolCall, ToolName};
 use harw_types::{
     AgentRole, ApprovalActor, ItemId, ModelId, ProviderId, ReasoningEffort, SessionId, TokenUsage,
@@ -210,10 +210,10 @@ pub struct AgentSession {
     /// wurde, vor jedem Modus-Schnitt. Dieselbe Rolle wie `base_activation`,
     /// eine Achse tiefer.
     ///
-    /// `Option`, weil [`harw_sandbox::SandboxSpec`] bewusst kein `Default`
+    /// `Option`, weil [`harw_authority::SandboxSpec`] bewusst kein `Default`
     /// hat: eine Sandbox entsteht ausschließlich aus einer aufgelösten
-    /// [`harw_sandbox::WorkspaceBinding`] plus Policy-Entscheidung
-    /// ([`harw_sandbox::SandboxSpec::from_resolved`]), es gibt also keinen
+    /// [`harw_authority::WorkspaceBinding`] plus Policy-Entscheidung
+    /// ([`harw_authority::SandboxSpec::from_resolved`]), es gibt also keinen
     /// neutralen Wert, den [`AgentSession::new_with_id`] erfinden dürfte.
     /// `None` heißt „diese Session hat keine Sandbox", nicht „unbegrenzt":
     /// ohne Spawn-Kontext gibt es nichts zu schneiden, und die
@@ -346,11 +346,58 @@ pub struct SpawnContext {
     pub ceiling: Option<ContextCeiling>,
 }
 
+/// Vorgabe-Wartezeit auf eine Freigabeentscheidung, bevor sie als abgelaufen
+/// gilt (Interaktionsvertrag §4.4).
+///
+/// # Beschreibung
+/// Re-Export von [`harw_types::DEFAULT_APPROVAL_TIMEOUT`] — nicht als eigene
+/// `harw-core`-Politik neu definiert. `harw-types` ist der einzige
+/// gemeinsame, zyklusfreie Ort für diesen Wert, weil sowohl `harw-core`
+/// ([`PendingApproval::timeout_at`]) als auch `harw-protocol`
+/// (`ApprovalRequest::timeout_at`) ihn brauchen und `harw-core` nicht von
+/// `harw-protocol` abhängen darf. [`PendingApproval`] speichert `timeout_at`
+/// als `requested_at + DEFAULT_APPROVAL_TIMEOUT` (sofern
+/// [`AgentSession::begin_approval`] keine eigene Wartezeit erhält), und jede
+/// Oberfläche — TUI wie ein künftiges Channel-Binding — liest denselben
+/// Ablaufzeitpunkt statt eine eigene Frist zu erfinden.
+pub use harw_types::DEFAULT_APPROVAL_TIMEOUT;
+
+/// Begründung, die jede Oberfläche für eine durch Zeitablauf erzwungene
+/// Ablehnung verwendet (Interaktionsvertrag §4.4: „timed-out-denied").
+///
+/// Re-Export von [`harw_types::APPROVAL_TIMEOUT_REASON`] — aus demselben
+/// Grund wie [`DEFAULT_APPROVAL_TIMEOUT`] oben: eine einzige Zeichenkette
+/// statt einer Kopie je Front-End/Crate.
+pub use harw_types::APPROVAL_TIMEOUT_REASON;
+
 #[derive(Debug, Clone)]
 pub struct PendingApproval {
     pub call: ToolCall,
     pub request: ItemId,
     pub actor: ApprovalActor,
+    /// Wanduhrzeit, zu der die Pause begann (Serveruhr, `jiff::Timestamp::now()`
+    /// am Aufrufort von [`AgentSession::begin_approval`]).
+    pub requested_at: jiff::Timestamp,
+    /// Ablaufzeitpunkt: `requested_at + timeout`. Nach Erreichen dieses
+    /// Zeitpunkts muss jede Oberfläche [`ApprovalResolution::timed_out`]
+    /// liefern, statt weiter auf eine Antwort zu warten (§4.4).
+    pub timeout_at: jiff::Timestamp,
+}
+
+impl PendingApproval {
+    /// Prüft, ob diese Pause zu `now` bereits abgelaufen ist.
+    ///
+    /// # Arguments
+    /// - `now` (`jiff::Timestamp`): die Wanduhrzeit der Oberfläche, die prüft.
+    ///
+    /// # Returns
+    /// `true`, wenn `now` `timeout_at` erreicht oder überschritten hat — die
+    /// Grenze ist inklusiv, wie beim TTL-Vergleich des durablen
+    /// `ApprovalStore` (C-APPR).
+    #[must_use]
+    pub fn is_timed_out(&self, now: jiff::Timestamp) -> bool {
+        now >= self.timeout_at
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -595,12 +642,12 @@ impl AgentSession {
     ///    die Basis gilt weiter.
     /// 2. Die Sandbox des Spawn-Kontexts wird als Schnitt der **Basis-Sandbox**
     ///    mit [`InteractionMode::permission_ceiling`] neu gesetzt
-    ///    ([`harw_sandbox::SandboxSpec::restrict`]). Der
-    ///    [`harw_sandbox::NetworkScope`] bleibt unangetastet — eine
+    ///    ([`harw_authority::SandboxSpec::restrict`]). Der
+    ///    [`harw_authority::NetworkScope`] bleibt unangetastet — eine
     ///    Permission-Obergrenze sagt nichts über einzelne Ziele aus, weder über
-    ///    Hostnamen ([`harw_sandbox::EgressTarget::Host`],
-    ///    [`harw_sandbox::EgressTarget::DnsSuffix`]) noch über Adressbereiche
-    ///    ([`harw_sandbox::EgressTarget::Cidr`]).
+    ///    Hostnamen ([`harw_authority::EgressTarget::Host`],
+    ///    [`harw_authority::EgressTarget::DnsSuffix`]) noch über Adressbereiche
+    ///    ([`harw_authority::EgressTarget::Cidr`]).
     ///
     /// Ohne Spawn-Kontext entfällt Schritt 2 ersatzlos: es gibt dann keine
     /// Autorität, die zu schneiden wäre, und die Tool-Ausführung lehnt eine
@@ -654,7 +701,7 @@ impl AgentSession {
         if let (Some(context), Some(base)) =
             (self.spawn_context.as_mut(), self.base_sandbox.as_ref())
         {
-            context.sandbox = base.restrict(&ceiling);
+            context.sandbox = base.restrict(&PermissionRequest::from_permissions(ceiling.iter()));
         }
     }
 
@@ -1260,11 +1307,30 @@ impl AgentSession {
         Ok(())
     }
 
+    /// Pausiert die Session für eine Freigabeentscheidung.
+    ///
+    /// # Description
+    /// Legt [`PendingApproval`] ab und trägt `now` als `requested_at` ein;
+    /// `timeout_at` ist `now + `[`DEFAULT_APPROVAL_TIMEOUT`]. Die Wartefrist
+    /// wird hier festgelegt — einmalig, unabhängig davon, welche Oberfläche
+    /// später darauf wartet (Interaktionsvertrag §4.4).
+    ///
+    /// # Arguments
+    /// - `call` (`ToolCall`): der exakte, festzuhaltende Werkzeugaufruf.
+    /// - `request` (`ItemId`): Korrelations-ID der Freigabeanfrage.
+    /// - `actor` (`ApprovalActor`): wer diese Anfrage beantworten darf.
+    /// - `now` (`jiff::Timestamp`): Serveruhr des Aufrufers, zur Testbarkeit
+    ///   injiziert statt intern `jiff::Timestamp::now()` zu rufen.
+    ///
+    /// # Errors
+    /// [`CoreError::NotIdle`], wenn die Session nicht [`SessionState::Running`]
+    /// ist.
     pub fn begin_approval(
         &mut self,
         call: ToolCall,
         request: ItemId,
         actor: ApprovalActor,
+        now: jiff::Timestamp,
     ) -> CoreResult<()> {
         if self.state != SessionState::Running {
             return Err(CoreError::NotIdle {
@@ -1272,10 +1338,13 @@ impl AgentSession {
                 state: self.state.to_string(),
             });
         }
+        let timeout_at = now.checked_add(DEFAULT_APPROVAL_TIMEOUT).unwrap_or(now);
         self.pending_approval = Some(PendingApproval {
             call,
             request,
             actor,
+            requested_at: now,
+            timeout_at,
         });
         self.state = SessionState::WaitingForApproval;
         Ok(())
@@ -1579,7 +1648,7 @@ mod tests {
     use harw_agent_dsl::resolved::{ResolutionTrace, ResolvedAgentDefinition};
     use harw_context::{ContextBudgetSpec, SectionName, TrustClass};
     use harw_extension_api::ExtensionRegistryBuilder;
-    use harw_sandbox::{Permission, PermissionSet, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_authority::{Permission, PermissionSet, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{TenantId, WorkspaceId};
     use std::path::PathBuf;
 
@@ -1629,6 +1698,95 @@ mod tests {
 
         assert_eq!(with_program.context_budget(), baseline.context_budget());
         assert_eq!(with_program.mode(), baseline.mode());
+    }
+
+    fn test_approval_call() -> ToolCall {
+        ToolCall {
+            id: ToolCallId::new(),
+            name: ToolName::new("fs.write"),
+            arguments: serde_json::json!({}),
+        }
+    }
+
+    fn test_approval_actor() -> ApprovalActor {
+        ApprovalActor::Operator {
+            id: "session-test-operator".to_owned(),
+        }
+    }
+
+    #[test]
+    fn begin_approval_stores_requested_at_and_computes_default_timeout_at() {
+        let mut session = test_session();
+        session
+            .try_start_turn()
+            .expect("an idle session can start a turn");
+        let now = jiff::Timestamp::constant(1_700_000_000, 0);
+
+        session
+            .begin_approval(test_approval_call(), ItemId::new(), test_approval_actor(), now)
+            .expect("a running session accepts an approval pause");
+
+        let pending = session
+            .pending_approval()
+            .expect("begin_approval must record a pending approval");
+        assert_eq!(pending.requested_at, now);
+        assert_eq!(
+            pending.timeout_at,
+            now.checked_add(DEFAULT_APPROVAL_TIMEOUT)
+                .expect("default timeout stays in range")
+        );
+    }
+
+    #[test]
+    fn pending_approval_is_timed_out_is_inclusive_at_the_deadline() {
+        let mut session = test_session();
+        session
+            .try_start_turn()
+            .expect("an idle session can start a turn");
+        let now = jiff::Timestamp::constant(1_700_000_000, 0);
+        session
+            .begin_approval(test_approval_call(), ItemId::new(), test_approval_actor(), now)
+            .expect("a running session accepts an approval pause");
+        let pending = session
+            .pending_approval()
+            .expect("begin_approval must record a pending approval");
+
+        assert!(!pending.is_timed_out(now), "freshly opened, not timed out");
+        assert!(
+            !pending.is_timed_out(
+                pending
+                    .timeout_at
+                    .checked_sub(jiff::SignedDuration::from_secs(1))
+                    .expect("one second before the deadline stays in range")
+            ),
+            "one second before the deadline must not be timed out"
+        );
+        assert!(
+            pending.is_timed_out(pending.timeout_at),
+            "exactly at timeout_at counts as timed out (inclusive bound)"
+        );
+        assert!(
+            pending.is_timed_out(
+                pending
+                    .timeout_at
+                    .checked_add(jiff::SignedDuration::from_secs(1))
+                    .expect("one second after the deadline stays in range")
+            ),
+            "past the deadline must stay timed out"
+        );
+    }
+
+    #[test]
+    fn begin_approval_rejects_a_session_that_is_not_running() {
+        let mut session = test_session();
+        let result = session.begin_approval(
+            test_approval_call(),
+            ItemId::new(),
+            test_approval_actor(),
+            jiff::Timestamp::now(),
+        );
+        assert!(matches!(result, Err(CoreError::NotIdle { .. })));
+        assert!(session.pending_approval().is_none());
     }
 
     fn executable_agent_ir(admitted: &[&str], forbidden: &[&str]) -> ExecutableAgentIr {

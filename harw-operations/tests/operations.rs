@@ -17,9 +17,7 @@ use harw_operations::{
 };
 use harw_operations::adapter::WebAdapter;
 use harw_operations::registry::OperationRegistry;
-use harw_sandbox::{
-    Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-};
+use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
 use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
 
 // ── Test fixtures (minimal concrete Operation impls) ─────────────────────────

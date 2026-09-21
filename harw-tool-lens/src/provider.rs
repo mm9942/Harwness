@@ -56,7 +56,7 @@ harw_tools::tool_provider! {
 mod tests {
     use super::*;
     use harw_extension_api::contributors::ToolProvider as _;
-    use harw_sandbox::Permission;
+    use harw_authority::Permission;
     use harw_tools::ToolName;
 
     /// Genau ein Werkzeug wird beworben -- die begründete Entscheidung aus

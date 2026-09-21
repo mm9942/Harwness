@@ -278,9 +278,7 @@ mod tests {
         collect_design_docs, DEFAULT_VISIBILITY, DOCS_DESIGN_INDEX, OPERATOR_ONLY_VISIBILITY,
     };
     use harw_lens_query::{resolve_index, IndexSelector, QueryError, ReadScope};
-    use harw_sandbox::{
-        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-    };
+    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_tools::{ToolCall, ToolExecutor as _, ToolName};
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::path::{Path, PathBuf};

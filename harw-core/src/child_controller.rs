@@ -89,7 +89,7 @@ use harw_extension_api::{
 };
 use harw_observe::TraceContext;
 use harw_protocol::items::{ContentPart, TurnItem};
-use harw_sandbox::SandboxSpec;
+use harw_authority::SandboxSpec;
 use harw_session_store::{ApprovalStore, ChildLeaseRecord, ChildLeaseStore};
 use harw_types::{AgentRole, ReasoningEffort, SessionId, ToolCallId};
 use jiff::{SignedDuration, Timestamp};
@@ -984,7 +984,7 @@ pub(crate) fn can_delegate_to(
 pub struct ParentGrant {
     pub role: Option<harw_agent_dsl::roles::AgentRoleId>,
     pub tools: BTreeSet<String>,
-    pub permissions: harw_sandbox::PermissionSet,
+    pub permissions: harw_authority::PermissionSet,
     pub max_depth: u32,
     pub budget_tokens: u64,
     pub reasoning_effort: Option<String>,
@@ -2106,6 +2106,66 @@ impl ManagedAgentSpawner {
         self.external_root_parent
             .as_ref()
             .filter(|root| root.session_id == record.parent)
+            .map(|root| root.spawn_context.organizational_role)
+    }
+
+    /// Liefert die organisatorische Rolle (§3 DSL-Spawn-Matrix) von `session`
+    /// selbst — anders als [`Self::parent_organizational_role`], das die
+    /// Rolle des Elternteils eines bereits admittierten Kindes liest, wird
+    /// hier direkt die übergebene Session befragt.
+    ///
+    /// # Beschreibung
+    /// Ergänzung für Aufrufstellen, die eine Zielrolle wählen müssen, bevor
+    /// ein Kind überhaupt existiert (z. B. `/explore`/`/research-web` in
+    /// `harw-ops`, die vor dem Spawn wissen müssen, ob die AUFRUFENDE Session
+    /// die `UserInterface`-Rolle trägt). Liest dieselbe vertrauenswürdige
+    /// Quelle wie `Self::admit` und `Self::parent_organizational_role`: den
+    /// `SpawnContext` einer laufenden Manager-Session, oder — für die
+    /// externe Wurzelsitzung ohne Manager-Spiegel — den `SpawnContext` aus
+    /// `external_root_parent`. Damit funktioniert die Methode auch für die
+    /// UIA-Root-Session, für die es (noch) keinen `ChildRecord` gibt.
+    ///
+    /// # Argumente
+    /// - `session` (`&SessionId`): die zu befragende Session (laufendes Kind
+    ///   oder die externe Root-Session).
+    ///
+    /// # Rückgabe
+    /// `Some(role)`, wenn `session` eine laufende Manager-Session mit
+    /// `SpawnContext` ist oder mit der externen Root-Session übereinstimmt;
+    /// sonst `None` — in jedem dieser Fälle behandelt der Aufrufer die
+    /// Zielwahl konservativ (unverändertes Verhalten ohne UIA-Rolle).
+    ///
+    /// # Panics
+    /// Nie.
+    ///
+    /// # Nebenläufigkeit
+    /// Nimmt kurz den `manager`-Lock, nur für die Dauer der Abfrage; keine
+    /// Sperre wird über den Rückgabewert hinaus gehalten. Sicher aus
+    /// mehreren Threads aufrufbar.
+    ///
+    /// # Examples
+    /// ```rust,no_run
+    /// # fn demo(spawner: &harw_core::child_controller::ManagedAgentSpawner, session: &harw_types::SessionId) {
+    /// if let Some(role) = spawner.session_organizational_role(session) {
+    ///     // role == harw_agent_dsl::roles::AgentRoleId::UserInterface → UIA-Zielwahl
+    ///     let _ = role;
+    /// }
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn session_organizational_role(
+        &self,
+        session: &SessionId,
+    ) -> Option<harw_agent_dsl::roles::AgentRoleId> {
+        if let Ok(manager) = self.manager.lock()
+            && let Ok(entry) = manager.get(session)
+            && let Some(context) = entry.spawn_context()
+        {
+            return Some(context.organizational_role);
+        }
+        self.external_root_parent
+            .as_ref()
+            .filter(|root| &root.session_id == session)
             .map(|root| root.spawn_context.organizational_role)
     }
 
@@ -3810,7 +3870,7 @@ mod tests {
     use harw_extension_api::{
         ApprovalDecision, ApprovalHandler, ExtFuture, ExtensionRegistryBuilder,
     };
-    use harw_sandbox::{Permission, PermissionSet, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_authority::{Permission, PermissionSet, WorkspaceRegistration, WorkspaceRegistry};
     use harw_tools::{ToolCall, ToolName};
     use harw_types::{ApprovalActor, ItemId, TenantId, TokenUsage, WorkspaceId};
     use std::path::PathBuf;

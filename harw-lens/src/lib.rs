@@ -236,6 +236,20 @@
 //!   Typen, die diese Fassade bewusst nicht freigibt (siehe oben); sie
 //!   isoliert freizugeben liefe leer.
 //!
+//! ## `harw-lens-source` — Introspektion (Knoten: Produktionslücke „kein
+//! Aufrufer baut je einen Index")
+//! - **Ja (seit diesem Knoten)** — [`IndexStatus`], [`index_status`]: genau
+//!   die künftige Introspektionsfunktion, die weiter oben im
+//!   `IndexManifest`-Abschnitt als „bewusste neue Ergänzung, kein
+//!   vergessener Fall" angekündigt war. Erster Konsument ist `harw lens
+//!   status` in `harw-cli` — ein Betreiber, der nach `harw lens build`
+//!   wissen will, welches Modell/welche Dimension/wie viele Chunks ein
+//!   Index tatsächlich trägt, ohne selbst `harw_lens_store::LensStore`
+//!   anzufassen (der Grund, warum `LensStore` weiterhin **nicht** zur
+//!   Fläche gehört, siehe oben). [`IndexStatus`] bleibt bewusst reine Daten
+//!   ohne Bezug zu `FlatIndex`/`VectorIndex`: ein Aufrufer bekommt Zahlen
+//!   und Enums, nie ein Handle, mit dem er selbst suchen könnte.
+//!
 //! # Kein `pub use *`
 //! Jeder Re-Export oben ist einzeln benannt und einzeln begründet. Ein
 //! Glob-Reexport einer der zehn Innencrates würde diese Begründungsarbeit
@@ -360,9 +374,9 @@ pub use harw_lens_embed::{
 
 // --- harw-lens-source: Quellenbindung, Indexaufbau (siehe Begründung oben) ---
 pub use harw_lens_source::{
-    collect_design_docs, collect_palace_documents, visibility_of_scope, IndexBuildReport,
-    RawDocument, SourceError, CHUNKER_VERSION, DEFAULT_VISIBILITY, DOCS_DESIGN_INDEX,
-    KNOWLEDGE_PALACE_INDEX, OPERATOR_ONLY_VISIBILITY,
+    collect_design_docs, collect_palace_documents, index_status, visibility_of_scope,
+    IndexBuildReport, IndexStatus, RawDocument, SourceError, CHUNKER_VERSION, DEFAULT_VISIBILITY,
+    DOCS_DESIGN_INDEX, KNOWLEDGE_PALACE_INDEX, OPERATOR_ONLY_VISIBILITY,
 };
 
 // --- harw-lens-query: Abfragepfad (siehe Begründung oben) ---

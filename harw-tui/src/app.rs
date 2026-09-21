@@ -106,10 +106,11 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
+use harw_authority::SandboxSpec;
 use harw_core::cancel::{CancelReason, CancelToken};
 use harw_core::turn_loop::TurnControl;
 use harw_core::{
@@ -121,20 +122,15 @@ use harw_extension_api::allow_rules::{ApprovalRule, RuleDecision, RuleScope, der
 use harw_extension_api::approval_mode::ApprovalMode;
 use harw_extension_api::registry::ContextProviderRegistrationError;
 use harw_extension_api::{ToolCall, ToolName};
-use harw_operations::{OpOutput, SessionController};
 use harw_operations::adapter::CommandAdapter;
+use harw_operations::{OpOutput, SessionController};
 use harw_plan::PlanStore;
 use harw_plan::goal::{GoalStore, evaluate_goal};
 use harw_protocol::events::{SessionEvent, TurnEvent};
 use harw_protocol::items::{ContentPart, ResultTrust, ToolCallResult, TurnItem};
-use harw_sandbox::SandboxSpec;
 use harw_types::SessionId;
 use harw_types::TokenUsage;
 
-use crate::{
-    CapabilitySet, CommandAction, CommandRegistry, DispatchContext, Invocation,
-    InvocationSurface, ShellCapability,
-};
 use crate::approval::{
     ApprovalDriver, ApprovalDriverError, ApprovalPrompt, ApprovalPromptReceiver, ChildTurnDriver,
 };
@@ -146,23 +142,33 @@ use crate::command_exec::execute_command_as;
 use crate::command_popup::{CommandPopup, PopupAction, TabOutcome};
 use crate::events::{HarwEvent, HarwEventSender};
 use crate::export::{
-    self, ExportAgentEntry, ExportAgentRef, ExportEntry, ExportErrorEntry, ExportMeta,
-    ExportMetaExtensions, ExportOptions, ExportPlanEntry, ExportStatus,
+    self, ExportAgentEntry, ExportEntry, ExportErrorEntry, ExportMeta, ExportMetaExtensions,
+    ExportOptions, ExportPlanEntry, ExportStatus,
 };
 use crate::frame_requester::{FrameRequester, MIN_FRAME_INTERVAL};
 use crate::history_cell::{
     AssistantHistoryCell, GoalCell, HistoryCell, PlainHistoryCell, PlanGraphCell,
     ReasoningHistoryCell, SharedToolCell, SubAgentCell, SubAgentStatus, ToolCell, ToolGroupCell,
-    ToolState, ToolVerbosity, UserHistoryCell, truncate_chars,
+    ToolState, ToolVerbosity, UserHistoryCell,
 };
+use crate::host_permit_dialog::{HostPermitPrompt, HostPermitPromptReceiver, HostPermitVariant};
+// Hinweis: die drei obigen Typen sind Re-Exporte aus
+// `harw_tool_shell::host_permit_prompt` (siehe `crate::host_permit_dialog`-
+// Moduldoku) — der Fragevertrag und die Ausstellungslogik leben dort bzw. in
+// `harw_tool_shell::exec::ShellExecutor::authorize_host_command`; `app.rs`
+// besitzt nur noch Rendering, Vorauswahl-Anzeige und das Arming-Delay.
 use crate::input_editor::{InputAction, InputEditor};
 use crate::input_history::InputHistoryStore;
 use crate::runtime_commands;
+use crate::{
+    CapabilitySet, CommandAction, CommandRegistry, DispatchContext, Invocation, InvocationSurface,
+    ShellCapability,
+};
 // Nur Tests (über `use super::*`) rufen die in `runtime_root` gewanderte
 // Coercion-Hilfe noch unqualifiziert auf; Prod in app.rs nutzt sie nicht.
+use crate::runtime_root::TitleJobContext;
 #[cfg(test)]
 use crate::runtime_root::as_dyn_approval_handler;
-use crate::runtime_root::TitleJobContext;
 use crate::session_controller::TuiSessionController;
 use crate::session_picker::{PickerAction, SessionEntry, SessionPicker};
 use crate::spinner::Spinner;
@@ -171,9 +177,6 @@ use crate::tui_event::TuiEvent;
 
 /// Taktrate der Spinner-Animation während ein Turn läuft.
 const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
-
-/// Willkommens-Systemzeile beim Start des Chats.
-pub(crate) const WELCOME: &str = "Willkommen. Tippe eine Nachricht — Enter zum Senden.";
 
 const NON_TEXT_CONTENT_PLACEHOLDER: &str = "[non-text content]";
 
@@ -833,6 +836,17 @@ pub struct ChatApp {
     /// Die aktuell offene Freigabefrage, die anstelle des Composers gezeichnet
     /// wird (Plan Schritt 3); `None` zeigt den normalen Composer.
     pending_approval_dialog: Option<ApprovalDialog>,
+    /// Die aktuell offene Host-Permit-Frage, die anstelle des Composers
+    /// gezeichnet wird (Plan „UIA-Shell-Worker und Shell-Modus", Schritt 2);
+    /// `None` zeigt den normalen Composer. Unabhängig von
+    /// `pending_approval_dialog`: beide Fragearten können, streng
+    /// nacheinander, während desselben Turns auftreten — `y`/`n` gehen immer
+    /// zuerst an eine offene [`ApprovalDialog`]-Frage, erst danach an diese.
+    pending_host_permit: Option<HostPermitPrompt>,
+    /// Der aus [`Self::pending_host_permit`] gebaute Auswahldialog
+    /// („Einmalig" / „Host-Arbeitsphase" / „Nein"); immer gemeinsam mit
+    /// `pending_host_permit` gesetzt bzw. geleert.
+    pending_host_permit_dialog: Option<ChoiceDialog>,
     /// Vorgemerktes Ziel des Shift+Tab-Zyklus, solange ein Turn läuft (Plan
     /// Schritt 5, AP W5-05: der Wechsel gilt erst an der nächsten Turn-Grenze).
     pending_permission_stage: Option<PermissionCycleStage>,
@@ -893,6 +907,11 @@ impl std::fmt::Debug for ChatApp {
                 "has_pending_approval_dialog",
                 &self.pending_approval_dialog.is_some(),
             )
+            .field(
+                "has_pending_host_permit_dialog",
+                &self.pending_host_permit_dialog.is_some(),
+            )
+            .field("host_mode_active", &self.host_mode_active())
             .field("pending_permission_stage", &self.pending_permission_stage)
             .field("has_overlay", &self.overlay.is_some())
             .field("export_entries_len", &self.export_entries.len())
@@ -990,6 +1009,8 @@ impl ChatApp {
             open_tool_group: None,
             ctrl_o_expand_last_armed: false,
             pending_approval_dialog: None,
+            pending_host_permit: None,
+            pending_host_permit_dialog: None,
             pending_permission_stage: None,
             mode_before_plan: None,
             overlay: None,
@@ -1377,7 +1398,10 @@ impl ChatApp {
 
         let dialog =
             ChoiceDialog::new("UIA-Provider wählen", None, options).with_selected(selected);
-        self.overlay = Some(Overlay::UiaProviderChoice(ProviderChoiceState { ids, dialog }));
+        self.overlay = Some(Overlay::UiaProviderChoice(ProviderChoiceState {
+            ids,
+            dialog,
+        }));
     }
 
     /// Löst eine getroffene Providerwahl auf (zweite Stufe von
@@ -1415,7 +1439,8 @@ impl ChatApp {
                         || model.aliases.iter().any(|alias| alias == active_model)
                 })
                 .map(|model| {
-                    Self::canonical_provider_name(&config, &model.provider) == Some(provider.as_str())
+                    Self::canonical_provider_name(&config, &model.provider)
+                        == Some(provider.as_str())
                 })
                 .unwrap_or(true),
         };
@@ -1484,12 +1509,8 @@ impl ChatApp {
             ids.push(model.id.clone());
         }
 
-        let dialog = ChoiceDialog::new(
-            format!("Modell wählen ({provider})"),
-            None,
-            options,
-        )
-        .with_selected(selected);
+        let dialog = ChoiceDialog::new(format!("Modell wählen ({provider})"), None, options)
+            .with_selected(selected);
         self.overlay = Some(Overlay::ModelChoice(ModelChoiceState {
             provider,
             ids,
@@ -1561,12 +1582,8 @@ impl ChatApp {
             ids.push(model.id.clone());
         }
 
-        let dialog = ChoiceDialog::new(
-            format!("UIA-Modell wählen ({provider})"),
-            None,
-            options,
-        )
-        .with_selected(selected);
+        let dialog = ChoiceDialog::new(format!("UIA-Modell wählen ({provider})"), None, options)
+            .with_selected(selected);
         self.overlay = Some(Overlay::UiaModelChoice(ModelChoiceState {
             provider,
             ids,
@@ -1639,8 +1656,9 @@ impl ChatApp {
                 }
                 self.set_approval_mode(ApprovalMode::AlwaysAsk);
                 self.active_mode = InteractionMode::Plan;
-                if let Err(error) =
-                    self.session_controller.request_mode(InteractionMode::Plan.as_str())
+                if let Err(error) = self
+                    .session_controller
+                    .request_mode(InteractionMode::Plan.as_str())
                 {
                     tracing::warn!(
                         error = %error,
@@ -1728,7 +1746,8 @@ impl ChatApp {
                 handle: ToolCellHandle::Group(Arc::clone(&group)),
                 verbosity: self.tool_verbosity,
             }));
-            self.tool_cells.push(ToolCellHandle::Group(Arc::clone(&group)));
+            self.tool_cells
+                .push(ToolCellHandle::Group(Arc::clone(&group)));
             self.open_tool_group = Some(group);
         } else {
             self.close_tool_group();
@@ -1949,6 +1968,56 @@ impl ChatApp {
     #[must_use]
     pub(crate) fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    /// `true`, solange diese Sitzung eine laufende Host-Arbeitsphase
+    /// ([`HostPermitVariant::SessionLease`]) hat.
+    ///
+    /// # Beschreibung
+    /// Fragt direkt [`harw_sandbox::HostPermitSessionRegistry::is_session_approved`]
+    /// über die Runtime-Montage ab, statt einen eigenen Merker zu pflegen — der
+    /// Ablauf einer Phase (TTL) und ein `/`-seitiges Beenden
+    /// ([`Self::end_host_mode`]) wirken dadurch ohne einen zweiten
+    /// Wahrheitsort sofort auch hier. `false`, wenn keine Runtime-Montage
+    /// vorliegt (z. B. in reinen Renderer-Tests).
+    #[must_use]
+    pub(crate) fn host_mode_active(&self) -> bool {
+        self.runtime.as_ref().is_some_and(|runtime| {
+            runtime
+                .host_permit_session_registry()
+                .is_session_approved(self.session_id.to_string().as_str())
+        })
+    }
+
+    /// Beendet eine laufende Host-Arbeitsphase dieser Sitzung sofort (Ctrl+H,
+    /// siehe [`handle_key`]) und widerruft alle dafür ausgestellten Permits.
+    ///
+    /// # Beschreibung
+    /// Ruft [`harw_sandbox::HostPermitSessionRegistry::forget_session`] (löscht
+    /// die Sitzungszustimmung und alle gemerkten Permit-Zuordnungen) und
+    /// zusätzlich [`harw_sandbox::ProcessPermitLedger::revoke_session`] (entzieht
+    /// auch bereits ausgestellte, aber noch nicht gemerkte Permits derselben
+    /// Sitzung) auf. Ohne die zweite Erweiterung könnte ein bereits
+    /// ausgestellter, aber dem Renderer nie gemeldeter Permit die Isolation
+    /// überdauern.
+    ///
+    /// # Rückgabe
+    /// `true`, wenn tatsächlich eine aktive Phase beendet wurde (und damit ein
+    /// Redraw sowie eine Systemzeile angebracht sind); `false`, wenn keine
+    /// Phase lief oder keine Runtime-Montage vorliegt.
+    pub(crate) fn end_host_mode(&mut self) -> bool {
+        let Some(runtime) = self.runtime.clone() else {
+            return false;
+        };
+        let session = self.session_id.to_string();
+        let registry = runtime.host_permit_session_registry();
+        if !registry.is_session_approved(&session) {
+            return false;
+        }
+        registry.forget_session(&session);
+        let _ = runtime.host_permit_ledger().revoke_session(&session);
+        self.push_line(Role::System, "Host-Modus beendet — Isolation wieder aktiv.");
+        true
     }
 
     /// Hängt eine typisierte Zelle für die gegebene Rolle und den Text an den Log an.
@@ -2214,10 +2283,12 @@ fn visible_message_text(content: &[ContentPart]) -> String {
 }
 
 fn export_tool_result_value(result: &ToolCallResult) -> serde_json::Value {
-    serde_json::to_value(result).unwrap_or_else(|_| serde_json::json!({
-        "status": "error",
-        "message": "tool result could not be serialized",
-    }))
+    serde_json::to_value(result).unwrap_or_else(|_| {
+        serde_json::json!({
+            "status": "error",
+            "message": "tool result could not be serialized",
+        })
+    })
 }
 
 fn export_tool_status(result: &ToolCallResult) -> ExportStatus {
@@ -2361,8 +2432,9 @@ fn hydrate_visible_history(app: &mut ChatApp, history: &ConversationHistory) {
                 if let Ok(mut guard) = cell.lock() {
                     guard.complete(&result_item.result, result_item.duration_ms);
                     if let Some(index) = tool_export_indices.get(&result_item.call_id)
-                        && let Some(ExportEntry::ToolCall { duration_ms, trust, .. }) =
-                            app.export_entries.get_mut(*index)
+                        && let Some(ExportEntry::ToolCall {
+                            duration_ms, trust, ..
+                        }) = app.export_entries.get_mut(*index)
                     {
                         *duration_ms = Some(result_item.duration_ms);
                         *trust = Some(export_trust(result_item.trust));
@@ -2386,22 +2458,24 @@ fn hydrate_visible_history(app: &mut ChatApp, history: &ConversationHistory) {
             TurnItem::Reasoning(reasoning) => {
                 let summary = reasoning.summary_text.join(" ");
                 if !summary.trim().is_empty() {
-                    app.export_entries.push(ExportEntry::Reasoning(summary.clone()));
+                    app.export_entries
+                        .push(ExportEntry::Reasoning(summary.clone()));
                     app.push_cell(Box::new(ReasoningHistoryCell { summary }));
                 }
             }
             TurnItem::Error(error) => {
                 app.push_line(Role::System, format!("⚠ {}", error.message));
-                app.export_entries.push(ExportEntry::Error(ExportErrorEntry {
-                    code: Some(if error.retryable {
-                        "retryable".to_owned()
-                    } else {
-                        "error".to_owned()
-                    }),
-                    message: error.message.clone(),
-                    details: Some(serde_json::json!({ "retryable": error.retryable })),
-                    agent: None,
-                }));
+                app.export_entries
+                    .push(ExportEntry::Error(ExportErrorEntry {
+                        code: Some(if error.retryable {
+                            "retryable".to_owned()
+                        } else {
+                            "error".to_owned()
+                        }),
+                        message: error.message.clone(),
+                        details: Some(serde_json::json!({ "retryable": error.retryable })),
+                        agent: None,
+                    }));
             }
         }
     }
@@ -2439,29 +2513,48 @@ fn incident_hint(error: &TuiError, provider_error_streak: u32) -> Option<&'stati
     };
     let message = message.to_ascii_lowercase();
     let provider_error = [
-        "provider", "model", "rate limit", "429", "timeout", "timed out",
-        "connection", "http",
+        "provider",
+        "model",
+        "rate limit",
+        "429",
+        "timeout",
+        "timed out",
+        "connection",
+        "http",
     ]
     .iter()
     .any(|needle| message.contains(needle));
     if provider_error && provider_error_streak >= 2 {
-        return Some("Hinweis: Wiederholter Providerfehler. Mit /bug-report kannst du einen Incident melden.");
+        return Some(
+            "Hinweis: Wiederholter Providerfehler. Mit /bug-report kannst du einen Incident melden.",
+        );
     }
-    if ["panic", "panicked", "thread '"].iter().any(|needle| message.contains(needle)) {
-        return Some("Hinweis: Panikhinweis erkannt. Mit /bug-report kannst du einen Incident melden.");
+    if ["panic", "panicked", "thread '"]
+        .iter()
+        .any(|needle| message.contains(needle))
+    {
+        return Some(
+            "Hinweis: Panikhinweis erkannt. Mit /bug-report kannst du einen Incident melden.",
+        );
     }
-    if ["agent", "child"].iter().any(|needle| message.contains(needle))
+    if ["agent", "child"]
+        .iter()
+        .any(|needle| message.contains(needle))
         && ["killed", "terminated", "aborted", "cancelled", "canceled"]
             .iter()
             .any(|needle| message.contains(needle))
     {
-        return Some("Hinweis: Ein Agent wurde beendet. Mit /bug-report kannst du einen Incident melden.");
+        return Some(
+            "Hinweis: Ein Agent wurde beendet. Mit /bug-report kannst du einen Incident melden.",
+        );
     }
     if ["lock contention", "contention", "deadlock", "lock poisoned"]
         .iter()
         .any(|needle| message.contains(needle))
     {
-        return Some("Hinweis: Lock-Contention erkannt. Mit /bug-report kannst du einen Incident melden.");
+        return Some(
+            "Hinweis: Lock-Contention erkannt. Mit /bug-report kannst du einen Incident melden.",
+        );
     }
     None
 }
@@ -2568,6 +2661,10 @@ struct QuitArm {
 ///   Handlers. Er wird während eines laufenden Turns in
 ///   [`drive_turn_animated`] gepollt — bliebe er ungepollt, liefe jede Frage
 ///   in den Timeout und würde damit zur Ablehnung.
+/// - `host_permit_prompts` (`&mut HostPermitPromptReceiver`): Fragekanal
+///   dieser Wurzelsitzung (siehe
+///   [`harw_runtime::RuntimeAssembly::take_host_permit_prompts`]).
+///   Ebenfalls in [`drive_turn_animated`] gepollt, aus demselben Grund.
 ///
 /// # Fehler
 /// [`TuiError`] bei Zeichnen, Terminal-I/O oder Turn-Fehler.
@@ -2588,6 +2685,7 @@ pub(crate) async fn run_loop(
     frame_req: &FrameRequester,
     approval_driver: &ApprovalDriver,
     approvals: &mut ApprovalPromptReceiver,
+    host_permit_prompts: &mut HostPermitPromptReceiver,
 ) -> Result<TuiRunOutcome, TuiError> {
     // Seitenkanäle der Turn-Ereignisverarbeitung: Werkzeugnamen-Korrelation und
     // die eine Verlaufszelle je Kind-Session.
@@ -2602,368 +2700,375 @@ pub(crate) async fn run_loop(
         // Sie passiert denselben Pfad wie eine frische `HarwEvent::Submit`.
         let mut submitted: Option<String> = app.pending_turns.pop_front();
 
-        if submitted.is_none() { tokio::select! {
-            maybe_tev = async { match app.deferred_input.pop_front() { Some(event) => Some(event), None => tui_rx.recv().await } } => {
-                let Some(tev) = maybe_tev else { return Ok(TuiRunOutcome::Quit) };
+        if submitted.is_none() {
+            tokio::select! {
+                maybe_tev = async { match app.deferred_input.pop_front() { Some(event) => Some(event), None => tui_rx.recv().await } } => {
+                    let Some(tev) = maybe_tev else { return Ok(TuiRunOutcome::Quit) };
 
-                // Abgelaufenen Beenden-Hinweis verwerfen.
-                if let Some(arm) = pending_quit {
-                    if arm.at.elapsed() > QUIT_HINT_WINDOW {
-                        pending_quit = None;
+                    // Abgelaufenen Beenden-Hinweis verwerfen.
+                    if let Some(arm) = pending_quit {
+                        if arm.at.elapsed() > QUIT_HINT_WINDOW {
+                            pending_quit = None;
+                        }
+                    }
+
+                    match tev {
+                        TuiEvent::Draw => {
+                            draw_viewport(guard, app, &spinner, pending_quit.map(|arm| arm.label))?;
+                        }
+                        TuiEvent::Key(key) => {
+                            if handle_key(app, key, &mut pending_quit, harw_tx) {
+                                frame_req.schedule_frame();
+                            }
+                        }
+                        TuiEvent::Mouse(mouse) => {
+                            // Nur das Rad scrollt die Historie; Klicks und
+                            // Bewegungen bleiben unbeachtet.
+                            if app.scroll.handle_mouse(
+                                mouse,
+                                app.last_history_total_lines() as usize,
+                                app.last_history_visible_rows() as usize,
+                            ) == ScrollAction::Redraw
+                            {
+                                frame_req.schedule_frame();
+                            }
+                        }
+                        TuiEvent::Paste(text) => {
+                            let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+                            app.input.insert_str(&normalized);
+                            app.sync_popup();
+                            frame_req.schedule_frame();
+                        }
+                        TuiEvent::Resize(_, _) => {
+                            frame_req.schedule_frame();
+                        }
                     }
                 }
-
-                match tev {
-                    TuiEvent::Draw => {
-                        draw_viewport(guard, app, &spinner, pending_quit.map(|arm| arm.label))?;
-                    }
-                    TuiEvent::Key(key) => {
-                        if handle_key(app, key, &mut pending_quit, harw_tx) {
-                            frame_req.schedule_frame();
-                        }
-                    }
-                    TuiEvent::Mouse(mouse) => {
-                        // Nur das Rad scrollt die Historie; Klicks und
-                        // Bewegungen bleiben unbeachtet.
-                        if app.scroll.handle_mouse(
-                            mouse,
-                            app.last_history_total_lines() as usize,
-                            app.last_history_visible_rows() as usize,
-                        ) == ScrollAction::Redraw
-                        {
-                            frame_req.schedule_frame();
-                        }
-                    }
-                    TuiEvent::Paste(text) => {
-                        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-                        app.input.insert_str(&normalized);
-                        app.sync_popup();
-                        frame_req.schedule_frame();
-                    }
-                    TuiEvent::Resize(_, _) => {
-                        frame_req.schedule_frame();
-                    }
-                }
-            }
-            maybe_hev = harw_rx.recv() => {
-                let Some(hev) = maybe_hev else { return Ok(TuiRunOutcome::Quit) };
-                match hev {
-                    HarwEvent::Quit => return Ok(TuiRunOutcome::Quit),
-                    HarwEvent::SystemMessage(message) => {
-                        // Mehrzeilige Ausgaben (z. B. `/help`) an `\n` aufteilen.
-                        let lines: Vec<Line<'static>> = message
-                            .split('\n')
-                            .map(|line| Line::from(line.to_owned()))
-                            .collect();
-                        app.push_lines(lines);
-                        frame_req.schedule_frame();
-                    }
-                    HarwEvent::Submit(text) => {
-                        // Ein Turn läuft nie parallel zum nächsten. Falls bereits
-                        // etwas zur Verarbeitung bereitsteht, bleibt diese Eingabe
-                        // FIFO erhalten.
-                        if submitted.is_some() {
-                            app.pending_turns.push_back(text);
-                        } else {
-                            submitted = Some(text);
-                        }
-                    }
-                    HarwEvent::Command(raw) => {
-                        if let Some(request) = resume_request(&raw) {
-                            return Ok(request);
-                        }
-                        // `/provider`/`/model` ohne Argument öffnen die
-                        // interaktive Auswahl statt der Text-Ausgabe (`show`)
-                        // — vor dem regulären `/command`-Dispatch
-                        // abgefangen, damit `show` nicht zusätzlich läuft.
-                        // `/provider list`, `/model switch x` u. ä. bleiben
-                        // unberührt und laufen unverändert weiter unten.
-                        if is_bare_command(&raw, "/provider") {
-                            app.open_provider_choice();
-                            frame_req.schedule_frame();
-                            continue;
-                        }
-                        if is_bare_command(&raw, "/model") {
-                            match app.resolved_config() {
-                                Some(config) => match app.active_or_default_provider(&config) {
-                                    Some(provider) => app.open_model_choice(provider, false),
-                                    None => app.push_line(
-                                        Role::System,
-                                        "Modell-Auswahl nicht verfügbar: kein aktiver oder \
-                                         Standard-Provider bekannt.",
-                                    ),
-                                },
-                                None => app.push_line(
-                                    Role::System,
-                                    "Modell-Auswahl nicht verfügbar: keine Konfiguration geladen.",
-                                ),
-                            }
-                            frame_req.schedule_frame();
-                            continue;
-                        }
-                        // `/uia-provider`/`/uia-model` ohne Argument öffnen
-                        // dieselbe interaktive Auswahl wie `/provider`/
-                        // `/model`, pinnen aber den UIA-Worker statt der
-                        // aktiven Session (Ops-Handler dafür werden parallel
-                        // in `harw-ops` ergänzt; bis dahin ist die
-                        // emittierte `/uia-provider switch`/`/uia-model
-                        // switch`-Zeile ein erwarteter "unbekannter Befehl").
-                        if is_bare_command(&raw, "/uia-provider") {
-                            app.open_uia_provider_choice();
-                            frame_req.schedule_frame();
-                            continue;
-                        }
-                        if is_bare_command(&raw, "/uia-model") {
-                            match app.resolved_config() {
-                                // Der UIA-Pin-Provider hat Vorrang vor dem
-                                // regulären aktiven/Standard-Provider, damit
-                                // die Modell-Liste zum tatsächlich gepinnten
-                                // Provider passt.
-                                Some(config) => {
-                                    let provider = config
-                                        .harness
-                                        .uia_provider
-                                        .clone()
-                                        .or_else(|| app.active_or_default_provider(&config));
-                                    match provider {
-                                        Some(provider) => app.open_uia_model_choice(provider),
-                                        None => app.push_line(
-                                            Role::System,
-                                            "UIA-Modell-Auswahl nicht verfügbar: kein UIA-Pin-, \
-                                             aktiver oder Standard-Provider bekannt.",
-                                        ),
-                                    }
-                                }
-                                None => app.push_line(
-                                    Role::System,
-                                    "UIA-Modell-Auswahl nicht verfügbar: keine Konfiguration geladen.",
-                                ),
-                            }
-                            frame_req.schedule_frame();
-                            continue;
-                        }
-                        // `/tools` — handled locally via `tools_command` module;
-                        // does NOT go through the Operation-Adapter pipeline so
-                        // that it can mutate the session's `SessionActivation`
-                        // directly without serialising through an async op.
-                        //
-                        // Split-borrow strategy: `registry()` returns `&ExtensionRegistry`
-                        // from the session. We cannot hold that reference AND call
-                        // `activation_mut()` at the same time because both go through
-                        // `gateway.session_mut()`. Solution: collect all registry data
-                        // we need into an owned value first, then drop the shared
-                        // borrow before taking the mutable one.
-                        let tools_outcome = if raw.trim_start_matches('/').starts_with("tools") {
-                            let args = raw
-                                .trim()
-                                .strip_prefix("/tools")
-                                .unwrap_or("")
-                                .to_owned();
-                            // Phase 1: clone tool specs out of the registry
-                            // (avoids holding a `&ExtensionRegistry` borrow
-                            //  while we later take `&mut SessionActivation`).
-                            let tool_names: Vec<(String, bool)> = {
-                                let session = gateway.session_mut();
-                                let registry = session.registry();
-                                let activation = session.activation();
-                                registry
-                                    .tool_providers()
-                                    .iter()
-                                    .flat_map(|p| p.tools())
-                                    .map(|spec| {
-                                        let name = spec.name().to_owned();
-                                        let enabled =
-                                            activation.is_tool_enabled(&harw_extension_api::ToolName::new(&name));
-                                        (name, enabled)
-                                    })
-                                    .collect()
-                            };
-                            // Phase 2: take the session ceiling (base ∩ mode) as an
-                            // owned value first, then mutate activation via the
-                            // parsed args. `/tools` may narrow, but never widen
-                            // beyond this ceiling (W2d-1/F-T, E8).
-                            let ceiling = gateway.session_mut().mode_ceiling();
-                            Some(crate::tools_command::dispatch_tools_command_bounded(
-                                &args,
-                                &tool_names,
-                                gateway.session_mut().activation_mut(),
-                                &ceiling,
-                            ))
-                        } else {
-                            None
-                        };
-
-                        if let Some(outcome) = tools_outcome {
-                            let lines: Vec<Line<'static>> = outcome
-                                .into_lines()
-                                .into_iter()
-                                .map(Line::from)
-                                .collect();
-                            app.push_lines(lines);
-                            frame_req.schedule_frame();
-                        } else {
-                            // `/compact` mutiert die aktive TUI-Sitzung direkt. Die
-                            // Operation-Adapter besitzen absichtlich keinen Zugriff auf
-                            // den lebenden `AgentSession`; über sie wäre deshalb nur der
-                            // frühere Not-available-Stub erreichbar. Der gekürzte Verlauf
-                            // wird sofort persistiert, damit ein anschließendes `/resume`
-                            // denselben Kontext erhält.
-                            let (output, output_data) = if raw.trim() == "/compact" {
-                                let (session, store, model) = gateway.borrow_turn_ctx();
-                                let context_window_tokens = session
-                                    .auto_compact()
-                                    .map(|policy| policy.context_window_tokens())
-                                    .unwrap_or(200_000);
-                                let mut plan = CompactionPlan::for_context_window(context_window_tokens);
-                                let (summary_provider, summary_model) =
-                                    session.compaction_summary_model();
-                                plan.summary_provider = summary_provider.cloned();
-                                plan.summary_model = summary_model.cloned();
-                                let output = match compact_session(session, model, &plan, None).await {
-                                    Ok(outcome) => {
-                                        if let Err(error) =
-                                            store.save_history(session.id(), session.history()).await
-                                        {
-                                            tracing::warn!(
-                                                %error,
-                                                "compact: Verlauf verdichtet, aber Persistenz fehlgeschlagen"
-                                            );
-                                        }
-                                        let summarized_suffix = if outcome.summarized {
-                                            ", zusammengefasst"
-                                        } else {
-                                            ""
-                                        };
-                                        format!(
-                                            "Kontext verdichtet: {} → {} Bytes ({} entfernt, {} Duplikate, {} gekürzt{summarized_suffix})",
-                                            outcome.bytes_before,
-                                            outcome.bytes_after,
-                                            outcome.items_dropped,
-                                            outcome.calls_deduplicated,
-                                            outcome.results_truncated,
-                                        )
-                                    }
-                                    Err(error) => format!("Verdichtung fehlgeschlagen: {error}"),
-                                };
-                                (output, None)
-                            } else {
-                            // `/command`-Zeile asynchron über die Operation-Adapter-
-                            // Pipeline ausführen; identischer Render-/Redraw-Pfad wie
-                            // bei `SystemMessage` (mehrzeilige Ausgaben an `\n`
-                            // aufteilen). Berechtigungsstufe und Slash-Dienste
-                            // stammen aus der Runtime-Montage; die Dienste werden
-                            // erst nach erfolgreicher Admission gebaut.
-                                match app.runtime() {
-                                    Some(rt) => {
-                                        let caller_tier = runtime_commands::caller_tier(rt.principal());
-                                        match execute_export_command_with_data(
-                                            app.adapters(),
-                                            app.sandbox(),
-                                            app.session_id(),
-                                            caller_tier,
-                                            &raw,
-                                            || runtime_commands::slash_service_map(rt.services()),
-                                        )
-                                        .await
-                                        {
-                                            Some(Ok(output)) => (output.text, output.data),
-                                            Some(Err(error)) => (error, None),
-                                            None => (
-                                                execute_command_as(
-                                                    app.adapters(),
-                                                    app.sandbox(),
-                                                    app.session_id(),
-                                                    caller_tier,
-                                                    &raw,
-                                                    || runtime_commands::slash_service_map(
-                                                        rt.services(),
-                                                    ),
-                                                )
-                                                .await,
-                                                None,
-                                            ),
-                                        }
-                                    }
-                                    None => {
-                                        tracing::error!("tui.command.no_runtime_assembly");
-                                        ("Fehler: keine Runtime-Montage".to_owned(), None)
-                                    }
-                                }
-                            };
-                            let lines: Vec<Line<'static>> = output
+                maybe_hev = harw_rx.recv() => {
+                    let Some(hev) = maybe_hev else { return Ok(TuiRunOutcome::Quit) };
+                    match hev {
+                        HarwEvent::Quit => return Ok(TuiRunOutcome::Quit),
+                        HarwEvent::SystemMessage(message) => {
+                            // Mehrzeilige Ausgaben (z. B. `/help`) an `\n` aufteilen.
+                            let lines: Vec<Line<'static>> = message
                                 .split('\n')
                                 .map(|line| Line::from(line.to_owned()))
                                 .collect();
                             app.push_lines(lines);
-                            // AP W5-05: Eine `/command`-Zeile läuft **zwischen**
-                            // Turns. Das ist eine gültige Turn-Grenze, also darf
-                            // ein soeben angefordertes `/mode` sofort wirken —
-                            // sonst zeigte die Statuszeile bis zur nächsten
-                            // Nachricht weiter den alten Modus.
-                            app.apply_pending_controller_state(gateway.session_mut());
-                            // AP W5-10b: Zielstand nach `/goal check` sichtbar
-                            // machen, sofern die Composition-Root Plan-/Ziel-
-                            // Dienste durchgereicht hat.
-                            if let Some(cell) = goal_cell_for_command(app, &raw) {
-                                app.push_cell(Box::new(cell));
+                            frame_req.schedule_frame();
+                        }
+                        HarwEvent::Submit(text) => {
+                            // Ein Turn läuft nie parallel zum nächsten. Falls bereits
+                            // etwas zur Verarbeitung bereitsteht, bleibt diese Eingabe
+                            // FIFO erhalten.
+                            if submitted.is_some() {
+                                app.pending_turns.push_back(text);
+                            } else {
+                                submitted = Some(text);
                             }
-                            // `/export`: bei `--datei <pfad>` direkt schreiben,
-                            // sonst die Zielauswahl öffnen (Slice E1).
-                            if let Some(request) = output_data
-                                .as_ref()
-                                .and_then(export_request_from_data)
-                                .or_else(|| export_request_for_command(&raw))
-                            {
-                                resolve_export_request(app, &request);
+                        }
+                        HarwEvent::Command(raw) => {
+                            if let Some(request) = resume_request(&raw) {
+                                return Ok(request);
                             }
+                            // `/provider`/`/model` ohne Argument öffnen die
+                            // interaktive Auswahl statt der Text-Ausgabe (`show`)
+                            // — vor dem regulären `/command`-Dispatch
+                            // abgefangen, damit `show` nicht zusätzlich läuft.
+                            // `/provider list`, `/model switch x` u. ä. bleiben
+                            // unberührt und laufen unverändert weiter unten.
+                            if is_bare_command(&raw, "/provider") {
+                                app.open_provider_choice();
+                                frame_req.schedule_frame();
+                                continue;
+                            }
+                            if is_bare_command(&raw, "/model") {
+                                match app.resolved_config() {
+                                    Some(config) => match app.active_or_default_provider(&config) {
+                                        Some(provider) => app.open_model_choice(provider, false),
+                                        None => app.push_line(
+                                            Role::System,
+                                            "Modell-Auswahl nicht verfügbar: kein aktiver oder \
+                                             Standard-Provider bekannt.",
+                                        ),
+                                    },
+                                    None => app.push_line(
+                                        Role::System,
+                                        "Modell-Auswahl nicht verfügbar: keine Konfiguration geladen.",
+                                    ),
+                                }
+                                frame_req.schedule_frame();
+                                continue;
+                            }
+                            // `/uia-provider`/`/uia-model` ohne Argument öffnen
+                            // dieselbe interaktive Auswahl wie `/provider`/
+                            // `/model`, pinnen aber den UIA-Worker statt der
+                            // aktiven Session (Ops-Handler dafür werden parallel
+                            // in `harw-ops` ergänzt; bis dahin ist die
+                            // emittierte `/uia-provider switch`/`/uia-model
+                            // switch`-Zeile ein erwarteter "unbekannter Befehl").
+                            if is_bare_command(&raw, "/uia-provider") {
+                                app.open_uia_provider_choice();
+                                frame_req.schedule_frame();
+                                continue;
+                            }
+                            if is_bare_command(&raw, "/uia-model") {
+                                match app.resolved_config() {
+                                    // Der UIA-Pin-Provider hat Vorrang vor dem
+                                    // regulären aktiven/Standard-Provider, damit
+                                    // die Modell-Liste zum tatsächlich gepinnten
+                                    // Provider passt.
+                                    Some(config) => {
+                                        let provider = config
+                                            .harness
+                                            .uia_provider
+                                            .clone()
+                                            .or_else(|| app.active_or_default_provider(&config));
+                                        match provider {
+                                            Some(provider) => app.open_uia_model_choice(provider),
+                                            None => app.push_line(
+                                                Role::System,
+                                                "UIA-Modell-Auswahl nicht verfügbar: kein UIA-Pin-, \
+                                                 aktiver oder Standard-Provider bekannt.",
+                                            ),
+                                        }
+                                    }
+                                    None => app.push_line(
+                                        Role::System,
+                                        "UIA-Modell-Auswahl nicht verfügbar: keine Konfiguration geladen.",
+                                    ),
+                                }
+                                frame_req.schedule_frame();
+                                continue;
+                            }
+                            // `/tools` — handled locally via `tools_command` module;
+                            // does NOT go through the Operation-Adapter pipeline so
+                            // that it can mutate the session's `SessionActivation`
+                            // directly without serialising through an async op.
+                            //
+                            // Split-borrow strategy: `registry()` returns `&ExtensionRegistry`
+                            // from the session. We cannot hold that reference AND call
+                            // `activation_mut()` at the same time because both go through
+                            // `gateway.session_mut()`. Solution: collect all registry data
+                            // we need into an owned value first, then drop the shared
+                            // borrow before taking the mutable one.
+                            let tools_outcome = if raw.trim_start_matches('/').starts_with("tools") {
+                                let args = raw
+                                    .trim()
+                                    .strip_prefix("/tools")
+                                    .unwrap_or("")
+                                    .to_owned();
+                                // Phase 1: clone tool specs out of the registry
+                                // (avoids holding a `&ExtensionRegistry` borrow
+                                //  while we later take `&mut SessionActivation`).
+                                let tool_names: Vec<(String, bool)> = {
+                                    let session = gateway.session_mut();
+                                    let registry = session.registry();
+                                    let activation = session.activation();
+                                    registry
+                                        .tool_providers()
+                                        .iter()
+                                        .flat_map(|p| p.tools())
+                                        .map(|spec| {
+                                            let name = spec.name().to_owned();
+                                            let enabled =
+                                                activation.is_tool_enabled(&harw_extension_api::ToolName::new(&name));
+                                            (name, enabled)
+                                        })
+                                        .collect()
+                                };
+                                // Phase 2: take the session ceiling (base ∩ mode) as an
+                                // owned value first, then mutate activation via the
+                                // parsed args. `/tools` may narrow, but never widen
+                                // beyond this ceiling (W2d-1/F-T, E8).
+                                let ceiling = gateway.session_mut().mode_ceiling();
+                                Some(crate::tools_command::dispatch_tools_command_bounded(
+                                    &args,
+                                    &tool_names,
+                                    gateway.session_mut().activation_mut(),
+                                    &ceiling,
+                                ))
+                            } else {
+                                None
+                            };
+
+                            if let Some(outcome) = tools_outcome {
+                                let lines: Vec<Line<'static>> = outcome
+                                    .into_lines()
+                                    .into_iter()
+                                    .map(Line::from)
+                                    .collect();
+                                app.push_lines(lines);
+                                frame_req.schedule_frame();
+                            } else {
+                                // `/compact` mutiert die aktive TUI-Sitzung direkt. Die
+                                // Operation-Adapter besitzen absichtlich keinen Zugriff auf
+                                // den lebenden `AgentSession`; über sie wäre deshalb nur der
+                                // frühere Not-available-Stub erreichbar. Der gekürzte Verlauf
+                                // wird sofort persistiert, damit ein anschließendes `/resume`
+                                // denselben Kontext erhält.
+                                let (output, output_data) = if raw.trim() == "/compact" {
+                                    let (session, store, model) = gateway.borrow_turn_ctx();
+                                    let context_window_tokens = session
+                                        .auto_compact()
+                                        .map(|policy| policy.context_window_tokens())
+                                        .unwrap_or(200_000);
+                                    let mut plan = CompactionPlan::for_context_window(context_window_tokens);
+                                    let (summary_provider, summary_model) =
+                                        session.compaction_summary_model();
+                                    plan.summary_provider = summary_provider.cloned();
+                                    plan.summary_model = summary_model.cloned();
+                                    let output = match compact_session(session, model, &plan, None).await {
+                                        Ok(outcome) => {
+                                            if let Err(error) =
+                                                store.save_history(session.id(), session.history()).await
+                                            {
+                                                tracing::warn!(
+                                                    %error,
+                                                    "compact: Verlauf verdichtet, aber Persistenz fehlgeschlagen"
+                                                );
+                                            }
+                                            let summarized_suffix = if outcome.summarized {
+                                                ", zusammengefasst"
+                                            } else {
+                                                ""
+                                            };
+                                            format!(
+                                                "Kontext verdichtet: {} → {} Bytes ({} entfernt, {} Duplikate, {} gekürzt{summarized_suffix})",
+                                                outcome.bytes_before,
+                                                outcome.bytes_after,
+                                                outcome.items_dropped,
+                                                outcome.calls_deduplicated,
+                                                outcome.results_truncated,
+                                            )
+                                        }
+                                        Err(error) => format!("Verdichtung fehlgeschlagen: {error}"),
+                                    };
+                                    (output, None)
+                                } else {
+                                // `/command`-Zeile asynchron über die Operation-Adapter-
+                                // Pipeline ausführen; identischer Render-/Redraw-Pfad wie
+                                // bei `SystemMessage` (mehrzeilige Ausgaben an `\n`
+                                // aufteilen). Berechtigungsstufe und Slash-Dienste
+                                // stammen aus der Runtime-Montage; die Dienste werden
+                                // erst nach erfolgreicher Admission gebaut.
+                                    match app.runtime() {
+                                        Some(rt) => {
+                                            let caller_tier = runtime_commands::caller_tier(rt.principal());
+                                            match execute_export_command_with_data(
+                                                app.adapters(),
+                                                app.sandbox(),
+                                                app.session_id(),
+                                                caller_tier,
+                                                &raw,
+                                                || runtime_commands::slash_service_map(rt.services()),
+                                            )
+                                            .await
+                                            {
+                                                Some(Ok(output)) => (output.text, output.data),
+                                                Some(Err(error)) => (error, None),
+                                                None => (
+                                                    execute_command_as(
+                                                        app.adapters(),
+                                                        app.sandbox(),
+                                                        app.session_id(),
+                                                        caller_tier,
+                                                        &raw,
+                                                        || runtime_commands::slash_service_map(
+                                                            rt.services(),
+                                                        ),
+                                                    )
+                                                    .await,
+                                                    None,
+                                                ),
+                                            }
+                                        }
+                                        None => {
+                                            tracing::error!("tui.command.no_runtime_assembly");
+                                            ("Fehler: keine Runtime-Montage".to_owned(), None)
+                                        }
+                                    }
+                                };
+                                let lines: Vec<Line<'static>> = output
+                                    .split('\n')
+                                    .map(|line| Line::from(line.to_owned()))
+                                    .collect();
+                                app.push_lines(lines);
+                                // AP W5-05: Eine `/command`-Zeile läuft **zwischen**
+                                // Turns. Das ist eine gültige Turn-Grenze, also darf
+                                // ein soeben angefordertes `/mode` sofort wirken —
+                                // sonst zeigte die Statuszeile bis zur nächsten
+                                // Nachricht weiter den alten Modus.
+                                app.apply_pending_controller_state(gateway.session_mut());
+                                // AP W5-10b: Zielstand nach `/goal check` sichtbar
+                                // machen, sofern die Composition-Root Plan-/Ziel-
+                                // Dienste durchgereicht hat.
+                                if let Some(cell) = goal_cell_for_command(app, &raw) {
+                                    app.push_cell(Box::new(cell));
+                                }
+                                // `/export`: bei `--datei <pfad>` direkt schreiben,
+                                // sonst die Zielauswahl öffnen (Slice E1).
+                                if let Some(request) = output_data
+                                    .as_ref()
+                                    .and_then(export_request_from_data)
+                                    .or_else(|| export_request_for_command(&raw))
+                                {
+                                    resolve_export_request(app, &request);
+                                }
+                                frame_req.schedule_frame();
+                            }
+                        }
+                    }
+                }
+                maybe_sev = event_rx.recv() => {
+                    match maybe_sev {
+                        Some(SessionEvent::SessionConfigured { model, .. }) => {
+                            app.set_export_session_model(model);
+                        }
+                        Some(SessionEvent::TurnCompleted { usage, .. }) => {
+                        app.total_usage.add(&usage);
+                        // Plan Schritt 7: einmalige Titel-Job-Anstoßung nach dem
+                        // ersten abgeschlossenen Turn der Sitzung. Der Kontext wird
+                        // dabei verbraucht (`Option::take`) — höchstens ein Versuch
+                        // je Sitzung, unabhängig davon, ob ein Modell auflösbar war
+                        // (siehe `TitleJobContext`-Doku in `runtime_root.rs`).
+                        if let Some(ctx) = app.title_job_context.take() {
+                            let pin = harw_runtime::session_title::title_model_selection(&ctx.config);
+                            let model = ctx.title_model.clone().or_else(|| {
+                                gateway
+                                    .session_mut()
+                                    .active_model()
+                                    .map(|id| id.as_str().to_owned())
+                            });
+                            match model {
+                                Some(model) => harw_runtime::spawn_title_job(
+                                    ctx.session_store_root,
+                                    app.session_id().clone(),
+                                    ctx.provider,
+                                    model,
+                                    pin,
+                                ),
+                                None => tracing::debug!(
+                                    "tui.session_title.no_model_available_skipping_job"
+                                ),
+                            }
+                        }
+                        frame_req.schedule_frame();
+                        }
+                        // Andere SessionEvent-Varianten und ein geschlossener Kanal
+                        // bleiben für den Renderer ohne sichtbare Auswirkung.
+                        _ => {}
+                    }
+                }
+                maybe_tev = turn_event_rx.recv() => {
+                    if let Some(tev) = maybe_tev {
+                        if handle_turn_event(app, &mut turn_state, tev) {
                             frame_req.schedule_frame();
                         }
                     }
                 }
             }
-            maybe_sev = event_rx.recv() => {
-                if let Some(SessionEvent::TurnCompleted { usage, .. }) = maybe_sev {
-                    app.total_usage.add(&usage);
-                    // Plan Schritt 7: einmalige Titel-Job-Anstoßung nach dem
-                    // ersten abgeschlossenen Turn der Sitzung. Der Kontext wird
-                    // dabei verbraucht (`Option::take`) — höchstens ein Versuch
-                    // je Sitzung, unabhängig davon, ob ein Modell auflösbar war
-                    // (siehe `TitleJobContext`-Doku in `runtime_root.rs`).
-                    if let Some(ctx) = app.title_job_context.take() {
-                        let pin = harw_runtime::session_title::title_model_selection(&ctx.config);
-                        let model = ctx.title_model.clone().or_else(|| {
-                            gateway
-                                .session_mut()
-                                .active_model()
-                                .map(|id| id.as_str().to_owned())
-                        });
-                        match model {
-                            Some(model) => harw_runtime::spawn_title_job(
-                                ctx.session_store_root,
-                                app.session_id().clone(),
-                                ctx.provider,
-                                model,
-                                pin,
-                            ),
-                            None => tracing::debug!(
-                                "tui.session_title.no_model_available_skipping_job"
-                            ),
-                        }
-                    }
-                    frame_req.schedule_frame();
-                }
-                // Andere SessionEvent-Varianten (TurnStarted, SessionConfigured, ...) und
-                // ein geschlossener Kanal (None) werden in dieser Welle bewusst ignoriert —
-                // nur die Token-Summary wird konsumiert.
-            }
-            maybe_tev = turn_event_rx.recv() => {
-                if let Some(tev) = maybe_tev {
-                    if handle_turn_event(app, &mut turn_state, tev) {
-                        frame_req.schedule_frame();
-                    }
-                }
-            }
-        } }
+        }
 
         // ── Turn-Pfad, außerhalb des `select!` ───────────────────────────────
         let Some(text) = submitted else {
@@ -2999,6 +3104,7 @@ pub(crate) async fn run_loop(
             &text,
             approval_driver,
             approvals,
+            host_permit_prompts,
             tui_rx,
             turn_event_rx,
             &mut turn_state,
@@ -3150,10 +3256,9 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                     call.name.as_str(),
                     call.arguments.clone(),
                 ));
-                state.export_tool_calls.insert(
-                    call_id.clone(),
-                    app.export_entries.len().saturating_sub(1),
-                );
+                state
+                    .export_tool_calls
+                    .insert(call_id.clone(), app.export_entries.len().saturating_sub(1));
             }
             // Bereits während einer Freigabefrage angelegt (Wettlauf zwischen
             // den beiden Kanälen, siehe `ensure_tool_cell`-Doku): kein neuer
@@ -3179,7 +3284,9 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                         }),
                     };
                     let cell = Arc::new(Mutex::new(ToolCell::started(&orphan)));
-                    state.pending_tool_cells.insert(call_id.clone(), Arc::clone(&cell));
+                    state
+                        .pending_tool_cells
+                        .insert(call_id.clone(), Arc::clone(&cell));
                     app.append_tool_cell("tool.result", Arc::clone(&cell));
                     cell
                 }
@@ -3198,14 +3305,15 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                     tool_name.as_deref().unwrap_or("tool.result"),
                     serde_json::json!({ "call_id": call_id.to_string(), "orphaned": true }),
                 ));
-                state.export_tool_calls.insert(
-                    call_id.clone(),
-                    app.export_entries.len().saturating_sub(1),
-                );
+                state
+                    .export_tool_calls
+                    .insert(call_id.clone(), app.export_entries.len().saturating_sub(1));
             }
             if let Some(index) = state.export_tool_calls.get(&call_id).copied()
-                && let Some(ExportEntry::ToolCall { duration_ms: call_duration, .. }) =
-                    app.export_entries.get_mut(index)
+                && let Some(ExportEntry::ToolCall {
+                    duration_ms: call_duration,
+                    ..
+                }) = app.export_entries.get_mut(index)
             {
                 *call_duration = Some(duration_ms);
             }
@@ -3239,7 +3347,8 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                 return false;
             }
             app.close_tool_group();
-            app.export_entries.push(ExportEntry::Reasoning(summary.clone()));
+            app.export_entries
+                .push(ExportEntry::Reasoning(summary.clone()));
             app.push_cell(Box::new(ReasoningHistoryCell { summary }));
             true
         }
@@ -3247,12 +3356,13 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             item: TurnItem::Error(error),
             ..
         } => {
-            app.export_entries.push(ExportEntry::Error(ExportErrorEntry {
-                code: Some("item_error".to_owned()),
-                message: error.message.clone(),
-                details: Some(serde_json::json!({ "retryable": error.retryable })),
-                agent: None,
-            }));
+            app.export_entries
+                .push(ExportEntry::Error(ExportErrorEntry {
+                    code: Some("item_error".to_owned()),
+                    message: error.message.clone(),
+                    details: Some(serde_json::json!({ "retryable": error.retryable })),
+                    agent: None,
+                }));
             app.push_line(Role::System, format!("⚠ {}", error.message));
             true
         }
@@ -3275,13 +3385,14 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
             state
                 .child_cells
                 .insert(child_id.clone(), Arc::clone(&cell));
-            app.export_entries.push(ExportEntry::Agent(ExportAgentEntry {
-                agent_id: child_id.clone(),
-                role: Some(role.clone()),
-                parent_id: None,
-                status: Some("running".to_owned()),
-                summary: question.clone(),
-            }));
+            app.export_entries
+                .push(ExportEntry::Agent(ExportAgentEntry {
+                    agent_id: child_id.clone(),
+                    role: Some(role.clone()),
+                    parent_id: None,
+                    status: Some("running".to_owned()),
+                    summary: question.clone(),
+                }));
             app.push_shared_cell(cell);
             tracing::debug!(child = %child_id, "tui.child_cell.created");
             true
@@ -3296,13 +3407,14 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                 cell.apply_progress(tool_calls, tokens);
             });
             if updated {
-                app.export_entries.push(ExportEntry::Agent(ExportAgentEntry {
-                    agent_id: child.as_str().to_owned(),
-                    role: None,
-                    parent_id: None,
-                    status: Some("running".to_owned()),
-                    summary: Some(format!("{tool_calls} Tool-Aufrufe, {tokens} Tokens")),
-                }));
+                app.export_entries
+                    .push(ExportEntry::Agent(ExportAgentEntry {
+                        agent_id: child.as_str().to_owned(),
+                        role: None,
+                        parent_id: None,
+                        status: Some("running".to_owned()),
+                        summary: Some(format!("{tool_calls} Tool-Aufrufe, {tokens} Tokens")),
+                    }));
             }
             updated
         }
@@ -3316,13 +3428,14 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                 cell.apply_completion(outcome.clone(), duration_ms);
             });
             if updated {
-                app.export_entries.push(ExportEntry::Agent(ExportAgentEntry {
-                    agent_id: child.as_str().to_owned(),
-                    role: None,
-                    parent_id: None,
-                    status: Some(outcome),
-                    summary: Some(format!("Dauer: {duration_ms} ms")),
-                }));
+                app.export_entries
+                    .push(ExportEntry::Agent(ExportAgentEntry {
+                        agent_id: child.as_str().to_owned(),
+                        role: None,
+                        parent_id: None,
+                        status: Some(outcome),
+                        summary: Some(format!("Dauer: {duration_ms} ms")),
+                    }));
             }
             updated
         }
@@ -3403,12 +3516,59 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                 false
             }
         },
-        // TurnCompleted hier NICHT verarbeiten — das würde den Wave-1-
-        // Duplikat-Antwort-Bug wiederholen (Token-Summary läuft exklusiv
-        // über den SessionEvent-Pfad). ItemAdded(AssistantMessage/...),
-        // TurnStarted, TurnFailed, TurnAborted: bewusst kein UI-Effekt.
+        TurnEvent::TurnFailed { reason, .. } => {
+            mark_incomplete_tool_exports(app, state, &format!("unvollständig ({reason})"))
+        }
+        TurnEvent::TurnAborted { .. } => {
+            mark_incomplete_tool_exports(app, state, "unvollständig (abgebrochen)")
+        }
+        // TurnCompleted läuft exklusiv über den SessionEvent-Pfad, damit die
+        // Token-Summary nicht doppelt erscheint. TurnStarted trägt keinen
+        // zusätzlichen sichtbaren Zustand.
         _ => false,
     }
+}
+
+/// Marks outstanding tools as incomplete when a turn terminates early.
+fn mark_incomplete_tool_exports(
+    app: &mut ChatApp,
+    state: &mut TurnEventState,
+    reason: &str,
+) -> bool {
+    let call_ids: Vec<_> = state.pending_tool_cells.keys().cloned().collect();
+    let mut changed = false;
+    for call_id in call_ids {
+        let Some(cell) = state.pending_tool_cells.get(&call_id) else {
+            continue;
+        };
+        let Ok(mut cell) = cell.lock() else {
+            tracing::error!(call_id = %call_id, "tui.tool_cell.lock_poisoned");
+            continue;
+        };
+        if cell.state != ToolState::Running || state.export_incomplete_tools.contains_key(&call_id)
+        {
+            continue;
+        }
+        cell.mark_incomplete();
+        let tool_name = state
+            .export_tool_calls
+            .get(&call_id)
+            .and_then(|index| app.export_entries.get(*index))
+            .and_then(|entry| match entry {
+                ExportEntry::ToolCall { tool_name, .. } => Some(tool_name.clone()),
+                _ => None,
+            });
+        app.export_entries.push(export_tool_result_entry(
+            &call_id,
+            tool_name,
+            &ToolCallResult::error(reason),
+            0,
+            Some(ResultTrust::Runtime),
+        ));
+        state.export_incomplete_tools.insert(call_id, ());
+        changed = true;
+    }
+    changed
 }
 
 /// Baut nach einem `/goal check` den sichtbaren Zielstand.
@@ -3520,7 +3680,9 @@ where
     };
 
     let CommandAction::Command(spec, raw_args) = action else {
-        return Some(Err("Eingabe abgelehnt: /export ist kein ausführbarer Command.".to_owned()));
+        return Some(Err(
+            "Eingabe abgelehnt: /export ist kein ausführbarer Command.".to_owned(),
+        ));
     };
     let path = format!("/{}", spec.name.as_str());
     let Some(adapter) = adapters.iter().find(|adapter| adapter.path() == path) else {
@@ -3698,13 +3860,19 @@ fn export_timestamp_now() -> String {
 fn build_export(app: &ChatApp, opts: &ExportOptions, format: ExportOutputFormat) -> String {
     let controller = SessionController::snapshot(app.session_controller.as_ref());
     let config = app.resolved_config();
-    let provider = controller
-        .active_provider
-        .or_else(|| config.as_ref().and_then(|config| config.harness.default_provider.clone()));
+    let provider = controller.active_provider.or_else(|| {
+        config
+            .as_ref()
+            .and_then(|config| config.harness.default_provider.clone())
+    });
     let model = controller
         .active_model
         .or_else(|| app.export_session_model.clone())
-        .or_else(|| config.as_ref().and_then(|config| config.harness.default_model.clone()));
+        .or_else(|| {
+            config
+                .as_ref()
+                .and_then(|config| config.harness.default_model.clone())
+        });
     let model = match (provider, model) {
         (Some(provider), Some(model)) => Some(format!("{provider}/{model}")),
         (None, Some(model)) => Some(model),
@@ -3761,10 +3929,7 @@ fn resolve_export_request(app: &mut ChatApp, request: &ExportRequest) {
                 Role::System,
                 format!("Export gespeichert: {}", written_path.display()),
             ),
-            Err(error) => app.push_line(
-                Role::System,
-                format!("Export fehlgeschlagen: {error}"),
-            ),
+            Err(error) => app.push_line(Role::System, format!("Export fehlgeschlagen: {error}")),
         }
     } else {
         app.pending_export_options = Some(opts);
@@ -4125,6 +4290,13 @@ fn handle_key(
         return app.toggle_tool_cells();
     }
 
+    // Ctrl+H — beendet eine laufende Host-Arbeitsphase sofort (Plan
+    // „UIA-Shell-Worker und Shell-Modus", Schritt 2: „eine Möglichkeit, sie
+    // zu beenden"). Ohne aktive Phase tut die Taste nichts (kein Redraw).
+    if ctrl && matches!(key.code, KeyCode::Char('h' | 'H')) {
+        return app.end_host_mode();
+    }
+
     // ── ChatScroll konsultieren (PageUp/PageDown/Shift+Up/Shift+Down etc.) ──
     // Echte Werte aus dem letzten `draw_viewport`-Aufruf (vor dem ersten Draw:
     // 0 Zeilen / 20 sichtbar als sicherer Platzhalter) — ChatScroll clamped selbst.
@@ -4304,6 +4476,7 @@ async fn run_turn_streaming(
     text: &str,
     approval_driver: &ApprovalDriver,
     approvals: &mut ApprovalPromptReceiver,
+    host_permit_prompts: &mut HostPermitPromptReceiver,
     tui_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TuiEvent>,
     turn_event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TurnEvent>,
     turn_state: &mut TurnEventState,
@@ -4333,6 +4506,7 @@ async fn run_turn_streaming(
         TurnInput::user(text).with_control(TurnControl::new().with_cancel(cancel)),
         approval_driver,
         approvals,
+        host_permit_prompts,
         tui_rx,
         turn_event_rx,
         turn_state,
@@ -4430,6 +4604,7 @@ async fn drive_turn_animated(
     input: TurnInput,
     approval_driver: &ApprovalDriver,
     approvals: &mut ApprovalPromptReceiver,
+    host_permit_prompts: &mut HostPermitPromptReceiver,
     tui_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TuiEvent>,
     turn_event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TurnEvent>,
     turn_state: &mut TurnEventState,
@@ -4448,9 +4623,7 @@ async fn drive_turn_animated(
 
     let outcome = loop {
         attempt += 1;
-        let turn_input = pending_input
-            .take()
-            .unwrap_or_else(rate_limit_retry_input);
+        let turn_input = pending_input.take().unwrap_or_else(rate_limit_retry_input);
 
         // Turn-Future in einen Block scopen, damit der `&mut session`-Borrow
         // freigegeben wird, bevor wir `session.history()` lesen.
@@ -4497,7 +4670,9 @@ async fn drive_turn_animated(
                 // parallele Clients nicht im Gleichtakt erneut auf denselben
                 // Limiter schlagen.
                 let base = retry_after_secs.min(RATE_LIMIT_AUTO_RETRY_CAP_SECS);
-                let jitter = (base / 4).min(15).saturating_mul(u64::from(attempt - 1) % 2);
+                let jitter = (base / 4)
+                    .min(15)
+                    .saturating_mul(u64::from(attempt - 1) % 2);
                 let wait_secs = base.saturating_add(jitter);
                 let deadline =
                     tokio::time::Instant::now() + std::time::Duration::from_secs(wait_secs);
@@ -4536,6 +4711,7 @@ async fn drive_turn_animated(
             outcome,
             approval_driver,
             approvals,
+            host_permit_prompts,
             tui_rx,
             turn_event_rx,
             turn_state,
@@ -4733,7 +4909,94 @@ fn quote_for_synthetic_command(value: &str) -> String {
 /// # Rückgabe
 /// Ein einsatzbereites [`ApprovalDialog`] mit Option 2 („nicht mehr fragen")
 /// nur, wenn [`derive_shell_rule`] für `shell.exec` einen Vorschlag liefert.
-fn build_approval_dialog(prompt: &ApprovalPrompt, app: &ChatApp, timeout: Duration) -> ApprovalDialog {
+/// Baut den [`ChoiceDialog`] für eine soeben eingetroffene [`HostPermitPrompt`]
+/// (Plan „UIA-Shell-Worker und Shell-Modus", Schritt 2).
+///
+/// # Beschreibung
+/// Bietet genau die zwei Varianten aus
+/// `docs/design/mediated-process-execution.md` plus eine Ablehnungsoption, in
+/// dieser festen Reihenfolge — [`ChoiceAction::Chosen`] liefert damit einen
+/// stabilen Index für [`apply_host_permit_decision`]:
+/// 0. [`HostPermitVariant::SingleExecution`]
+/// 1. [`HostPermitVariant::SessionLease`]
+/// 2. Ablehnung
+///
+/// Vorausgewählt ist [`HostPermitPrompt::preselected_variant`] — der Modus
+/// ändert nur diese Vorauswahl, nie die Optionsliste selbst; der Mensch
+/// bestätigt in jedem Fall explizit (`Enter`).
+///
+/// # Argumente
+/// - `prompt` (`&HostPermitPrompt`): die anzuzeigende Frage.
+///
+/// # Rückgabe
+/// Ein einsatzbereiter [`ChoiceDialog`] mit der passenden Vorauswahl.
+fn build_host_permit_dialog(prompt: &HostPermitPrompt) -> ChoiceDialog {
+    let selected = match prompt.preselected_variant() {
+        HostPermitVariant::SingleExecution => 0,
+        HostPermitVariant::SessionLease => 1,
+    };
+    let options = vec![
+        HostPermitVariant::SingleExecution.label().to_owned(),
+        HostPermitVariant::SessionLease.label().to_owned(),
+        "Nein, ablehnen".to_owned(),
+    ];
+    let hint = format!(
+        "Worker {} verlangt Host-Ausführung in Sitzung {}: {}",
+        prompt.worker_definition(),
+        prompt.session(),
+        prompt.command(),
+    );
+    ChoiceDialog::new("Host-Ausführung erlauben?", Some(hint), options).with_selected(selected)
+}
+
+/// Setzt eine Entscheidung aus dem Host-Permit-Dialog um (Plan
+/// „UIA-Shell-Worker und Shell-Modus", Schritt 2).
+///
+/// # Beschreibung
+/// Übersetzt den nullbasierten Options-Index aus [`build_host_permit_dialog`]
+/// in die passende [`HostPermitPrompt`]-Antwort und hängt eine kurze
+/// Systemzeile an, die die getroffene Entscheidung festhält (Nutzerzustimmung
+/// muss laut Konzept „als Sitzungsereignis persistiert" werden — die
+/// permanente Statuszeile `HOST-MODUS AKTIV` bleibt die primäre Anzeige einer
+/// laufenden Phase, siehe [`ChatApp::host_mode_active`]).
+///
+/// # Argumente
+/// - `app` (`&mut ChatApp`): nimmt die Systemzeile auf.
+/// - `prompt` ([`HostPermitPrompt`]): die zu beantwortende Frage.
+/// - `option_index` (`usize`): der gewählte, nullbasierte Options-Index aus
+///   [`build_host_permit_dialog`] (`2` und jeder größere Index gelten als
+///   Ablehnung — fail-closed statt eines Panics bei einem unerwarteten Index).
+fn apply_host_permit_decision(app: &mut ChatApp, prompt: HostPermitPrompt, option_index: usize) {
+    let message = match option_index {
+        0 => {
+            let delivered = prompt.approve(HostPermitVariant::SingleExecution);
+            if delivered {
+                "Host-Ausführung einmalig freigegeben."
+            } else {
+                "Host-Ausführung freigegeben, aber die Antwort kam nicht mehr an — der Auftrag ist bereits weitergelaufen."
+            }
+        }
+        1 => {
+            let delivered = prompt.approve(HostPermitVariant::SessionLease);
+            if delivered {
+                "Host-Arbeitsphase freigegeben — HOST-MODUS AKTIV (Strg+H beendet sie)."
+            } else {
+                "Host-Arbeitsphase freigegeben, aber die Antwort kam nicht mehr an — der Auftrag ist bereits weitergelaufen."
+            }
+        }
+        _ => {
+            prompt.deny();
+            "Host-Ausführung abgelehnt."
+        }
+    };
+    app.push_line(Role::System, message);
+}
+
+fn build_approval_dialog(
+    prompt: &ApprovalPrompt,
+    app: &ChatApp,
+    timeout: Duration,
+) -> ApprovalDialog {
     let call = prompt.call();
     let remember_rule = if call.name.as_str() == "shell.exec" {
         call.arguments
@@ -4784,7 +5047,11 @@ fn build_approval_dialog(prompt: &ApprovalPrompt, app: &ChatApp, timeout: Durati
 ///   Persistenz-Anstoßung und nimmt eine optionale Systemzeile auf.
 /// - `pending` ([`PendingApprovalPrompt`]): die zu beantwortende Frage samt Zelle.
 /// - `choice` ([`ApprovalChoice`]): die getroffene Entscheidung.
-async fn apply_approval_decision(app: &mut ChatApp, pending: PendingApprovalPrompt, choice: ApprovalChoice) {
+async fn apply_approval_decision(
+    app: &mut ChatApp,
+    pending: PendingApprovalPrompt,
+    choice: ApprovalChoice,
+) {
     let PendingApprovalPrompt { prompt, tool_cell } = pending;
     let tool_name = prompt.tool_name().to_owned();
 
@@ -4902,6 +5169,10 @@ struct PendingApprovalPrompt {
 /// - `outcome` ([`TurnOutcome`]): die gemeldete Pause (nie `Completed`).
 /// - `approval_driver` (`&ApprovalDriver`): Treiber über beide Pausearten.
 /// - `approvals` (`&mut ApprovalPromptReceiver`): Fragekanal desselben Handlers.
+/// - `host_permit_prompts` (`&mut HostPermitPromptReceiver`): Fragekanal
+///   dieser Wurzelsitzung (siehe
+///   [`harw_runtime::RuntimeAssembly::take_host_permit_prompts`]); analog zu
+///   `approvals` gepollt, sonst liefe jede Host-Permit-Frage in den Timeout.
 /// - `tui_rx` / `turn_event_rx` / `turn_state`: siehe [`drive_turn_animated`].
 ///
 /// # Rückgabe
@@ -4924,6 +5195,7 @@ async fn drive_pauses_to_completion(
     outcome: TurnOutcome,
     approval_driver: &ApprovalDriver,
     approvals: &mut ApprovalPromptReceiver,
+    host_permit_prompts: &mut HostPermitPromptReceiver,
     tui_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TuiEvent>,
     turn_event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<TurnEvent>,
     turn_state: &mut TurnEventState,
@@ -4939,6 +5211,10 @@ async fn drive_pauses_to_completion(
     let mut pending: Option<PendingApprovalPrompt> = None;
     let mut dialog_shown_at: Option<Instant> = None;
     let mut approvals_open = true;
+    // Analog zu `dialog_shown_at`/`approvals_open`, aber für die
+    // Host-Permit-Frage (`app.pending_host_permit`/`app.pending_host_permit_dialog`).
+    let mut host_permit_shown_at: Option<Instant> = None;
+    let mut host_permit_prompts_open = true;
     let mut input_open = true;
 
     let (session, store, model) = gateway.borrow_turn_ctx();
@@ -4972,6 +5248,12 @@ async fn drive_pauses_to_completion(
                     // tatsächlich `Some` ist (siehe unten); ein verwaister
                     // `Some`-Wert würde also nie fälschlich als „schon lange
                     // offen" gelesen.
+                    draw_viewport(guard, app, spinner, None)?;
+                }
+                // Dieselbe Regel für eine noch offene Host-Permit-Frage.
+                if let Some(prompt) = app.pending_host_permit.take() {
+                    prompt.deny();
+                    app.pending_host_permit_dialog = None;
                     draw_viewport(guard, app, spinner, None)?;
                 }
                 return Ok(());
@@ -5014,9 +5296,35 @@ async fn drive_pauses_to_completion(
                     }
                 }
             }
+            maybe_host_prompt = host_permit_prompts.recv(), if host_permit_prompts_open => {
+                match maybe_host_prompt {
+                    Some(prompt) => {
+                        tracing::info!(
+                            session = prompt.session(),
+                            worker = prompt.worker_definition(),
+                            "tui.host_permit.prompt_shown"
+                        );
+                        // Dieselbe K3-Regel wie bei `approvals.recv()` oben:
+                        // eine noch offene ältere Host-Permit-Frage wird nicht
+                        // still überschrieben, sondern abgelehnt.
+                        if let Some(stale) = app.pending_host_permit.take() {
+                            tracing::warn!("tui.host_permit.stale_prompt_closed");
+                            stale.deny();
+                        }
+                        app.pending_host_permit_dialog = Some(build_host_permit_dialog(&prompt));
+                        app.pending_host_permit = Some(prompt);
+                        host_permit_shown_at = Some(Instant::now());
+                        draw_viewport(guard, app, spinner, None)?;
+                    }
+                    None => {
+                        tracing::warn!("tui.host_permit.prompt_channel_ended");
+                        host_permit_prompts_open = false;
+                    }
+                }
+            }
             maybe_event = tui_rx.recv(), if input_open => {
                 match maybe_event {
-                    Some(event) if pending.is_none() => {
+                    Some(event) if pending.is_none() && app.pending_host_permit.is_none() => {
                         if handle_busy_event(app, event) {
                             draw_viewport(guard, app, spinner, None)?;
                         }
@@ -5029,7 +5337,8 @@ async fn drive_pauses_to_completion(
                         }
                         // Ctrl+C bleibt fail-safe und lehnt sofort ab,
                         // unabhängig vom Arming-Delay des Panels — dieselbe
-                        // Sicherheitsinvariante wie zuvor.
+                        // Sicherheitsinvariante wie zuvor, jetzt für beide
+                        // Fragearten.
                         if key.modifiers.contains(KeyModifiers::CONTROL)
                             && matches!(key.code, KeyCode::Char('c' | 'C'))
                         {
@@ -5043,30 +5352,73 @@ async fn drive_pauses_to_completion(
                             }
                             app.pending_approval_dialog = None;
                             dialog_shown_at = None;
+                            if let Some(prompt) = app.pending_host_permit.take() {
+                                prompt.deny();
+                            }
+                            app.pending_host_permit_dialog = None;
+                            host_permit_shown_at = None;
                             draw_viewport(guard, app, spinner, None)?;
                             continue;
                         }
-                        let since_shown = dialog_shown_at.map_or(Duration::ZERO, |shown| shown.elapsed());
-                        let armed = approval_dialog_key_is_armed(key, since_shown);
-                        let Some(dialog) = app.pending_approval_dialog.as_mut() else {
-                            continue;
-                        };
-                        match dialog.handle_key(key, armed) {
-                            DialogAction::Stay => {
-                                if queue_busy_key(app, key) {
+                        if pending.is_some() {
+                            let since_shown = dialog_shown_at.map_or(Duration::ZERO, |shown| shown.elapsed());
+                            let armed = approval_dialog_key_is_armed(key, since_shown);
+                            let Some(dialog) = app.pending_approval_dialog.as_mut() else {
+                                continue;
+                            };
+                            match dialog.handle_key(key, armed) {
+                                DialogAction::Stay => {
+                                    if queue_busy_key(app, key) {
+                                        draw_viewport(guard, app, spinner, None)?;
+                                    }
+                                }
+                                DialogAction::ToggleDetails => {
+                                    draw_viewport(guard, app, spinner, None)?;
+                                }
+                                DialogAction::Decided(choice) => {
+                                    if let Some(open) = pending.take() {
+                                        apply_approval_decision(app, open, choice).await;
+                                    }
+                                    app.pending_approval_dialog = None;
+                                    dialog_shown_at = None;
                                     draw_viewport(guard, app, spinner, None)?;
                                 }
                             }
-                            DialogAction::ToggleDetails => {
-                                draw_viewport(guard, app, spinner, None)?;
+                        } else if app.pending_host_permit.is_some() {
+                            // Dasselbe Arming-Delay wie beim Freigabe-Panel
+                            // (`approval_dialog_key_is_armed`), hier auf den
+                            // generischen `ChoiceDialog` angewandt: solange
+                            // nicht scharfgeschaltet, zählt keine Taste.
+                            let since_shown = host_permit_shown_at.map_or(Duration::ZERO, |shown| shown.elapsed());
+                            if !approval_dialog_key_is_armed(key, since_shown) {
+                                continue;
                             }
-                            DialogAction::Decided(choice) => {
-                                if let Some(open) = pending.take() {
-                                    apply_approval_decision(app, open, choice).await;
+                            let Some(dialog) = app.pending_host_permit_dialog.as_mut() else {
+                                continue;
+                            };
+                            match dialog.handle_key(key) {
+                                ChoiceAction::Stay => {
+                                    if queue_busy_key(app, key) {
+                                        draw_viewport(guard, app, spinner, None)?;
+                                    }
                                 }
-                                app.pending_approval_dialog = None;
-                                dialog_shown_at = None;
-                                draw_viewport(guard, app, spinner, None)?;
+                                ChoiceAction::Cancel => {
+                                    if let Some(prompt) = app.pending_host_permit.take() {
+                                        prompt.deny();
+                                    }
+                                    app.pending_host_permit_dialog = None;
+                                    host_permit_shown_at = None;
+                                    app.push_line(Role::System, "Host-Ausführung abgelehnt.");
+                                    draw_viewport(guard, app, spinner, None)?;
+                                }
+                                ChoiceAction::Chosen(index) => {
+                                    if let Some(prompt) = app.pending_host_permit.take() {
+                                        apply_host_permit_decision(app, prompt, index);
+                                    }
+                                    app.pending_host_permit_dialog = None;
+                                    host_permit_shown_at = None;
+                                    draw_viewport(guard, app, spinner, None)?;
+                                }
                             }
                         }
                     }
@@ -5093,6 +5445,11 @@ async fn drive_pauses_to_completion(
                             .await;
                             app.pending_approval_dialog = None;
                             dialog_shown_at = None;
+                        }
+                        if let Some(prompt) = app.pending_host_permit.take() {
+                            prompt.deny();
+                            app.pending_host_permit_dialog = None;
+                            host_permit_shown_at = None;
                         }
                     }
                 }
@@ -5134,7 +5491,10 @@ fn queue_busy_key(app: &mut ChatApp, key: KeyEvent) -> bool {
             }
             true
         }
-        InputAction::Redraw => { app.sync_popup(); true }
+        InputAction::Redraw => {
+            app.sync_popup();
+            true
+        }
         InputAction::Passthrough => false,
     }
 }
@@ -5173,7 +5533,8 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> bool {
         }
         TuiEvent::Draw | TuiEvent::Resize(_, _) => true,
         TuiEvent::Paste(text) => {
-            app.input.insert_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+            app.input
+                .insert_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
             app.sync_popup();
             true
         }
@@ -5275,9 +5636,14 @@ fn render_viewport(
     // Höhe und Cursor-Position müssen mit
     // derselben Breite rechnen, sonst laufen sie auseinander.
     let input_width = (area.width.saturating_sub(5)) as usize;
-    let input_height = match &app.pending_approval_dialog {
-        Some(dialog) => dialog.desired_height(area.width),
-        None => {
+    let input_height = match (&app.pending_approval_dialog, &app.pending_host_permit_dialog) {
+        (Some(dialog), _) => dialog.desired_height(area.width),
+        // Eine Host-Permit-Frage kann nur auftreten, wenn keine normale
+        // Werkzeugfreigabe offen ist (siehe `drive_pauses_to_completion`:
+        // `y`/`n` gehen zuerst an eine offene `ApprovalDialog`-Frage) — die
+        // beiden Panels ersetzen den Composer deshalb nie gleichzeitig.
+        (None, Some(dialog)) => dialog.desired_height(),
+        (None, None) => {
             let input_line_count = app.input.visible_lines(input_width).len().clamp(1, 8) as u16;
             input_line_count + 2
         }
@@ -5287,7 +5653,11 @@ fn render_viewport(
     // sichtbar bleiben und darf nicht vom Verlauf verdrängt werden.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1), Constraint::Length(input_height)])
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(input_height),
+        ])
         .split(area);
     let history_area = chunks[0];
     let status_area = chunks[1];
@@ -5355,12 +5725,44 @@ fn render_viewport(
     } else {
         format!(" · {n} Nachricht(en) warten", n = app.pending_turns.len())
     };
+    let tool_suffix = if app.has_collapsed_tool_cells() {
+        " · Ctrl+O: Werkzeugdetails"
+    } else {
+        ""
+    };
+    let pending_permission_suffix = app
+        .pending_permission_stage()
+        .map(|_| " · Freigabemodus wird nach dem Turn übernommen")
+        .unwrap_or("");
     let status = format!(
-        " {spinner_prefix}Shift+Tab: {permission} | Modus: {} | Tokens: {} (in {}, out {}{cache_suffix}){cancel_suffix}{quit_suffix}{queue_suffix}",
-        app.active_mode.as_str(), app.total_usage.total(),
-        app.total_usage.input_tokens, app.total_usage.output_tokens,
+        " {spinner_prefix}Shift+Tab: {permission} | Modus: {} | Tokens: {} (in {}, out {}{cache_suffix}){cancel_suffix}{quit_suffix}{queue_suffix}{tool_suffix}{pending_permission_suffix}",
+        app.active_mode().as_str(),
+        app.total_usage.total(),
+        app.total_usage.input_tokens,
+        app.total_usage.output_tokens,
     );
-    frame.render_widget(Paragraph::new(status).style(Style::default().fg(style::border_color(theme))), status_area);
+    // Solange eine Host-Arbeitsphase läuft, muss die Statuszeile das gemäß
+    // `docs/design/mediated-process-execution.md` („permanent und
+    // unübersehbar `HOST-MODUS AKTIV`") in einer eigenen, hervorgehobenen
+    // Warnfarbe zeigen — ein einfacher String-Suffix in derselben Farbe wie
+    // der Rest der Zeile wäre zu leicht zu übersehen.
+    if app.host_mode_active() {
+        let line = Line::from(vec![
+            Span::styled(status, Style::default().fg(style::border_color(theme))),
+            Span::styled(
+                " · HOST-MODUS AKTIV (Strg+H beendet)",
+                Style::default()
+                    .fg(style::warning_color(theme))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line), status_area);
+    } else {
+        frame.render_widget(
+            Paragraph::new(status).style(Style::default().fg(style::border_color(theme))),
+            status_area,
+        );
+    }
 
     // ── History ──────────────────────────────────────────────────────
     // Alle Zellen zu einem flachen Zeilen-Vec zusammenführen.
@@ -5428,6 +5830,14 @@ fn render_viewport(
     // wird über Pfeiltasten/Ziffern bedient, nicht getippt.
     if let Some(dialog) = &app.pending_approval_dialog {
         dialog.render(input_area, frame.buffer_mut(), &theme);
+        return;
+    }
+    // Dieselbe Composer-Ersetzung für eine offene Host-Permit-Frage (Plan
+    // „UIA-Shell-Worker und Shell-Modus", Schritt 2) — nur erreichbar, wenn
+    // keine `ApprovalDialog`-Frage offen ist (siehe Kommentar bei
+    // `input_height`).
+    if let Some(dialog) = &app.pending_host_permit_dialog {
+        dialog.render(input_area, frame.buffer_mut(), theme);
         return;
     }
 
@@ -5598,7 +6008,7 @@ mod tests {
     /// Baut eine gültige Test-`SandboxSpec` gegen ein eindeutiges Temp-Verzeichnis
     /// (Muster übernommen aus `harw-operations/src/adapter/command.rs`).
     fn test_sandbox() -> SandboxSpec {
-        use harw_sandbox::{Permission, PermissionSet, WorkspaceRegistration, WorkspaceRegistry};
+        use harw_authority::{Permission, PermissionSet, WorkspaceRegistration, WorkspaceRegistry};
         use harw_types::{TenantId, WorkspaceId};
 
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -5638,7 +6048,7 @@ mod tests {
     /// Popup-/Tab-Tests wird die Registry deshalb im Anschluss durch
     /// [`CommandRegistry::built_in()`] ersetzt, damit `/`-Präfixe echte
     /// Treffer liefern statt eines leeren, sofort wieder geschlossenen Popups.
-    fn test_chat_app() -> ChatApp {
+    pub(super) fn test_chat_app() -> ChatApp {
         let mut app = ChatApp::new(Vec::new(), test_sandbox(), SessionId::new());
         app.command_registry = CommandRegistry::built_in();
         app
@@ -5734,7 +6144,9 @@ mod tests {
 
         let second = path.with_file_name(format!(
             "{}-2.md",
-            path.file_stem().and_then(|stem| stem.to_str()).expect("stem")
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("stem")
         ));
         std::fs::remove_file(first).ok();
         std::fs::remove_file(second).ok();
@@ -5767,20 +6179,29 @@ mod tests {
 
     #[test]
     fn busy_turn_scrolls_immediately_and_preserves_typed_input_in_order() {
+        // `queue_busy_key` (siehe Doku dort) wurde bewusst umgebaut: Tastatur-
+        // Events werden während eines laufenden Turns nicht mehr roh in
+        // `deferred_input` zwischengelagert, sondern live in `app.input`
+        // editiert — der Composer bleibt beim Tippen sichtbar aktuell.
+        // Fertige Chat-Zeilen landen direkt in `pending_turns`; nur ein
+        // fertiges Slash-Kommando wird für die autorisierte Nach-Turn-
+        // Ausführung als Paste+Enter in `deferred_input` gelegt. Diese
+        // Assertions prüfen jetzt genau das, statt die alte Roh-Event-
+        // Warteschlange: Scrollen wirkt weiterhin sofort, und Tippen +
+        // Einfügen bleiben in der Reihenfolge im Composer erhalten.
         let mut app = test_chat_app();
         app.last_history_total_lines.set(100);
         app.last_history_visible_rows.set(10);
         let typed = TuiEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         let pasted = TuiEvent::Paste("next prompt".to_owned());
-        assert!(!handle_busy_event(&mut app, typed.clone()));
+        assert!(handle_busy_event(&mut app, typed.clone()));
         assert!(handle_busy_event(
             &mut app,
             TuiEvent::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
         ));
         assert!(app.scroll.offset() > 0);
-        assert!(!handle_busy_event(&mut app, pasted.clone()));
-        assert_eq!(app.deferred_input.pop_front(), Some(typed));
-        assert_eq!(app.deferred_input.pop_front(), Some(pasted));
+        assert!(handle_busy_event(&mut app, pasted.clone()));
+        assert_eq!(app.input.text(), "xnext prompt");
         assert!(app.deferred_input.is_empty());
     }
 
@@ -5831,9 +6252,19 @@ mod tests {
             terminal.backend().buffer()[(position.x - 1, position.y)].symbol(),
             "t"
         );
+        // `render_viewport` legt die Statuszeile inzwischen ÜBER den Composer
+        // statt darunter (siehe Kommentar „History | permanente Statuszeile |
+        // Eingabe" dort): der Sicherheitsmodus soll nicht vom Verlauf
+        // verdrängt werden können. Dadurch sitzt `input_area` jetzt eine Zeile
+        // tiefer als zur Einführung dieses Tests (damals History | Eingabe |
+        // Status), und die alte Grenze `< 14` war an die alte Reihenfolge
+        // gebunden. Mit 20x16-Testterminal, 11 Composer-Zeilen (geclamped auf
+        // 8, `input_height` = 10) und der Statuszeile jetzt bei y=5 liegt
+        // `input_area` bei y=6..16; die eigene Bodenkante des Composers (Zeile
+        // 15) bleibt die relevante Grenze, kein `status_area` mehr darunter.
         assert!(
-            position.y < 14,
-            "cursor remains inside input, above border and status"
+            position.y < 15,
+            "cursor remains inside input, above its own bottom border"
         );
     }
 
@@ -6098,7 +6529,14 @@ forbidden = [{forbidden}]
     #[test]
     fn double_ctrl_d_quits_regardless_of_composer_or_popup_state() {
         let mut app = test_chat_app();
-        app.input.insert_str("/status mit Entwurf");
+        // `sync_popup` schließt das Popup, sobald der Query-Teil nach dem
+        // `/` ein Leerzeichen enthält (Argument-Eingabe hat begonnen, siehe
+        // Doku an `sync_popup`) — "/status mit Entwurf" erfüllt die
+        // Vorbedingung deshalb nicht mehr. Ein reiner Kommandoname ohne
+        // Leerzeichen hält das Popup dagegen offen und deckt denselben Fall
+        // ab (nicht-leerer Composer + offenes Popup); die geprüfte Aussage
+        // (doppeltes Ctrl-D beendet immer) bleibt unverändert.
+        app.input.insert_str("/status");
         app.sync_popup();
         assert!(app.command_popup.is_some(), "Vorbedingung: Popup ist offen");
 
@@ -6109,7 +6547,10 @@ forbidden = [{forbidden}]
         assert!(handle_key(&mut app, ctrl_d, &mut pending_quit, &bus));
         assert!(matches!(
             pending_quit,
-            Some(QuitArm { label: "Ctrl+D", .. })
+            Some(QuitArm {
+                label: "Ctrl+D",
+                ..
+            })
         ));
         assert!(matches!(
             receiver.try_recv(),
@@ -6147,7 +6588,10 @@ forbidden = [{forbidden}]
 
         assert!(redraw, "Enter muss einen Redraw anfordern");
         assert_eq!(app.input(), "/compact ");
-        assert!(app.command_popup.is_none(), "Auswahl muss das Popup schließen");
+        assert!(
+            app.command_popup.is_none(),
+            "Auswahl muss das Popup schließen"
+        );
         assert!(
             receiver.try_recv().is_err(),
             "Autocomplete darf noch keinen Command absenden"
@@ -6168,8 +6612,14 @@ forbidden = [{forbidden}]
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         ));
 
-        assert_eq!(app.pending_turns.pop_front().as_deref(), Some("erste Nachricht"));
-        assert_eq!(app.pending_turns.pop_front().as_deref(), Some("zweite Nachricht"));
+        assert_eq!(
+            app.pending_turns.pop_front().as_deref(),
+            Some("erste Nachricht")
+        );
+        assert_eq!(
+            app.pending_turns.pop_front().as_deref(),
+            Some("zweite Nachricht")
+        );
         assert!(app.pending_turns.is_empty());
     }
 
@@ -6489,7 +6939,10 @@ forbidden = [{forbidden}]
             .export_entries
             .iter()
             .filter(|entry| {
-                matches!(entry, ExportEntry::ToolCall { .. } | ExportEntry::ToolResult { .. })
+                matches!(
+                    entry,
+                    ExportEntry::ToolCall { .. } | ExportEntry::ToolResult { .. }
+                )
             })
             .collect::<Vec<_>>();
         assert_eq!(tool_entries.len(), 4);
@@ -6511,12 +6964,17 @@ forbidden = [{forbidden}]
 
     #[test]
     fn incident_hint_is_small_and_only_suggests_bug_report_on_known_signals() {
-        assert!(incident_hint(&TuiError::Core("provider timeout".to_owned()), 2)
-            .is_some_and(|hint| hint.contains("/bug-report")));
-        assert!(incident_hint(&TuiError::Core("agent killed".to_owned()), 0)
-            .is_some_and(|hint| hint.contains("/bug-report")));
-        assert!(incident_hint(&TuiError::Core("ordinary validation error".to_owned()), 9)
-            .is_none());
+        assert!(
+            incident_hint(&TuiError::Core("provider timeout".to_owned()), 2)
+                .is_some_and(|hint| hint.contains("/bug-report"))
+        );
+        assert!(
+            incident_hint(&TuiError::Core("agent killed".to_owned()), 0)
+                .is_some_and(|hint| hint.contains("/bug-report"))
+        );
+        assert!(
+            incident_hint(&TuiError::Core("ordinary validation error".to_owned()), 9).is_none()
+        );
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -6629,9 +7087,9 @@ forbidden = [{forbidden}]
             .tool_provider(Arc::new(CountingToolProvider {
                 executions: Arc::clone(executions),
             }))
-            .approval_handler(Arc::new(harw_registry_defaults::DefaultApprovalPolicy::new(
-                ApprovalModeCell::default(),
-            )))
+            .approval_handler(Arc::new(
+                harw_registry_defaults::DefaultApprovalPolicy::new(ApprovalModeCell::default()),
+            ))
             .approval_handler(registered)
             .build();
         let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -6896,13 +7354,26 @@ forbidden = [{forbidden}]
             .collect::<Vec<_>>();
         let controller = Arc::new(TuiSessionController::new());
 
+        // `build_services` (command_exec.rs) spiegelt die Produktionsfläche
+        // `RuntimeServices::service_map` bewusst nicht 1:1 — es fehlt dort die
+        // `ApprovalModeCell` (siehe `harw-runtime/src/services.rs::assemble`,
+        // wo `self.parts.approval_mode.clone()` unbedingt auf jeder Fläche
+        // eingetragen wird). `/permissions` liest/schreibt den Freigabemodus
+        // ausschließlich über `ctx.service::<ApprovalModeCell>()`
+        // (`harw-ops/src/permissions.rs`), also braucht dieser Test dieselbe
+        // Zelle wie die echte Laufzeit — hier direkt nach `build_services`
+        // nachgetragen, ohne `command_exec.rs` selbst zu ändern.
         let permissions = execute_command_as(
             &adapters,
             &sandbox,
             &SessionId::new(),
             harw_operations::PermissionTier::Operator,
             "/permissions",
-            || build_services(&adapters, None, None, &controller, None),
+            || {
+                let mut services = build_services(&adapters, None, None, &controller, None);
+                services.insert(ApprovalModeCell::default());
+                services
+            },
         )
         .await;
         assert!(permissions.contains("Freigabemodus"), "{permissions}");
@@ -6959,7 +7430,6 @@ forbidden = [{forbidden}]
 
         assert_eq!(session.mode(), InteractionMode::Explore);
         assert_eq!(app.active_mode(), InteractionMode::Explore);
-
     }
 
     /// Ein unbekannter Modusname wird abgewiesen statt still auf den Default zu
@@ -7152,6 +7622,7 @@ forbidden = [{forbidden}]
 #[cfg(test)]
 mod approval_arming_tests {
     use super::*;
+    use super::tests::test_chat_app;
     use crossterm::event::KeyEventKind;
 
     /// Tastendruck ohne Modifier.
@@ -7217,11 +7688,8 @@ mod approval_arming_tests {
     /// Eine gedrückt gehaltene Taste ist keine Entscheidung.
     #[test]
     fn a_repeated_key_never_answers() {
-        let repeat = KeyEvent::new_with_kind(
-            KeyCode::Char('y'),
-            KeyModifiers::NONE,
-            KeyEventKind::Repeat,
-        );
+        let repeat =
+            KeyEvent::new_with_kind(KeyCode::Char('y'), KeyModifiers::NONE, KeyEventKind::Repeat);
         assert_eq!(
             classify_armed_approval_key(repeat, ARMED, true),
             ApprovalKeyAction::NotArmed
@@ -7291,5 +7759,141 @@ mod approval_arming_tests {
         // Rearm: eine neu eingetroffene Frage setzt die seit dem Anzeigen
         // verstrichene Zeit auf null zurück.
         assert!(!approval_dialog_key_is_armed(answer_key, Duration::ZERO));
+    }
+
+    // ── Host-Permit-Dialog (Plan „UIA-Shell-Worker und Shell-Modus", Schritt 2) ──
+    //
+    // Der Frage-/Antwortvertrag (`HostPermitPrompt`) und die
+    // Ausstellungslogik (Ledger/Registry) leben inzwischen in
+    // `harw_tool_shell` (Vertrag) bzw. `harw_tool_shell::exec::ShellExecutor`
+    // (Ausstellung, eigenständig dort getestet). Die folgenden Tests prüfen
+    // deshalb nur noch, was `app.rs` selbst besitzt: welche Vorauswahl der
+    // Dialog anzeigt und welche Entscheidung der App-seitige Dispatch über
+    // den Antwortkanal der Frage zurücksendet.
+
+    /// Baut eine echte [`HostPermitPrompt`] über ihren öffentlichen
+    /// Konstruktor (`harw_tool_shell::host_permit_prompt::HostPermitPrompt::new`)
+    /// — denselben Vertrag, den
+    /// `harw_tool_shell::exec::ShellExecutor::authorize_host_command`
+    /// tatsächlich verwendet — statt die privaten Felder des Typs zu erraten.
+    fn build_host_permit_prompt(
+        preselected: HostPermitVariant,
+    ) -> (HostPermitPrompt, tokio::sync::oneshot::Receiver<Option<HostPermitVariant>>) {
+        HostPermitPrompt::new(
+            "s1".to_owned(),
+            "host-process-worker@1".to_owned(),
+            "echo hi".to_owned(),
+            std::path::PathBuf::from("/workspace"),
+            preselected,
+        )
+    }
+
+    /// `build_host_permit_dialog` wählt Option 0 (Einmalig) vor, wenn der
+    /// Aufrufer [`HostPermitVariant::SingleExecution`] vorgeschlagen hat
+    /// (Arbeitsmodus außerhalb von `shell`).
+    #[tokio::test]
+    async fn build_host_permit_dialog_preselects_single_execution() {
+        let (prompt, answer) = build_host_permit_prompt(HostPermitVariant::SingleExecution);
+        let mut dialog = build_host_permit_dialog(&prompt);
+        let action = dialog.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(action, ChoiceAction::Chosen(0));
+        assert!(prompt.deny());
+        assert_eq!(answer.await.expect("responder must deliver an answer"), None);
+    }
+
+    /// `build_host_permit_dialog` wählt Option 1 (Host-Arbeitsphase) vor,
+    /// wenn der Aufrufer [`HostPermitVariant::SessionLease`] vorgeschlagen hat
+    /// (Shell-Modus).
+    #[tokio::test]
+    async fn build_host_permit_dialog_preselects_session_lease() {
+        let (prompt, answer) = build_host_permit_prompt(HostPermitVariant::SessionLease);
+        let mut dialog = build_host_permit_dialog(&prompt);
+        let action = dialog.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(action, ChoiceAction::Chosen(1));
+        assert!(prompt.deny());
+        assert_eq!(answer.await.expect("responder must deliver an answer"), None);
+    }
+
+    /// `apply_host_permit_decision` mit Options-Index 0 genehmigt genau die
+    /// Einzelfreigabe — der eigentliche Ledger-/Registry-Pfad ist bereits in
+    /// `harw_tool_shell::exec`'s eigenen Tests abgedeckt; hier wird nur
+    /// geprüft, dass der App-seitige Dispatch die richtige Variante über den
+    /// Antwortkanal sendet und die erwartete Systemzeile anhängt.
+    #[tokio::test]
+    async fn apply_host_permit_decision_index_zero_approves_single_execution() {
+        let (prompt, answer) = build_host_permit_prompt(HostPermitVariant::SingleExecution);
+        let mut app = test_chat_app();
+        apply_host_permit_decision(&mut app, prompt, 0);
+        assert_eq!(
+            answer.await.expect("responder must deliver an answer"),
+            Some(HostPermitVariant::SingleExecution)
+        );
+        assert!(
+            app.cells
+                .iter()
+                .any(|cell| cell
+                    .display_lines(80, app.theme)
+                    .iter()
+                    .any(|line| line_contains(line, "einmalig freigegeben"))),
+            "a system line must confirm the single-execution approval"
+        );
+    }
+
+    /// `apply_host_permit_decision` mit Options-Index 1 genehmigt die
+    /// Host-Arbeitsphase.
+    #[tokio::test]
+    async fn apply_host_permit_decision_index_one_approves_session_lease() {
+        let (prompt, answer) = build_host_permit_prompt(HostPermitVariant::SessionLease);
+        let mut app = test_chat_app();
+        apply_host_permit_decision(&mut app, prompt, 1);
+        assert_eq!(
+            answer.await.expect("responder must deliver an answer"),
+            Some(HostPermitVariant::SessionLease)
+        );
+        assert!(
+            app.cells
+                .iter()
+                .any(|cell| cell
+                    .display_lines(80, app.theme)
+                    .iter()
+                    .any(|line| line_contains(line, "HOST-MODUS AKTIV"))),
+            "a system line must confirm the session-lease approval"
+        );
+    }
+
+    /// Jeder andere Options-Index (hier: die „Nein"-Option, Index 2) lehnt ab
+    /// — fail-closed statt eines Panics bei einem unerwarteten Index.
+    #[tokio::test]
+    async fn apply_host_permit_decision_any_other_index_denies() {
+        let (prompt, answer) = build_host_permit_prompt(HostPermitVariant::SingleExecution);
+        let mut app = test_chat_app();
+        apply_host_permit_decision(&mut app, prompt, 2);
+        assert_eq!(answer.await.expect("responder must deliver an answer"), None);
+    }
+
+    /// Fällt der Fragekanal weg, ohne dass je geantwortet wurde (z. B. der
+    /// Dialog wird verworfen, ohne `approve`/`deny` aufzurufen), schließt
+    /// [`HostPermitPrompt`]s `Drop` den Antwortkanal — der Empfänger sieht
+    /// `Err`, nie eine stillschweigende Zustimmung. Dieselbe Sicherheitsregel
+    /// wie beim normalen Freigabe-Panel: Ablehnung ist der Default.
+    #[tokio::test]
+    async fn dropped_host_permit_prompt_fails_closed() {
+        let (prompt, answer) = build_host_permit_prompt(HostPermitVariant::SingleExecution);
+        drop(prompt);
+        assert!(
+            answer.await.is_err(),
+            "a dropped prompt must close the answer channel instead of implicitly approving"
+        );
+    }
+
+    /// Kleiner Helfer, der eine gerenderte [`Line`] auf enthaltenen Text prüft
+    /// (Spans zu einem String zusammengefügt), ohne von der genauen
+    /// Span-Aufteilung abzuhängen.
+    fn line_contains(line: &Line<'static>, needle: &str) -> bool {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+            .contains(needle)
     }
 }

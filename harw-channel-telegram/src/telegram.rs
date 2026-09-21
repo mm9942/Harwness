@@ -1,13 +1,14 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 
 use harw_channel::{
     Admission, AttachmentSupport, ChannelAdapter, ChannelCapabilities, ChannelError, ChannelSendOp,
     DeferralReason, InboundEvent, InlineAction, MarkdownSupport, OutboundContent, PairingRecord,
-    PairingStore, RejectionReason, SessionKey, ThreadSupport,
+    PairingStore, RejectionReason, SessionKey, ThreadRef, ThreadSupport,
 };
 use harw_types::{PeerId, TenantId};
 
@@ -20,6 +21,42 @@ use crate::{
 const UNPAIRED_TENANT: &str = "harw:unpaired";
 const INGRESS_UNAVAILABLE_MESSAGE: &str = "Telegram ingress is not configured";
 const CHANNEL_MISMATCH_REASON: &str = "inbound event channel does not match Telegram binding";
+/// Sliding-window width for `max_updates_per_peer_per_min` (§3.5) and for the
+/// "at most one throttle notice per window" de-duplication.
+const RATE_LIMIT_WINDOW: SignedDuration = SignedDuration::from_secs(60);
+/// The single throttled reply sent at most once per rate-limit window. Kept
+/// intentionally short and free of Telegram MarkdownV2 reserved characters so
+/// no downstream escaping decision is required for it.
+const THROTTLE_NOTICE_TEXT: &str = "Zu schnell — bitte kurz warten und erneut senden.";
+
+/// One per-rate-limit-key sliding-window counter (§3.5).
+///
+/// `last_counted_update` makes [`TelegramChannel::record_inbound_rate`]
+/// idempotent for a repeated call with the *same* event (the admission
+/// pipeline may legitimately re-check an already-admitted event), so a
+/// caller invoking it twice for one update never consumes two slots of the
+/// peer's budget.
+#[derive(Debug, Clone)]
+struct RateWindow {
+    window_start: Timestamp,
+    count: u32,
+    last_counted_update: Option<String>,
+}
+
+/// A single outbound reply produced by the rate-limit gate itself (§3.5's
+/// "single throttled reply per window at most"), decoupled from the ordinary
+/// admitted-event runtime path since a rejected event never reaches it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThrottleNotice {
+    /// The peer/session-partition identity the notice must be delivered to
+    /// (mirrors `InboundEvent::peer`, §3.3).
+    pub peer: PeerId,
+    /// The originating thread, if any, so a forum-topic reply lands in the
+    /// same topic as the throttled traffic.
+    pub thread: Option<ThreadRef>,
+    /// The harness-native content to render; always a plain [`OutboundContent::Message`].
+    pub content: OutboundContent,
+}
 
 /// Pure Telegram binding; HTTP polling/webhook delivery is intentionally wired
 /// later behind this policy boundary.
@@ -41,6 +78,21 @@ pub struct TelegramChannel {
     /// In-memory only, without sender/message content, so a flood of
     /// unpinned traffic stays observable without becoming persistence.
     rejected_unpinned: Arc<AtomicU64>,
+    /// In-memory, per-rate-limit-key sliding-window counters enforcing
+    /// `max_updates_per_peer_per_min` (§3.5). Deliberately process-local: a
+    /// restart resetting the window is an acceptable trade-off for a
+    /// perimeter throttle, unlike pairing/replay state which must survive
+    /// restarts.
+    rate_limits: Arc<Mutex<HashMap<String, RateWindow>>>,
+    /// Last time a [`ThrottleNotice`] was emitted per rate-limit key, so at
+    /// most one "too fast" reply goes out per window even though many
+    /// updates from a flooding peer are rejected in that same window.
+    last_throttle_notice: Arc<Mutex<HashMap<String, Timestamp>>>,
+    /// Optional outbound handoff for [`ThrottleNotice`]s. `None` (the
+    /// default) means rate-limited traffic is dropped silently; a transport
+    /// composition (e.g. `harw gateway`) opts in via
+    /// [`Self::with_throttle_sink`].
+    throttle_sink: Option<Arc<Mutex<Sender<ThrottleNotice>>>>,
 }
 
 impl std::fmt::Debug for TelegramChannel {
@@ -55,6 +107,7 @@ impl std::fmt::Debug for TelegramChannel {
                 "rejected_unpinned_sender_count",
                 &self.rejected_unpinned.load(Ordering::Relaxed),
             )
+            .field("throttle_sink_configured", &self.throttle_sink.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -69,6 +122,9 @@ impl TelegramChannel {
             sandbox: TelegramSandbox::reduced_default(),
             ingress: None,
             rejected_unpinned: Arc::new(AtomicU64::new(0)),
+            rate_limits: Arc::new(Mutex::new(HashMap::new())),
+            last_throttle_notice: Arc::new(Mutex::new(HashMap::new())),
+            throttle_sink: None,
         }
     }
 
@@ -92,7 +148,21 @@ impl TelegramChannel {
             sandbox: TelegramSandbox::reduced_default(),
             ingress: Some(Arc::new(Mutex::new(Some(ingress)))),
             rejected_unpinned: Arc::new(AtomicU64::new(0)),
+            rate_limits: Arc::new(Mutex::new(HashMap::new())),
+            last_throttle_notice: Arc::new(Mutex::new(HashMap::new())),
+            throttle_sink: None,
         }
+    }
+
+    /// Registers an outbound handoff for [`ThrottleNotice`]s (§3.5).
+    ///
+    /// A transport composition uses this to deliver the "you're sending too
+    /// fast" reply; without it, rate-limited traffic is dropped silently
+    /// (still rejected, just without a human-visible reply).
+    #[must_use]
+    pub fn with_throttle_sink(mut self, sink: Sender<ThrottleNotice>) -> Self {
+        self.throttle_sink = Some(Arc::new(Mutex::new(sink)));
+        self
     }
 
     #[must_use]
@@ -174,6 +244,106 @@ impl TelegramChannel {
     #[must_use]
     pub fn rejected_unpinned_sender_count(&self) -> u64 {
         self.rejected_unpinned.load(Ordering::Relaxed)
+    }
+
+    /// The sliding-window rate-limit key for `event` (§3.5).
+    ///
+    /// Prefers the *actual sender* (`SenderRef::id`) over `InboundEvent::peer`
+    /// so the per-peer budget in a shared group session ("a single paired
+    /// user hammering the bot") is scoped to the human who sent the message,
+    /// not to the whole group's `PeerId`. DMs have no meaningful distinction
+    /// between the two, since `peer` and `sender.id` coincide there.
+    fn rate_limit_key(event: &InboundEvent) -> String {
+        event
+            .sender
+            .as_ref()
+            .map(|sender| sender.id.clone())
+            .unwrap_or_else(|| event.peer.as_str().to_owned())
+    }
+
+    /// Applies and idempotently records one inbound event against the
+    /// per-peer sliding-window budget (§3.5's `max_updates_per_peer_per_min`).
+    ///
+    /// # Returns
+    /// `true` if the event stays within the configured budget for its
+    /// window, `false` once the budget for the current window is exhausted.
+    ///
+    /// # Concurrency
+    /// A repeated call for an event carrying the *same* `raw_event_id` as the
+    /// last call for this key does not consume an additional slot: the
+    /// admission pipeline may re-check an already-admitted event (see the
+    /// module docs), and this must not silently halve the configured budget.
+    fn record_inbound_rate(&self, event: &InboundEvent) -> bool {
+        let limit = self.config.max_updates_per_peer_per_min;
+        let key = Self::rate_limit_key(event);
+        let now = event.received_at;
+        let mut windows = self
+            .rate_limits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let window = windows.entry(key).or_insert_with(|| RateWindow {
+            window_start: now,
+            count: 0,
+            last_counted_update: None,
+        });
+
+        if window_expired(window.window_start, now) {
+            window.window_start = now;
+            window.count = 0;
+            window.last_counted_update = None;
+        }
+
+        if event.raw_event_id.is_some() && window.last_counted_update == event.raw_event_id {
+            // Same event re-checked (not a fresh update): report the prior
+            // decision without consuming another slot.
+            return window.count <= limit;
+        }
+
+        window.count = window.count.saturating_add(1);
+        window.last_counted_update = event.raw_event_id.clone();
+        window.count <= limit
+    }
+
+    /// Emits at most one [`ThrottleNotice`] per rate-limit window (§3.5).
+    ///
+    /// Called only from [`Self::forward_ingress_event`], which processes each
+    /// unique inbound event exactly once, so this cannot double-notify for a
+    /// single event the way [`Self::admit`] can be re-invoked for one.
+    fn maybe_notify_throttled(&self, event: &InboundEvent) {
+        let Some(sink) = self.throttle_sink.as_ref() else {
+            return;
+        };
+        let key = Self::rate_limit_key(event);
+        let now = event.received_at;
+        let should_notify = {
+            let mut last = self
+                .last_throttle_notice
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let should = match last.get(&key) {
+                Some(previous) => window_expired(*previous, now),
+                None => true,
+            };
+            if should {
+                last.insert(key, now);
+            }
+            should
+        };
+        if !should_notify {
+            return;
+        }
+        let notice = ThrottleNotice {
+            peer: event.peer.clone(),
+            thread: event.thread.clone(),
+            content: OutboundContent::Message {
+                markdown: THROTTLE_NOTICE_TEXT.to_owned(),
+            },
+        };
+        if let Ok(sink) = sink.lock() {
+            // Best-effort: a full/closed outbound handoff must not block or
+            // fail admission, which has already made its (correct) decision.
+            let _ = sink.send(notice);
+        }
     }
 
     /// Returns the intersection-only capability profile for this remote binding.
@@ -277,12 +447,29 @@ impl TelegramChannel {
         }
 
         let key = self.derive_session_key(&event)?;
-        if self.admit(&event, &key) == Admission::Admitted {
-            sink.send(event)
-                .map_err(|_| TelegramChannelError::IngressUnavailable)?;
+        match self.admit(&event, &key) {
+            Admission::Admitted => {
+                sink.send(event)
+                    .map_err(|_| TelegramChannelError::IngressUnavailable)?;
+            }
+            Admission::Rejected(RejectionReason::RateLimited) => {
+                self.maybe_notify_throttled(&event);
+            }
+            Admission::Rejected(_) | Admission::Deferred(_) => {}
         }
         Ok(())
     }
+}
+
+/// Whether more than [`RATE_LIMIT_WINDOW`] has elapsed since `window_start`,
+/// i.e. whether a sliding-window counter/notice anchored at `window_start`
+/// must reset as of `now`. Timestamp overflow (astronomically unlikely for
+/// wall-clock inputs) is treated as expired so the gate fails open toward
+/// resetting rather than getting stuck permanently closed.
+fn window_expired(window_start: Timestamp, now: Timestamp) -> bool {
+    window_start
+        .checked_add(RATE_LIMIT_WINDOW)
+        .map_or(true, |window_end| now >= window_end)
 }
 
 impl ChannelAdapter for TelegramChannel {
@@ -331,6 +518,9 @@ impl ChannelAdapter for TelegramChannel {
         }
         if self.validate_channel(event).is_err() {
             return Admission::Rejected(RejectionReason::Other("channel mismatch".to_owned()));
+        }
+        if !self.record_inbound_rate(event) {
+            return Admission::Rejected(RejectionReason::RateLimited);
         }
         if self.config.is_group(&event.peer) {
             if self.config.require_mention_in_groups && !event.mentioned {
@@ -434,6 +624,42 @@ impl From<TelegramChannelError> for ChannelError {
                 channel: harw_types::ChannelId::from_str("telegram"),
                 peer,
             },
+            // The work-request variants below likewise predate a channel-id
+            // field (they are surfaced directly to a Telegram reply by
+            // `harw-cli/src/gateway.rs`, not through this admission-pipeline
+            // conversion); folded into `AdmissionDenied`/`NotYetImplemented`
+            // with the same "telegram" placeholder channel used above so this
+            // match stays exhaustive without inventing new `ChannelError`
+            // shapes for a path that does not exercise them today.
+            TelegramChannelError::WorkspaceUnresolved {
+                alias, tenant, ..
+            } => ChannelError::AdmissionDenied {
+                channel: harw_types::ChannelId::from_str("telegram"),
+                reason: format!("workspace alias '{alias}' unresolved for tenant '{tenant}'"),
+            },
+            TelegramChannelError::InvalidWorkRequestRole { role } => ChannelError::AdmissionDenied {
+                channel: harw_types::ChannelId::from_str("telegram"),
+                reason: format!("invalid work-request role '{role}'"),
+            },
+            TelegramChannelError::WorkRequestNotFound { work_id } => ChannelError::AdmissionDenied {
+                channel: harw_types::ChannelId::from_str("telegram"),
+                reason: format!("work request '{work_id}' is unknown"),
+            },
+            TelegramChannelError::WorkRequestInvalidTransition {
+                work_id,
+                from,
+                action,
+            } => ChannelError::AdmissionDenied {
+                channel: harw_types::ChannelId::from_str("telegram"),
+                reason: format!("work request '{work_id}' cannot be {action} from state '{from}'"),
+            },
+            TelegramChannelError::LaunchNotYetAvailable { work_id } => {
+                ChannelError::NotYetImplemented(format!(
+                    "sandboxed launch for work request '{work_id}'"
+                ))
+            }
+            TelegramChannelError::Io(error) => ChannelError::Io(error),
+            TelegramChannelError::Serde(error) => ChannelError::Serde(error),
         }
     }
 }
@@ -459,6 +685,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::mpsc;
     use std::thread;
+    use std::time::{Duration, Instant};
 
     use jiff::Timestamp;
 
@@ -689,7 +916,7 @@ mod tests {
 
     #[test]
     fn telegram_profile_only_removes_upstream_capabilities() {
-        use harw_sandbox::Permission::{ExecuteProcess, ReadWorkspace, WriteWorkspace};
+        use harw_authority::Permission::{ExecuteProcess, ReadWorkspace, WriteWorkspace};
 
         let (_dir, store) = store();
         let adapter = TelegramChannel::new(config(ChannelId::from_str("telegram:ops")), store);
@@ -747,7 +974,17 @@ mod tests {
         let runner = adapter.clone();
         let join = thread::spawn(move || runner.run_ingress(sink_tx));
 
-        for _ in 0..1_000 {
+        // Poll on a wall-clock deadline rather than a fixed spin-count: a
+        // fixed number of `yield_now()` calls is not guaranteed to give the
+        // OS scheduler enough opportunities to actually run the spawned
+        // runner thread when the host is under heavy concurrent load (e.g.
+        // other test/agent activity competing for CPU), even though no
+        // deadlock exists. If the mutex really were held across `recv`
+        // (the bug this test guards against), `ingress.lock()` below would
+        // itself block forever and the test would hang/time out instead of
+        // reaching either assertion.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
             if ingress.lock().expect("ingress lock").as_ref().is_none() {
                 assert!(
                     ingress.try_lock().is_ok(),
@@ -755,12 +992,12 @@ mod tests {
                 );
                 break;
             }
+            assert!(
+                Instant::now() < deadline,
+                "ingress runner did not extract the receiver within the timeout"
+            );
             thread::yield_now();
         }
-        assert!(
-            ingress.lock().expect("ingress lock").as_ref().is_none(),
-            "ingress runner did not extract the receiver"
-        );
 
         ingress_tx
             .send(event("100", true))
@@ -934,5 +1171,110 @@ mod tests {
             ChannelError::Unpaired { channel, peer: actual_peer }
                 if channel.as_str() == "telegram" && actual_peer == peer
         ));
+    }
+
+    #[test]
+    fn rate_limit_rejects_beyond_budget_and_recovers_next_window() {
+        let (_dir, store) = store();
+        let channel = ChannelId::from_str("telegram:ops");
+        pair(&store, &channel, "100", "ops");
+        let mut config = config(channel);
+        config.max_updates_per_peer_per_min = 2;
+        let adapter = TelegramChannel::new(config, store);
+        let base = Timestamp::now();
+
+        let mut first = event("100", true);
+        first.raw_event_id = Some("1".to_owned());
+        first.received_at = base;
+        let key = adapter.derive_session_key(&first).unwrap();
+        assert_eq!(adapter.admit(&first, &key), Admission::Admitted);
+
+        let mut second = event("100", true);
+        second.raw_event_id = Some("2".to_owned());
+        second.received_at = base;
+        assert_eq!(adapter.admit(&second, &key), Admission::Admitted);
+
+        let mut third = event("100", true);
+        third.raw_event_id = Some("3".to_owned());
+        third.received_at = base;
+        assert_eq!(
+            adapter.admit(&third, &key),
+            Admission::Rejected(RejectionReason::RateLimited)
+        );
+
+        let mut fourth = event("100", true);
+        fourth.raw_event_id = Some("4".to_owned());
+        fourth.received_at = base.checked_add(jiff::SignedDuration::from_secs(61)).unwrap();
+        assert_eq!(adapter.admit(&fourth, &key), Admission::Admitted);
+    }
+
+    #[test]
+    fn rate_limit_is_idempotent_across_a_repeated_admit_call_for_one_event() {
+        let (_dir, store) = store();
+        let channel = ChannelId::from_str("telegram:ops");
+        pair(&store, &channel, "100", "ops");
+        let mut config = config(channel);
+        config.max_updates_per_peer_per_min = 1;
+        let adapter = TelegramChannel::new(config, store);
+        let inbound = event("100", true);
+        let key = adapter.derive_session_key(&inbound).unwrap();
+
+        // A second `admit()` call for the exact same event (mirroring the
+        // gateway's own redundant post-ingress admission re-check) must not
+        // consume a second slot of the peer's budget.
+        assert_eq!(adapter.admit(&inbound, &key), Admission::Admitted);
+        assert_eq!(adapter.admit(&inbound, &key), Admission::Admitted);
+    }
+
+    #[test]
+    fn rate_limited_ingress_emits_at_most_one_throttle_notice_per_window() {
+        let (_dir, store) = store();
+        let channel = ChannelId::from_str("telegram:ops");
+        pair(&store, &channel, "100", "ops");
+        let mut config = config(channel);
+        config.max_updates_per_peer_per_min = 1;
+        let (ingress_tx, ingress_rx) = mpsc::channel();
+        let (throttle_tx, throttle_rx) = mpsc::channel();
+        let adapter = TelegramChannel::with_ingress_receiver(config, store, ingress_rx)
+            .with_throttle_sink(throttle_tx);
+        let (sink_tx, sink_rx) = mpsc::channel();
+
+        let mut first = event("100", true);
+        first.raw_event_id = Some("1".to_owned());
+        let mut second = event("100", true);
+        second.raw_event_id = Some("2".to_owned());
+        let mut third = event("100", true);
+        third.raw_event_id = Some("3".to_owned());
+        ingress_tx.send(first).unwrap();
+        ingress_tx.send(second).unwrap();
+        ingress_tx.send(third).unwrap();
+        drop(ingress_tx);
+
+        adapter.run_ingress(sink_tx).unwrap();
+
+        assert_eq!(sink_rx.recv().unwrap().peer.as_str(), "100");
+        assert!(sink_rx.try_recv().is_err());
+
+        let notice = throttle_rx.recv().expect("exactly one throttle notice");
+        assert_eq!(notice.peer.as_str(), "100");
+        assert!(throttle_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn no_throttle_notice_without_a_configured_sink() {
+        let (_dir, store) = store();
+        let channel = ChannelId::from_str("telegram:ops");
+        pair(&store, &channel, "100", "ops");
+        let mut config = config(channel);
+        config.max_updates_per_peer_per_min = 0;
+        let (ingress_tx, ingress_rx) = mpsc::channel();
+        let adapter = TelegramChannel::with_ingress_receiver(config, store, ingress_rx);
+        let (sink_tx, sink_rx) = mpsc::channel();
+
+        ingress_tx.send(event("100", true)).unwrap();
+        drop(ingress_tx);
+
+        adapter.run_ingress(sink_tx).unwrap();
+        assert!(sink_rx.try_recv().is_err());
     }
 }

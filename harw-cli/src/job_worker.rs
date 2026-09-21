@@ -40,23 +40,27 @@
 //! [`PlanNodeServices`], home and transcript root through
 //! [`JobWorkerContext`].
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use harw_agent_dsl::roles::AgentRoleId;
+use harw_authority::{Permission, PermissionRequest, PermissionSet, SandboxSpec};
 use harw_core::{
     AgentSession, DurableJobRunner, ExecutionControl, JobExecutionRegistry, ModelMessage,
     ModelProvider, StateStore, TranscriptStateStore, TurnInput, TurnOutcome, run_turn,
 };
-use harw_job_runtime::{JobClaim, JobKind, JobOutcome, JobState};
-use harw_plan::admission::{MutationContract, PathRule};
+use harw_job_runtime::{Budget, JobClaim, JobKind, JobOutcome, JobScope, JobState, RetryPolicy};
+use harw_plan::admission::{
+    FileChange, MutationContract, PatchFile, PathRule, RepoRevision, ScopeViolation, UnifiedDiff,
+    validate_patch,
+};
 use harw_plan::{Criterion, PlanNodeKind, PlanStore, TaskId, VerificationStep};
-use harw_plan_bridge::{PlanJobBridge, offset_from_timestamp};
+use harw_plan_bridge::{JobAdmissionTemplate, PlanBridgeError, PlanJobBridge, offset_from_timestamp};
 use harw_protocol::{SessionEvent, TurnEvent};
 use harw_registry_defaults::profile::{IdentityOverrides, RegistryProfile};
 use harw_runtime::{RuntimeAssembly, RuntimeNarrowing};
-use harw_sandbox::{Permission, PermissionSet, SandboxSpec};
 use harw_session_store::{ClaimRequest, JobListQuery, JobStore, TranscriptStore};
 use harw_types::{SessionId, ThreadRef};
 
@@ -952,6 +956,28 @@ async fn execute_plan_node_claim(
             }
         };
 
+    // Workspace-Schnappschuss vor dem Turn (Befund K36): ohne einen Vergleich
+    // vorher/nachher lässt sich kein `UnifiedDiff` bauen, gegen den
+    // `harw_plan::admission::validate_patch` den Mutationsvertrag prüfen
+    // könnte. Der Schnappschuss deckt den ganzen Workspace ab, nicht nur die
+    // vom Vertrag erlaubten Pfade — die abgeleitete Sandbox schneidet
+    // `WriteWorkspace` nicht auf Pfadebene, ein Turn könnte also technisch
+    // überall darunter schreiben (`snapshot_workspace`).
+    let workspace_root = sandbox.workspace().canonical_root().to_path_buf();
+    let before_snapshot = snapshot_workspace(&workspace_root);
+
+    // Alles, was ein durch diesen Knoten neu bereiter Folgeknoten braucht, um
+    // unter genau derselben Autorität admittiert zu werden wie dieser Knoten
+    // selbst (Befund K37) — erfasst, bevor `claim`/`job_store` weiter unten
+    // verschoben werden.
+    let admission = ReadyNodeAdmission {
+        job_store: Arc::clone(&job_store),
+        scope: claim.scope.clone(),
+        budget: claim.job.budget.clone(),
+        retry: claim.job.retry.clone(),
+        base_revision: payload.contract.base_revision.clone(),
+    };
+
     let Some(runtime_root) = context.runtime_root.as_ref() else {
         tracing::error!(
             task = %payload.task_id,
@@ -965,6 +991,7 @@ async fn execute_plan_node_claim(
             JobOutcome::Blocked {
                 reason: MISSING_RUNTIME_ROOT.to_owned(),
             },
+            &admission,
         );
     };
 
@@ -1012,8 +1039,10 @@ async fn execute_plan_node_claim(
     );
 
     let outcome = execute_turn(claim, plan_node_prompt(&payload), model, control, setup).await;
+    let outcome =
+        enforce_patch_admission(&payload.contract, &workspace_root, &before_snapshot, outcome);
 
-    report_plan_node_outcome(&services, &payload.task_id, &work_id, outcome)
+    report_plan_node_outcome(&services, &payload.task_id, &work_id, outcome, &admission)
 }
 
 // Fail-closed check of a plan node's assembled sandbox (J1-F). Since R0-F the
@@ -1556,11 +1585,16 @@ fn derive_plan_node_sandbox(
     // binding is kept so the result is a child of `inherited`, and the network
     // scope is cut to the table's.
     let node_permissions = node
-        .restrict(&ceiling)
-        .restrict(inherited.permissions())
+        .restrict(&PermissionRequest::from_permissions(ceiling.iter()))
+        .restrict(&PermissionRequest::from_permissions(
+            inherited.permissions().iter(),
+        ))
         .permissions()
         .clone();
-    let derived = inherited.restrict_with(&node_permissions, node.network_scope());
+    let derived = inherited.restrict(
+        &PermissionRequest::from_permissions(node_permissions.iter())
+            .with_network_scope(node.network_scope().clone()),
+    );
     derived.ensure_child_of(inherited).map_err(|error| {
         format!(
             "derived plan-node sandbox is not a reduction of the job sandbox: {}",
@@ -1604,8 +1638,295 @@ fn profile_for_node_kind(kind: PlanNodeKind, may_write: bool) -> RegistryProfile
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
+// Patch admission (Befund K36)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Günstiger Fingerabdruck einer Datei, um "hat sich geändert" ohne Hashing
+/// des Inhalts zu entscheiden.
+///
+/// # Description
+/// Größe und Änderungszeit reichen aus, um einen echten Vorher/Nachher-
+/// Vergleich zu führen, ohne jede Datei im Schreibbereich einzulesen. Ein
+/// böswilliger Turn, der Inhalt bei gleicher Größe und Zeit exakt tauscht,
+/// wäre ohnehin durch die Sandbox-Rechte begrenzt — diese Struktur dient der
+/// Diff-*Erkennung*, nicht der Autorisierung selbst.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FileFingerprint {
+    /// Dateigröße in Bytes.
+    len: u64,
+    /// Letzte Änderungszeit laut Dateisystem-Metadaten.
+    modified: SystemTime,
+}
+
+/// Nimmt einen Schnappschuss aller regulären Dateien im Arbeitsverzeichnis auf.
+///
+/// # Description
+/// Der Schnappschuss deckt das **gesamte** Arbeitsverzeichnis ab, nicht nur
+/// die von `contract.allowed_paths` benannten Pfade. Grund: die abgeleitete
+/// Sandbox (`derive_plan_node_sandbox`) gewährt `WriteWorkspace` nur grob für
+/// den ganzen Workspace — sie kennt keine Durchsetzung auf Pfadebene. Ein
+/// Turn könnte also technisch überall im Workspace schreiben; würde der
+/// Schnappschuss nur die erlaubten Pfade beobachten, bliebe jede Datei
+/// außerhalb davon unsichtbar und `validate_patch` bekäme sie nie zu sehen —
+/// genau die Lücke, die diese Prüfung schließen soll (Befund K36).
+///
+/// # Arguments
+/// - `workspace_root` (`&Path`): kanonische Wurzel der abgeleiteten Sandbox.
+///
+/// # Returns
+/// Abbildung von Repo-relativem, vorwärts-Slash-normalisiertem Pfad auf
+/// [`FileFingerprint`]. Ein nicht (mehr) existierendes Arbeitsverzeichnis
+/// liefert eine leere Abbildung.
+///
+/// # Concurrency
+/// Synchrones Dateisystem-I/O; wird aus einem Job-Worker-Task heraus
+/// aufgerufen, der ohnehin schon Sandbox-Pfade kanonisiert.
+fn snapshot_workspace(workspace_root: &Path) -> BTreeMap<String, FileFingerprint> {
+    let mut out = BTreeMap::new();
+    walk_into(workspace_root, workspace_root, &mut out);
+    out
+}
+
+// Rekursiver Durchlauf: Verzeichnisse werden aufgeklappt, reguläre Dateien
+// tragen ihren Fingerabdruck ein. Symlinks und Spezialdateien werden bewusst
+// nicht verfolgt — dieselbe Zurückhaltung wie bei der rein lexikalischen
+// Pfadprüfung in `leaves_workspace`. Nicht lesbare Einträge werden
+// übersprungen statt den ganzen Lauf abzubrechen: ein fehlendes Verzeichnis
+// bedeutet hier nur "keine Dateien darunter", kein Fehler.
+fn walk_into(path: &Path, workspace_root: &Path, out: &mut BTreeMap<String, FileFingerprint>) {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+
+    if metadata.is_dir() {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            walk_into(&entry.path(), workspace_root, out);
+        }
+        return;
+    }
+
+    if !metadata.is_file() {
+        return;
+    }
+
+    let Ok(relative) = path.strip_prefix(workspace_root) else {
+        return;
+    };
+    let Some(relative_str) = relative.to_str() else {
+        return;
+    };
+    let normalized = relative_str.replace('\\', "/");
+    let fingerprint = FileFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+    };
+    out.insert(normalized, fingerprint);
+}
+
+/// Baut aus zwei Schnappschüssen einen [`UnifiedDiff`].
+///
+/// # Description
+/// Ein Pfad, der nur nachher existiert, ist [`FileChange::Added`]; ein Pfad,
+/// der nur vorher existiert, ist [`FileChange::Deleted`]; ein Pfad mit
+/// abweichendem [`FileFingerprint`] ist [`FileChange::Modified`]. Umbenennungen
+/// werden nicht erkannt — sie erscheinen als ein `Added`- und ein
+/// `Deleted`-Eintrag, was für die Zweckprüfung hier sogar strenger ist: beide
+/// Endpunkte werden unabhängig gegen den Vertrag geprüft.
+fn diff_snapshots(
+    base_revision: RepoRevision,
+    before: &BTreeMap<String, FileFingerprint>,
+    after: &BTreeMap<String, FileFingerprint>,
+) -> UnifiedDiff {
+    let mut files = Vec::new();
+
+    for (path, after_fp) in after {
+        match before.get(path) {
+            None => files.push(PatchFile {
+                path: path.clone(),
+                source_path: None,
+                change: FileChange::Added,
+            }),
+            Some(before_fp) if before_fp != after_fp => files.push(PatchFile {
+                path: path.clone(),
+                source_path: None,
+                change: FileChange::Modified,
+            }),
+            Some(_) => {}
+        }
+    }
+
+    for path in before.keys() {
+        if !after.contains_key(path) {
+            files.push(PatchFile {
+                path: path.clone(),
+                source_path: None,
+                change: FileChange::Deleted,
+            });
+        }
+    }
+
+    UnifiedDiff {
+        base_revision,
+        files,
+    }
+}
+
+// Menschenlesbare, aber immer noch typisierte Zusammenfassung aller
+// `ScopeViolation`-Befunde. Bleibt eine Übersetzung des typisierten Enums,
+// keine Ad-hoc-Freitextmeldung.
+fn describe_violations(violations: &[ScopeViolation]) -> String {
+    let parts: Vec<String> = violations
+        .iter()
+        .map(|violation| match violation {
+            ScopeViolation::OutsideAllowed { path } => {
+                format!("'{path}' liegt außerhalb der erlaubten Pfade")
+            }
+            ScopeViolation::Forbidden { path, rule } => {
+                format!("'{path}' trifft die verbotene Regel {rule:?}")
+            }
+            ScopeViolation::BaseRevisionMismatch { contract, patch } => format!(
+                "Basis-Revision weicht ab: Vertrag erwartet '{}', Diff hat '{}'",
+                contract.0, patch.0
+            ),
+        })
+        .collect();
+    format!(
+        "plan node patch rejected by admission: {}",
+        parts.join("; ")
+    )
+}
+
+/// Prüft einen erfolgreichen Turn gegen seinen eigenen Mutationsvertrag
+/// (Befund K36).
+///
+/// # Description
+/// Nur eine [`JobOutcome::Succeeded`] kann überhaupt etwas geschrieben haben —
+/// jede andere Ausprägung geht unverändert durch. Bei Erfolg wird der
+/// Nachher-Schnappschuss genommen, ein [`UnifiedDiff`] gebaut und über
+/// [`validate_patch`] gegen `contract` geprüft. Ein Verstoß ersetzt das
+/// Ergebnis durch ein `JobOutcome::Failed` mit den typisierten
+/// `ScopeViolation`-Befunden im Klartext (`describe_violations`) — nicht durch
+/// ein Log allein, das den Knoten trotzdem als abgeschlossen durchließe.
+///
+/// # Arguments
+/// - `contract` (`&MutationContract`): der Mutationsvertrag des Knotens.
+/// - `workspace_root` (`&Path`): kanonische Wurzel, gegen die normalisiert wird.
+/// - `before` (`&BTreeMap<String, FileFingerprint>`): Schnappschuss vor dem Turn.
+/// - `outcome` (`JobOutcome`): das rohe Turn-Ergebnis.
+///
+/// # Returns
+/// `outcome` unverändert, außer bei einem admittierten Verstoß eines
+/// erfolgreichen Turns — dann `JobOutcome::Failed`.
+///
+/// # Concurrency
+/// Synchrones Dateisystem-I/O für den Nachher-Schnappschuss, sonst rein
+/// funktional.
+fn enforce_patch_admission(
+    contract: &MutationContract,
+    workspace_root: &Path,
+    before: &BTreeMap<String, FileFingerprint>,
+    outcome: JobOutcome,
+) -> JobOutcome {
+    let JobOutcome::Succeeded { result } = outcome else {
+        return outcome;
+    };
+
+    let after = snapshot_workspace(workspace_root);
+    let diff = diff_snapshots(contract.base_revision.clone(), before, &after);
+    let report = validate_patch(contract, &diff);
+
+    if report.admitted {
+        return JobOutcome::Succeeded { result };
+    }
+
+    tracing::error!(
+        task = %contract.task_id,
+        violations = report.violations.len(),
+        "plan-node patch rejected by admission"
+    );
+    JobOutcome::Failed {
+        reason: sanitize_failure(&describe_violations(&report.violations)),
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
 // Plan reporting
 // ──────────────────────────────────────────────────────────────────────────────
+
+/// Alles, was `report_plan_node_outcome` nach einem erfolgreich
+/// abgeschlossenen Knoten braucht, um `PlanJobBridge::admit_ready_nodes`
+/// aufzurufen (Befund K37).
+///
+/// # Description
+/// Die Werte stammen bewusst nicht aus einer frisch konstruierten Vorlage,
+/// sondern aus dem bereits laufenden Job selbst (`JobClaim::scope`,
+/// `Job::budget`, `Job::retry`) und aus dessen eigenem Mutationsvertrag
+/// (`MutationContract::base_revision`). Ein neu bereiter Folgeknoten erbt so
+/// exakt die Autoritäts- und Ressourcengrenzen, unter denen der abschließende
+/// Knoten selbst lief — keine stillschweigende Rechteausweitung durch eine
+/// unabhängig gebaute Vorlage.
+struct ReadyNodeAdmission {
+    /// Job-Speicher, in den neu bereite Folgeknoten als Jobs eingereiht werden.
+    job_store: Arc<JobStore>,
+    /// Mandant, Workspace und Einreicher-Identität, geerbt vom laufenden Job.
+    scope: JobScope,
+    /// Ressourcendeckel, geerbt vom laufenden Job.
+    budget: Budget,
+    /// Wiederholungspolitik, geerbt vom laufenden Job.
+    retry: RetryPolicy,
+    /// Basis-Revision, gegen die der Mutationsvertrag des abschließenden
+    /// Knotens galt.
+    base_revision: RepoRevision,
+}
+
+// Reicht neu bereite Folgeknoten als Jobs ein, nachdem ein Knoten erfolgreich
+// abgeschlossen wurde (Befund K37). Bestmöglich (best effort): ein Fehler hier
+// darf den bereits gemeldeten Job-Ausgang nicht mehr verändern, er wird nur
+// laut geloggt — dieselbe Regel wie bei `report_plan_node_failure`.
+// `PlanBridgeError::NoReadyNodes` ist der Normalfall, wenn dieser Knoten kein
+// Geschwister entsperrt hat.
+fn admit_newly_ready_nodes(
+    services: &PlanNodeServices,
+    admission: &ReadyNodeAdmission,
+    work_id: &str,
+) {
+    let template = JobAdmissionTemplate::new(
+        admission.scope.clone(),
+        admission.budget.clone(),
+        admission.retry.clone(),
+        admission.base_revision.clone(),
+        Timestamp::now(),
+    );
+    match PlanJobBridge::admit_ready_nodes(
+        services.plan(),
+        admission.job_store.as_ref(),
+        &template,
+        services.actor(),
+    ) {
+        Ok(admitted) => {
+            if !admitted.is_empty() {
+                tracing::info!(
+                    work_id = %work_id,
+                    admitted = admitted.len(),
+                    "follow-up plan nodes admitted after job completion"
+                );
+            }
+        }
+        Err(PlanBridgeError::NoReadyNodes) => {
+            tracing::debug!(work_id = %work_id, "no further plan node became ready");
+        }
+        Err(error) => {
+            tracing::error!(
+                work_id = %work_id,
+                error = %error,
+                "could not admit newly ready plan nodes"
+            );
+        }
+    }
+}
 
 // Invalidates the node and returns the matching job outcome.
 fn fail_plan_node(
@@ -1645,6 +1966,7 @@ fn report_plan_node_outcome(
     task: &TaskId,
     work_id: &str,
     outcome: JobOutcome,
+    admission: &ReadyNodeAdmission,
 ) -> JobOutcome {
     match outcome {
         JobOutcome::Succeeded { result } => {
@@ -1663,6 +1985,9 @@ fn report_plan_node_outcome(
                         work_id = %work_id,
                         "plan node completed by durable job"
                     );
+                    // Befund K37: erst jetzt, mit dem Knoten sicher `Completed`,
+                    // können Folgeknoten überhaupt bereit geworden sein.
+                    admit_newly_ready_nodes(services, admission, work_id);
                     JobOutcome::Succeeded { result }
                 }
                 Err(error) => {
@@ -1925,12 +2250,11 @@ impl ExecutionControl for WorkerExecutionControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use harw_authority::{WorkspaceRegistration, WorkspaceRegistry};
     use harw_core::{EchoModelProvider, JobExecutionRegistry, RecordingModelProvider};
-    use harw_job_runtime::{Budget, Job, JobScope, RetryPolicy, StoredJob};
-    use harw_plan::admission::RepoRevision;
+    use harw_job_runtime::{Job, StoredJob};
     use harw_plan::ids::RevisionId;
     use harw_plan::{InMemoryPlanStore, PlanAction, PlanId, PlanNodeStatus};
-    use harw_sandbox::{WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{ApprovalActor, ItemId, TenantId, ToolCallId, WorkId, WorkspaceId};
 
     // ── Fixtures ──────────────────────────────────────────────────────────
@@ -2421,6 +2745,405 @@ mod tests {
             paused_turn_outcome(&paused, PauseDisposition::Blocked),
             JobOutcome::Blocked { .. }
         ));
+    }
+
+    // ── Patch admission (Befund K36) ─────────────────────────────────────
+
+    #[test]
+    fn test_snapshot_workspace_finds_every_file_below_the_root() {
+        let temp = temp_dir();
+        let workspace_root = temp.path().to_path_buf();
+        if let Err(error) = std::fs::create_dir_all(workspace_root.join("src")) {
+            panic!("create src: {error}");
+        }
+        if let Err(error) = std::fs::write(workspace_root.join("src/lib.rs"), "fn main() {}") {
+            panic!("write lib.rs: {error}");
+        }
+        if let Err(error) = std::fs::write(workspace_root.join("outside.rs"), "// unrelated") {
+            panic!("write outside.rs: {error}");
+        }
+
+        let snapshot = snapshot_workspace(&workspace_root);
+        assert_eq!(
+            snapshot.keys().cloned().collect::<Vec<_>>(),
+            vec!["outside.rs".to_owned(), "src/lib.rs".to_owned()],
+            "der ganze Workspace muss erfasst werden, nicht nur die erlaubten Pfade \
+             (Befund K36: die Sandbox schneidet nicht auf Pfadebene)"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_workspace_of_a_missing_root_is_empty() {
+        let temp = temp_dir();
+        let missing = temp.path().join("does-not-exist");
+        assert!(snapshot_workspace(&missing).is_empty());
+    }
+
+    #[test]
+    fn test_diff_snapshots_detects_added_modified_and_deleted_files() {
+        let mut before = BTreeMap::new();
+        before.insert(
+            "src/kept.rs".to_owned(),
+            FileFingerprint {
+                len: 10,
+                modified: SystemTime::UNIX_EPOCH,
+            },
+        );
+        before.insert(
+            "src/gone.rs".to_owned(),
+            FileFingerprint {
+                len: 5,
+                modified: SystemTime::UNIX_EPOCH,
+            },
+        );
+        let mut after = BTreeMap::new();
+        after.insert(
+            "src/kept.rs".to_owned(),
+            FileFingerprint {
+                len: 11,
+                modified: SystemTime::UNIX_EPOCH,
+            },
+        );
+        after.insert(
+            "src/new.rs".to_owned(),
+            FileFingerprint {
+                len: 3,
+                modified: SystemTime::UNIX_EPOCH,
+            },
+        );
+
+        let diff = diff_snapshots(RepoRevision("sha".to_owned()), &before, &after);
+        assert_eq!(diff.base_revision, RepoRevision("sha".to_owned()));
+        assert_eq!(diff.files.len(), 3, "added + modified + deleted");
+        assert!(diff.files.contains(&PatchFile {
+            path: "src/kept.rs".to_owned(),
+            source_path: None,
+            change: FileChange::Modified,
+        }));
+        assert!(diff.files.contains(&PatchFile {
+            path: "src/new.rs".to_owned(),
+            source_path: None,
+            change: FileChange::Added,
+        }));
+        assert!(diff.files.contains(&PatchFile {
+            path: "src/gone.rs".to_owned(),
+            source_path: None,
+            change: FileChange::Deleted,
+        }));
+    }
+
+    #[test]
+    fn test_diff_snapshots_reports_no_files_for_an_unchanged_snapshot() {
+        let mut snapshot = BTreeMap::new();
+        snapshot.insert(
+            "src/lib.rs".to_owned(),
+            FileFingerprint {
+                len: 1,
+                modified: SystemTime::UNIX_EPOCH,
+            },
+        );
+        let diff = diff_snapshots(RepoRevision("sha".to_owned()), &snapshot, &snapshot);
+        assert!(diff.files.is_empty());
+    }
+
+    #[test]
+    fn test_describe_violations_formats_each_violation_kind() {
+        let violations = vec![
+            ScopeViolation::OutsideAllowed {
+                path: "src/outside.rs".to_owned(),
+            },
+            ScopeViolation::Forbidden {
+                path: "src/secret.rs".to_owned(),
+                rule: PathRule::Exact("src/secret.rs".to_owned()),
+            },
+            ScopeViolation::BaseRevisionMismatch {
+                contract: RepoRevision("expected".to_owned()),
+                patch: RepoRevision("actual".to_owned()),
+            },
+        ];
+        let message = describe_violations(&violations);
+        assert!(message.contains("src/outside.rs"));
+        assert!(message.contains("src/secret.rs"));
+        assert!(message.contains("expected"));
+        assert!(message.contains("actual"));
+    }
+
+    #[test]
+    fn test_enforce_patch_admission_passes_through_a_non_succeeded_outcome() {
+        let temp = temp_dir();
+        let contract = contract_for("t-1", &[PathRule::Exact("src/lib.rs".to_owned())]);
+        let outcome = JobOutcome::Blocked {
+            reason: "irrelevant".to_owned(),
+        };
+        let result =
+            enforce_patch_admission(&contract, temp.path(), &BTreeMap::new(), outcome);
+        assert!(matches!(result, JobOutcome::Blocked { reason } if reason == "irrelevant"));
+    }
+
+    #[test]
+    fn test_enforce_patch_admission_admits_a_write_inside_scope() {
+        let temp = temp_dir();
+        let workspace_root = temp.path().to_path_buf();
+        if let Err(error) = std::fs::create_dir_all(workspace_root.join("src")) {
+            panic!("create src: {error}");
+        }
+        let contract = contract_for("t-1", &[PathRule::DirectoryPrefix("src".to_owned())]);
+        let before = snapshot_workspace(&workspace_root);
+
+        if let Err(error) = std::fs::write(workspace_root.join("src/lib.rs"), "fn main() {}") {
+            panic!("write lib.rs: {error}");
+        }
+
+        let outcome = JobOutcome::Succeeded {
+            result: serde_json::json!({"assistant": "done"}),
+        };
+        let result = enforce_patch_admission(&contract, &workspace_root, &before, outcome);
+        assert!(
+            matches!(result, JobOutcome::Succeeded { .. }),
+            "ein Schreibvorgang innerhalb des Vertrags darf nicht abgelehnt werden: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_enforce_patch_admission_rejects_a_write_outside_scope() {
+        let temp = temp_dir();
+        let workspace_root = temp.path().to_path_buf();
+        if let Err(error) = std::fs::create_dir_all(workspace_root.join("src")) {
+            panic!("create src: {error}");
+        }
+        // Nur `src/lib.rs` ist erlaubt; der Schnappschuss deckt trotzdem den
+        // ganzen Workspace ab (Befund K36), sonst bliebe ein Schreibvorgang
+        // außerhalb der erlaubten Datei unsichtbar.
+        let contract = contract_for("t-1", &[PathRule::Exact("src/lib.rs".to_owned())]);
+        let before = snapshot_workspace(&workspace_root);
+
+        if let Err(error) = std::fs::write(workspace_root.join("src/rogue.rs"), "// nope") {
+            panic!("write rogue.rs: {error}");
+        }
+
+        let outcome = JobOutcome::Succeeded {
+            result: serde_json::json!({"assistant": "done"}),
+        };
+        let result = enforce_patch_admission(&contract, &workspace_root, &before, outcome);
+        let JobOutcome::Failed { reason } = result else {
+            panic!("ein Verstoß gegen den Mutationsvertrag muss den Job scheitern lassen");
+        };
+        assert!(
+            reason.contains("rogue.rs"),
+            "der typisierte Verstoß muss im Grund benannt sein: {reason}"
+        );
+    }
+
+    // ── Ready-node admission (Befund K37) ────────────────────────────────
+
+    #[test]
+    fn test_admit_newly_ready_nodes_admits_a_dependent_after_completion() {
+        let temp = temp_dir();
+        let node_a = harw_plan::plan_node!("t-1", write: ["src/t-1.rs"]);
+        let node_b = harw_plan::plan_node!("t-2", deps: ["t-1"], write: ["src/t-2.rs"]);
+
+        let plan = InMemoryPlanStore::new();
+        if let Err(error) = plan.apply(
+            PlanAction::Create {
+                plan_id: PlanId::new("p-test"),
+                goal: "test goal".to_owned(),
+            },
+            "test",
+        ) {
+            panic!("create plan: {error}");
+        }
+        let expected_rev = plan.revision();
+        if let Err(error) = plan.apply_batch(
+            &PlanId::new("p-test"),
+            vec![
+                PlanAction::AddNode { node: node_a },
+                PlanAction::AddNode { node: node_b },
+            ],
+            "test",
+            expected_rev,
+        ) {
+            panic!("add nodes: {error}");
+        }
+        let plan: Arc<dyn PlanStore> = Arc::new(plan);
+
+        let jobs = Arc::new(JobStore::new(temp.path()));
+        let initial_template = JobAdmissionTemplate::new(
+            JobScope::new(
+                TenantId::from_str("tenant"),
+                WorkspaceId::from_str("workspace"),
+                ApprovalActor::Operator {
+                    id: "operator".to_owned(),
+                },
+            ),
+            Budget::unbounded(),
+            RetryPolicy {
+                max_attempts: 1,
+                base_delay: SignedDuration::from_secs(1),
+                factor: 1.0,
+                max_delay: SignedDuration::from_secs(1),
+            },
+            RepoRevision("sha".to_owned()),
+            Timestamp::now(),
+        );
+
+        // Nur `t-1` hat keine offenen Dependencies und wird admittiert; `t-2`
+        // bleibt vorerst blockiert.
+        let admitted = match PlanJobBridge::admit_ready_nodes(
+            plan.as_ref(),
+            jobs.as_ref(),
+            &initial_template,
+            "test-runtime",
+        ) {
+            Ok(admitted) => admitted,
+            Err(error) => panic!("admit_ready_nodes: {error}"),
+        };
+        assert_eq!(admitted.len(), 1);
+        let (task, work_id) = admitted[0].clone();
+        assert_eq!(task, TaskId::new("t-1"));
+
+        let services = PlanNodeServices::new(
+            Arc::clone(&plan),
+            sandbox_with(temp.path(), &[Permission::ReadWorkspace]),
+            "test-runtime".to_owned(),
+        );
+        let admission = ReadyNodeAdmission {
+            job_store: Arc::clone(&jobs),
+            scope: initial_template.scope.clone(),
+            budget: initial_template.budget.clone(),
+            retry: initial_template.retry.clone(),
+            base_revision: initial_template.base_revision.clone(),
+        };
+
+        // Simuliert den erfolgreichen Abschluss des `t-1`-Jobs — genau der
+        // Aufruf, den `execute_plan_node_claim` nach einem erfolgreichen Turn
+        // macht.
+        let outcome = report_plan_node_outcome(
+            &services,
+            &task,
+            &work_id,
+            JobOutcome::Succeeded {
+                result: serde_json::json!({"assistant": "t-1 done"}),
+            },
+            &admission,
+        );
+        assert!(matches!(outcome, JobOutcome::Succeeded { .. }));
+
+        let snapshot = match plan.current() {
+            Ok(snapshot) => snapshot,
+            Err(error) => panic!("current: {error}"),
+        };
+        let node_a_after = match snapshot.nodes.iter().find(|node| node.id == TaskId::new("t-1"))
+        {
+            Some(node) => node,
+            None => panic!("t-1 fehlt im Plan"),
+        };
+        assert_eq!(node_a_after.status, PlanNodeStatus::Completed);
+
+        let node_b_after = match snapshot.nodes.iter().find(|node| node.id == TaskId::new("t-2"))
+        {
+            Some(node) => node,
+            None => panic!("t-2 fehlt im Plan"),
+        };
+        assert_eq!(
+            node_b_after.status,
+            PlanNodeStatus::InProgress,
+            "t-2 muss nach Abschluss von t-1 automatisch admittiert werden"
+        );
+        let assigned_job = match &node_b_after.assignment {
+            Some(assignment) => match &assignment.job {
+                Some(job) => job.clone(),
+                None => panic!("t-2 hat keine Job-Zuweisung"),
+            },
+            None => panic!("t-2 hat kein Assignment"),
+        };
+        if let Err(error) = jobs.get(&WorkId::from_str(assigned_job.as_str())) {
+            panic!("der für t-2 admittierte Job muss im Job-Speicher stehen: {error}");
+        }
+    }
+
+    #[test]
+    fn test_admit_newly_ready_nodes_is_best_effort_when_no_node_becomes_ready() {
+        // Ein einzelner Knoten ohne Nachfolger: `admit_ready_nodes` meldet
+        // `NoReadyNodes` — das darf `report_plan_node_outcome` nicht scheitern
+        // lassen, es ist der Normalfall am Ende eines Plans.
+        let temp = temp_dir();
+        let node_a = harw_plan::plan_node!("t-1", write: ["src/t-1.rs"]);
+        let plan = InMemoryPlanStore::new();
+        if let Err(error) = plan.apply(
+            PlanAction::Create {
+                plan_id: PlanId::new("p-test"),
+                goal: "test goal".to_owned(),
+            },
+            "test",
+        ) {
+            panic!("create plan: {error}");
+        }
+        let expected_rev = plan.revision();
+        if let Err(error) = plan.apply_batch(
+            &PlanId::new("p-test"),
+            vec![PlanAction::AddNode { node: node_a }],
+            "test",
+            expected_rev,
+        ) {
+            panic!("add node: {error}");
+        }
+        let plan: Arc<dyn PlanStore> = Arc::new(plan);
+
+        let jobs = Arc::new(JobStore::new(temp.path()));
+        let template = JobAdmissionTemplate::new(
+            JobScope::new(
+                TenantId::from_str("tenant"),
+                WorkspaceId::from_str("workspace"),
+                ApprovalActor::Operator {
+                    id: "operator".to_owned(),
+                },
+            ),
+            Budget::unbounded(),
+            RetryPolicy {
+                max_attempts: 1,
+                base_delay: SignedDuration::from_secs(1),
+                factor: 1.0,
+                max_delay: SignedDuration::from_secs(1),
+            },
+            RepoRevision("sha".to_owned()),
+            Timestamp::now(),
+        );
+        let admitted = match PlanJobBridge::admit_ready_nodes(
+            plan.as_ref(),
+            jobs.as_ref(),
+            &template,
+            "test-runtime",
+        ) {
+            Ok(admitted) => admitted,
+            Err(error) => panic!("admit_ready_nodes: {error}"),
+        };
+        let (task, work_id) = admitted[0].clone();
+
+        let services = PlanNodeServices::new(
+            Arc::clone(&plan),
+            sandbox_with(temp.path(), &[Permission::ReadWorkspace]),
+            "test-runtime".to_owned(),
+        );
+        let admission = ReadyNodeAdmission {
+            job_store: Arc::clone(&jobs),
+            scope: template.scope.clone(),
+            budget: template.budget.clone(),
+            retry: template.retry.clone(),
+            base_revision: template.base_revision.clone(),
+        };
+
+        // Darf weder scheitern noch panicken, obwohl kein Folgeknoten bereit
+        // wird.
+        let outcome = report_plan_node_outcome(
+            &services,
+            &task,
+            &work_id,
+            JobOutcome::Succeeded {
+                result: serde_json::json!({"assistant": "done"}),
+            },
+            &admission,
+        );
+        assert!(matches!(outcome, JobOutcome::Succeeded { .. }));
     }
 
     // ── Worker loop ───────────────────────────────────────────────────────

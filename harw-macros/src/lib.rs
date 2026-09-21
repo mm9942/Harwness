@@ -175,7 +175,7 @@ pub fn derive_tool(input: TokenStream) -> TokenStream {
 /// Accepted `permission` values are `"read_workspace"`, `"write_workspace"`,
 /// `"execute_process"`, `"network_access"`, `"read_secrets"`,
 /// `"manage_plugins"` and `"read_cargo_registry"` — the variants of
-/// `harw_sandbox::Permission`. Any other value is a compile error listing the
+/// `harw_authority::Permission`. Any other value is a compile error listing the
 /// allowed set rather than a silent fallback onto a different permission; a
 /// typo must never resolve to a *different* (possibly weaker) permission.
 ///

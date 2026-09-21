@@ -8,13 +8,13 @@
 //! samt `source`/`checksum`.
 //!
 //! # Sicherheitskontrakt
-//! - Permission: [`harw_sandbox::Permission::ReadWorkspace`] — `Cargo.lock`
+//! - Permission: [`harw_authority::Permission::ReadWorkspace`] — `Cargo.lock`
 //!   liegt im Workspace und wird ausschließlich über `canonical_root()` der
 //!   Sandbox gelesen; es gibt kein Pfad-Argument.
 //! - Die **Registry-Anreicherung** (aufgelöster Quellpfad, verfügbare
 //!   Versionen) liegt außerhalb des Workspace. Sie wird deshalb nur ergänzt,
 //!   wenn die Sandbox zusätzlich
-//!   [`harw_sandbox::Permission::ReadCargoRegistry`] gewährt; sonst bleiben die
+//!   [`harw_authority::Permission::ReadCargoRegistry`] gewährt; sonst bleiben die
 //!   Felder leer und die Antwort sagt das ausdrücklich (fail closed).
 //!
 //! # Schlüsseltypen

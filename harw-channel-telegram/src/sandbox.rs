@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use harw_sandbox::{Permission, PermissionSet};
+use harw_authority::{Permission, PermissionSet};
 
 /// Conservative channel profile applied after the upstream policy decision.
 ///

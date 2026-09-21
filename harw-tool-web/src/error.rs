@@ -124,7 +124,7 @@ pub enum WebToolError {
 
     /// Ein Redirect zeigte auf einen Host außerhalb der Sandbox-Allowlist.
     ///
-    /// Jeder Hop wird erneut gegen [`harw_sandbox::NetworkScope`] geprüft; ein
+    /// Jeder Hop wird erneut gegen [`harw_authority::NetworkScope`] geprüft; ein
     /// Redirect ist damit kein Weg an der Allowlist vorbei.
     #[msg("Host '{host}' ist nicht in der erlaubten Host-Liste dieser Sandbox (URL '{url}')")]
     RedirectHostNotAllowed {

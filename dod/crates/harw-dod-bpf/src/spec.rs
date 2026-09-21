@@ -78,6 +78,10 @@ pub enum BpfProgramKind {
     Tracepoint,
     /// Eine dynamische Sonde auf eine Kernel-Funktion.
     KProbe,
+    /// A BTF-typed function-entry hook.  This is used for TCP connect so the
+    /// event is produced in the calling task, never from a later socket-state
+    /// callback that may run in softirq context.
+    FEntry,
     /// Ein Programm, das an einen rohen Socket angehängt wird.
     SocketFilter,
 }

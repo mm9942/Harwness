@@ -188,7 +188,7 @@ mod tests {
     use super::AgentArgs;
     use crate::testutil::toks;
     use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
-    use harw_sandbox::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::sync::atomic::{AtomicU64, Ordering};
 

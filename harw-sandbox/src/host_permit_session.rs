@@ -116,7 +116,9 @@ impl HostPermitSessionRegistry {
         let session = session.into();
         let expires_at = Instant::now() + ttl;
         if let Ok(mut state) = self.state.lock() {
-            state.approved_sessions.retain(|(existing, _)| existing != &session);
+            state
+                .approved_sessions
+                .retain(|(existing, _)| existing != &session);
             state.approved_sessions.push((session, expires_at));
         }
     }
@@ -155,7 +157,9 @@ impl HostPermitSessionRegistry {
             return false;
         };
         let now = Instant::now();
-        state.approved_sessions.retain(|(_, expires_at)| *expires_at > now);
+        state
+            .approved_sessions
+            .retain(|(_, expires_at)| *expires_at > now);
         state
             .approved_sessions
             .iter()
@@ -187,7 +191,7 @@ impl HostPermitSessionRegistry {
     ///
     /// # Examples
     /// ```rust
-    /// use harw_sandbox::{HostPermitSessionRegistry, ProcessEnvironment, request_for_workspace};
+    /// use harw_sandbox ::{HostPermitSessionRegistry, ProcessEnvironment, request_for_workspace};
     /// use std::path::Path;
     ///
     /// let registry = HostPermitSessionRegistry::default();
@@ -306,7 +310,9 @@ impl HostPermitSessionRegistry {
         let Ok(mut state) = self.state.lock() else {
             return Vec::new();
         };
-        state.approved_sessions.retain(|(existing, _)| existing != session);
+        state
+            .approved_sessions
+            .retain(|(existing, _)| existing != session);
         let mut removed_ids = Vec::new();
         state.remembered.retain(|entry| {
             if entry.request.session == session {

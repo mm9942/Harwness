@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+harw-authority = { path = "../harw-authority" }
 harw-agent-dsl = { path = "../harw-agent-dsl" }
 harw-types = { path = "../harw-types" }
 harw-protocol = { path = "../harw-protocol" }

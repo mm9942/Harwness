@@ -338,7 +338,7 @@ mod tests {
         ApprovalPolicy, FromRawArgs, OpContext, OpError, Operation, Surface,
         context::ServiceMap,
     };
-    use harw_sandbox::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::{
         path::PathBuf,

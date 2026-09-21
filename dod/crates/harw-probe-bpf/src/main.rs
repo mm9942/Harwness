@@ -165,7 +165,7 @@ use std::sync::Arc;
 use clap::Parser as _;
 use harw_dod_bpf::BpfProgramSource;
 use harw_dod_signals::Sensor;
-use harw_sandbox::{EgressTarget, NetworkScope};
+use harw_authority::{EgressTarget, NetworkScope};
 use harw_types::SensorId;
 
 use cli::{Cli, LogLevel};
@@ -274,7 +274,7 @@ fn run(cli: Cli) -> Result<(), ProbeError> {
     let fs_roots = fs_scope_roots(&cli);
     landlock::enforce_fs_scope(&fs_roots)?;
 
-    let procmon_source = program_source(cli.procmon_program_path.clone());
+    let procmon_source = program_source(cli.exec_program_path.clone());
     let procmon_loader = real_loader::build_real_loader()?;
     let procmon_sensor = sensors::build_procmon_sensor(
         procmon_loader,
@@ -282,9 +282,9 @@ fn run(cli: Cli) -> Result<(), ProbeError> {
         procmon_source,
     )?;
 
-    let flow_source = program_source(cli.flow_program_path.clone());
+    let flow_source = program_source(cli.tcp_v4_program_path.clone());
     let flow_loader = real_loader::build_real_loader()?;
-    let scope = network_scope(&cli);
+    let scope = network_scope(&[]);
     let flow_sensor = sensors::build_flow_sensor(
         flow_loader,
         SensorId::from_str(cli.sensor_id_flow.clone()),
@@ -317,7 +317,15 @@ fn run(cli: Cli) -> Result<(), ProbeError> {
 /// unproblematisch).
 fn fs_scope_roots(cli: &Cli) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    for path in [&cli.procmon_program_path, &cli.flow_program_path].into_iter().flatten() {
+    for path in [
+        &cli.exec_program_path,
+        &cli.exit_program_path,
+        &cli.tcp_v4_program_path,
+        &cli.tcp_v6_program_path,
+    ]
+    .into_iter()
+    .flatten()
+    {
         if let Some(parent) = path.parent() {
             roots.push(parent.to_path_buf());
         }
@@ -346,7 +354,7 @@ fn program_source(path: Option<PathBuf>) -> BpfProgramSource {
     }
 }
 
-/// Baut den `harw_sandbox::NetworkScope`, den [`sensors::FlowSensor`] gegen
+/// Baut den `harw_authority::NetworkScope`, den [`sensors::FlowSensor`] gegen
 /// jede beobachtete Verbindung prüft.
 ///
 /// # Arguments
@@ -357,8 +365,12 @@ fn program_source(path: Option<PathBuf>) -> BpfProgramSource {
 /// Netzen. Ohne Angabe ein leerer Scope, der jede ausgehende Verbindung
 /// meldet — siehe [`cli`]-Moduldoku für die Begründung, warum
 /// `Host`/`DnsSuffix`-Ziele hier nicht angeboten werden.
-fn network_scope(cli: &Cli) -> NetworkScope {
-    let targets: Vec<EgressTarget> = cli.egress_allow_cidr.iter().cloned().map(EgressTarget::Cidr).collect();
+fn network_scope(cidrs: &[ipnet::IpNet]) -> NetworkScope {
+    let targets: Vec<EgressTarget> = cidrs
+        .iter()
+        .cloned()
+        .map(EgressTarget::Cidr)
+        .collect();
     NetworkScope::from_targets(targets)
 }
 
@@ -406,8 +418,8 @@ mod tests {
     #[test]
     fn test_fs_scope_roots_collects_parent_directories_of_configured_paths() {
         let mut cli = minimal_cli();
-        cli.procmon_program_path = Some(PathBuf::from("/opt/harw/bpf/procmon.o"));
-        cli.flow_program_path = Some(PathBuf::from("/opt/harw/bpf/flow.o"));
+        cli.exec_program_path = Some(PathBuf::from("/opt/harw/bpf/exec.o"));
+        cli.tcp_v4_program_path = Some(PathBuf::from("/opt/harw/bpf/flow.o"));
 
         let roots = fs_scope_roots(&cli);
         assert_eq!(roots, vec![PathBuf::from("/opt/harw/bpf"), PathBuf::from("/opt/harw/bpf")]);
@@ -416,15 +428,15 @@ mod tests {
     #[test]
     fn test_network_scope_is_empty_without_configured_cidrs() {
         let cli = minimal_cli();
-        let scope = network_scope(&cli);
+        let scope = network_scope(&[]);
         assert!(!scope.allows_addr(std::net::IpAddr::from([127, 0, 0, 1])));
     }
 
     #[test]
     fn test_network_scope_allows_a_configured_cidr() {
         let mut cli = minimal_cli();
-        cli.egress_allow_cidr = vec!["10.0.0.0/24".parse::<IpNet>().expect("valid test CIDR literal")];
-        let scope = network_scope(&cli);
+        let cidrs = vec!["10.0.0.0/24".parse::<IpNet>().expect("valid test CIDR literal")];
+        let scope = network_scope(&cidrs);
         assert!(scope.allows_addr(std::net::IpAddr::from([10, 0, 0, 5])));
         assert!(!scope.allows_addr(std::net::IpAddr::from([203, 0, 113, 9])));
     }

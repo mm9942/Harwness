@@ -437,6 +437,168 @@ impl DoctorCheck for HomePermsCheck {
     }
 }
 
+/// Vorberechnete Evidenz der Audit-Integritätsprüfung
+/// (`docs/design/secrets-and-audit.md` §4.3): Hash-Kette (`audit.log`) und
+/// signierte ML-DSA-Checkpoints (`checkpoints.log`) eines konfigurierten
+/// Geheimnisspeichers.
+///
+/// `harw-install` hängt bewusst nicht von `harw-secrets` ab (Layering
+/// zwischen Installations-Diagnose und der Krypto-/Audit-Implementierung).
+/// Deshalb kann [`AuditIntegrityCheck`] die Prüfung nicht selbst ausführen —
+/// der Aufrufer (`harw-cli`s `doctor`-Befehl) ruft die tatsächliche
+/// Verifikation über `harw_secrets::SecretStore::verify_persisted_audit_chain`
+/// und `harw_secrets::SecretStore::verify_persisted_checkpoints` auf und
+/// liefert nur das fertige Ergebnis hierher — exakt dasselbe Muster wie
+/// [`RuntimeCompositionCheck`] für die Tool-Komposition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditIntegrityEvidence {
+    /// Weder Audit-Log noch Checkpoint-Datei enthalten etwas (Datei fehlt
+    /// oder ist leer): kein Fund, kein Bruch — ein Speicher, der noch nie
+    /// durabel mutiert oder einen Checkpoint signiert hat, sieht genauso aus.
+    Absent,
+    /// Hash-Kette und Checkpoints wurden gelesen und vollständig verifiziert
+    /// (innere Verkettung, Monotonie, Reichweite; Signaturen nur, wenn ein
+    /// Verifikationsschlüssel konfiguriert war).
+    Intact {
+        /// Anzahl der Ereignisse in der Audit-Kette.
+        event_count: u64,
+        /// Anzahl der Checkpoints in der Checkpoint-Datei.
+        checkpoint_count: u64,
+        /// Ob ML-DSA-Signaturen tatsächlich geprüft wurden.
+        signatures_checked: bool,
+    },
+    /// Eine der beiden Dateien konnte nicht gelesen/dekodiert werden — weder
+    /// „unversehrt" noch „Bruch" feststellbar.
+    Unreadable(String),
+    /// Ein tatsächlicher Bruch wurde festgestellt (Hash-Kette, Checkpoint-
+    /// Verkettung, Monotonie, Reichweite oder Signatur).
+    Broken(String),
+}
+
+/// Prüft die Audit-Integrität (§4.3) anhand vorberechneter
+/// [`AuditIntegrityEvidence`].
+///
+/// # Description
+/// Übersetzt die vier Evidenzfälle in ein [`CheckOutcome`]: `Absent` und
+/// `Intact` sind bestanden, `Unreadable` ist ein nicht-kritischer Mangel
+/// (wir konnten nicht nachsehen), `Broken` ist das Sicherheitsereignis
+/// dieses Checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditIntegrityCheck {
+    evidence: AuditIntegrityEvidence,
+}
+
+impl AuditIntegrityCheck {
+    /// Erzeugt den Check für die gelieferte Evidenz.
+    #[must_use]
+    pub fn new(evidence: AuditIntegrityEvidence) -> Self {
+        Self { evidence }
+    }
+}
+
+impl DoctorCheck for AuditIntegrityCheck {
+    /// Liefert den Bezeichner `"secrets/audit-integrity"`.
+    fn id(&self) -> &str {
+        "secrets/audit-integrity"
+    }
+
+    /// Übersetzt die Evidenz in ein [`CheckOutcome`].
+    fn run(&self) -> CheckOutcome {
+        match &self.evidence {
+            AuditIntegrityEvidence::Absent => CheckOutcome::Ok(
+                "keine Audit-Historie vorhanden (noch nie durabel mutiert oder Checkpoint signiert)"
+                    .to_owned(),
+            ),
+            AuditIntegrityEvidence::Intact {
+                event_count,
+                checkpoint_count,
+                signatures_checked,
+            } => {
+                let signature_note = if *signatures_checked {
+                    "Signaturen geprüft"
+                } else {
+                    "Signaturen nicht geprüft (kein Verifikationsschlüssel konfiguriert)"
+                };
+                CheckOutcome::Ok(format!(
+                    "Audit-Kette unversehrt ({event_count} Ereignisse), {checkpoint_count} Checkpoints unversehrt ({signature_note})"
+                ))
+            }
+            AuditIntegrityEvidence::Unreadable(reason) => {
+                CheckOutcome::Warn(format!("Audit-Integrität nicht prüfbar: {reason}"))
+            }
+            AuditIntegrityEvidence::Broken(reason) => {
+                CheckOutcome::Fail(format!("Audit-Integrität verletzt: {reason}"))
+            }
+        }
+    }
+}
+
+/// Vorberechnete Evidenz der KEK-Schlüsseldatei-Berechtigungsprüfung.
+///
+/// `harw-install` hängt aus denselben Layering-Gründen wie
+/// [`AuditIntegrityEvidence`] nicht von `harw-secrets` ab; der Aufrufer
+/// liefert das Ergebnis von `harw_secrets::kek::check_key_file_permissions`
+/// hierher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KekFilePermsEvidence {
+    /// Kein dateibasierter KEK konfiguriert (kein KEK oder Keyring-/EnvSeed-
+    /// Provenienz): diese Prüfung ist nicht anwendbar.
+    NotApplicable,
+    /// Die Schlüsseldatei unter `path` hat sichere Berechtigungen (`0600`).
+    Ok {
+        /// Pfad der geprüften Schlüsseldatei.
+        path: String,
+    },
+    /// Die Schlüsseldatei unter `path` hat unsichere Berechtigungen oder ist
+    /// anderweitig nicht ladbar; `reason` beschreibt das Problem ohne
+    /// Schlüsselinhalt.
+    Unsafe {
+        /// Pfad der geprüften Schlüsseldatei.
+        path: String,
+        /// Menschenlesbare Fehlerbeschreibung ohne Schlüsselinhalt.
+        reason: String,
+    },
+}
+
+/// Prüft, dass die konfigurierte KEK-Schlüsseldatei — falls vorhanden — nur
+/// vom Eigentümer lesbar ist (`0600`), anhand vorberechneter
+/// [`KekFilePermsEvidence`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KekFilePermsCheck {
+    evidence: KekFilePermsEvidence,
+}
+
+impl KekFilePermsCheck {
+    /// Erzeugt den Check für die gelieferte Evidenz.
+    #[must_use]
+    pub fn new(evidence: KekFilePermsEvidence) -> Self {
+        Self { evidence }
+    }
+}
+
+impl DoctorCheck for KekFilePermsCheck {
+    /// Liefert den Bezeichner `"secrets/kek-file-perms"`.
+    fn id(&self) -> &str {
+        "secrets/kek-file-perms"
+    }
+
+    /// Übersetzt die Evidenz in ein [`CheckOutcome`].
+    fn run(&self) -> CheckOutcome {
+        match &self.evidence {
+            KekFilePermsEvidence::NotApplicable => CheckOutcome::Ok(
+                "kein dateibasierter KEK konfiguriert — Berechtigungsprüfung nicht anwendbar"
+                    .to_owned(),
+            ),
+            KekFilePermsEvidence::Ok { path } => {
+                CheckOutcome::Ok(format!("KEK-Schlüsseldatei-Berechtigungen sicher (0600): {path}"))
+            }
+            KekFilePermsEvidence::Unsafe { path, reason } => CheckOutcome::Fail(format!(
+                "KEK-Schlüsseldatei '{path}' hat unsichere Berechtigungen: {reason}"
+            )),
+        }
+    }
+}
+
 /// Baut die Standard-Check-Liste für die harw-Diagnose.
 ///
 /// # Description
@@ -689,5 +851,103 @@ mod tests {
             );
         }
         assert!(!is_sensitive_tool("fs.read"));
+    }
+
+    #[test]
+    fn audit_integrity_check_id_stable() {
+        assert_eq!(
+            AuditIntegrityCheck::new(AuditIntegrityEvidence::Absent).id(),
+            "secrets/audit-integrity"
+        );
+    }
+
+    #[test]
+    fn audit_integrity_absent_is_a_pass_with_a_note() {
+        let check = AuditIntegrityCheck::new(AuditIntegrityEvidence::Absent);
+        assert!(
+            matches!(check.run(), CheckOutcome::Ok(message) if message.contains("keine Audit-Historie"))
+        );
+    }
+
+    #[test]
+    fn audit_integrity_intact_reports_counts_and_signature_status() {
+        let check = AuditIntegrityCheck::new(AuditIntegrityEvidence::Intact {
+            event_count: 12,
+            checkpoint_count: 2,
+            signatures_checked: true,
+        });
+        assert!(matches!(
+            check.run(),
+            CheckOutcome::Ok(message)
+                if message.contains("12 Ereignisse")
+                    && message.contains("2 Checkpoints")
+                    && message.contains("Signaturen geprüft")
+        ));
+    }
+
+    #[test]
+    fn audit_integrity_intact_without_a_key_notes_signatures_were_skipped() {
+        let check = AuditIntegrityCheck::new(AuditIntegrityEvidence::Intact {
+            event_count: 3,
+            checkpoint_count: 1,
+            signatures_checked: false,
+        });
+        assert!(
+            matches!(check.run(), CheckOutcome::Ok(message) if message.contains("kein Verifikationsschlüssel"))
+        );
+    }
+
+    #[test]
+    fn audit_integrity_unreadable_is_a_warning_not_a_pass_or_fail() {
+        let check =
+            AuditIntegrityCheck::new(AuditIntegrityEvidence::Unreadable("kaputt".to_owned()));
+        assert!(matches!(check.run(), CheckOutcome::Warn(message) if message.contains("kaputt")));
+    }
+
+    #[test]
+    fn audit_integrity_broken_is_a_fail_naming_the_broken_segment() {
+        let check = AuditIntegrityCheck::new(AuditIntegrityEvidence::Broken(
+            "Audit-Kette gebrochen bei Ereignis 3".to_owned(),
+        ));
+        assert!(
+            matches!(check.run(), CheckOutcome::Fail(message) if message.contains("Ereignis 3"))
+        );
+    }
+
+    #[test]
+    fn kek_file_perms_check_id_stable() {
+        assert_eq!(
+            KekFilePermsCheck::new(KekFilePermsEvidence::NotApplicable).id(),
+            "secrets/kek-file-perms"
+        );
+    }
+
+    #[test]
+    fn kek_file_perms_not_applicable_is_a_pass() {
+        let check = KekFilePermsCheck::new(KekFilePermsEvidence::NotApplicable);
+        assert!(
+            matches!(check.run(), CheckOutcome::Ok(message) if message.contains("nicht anwendbar"))
+        );
+    }
+
+    #[test]
+    fn kek_file_perms_ok_reports_the_checked_path() {
+        let check = KekFilePermsCheck::new(KekFilePermsEvidence::Ok {
+            path: "/home/u/.harw/kek.seed".to_owned(),
+        });
+        assert!(
+            matches!(check.run(), CheckOutcome::Ok(message) if message.contains("/home/u/.harw/kek.seed"))
+        );
+    }
+
+    #[test]
+    fn kek_file_perms_unsafe_is_a_fail_with_the_reason() {
+        let check = KekFilePermsCheck::new(KekFilePermsEvidence::Unsafe {
+            path: "/home/u/.harw/kek.seed".to_owned(),
+            reason: "unsafe permissions 0644".to_owned(),
+        });
+        assert!(
+            matches!(check.run(), CheckOutcome::Fail(message) if message.contains("unsafe permissions 0644"))
+        );
     }
 }

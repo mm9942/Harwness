@@ -4,9 +4,7 @@
 //! Verzeichnis `outside/` mit Geheimnissen an; [`Fixture::plant_escapes`]
 //! erzeugt echte Symlinks aus dem Workspace hinaus sowie Symlink-Schleifen.
 
-use harw_sandbox::{
-    Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-};
+use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
 use harw_tools::{ToolCall, ToolExecutionContext, ToolName, ToolOutput};
 use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
 use std::fs;

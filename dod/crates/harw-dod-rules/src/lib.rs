@@ -67,11 +67,11 @@
 //!
 //! # Examples
 //! ```rust
+//! use harw_authority::NetworkScope;
 //! use harw_dod_rules::rule::{Rule, RuleContext};
 //! use harw_dod_rules::rules::EgressFlowRule;
 //! use harw_dod_rules::{run_rules, triage, Verdict};
 //! use harw_dod_signals::{EventKind, SecurityEvent};
-//! use harw_sandbox::NetworkScope;
 //! use harw_types::SensorId;
 //!
 //! let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);

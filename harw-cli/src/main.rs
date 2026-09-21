@@ -28,6 +28,7 @@ mod connect;
 mod gateway;
 mod home;
 mod job_worker;
+mod lens;
 mod lifecycle;
 mod mcp;
 mod mcp_auth;
@@ -270,7 +271,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         Some(Command::Init) => cmd_init(home_override),
         Some(Command::Onboard) => {
             let home = home::resolve_home(home_override)?;
-            harw_home::ensure_home(&home).map_err(|error| error.to_string())?;
+            home::ensure_home(&home).map_err(|error| error.to_string())?;
             onboarding::run_wizard(&home)
         }
         Some(Command::Connect { channel, pair }) => {
@@ -313,7 +314,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
         }
         Some(Command::Run { input }) => {
             let home = home::resolve_home(home_override)?;
-            harw_home::ensure_home(&home).map_err(|error| error.to_string())?;
+            home::ensure_home(&home).map_err(|error| error.to_string())?;
             println!("{}", run_local_echo(&input.join(" "), &home)?);
             Ok(())
         }
@@ -360,6 +361,7 @@ fn dispatch(cli: Cli) -> Result<(), String> {
             requested_goal.as_deref(),
             &args,
         ),
+        Some(Command::Lens { action }) => lens::run(home_override, action),
     }
 }
 
@@ -384,12 +386,12 @@ fn run_startup_migrations(
         | Some(Command::Uia { .. })
         | Some(Command::Analyze(_)) => {
             let home = home::resolve_home(home_override)?;
-            harw_home::ensure_home(&home).map_err(|error| error.to_string())?;
+            home::ensure_home(&home).map_err(|error| error.to_string())?;
             harw_home::config_layers(&home).map_err(|error| error.to_string())?
         }
         Some(Command::Web { .. }) => {
             let home = web_home(home::resolve_home(home_override))?;
-            harw_home::ensure_home(&home).map_err(|error| error.to_string())?;
+            home::ensure_home(&home).map_err(|error| error.to_string())?;
             harw_home::config_layers(&home).map_err(|error| error.to_string())?
         }
         Some(Command::Doctor { config_dir }) | Some(Command::Serve { config_dir }) => {
@@ -397,7 +399,7 @@ fn run_startup_migrations(
                 Some(dir) => vec![dir.clone()],
                 None => {
                     let home = home::resolve_home(home_override)?;
-                    harw_home::ensure_home(&home).map_err(|error| error.to_string())?;
+                    home::ensure_home(&home).map_err(|error| error.to_string())?;
                     harw_home::config_layers(&home).map_err(|error| error.to_string())?
                 }
             }
@@ -415,7 +417,8 @@ fn run_startup_migrations(
             | Command::Uninstall { .. }
             | Command::Sandbox { .. }
             | Command::Mcp { .. }
-            | Command::BugReport { .. },
+            | Command::BugReport { .. }
+            | Command::Lens { .. },
         ) => return Ok(()),
     };
 
@@ -466,7 +469,7 @@ fn migrate_config_paths(config_paths: &[PathBuf]) -> Result<(), String> {
 /// Legt den Root-Space an (idempotent) und meldet, was neu erstellt wurde.
 fn cmd_init(home_override: Option<PathBuf>) -> Result<(), String> {
     let home = home::resolve_home(home_override)?;
-    let report = harw_home::ensure_home(&home).map_err(|error| error.to_string())?;
+    let report = home::ensure_home(&home).map_err(|error| error.to_string())?;
     if report.created_home {
         println!("Root-Space angelegt: {}", report.home.display());
     } else {
@@ -598,7 +601,7 @@ fn resolve_layers(
         return Ok(vec![dir]);
     }
     let home = home::resolve_home(home_override)?;
-    harw_home::ensure_home(&home).map_err(|error| error.to_string())?;
+    home::ensure_home(&home).map_err(|error| error.to_string())?;
     harw_home::config_layers(&home).map_err(|error| error.to_string())
 }
 
@@ -984,11 +987,41 @@ fn require_home_for_sealed_refs(
     Ok(())
 }
 
-fn configured_serve_uses_sealed_secret(config: &ResolvedConfig) -> bool {
+/// Prüft, ob der Provider, den `serve` tatsächlich verwendet
+/// (`config.harness.default_provider`), eine `secrets:`-Referenz trägt.
+///
+/// Anders als ein Scan über alle aktivierten Provider betrachtet diese
+/// Funktion ausschließlich den Provider, den `serve_mcp` über
+/// [`build_serve_provider`] tatsächlich lädt (`ModelSource`/`default_provider`,
+/// siehe `harw_provider_http::build_provider_with_home`). Ein zweiter,
+/// aktivierter, aber von diesem Lauf nie angesprochener `secrets:`-Provider
+/// verlangt hier kein KEK.
+fn active_serve_provider_uses_sealed_secret(config: &ResolvedConfig) -> bool {
     config
-        .providers
-        .values()
-        .any(|provider| provider.enabled && matches!(&provider.auth, Some(SecretRef::Secrets(_))))
+        .harness
+        .default_provider
+        .as_deref()
+        .and_then(|provider_id| config.providers.get(provider_id))
+        .is_some_and(|provider| {
+            provider.enabled && matches!(&provider.auth, Some(SecretRef::Secrets(_)))
+        })
+}
+
+/// Prüft, ob `serve` ein KEK braucht: entweder weil der tatsächlich genutzte
+/// Provider (`default_provider`) `secrets:` referenziert, oder weil
+/// mindestens ein konfigurierter MCP-Principal ein `secrets:`-Credential
+/// referenziert.
+///
+/// Der Principal-Teil bleibt bewusst ein Scan über **alle** konfigurierten
+/// Principals, nicht nur einen: `serve_mcp` authentifiziert jeden
+/// konfigurierten Principal gleichzeitig (`build_authenticator` löst jedes
+/// `credential_ref` auf, bevor der Listener bindet) — welcher Principal sich
+/// später verbindet, steht beim Start nicht fest. Dieser Teil ist also
+/// bereits korrekt auf „die Menge, die dieser Lauf tatsächlich verwendet"
+/// verengt, nur ist diese Menge hier eben „alle Principals", nicht „ein
+/// Provider".
+fn configured_serve_uses_sealed_secret(config: &ResolvedConfig) -> bool {
+    active_serve_provider_uses_sealed_secret(config)
         || config
             .harness
             .mcp_listener
@@ -997,10 +1030,35 @@ fn configured_serve_uses_sealed_secret(config: &ResolvedConfig) -> bool {
             .any(|principal| matches!(&principal.credential_ref, SecretRef::Secrets(_)))
 }
 
-/// Opens the single sealed-secret resolver shared by provider and MCP auth.
-/// The secret-store module intentionally keys opening off providers; a
-/// synthetic provider in a separate config view extends that decision to
-/// MCP-only `secrets:` credentials without changing the loaded configuration.
+/// Öffnet den einen geteilten Secret-Resolver für Provider- und MCP-Auth von
+/// `serve`, verengt auf genau die Provider/Principals, die dieser Lauf
+/// tatsächlich verwendet.
+///
+/// # Description
+/// Baut eine eigene, minimale [`ResolvedConfig`]-Sicht (`resolver_config`)
+/// statt der vollständigen `config` an
+/// [`crate::secret_store::open_configured_secret_resolver`] weiterzureichen
+/// — dieser prüft die KEK-Pflicht über **alle** in der übergebenen
+/// Konfiguration enthaltenen aktivierten Provider, ein ungenutzter zweiter
+/// `secrets:`-Provider ohne KEK dürfte `serve` also nicht blockieren
+/// (dasselbe Muster wie
+/// [`crate::secret_store::open_configured_secret_resolver_for_active_provider`]
+/// für `runtime_entry`). `resolver_config` enthält deshalb höchstens zwei
+/// Einträge:
+/// - den tatsächlich genutzten Provider (`config.harness.default_provider`),
+///   nur wenn er aktiviert ist und `secrets:` referenziert;
+/// - einen synthetischen `__mcp_secret_resolver__`-Provider, nur wenn
+///   mindestens ein konfigurierter MCP-Principal ein `secrets:`-Credential
+///   referenziert (siehe [`configured_serve_uses_sealed_secret`] für die
+///   Begründung, warum hier weiterhin alle Principals gelten).
+///
+/// Referenziert weder der genutzte Provider noch ein Principal `secrets:`,
+/// wird nichts geöffnet — auch dann nicht, wenn ein anderer, ungenutzter
+/// Provider `secrets:` referenziert. Referenziert einer von beiden es aber,
+/// bleibt das Fail-Closed-Verhalten von
+/// [`crate::secret_store::open_configured_secret_resolver`] unverändert: ohne
+/// konfiguriertes KEK schlägt der Aufruf fehl, es gibt keinen
+/// Klartext-Fallback.
 fn open_serve_secret_resolver(
     config: &ResolvedConfig,
     home: Option<&Path>,
@@ -1008,44 +1066,56 @@ fn open_serve_secret_resolver(
     let Some(home) = home else {
         return Ok(None);
     };
-    if config
-        .providers
-        .values()
-        .any(|provider| provider.enabled && matches!(&provider.auth, Some(SecretRef::Secrets(_))))
-    {
-        return secret_store::open_configured_secret_resolver(home, config);
+
+    let mut resolver_config = ResolvedConfig {
+        auth: config.auth.clone(),
+        ..Default::default()
+    };
+    let mut needs_resolver = false;
+
+    if let Some(provider_id) = config.harness.default_provider.as_deref() {
+        if let Some(provider) = config.providers.get(provider_id) {
+            if provider.enabled && matches!(&provider.auth, Some(SecretRef::Secrets(_))) {
+                resolver_config
+                    .providers
+                    .insert(provider_id.to_owned(), provider.clone());
+                needs_resolver = true;
+            }
+        }
     }
-    if !config
+
+    if config
         .harness
         .mcp_listener
         .principals
         .iter()
         .any(|principal| matches!(&principal.credential_ref, SecretRef::Secrets(_)))
     {
+        resolver_config.providers.insert(
+            "__mcp_secret_resolver__".to_owned(),
+            ProviderToml {
+                name: "__mcp_secret_resolver__".to_owned(),
+                api: "openai-compatible".to_owned(),
+                base_url: "https://invalid.local".to_owned(),
+                auth: Some(SecretRef::Secrets("__mcp_secret_resolver__".to_owned())),
+                auth_header: None,
+                api_key: None,
+                originator: None,
+                headers: std::collections::HashMap::new(),
+                models: Vec::new(),
+                enabled: true,
+                origin_allowlist: OriginAllowlistToml::default(),
+                rate_limit: None,
+                max_concurrency: None,
+            },
+        );
+        needs_resolver = true;
+    }
+
+    if !needs_resolver {
         return Ok(None);
     }
 
-    let mut resolver_config = ResolvedConfig {
-        auth: config.auth.clone(),
-        ..Default::default()
-    };
-    resolver_config.providers.insert(
-        "__mcp_secret_resolver__".to_owned(),
-        ProviderToml {
-            name: "__mcp_secret_resolver__".to_owned(),
-            api: "openai-compatible".to_owned(),
-            base_url: "https://invalid.local".to_owned(),
-            auth: Some(SecretRef::Secrets("__mcp_secret_resolver__".to_owned())),
-            auth_header: None,
-            api_key: None,
-            headers: std::collections::HashMap::new(),
-            models: Vec::new(),
-            enabled: true,
-            origin_allowlist: OriginAllowlistToml::default(),
-            rate_limit: None,
-            max_concurrency: None,
-        },
-    );
     secret_store::open_configured_secret_resolver(home, &resolver_config)
 }
 
@@ -1245,7 +1315,7 @@ const CLI_ACTOR: &str = "human:cli";
 const PLAN_NODE_JOB_ACTOR: &str = "job:plan-node-worker";
 
 /// Aufzählung der gültigen Interaktionsmodi für Fehlermeldungen.
-const VALID_MODE_NAMES: &str = "chat, plan, explore, work";
+const VALID_MODE_NAMES: &str = "chat, plan, explore, work, shell";
 
 /// Löst den Interaktionsmodus einer neuen Session auf.
 ///
@@ -1276,7 +1346,7 @@ const VALID_MODE_NAMES: &str = "chat, plan, explore, work";
 /// `resolve_startup_mode(Some("explore"), "chat")` ergibt
 /// [`InteractionMode::Explore`]; `resolve_startup_mode(None, "plan")` ergibt
 /// [`InteractionMode::Plan`]; `resolve_startup_mode(Some("wörk"), "chat")`
-/// ergibt einen Fehler, der `chat, plan, explore, work` nennt.
+/// ergibt einen Fehler, der `chat, plan, explore, work, shell` nennt.
 fn resolve_startup_mode(
     requested: Option<&str>,
     configured: &str,
@@ -1859,7 +1929,7 @@ fn prepare_planning_startup(
     requested_mode: Option<&str>,
     requested_goal: Option<&str>,
 ) -> Result<PlanningStartup, String> {
-    harw_home::ensure_home(&spec.home).map_err(|error| error.to_string())?;
+    home::ensure_home(&spec.home).map_err(|error| error.to_string())?;
     let (config, _trust) = harw_runtime::load_config(spec).map_err(|error| error.to_string())?;
 
     let mode = resolve_startup_mode(requested_mode, &config.harness.mode.default)?;
@@ -2166,15 +2236,22 @@ fn cmd_analyze(
 ///
 /// # Description
 /// Validiert die Config-Layer wie bisher und druckt deren Kennzahlen. Für die
-/// Laufzeit-Rechte gibt es drei Fälle ([`doctor_home_resolution`]):
-/// - `--config-dir` gesetzt: Runtime-Montage übersprungen, eine Zeile
-///   `runtime_warning=skipped: --config-dir` (C6 — ein externes `--config-dir`
-///   ist kein HARW-Home; ein Montageversuch dagegen wäre irreführend).
+/// Laufzeit-Rechte und die Diagnose-Checks gibt es drei Fälle
+/// ([`doctor_home_resolution`]):
+/// - `--config-dir` gesetzt: Runtime-Montage und Checks übersprungen, eine
+///   Zeile `runtime_warning=skipped: --config-dir` (C6 — ein externes
+///   `--config-dir` ist kein HARW-Home; ein Montageversuch dagegen wäre
+///   irreführend).
 /// - kein `--config-dir`, aber [`home::resolve_home`] scheitert: eine Zeile
 ///   `runtime_warning=<text>` — der Fehler wird gemeldet, nicht still
 ///   verworfen.
 /// - sonst: [`print_runtime_rights`] montiert [`EntryKind::Doctor`] und
-///   druckt die effektiven Rechte.
+///   druckt die effektiven Rechte, anschließend führt [`run_doctor_checks`]
+///   die vollständige Diagnose-Check-Liste aus (System/Sandbox/Runtime-
+///   Grenzen/Service-Manager/Home aus [`harw_install::doctor::default_checks`]
+///   plus die Audit-Integritäts- und KEK-Berechtigungs-Checks aus
+///   `harw-secrets`) und druckt für jeden Check eine
+///   `check <id>: <PASS|WARN|FAIL> — <message>`-Zeile.
 ///
 /// # Arguments
 /// - `layers` (`Vec<PathBuf>`): die Config-Layer.
@@ -2182,10 +2259,13 @@ fn cmd_analyze(
 /// - `config_dir` (`Option<PathBuf>`): expliziter `--config-dir`-Wert.
 ///
 /// # Errors
-/// Ein `String`, wenn die Config nicht geladen oder validiert werden kann.
-/// Ein Montagefehler oder ein nicht auflösbares Home ist **kein** Fehler
-/// dieses Befehls: beides erscheint als Warnzeile, der Exit-Code bleibt der
-/// der Config-Prüfung.
+/// Ein `String`, wenn die Config nicht geladen oder validiert werden kann,
+/// oder wenn mindestens einer der Diagnose-Checks
+/// [`harw_install::doctor::CheckOutcome::Fail`] meldet — in beiden Fällen
+/// beendet sich `harw doctor` mit einem von Null verschiedenen Exit-Code
+/// (siehe `main`). Ein Montagefehler oder ein nicht auflösbares Home ist
+/// **kein** Fehler dieses Befehls: beides erscheint als Warnzeile und
+/// überspringt die Checks, ohne den Exit-Code zu beeinflussen.
 fn doctor(
     layers: Vec<PathBuf>,
     home_override: Option<PathBuf>,
@@ -2216,11 +2296,269 @@ fn doctor(
         config.harness.mcp_listener.listen_addr
     );
     println!("mcp_listener_path={}", config.harness.mcp_listener.path);
+
+    let mut any_check_failed = false;
     match doctor_home_resolution(config_dir.as_deref(), home_override) {
-        Ok(home) => print_runtime_rights(&home),
+        Ok(home) => {
+            print_runtime_rights(&home);
+            any_check_failed = run_doctor_checks(&home, &config);
+        }
         Err(reason) => println!("runtime_warning={reason}"),
     }
+
+    if any_check_failed {
+        return Err("harw doctor: mindestens ein Check ist fehlgeschlagen".to_owned());
+    }
     Ok(())
+}
+
+/// Führt die vollständige Doctor-Check-Liste aus und druckt für jeden Check
+/// genau eine Zeile.
+///
+/// # Description
+/// Baut die Standard-Checks über [`harw_install::doctor::default_checks`]
+/// (System/Sandbox/Runtime-Tool-Grenzen/Service-Manager/Home-Existenz/Home-
+/// Berechtigungen) und hängt zwei weitere an: die Audit-Integritätsprüfung
+/// (§4.3 in `docs/design/secrets-and-audit.md`, Evidenz aus
+/// [`audit_integrity_evidence`]) und die KEK-Schlüsseldatei-Berechtigungs-
+/// prüfung (Evidenz aus [`kek_file_perms_evidence`]). Jeder Check erscheint
+/// als eine Zeile `check <id>: <PASS|WARN|FAIL> — <message>`.
+///
+/// # Arguments
+/// - `home` (`&Path`): aufgelöster Root-Space, unter dem die Home- und
+///   Secrets-Checks laufen.
+/// - `config` (`&ResolvedConfig`): geladene Konfiguration, für die
+///   KEK-Provenienz des Berechtigungs-Checks.
+///
+/// # Returns
+/// `true`, wenn mindestens ein Check [`harw_install::doctor::CheckOutcome::Fail`]
+/// meldet — der Aufrufer beendet `harw doctor` in diesem Fall mit einem von
+/// Null verschiedenen Exit-Code.
+fn run_doctor_checks(home: &Path, config: &ResolvedConfig) -> bool {
+    let mut checks = harw_install::doctor::default_checks(home);
+    checks.push(Box::new(harw_install::doctor::AuditIntegrityCheck::new(
+        audit_integrity_evidence(home),
+    )));
+    checks.push(Box::new(harw_install::doctor::KekFilePermsCheck::new(
+        kek_file_perms_evidence(config),
+    )));
+
+    let mut any_failed = false;
+    for (id, outcome) in harw_install::doctor::run_all(&checks) {
+        let (label, message) = match &outcome {
+            harw_install::doctor::CheckOutcome::Ok(message) => ("PASS", message.as_str()),
+            harw_install::doctor::CheckOutcome::Warn(message) => ("WARN", message.as_str()),
+            harw_install::doctor::CheckOutcome::Fail(message) => {
+                any_failed = true;
+                ("FAIL", message.as_str())
+            }
+        };
+        println!("check {id}: {label} — {message}");
+    }
+    any_failed
+}
+
+/// Ermittelt die Evidenz für den Audit-Integritäts-Check (§4.3).
+///
+/// # Description
+/// Öffnet — ohne KEK-Material zu laden, das die reine Pfadverifikation nicht
+/// braucht — einen [`harw_secrets::SecretStore`] am dokumentierten
+/// versiegelten-Speicher-Root `<home>/sealed-secrets` (siehe
+/// `crate::secret_store::open_configured_secret_resolver`s Moduldoku für
+/// diese Konvention) und ruft nacheinander
+/// [`harw_secrets::SecretStore::verify_persisted_audit_chain`] und
+/// [`harw_secrets::SecretStore::verify_persisted_checkpoints`] auf. Ein noch
+/// nicht existierendes `audit.log`/`checkpoints.log` ist **kein**
+/// Fehlschlag: ein Root-Space, der noch nie einen versiegelten
+/// Geheimnisspeicher benutzt hat, sieht genauso aus
+/// ([`harw_install::doctor::AuditIntegrityEvidence::Absent`]).
+///
+/// Ein ML-DSA-Verifikationsschlüssel ist derzeit nirgends konfigurierbar
+/// (siehe `docs/design/secrets-and-audit.md` §4.2: „distinct from the KEK,
+/// … should be rotatable independently" — noch ohne eigene Provenienz-
+/// Konfiguration): die Signaturprüfung wird deshalb mit `None` ausdrücklich
+/// übersprungen statt stillschweigend als bestanden gemeldet.
+///
+/// # Arguments
+/// - `home` (`&Path`): aufgelöster Root-Space (`~/.harw`).
+///
+/// # Returns
+/// Die klassifizierte Evidenz für [`harw_install::doctor::AuditIntegrityCheck`].
+fn audit_integrity_evidence(home: &Path) -> harw_install::doctor::AuditIntegrityEvidence {
+    use harw_install::doctor::AuditIntegrityEvidence as Evidence;
+    use harw_secrets::AuditError;
+    use harw_secrets::audit::chain::PersistedChainStatus;
+    use harw_secrets::audit::checkpoint::PersistedCheckpointStatus;
+
+    let store = harw_secrets::SecretStore::new(
+        home.join("sealed-secrets"),
+        harw_secrets::CryptoPolicy::strongest(),
+        harw_secrets::KekProvenance::EnvSeed {
+            var: "HARW_DOCTOR_UNUSED_KEK_SEED".to_owned(),
+        },
+        harw_secrets::KeyVersion::initial(),
+    );
+
+    let chain_result = store.verify_persisted_audit_chain();
+    let (chain_event_count, chain_problem): (u64, Option<String>) = match &chain_result {
+        Ok(PersistedChainStatus::Absent) => (0, None),
+        Ok(PersistedChainStatus::Intact { event_count, .. }) => (*event_count, None),
+        Err(AuditError::ChainBroken { index, .. }) => (
+            u64::MAX,
+            Some(format!("Audit-Kette gebrochen bei Ereignis {index}")),
+        ),
+        Err(other) => (u64::MAX, Some(format!("Audit-Kette unlesbar: {other}"))),
+    };
+
+    // Ohne vertrauenswürdige Ereigniszahl (Kette selbst unlesbar/gebrochen)
+    // wird die Reichweitenprüfung bewusst zu einem No-op (`u64::MAX`) statt
+    // gegen eine erfundene `0` zu vergleichen — siehe
+    // `verify_persisted_checkpoints`s Doku.
+    let checkpoint_result = store.verify_persisted_checkpoints(chain_event_count, None);
+    let (checkpoint_count, signatures_checked, checkpoint_problem): (u64, bool, Option<String>) =
+        match &checkpoint_result {
+            Ok(PersistedCheckpointStatus::Absent) => (0, false, None),
+            Ok(PersistedCheckpointStatus::Intact {
+                checkpoint_count,
+                signatures_checked,
+            }) => (*checkpoint_count, *signatures_checked, None),
+            Err(AuditError::ChainBroken { index, .. }) => (
+                0,
+                false,
+                Some(format!("Checkpoint-Kette gebrochen bei Index {index}")),
+            ),
+            Err(AuditError::NonMonotonicCheckpoint { index }) => (
+                0,
+                false,
+                Some(format!(
+                    "Checkpoints nicht monoton aufsteigend bei Index {index}"
+                )),
+            ),
+            Err(AuditError::CheckpointBeyondLog { referenced, actual }) => (
+                0,
+                false,
+                Some(format!(
+                    "Checkpoint referenziert Ereigniszahl {referenced}, Log enthält nur {actual} Ereignisse"
+                )),
+            ),
+            Err(AuditError::InvalidCheckpointSignature { event_count }) => (
+                0,
+                false,
+                Some(format!(
+                    "ungültige Checkpoint-Signatur bei Ereigniszahl {event_count}"
+                )),
+            ),
+            Err(other) => (0, false, Some(format!("Checkpoints unlesbar: {other}"))),
+        };
+
+    let chain_broken = matches!(chain_result, Err(AuditError::ChainBroken { .. }));
+    let checkpoint_broken = matches!(
+        checkpoint_result,
+        Err(AuditError::ChainBroken { .. })
+            | Err(AuditError::NonMonotonicCheckpoint { .. })
+            | Err(AuditError::CheckpointBeyondLog { .. })
+            | Err(AuditError::InvalidCheckpointSignature { .. })
+    );
+
+    // Sicherheitsereignis (tatsächlicher Bruch) geht vor bloßem Lesefehler,
+    // Lesefehler geht vor „nichts da" — nie umgekehrt zusammengefasst.
+    if chain_broken || checkpoint_broken {
+        let reason = [chain_problem, checkpoint_problem]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Evidence::Broken(reason);
+    }
+
+    if chain_problem.is_some() || checkpoint_problem.is_some() {
+        let reason = [chain_problem, checkpoint_problem]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Evidence::Unreadable(reason);
+    }
+
+    if chain_event_count == 0 && checkpoint_count == 0 {
+        return Evidence::Absent;
+    }
+
+    Evidence::Intact {
+        event_count: chain_event_count,
+        checkpoint_count,
+        signatures_checked,
+    }
+}
+
+/// Ermittelt die Evidenz für den KEK-Schlüsseldatei-Berechtigungs-Check.
+///
+/// # Description
+/// Ist kein KEK konfiguriert, oder ist die konfigurierte Provenienz nicht
+/// `key_file` (also `keyring`/`env_seed`), ist diese Prüfung nicht
+/// anwendbar — das ist bewusst kein Fehlschlag: nur die dateibasierte
+/// Provenienz hat eine Dateiberechtigung, die geprüft werden könnte. Sonst
+/// wird der konfigurierte Pfad (mit derselben `~/`-Expansion wie
+/// `crate::secret_store::expand_leading_home`) an
+/// [`harw_secrets::kek::check_key_file_permissions`] übergeben — dieselbe
+/// Prüfung, die den Prozessstart beim Laden des echten KEK-Materials schon
+/// heute erzwingt (siehe dortige Moduldoku).
+///
+/// # Arguments
+/// - `config` (`&ResolvedConfig`): geladene Konfiguration.
+///
+/// # Returns
+/// Die klassifizierte Evidenz für [`harw_install::doctor::KekFilePermsCheck`].
+fn kek_file_perms_evidence(config: &ResolvedConfig) -> harw_install::doctor::KekFilePermsEvidence {
+    use harw_install::doctor::KekFilePermsEvidence as Evidence;
+
+    let Some(kek) = config.auth.kek.as_ref() else {
+        return Evidence::NotApplicable;
+    };
+    if !matches!(&kek.provenance, harw_config::KekProvenance::KeyFile) {
+        return Evidence::NotApplicable;
+    }
+    let Some(raw_path) = kek.key_file_path.as_deref().filter(|path| !path.is_empty()) else {
+        return Evidence::Unsafe {
+            path: "<nicht konfiguriert>".to_owned(),
+            reason: "key_file_path fehlt trotz provenance = key_file".to_owned(),
+        };
+    };
+
+    let path = expand_leading_home_for_kek_check(raw_path);
+    match harw_secrets::kek::check_key_file_permissions(&path) {
+        Ok(()) => Evidence::Ok {
+            path: path.display().to_string(),
+        },
+        Err(error) => Evidence::Unsafe {
+            path: path.display().to_string(),
+            reason: error.to_string(),
+        },
+    }
+}
+
+/// Expandiert ein führendes `~/` im konfigurierten KEK-Schlüsseldateipfad
+/// gegen `$HOME`.
+///
+/// Bildet dieselbe Konvention wie das private
+/// `crate::secret_store::expand_leading_home` eigenständig nach: `harw
+/// doctor` darf laut Aufgabenbereich nur die `doctor`-Funktion und ihre
+/// Helfer in dieser Datei ändern, `crate::secret_store` bleibt unangetastet.
+///
+/// # Arguments
+/// - `path` (`&str`): der konfigurierte, ggf. `~/`-präfigierte Pfad.
+///
+/// # Returns
+/// Den expandierten Pfad, oder `path` unverändert, wenn kein `~/`-Präfix
+/// vorliegt oder `$HOME` nicht gesetzt/leer ist.
+fn expand_leading_home_for_kek_check(path: &str) -> PathBuf {
+    let Some(remainder) = path.strip_prefix("~/") else {
+        return PathBuf::from(path);
+    };
+    match std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+        Some(home) => PathBuf::from(home).join(remainder),
+        None => PathBuf::from(path),
+    }
 }
 
 /// Entscheidet, ob und wie `doctor` den Root-Space für die Laufzeit-Rechte auflöst.
@@ -2468,6 +2806,7 @@ mod tests {
             )),
             auth_header: Some("bearer".to_owned()),
             api_key: None,
+            originator: None,
             headers: std::collections::HashMap::new(),
             models: vec!["model".to_owned()],
             enabled: true,
@@ -2628,7 +2967,7 @@ mod tests {
             .expect_err("ein unbekannter Modus darf nicht still auf chat fallen");
 
         assert!(error.contains("voelliger-unsinn"), "{error}");
-        for mode in ["chat", "plan", "explore", "work"] {
+        for mode in ["chat", "plan", "explore", "work", "shell"] {
             assert!(error.contains(mode), "{error} nennt '{mode}' nicht");
         }
     }
@@ -2982,6 +3321,48 @@ mod tests {
     #[test]
     fn test_cmd_analyze_disabled_plan_surface_names_config_key() {
         let home = tempfile::tempdir().expect("create temporary home");
+        // `[tools.plan].enabled` defaults to `true` (siehe
+        // `harw-config/src/plan_toml.rs::PlanSection::default`), also muss
+        // die Fläche hier explizit abgeschaltet werden — sonst durchläuft
+        // `cmd_analyze` die `is_enabled()`-Prüfung und versucht die Operation
+        // tatsächlich auszuführen, was hier (ohne echten Workspace-Root im
+        // `cwd` des Testprozesses) an einem unrelated Workspace-Graph-Fehler
+        // scheitert statt an der hier geprüften Fehlermeldung.
+        //
+        // `[tools.plan]` muss ins **Profil**-`config.toml` geschrieben werden,
+        // nicht ins Root-`config.toml` von `home`: `cmd_analyze` lädt seine
+        // Konfiguration über `prepare_planning_startup` →
+        // `home::ensure_home` + `harw_runtime::load_config`, und
+        // `discover_config_with_restricted` (`harw-config/src/discovery.rs`)
+        // läuft die vertrauten Layer (Root, dann aktives Profil) in
+        // aufsteigender Präzedenz durch und ersetzt bei jedem Layer mit
+        // eigenem `config.toml` `resolved.harness` **vollständig** durch die
+        // frisch aus diesem Layer geparste `HarnessConfig`
+        // (`resolved.harness = cfg;`). Nur eine explizite Handvoll Felder
+        // (`default_provider`, `default_model`, `active_uia_definition`,
+        // `onboarding`, `internal_models`) wird dabei fortgeschrieben —
+        // `tools.plan` gehört nicht dazu. Das von `home::ensure_home`
+        // gescaffoldete Profil-`config.toml` kennt kein `[tools.plan]`,
+        // deserialisiert es also mit dem Default `enabled = true`, und dieser
+        // Wert überschreibt beim Profil-Layer (dem letzten Layer hier) das
+        // `enabled = false`, das nur im Root-`config.toml` stünde — die
+        // Schwester `test_analyze_assembly_registers_analyze_operation_when_plan_enabled`
+        // schreibt zwar ebenfalls nur ins Root-`config.toml`, besteht aber nur
+        // zufällig, weil `enabled = true` dort mit dem Profil-Default
+        // übereinstimmt. Root-Space zuerst scaffolden (idempotent — der
+        // Aufruf in `prepare_planning_startup` überschreibt danach keine
+        // vorhandene Datei mehr), dann `[tools.plan] enabled = false` in die
+        // Profil-`config.toml` schreiben, die Datei, die `cmd_analyze`
+        // tatsächlich zuletzt liest.
+        harw_home::ensure_home(home.path()).expect("home scaffolds");
+        std::fs::write(
+            home.path()
+                .join("profiles")
+                .join("default")
+                .join("config.toml"),
+            "[tools.plan]\nenabled = false\n",
+        )
+        .expect("write plan-disabled config");
         let args = AnalyzeArgs {
             crate_name: None,
             workspace: false,
@@ -3066,11 +3447,34 @@ mod tests {
             )
             .expect("valid sealed provider config"),
         );
+        // `serve` must actually select this provider for the gate to fire —
+        // the provider-scoped check only looks at `default_provider`.
+        config.harness.default_provider = Some("sealed".to_owned());
 
         let error = require_home_for_sealed_refs(&config, secret_store_home.as_deref())
             .expect_err("external config must not guess a sealed-secret root");
         assert!(error.contains("requires HARW_HOME"), "{error}");
         assert!(error.contains("--config-dir"), "{error}");
+    }
+
+    /// Ein aktivierter `secrets:`-Provider, den `serve` gar nicht auswählt
+    /// (kein `default_provider`), darf den Start nicht blockieren — ein
+    /// fehlkonfigurierter Provider darf unbeteiligte Einträge nicht
+    /// mitreißen.
+    #[test]
+    fn external_serve_config_ignores_unused_sealed_provider_without_home() {
+        let mut config = ResolvedConfig::default();
+        config.providers.insert(
+            "sealed".to_owned(),
+            toml::from_str(
+                "name = \"sealed\"\napi = \"openai-compatible\"\nbase_url = \"https://example.test\"\nauth = \"secrets:provider-token\"\n",
+            )
+            .expect("valid sealed provider config"),
+        );
+        config.harness.default_provider = None;
+
+        require_home_for_sealed_refs(&config, None)
+            .expect("an enabled but unselected sealed provider must not require HARW_HOME");
     }
 
     #[test]
@@ -3093,6 +3497,9 @@ mod tests {
             )
             .expect("valid sealed provider config"),
         );
+        // `serve` must actually select this provider for the gate to fire —
+        // the provider-scoped check only looks at `default_provider`.
+        config.harness.default_provider = Some("sealed".to_owned());
 
         let error = require_home_for_sealed_refs(&config, None)
             .expect_err("external config must not guess a sealed-secret root");
@@ -3133,6 +3540,107 @@ mod tests {
 
         require_home_for_sealed_refs(&config, Some(Path::new("/tmp/harw-sealed-secret-store")))
             .expect("explicit home enables the sealed MCP principal secret store");
+    }
+
+    /// Baut eine Config mit zwei Providern: `"sealed"` referenziert
+    /// `secrets:`, wird aber nicht ausgewählt; `"plain"` referenziert `env:`
+    /// und ist `default_provider`. Für den provider-verengten Serve-Pfad darf
+    /// so ein ungenutzter `sealed`-Provider den Start nicht blockieren.
+    fn serve_config_with_unused_sealed_provider() -> ResolvedConfig {
+        let mut config = ResolvedConfig::default();
+        config.providers.insert(
+            "sealed".to_owned(),
+            toml::from_str(
+                "name = \"sealed\"\napi = \"openai-compatible\"\nbase_url = \"https://example.test\"\nauth = \"secrets:provider-token\"\n",
+            )
+            .expect("valid sealed provider config"),
+        );
+        config.providers.insert(
+            "plain".to_owned(),
+            toml::from_str(
+                "name = \"plain\"\napi = \"openai-compatible\"\nbase_url = \"https://example.test\"\nauth = \"env:PLAIN_TOKEN\"\n",
+            )
+            .expect("valid plain provider config"),
+        );
+        config.harness.default_provider = Some("plain".to_owned());
+        config
+    }
+
+    #[test]
+    fn active_serve_provider_uses_sealed_secret_ignores_an_unselected_sealed_provider() {
+        let config = serve_config_with_unused_sealed_provider();
+        assert!(!active_serve_provider_uses_sealed_secret(&config));
+    }
+
+    #[test]
+    fn active_serve_provider_uses_sealed_secret_true_for_the_selected_provider() {
+        let mut config = serve_config_with_unused_sealed_provider();
+        config.harness.default_provider = Some("sealed".to_owned());
+        assert!(active_serve_provider_uses_sealed_secret(&config));
+    }
+
+    /// Kernverhalten dieses Reports: ein aktivierter, aber von `serve` nicht
+    /// ausgewählter `secrets:`-Provider ohne KEK darf den Start nicht
+    /// blockieren — `open_serve_secret_resolver` muss `Ok(None)` liefern,
+    /// nicht fehlschlagen.
+    #[test]
+    fn open_serve_secret_resolver_ignores_unused_sealed_provider_without_a_kek() {
+        let config = serve_config_with_unused_sealed_provider();
+        let home = tempfile::tempdir().expect("temporary home");
+
+        let resolver = open_serve_secret_resolver(&config, Some(home.path()))
+            .expect("an unused sealed provider must not require a KEK");
+        assert!(resolver.is_none());
+    }
+
+    #[test]
+    fn open_serve_secret_resolver_fails_closed_for_the_selected_sealed_provider() {
+        let mut config = serve_config_with_unused_sealed_provider();
+        config.harness.default_provider = Some("sealed".to_owned());
+        let home = tempfile::tempdir().expect("temporary home");
+
+        let result = open_serve_secret_resolver(&config, Some(home.path()));
+        let Err(error) = result else {
+            panic!("the actually selected sealed provider must still require a KEK");
+        };
+        assert!(error.contains("requires a configured KEK"), "{error}");
+    }
+
+    /// Auch wenn `default_provider` selbst kein `secrets:` referenziert,
+    /// bleibt ein `secrets:`-MCP-Principal fail-closed: jeder konfigurierte
+    /// Principal ist ein Authentifizierungsziel, das `serve` beim Start
+    /// tatsächlich verwendet (`build_authenticator`).
+    #[test]
+    fn open_serve_secret_resolver_fails_closed_for_a_sealed_mcp_principal_with_plain_provider() {
+        let mut config = serve_config_with_unused_sealed_provider();
+        config
+            .harness
+            .mcp_listener
+            .principals
+            .push(harw_config::McpPrincipalToml {
+                id: "sealed-mcp".to_owned(),
+                credential_ref: "secrets:mcp-token".parse().expect("valid secret ref"),
+                tenant: "mia".to_owned(),
+                workspace: "harwness".to_owned(),
+                job_capabilities: Vec::new(),
+            });
+        let home = tempfile::tempdir().expect("temporary home");
+
+        let result = open_serve_secret_resolver(&config, Some(home.path()));
+        let Err(error) = result else {
+            panic!("a configured sealed MCP principal must still require a KEK");
+        };
+        assert!(error.contains("requires a configured KEK"), "{error}");
+    }
+
+    #[test]
+    fn open_serve_secret_resolver_returns_none_without_home_even_for_a_selected_sealed_provider() {
+        let mut config = serve_config_with_unused_sealed_provider();
+        config.harness.default_provider = Some("sealed".to_owned());
+
+        let resolver = open_serve_secret_resolver(&config, None)
+            .expect("without --home there is nowhere to open the sealed store");
+        assert!(resolver.is_none());
     }
 
     #[test]
@@ -3551,5 +4059,178 @@ mod tests {
         assert!(manifest.contains("jemalloc = [\"dep:tikv-jemallocator\"]"));
         // Opt-in: the default feature set must not pull jemalloc in.
         assert!(manifest.contains("default = []"));
+    }
+
+    fn unique_doctor_temp_dir(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "harw-cli-doctor-{label}-{}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn expand_leading_home_for_kek_check_leaves_paths_without_a_tilde_unchanged() {
+        assert_eq!(
+            expand_leading_home_for_kek_check("/etc/harw/kek.seed"),
+            PathBuf::from("/etc/harw/kek.seed")
+        );
+    }
+
+    #[test]
+    fn expand_leading_home_for_kek_check_expands_a_leading_tilde_against_home() {
+        let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+            // No $HOME in this environment: nothing to expand against, skip
+            // rather than assert on an environment this test does not control.
+            return;
+        };
+        let expected = PathBuf::from(home).join(".harw/kek.seed");
+        assert_eq!(
+            expand_leading_home_for_kek_check("~/.harw/kek.seed"),
+            expected
+        );
+    }
+
+    #[test]
+    fn audit_integrity_evidence_reports_absent_for_a_fresh_home() {
+        let home = unique_doctor_temp_dir("audit-absent");
+        std::fs::create_dir_all(&home).expect("create fresh temp home");
+
+        assert!(matches!(
+            audit_integrity_evidence(&home),
+            harw_install::doctor::AuditIntegrityEvidence::Absent
+        ));
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn kek_file_perms_evidence_not_applicable_without_a_configured_kek() {
+        let config = ResolvedConfig::default();
+        assert!(matches!(
+            kek_file_perms_evidence(&config),
+            harw_install::doctor::KekFilePermsEvidence::NotApplicable
+        ));
+    }
+
+    #[test]
+    fn kek_file_perms_evidence_not_applicable_for_non_key_file_provenance() {
+        let config = ResolvedConfig {
+            auth: harw_config::AuthConfig {
+                kek: Some(harw_config::KekConfig {
+                    provenance: harw_config::KekProvenance::EnvSeed,
+                    key_file_path: None,
+                    keyring_entry: None,
+                    env_seed_var: Some("HARW_TEST_SEED".to_owned()),
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            kek_file_perms_evidence(&config),
+            harw_install::doctor::KekFilePermsEvidence::NotApplicable
+        ));
+    }
+
+    #[test]
+    fn kek_file_perms_evidence_is_unsafe_when_key_file_path_is_missing() {
+        let config = ResolvedConfig {
+            auth: harw_config::AuthConfig {
+                kek: Some(harw_config::KekConfig {
+                    provenance: harw_config::KekProvenance::KeyFile,
+                    key_file_path: None,
+                    keyring_entry: None,
+                    env_seed_var: None,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            kek_file_perms_evidence(&config),
+            harw_install::doctor::KekFilePermsEvidence::Unsafe { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kek_file_perms_evidence_ok_for_a_0600_key_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = unique_doctor_temp_dir("kek-ok");
+        std::fs::write(&path, [0u8; 32]).expect("write test key file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("set 0600 permissions");
+
+        let config = ResolvedConfig {
+            auth: harw_config::AuthConfig {
+                kek: Some(harw_config::KekConfig {
+                    provenance: harw_config::KekProvenance::KeyFile,
+                    key_file_path: Some(path.display().to_string()),
+                    keyring_entry: None,
+                    env_seed_var: None,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            kek_file_perms_evidence(&config),
+            harw_install::doctor::KekFilePermsEvidence::Ok { .. }
+        ));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kek_file_perms_evidence_unsafe_for_a_group_readable_key_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = unique_doctor_temp_dir("kek-unsafe");
+        std::fs::write(&path, [0u8; 32]).expect("write test key file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))
+            .expect("set unsafe permissions");
+
+        let config = ResolvedConfig {
+            auth: harw_config::AuthConfig {
+                kek: Some(harw_config::KekConfig {
+                    provenance: harw_config::KekProvenance::KeyFile,
+                    key_file_path: Some(path.display().to_string()),
+                    keyring_entry: None,
+                    env_seed_var: None,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            kek_file_perms_evidence(&config),
+            harw_install::doctor::KekFilePermsEvidence::Unsafe { .. }
+        ));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn run_doctor_checks_returns_false_when_nothing_fails() {
+        let home = unique_doctor_temp_dir("run-checks-ok");
+        std::fs::create_dir_all(&home).expect("create fresh temp home");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))
+                .expect("set 0700 home permissions");
+        }
+        let config = ResolvedConfig::default();
+
+        assert!(!run_doctor_checks(&home, &config));
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

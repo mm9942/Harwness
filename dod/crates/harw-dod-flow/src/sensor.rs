@@ -63,7 +63,7 @@
 //! Diese Crate lädt kein Programm selbst: der Aufrufer ruft
 //! `loader.load(&spec)` auf (`spec` z. B. aus [`crate::flow_program_spec`])
 //! und übergibt Lader, den entstandenen `harw_dod_bpf::BpfHandle` sowie den
-//! für diesen Host autorisierten `harw_sandbox::NetworkScope` an
+//! für diesen Host autorisierten `harw_authority::NetworkScope` an
 //! [`FlowSensor::new`]. Konstruktion bleibt dadurch unfehlbar (kein `Result`
 //! nötig).
 //!
@@ -82,7 +82,7 @@
 //! `FlowSensor: Send + Sync + Debug` (Anforderung von
 //! `harw_dod_signals::Sensor`): `SensorHandle<Bound>`,
 //! `Box<dyn harw_dod_bpf::BpfLoader>`, `harw_dod_bpf::BpfHandle`,
-//! `harw_sandbox::NetworkScope` und `std::time::Duration` sind alle
+//! `harw_authority::NetworkScope` und `std::time::Duration` sind alle
 //! `Send + Sync`. [`FlowSensor::poll`] nimmt `&self` und führt keine innere
 //! Veränderlichkeit — konkurrierende Polls auf demselben Sensor sind sicher.
 //!
@@ -103,7 +103,7 @@
 //! use harw_dod_flow::FlowSensor;
 //! use harw_dod_flow::flow_program_spec;
 //! use harw_dod_signals::Sensor;
-//! use harw_sandbox::NetworkScope;
+//! use harw_authority::NetworkScope;
 //! use harw_types::SensorId;
 //! use std::borrow::Cow;
 //!
@@ -127,7 +127,7 @@ use std::time::Duration;
 use harw_dod_bpf::{BpfError, BpfHandle, BpfLoader};
 use harw_dod_cap::{Bound, SensorError, SensorHandle};
 use harw_dod_signals::{Sensor, SensorReading};
-use harw_sandbox::NetworkScope;
+use harw_authority::NetworkScope;
 use jiff::Timestamp;
 
 use crate::error::FlowError;
@@ -148,7 +148,7 @@ pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_millis(200);
 /// # Description
 /// Hält einen gebundenen Griff, einen Lader, einen bereits geladenen
 /// [`harw_dod_bpf::BpfHandle`] und den für diesen Host autorisierten
-/// [`harw_sandbox::NetworkScope`] als unabhängige, bei der Konstruktion
+/// [`harw_authority::NetworkScope`] als unabhängige, bei der Konstruktion
 /// übergebene Werte. Siehe Moduldoku für die Fähigkeits-Invarianz zwischen
 /// Griff und Lader, für die `observe()`-Beziehung und für die
 /// `sensor_suite!`-Ausnahme.
@@ -172,7 +172,7 @@ impl FlowSensor {
     /// - `bpf_handle` (`harw_dod_bpf::BpfHandle`): der Griff eines bereits
     ///   erfolgreich geladenen Programms (aus einem vorherigen
     ///   `loader.load(&spec)`-Aufruf, z. B. mit [`crate::flow_program_spec`]).
-    /// - `scope` (`harw_sandbox::NetworkScope`): der für diesen Host
+    /// - `scope` (`harw_authority::NetworkScope`): der für diesen Host
     ///   autorisierte Zielbereich, an [`crate::report::observe`]
     ///   durchgereicht.
     ///
@@ -204,7 +204,7 @@ impl FlowSensor {
     /// - `loader` (`Box<dyn harw_dod_bpf::BpfLoader>`): die Ladeschicht.
     /// - `bpf_handle` (`harw_dod_bpf::BpfHandle`): der Griff des geladenen
     ///   Programms.
-    /// - `scope` (`harw_sandbox::NetworkScope`): der autorisierte
+    /// - `scope` (`harw_authority::NetworkScope`): der autorisierte
     ///   Zielbereich.
     /// - `timeout` (`std::time::Duration`): wie lange
     ///   [`harw_dod_bpf::BpfLoader::read_events`] bei jedem Poll auf
@@ -356,7 +356,7 @@ mod tests {
     use harw_dod_bpf::{BpfError, BpfLoader, BpfProgramKind, BpfProgramSource, BpfProgramSpec};
     use harw_dod_cap::{Bound, Capability, ReadScope, SensorHandle, SensorError};
     use harw_dod_signals::{EventKind, Sensor};
-    use harw_sandbox::{EgressTarget, NetworkScope};
+    use harw_authority::{EgressTarget, NetworkScope};
     use harw_types::SensorId;
     use jiff::Timestamp;
     use std::borrow::Cow;

@@ -1,5 +1,14 @@
 //! eBPF-Ladeschicht hinter einem Trait — Knoten **AW7-01a**.
 //!
+//! > **V1-Betriebsvertrag.** Die historischen Erläuterungen zu
+//! > `BpfProgramSpec`/`RawBpfEvent` weiter unten bleiben ausschließlich für
+//! > Fixture-Kompatibilität erhalten. Ein echter Lader akzeptiert nur
+//! > [`BpfObjectContract`] über [`real::RealBpfLoader::load_contract`] oder
+//! > `load_contracts`: versionierte C-ELFs, die vier festen Maps, ein vor dem
+//! > Attach gefülltes [`BpfScope`] und die v1-Wire-Ereignisse. Insbesondere
+//! > ist `sock:inet_sock_set_state` kein Produktionshook mehr; TCP-Connect
+//! > hängt per FEntry an `tcp_v4_connect` bzw. `tcp_v6_connect`.
+//!
 //! # Zweck
 //! Diese Crate ist die Fassade zwischen dem Kernel und den drei
 //! Sensor-Crates, die eBPF-Programme brauchen: `harw-dod-procmon`
@@ -132,21 +141,35 @@
 //! assert!(events.is_empty());
 //! ```
 
+pub mod abi;
+pub mod contract;
 pub mod error;
 pub mod event;
 pub mod fixture;
 pub mod handle;
 pub mod loader;
 pub mod real;
+pub mod profile;
 pub mod spec;
+pub mod time;
 
 pub use error::BpfError;
+pub use abi::{parse_wire_event, TaskIdentity, WireEvent, WireEventType, WIRE_HEADER_LEN_V1, WIRE_VERSION_V1};
+pub use contract::{
+    BpfObjectContract, EVENTS_MAP_NAME, EXEC_ATTACH_POINT, EXEC_PROGRAM_NAME,
+    EXIT_ATTACH_POINT, EXIT_PROGRAM_NAME, LOSS_COUNTS_MAP_NAME,
+    REQUIRED_MAP_NAMES, SEQUENCE_MAP_NAME, SCOPE_MAP_NAME,
+    TCP_V4_CONNECT_ATTACH_POINT, TCP_V4_CONNECT_PROGRAM_NAME,
+    TCP_V6_CONNECT_ATTACH_POINT, TCP_V6_CONNECT_PROGRAM_NAME,
+};
 pub use event::RawBpfEvent;
 pub use fixture::FixtureBpfLoader;
 pub use handle::BpfHandle;
 pub use loader::BpfLoader;
-pub use real::RealBpfLoader;
+pub use real::{BpfLossCounters, RealBpfLoader, TimedWireEvent};
+pub use profile::{BpfScope, ResolvedCgroup, MAX_SCOPE_CGROUP_IDS};
 pub use spec::{BpfProgramKind, BpfProgramSource, BpfProgramSpec};
+pub use time::{KernelTimeMapper, TimeConfidence};
 
 /// Die Fähigkeit, die ein echter (Nicht-Fixture-)Lader zum Laden braucht.
 ///

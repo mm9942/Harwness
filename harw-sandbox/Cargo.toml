@@ -7,12 +7,18 @@ rust-version.workspace = true
 [dependencies]
 # Drop-Guard `SandboxChild` (W5 N-SBX) protokolliert Kill/Wait-Fehler.
 tracing = { workspace = true }
-harw-types = { path = "../harw-types" }
-ipnet = { workspace = true }
-serde = { version = "1", features = ["derive"] }
+harw-authority = { path = "../harw-authority" }
 # W0B-04: WHATWG-URL-Parsing für `egress::EgressUrl` — derselbe Parser wie
 # in reqwest, damit geprüfter und verbundener Host nie auseinanderlaufen.
 url = "2.5.8"
+
+[dev-dependencies]
+# Testfixtures bauen `WorkspaceRegistration`/`WorkspaceRegistry` (aus
+# harw-authority) direkt und brauchen dafür `TenantId`/`WorkspaceId`.
+# harw-authority re-exportiert diese Typen bewusst nicht (siehe
+# `harw-sandbox/src/lib.rs`-Doku: keine Authority-Typen im Root), und
+# harw-sandbox selbst hat sonst keinen Bezug zu harw-types.
+harw-types = { path = "../harw-types" }
 
 [lints]
 workspace = true

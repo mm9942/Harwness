@@ -5,14 +5,21 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+harw-authority = { path = "../harw-authority" }
 harw-channel = { path = "../harw-channel" }
+harw-session-store = { path = "../harw-session-store" }
 harw-types = { path = "../harw-types" }
 harw-sandbox = { path = "../harw-sandbox" }
 jiff = { workspace = true }
 rand = "0.10.2"
-
-[dev-dependencies]
-tempfile = "3.27.0"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tracing = { workspace = true }
+# Pinned to the exact version already resolved elsewhere in this workspace
+# (harw-secrets/Cargo.toml) so this addition needs no new dependency
+# resolution; `cargo add sha2` is unavailable in this task's tool sandbox.
+sha2 = "0.10.9"
 
 [lints]
 workspace = true

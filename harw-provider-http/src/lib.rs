@@ -19,6 +19,21 @@
 //! (W4a / A-OAI: `Transient`/`Auth`/`QuotaExceeded`/`ContextLength`/`Timeout`,
 //! siehe `error::model_error_for_status`).
 //!
+//! ## Credential-Pool (`[[credential_pool.<provider>]]`)
+//! `provider.auth` (die einzelne `SecretRef`) — bei Anthropic zusätzlich die
+//! implizite Umgebungs-Auflösung, wenn `provider.auth` fehlt — ist **immer**
+//! das zuerst versuchte Credential. Ein nicht-leerer `auth.credential_pool`
+//! (mehrere `CredentialEntry`, z. B. mehrere `openai`-Keys mit getrennten
+//! Kontingenten) liefert nur **Failover-Kandidaten**, die erst nach einem
+//! Auth-/Kontingent-Fehler des primären Credentials probiert werden, dann
+//! aufsteigend nach `CredentialEntry::priority`, stabil nach Datei-Reihenfolge
+//! (siehe [`harw_config::AuthConfig::credential_pool_ordered`]). Fehlt
+//! `provider.auth`, wird stattdessen der erste Pool-Eintrag primär. Ist der
+//! Pool leer oder für den Provider nicht konfiguriert, ändert sich nichts.
+//! Schlägt der aktive Eintrag mit 401/403 oder Kontingent-Erschöpfung fehl,
+//! wird er bounded (60 s) abgekühlt und derselbe Request **genau einmal**
+//! mit dem nächsten Eintrag wiederholt (siehe `credential_pool`-Modul).
+//!
 //! ## Wire-Vertrag (W4a / A-OAI)
 //! - **Tool-Ergebnisse** gehen ausschließlich über
 //!   [`harw_core::envelope::render_tool_result`] auf den Wire (Trust-Hülle,
@@ -97,6 +112,7 @@ pub use retry::{
 pub use routing::RoutingModelProvider;
 
 mod codex;
+mod credential_pool;
 
 /// Synchronously resolves a `secrets:` credential reference.
 ///
@@ -383,8 +399,75 @@ fn build_named_provider(
     };
 
     if provider.api == "anthropic-messages" {
-        let (base_url, credential) =
-            resolve_anthropic(provider_name, provider, sources, &env_nonempty)?;
+        // Credential-Pool liefert nur Failover-Kandidaten hinter dem
+        // primären Credential (siehe Modul-Doku „Credential-Pool" und
+        // `credential_pool`-Moduldoku). Jeder Pool-Eintrag wird nach
+        // demselben Schema klassifiziert wie eine explizite `provider.auth`-
+        // `SecretRef`: `auth_header == "bearer"` → OAuth-Bearer, sonst
+        // Präfix-Erkennung über [`classify_anthropic_secret`].
+        let auth_header_is_bearer = provider.auth_header.as_deref() == Some("bearer");
+        let pool: Option<credential_pool::CredentialPool<AnthropicCredential>> =
+            credential_pool::CredentialPool::from_auth_config(
+                &config.auth,
+                provider_name,
+                sources,
+                |secret| {
+                    Ok(if auth_header_is_bearer {
+                        AnthropicCredential::Bearer(secret)
+                    } else {
+                        classify_anthropic_secret(secret.expose_secret().to_owned())
+                    })
+                },
+            )?;
+        if let Some(pool) = &pool {
+            for index in 0..pool.len() {
+                if let Some(url) = &pool.entry(index).base_url {
+                    validate_endpoint(url)?;
+                }
+            }
+        }
+        // `resolve_anthropic` ist der primäre Weg (explizite `provider.auth`
+        // oder implizite Umgebungs-Auflösung) und wird immer zuerst
+        // versucht. Gelingt er und ist ein Pool konfiguriert, wird das
+        // Ergebnis als Index 0 vor die Pool-Einträge gestellt
+        // (`prepend_primary`); scheitert er (kein `provider.auth`, keine
+        // passende implizite Auflösung), übernimmt stattdessen der erste
+        // Pool-Eintrag als primäres Credential — fehlt auch der, wird der
+        // Fehler von `resolve_anthropic` durchgereicht.
+        let primary = resolve_anthropic(provider_name, provider, sources, &env_nonempty);
+        let (base_url, credential, pool) = match (primary, pool) {
+            (Ok((base_url, credential)), Some(pool)) => {
+                let pool = pool.prepend_primary(credential, format!("{provider_name}#primary"));
+                tracing::debug!(
+                    provider = provider_name,
+                    failover_entries = pool.len() - 1,
+                    "credential_pool.configured_as_failover"
+                );
+                let index = pool.select(None).unwrap_or(0);
+                let entry = pool.entry(index);
+                let selected_base_url = entry.base_url.clone().unwrap_or(base_url);
+                (selected_base_url, entry.value.clone(), Some(pool))
+            }
+            (Ok((base_url, credential)), None) => (base_url, credential, None),
+            (Err(_), Some(pool)) => {
+                tracing::debug!(
+                    provider = provider_name,
+                    "credential_pool.primary_absent_first_pool_entry_promoted"
+                );
+                let index = pool.select(None).unwrap_or(0);
+                let entry = pool.entry(index);
+                let base_url = entry.base_url.clone().unwrap_or_else(|| {
+                    if provider.base_url.trim().is_empty() {
+                        DEFAULT_ANTHROPIC_BASE_URL.to_owned()
+                    } else {
+                        provider.base_url.clone()
+                    }
+                });
+                let credential = entry.value.clone();
+                (base_url, credential, Some(pool))
+            }
+            (Err(error), None) => return Err(error),
+        };
         let mut backend =
             AnthropicMessagesProvider::from_base(&base_url, model.to_owned(), credential);
         backend.configure(
@@ -392,6 +475,7 @@ fn build_named_provider(
             configured_headers(provider_name, &provider.headers, sources)?,
         );
         backend.configure_rate_limit(provider.rate_limit.clone());
+        backend.configure_credential_pool(pool);
         return Ok(Box::new(RetryingProvider::new(
             backend,
             network_retry_policy(),
@@ -701,6 +785,11 @@ pub struct OpenAiResponsesProvider {
     /// gleichzeitigen Chat-Turn-Requests (etwa durch Tool-Use-Fanout einer
     /// einzigen User-Runde) ins Stocken geraten.
     concurrency_limiter: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    /// `auth.credential_pool[provider_id]`, falls nicht-leer konfiguriert
+    /// (siehe Modul-Doku „Credential-Pool" und [`credential_pool`]).
+    /// `None` heißt: dieser Provider nutzt ausschließlich `api_key`/`base_url`
+    /// oben (unverändertes Verhalten ohne Pool).
+    credential_pool: Option<std::sync::Arc<credential_pool::CredentialPool<SecretString>>>,
 }
 
 /// Eine gemerkte Reasoning-Runde der Responses-API (W4a / A-OAI).
@@ -827,6 +916,7 @@ impl OpenAiResponsesProvider {
             cache_overrides: std::collections::HashMap::new(),
             rate_limiter: std::sync::Arc::new(rate_limiter::ProviderRateLimiter::new(None)),
             concurrency_limiter: None,
+            credential_pool: None,
         }
     }
 
@@ -895,7 +985,11 @@ impl OpenAiResponsesProvider {
     /// (siehe [`harw_config::ProviderToml::max_concurrency`]) wird, falls
     /// `Some(n)`, in [`Self::concurrency_limiter`] als frischen
     /// `Arc<Semaphore>` mit `n` Permits übersetzt; `None` lässt das Feld
-    /// unverändert `None` (unbegrenzt).
+    /// unverändert `None` (unbegrenzt). `provider.auth` bleibt immer das
+    /// primäre Credential; ist `config.auth.credential_pool` für
+    /// `provider_name` nicht-leer, liefert er nur Failover-Kandidaten
+    /// dahinter (siehe Modul-Doku „Credential-Pool"); Codex-Routen bleiben
+    /// davon unberührt.
     fn from_named_config(
         provider_name: &str,
         provider: &harw_config::ProviderToml,
@@ -929,14 +1023,67 @@ impl OpenAiResponsesProvider {
                 "bearer"
             }
         });
-        let api_key = if let Some(reference) = &provider.auth {
-            resolve_secret(reference, sources)?
+        // Primäres Credential: `provider.auth`, sonst bei `auth_header ==
+        // "none"` ein leeres Secret (kein Credential nötig, z. B. Ollama).
+        // Ein konfigurierter Credential-Pool ersetzt dies NICHT mehr — er
+        // liefert nur Failover-Kandidaten hinter dem primären Credential
+        // (siehe Modul-Doku „Credential-Pool"); fehlt das primäre
+        // Credential, übernimmt stattdessen der erste Pool-Eintrag diese
+        // Rolle. Codex-Routen haben ihre eigene OAuth-Auflösung
+        // (`route.headers()`) und nehmen nie am Pool teil.
+        let primary: Option<SecretString> = if let Some(reference) = &provider.auth {
+            Some(resolve_secret(reference, sources)?)
         } else if auth_header == "none" {
-            SecretString::new(String::new().into())
+            Some(SecretString::new(String::new().into()))
         } else {
-            return Err(HttpProviderError::MissingDefault {
-                what: format!("auth for provider '{provider_name}'"),
-            });
+            None
+        };
+        let pool: Option<credential_pool::CredentialPool<SecretString>> =
+            if codex_route.is_none() {
+                let pool = credential_pool::CredentialPool::from_auth_config(
+                    &config.auth,
+                    provider_name,
+                    sources,
+                    |secret| Ok(secret),
+                )?;
+                if let Some(pool) = &pool {
+                    for index in 0..pool.len() {
+                        if let Some(url) = &pool.entry(index).base_url {
+                            validate_endpoint(url)?;
+                        }
+                    }
+                }
+                pool
+            } else {
+                None
+            };
+        let (api_key, pool) = match (pool, primary) {
+            (Some(pool), Some(primary_value)) => {
+                let pool = pool.prepend_primary(primary_value, format!("{provider_name}#primary"));
+                tracing::debug!(
+                    provider = provider_name,
+                    failover_entries = pool.len() - 1,
+                    "credential_pool.configured_as_failover"
+                );
+                let index = pool.select(None).unwrap_or(0);
+                let api_key = pool.entry(index).value.clone();
+                (api_key, Some(pool))
+            }
+            (Some(pool), None) => {
+                tracing::debug!(
+                    provider = provider_name,
+                    "credential_pool.primary_absent_first_pool_entry_promoted"
+                );
+                let index = pool.select(None).unwrap_or(0);
+                let api_key = pool.entry(index).value.clone();
+                (api_key, Some(pool))
+            }
+            (None, Some(primary_value)) => (primary_value, None),
+            (None, None) => {
+                return Err(HttpProviderError::MissingDefault {
+                    what: format!("auth for provider '{provider_name}'"),
+                });
+            }
         };
         let mut http_provider = Self::with_transport(
             base_url.trim_end_matches('/').to_owned(),
@@ -946,6 +1093,7 @@ impl OpenAiResponsesProvider {
         );
         http_provider.auth_header = auth_header.to_owned();
         http_provider.codex_route = codex_route;
+        http_provider.credential_pool = pool.map(std::sync::Arc::new);
         if !matches!(
             provider.api.as_str(),
             "openai-chat" | "openai-responses" | "ollama"
@@ -2364,7 +2512,16 @@ impl OpenAiResponsesProvider {
     /// Alle Credential-Header sind sensitiv markiert: `bearer_auth` tut das in
     /// reqwest selbst (`header_sensitive(.., true)`), `api-key`/`x-api-key`
     /// über [`sensitive_header_value`].
-    async fn authorized_request(&self, url: &str) -> Result<reqwest::RequestBuilder, ModelError> {
+    ///
+    /// `api_key` kommt vom Aufrufer (siehe [`Self::credential_for`]) statt
+    /// immer `self.api_key` zu lesen, damit ein aktiver
+    /// `credential_pool`-Eintrag denselben Header-Aufbau ohne Duplikation
+    /// nutzen kann.
+    async fn authorized_request(
+        &self,
+        url: &str,
+        api_key: &SecretString,
+    ) -> Result<reqwest::RequestBuilder, ModelError> {
         let builder = self.client.post(url).headers(self.headers.clone());
         if let Some(route) = &self.codex_route {
             return Ok(builder.headers(route.headers(&self.client).await?));
@@ -2373,10 +2530,173 @@ impl OpenAiResponsesProvider {
             "none" => builder,
             "api-key" | "x-api-key" => builder.header(
                 self.auth_header.as_str(),
-                sensitive_header_value(self.api_key.expose_secret())?,
+                sensitive_header_value(api_key.expose_secret())?,
             ),
-            _ => builder.bearer_auth(self.api_key.expose_secret()),
+            _ => builder.bearer_auth(api_key.expose_secret()),
         })
+    }
+
+    /// Liefert API-Key + Basis-URL für einen Versuch.
+    ///
+    /// # Description
+    /// `credential_idx` wählt (falls `Some` und [`Self::credential_pool`]
+    /// gesetzt) einen konkreten Pool-Eintrag; dessen `base_url`-Override
+    /// gewinnt, wenn gesetzt, sonst bleibt `self.base_url` die Basis. Ohne
+    /// Pool oder mit `credential_idx: None` liefert dies unverändert
+    /// `self.api_key`/`self.base_url` — das bisherige Verhalten ohne
+    /// Credential-Pool.
+    fn credential_for(&self, credential_idx: Option<usize>) -> (&SecretString, &str) {
+        match (credential_idx, &self.credential_pool) {
+            (Some(index), Some(pool)) => {
+                let entry = pool.entry(index);
+                (
+                    &entry.value,
+                    entry.base_url.as_deref().unwrap_or(self.base_url.as_str()),
+                )
+            }
+            _ => (&self.api_key, self.base_url.as_str()),
+        }
+    }
+
+    /// Sendet **einen** Versuch mit dem durch `credential_idx` gewählten
+    /// Credential. Der eigentliche Körper von [`ModelProvider::respond`] vor
+    /// Einführung des Credential-Pools — unverändert bis auf die
+    /// Credential-/Basis-URL-Auswahl über [`Self::credential_for`], damit
+    /// [`ModelProvider::respond`] denselben Versuch mit einem anderen
+    /// Pool-Eintrag wiederholen kann, ohne Wire-Aufbau, Gates oder
+    /// Antwort-Interpretation zu duplizieren.
+    ///
+    /// # Errors
+    /// Siehe [`ModelProvider::respond`].
+    async fn respond_once(
+        &self,
+        request: ModelRequest,
+        credential_idx: Option<usize>,
+    ) -> Result<ModelResponse, ModelError> {
+        let (api_key, base_url) = self.credential_for(credential_idx);
+        let model = self.selected_model(&request)?;
+        let (url, mut wire) = match self.transport {
+            Transport::Responses => {
+                let replay = self
+                    .reasoning_replay
+                    .for_request(&self.provider_id, model, &request);
+                tracing::debug!(
+                    model,
+                    replayed_reasoning_rounds = replay.len(),
+                    "sending responses request"
+                );
+                (
+                    format!("{base_url}/responses"),
+                    build_responses_body(model, &request, &replay)?,
+                )
+            }
+            Transport::Chat => {
+                let strategy = cache_strategy::resolve_cache_strategy(
+                    &self.provider_id,
+                    model,
+                    self.cache_overrides.get(model).copied(),
+                );
+                let mut body = build_chat_body(&request, model);
+                cache_strategy::apply_chat_cache_control(&mut body, strategy);
+                tracing::debug!(model, strategy = strategy.label(), "sending chat request");
+                (format!("{base_url}/chat/completions"), body)
+            }
+        };
+
+        if self.codex_route.is_some() {
+            codex::prepare_body(&mut wire);
+        }
+
+        // Hartes Nebenläufigkeits-Limit (siehe [`Self::concurrency_limiter`]):
+        // blockiert, bis ein Slot frei wird, statt fehlzuschlagen. Der
+        // Guard bleibt bis zum Ende dieses async-Blocks (also bis der
+        // Response-Body vollständig gelesen/geparst ist) im Scope, damit
+        // die Grenze wirklich in Flug befindliche Requests zählt, nicht
+        // nur abgesetzte.
+        let _concurrency_permit = match &self.concurrency_limiter {
+            Some(semaphore) => Some(
+                std::sync::Arc::clone(semaphore)
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| {
+                        ModelError::RequestFailed(
+                            "internal error: provider concurrency semaphore was closed"
+                                .to_owned(),
+                        )
+                    })?,
+            ),
+            None => None,
+        };
+        self.rate_limiter.wait_for_slot().await;
+        // Codex-Route: bei einem tatsächlichen 401 genau einmal
+        // reaktiv erneuern und den Request genau einmal wiederholen —
+        // kein zweiter Refresh-Versuch nach erneutem 401 (siehe
+        // `codex::CodexRoute::refresh`).
+        let mut codex_refreshed_after_401 = false;
+        let response = loop {
+            let builder = self.authorized_request(&url, api_key).await?;
+            let response = builder
+                .json(&wire)
+                .timeout(self.request_timeout)
+                .send()
+                .await
+                .map_err(|error| model_error_for_transport(error, false))?;
+
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED
+                && !codex_refreshed_after_401
+                && let Some(route) = &self.codex_route
+            {
+                codex_refreshed_after_401 = true;
+                if route.refresh(&self.client).await.is_ok() {
+                    continue;
+                }
+            }
+            break response;
+        };
+
+        self.rate_limiter.observe_headers(response.headers());
+        let status = response.status();
+        let retry_after = header_string(response.headers(), "retry-after");
+        let retry_after_ms = header_string(response.headers(), "retry-after-ms");
+        let request_id = provider_request_id(response.headers());
+        let value: Value = if status.is_success() && self.codex_route.is_some() {
+            codex::read_response(response).await?
+        } else {
+            let body = response
+                .text()
+                .await
+                .map_err(|error| model_error_for_transport(error, true))?;
+
+            if !status.is_success() {
+                let hint =
+                    retry_after_hint(retry_after.as_deref(), retry_after_ms.as_deref(), &body);
+                let error =
+                    model_error_for_status(status.as_u16(), request_id.as_deref(), hint, &body);
+                tracing::debug!(
+                    status = status.as_u16(),
+                    retryable = error.is_retryable(),
+                    "provider returned an error status"
+                );
+                return Err(error);
+            }
+
+            serde_json::from_str(&body)?
+        };
+        let mut response = match self.transport {
+            Transport::Responses => {
+                let (response, replay) = interpret_responses(&value, &self.provider_id, model)?;
+                if let Some(entry) = replay {
+                    self.reasoning_replay.remember(entry);
+                }
+                response
+            }
+            Transport::Chat => interpret_chat(&value)?,
+        };
+        let names = tool_names::ToolNameCodec::for_request(&request);
+        for call in &mut response.tool_calls {
+            call.name = ToolName::new(names.decode(call.name.as_str()));
+        }
+        Ok(response)
     }
 }
 
@@ -2384,20 +2704,16 @@ impl ModelProvider for OpenAiResponsesProvider {
     /// Sendet einen Modell-Request an diesen Provider und liefert die Antwort.
     ///
     /// # Description
-    /// Baut den Wire-Body für den konfigurierten [`Transport`] (Responses
-    /// oder Chat), durchläuft dann zwei unabhängige, in dieser Reihenfolge
-    /// wirkende Gates, bevor der eigentliche HTTP-Request abgesetzt wird:
-    /// 1. `concurrency_limiter` (falls konfiguriert) — hartes,
-    ///    client-seitiges Limit gleichzeitig in Flug befindlicher Requests;
-    ///    blockiert, bis ein Slot frei wird. Der erworbene Permit bleibt bis
-    ///    zum Ende dieses Aufrufs (nach vollständigem Lesen der Antwort) im
-    ///    Scope.
-    /// 2. `rate_limiter` (siehe [`rate_limiter::ProviderRateLimiter`]) —
-    ///    reaktives Pacing anhand zuvor beobachteter
-    ///    Provider-Rate-Limit-Header, wartet ggf. vor dem nächsten Request.
-    ///
-    /// Erst danach wird der HTTP-Request tatsächlich gesendet (inkl.
-    /// Codex-401-Refresh-Retry, siehe Kommentare im Körper).
+    /// Delegiert den eigentlichen Versuch an [`Self::respond_once`]. Ist
+    /// [`Self::credential_pool`] gesetzt (siehe Modul-Doku
+    /// „Credential-Pool"), wird zuerst dessen bevorzugter, nicht
+    /// abkühlender Eintrag gewählt. Schlägt dieser Versuch mit
+    /// [`credential_pool::should_failover`] fehl (401/403 oder
+    /// Kontingent-Erschöpfung) **und** hat der Pool mehr als einen Eintrag,
+    /// wird der verwendete Eintrag für [`credential_pool::DEFAULT_COOLDOWN`]
+    /// abgekühlt und derselbe Request **genau einmal** mit dem nächsten
+    /// nicht abkühlenden Eintrag wiederholt — nie öfter. Ohne Pool bleibt
+    /// das Verhalten unverändert: ein einziger Versuch mit `self.api_key`.
     ///
     /// # Errors
     /// - [`ModelError::RequestFailed`]: das Nebenläufigkeits-Semaphore wurde
@@ -2414,129 +2730,39 @@ impl ModelProvider for OpenAiResponsesProvider {
     /// exklusiven Lock auf `self`.
     fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
         Box::pin(async move {
-            let model = self.selected_model(&request)?;
-            let (url, mut wire) = match self.transport {
-                Transport::Responses => {
-                    let replay =
-                        self.reasoning_replay
-                            .for_request(&self.provider_id, model, &request);
-                    tracing::debug!(
-                        model,
-                        replayed_reasoning_rounds = replay.len(),
-                        "sending responses request"
-                    );
-                    (
-                        format!("{}/responses", self.base_url),
-                        build_responses_body(model, &request, &replay)?,
-                    )
-                }
-                Transport::Chat => {
-                    let strategy = cache_strategy::resolve_cache_strategy(
-                        &self.provider_id,
-                        model,
-                        self.cache_overrides.get(model).copied(),
-                    );
-                    let mut body = build_chat_body(&request, model);
-                    cache_strategy::apply_chat_cache_control(&mut body, strategy);
-                    tracing::debug!(model, strategy = strategy.label(), "sending chat request");
-                    (format!("{}/chat/completions", self.base_url), body)
-                }
+            let Some(pool) = self.credential_pool.as_ref() else {
+                return self.respond_once(request, None).await;
             };
-
-            if self.codex_route.is_some() {
-                codex::prepare_body(&mut wire);
-            }
-
-            // Hartes Nebenläufigkeits-Limit (siehe [`Self::concurrency_limiter`]):
-            // blockiert, bis ein Slot frei wird, statt fehlzuschlagen. Der
-            // Guard bleibt bis zum Ende dieses async-Blocks (also bis der
-            // Response-Body vollständig gelesen/geparst ist) im Scope, damit
-            // die Grenze wirklich in Flug befindliche Requests zählt, nicht
-            // nur abgesetzte.
-            let _concurrency_permit = match &self.concurrency_limiter {
-                Some(semaphore) => Some(
-                    std::sync::Arc::clone(semaphore)
-                        .acquire_owned()
-                        .await
-                        .map_err(|_| {
-                            ModelError::RequestFailed(
-                                "internal error: provider concurrency semaphore was closed"
-                                    .to_owned(),
-                            )
-                        })?,
-                ),
-                None => None,
-            };
-            self.rate_limiter.wait_for_slot().await;
-            // Codex-Route: bei einem tatsächlichen 401 genau einmal
-            // reaktiv erneuern und den Request genau einmal wiederholen —
-            // kein zweiter Refresh-Versuch nach erneutem 401 (siehe
-            // `codex::CodexRoute::refresh`).
-            let mut codex_refreshed_after_401 = false;
-            let response = loop {
-                let builder = self.authorized_request(&url).await?;
-                let response = builder
-                    .json(&wire)
-                    .timeout(self.request_timeout)
-                    .send()
-                    .await
-                    .map_err(|error| model_error_for_transport(error, false))?;
-
-                if response.status() == reqwest::StatusCode::UNAUTHORIZED
-                    && !codex_refreshed_after_401
-                    && let Some(route) = &self.codex_route
-                {
-                    codex_refreshed_after_401 = true;
-                    if route.refresh(&self.client).await.is_ok() {
-                        continue;
+            let primary_idx = pool.select(None);
+            match self.respond_once(request.clone(), primary_idx).await {
+                Ok(response) => Ok(response),
+                Err(error) => {
+                    if pool.len() <= 1 || !credential_pool::should_failover(&error) {
+                        return Err(error);
+                    }
+                    let Some(used_idx) = primary_idx else {
+                        return Err(error);
+                    };
+                    pool.mark_cooldown(used_idx);
+                    tracing::warn!(
+                        provider = %self.provider_id,
+                        credential_label = %pool.entry(used_idx).label,
+                        error = %error,
+                        "credential_pool.entry_cooldown"
+                    );
+                    match pool.select(Some(used_idx)) {
+                        Some(next_idx) => {
+                            tracing::info!(
+                                provider = %self.provider_id,
+                                credential_label = %pool.entry(next_idx).label,
+                                "credential_pool.failover_retry"
+                            );
+                            self.respond_once(request, Some(next_idx)).await
+                        }
+                        None => Err(error),
                     }
                 }
-                break response;
-            };
-
-            self.rate_limiter.observe_headers(response.headers());
-            let status = response.status();
-            let retry_after = header_string(response.headers(), "retry-after");
-            let retry_after_ms = header_string(response.headers(), "retry-after-ms");
-            let request_id = provider_request_id(response.headers());
-            let value: Value = if status.is_success() && self.codex_route.is_some() {
-                codex::read_response(response).await?
-            } else {
-                let body = response
-                    .text()
-                    .await
-                    .map_err(|error| model_error_for_transport(error, true))?;
-
-                if !status.is_success() {
-                    let hint =
-                        retry_after_hint(retry_after.as_deref(), retry_after_ms.as_deref(), &body);
-                    let error =
-                        model_error_for_status(status.as_u16(), request_id.as_deref(), hint, &body);
-                    tracing::debug!(
-                        status = status.as_u16(),
-                        retryable = error.is_retryable(),
-                        "provider returned an error status"
-                    );
-                    return Err(error);
-                }
-
-                serde_json::from_str(&body)?
-            };
-            let mut response = match self.transport {
-                Transport::Responses => {
-                    let (response, replay) = interpret_responses(&value, &self.provider_id, model)?;
-                    if let Some(entry) = replay {
-                        self.reasoning_replay.remember(entry);
-                    }
-                    response
-                }
-                Transport::Chat => interpret_chat(&value)?,
-            };
-            let names = tool_names::ToolNameCodec::for_request(&request);
-            for call in &mut response.tool_calls {
-                call.name = ToolName::new(names.decode(call.name.as_str()));
             }
-            Ok(response)
         })
     }
 }
@@ -2885,6 +3111,7 @@ mod tests {
             origin_allowlist: harw_config::OriginAllowlistToml::default(),
             rate_limit: None,
             max_concurrency: None,
+            originator: None,
         }
     }
 
@@ -4703,6 +4930,7 @@ mod tests {
             origin_allowlist: harw_config::OriginAllowlistToml::default(),
             rate_limit: None,
             max_concurrency: None,
+            originator: None,
         }
     }
 
@@ -5063,8 +5291,9 @@ mod tests {
                 SecretString::new("sk-sensitive-header-value".into()),
             );
             provider.auth_header = auth_header.to_owned();
+            let api_key = provider.api_key.clone();
             let request = provider
-                .authorized_request("https://example.test/v1/chat/completions")
+                .authorized_request("https://example.test/v1/chat/completions", &api_key)
                 .await
                 .expect("credential header")
                 .build()

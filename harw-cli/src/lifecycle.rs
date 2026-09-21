@@ -634,16 +634,25 @@ mod tests {
         // Mindestmenge geprüft: eine Änderung der Werkzeugfläche der Standard-
         // Zusammenstellung soll auffallen, nicht durchrutschen. `fs.glob` und
         // `fs.grep` kamen mit den Recherche-Werkzeugen hinzu (AP W2-01/02).
-        // `status`/`ps`/`diff`/`stop` sind die vier `harw-ops`-Operationen, die
+        // `status`/`ps`/`diff`/`stop` sind vier der `harw-ops`-Operationen, die
         // `model_tool(...)` deklarieren (`harw-ops/src/{status,ps,diff,stop}.rs`)
         // und über `harw_ops::register_all` (`harw-runtime/src/assembly.rs`)
         // unbedingt in jede Zusammenstellung eingehängt werden — unabhängig vom
         // `RegistryProfile` und ohne das `[tools.plan]`-Gate (das nur
-        // `plan`/`goal` hinzufügt, hier nicht aktiv). Sie gehören deshalb zur
-        // Grundausstattung, nicht nur zu einer optionalen Erweiterung wie
-        // `browser.*`. `rights_snapshot().tools` liefert sortiert und
-        // dublettenfrei (harw-runtime/src/assembly.rs `rights_snapshot`),
-        // deshalb wird hier als Menge statt per `starts_with`-Präfix verglichen.
+        // `plan`/`goal` hinzufügt, hier nicht aktiv). `cancel` reiht sich seit
+        // der Genehmigungs-Befehlsgruppe (`/approve /deny /review /cancel
+        // /retry`, Interaktionsvertrag §2.3/§4) in dieselbe Grundausstattung
+        // ein: `harw-ops/src/cancel.rs` deklariert als einzige der fünf neuen
+        // Befehle ein `model_tool(approval = "always")` (siehe dortige
+        // Moduldoku, Abschnitt „Verhältnis zu /stop" — dieselbe
+        // `JobStore::cancel`-Transition wie `/stop`, nur über die
+        // Genehmigungs-Befehlsgruppe erreichbar), `approve`/`deny`/`review`/
+        // `retry` bleiben bewusst reine Commands ohne `ModelTool` und tauchen
+        // hier deshalb nicht auf. Sie gehören deshalb zur Grundausstattung,
+        // nicht nur zu einer optionalen Erweiterung wie `browser.*`.
+        // `rights_snapshot().tools` liefert sortiert und dublettenfrei
+        // (harw-runtime/src/assembly.rs `rights_snapshot`), deshalb wird hier
+        // als Menge statt per `starts_with`-Präfix verglichen.
         let base: HashSet<&str> = [
             "fs.read",
             "fs.write",
@@ -656,6 +665,7 @@ mod tests {
             "ps",
             "diff",
             "stop",
+            "cancel",
         ]
         .into_iter()
         .collect();

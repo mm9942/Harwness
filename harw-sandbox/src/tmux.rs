@@ -115,11 +115,9 @@ fn canonical_socket(path: &Path) -> Result<PathBuf, TmuxProfileError> {
             path: path.to_path_buf(),
         });
     }
-    let canonical = path
-        .canonicalize()
-        .map_err(|_| TmuxProfileError::Missing {
-            path: path.to_path_buf(),
-        })?;
+    let canonical = path.canonicalize().map_err(|_| TmuxProfileError::Missing {
+        path: path.to_path_buf(),
+    })?;
     // Unix: Prüfe, ob der Pfad ein Socket ist.
     #[cfg(unix)]
     {
@@ -128,9 +126,7 @@ fn canonical_socket(path: &Path) -> Result<PathBuf, TmuxProfileError> {
             path: canonical.clone(),
         })?;
         if !meta.file_type().is_socket() {
-            return Err(TmuxProfileError::NotSocket {
-                path: canonical,
-            });
+            return Err(TmuxProfileError::NotSocket { path: canonical });
         }
     }
     #[cfg(not(unix))]
@@ -152,11 +148,8 @@ mod tests {
 
     #[test]
     fn rejects_dotdot_path() {
-        let err = TmuxSandboxProfile::new(
-            TmuxOperationMode::Inspect,
-            "/tmp/../etc/tmux-socket",
-        )
-        .unwrap_err();
+        let err = TmuxSandboxProfile::new(TmuxOperationMode::Inspect, "/tmp/../etc/tmux-socket")
+            .unwrap_err();
         assert!(matches!(err, TmuxProfileError::InvalidPath { .. }));
     }
 
@@ -172,10 +165,8 @@ mod tests {
 
     #[test]
     fn rejects_non_socket_file() {
-        let tmp = std::env::temp_dir().join(format!(
-            "harwness-tmux-notsock-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("harwness-tmux-notsock-{}", std::process::id()));
         std::fs::write(&tmp, b"not a socket").unwrap();
         let err = TmuxSandboxProfile::new(TmuxOperationMode::Inspect, &tmp).unwrap_err();
         assert!(matches!(err, TmuxProfileError::NotSocket { .. }));
@@ -186,10 +177,7 @@ mod tests {
     #[test]
     fn accepts_real_unix_socket() {
         use std::os::unix::net::UnixListener;
-        let dir = std::env::temp_dir().join(format!(
-            "harwness-tmux-real-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("harwness-tmux-real-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("tmux.sock");
         let _listener = UnixListener::bind(&sock).unwrap();

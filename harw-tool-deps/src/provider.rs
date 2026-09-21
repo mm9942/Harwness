@@ -53,7 +53,7 @@ mod tests {
     use super::*;
     use crate::test_support::{block_on, sandbox_context, scratch_dir, tool_call};
     use harw_extension_api::contributors::ToolProvider as _;
-    use harw_sandbox::Permission;
+    use harw_authority::Permission;
     use harw_tools::{ToolName, ToolOutput};
     use std::collections::HashSet;
     use std::fs;

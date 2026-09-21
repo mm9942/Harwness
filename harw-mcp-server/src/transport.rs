@@ -704,6 +704,12 @@ fn tool_catalog(principal: Option<&McpPrincipal>) -> Value {
                 "properties": {
                     "kind": {"type": "string", "enum": ["worker", "dream"]},
                     "input": {"type": "object"},
+                    "idempotency_key": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 128,
+                        "pattern": "^[A-Za-z0-9._:-]+$"
+                    },
                     "budget": {
                         "type": "object",
                         "properties": {
@@ -891,15 +897,15 @@ fn parse_submit_arguments(message: &Value) -> Result<McpJobSubmission, &'static 
         return Err("invalid harw_job_submit arguments: expected an object");
     };
     if arguments.len() < 2
-        || arguments.len() > 3
+        || arguments.len() > 4
         || !arguments.contains_key("kind")
         || !arguments.contains_key("input")
         || arguments
             .keys()
-            .any(|key| !matches!(key.as_str(), "kind" | "input" | "budget"))
+            .any(|key| !matches!(key.as_str(), "kind" | "input" | "idempotency_key" | "budget"))
     {
         return Err(
-            "invalid harw_job_submit arguments: expected only 'kind', 'input', and optional 'budget'",
+            "invalid harw_job_submit arguments: expected only 'kind', 'input', and optional 'idempotency_key', 'budget'",
         );
     }
     let kind = match arguments.get("kind").and_then(Value::as_str) {
@@ -912,6 +918,17 @@ fn parse_submit_arguments(message: &Value) -> Result<McpJobSubmission, &'static 
         .filter(|input| input.as_object().is_some_and(|input| !input.is_empty()))
         .cloned()
         .ok_or("invalid harw_job_submit arguments: 'input' must be a non-empty object")?;
+    // Grammatik- und Eindeutigkeitsprüfung des Schlüssels liegt bei
+    // `McpIdempotencyKey::parse` im Supervisor; hier wird nur der Wire-Typ
+    // durchgesetzt (fail closed statt eine Nicht-Zeichenkette stillschweigend
+    // zu ignorieren).
+    let idempotency_key = match arguments.get("idempotency_key") {
+        None => None,
+        Some(Value::String(key)) => Some(key.clone()),
+        Some(_) => {
+            return Err("invalid harw_job_submit arguments: 'idempotency_key' must be a string");
+        }
+    };
     let budget = arguments
         .get("budget")
         .map(parse_submit_budget)
@@ -919,6 +936,7 @@ fn parse_submit_arguments(message: &Value) -> Result<McpJobSubmission, &'static 
     Ok(McpJobSubmission {
         kind,
         input,
+        idempotency_key,
         budget,
     })
 }
@@ -1002,12 +1020,21 @@ fn optional_positive_u64(
 fn supervisor_error_response(id: Option<Value>, error: &McpSupervisorError) -> McpResponse {
     match error {
         McpSupervisorError::NotAuthorized => json_rpc_error(id, -32001, &error.to_string(), None),
-        McpSupervisorError::InvalidSubmission(_) => {
+        McpSupervisorError::InvalidSubmission(_)
+        | McpSupervisorError::InvalidIdempotencyKey { .. }
+        | McpSupervisorError::IdempotencyConflict { .. } => {
             json_rpc_error(id, -32602, &error.to_string(), None)
+        }
+        McpSupervisorError::RateLimited { .. } => {
+            json_rpc_error(id, -32003, &error.to_string(), None)
         }
         McpSupervisorError::JobStore(store_error) => {
             eprintln!("harw-mcp-server: {error}");
             json_rpc_error(id, -32000, redacted_store_error_message(store_error), None)
+        }
+        McpSupervisorError::LimiterUnavailable => {
+            eprintln!("harw-mcp-server: {error}");
+            json_rpc_error(id, -32000, &error.to_string(), None)
         }
     }
 }
@@ -1927,7 +1954,7 @@ mod tests {
             (
                 4,
                 json!({"kind": "worker", "input": {}, "extra": true}),
-                "expected only 'kind', 'input', and optional 'budget'",
+                "expected only 'kind', 'input', and optional 'idempotency_key', 'budget'",
             ),
             (
                 5,

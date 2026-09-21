@@ -307,7 +307,7 @@ mod tests {
     use harw_dod_rules::rules::EgressFlowRule;
     use harw_dod_rules::{run_rules, triage};
     use harw_dod_signals::{EventKind, SecurityEvent};
-    use harw_sandbox::NetworkScope;
+    use harw_authority::NetworkScope;
     use harw_types::{CgroupId, SensorId};
 
     fn confirmed_finding() -> Finding<Triaged> {

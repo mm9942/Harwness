@@ -32,7 +32,7 @@ use harw_extension_api::ExtensionRegistryBuilder;
 use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_operations::registry::OperationRegistry;
 use harw_project_discovery::ProjectContext;
-use harw_sandbox::NetworkScope;
+use harw_authority::NetworkScope;
 
 use crate::assembly::{SessionLifecycleHook, TurnLimits};
 use crate::config::ConfigTrustReport;

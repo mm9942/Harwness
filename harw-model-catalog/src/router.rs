@@ -19,6 +19,26 @@
 //! # Design reference
 //! See `docs/design/model-catalog-v2.md` §6.
 //!
+//! # Produktionsstatus (Befund K-router-1)
+//! [`rank`] und [`pick`] haben derzeit **keinen produktiven Aufrufer** — nur
+//! die Tests dieses Moduls rufen sie auf. Die Stelle, an der `harw-runtime`
+//! heute tatsächlich das Modell für eine Kind-Rolle wählt, ist
+//! `RuntimeChildRegistryFactory::model_for` (Implementierung des
+//! `harw_core::ChildRegistryFactory`-Traits, definiert in
+//! `harw-core/src/child_controller.rs:1078`) und dessen
+//! komplexitätsbewusste Variante `model_for_task`, in
+//! `harw-runtime/src/children.rs:476` bzw. `:502` — sie entscheidet über
+//! `internal_point_for_role`/`pinned_model_for_point` (Addendum C/D/E)
+//! unabhängig von diesem Router, ohne [`crate::descriptor::ModelDescriptor`],
+//! [`crate::runtime::ModelRuntimeProfile`] oder
+//! [`crate::observed::ObservedModelBehavior`] heranzuziehen.
+//!
+//! Ein künftiges Verdrahten von [`rank`]/[`pick`] gehört dorthin: als
+//! zusätzliche Kandidatenquelle für `model_for`/`model_for_task`, bevor auf
+//! den geerbten Eltern-Provider zurückgefallen wird. Diese Datei nimmt diese
+//! Verdrahtung bewusst **nicht** vor — `harw-runtime` liegt außerhalb des
+//! Bearbeitungsumfangs dieser Änderung.
+//!
 //! # Examples
 //! ```rust,no_run
 //! use harw_model_catalog::router::{ModelRole, Candidate, pick};

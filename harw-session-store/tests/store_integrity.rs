@@ -373,7 +373,16 @@ fn test_unblock_returns_blocked_job_to_ready() {
     assert_eq!(store.get(&work_id).unwrap().job.state, JobState::Blocked);
     let later = now.checked_add(SignedDuration::from_secs(3)).unwrap();
 
-    let event = store.unblock(&work_id, later).unwrap();
+    let event = store
+        .unblock(
+            &work_id,
+            later,
+            ApprovalActor::Operator {
+                id: "operator-a".to_owned(),
+            },
+            Some("looks fine".to_owned()),
+        )
+        .unwrap();
 
     assert_eq!(event.state, JobState::Ready);
     let persisted = store.get(&work_id).unwrap();
@@ -382,6 +391,15 @@ fn test_unblock_returns_blocked_job_to_ready() {
     assert_eq!(persisted.completion, None);
     assert_eq!(persisted.lease, None);
     assert_eq!(persisted.revision, event.revision);
+
+    let approval = store.get_approval(&work_id).unwrap().unwrap();
+    assert_eq!(approval.approved_at, later);
+    assert_eq!(approval.note.as_deref(), Some("looks fine"));
+    assert_eq!(approval.revision, event.revision);
+    assert!(matches!(
+        approval.approved_by,
+        ApprovalActor::Operator { ref id } if id == "operator-a"
+    ));
 }
 
 #[test]
@@ -392,7 +410,16 @@ fn test_unblock_rejects_job_that_is_not_blocked() {
     store.admit(&stored_job(work_id.as_str(), Timestamp::now())).unwrap();
     let before = store.get(&work_id).unwrap();
 
-    let error = store.unblock(&work_id, Timestamp::now()).unwrap_err();
+    let error = store
+        .unblock(
+            &work_id,
+            Timestamp::now(),
+            ApprovalActor::Operator {
+                id: "operator-a".to_owned(),
+            },
+            None,
+        )
+        .unwrap_err();
 
     assert!(matches!(
         error,

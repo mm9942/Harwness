@@ -213,9 +213,7 @@ fn glob_blocking(root: &Path, args: &GlobArgs) -> ToolOutput {
 mod tests {
     use super::*;
     use crate::test_support::{Fixture, SECRET, call as tool_call, render};
-    use harw_sandbox::{
-        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-    };
+    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_tools::ToolExecutor;
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::fs;

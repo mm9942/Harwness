@@ -1,0 +1,9 @@
+# This lock is intentionally fail-closed until it is populated by the first
+# target-host validation.  A guessed compiler or bpftool version would make a
+# manifest look reproducible without providing that guarantee.  `make` refuses
+# to build while either value is UNVALIDATED; the validated, exact first output
+# line of each command is then committed here before producing artifacts.
+schema_version = 1
+clang_version = "Debian clang version 19.1.7 (3+b1)"
+bpftool_version = "bpftool v7.7.0"
+llvm_objdump_version = "Debian LLVM version 19.1.7"

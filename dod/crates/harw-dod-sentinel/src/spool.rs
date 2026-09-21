@@ -889,7 +889,7 @@ mod tests {
     use harw_dod_rules::rules::StructureDriftRule;
     use harw_dod_rules::run_rules;
     use harw_dod_signals::{DriftSeverity, EventKind, SecurityEvent, SecurityEvidence};
-    use harw_sandbox::NetworkScope;
+    use harw_authority::NetworkScope;
     use harw_types::SensorId;
     use jiff::Timestamp;
 

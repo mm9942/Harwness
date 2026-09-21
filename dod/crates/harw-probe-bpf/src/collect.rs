@@ -138,7 +138,7 @@ mod tests {
     use harw_dod_bpf::BpfProgramSource;
     use harw_dod_cap::{Bound, Capability, ReadScope, SensorError, SensorHandle};
     use harw_dod_signals::{EventKind, SecurityEvent, Sensor, SensorReading};
-    use harw_sandbox::NetworkScope;
+    use harw_authority::NetworkScope;
     use harw_types::{ContentDigest, SensorId};
     use jiff::Timestamp;
 

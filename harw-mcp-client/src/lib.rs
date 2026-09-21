@@ -15,6 +15,11 @@ const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MCP_SESSION_HEADER: HeaderName = HeaderName::from_static("mcp-session-id");
 const MCP_PROTOCOL_HEADER: HeaderName = HeaderName::from_static("mcp-protocol-version");
 
+/// Maximale Größe einer MCP-Antwort in Bytes. Schützt vor Speichererschöpfung
+/// durch übergroße oder fehlerhafte Server-Antworten, etwa Bild- oder
+/// Ressourcen-Inhalte in `tools/call`-Ergebnissen.
+const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
 pub type McpResult<T> = Result<T, McpError>;
 
 #[derive(Debug)]
@@ -29,6 +34,11 @@ pub enum McpError {
     Sse(String),
     SseResponseMissing,
     NotInitialized,
+    /// Die Antwort überschreitet [`MAX_RESPONSE_BYTES`].
+    ResponseTooLarge { limit: usize },
+    /// Das aufgerufene Tool meldet `isError: true`. Dies ist ein
+    /// fachlicher Fehler des Tools, kein Transport- oder Protokollfehler.
+    ToolCallFailed(Vec<McpContent>),
 }
 
 impl fmt::Display for McpError {
@@ -48,6 +58,24 @@ impl fmt::Display for McpError {
             Self::Sse(reason) => write!(f, "invalid MCP SSE response: {reason}"),
             Self::SseResponseMissing => write!(f, "MCP SSE response contained no JSON-RPC result"),
             Self::NotInitialized => write!(f, "MCP client must initialize before tools/list"),
+            Self::ResponseTooLarge { limit } => {
+                write!(f, "MCP response exceeded the maximum size of {limit} bytes")
+            }
+            Self::ToolCallFailed(content) => {
+                let text = content
+                    .iter()
+                    .filter_map(|item| match item {
+                        McpContent::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if text.is_empty() {
+                    write!(f, "MCP tool call reported an error")
+                } else {
+                    write!(f, "MCP tool call reported an error: {text}")
+                }
+            }
         }
     }
 }
@@ -79,6 +107,55 @@ pub struct McpTool {
 pub struct McpToolPage {
     pub tools: Vec<McpTool>,
     pub next_cursor: Option<String>,
+}
+
+/// Ein einzelnes Inhaltselement einer `tools/call`-Antwort.
+///
+/// MCP-Server liefern Text-, Bild- und Ressourcen-Inhalte. Unbekannte
+/// `type`-Werte (z. B. zukünftige `audio`-Inhalte) werden verlustfrei als
+/// `Unknown` abgebildet, damit sie den Parser nicht brechen.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum McpContent {
+    /// Reiner Textinhalt.
+    Text {
+        /// Der Textinhalt selbst.
+        text: String,
+    },
+    /// Binäres Bild, base64-kodiert.
+    Image {
+        /// Base64-kodierte Bilddaten.
+        data: String,
+        /// MIME-Typ des Bildes, z. B. `image/png`.
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+    /// Eingebettete Ressource (z. B. Datei- oder API-Inhalt).
+    Resource {
+        /// Die eigentliche Ressource.
+        resource: McpResourceContents,
+    },
+    /// Fallback für unbekannte, künftige Content-Typen.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Der Inhalt einer eingebetteten MCP-Ressource innerhalb von
+/// [`McpContent::Resource`].
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpResourceContents {
+    /// URI der Ressource.
+    pub uri: String,
+    /// Optionaler MIME-Typ der Ressource.
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    /// Textinhalt, falls die Ressource als Text vorliegt.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Base64-kodierter Binärinhalt, falls die Ressource binär vorliegt.
+    #[serde(default)]
+    pub blob: Option<String>,
 }
 
 /// Session-bound Streamable-HTTP client.
@@ -192,6 +269,32 @@ impl McpClient {
         }
     }
 
+    /// Ruft ein MCP-Tool per `tools/call` auf und liefert dessen Inhalt.
+    ///
+    /// `arguments` wird unverändert als `arguments`-Feld des JSON-RPC-Requests
+    /// gesendet; leere Argumente können als `serde_json::json!({})` übergeben
+    /// werden.
+    ///
+    /// # Errors
+    /// - [`McpError::NotInitialized`], wenn zuvor kein `initialize` aufgerufen wurde.
+    /// - [`McpError::ToolCallFailed`], wenn der Server `isError: true` meldet;
+    ///   dies ist ein fachlicher Fehler des Tools, kein Transport-/Protokollfehler.
+    /// - [`McpError::ResponseTooLarge`], wenn die Antwort [`MAX_RESPONSE_BYTES`] überschreitet.
+    /// - Übrige Varianten bei Transport- oder Protokollfehlern, wie bei anderen Requests.
+    pub async fn call_tool(&mut self, name: &str, arguments: Value) -> McpResult<Vec<McpContent>> {
+        if !self.initialized {
+            return Err(McpError::NotInitialized);
+        }
+        let result = self
+            .request(
+                "tools/call",
+                json!({"name": name, "arguments": arguments}),
+                false,
+            )
+            .await?;
+        parse_tool_call_result(result)
+    }
+
     /// Best-effort MCP session teardown.
     pub async fn close(&mut self) -> McpResult<()> {
         let Some(session) = self.session_id.as_deref() else {
@@ -270,15 +373,19 @@ impl McpClient {
                 self.session_id = Some(value.to_owned());
             }
         }
-        if response
+        let is_sse = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.starts_with("text/event-stream"))
-        {
-            return parse_sse_response(response, id).await;
+            .is_some_and(|value| value.starts_with("text/event-stream"));
+        let bytes = read_body_capped(response, MAX_RESPONSE_BYTES).await?;
+        if is_sse {
+            return parse_sse_bytes(&bytes, id);
         }
-        parse_json_rpc_response(response.json().await.map_err(McpError::Http)?, id)
+        let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+            McpError::InvalidJsonRpc(format!("response body is not valid JSON: {error}"))
+        })?;
+        parse_json_rpc_response(value, id)
     }
 
     fn headers(&self, include_protocol: bool, session: Option<&str>) -> McpResult<HeaderMap> {
@@ -353,12 +460,51 @@ fn parse_json_rpc_response(value: Value, expected_id: u64) -> McpResult<Value> {
         .ok_or_else(|| McpError::InvalidJsonRpc("response has neither result nor error".to_owned()))
 }
 
-async fn parse_sse_response(mut response: reqwest::Response, expected_id: u64) -> McpResult<Value> {
+/// Prüft, ob eine gemessene Byte-Länge das gegebene Limit überschreitet.
+fn ensure_within_limit(len: usize, limit: usize) -> McpResult<()> {
+    if len > limit {
+        Err(McpError::ResponseTooLarge { limit })
+    } else {
+        Ok(())
+    }
+}
+
+/// Liest den Antwortkörper vollständig ein, bricht aber sofort ab, sobald
+/// `limit` überschritten wird, statt die gesamte (potenziell riesige)
+/// Antwort erst zu puffern.
+async fn read_body_capped(mut response: reqwest::Response, limit: usize) -> McpResult<Vec<u8>> {
+    if let Some(len) = response.content_length() {
+        ensure_within_limit(usize::try_from(len).unwrap_or(usize::MAX), limit)?;
+    }
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(McpError::Http)? {
         bytes.extend_from_slice(&chunk);
+        ensure_within_limit(bytes.len(), limit)?;
     }
-    let text = String::from_utf8(bytes).map_err(|error| McpError::Sse(error.to_string()))?;
+    Ok(bytes)
+}
+
+/// Wertet das `result`-Objekt einer `tools/call`-Antwort aus: parst das
+/// `content`-Array in [`McpContent`] und behandelt `isError: true` als
+/// eigenständigen, vom Transport getrennten Fehlerfall.
+fn parse_tool_call_result(result: Value) -> McpResult<Vec<McpContent>> {
+    let content: Vec<McpContent> =
+        serde_json::from_value(result.get("content").cloned().unwrap_or_else(|| json!([])))
+            .map_err(|error| {
+                McpError::InvalidJsonRpc(format!("tools/call result is invalid: {error}"))
+            })?;
+    let is_error = result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if is_error {
+        return Err(McpError::ToolCallFailed(content));
+    }
+    Ok(content)
+}
+
+fn parse_sse_bytes(bytes: &[u8], expected_id: u64) -> McpResult<Value> {
+    let text = std::str::from_utf8(bytes).map_err(|error| McpError::Sse(error.to_string()))?;
     for event in text.split("\n\n") {
         let data = event
             .lines()
@@ -392,5 +538,95 @@ mod tests {
         assert!(McpClient::new("https://mcp.cloudflare.com/mcp", None).is_ok());
         assert!(McpClient::new("http://localhost:3000/mcp", None).is_ok());
         assert!(McpClient::new("http://example.test/mcp", None).is_err());
+    }
+
+    #[test]
+    fn parse_tool_call_result_maps_content_variants() {
+        let result = json!({
+            "content": [
+                {"type": "text", "text": "hello"},
+                {"type": "image", "data": "YWJj", "mimeType": "image/png"},
+                {"type": "resource", "resource": {
+                    "uri": "file:///a.txt",
+                    "mimeType": "text/plain",
+                    "text": "abc"
+                }},
+                {"type": "audio", "data": "future-proofing"}
+            ],
+            "isError": false
+        });
+        let content = parse_tool_call_result(result).unwrap();
+        assert_eq!(content.len(), 4);
+        assert!(matches!(&content[0], McpContent::Text { text } if text == "hello"));
+        assert!(
+            matches!(&content[1], McpContent::Image { data, mime_type } if data == "YWJj" && mime_type == "image/png")
+        );
+        match &content[2] {
+            McpContent::Resource { resource } => {
+                assert_eq!(resource.uri, "file:///a.txt");
+                assert_eq!(resource.mime_type.as_deref(), Some("text/plain"));
+                assert_eq!(resource.text.as_deref(), Some("abc"));
+                assert_eq!(resource.blob, None);
+            }
+            other => panic!("expected Resource content, got {other:?}"),
+        }
+        assert!(matches!(&content[3], McpContent::Unknown));
+    }
+
+    #[test]
+    fn parse_tool_call_result_is_error_yields_tool_call_failed() {
+        let result = json!({
+            "content": [{"type": "text", "text": "boom"}],
+            "isError": true
+        });
+        match parse_tool_call_result(result) {
+            Err(McpError::ToolCallFailed(content)) => {
+                assert_eq!(content.len(), 1);
+                assert!(matches!(&content[0], McpContent::Text { text } if text == "boom"));
+            }
+            other => panic!("expected ToolCallFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_tool_call_result_missing_content_defaults_to_empty() {
+        let content = parse_tool_call_result(json!({})).unwrap();
+        assert!(content.is_empty());
+    }
+
+    #[test]
+    fn ensure_within_limit_rejects_oversized_bodies() {
+        assert!(ensure_within_limit(10, 20).is_ok());
+        assert!(matches!(
+            ensure_within_limit(30, 20),
+            Err(McpError::ResponseTooLarge { limit: 20 })
+        ));
+    }
+
+    #[test]
+    fn parse_sse_bytes_extracts_first_json_rpc_event() {
+        let sse =
+            b"event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"ok\":true}}\n\n";
+        let value = parse_sse_bytes(sse, 1).unwrap();
+        assert_eq!(value["ok"], true);
+    }
+
+    #[test]
+    fn parse_sse_bytes_without_data_event_is_missing() {
+        assert!(matches!(
+            parse_sse_bytes(b"event: ping\n\n", 1),
+            Err(McpError::SseResponseMissing)
+        ));
+    }
+
+    #[test]
+    fn tool_call_failed_display_includes_text_content() {
+        let error = McpError::ToolCallFailed(vec![McpContent::Text {
+            text: "division by zero".to_owned(),
+        }]);
+        assert_eq!(
+            error.to_string(),
+            "MCP tool call reported an error: division by zero"
+        );
     }
 }

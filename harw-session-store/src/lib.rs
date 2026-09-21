@@ -42,8 +42,9 @@ pub use child_lease::{ChildLeaseCompletionRecord, ChildLeaseRecord, ChildLeaseSt
 pub use error::{SessionStoreError, SessionStoreResult};
 pub use freeze::{Freeze, FreezeResolution, FreezeResolutionOutcome, FreezeStore};
 pub use job_store::{
-    CancelRequest, CancellationTransition, ClaimRequest, CompleteRequest, ExpiredJob, JobEventSink,
-    JobLifecycleEvent, JobListQuery, JobPage, JobStore, NoopJobEventSink, RenewalRequest,
+    CancelRequest, CancellationTransition, ClaimRequest, CompleteRequest, ExpiredJob, JobApproval,
+    JobEventSink, JobLifecycleEvent, JobListQuery, JobPage, JobStore, NoopJobEventSink,
+    RenewalRequest, RetryRequest,
 };
 pub use meta::{SessionMeta, TitleSource, SESSION_META_VERSION};
 pub use reader::TranscriptReader;

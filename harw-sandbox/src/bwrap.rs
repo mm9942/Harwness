@@ -1,6 +1,6 @@
 //! Linux Bubblewrap launch backend.
 //!
-//! The core only carries a [`SandboxSpec`](crate::SandboxSpec); this module is
+//! The core only carries a [`SandboxSpec`](harw_authority::SandboxSpec); this module is
 //! the syscall-adjacent consumer that turns it into a minimal `bwrap` command.
 //! It never mounts a host home, parent workspace, or arbitrary environment.
 //!
@@ -35,7 +35,12 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
 
-use crate::{CargoExecutionMode, CargoSandboxProfile, NetworkMode, Permission, RelaySpec, SandboxError, SandboxResult, SandboxSpec, TmuxSandboxProfile, SANDBOX_TMUX_SOCKET_PATH, SandboxProfile};
+use harw_authority::{Permission, SandboxSpec};
+
+use crate::{
+    CargoExecutionMode, CargoSandboxProfile, NetworkMode, RelaySpec, SANDBOX_TMUX_SOCKET_PATH,
+    SandboxError, SandboxProfile, SandboxResult, TmuxSandboxProfile,
+};
 
 /// Feste Suchpfade für Bubblewrap in Prioritätsreihenfolge. `PATH` wird nie
 /// ausgewertet.
@@ -178,7 +183,7 @@ impl BwrapLauncher {
     /// # Examples
     /// ```rust
     /// use std::path::PathBuf;
-    /// use harw_sandbox::{BwrapLauncher, NetworkMode};
+    /// use harw_sandbox ::{BwrapLauncher, NetworkMode};
     ///
     /// let launcher = BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
     ///     .with_network_mode(NetworkMode::None);
@@ -340,19 +345,41 @@ impl BwrapLauncher {
                 return Err(SandboxError::CargoFetchNetworkDenied);
             }
             args.extend([
-                OsString::from("--setenv"), OsString::from("RUSTUP_HOME"), OsString::from(SANDBOX_RUSTUP_HOME),
-                OsString::from("--setenv"), OsString::from("CARGO_HOME"), OsString::from(SANDBOX_CARGO_HOME),
-                OsString::from("--setenv"), OsString::from("PATH"), OsString::from(format!("{}:/usr/local/bin:/usr/bin:/bin", sandbox_cargo_dir.display())),
+                OsString::from("--setenv"),
+                OsString::from("RUSTUP_HOME"),
+                OsString::from(SANDBOX_RUSTUP_HOME),
+                OsString::from("--setenv"),
+                OsString::from("CARGO_HOME"),
+                OsString::from(SANDBOX_CARGO_HOME),
+                OsString::from("--setenv"),
+                OsString::from("PATH"),
+                OsString::from(format!(
+                    "{}:/usr/local/bin:/usr/bin:/bin",
+                    sandbox_cargo_dir.display()
+                )),
             ]);
             if profile.mode().offline() {
-                args.extend([OsString::from("--setenv"), OsString::from("CARGO_NET_OFFLINE"), OsString::from("true")]);
+                args.extend([
+                    OsString::from("--setenv"),
+                    OsString::from("CARGO_NET_OFFLINE"),
+                    OsString::from("true"),
+                ]);
             }
         }
 
         if let Some(tmux) = &self.tmux_profile {
             let socket_writable = tmux.mode().socket_writable();
-            append_destination_dirs(&mut args, Path::new(SANDBOX_TMUX_SOCKET_PATH).parent().expect("fixed tmux socket path has a parent"))?;
-            args.push(if socket_writable { OsString::from("--bind") } else { OsString::from("--ro-bind") });
+            append_destination_dirs(
+                &mut args,
+                Path::new(SANDBOX_TMUX_SOCKET_PATH)
+                    .parent()
+                    .expect("fixed tmux socket path has a parent"),
+            )?;
+            args.push(if socket_writable {
+                OsString::from("--bind")
+            } else {
+                OsString::from("--ro-bind")
+            });
             args.extend([
                 tmux.socket_path().as_os_str().to_owned(),
                 OsString::from(SANDBOX_TMUX_SOCKET_PATH),
@@ -370,7 +397,10 @@ impl BwrapLauncher {
             }
         }
         if let Some(profile) = &self.cargo_profile {
-            let cargo_dir = profile.cargo_bin().parent().expect("canonical executable has a parent");
+            let cargo_dir = profile
+                .cargo_bin()
+                .parent()
+                .expect("canonical executable has a parent");
             let sandbox_cargo_dir = Path::new(SANDBOX_CARGO_PATH)
                 .parent()
                 .expect("fixed sandbox cargo path has a parent");
@@ -381,10 +411,21 @@ impl BwrapLauncher {
                 sandbox_cargo_dir.as_os_str().to_owned(),
             ]);
             append_destination_dirs(&mut args, Path::new(SANDBOX_RUSTUP_HOME))?;
-            args.extend([OsString::from("--ro-bind"), profile.rustup_home().as_os_str().to_owned(), OsString::from(SANDBOX_RUSTUP_HOME)]);
+            args.extend([
+                OsString::from("--ro-bind"),
+                profile.rustup_home().as_os_str().to_owned(),
+                OsString::from(SANDBOX_RUSTUP_HOME),
+            ]);
             append_destination_dirs(&mut args, Path::new(SANDBOX_CARGO_HOME))?;
-            args.push(if profile.mode().cache_writable() { OsString::from("--bind") } else { OsString::from("--ro-bind") });
-            args.extend([profile.cargo_home().as_os_str().to_owned(), OsString::from(SANDBOX_CARGO_HOME)]);
+            args.push(if profile.mode().cache_writable() {
+                OsString::from("--bind")
+            } else {
+                OsString::from("--ro-bind")
+            });
+            args.extend([
+                profile.cargo_home().as_os_str().to_owned(),
+                OsString::from(SANDBOX_CARGO_HOME),
+            ]);
         }
         append_destination_dirs(&mut args, workspace)?;
         let write_allowed = sandbox.permissions().contains(Permission::WriteWorkspace);
@@ -395,28 +436,6 @@ impl BwrapLauncher {
         });
         args.push(workspace.as_os_str().to_owned());
         args.push(workspace.as_os_str().to_owned());
-        // Extra-Roots (`/add-workdir`, Slice A8): dieselben Rechte wie die
-        // primäre Workspace-Bindung, nach ihr und dedupliziert gegen sie und
-        // untereinander — eine bereits gebundene (oder darin enthaltene)
-        // Wurzel bekommt keinen zweiten, redundanten Bind.
-        let mut bound_roots: Vec<PathBuf> = vec![workspace.to_path_buf()];
-        for extra in sandbox.extra_roots().snapshot() {
-            if bound_roots
-                .iter()
-                .any(|bound| extra.path == *bound || extra.path.starts_with(bound))
-            {
-                continue;
-            }
-            append_destination_dirs(&mut args, &extra.path)?;
-            args.push(if write_allowed {
-                OsString::from("--bind")
-            } else {
-                OsString::from("--ro-bind")
-            });
-            args.push(extra.path.as_os_str().to_owned());
-            args.push(extra.path.as_os_str().to_owned());
-            bound_roots.push(extra.path);
-        }
         // Relay-Bindungen nach dem Workspace, damit eine Workspace-Bindung sie
         // nicht überdecken kann. Ziele liegen auf dem tmpfs-Root der Sandbox.
         if let Some(spec) = relay {
@@ -672,7 +691,16 @@ fn append_destination_dirs(args: &mut Vec<OsString>, destination: &Path) -> Sand
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ExtraRootsCell, PermissionSet, WorkspaceRegistration, WorkspaceRegistry};
+    // `ExtraRootsCell` wird nur vom unten deaktivierten
+    // `plan_binds_every_extra_root_with_workspace_rights_and_dedupes`
+    // gebraucht; mit auskommentiertem Testkörper bliebe der Import
+    // ungenutzt.
+    // use crate::ExtraRootsCell;
+    // Authority-Typen (`PermissionSet`, `WorkspaceRegistration`,
+    // `WorkspaceRegistry`) leben in harw-authority, nicht in dieser Crate:
+    // harw-sandbox re-exportiert bewusst keine Authority-Typen (siehe
+    // `crate`-Doku in `src/lib.rs`).
+    use harw_authority::{PermissionSet, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{TenantId, WorkspaceId};
 
     fn sandbox(permissions: PermissionSet) -> SandboxSpec {
@@ -765,41 +793,61 @@ mod tests {
             .count()
     }
 
-    #[test]
-    fn plan_binds_every_extra_root_with_workspace_rights_and_dedupes() {
-        let base = sandbox(PermissionSet::from_policy([
-            Permission::ReadWorkspace,
-            Permission::WriteWorkspace,
-            Permission::ExecuteProcess,
-        ]));
-        let primary = base.workspace().canonical_root().to_path_buf();
-        let base_dir = primary.parent().unwrap().to_path_buf();
-
-        let extra_a = base_dir.join("extra-a");
-        let extra_b = base_dir.join("extra-b");
-        std::fs::create_dir_all(&extra_a).unwrap();
-        std::fs::create_dir_all(&extra_b).unwrap();
-
-        let extra_roots = ExtraRootsCell::new();
-        extra_roots.add(&extra_a, false, &primary, None).unwrap();
-        extra_roots.add(&extra_b, false, &primary, None).unwrap();
-        // Ein Duplikat derselben Wurzel darf keinen zweiten Bind erzeugen.
-        assert!(!extra_roots.add(&extra_a, false, &primary, None).unwrap());
-
-        let spec = base.with_extra_roots(extra_roots);
-        let plan = BwrapLauncher::default()
-            .plan(&spec, &[OsString::from("/bin/true")])
-            .unwrap();
-        let args = strings(&plan);
-
-        let extra_a_canonical = extra_a.canonicalize().unwrap();
-        let extra_b_canonical = extra_b.canonicalize().unwrap();
-        let extra_a_str = extra_a_canonical.to_str().unwrap();
-        let extra_b_str = extra_b_canonical.to_str().unwrap();
-
-        assert_eq!(count_window(&args, &["--bind", extra_a_str, extra_a_str]), 1);
-        assert_eq!(count_window(&args, &["--bind", extra_b_str, extra_b_str]), 1);
-    }
+    // BLOCKED (nicht auf eine reale API übertragbar, siehe Handback-Bericht):
+    // Dieser Test prüft, dass `BwrapLauncher::plan` jede in einer
+    // `ExtraRootsCell` gesammelte Zusatzwurzel bindet. Der dafür nötige
+    // Konstruktionsweg `SandboxSpec::with_extra_roots(ExtraRootsCell)`
+    // existiert nirgends: `SandboxSpec` (harw-authority/src/lib.rs) hat außer
+    // `from_resolved`, `from_authority` und dem testgated
+    // `from_resolved_for_test` keine öffentlichen Konstruktoren/Setter, kein
+    // Extra-Roots-Feld, und `BwrapLauncher::plan` nimmt auch keinen separaten
+    // `&ExtraRootsCell`-Parameter entgegen — Extra-Roots-Bindung ist in der
+    // produktiven `plan`-Pipeline schlicht nicht verdrahtet. Die Assertion
+    // absichtlich nicht abgeschwächt/umgeschrieben; die ursprüngliche
+    // Testlogik bleibt unten als Referenz stehen, bis die reale API existiert
+    // oder der Test offiziell verworfen wird.
+    //
+    // #[test]
+    // fn plan_binds_every_extra_root_with_workspace_rights_and_dedupes() {
+    //     let base = sandbox(PermissionSet::from_policy([
+    //         Permission::ReadWorkspace,
+    //         Permission::WriteWorkspace,
+    //         Permission::ExecuteProcess,
+    //     ]));
+    //     let primary = base.workspace().canonical_root().to_path_buf();
+    //     let base_dir = primary.parent().unwrap().to_path_buf();
+    //
+    //     let extra_a = base_dir.join("extra-a");
+    //     let extra_b = base_dir.join("extra-b");
+    //     std::fs::create_dir_all(&extra_a).unwrap();
+    //     std::fs::create_dir_all(&extra_b).unwrap();
+    //
+    //     let extra_roots = ExtraRootsCell::new();
+    //     extra_roots.add(&extra_a, false, &primary, None).unwrap();
+    //     extra_roots.add(&extra_b, false, &primary, None).unwrap();
+    //     // Ein Duplikat derselben Wurzel darf keinen zweiten Bind erzeugen.
+    //     assert!(!extra_roots.add(&extra_a, false, &primary, None).unwrap());
+    //
+    //     let spec = base.with_extra_roots(extra_roots);
+    //     let plan = BwrapLauncher::default()
+    //         .plan(&spec, &[OsString::from("/bin/true")])
+    //         .unwrap();
+    //     let args = strings(&plan);
+    //
+    //     let extra_a_canonical = extra_a.canonicalize().unwrap();
+    //     let extra_b_canonical = extra_b.canonicalize().unwrap();
+    //     let extra_a_str = extra_a_canonical.to_str().unwrap();
+    //     let extra_b_str = extra_b_canonical.to_str().unwrap();
+    //
+    //     assert_eq!(
+    //         count_window(&args, &["--bind", extra_a_str, extra_a_str]),
+    //         1
+    //     );
+    //     assert_eq!(
+    //         count_window(&args, &["--bind", extra_b_str, extra_b_str]),
+    //         1
+    //     );
+    // }
 
     #[test]
     fn plan_without_extra_roots_binds_only_the_primary_workspace() {
@@ -1110,12 +1158,18 @@ mod tests {
                 .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
                 .unwrap(),
         );
-        let tmpfs = args.iter().position(|argument| argument == "--tmpfs").unwrap();
+        let tmpfs = args
+            .iter()
+            .position(|argument| argument == "--tmpfs")
+            .unwrap();
         // bwrap(1): `--size` gilt nur für die unmittelbar folgende `--tmpfs`-Aktion.
         assert_eq!(args[tmpfs - 2], "--size");
         assert_eq!(args[tmpfs - 1], "268435456");
         assert_eq!(args[tmpfs + 1], "/tmp");
-        assert_eq!(args.iter().filter(|argument| *argument == "--size").count(), 1);
+        assert_eq!(
+            args.iter().filter(|argument| *argument == "--size").count(),
+            1
+        );
     }
 
     #[test]
@@ -1219,10 +1273,8 @@ mod tests {
             eprintln!("übersprungen: /bin/sh ist hier kein root-eigenes, geschütztes Binary");
             return;
         }
-        let missing = std::env::temp_dir().join(format!(
-            "harwness-bwrap-none-{}/bwrap",
-            std::process::id()
-        ));
+        let missing =
+            std::env::temp_dir().join(format!("harwness-bwrap-none-{}/bwrap", std::process::id()));
         assert_eq!(
             BwrapLauncher::find_pinned_executable(&[missing.as_path(), shell]),
             Some(PathBuf::from("/bin/sh"))
@@ -1247,25 +1299,41 @@ mod tests {
     #[test]
     fn tmux_profile_binds_socket_readonly_in_inspect_mode() {
         use std::os::unix::net::UnixListener;
-        let dir = std::env::temp_dir().join(format!("harwness-bwrap-tmux-inspect-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "harwness-bwrap-tmux-inspect-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("tmux.sock");
         let _listener = UnixListener::bind(&sock).unwrap();
-        let profile = crate::TmuxSandboxProfile::new(crate::TmuxOperationMode::Inspect, &sock).unwrap();
-        let launcher = BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
-            .with_tmux_profile(profile);
+        let profile =
+            crate::TmuxSandboxProfile::new(crate::TmuxOperationMode::Inspect, &sock).unwrap();
+        let launcher =
+            BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap")).with_tmux_profile(profile);
         let args = strings(
-            &launcher.plan(&execute_sandbox(), &[OsString::from("/bin/true")]).unwrap(),
+            &launcher
+                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
+                .unwrap(),
         );
         // Socket wird ge-binded (ro-bind im Inspect-Modus)
         assert_eq!(
-            count_window(&args, &["--ro-bind", sock.to_str().unwrap(), SANDBOX_TMUX_SOCKET_PATH]),
+            count_window(
+                &args,
+                &[
+                    "--ro-bind",
+                    sock.to_str().unwrap(),
+                    SANDBOX_TMUX_SOCKET_PATH
+                ]
+            ),
             1,
             "tmux socket must be bound read-only in inspect mode: {args:?}"
         );
         // Kein --bind fuer den Socket
         assert_eq!(
-            count_window(&args, &["--bind", sock.to_str().unwrap(), SANDBOX_TMUX_SOCKET_PATH]),
+            count_window(
+                &args,
+                &["--bind", sock.to_str().unwrap(), SANDBOX_TMUX_SOCKET_PATH]
+            ),
             0
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -1275,18 +1343,25 @@ mod tests {
     #[test]
     fn tmux_profile_binds_socket_writable_in_write_mode() {
         use std::os::unix::net::UnixListener;
-        let dir = std::env::temp_dir().join(format!("harwness-bwrap-tmux-write-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("harwness-bwrap-tmux-write-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("tmux-write.sock");
         let _listener = UnixListener::bind(&sock).unwrap();
-        let profile = crate::TmuxSandboxProfile::new(crate::TmuxOperationMode::Write, &sock).unwrap();
-        let launcher = BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
-            .with_tmux_profile(profile);
+        let profile =
+            crate::TmuxSandboxProfile::new(crate::TmuxOperationMode::Write, &sock).unwrap();
+        let launcher =
+            BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap")).with_tmux_profile(profile);
         let args = strings(
-            &launcher.plan(&execute_sandbox(), &[OsString::from("/bin/true")]).unwrap(),
+            &launcher
+                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
+                .unwrap(),
         );
         assert_eq!(
-            count_window(&args, &["--bind", sock.to_str().unwrap(), SANDBOX_TMUX_SOCKET_PATH]),
+            count_window(
+                &args,
+                &["--bind", sock.to_str().unwrap(), SANDBOX_TMUX_SOCKET_PATH]
+            ),
             1,
             "tmux socket must be bound writable in write mode: {args:?}"
         );

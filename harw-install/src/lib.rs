@@ -43,7 +43,10 @@ pub mod update;
 
 pub use context::{InstallContext, InstallMethod};
 pub use dod_units::{ParsedUnit, UnitClass, UNIT_CLASSES};
-pub use doctor::{CheckOutcome, DoctorCheck, default_checks, run_all};
+pub use doctor::{
+    AuditIntegrityCheck, AuditIntegrityEvidence, CheckOutcome, DoctorCheck, KekFilePermsCheck,
+    KekFilePermsEvidence, default_checks, run_all,
+};
 pub use error::{DoctorError, InstallError, MigrationError, PathError, ServiceError, UpdateError};
 pub use migration::{ConfigMigration, MigrationRunner};
 pub use pathscope::PathScope;

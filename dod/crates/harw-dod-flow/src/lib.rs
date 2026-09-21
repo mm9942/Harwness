@@ -1,5 +1,12 @@
 //! Verbindungsereignisse über eBPF — Knoten **AW7-01c**.
 //!
+//! > **V1-Betriebsvertrag.** Der ältere `FlowSensor`/`RawBpfEvent`-Pfad
+//! > weiter unten ist Fixture- und Übergangskompatibilität, nicht der Weg
+//! > für den realen BPF-Lader. Produktionscode erstellt die beiden
+//! > [`flow_contracts`] und verarbeitet `TcpConnectEventV1` aus
+//! > versionierten Wire-Ereignissen. Der Hook beschreibt den
+//! > **ausgehenden Connect-Versuch**, nicht einen späteren Socket-State.
+//!
 //! # Verantwortungsbereich
 //! Geschwister-Crate von `harw-dod-procmon` (AW7-01b): beide bauen auf
 //! `harw-dod-bpf` (AW7-01a) auf, beide melden über `harw-dod-signals`, aber
@@ -31,9 +38,9 @@
 //!
 //! Diese Crate **braucht** ihn nicht: Verbindungszustandswechsel (Verbindung
 //! aufgebaut, geschlossen, …) lassen sich vollständig über den statischen
-//! Kernel-Tracepoint `sock:inet_sock_set_state` beobachten
-//! ([`FLOW_TRACEPOINT_ATTACH_POINT`]) — ein `harw_dod_bpf::BpfProgramKind::Tracepoint`,
-//! der wie `syscalls:sys_enter_execve` in `harw-dod-procmon` ohne einen
+//! BTF-Funktionseinstieg `tcp_v4_connect` und `tcp_v6_connect` beobachten
+//! ([`FLOW_TCP_V4_CONNECT_ATTACH_POINT`]) — ein `harw_dod_bpf::BpfProgramKind::FEntry`,
+//! der wie `sched:sched_process_exec` in `harw-dod-procmon` ohne einen
 //! bereits offenen Socket auskommt. Ein `SocketFilter` (der einen solchen
 //! Socket bräuchte) wäre nötig, um den *Inhalt* von Paketen auf einer
 //! Schnittstelle zu sehen — aber diese Crate meldet ausdrücklich keine
@@ -57,7 +64,7 @@
 //! Siehe [`report`]-Moduldoku für die vollständige Begründung. Kurzfassung:
 //! gemeldet wird die **volle** Zieladresse (nicht ein Netz), aber **nur**,
 //! wenn die Verbindung ausgehend ist **und** ihr Ziel außerhalb des
-//! übergebenen `harw_sandbox::NetworkScope` liegt — „meldet nur, was den
+//! übergebenen `harw_authority::NetworkScope` liegt — „meldet nur, was den
 //! erlaubten Bereich verlässt". Diese Crate hängt dafür bewusst zusätzlich
 //! an `harw-sandbox`, über die im Auftrag nicht ausdrücklich vorgesehene,
 //! aber geprüfte Kantenrichtung: `harw-sandbox` hängt selbst an nichts aus
@@ -87,7 +94,7 @@
 //!
 //! # Diese Crate implementiert `harw_dod_signals::Sensor` (K52)
 //! [`sensor::FlowSensor`] bindet einen injizierten `harw_dod_bpf::BpfLoader`
-//! und einen `harw_sandbox::NetworkScope` an
+//! und einen `harw_authority::NetworkScope` an
 //! `harw_dod_signals::Sensor::poll` — nach demselben Muster wie
 //! `harw-dod-procmon::ProcmonSensor`, damit ein Konsument wie
 //! `harw-probe-bpf` beide Sensoren einheitlich über `Arc<dyn Sensor>` und
@@ -112,7 +119,7 @@
 //! [`event::parse_flow_payload`], [`report::to_security_event`],
 //! [`report::observe`], [`sensor::FlowSensor`], [`sensor::DEFAULT_READ_TIMEOUT`],
 //! [`error::FlowError`], [`error::FlowResult`],
-//! [`REQUIRED_CAPABILITY`], [`FLOW_TRACEPOINT_ATTACH_POINT`],
+//! [`REQUIRED_CAPABILITY`], [`FLOW_TCP_V4_CONNECT_ATTACH_POINT`],
 //! [`flow_program_spec`].
 //!
 //! # Nebenläufigkeit
@@ -132,7 +139,7 @@
 //! # Examples
 //! ```rust
 //! use harw_dod_flow::{event::parse_flow_payload, report::to_security_event};
-//! use harw_sandbox::NetworkScope;
+//! use harw_authority::NetworkScope;
 //! use harw_types::SensorId;
 //!
 //! let mut payload = vec![0u8; 32];
@@ -160,7 +167,7 @@ pub mod report;
 pub mod sensor;
 
 pub use error::{FlowError, FlowResult};
-pub use event::{parse_flow_payload, Direction, FlowEvent, Protocol};
+pub use event::{parse_flow_payload, parse_tcp_connect_v1, Direction, FlowEvent, Protocol, TcpConnectEventV1};
 pub use report::{observe, to_security_event};
 pub use sensor::{FlowSensor, DEFAULT_READ_TIMEOUT};
 
@@ -185,19 +192,55 @@ pub const REQUIRED_CAPABILITY: harw_dod_cap::Capability = harw_dod_cap::Capabili
 /// wird.
 ///
 /// # Description
-/// `sock:inet_sock_set_state` feuert bei jedem Zustandswechsel eines
+/// `tcp_v4_connect` feuert im Kontext des aufrufenden Tasks vor dem
 /// Sockets (u. a. Verbindungsaufbau und -abbau) und trägt dabei bereits
 /// Prozesskontext, Adressfamilie, lokale und entfernte Adresse/Port — alles,
-/// was [`event::parse_flow_payload`] deutet. Ein `BpfProgramKind::Tracepoint`
+/// was [`event::parse_tcp_connect_v1`] deutet. Ein `BpfProgramKind::FEntry`
 /// darauf braucht **keinen** bereits offenen Socket, anders als ein
 /// `BpfProgramKind::SocketFilter` — siehe Moduldoku, Abschnitt „Warum ein
 /// Tracepoint".
 ///
 /// # Examples
 /// ```rust
-/// assert_eq!(harw_dod_flow::FLOW_TRACEPOINT_ATTACH_POINT, "sock:inet_sock_set_state");
+/// assert_eq!(harw_dod_flow::FLOW_TCP_V4_CONNECT_ATTACH_POINT, "tcp_v4_connect");
 /// ```
-pub const FLOW_TRACEPOINT_ATTACH_POINT: &str = "sock:inet_sock_set_state";
+/// The target BTF function used for IPv4 outbound TCP attempts.  Unlike the
+/// former socket-state tracepoint, fentry runs in the initiating task.
+pub const FLOW_TCP_V4_CONNECT_ATTACH_POINT: &str = harw_dod_bpf::TCP_V4_CONNECT_ATTACH_POINT;
+/// The target BTF function used for IPv6 outbound TCP attempts.
+pub const FLOW_TCP_V6_CONNECT_ATTACH_POINT: &str = harw_dod_bpf::TCP_V6_CONNECT_ATTACH_POINT;
+pub const FLOW_TCP_V4_CONNECT_PROGRAM_NAME: &str = harw_dod_bpf::TCP_V4_CONNECT_PROGRAM_NAME;
+pub const FLOW_TCP_V6_CONNECT_PROGRAM_NAME: &str = harw_dod_bpf::TCP_V6_CONNECT_PROGRAM_NAME;
+
+/// Build both task-context TCP contracts.  `tcp_v4_connect` and
+/// `tcp_v6_connect` are separate target-BTF fentry attachments so a host
+/// missing either one cannot quietly claim full dual-stack coverage.
+#[must_use]
+pub fn flow_contracts(
+    sensor: harw_types::SensorId,
+    ipv4_source: harw_dod_bpf::BpfProgramSource,
+    ipv6_source: harw_dod_bpf::BpfProgramSource,
+    scope: harw_dod_bpf::BpfScope,
+) -> [harw_dod_bpf::BpfObjectContract; 2] {
+    [
+        harw_dod_bpf::BpfObjectContract::new(
+            sensor.clone(),
+            FLOW_TCP_V4_CONNECT_PROGRAM_NAME,
+            harw_dod_bpf::BpfProgramKind::FEntry,
+            FLOW_TCP_V4_CONNECT_ATTACH_POINT,
+            ipv4_source,
+            scope.clone(),
+        ),
+        harw_dod_bpf::BpfObjectContract::new(
+            sensor,
+            FLOW_TCP_V6_CONNECT_PROGRAM_NAME,
+            harw_dod_bpf::BpfProgramKind::FEntry,
+            FLOW_TCP_V6_CONNECT_ATTACH_POINT,
+            ipv6_source,
+            scope,
+        ),
+    ]
+}
 
 /// Baut die Programmbeschreibung, mit der ein echter `harw_dod_bpf::BpfLoader`
 /// das eBPF-Programm dieser Crate laden würde.
@@ -206,7 +249,7 @@ pub const FLOW_TRACEPOINT_ATTACH_POINT: &str = "sock:inet_sock_set_state";
 /// Macht die Entscheidung „Tracepoint, kein roher Socket" (siehe Moduldoku)
 /// als Code sichtbar und testbar: die Programmart ist fest
 /// `harw_dod_bpf::BpfProgramKind::Tracepoint`, der Anknüpfungspunkt fest
-/// [`FLOW_TRACEPOINT_ATTACH_POINT`]. Nur die Rumpfquelle bleibt dem Aufrufer
+/// [`FLOW_TCP_V4_CONNECT_ATTACH_POINT`]. Nur die Rumpfquelle bleibt dem Aufrufer
 /// überlassen — sie hängt davon ab, ob das aufrufende Binary den Bytecode
 /// einbettet oder von einem Pfad lädt (siehe
 /// `harw_dod_bpf::BpfProgramSource`-Moduldoku).
@@ -231,8 +274,8 @@ pub const FLOW_TRACEPOINT_ATTACH_POINT: &str = "sock:inet_sock_set_state";
 ///     SensorId::from_str("flow-0"),
 ///     BpfProgramSource::Embedded(Cow::Borrowed(b"\0asm".as_slice())),
 /// );
-/// assert_eq!(spec.kind, BpfProgramKind::Tracepoint);
-/// assert_eq!(spec.attach_point, "sock:inet_sock_set_state");
+/// assert_eq!(spec.kind, BpfProgramKind::FEntry);
+/// assert_eq!(spec.attach_point, "tcp_v4_connect");
 /// ```
 #[must_use]
 pub fn flow_program_spec(
@@ -241,15 +284,15 @@ pub fn flow_program_spec(
 ) -> harw_dod_bpf::BpfProgramSpec {
     harw_dod_bpf::BpfProgramSpec::new(
         sensor,
-        harw_dod_bpf::BpfProgramKind::Tracepoint,
-        FLOW_TRACEPOINT_ATTACH_POINT,
+        harw_dod_bpf::BpfProgramKind::FEntry,
+        FLOW_TCP_V4_CONNECT_ATTACH_POINT,
         source,
     )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{flow_program_spec, FLOW_TRACEPOINT_ATTACH_POINT, REQUIRED_CAPABILITY};
+    use super::{flow_contracts, flow_program_spec, FLOW_TCP_V4_CONNECT_ATTACH_POINT, REQUIRED_CAPABILITY};
 
     #[test]
     fn test_required_capability_is_load_bpf_program_in_the_bpf_class() {
@@ -258,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn test_flow_program_spec_uses_a_tracepoint_and_needs_no_open_socket() {
+    fn test_flow_program_spec_uses_an_fentry_and_needs_no_open_socket() {
         let dir = tempfile::tempdir().expect("tempdir for program body");
         let body_path = dir.path().join("flow.bpf.o");
         std::fs::write(&body_path, b"bytecode-bytes").expect("write fixture program body");
@@ -268,9 +311,23 @@ mod tests {
             harw_dod_bpf::BpfProgramSource::Path(body_path),
         );
 
-        assert_eq!(spec.kind, harw_dod_bpf::BpfProgramKind::Tracepoint);
-        assert_eq!(spec.attach_point, FLOW_TRACEPOINT_ATTACH_POINT);
-        assert_eq!(spec.attach_point, "sock:inet_sock_set_state");
+        assert_eq!(spec.kind, harw_dod_bpf::BpfProgramKind::FEntry);
+        assert_eq!(spec.attach_point, FLOW_TCP_V4_CONNECT_ATTACH_POINT);
+        assert_eq!(spec.attach_point, "tcp_v4_connect");
+    }
+
+    #[test]
+    fn v1_contracts_require_separate_v4_and_v6_task_context_hooks() {
+        use std::borrow::Cow;
+
+        let contracts = flow_contracts(
+            harw_types::SensorId::from_str("flow-0"),
+            harw_dod_bpf::BpfProgramSource::Embedded(Cow::Borrowed(b"v4")),
+            harw_dod_bpf::BpfProgramSource::Embedded(Cow::Borrowed(b"v6")),
+            harw_dod_bpf::BpfScope::Host,
+        );
+        assert_eq!(contracts[0].program_name, "dod_tcp_v4_connect");
+        assert_eq!(contracts[1].program_name, "dod_tcp_v6_connect");
     }
 
     /// Hält die Entscheidung „kein `aya` in dieser Crate" strukturell fest,

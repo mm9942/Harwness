@@ -17,7 +17,7 @@ use harw_dod::{
     Actor, Capability, CpuSensor, EgressFlowRule, EventKind, ReadScope, Rule, RuleContext,
     SecurityEvent, Sensor, SensorHandle, Verdict, run_rules, triage,
 };
-use harw_sandbox::NetworkScope;
+use harw_authority::NetworkScope;
 use harw_types::SensorId;
 
 /// "Beobachte den Host": ein Griff bauen, einen der neun re-exportierten

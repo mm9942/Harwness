@@ -1057,11 +1057,20 @@ mod tests {
     /// sowie `harw-runtime`s eigene Test-Fixtures (`assembly.rs`,
     /// `tests/rights_matrix.rs`):
     /// `<home>/profiles/default/agents/fixture-uia/definition.toml` plus eine
-    /// Zeile `active_uia_definition = "<id>"`, an das von `ensure_home`
-    /// geschriebene Profil-`config.toml` angehängt (statt es zu
-    /// überschreiben, damit dessen restlicher Inhalt erhalten bleibt) — das
-    /// aktive Profil ohne `active_profile`-Datei ist `"default"`
+    /// Zeile `active_uia_definition = "<id>"`, dem von `ensure_home`
+    /// geschriebenen Profil-`config.toml` vorangestellt (statt sie ans
+    /// Dateiende anzuhängen), damit dessen restlicher Inhalt erhalten bleibt
+    /// — das aktive Profil ohne `active_profile`-Datei ist `"default"`
     /// (`harw_home::active_profile_name`).
+    ///
+    /// `PROFILE_CONFIG_TEMPLATE` (`harw-home/src/scaffold.rs`) endet mit
+    /// einer offenen `[mcp_listener]`-Tabelle. In TOML gehört ein
+    /// schlüssellos vorangestelltes `key = value` nach einem
+    /// Tabellenkopf zur zuletzt geöffneten Tabelle — ein Anhängen ans
+    /// Dateiende hätte `active_uia_definition` also fälschlich in
+    /// `[mcp_listener]` platziert und (mit `deny_unknown_fields`) einen
+    /// Parse-Fehler ausgelöst. Voranstellen hält den Schlüssel auf
+    /// Root-Ebene, wo `HarnessConfig::active_uia_definition` ihn erwartet.
     fn write_fixture_uia(home: &Path) {
         let profile_dir = home.join("profiles").join("default");
         let agent_dir = profile_dir.join("agents").join("fixture-uia");
@@ -1071,13 +1080,14 @@ mod tests {
             "schema = \"harwness.agent/v1\"\nid = \"harwness.agent.fixture-uia@1\"\nversion = \"1.0.0\"\nrole = \"user-interface\"\nspecialization = \"terminal-ui\"\n",
         )
         .expect("fixture uia definition");
-        let mut config_file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(profile_dir.join("config.toml"))
-            .expect("open profile config for the fixture UIA");
-        config_file
-            .write_all(b"\nactive_uia_definition = \"harwness.agent.fixture-uia@1\"\n")
-            .expect("append active_uia_definition to profile config");
+        let config_path = profile_dir.join("config.toml");
+        let existing =
+            std::fs::read_to_string(&config_path).expect("read profile config for the fixture UIA");
+        let updated = format!(
+            "active_uia_definition = \"harwness.agent.fixture-uia@1\"\n\n{existing}"
+        );
+        std::fs::write(&config_path, updated)
+            .expect("prepend active_uia_definition to profile config");
     }
 
     fn fixture_inputs(
@@ -1558,10 +1568,35 @@ mod tests {
     #[test]
     fn test_one_shot_assembly_applies_mode_and_config_policy() {
         let fixture = chat_fixture();
+        // `[policy]` gehört ins **Profil**-`config.toml`, nicht ins
+        // Root-`config.toml` von `fixture.home`: `discover_config_with_restricted`
+        // (`harw-config/src/discovery.rs`) läuft `layers` (Root, dann aktives
+        // Profil) in aufsteigender Präzedenz durch und ersetzt bei jedem
+        // Layer, das ein `config.toml` hat, `resolved.harness` **vollständig**
+        // durch die frisch aus diesem Layer geparste `HarnessConfig`
+        // (`resolved.harness = cfg;`). Nur eine explizite Handvoll Felder
+        // (`default_provider`, `default_model`, `active_uia_definition`,
+        // `onboarding`, `internal_models`) wird dabei vom vorherigen Layer
+        // fortgeschrieben — `policy` gehört nicht dazu. Das von
+        // `harw_home::ensure_home` gescaffoldete Profil-`config.toml`
+        // (`PROFILE_CONFIG_TEMPLATE`) kennt kein `[policy]`, deserialisiert es
+        // also als leer, und dieser leere Wert überschreibt beim Profil-Layer
+        // (dem letzten Layer hier, da `chat_fixture()` kein `.harw` im Projekt
+        // anlegt) das `require_approval_for`, das dieser Test zuvor nur ins
+        // Root-`config.toml` geschrieben hatte — die Kette sah darum nie etwas
+        // davon (`snapshot.config_policy_tools` blieb `[]`). Ein Schreiben ins
+        // Root-`config.toml` bliebe also wirkungslos, solange ein Profil-Layer
+        // danach folgt; das Profil-`config.toml` ist die Datei, die
+        // `one_shot_assembly` für `[policy]` tatsächlich liest.
+        let profile_config_path = fixture
+            .home
+            .join("profiles")
+            .join("default")
+            .join("config.toml");
         let mut config_file = std::fs::OpenOptions::new()
             .append(true)
-            .open(fixture.home.join("config.toml"))
-            .expect("open home config");
+            .open(&profile_config_path)
+            .expect("open profile config");
         config_file
             .write_all(b"\n[policy]\nrequire_approval_for = [\"fs.write\"]\n")
             .expect("append approval policy");

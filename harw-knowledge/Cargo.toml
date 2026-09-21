@@ -65,6 +65,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
 jiff = { workspace = true }
 serde_norway = "0.9.42"
+# `kanban/boards/<board-id>/board.toml` persistence (§1.2, §6). Pinned via the
+# workspace default (`[workspace.dependencies] toml`, root `Cargo.toml`), same
+# as `harw-home`/`harw-authority`/`harw-lens-embed`.
+toml = { workspace = true }
 # External crates are LISTED here for the parent build to `cargo add` (this
 # worker never runs cargo); no version is invented for them.
 # TODO(parent cargo add): jiff --features serde   # Timestamp for frontmatter / diary / dream (NOT chrono)
@@ -75,7 +79,6 @@ serde_norway = "0.9.42"
 # TODO(parent cargo add): croner                  # dream-job cron schedule parsing (§4.3)
 # TODO(parent cargo add): blake3                  # content-hash for artifact versioning / index-cache keys (future)
 # TODO(parent cargo add): etcetera                # XDG/workspace-root resolution for the on-disk layout (§1.2)
-# TODO(parent cargo add): toml                    # kanban board.toml metadata (§1.2)
 # Optional — NOT required by knowledge-surfaces.md v1; add only if a later phase needs them:
 # TODO(parent cargo add): ulid                    # OPTIONAL time-ordered ids (doc uses slug-derived ids)
 # TODO(parent cargo add): redb                    # OPTIONAL embedded index cache (doc uses a rebuildable file cache)

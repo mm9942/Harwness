@@ -39,7 +39,7 @@ use std::sync::Arc;
 
 use harw_browser::policy::OriginRule;
 use harw_extension_api::contributors::ToolProvider;
-use harw_sandbox::Permission;
+use harw_authority::Permission;
 use harw_tools::{
     AdditionalProperties, FunctionToolSpec, JsonSchema, JsonSchemaType, ToolCall,
     ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName, ToolOutput, ToolSpec,

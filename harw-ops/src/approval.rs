@@ -391,9 +391,7 @@ mod tests {
     };
     use crate::testutil::toks;
     use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
-    use harw_sandbox::{
-        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-    };
+    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_session_store::approval::{ApprovalRecord, ApprovalStore};
     use harw_types::{
         ApprovalActor, Clock, IngressSurface, ItemId, PermissionTier, Principal, PrincipalKind,

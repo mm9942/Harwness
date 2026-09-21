@@ -1,0 +1,15 @@
+[Unit]
+Description=HARW DoD Warden activation socket (disabled)
+ConditionPathExists=@SYSCONFDIR@/warden.enable
+
+[Socket]
+ListenSequentialPacket=@RUNTIMEDIR@/warden.sock
+SocketMode=0660
+SocketUser=root
+SocketGroup=harw-dod-ipc
+DirectoryMode=0750
+Service=harw-dod-warden.service
+RemoveOnStop=yes
+
+# No [Install] section: the socket is never enabled by `install`, `enable`,
+# or the observation target. This is a SOCK_SEQPACKET endpoint, not a stream.

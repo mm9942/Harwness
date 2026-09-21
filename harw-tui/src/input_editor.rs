@@ -302,13 +302,27 @@ impl InputEditor {
         debug_assert!(self.buffer.is_char_boundary(self.cursor));
     }
 
-    /// Löscht auf der aktuellen Zeile alles rechts vom Cursor (Ctrl+K-Semantik).
+    /// Löscht auf der aktuellen Zeile alles rechts vom Cursor (Ctrl+K-Semantik,
+    /// Emacs `kill-line`).
     ///
-    /// Ein folgender Zeilenumbruch und alle nachfolgenden Eingabezeilen bleiben
-    /// erhalten, damit Ctrl+K keinen mehrzeiligen Entwurf unerwartet verkürzt.
+    /// Steht der Cursor noch vor dem Zeilenende, wird nur bis zum Zeilenende
+    /// gelöscht; der Zeilenumbruch selbst bleibt erhalten, damit Ctrl+K keinen
+    /// mehrzeiligen Entwurf unerwartet verkürzt. Steht der Cursor dagegen
+    /// bereits am Zeilenende — nichts mehr auf dieser Zeile zu löschen — und
+    /// folgt eine weitere Zeile, wird stattdessen der Zeilenumbruch selbst
+    /// entfernt: die nächste Zeile rückt an die aktuelle heran (klassisches
+    /// Emacs-`kill-line`-Verhalten). Steht der Cursor bereits am Ende des
+    /// gesamten Puffers (keine weitere Zeile zum Anhängen), ist die Operation
+    /// ein No-Op.
     pub fn delete_to_end(&mut self) {
         let end = self.current_line_end();
-        self.buffer.drain(self.cursor..end);
+        if self.cursor < end {
+            self.buffer.drain(self.cursor..end);
+        } else if end < self.buffer.len() {
+            // `end` zeigt auf den Zeilenumbruch selbst (buffer[end] == '\n').
+            let next = end + '\n'.len_utf8();
+            self.buffer.drain(end..next);
+        }
         debug_assert!(self.buffer.is_char_boundary(self.cursor));
     }
 
@@ -1331,6 +1345,13 @@ mod tests {
     }
 
     // 21. ctrl_k_deletes_only_to_end_of_current_line
+    //
+    // Emacs-`kill-line`-Semantik: steht der Cursor noch vor dem Zeilenende,
+    // löscht Ctrl+K nur bis dahin und lässt den Zeilenumbruch stehen. Steht
+    // der Cursor schon am Zeilenende (nichts mehr auf dieser Zeile), löscht
+    // ein weiteres Ctrl+K stattdessen den Zeilenumbruch selbst und zieht die
+    // nächste Zeile heran — ist der Cursor bereits am Ende des gesamten
+    // Puffers (keine weitere Zeile), ist die Operation ein No-Op.
     #[test]
     fn test_ctrl_k_deletes_to_end_of_current_line_without_moving_cursor() {
         let mut ed = InputEditor::new();
@@ -1346,13 +1367,32 @@ mod tests {
         assert_eq!(ed.text(), "before\n");
         assert_eq!(ed.cursor(), cursor);
 
+        // Cursor steht jetzt bereits am Ende der (leeren) zweiten Zeile UND
+        // am Ende des gesamten Puffers — keine weitere Zeile zum Anhängen,
+        // also No-Op.
         ed.move_home();
         assert_eq!(
             ed.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)),
             InputAction::Redraw
         );
-        assert_eq!(ed.text(), "\n");
-        assert_eq!(ed.cursor(), 0);
+        assert_eq!(ed.text(), "before\n");
+        assert_eq!(ed.cursor(), cursor);
+
+        // Gegenprobe für den Join-Fall: Cursor am Ende der ersten Zeile,
+        // direkt vor dem Zeilenumbruch, mit einer zweiten Zeile dahinter —
+        // Ctrl+K entfernt hier den Zeilenumbruch und zieht "after" heran.
+        ed.clear();
+        ed.insert_str("before\nafter");
+        for _ in 0..6 {
+            ed.move_left();
+        }
+        assert_eq!(ed.cursor(), 6);
+        assert_eq!(
+            ed.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL)),
+            InputAction::Redraw
+        );
+        assert_eq!(ed.text(), "beforeafter");
+        assert_eq!(ed.cursor(), 6);
     }
 
     // 22. utf8_boundary_safety

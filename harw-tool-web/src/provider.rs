@@ -26,7 +26,7 @@
 //! [`configure`] bzw. [`crate::fetch::install_fetcher`] (ohne Aufruf kein
 //! Abruf). Der geteilte Fetcher trägt **keinen** Sandbox-Scope; jeder Tool-Aufruf leitet mit
 //! [`crate::fetch::scoped_fetcher`] eine Kopie ab, die den
-//! [`harw_sandbox::NetworkScope`] der aktiven Sandbox trägt. Damit ist die
+//! [`harw_authority::NetworkScope`] der aktiven Sandbox trägt. Damit ist die
 //! Allowlist pro Aufruf gebunden und nicht prozessweit eingefroren.
 //!
 //! # Schlüsseltypen

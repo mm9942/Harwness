@@ -11,7 +11,7 @@ pub mod items;
 pub mod methods;
 pub mod wire;
 
-pub use approvals::{ApprovalRequest, ApprovalResponse};
+pub use approvals::{ApprovalKind, ApprovalRequest, ApprovalResponse};
 pub use events::{SessionEvent, TurnEvent};
 pub use items::{
     AssistantMessageItem, ContentPart, ErrorItem, OpaqueReasoning, ReasoningItem, ResultTrust,

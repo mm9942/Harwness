@@ -8,7 +8,7 @@
 //! # Key types
 //! - [`require_permission`] — generic single-permission guard.
 //! - [`require_host_access`] — network guard combining `Permission::NetworkAccess`
-//!   with the sandbox's [`harw_sandbox::NetworkScope`] host allow-list.
+//!   with the sandbox's [`harw_authority::NetworkScope`] host allow-list.
 //! - [`host_from_url`] — URL-to-hostname extraction used to feed
 //!   [`require_host_access`]; delegates to [`harw_sandbox::EgressUrl::parse`]
 //!   (WHATWG parsing, the same parser reqwest uses to connect).
@@ -23,7 +23,7 @@
 //! ```rust,no_run
 //! use harw_tools::sandbox_guard::{host_from_url, require_host_access, require_permission};
 //! use harw_tools::{ToolExecutionContext, ToolOutput, ToolsError};
-//! use harw_sandbox::Permission;
+//! use harw_authority::Permission;
 //!
 //! fn dispatch(ctx: &ToolExecutionContext, url: &str) -> Result<ToolOutput, ToolsError> {
 //!     if let Some(err) = require_permission(ctx, Permission::ReadWorkspace, "fs.read") {
@@ -39,7 +39,8 @@
 //! ```
 
 use crate::{executor::ToolExecutionContext, output::ToolOutput};
-use harw_sandbox::{EgressUrl, Permission};
+use harw_authority::Permission;
+use harw_sandbox::EgressUrl;
 
 /// Returns `Some(ToolOutput::error(...))` when the sandbox does NOT grant the
 /// required permission. Callers wrap the result in `Ok(...)` so the check reads
@@ -72,7 +73,7 @@ use harw_sandbox::{EgressUrl, Permission};
 /// ```rust,no_run
 /// use harw_tools::sandbox_guard::require_permission;
 /// use harw_tools::{ToolExecutionContext, ToolOutput, ToolsError};
-/// use harw_sandbox::Permission;
+/// use harw_authority::Permission;
 ///
 /// fn dispatch(ctx: &ToolExecutionContext) -> Result<ToolOutput, ToolsError> {
 ///     if let Some(err) = require_permission(ctx, Permission::ReadWorkspace, "fs.read") {
@@ -109,15 +110,15 @@ pub fn require_permission(
 /// fortfahren.
 ///
 /// Die Prüfung bleibt bewusst namensgebunden
-/// ([`harw_sandbox::NetworkScope::allows`]), nicht adressgebunden
-/// ([`harw_sandbox::NetworkScope::allows_addr`]): dieser Guard läuft als
+/// ([`harw_authority::NetworkScope::allows`]), nicht adressgebunden
+/// ([`harw_authority::NetworkScope::allows_addr`]): dieser Guard läuft als
 /// Makro-Prolog *vor* jeder Deserialisierung und jedem Verbindungsaufbau — es
 /// gibt an dieser Stelle noch keine aufgelöste Adresse zu prüfen. `allows_addr`
 /// würde hier auch nicht weiterhelfen: ein über
-/// [`harw_sandbox::NetworkScope::from_hosts`]
+/// [`harw_authority::NetworkScope::from_hosts`]
 /// aus Hostnamen gebauter Scope trägt ausschließlich
-/// [`harw_sandbox::EgressTarget::DnsSuffix`]-Ziele, nie
-/// [`harw_sandbox::EgressTarget::Cidr`]-Ziele, gegen die `allows_addr`
+/// [`harw_authority::EgressTarget::DnsSuffix`]-Ziele, nie
+/// [`harw_authority::EgressTarget::Cidr`]-Ziele, gegen die `allows_addr`
 /// auswerten könnte.
 ///
 /// # Arguments
@@ -214,7 +215,7 @@ pub fn host_from_url(url: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::executor::ToolExecutionContext;
-    use harw_sandbox::{
+    use harw_authority::{
         NetworkScope, Permission, PermissionSet, SandboxSpec, WorkspaceRegistration,
         WorkspaceRegistry,
     };
@@ -246,17 +247,40 @@ mod tests {
         (base, spec)
     }
 
-    /// Wie [`make_sandbox`], aber mit einem eingeschränkten Netzwerk-Scope, der nur die
-    /// übergebenen Hosts erlaubt. Baut auf [`make_sandbox`] auf, sodass dessen bestehende
-    /// Aufrufer und Tests unverändert bleiben.
+    /// Wie [`make_sandbox`], setzt zusätzlich einen echten, eingeschränkten
+    /// Netzwerk-Scope, der nur die übergebenen Hosts erlaubt. Nutzt
+    /// `SandboxSpec::from_resolved_for_test` (Feature `test-support` von
+    /// `harw-authority`, nur in `[dev-dependencies]` dieser Crate) — die
+    /// produktive API erlaubt außerhalb von `harw-authority` sonst nur
+    /// `NetworkScope::empty()` (`SandboxSpec::from_resolved`).
     fn make_sandbox_with_hosts(
         test_id: &str,
         permissions: Vec<Permission>,
         allowed_hosts: Vec<&str>,
     ) -> (PathBuf, SandboxSpec) {
-        let (base, spec) = make_sandbox(test_id, permissions);
-        let scope = NetworkScope::from_hosts(allowed_hosts.into_iter().map(str::to_owned));
-        (base, spec.with_network_scope(scope))
+        let base = std::env::temp_dir()
+            .join("harw_sandbox_guard_tests")
+            .join(test_id);
+        let ws = base.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let registry = WorkspaceRegistry::build(
+            &base,
+            [WorkspaceRegistration {
+                tenant: TenantId::from_str("t"),
+                workspace: WorkspaceId::from_str("w"),
+                root: PathBuf::from("ws"),
+            }],
+        )
+        .unwrap();
+        let binding = registry
+            .resolve(&TenantId::from_str("t"), &WorkspaceId::from_str("w"))
+            .unwrap();
+        let spec = SandboxSpec::from_resolved_for_test(
+            binding,
+            PermissionSet::from_policy(permissions),
+            NetworkScope::from_hosts(allowed_hosts.into_iter().map(str::to_owned)),
+        );
+        (base, spec)
     }
 
     fn make_ctx(spec: SandboxSpec) -> ToolExecutionContext {
@@ -363,6 +387,8 @@ mod tests {
     }
 
     /// `NetworkAccess` gewährt, aber Host nicht im Scope → `Some(error)`, Meldung nennt den Host.
+    /// Prüft gezielt gegen die Allow-Liste, nicht nur gegen einen leeren Scope:
+    /// `docs.rs` selbst bleibt erlaubt, nur `evil.example` wird abgelehnt.
     #[test]
     fn test_require_host_access_returns_error_when_host_not_allowed() {
         let (_base, spec) = make_sandbox_with_hosts(
@@ -371,6 +397,11 @@ mod tests {
             vec!["docs.rs"],
         );
         let ctx = make_ctx(spec);
+
+        assert!(
+            require_host_access(&ctx, "docs.rs", "http.fetch").is_none(),
+            "docs.rs is on the allow list and must remain allowed"
+        );
 
         let output = require_host_access(&ctx, "evil.example", "http.fetch")
             .expect("should produce Some when host is not in the allowed scope");

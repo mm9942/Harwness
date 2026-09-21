@@ -1,13 +1,13 @@
 //! `NetPlan`: der inspizierbare, unveränderliche Netzplan-Wert.
 //!
 //! Enthält [`NetPlan`] selbst und [`plan_for_scope`], die einzige Brücke von
-//! `harw_sandbox::NetworkScope` zu dieser Crate. Siehe die Moduldoc von
+//! `harw_authority::NetworkScope` zu dieser Crate. Siehe die Moduldoc von
 //! `crate` für die Gesamt-Architektur und die Zusage, die dieser Knoten
 //! trägt.
 
 use std::net::IpAddr;
 
-use harw_sandbox::{EgressTarget, NetworkScope};
+use harw_authority::{EgressTarget, NetworkScope};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -41,7 +41,7 @@ impl NetPlan {
     ///
     /// # Description
     /// Normalisiert `host` identisch zu
-    /// `harw_sandbox::NetworkScope::allows` und delegiert dann an jede
+    /// `harw_authority::NetworkScope::allows` und delegiert dann an jede
     /// Regel. Für einen per [`plan_for_scope`] gebauten Plan gilt: dieses
     /// Ergebnis ist identisch zu `scope.allows(host)` des Quell-Bereichs —
     /// das ist die Grundlage der Eigenschaft, dass ein Plan nie mehr
@@ -59,7 +59,7 @@ impl NetPlan {
     ///
     /// # Examples
     /// ```rust
-    /// use harw_sandbox::NetworkScope;
+    /// use harw_authority::NetworkScope;
     /// use harw_dod_netpolicy::plan_for_scope;
     ///
     /// let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);
@@ -153,7 +153,7 @@ impl NetPlan {
 ///
 /// # Examples
 /// ```rust
-/// use harw_sandbox::NetworkScope;
+/// use harw_authority::NetworkScope;
 /// use harw_dod_netpolicy::plan_for_scope;
 ///
 /// let scope = NetworkScope::empty();

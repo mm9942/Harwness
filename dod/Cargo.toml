@@ -6,6 +6,7 @@ members = [
     "crates/harw-dod-bpf",
     "crates/harw-dod-cap",
     "crates/harw-dod-cgroup",
+    "crates/harw-dod-config",
     "crates/harw-dod-cpu",
     "crates/harw-dod-escalate",
     "crates/harw-dod-fixtures",

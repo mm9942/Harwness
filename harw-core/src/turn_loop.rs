@@ -692,6 +692,23 @@ impl From<ReviewDecision> for ApprovalResolution {
     }
 }
 
+impl ApprovalResolution {
+    /// Die eine Ablehnung, die jede Oberfläche liefert, sobald
+    /// [`crate::session::PendingApproval::timeout_at`] erreicht ist, ohne
+    /// dass eine ausdrückliche Entscheidung eintraf (Interaktionsvertrag
+    /// §4.4). Eine gemeinsame Konstruktionsstelle statt einer Kopie der
+    /// Begründung je Front-End.
+    ///
+    /// # Returns
+    /// [`Self::Reject`] mit [`crate::session::APPROVAL_TIMEOUT_REASON`].
+    #[must_use]
+    pub fn timed_out() -> Self {
+        Self::Reject {
+            reason: crate::session::APPROVAL_TIMEOUT_REASON.to_owned(),
+        }
+    }
+}
+
 /// Sammelt Kontext von allen `ContextProvider`n und filtert nach der
 /// session-level [`SessionActivation`][crate::activation::SessionActivation].
 ///
@@ -2481,16 +2498,17 @@ async fn drive_turn(
                     );
                     let _approval_guard = approval_span.enter();
 
+                    let paused_at = jiff::Timestamp::now();
                     if let Some(approvals) = approvals {
                         approvals.issue(&ApprovalRecord {
                             request: request.clone(),
                             session: session.id().clone(),
                             call_id: call.id.clone(),
                             actor: actor.clone(),
-                            issued_at: jiff::Timestamp::now(),
+                            issued_at: paused_at,
                         })?;
                     }
-                    session.begin_approval(call.clone(), request.clone(), actor)?;
+                    session.begin_approval(call.clone(), request.clone(), actor, paused_at)?;
                     return Ok(TurnOutcome::AwaitingApproval {
                         call_id: call.id,
                         request,
@@ -3393,7 +3411,7 @@ mod tests {
     use harw_extension_api::{
         AgentSpawnError, AgentSpawner, ExtensionRegistryBuilder, SpawnFuture, SpawnInput,
     };
-    use harw_sandbox::SandboxSpec;
+    use harw_authority::SandboxSpec;
     use harw_tools::{
         FunctionToolSpec, JsonSchema, ToolCall, ToolExecutionContext, ToolExecutor,
         ToolExecutorFuture, ToolName, ToolOutput, ToolSpec, ToolsError,
@@ -3404,6 +3422,16 @@ mod tests {
     use tokio::sync::mpsc;
 
     struct LoadFailStore;
+
+    #[test]
+    fn approval_resolution_timed_out_is_a_reject_with_the_canonical_reason() {
+        assert_eq!(
+            ApprovalResolution::timed_out(),
+            ApprovalResolution::Reject {
+                reason: crate::session::APPROVAL_TIMEOUT_REASON.to_owned(),
+            }
+        );
+    }
 
     #[test]
     fn sequence_exhaustion_rejects_the_turn() {
@@ -4386,9 +4414,9 @@ mod tests {
             .parent()
             .expect("harw-core hat ein Workspace-Elternverzeichnis")
             .to_path_buf();
-        let registry = harw_sandbox::WorkspaceRegistry::build(
+        let registry = harw_authority::WorkspaceRegistry::build(
             &harness_root,
-            [harw_sandbox::WorkspaceRegistration {
+            [harw_authority::WorkspaceRegistration {
                 tenant: harw_types::TenantId::from_str("test-tenant"),
                 workspace: harw_types::WorkspaceId::from_str("core-parallel-tests"),
                 root: std::path::PathBuf::from("harw-core"),
@@ -4402,10 +4430,10 @@ mod tests {
                     &harw_types::WorkspaceId::from_str("core-parallel-tests"),
                 )
                 .expect("Test-Workspace löst auf"),
-            harw_sandbox::PermissionSet::from_policy([
-                harw_sandbox::Permission::ReadWorkspace,
-                harw_sandbox::Permission::WriteWorkspace,
-                harw_sandbox::Permission::ExecuteProcess,
+            harw_authority::PermissionSet::from_policy([
+                harw_authority::Permission::ReadWorkspace,
+                harw_authority::Permission::WriteWorkspace,
+                harw_authority::Permission::ExecuteProcess,
             ]),
         )
     }

@@ -2485,12 +2485,12 @@ mod tests {
     /// pattern as every other executor test in this workspace (duplicated,
     /// not shared, by convention — see `harw_tools::context_load`'s own
     /// tests).
-    fn test_sandbox() -> harw_sandbox::SandboxSpec {
+    fn test_sandbox() -> harw_authority::SandboxSpec {
         let base = std::env::temp_dir().join("harw_core_context_budget_tests");
         let _ = std::fs::create_dir_all(&base);
-        let registry = harw_sandbox::WorkspaceRegistry::build(
+        let registry = harw_authority::WorkspaceRegistry::build(
             &base,
-            [harw_sandbox::WorkspaceRegistration {
+            [harw_authority::WorkspaceRegistration {
                 tenant: harw_types::TenantId::from_str("t"),
                 workspace: harw_types::WorkspaceId::from_str("w"),
                 root: std::path::PathBuf::from("."),
@@ -2500,9 +2500,9 @@ mod tests {
         let binding = registry
             .resolve(&harw_types::TenantId::from_str("t"), &harw_types::WorkspaceId::from_str("w"))
             .expect("test workspace resolves");
-        harw_sandbox::SandboxSpec::from_resolved(
+        harw_authority::SandboxSpec::from_resolved(
             binding,
-            harw_sandbox::PermissionSet::from_policy(vec![harw_sandbox::Permission::ReadWorkspace]),
+            harw_authority::PermissionSet::from_policy(vec![harw_authority::Permission::ReadWorkspace]),
         )
     }
 

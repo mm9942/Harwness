@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+harw-authority = { path = "../../../harw-authority" }
 # Zugriffsvokabular: Capability, CapabilityClass, ReadScope, SensorHandle,
 # SensorError, Permanence -- ohne das kann kein Aufrufer einen Griff bauen,
 # den einer der Sensor-Typen unten annimmt (siehe `//!`-Block in src/lib.rs).

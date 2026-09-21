@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+harw-authority = { path = "../harw-authority" }
 async-trait = "0.1.89"
 harw-browser = { path = "../harw-browser" }
 harw-extension-api = { path = "../harw-extension-api" }

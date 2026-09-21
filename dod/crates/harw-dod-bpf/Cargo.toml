@@ -16,6 +16,9 @@ harw-macros = { path = "../../../harw-macros" }
 harw-dod-cap = { path = "../harw-dod-cap" }
 # Zeitachse für den dekodierten Ereignis-Zeitstempel (Formungsteil).
 jiff = { workspace = true }
+# `CLOCK_MONOTONIC` and `CLOCK_REALTIME` are sampled together by the loader;
+# no `ktime` value is treated as Unix epoch time.
+rustix = { workspace = true, features = ["time"] }
 # Reale eBPF-Ladeschicht (`src/real.rs`, Nachtrag zu AW7-01a/AW7-01d): der
 # `harw-dod-flow`-Konsument hängt inzwischen an einem Tracepoint statt an
 # `SocketFilter`, was das zuvor dokumentierte Hindernis (ein generischer

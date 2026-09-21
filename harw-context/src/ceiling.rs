@@ -3,8 +3,8 @@
 //! # Verantwortungsbereich
 //! Besitzt [`ContextCeiling`] und [`CeilingViolation`]. Eine `ContextCeiling`
 //! wird beim Handoff an ein Kind **im selben Schritt geschnitten** wie die
-//! Berechtigungen (vgl. `harw_sandbox::PermissionSet` /
-//! `harw_sandbox::NetworkScope`, deren Vorbild diese Datei folgt): ein Kind
+//! Berechtigungen (vgl. `harw_authority::PermissionSet` /
+//! `harw_authority::NetworkScope`, deren Vorbild diese Datei folgt): ein Kind
 //! kann seine Decke nie anheben, weil es keine Methode gibt, mit der es das
 //! täte. Es gibt bewusst kein `union`, kein `widen`, keinen öffentlichen
 //! Konstruktor, der zwei Decken zu einer größeren verschmilzt.

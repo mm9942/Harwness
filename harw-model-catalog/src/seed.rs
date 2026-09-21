@@ -103,6 +103,7 @@ fn provider_toml_from(spec: &ProviderSpec) -> ProviderToml {
         origin_allowlist: OriginAllowlistToml::default(),
         rate_limit: None,
         max_concurrency: None,
+        originator: None,
     }
 }
 

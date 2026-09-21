@@ -9,6 +9,7 @@ default = ["browser"]
 browser = ["harw-registry-defaults/browser"]
 
 [dependencies]
+harw-authority = { path = "../harw-authority" }
 # Gemeinsame Runtime-Montage (L12): darf nur von `harw-tui` und `harw-cli`
 # genutzt werden, sonst entsteht ein Zyklus.
 harw-agent-dsl = { path = "../harw-agent-dsl" }
@@ -44,6 +45,10 @@ harw-registry-defaults = { path = "../harw-registry-defaults" }
 harw-sandbox = { path = "../harw-sandbox" }
 harw-secrets = { path = "../harw-secrets" }
 harw-session-store = { path = "../harw-session-store" }
+# Geteilter Host-Permit-Fragekanal (`host_permit_prompt`): `RuntimeAssembly`
+# baut ihn hier, damit `harw-tui` ihn übernimmt statt einen eigenen zu bauen,
+# ohne dass `harw-tool-shell` selbst je von `harw-tui` abhängen müsste.
+harw-tool-shell = { path = "../harw-tool-shell" }
 harw-types = { path = "../harw-types" }
 # Kein `[workspace.dependencies]`-Eintrag für tokio; Version = Cargo.lock.
 tokio = { version = "1.53.0", features = ["rt", "sync", "time"] }

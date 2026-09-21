@@ -703,10 +703,8 @@ mod tests {
     use harw_extension_api::approval_mode::ApprovalModeCell;
     use harw_operations::context::ServiceMap;
     use harw_operations::{FromRawArgs, OpContext, OpError};
-    use harw_sandbox::{
-        ExtraRootsCell, Permission, PermissionSet, SandboxSpec, WorkspaceRegistration,
-        WorkspaceRegistry,
-    };
+    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_sandbox    ::ExtraRootsCell;
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};

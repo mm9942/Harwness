@@ -7,10 +7,10 @@
 use std::net::IpAddr;
 
 use harw_dod_netpolicy::plan_for_scope;
-use harw_sandbox::NetworkScope;
+use harw_authority::NetworkScope;
 
 // Baut einen `NetworkScope` über dessen öffentlichen `serde`-Wire-Vertrag
-// (siehe `harw_sandbox::EgressTarget`s `Serialize`/`Deserialize`-Kommentar
+// (siehe `harw_authority::EgressTarget`s `Serialize`/`Deserialize`-Kommentar
 // in `harw-sandbox/src/lib.rs`): ein führendes `=` ergibt `Host`, ein
 // gültiges CIDR-Literal ergibt `Cidr`, alles andere `DnsSuffix`. Das ist der
 // einzige Weg, aus einer anderen Crate einen Bereich mit `Host`- oder

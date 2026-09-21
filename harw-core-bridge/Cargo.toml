@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+harw-authority = { path = "../harw-authority" }
 harw-types = { path = "../harw-types" }
 harw-sandbox = { path = "../harw-sandbox" }
 harw-operations = { path = "../harw-operations" }
@@ -26,6 +27,15 @@ tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros"] }
 # implementieren, um die Contract-Auflösung über den OpContext zu prüfen.
 harw-agent-dsl = { path = "../harw-agent-dsl" }
 harw-catalog = { path = "../harw-catalog" }
+# Nur für Tests: schaltet `harw_authority::SandboxSpec::from_resolved_for_test`
+# frei, das eine Sandbox mit einem echten, nicht-leeren `NetworkScope` baut —
+# die produktive API von `harw-authority` (bereits oben unter
+# `[dependencies]`) erlaubt das sonst nirgends. Nötig, damit die
+# Authority-Reduzierer-Tests belegen, dass `reduce_to_read_network` die
+# Parent-Hosts tatsächlich durchreicht, während die anderen Reduzierer sie
+# löschen. Wegen `resolver = "2"` nur im Testbuild aktiv, nie im produktiven
+# Build dieser Crate.
+harw-authority = { path = "../harw-authority", features = ["test-support"] }
 
 [lints]
 workspace = true

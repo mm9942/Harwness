@@ -1,52 +1,27 @@
-//! Ausführungsmotor: führt Regeln aus und zertifiziert ihre rohen Befunde.
+//! Regelmaschine: führt alle Regeln parallel über einem gemeinsamen
+//! [`RuleContext`] aus (Knoten AW4-04 p2.1-p2.4).
 //!
 //! # Verantwortungsbereich
-//! [`run_rules`] ist der einzige Ort außerhalb von [`crate::finding`], der
-//! den `pub(crate)`-Übergang `Finding::check` aufruft. Genau darüber bekommt
-//! ein Aufrufer außerhalb dieser Crate — namentlich `harw-dod-escalate`
-//! (Knoten AW5-03) — überhaupt einen `Finding<RuleChecked>` in die Hand:
-//! nicht durch eigene Konstruktion (unmöglich, siehe
-//! [`crate::finding`]-Moduldoku), sondern indem es das Ergebnis dieser
-//! Funktion entgegennimmt.
+//! Dieses Modul bindet [`Rule`]‑Implementierungen aus [`crate::rules`] ein
+//! und ruft sie nebenläufig auf. Es entscheidet **nicht**, was ein Befund
+//! bedeutet, und zertifiziert ihn nicht — das passiert später in
+//! [`crate::certification`].
 //!
-//! Ein so zertifizierter Befund verlässt den Sammelprozess nicht als
-//! `Finding<RuleChecked>`, sondern über
-//! [`crate::finding::Finding::record`] als [`crate::finding::FindingRecord`]
-//! (Spool, W3/C-FIND); triagiert wird er am Zielort über
-//! [`crate::finding::triage_record`], das ein Verdikt nur gegen einen selbst
-//! neu berechneten Record-Digest akzeptiert. Die zweite Prägestelle dieser
-//! Crate ist `crate::advisory::correlate_advisories` (ebenfalls hinter
-//! `Finding::check`, siehe dortige Moduldoku).
-//!
-//! # Warum die Identitätsvergabe hier liegt und nicht in `Rule::evaluate`
-//! [`harw_types::FindingId::new`] erzeugt eine zufällige UUID. Läge diese
-//! Vergabe in einer [`crate::rule::Rule::evaluate`]-Implementierung, wäre die
-//! Regel nicht mehr deterministisch prüfbar: zwei Aufrufe mit identischem
-//! [`crate::rule::RuleContext`] lieferten unterschiedliche Ergebnisse, obwohl
-//! sich an der Beobachtung nichts geändert hat — genau der Fall, den die
-//! Reinheitsauflage in [`crate::rule`]-Moduldoku ausschließt. Diese Funktion
-//! liegt deshalb bewusst *hinter* jeder Regelauswertung, in der reinen
-//! Verdrahtung: `Finding<Raw>` trägt keine Identität (`S::Identity = ()`,
-//! siehe [`crate::finding`]-Moduldoku), also bleibt die Regel selbst
-//! vollständig deterministisch, während der Motor jedem zertifizierten
-//! Befund erst danach eine stabile, einmalige Identität zuweist.
-//!
-//! # Nebenläufigkeit
-//! [`run_rules`] liest `rules` und `ctx` nur (`&`), schreibt nirgends
-//! geteilten Zustand und ist damit sicher aus mehreren Threads mit
-//! unterschiedlichen Argumenten aufrufbar. Jede einzelne
-//! [`crate::rule::Rule::evaluate`]-Implementierung muss selbst
-//! `Send + Sync` sein (Supertrait-Bound auf [`crate::rule::Rule`]).
+//! # Parallelität
+//! Die Implementierung benutzt `rayon::join_all`, damit jede Regel als
+//! unabhängige Berechnung läuft. Alle Regeln sind reine Funktionen auf dem
+//! unveränderlichen [`RuleContext`]; es gibt keinen gemeinsamen veränderlichen
+//! Zustand und keine Sperren.
 //!
 //! # Fehler
-//! Keine. Regeln liefern kein `Result`; die Identitätsvergabe ist total.
+//! Keine. Regeln liefern entweder Befunde oder nicht; ein Lauf kann nicht
+//! fehlschlagen.
 //!
 //! # Examples
 //! ```rust
-//! use harw_dod_rules::rule::{Rule, RuleContext};
-//! use harw_dod_rules::rules::StructureDriftRule;
-//! use harw_dod_rules::run_rules;
-//! use harw_sandbox::NetworkScope;
+//! use harw_authority::NetworkScope;
+//! use harw_dod_rules::engine::run_rules;
+//! use harw_dod_rules::rule::RuleContext;
 //!
 //! let scope = NetworkScope::empty();
 //! let ctx = RuleContext {
@@ -56,49 +31,30 @@
 //!     baselines: &[],
 //!     network_scope: &scope,
 //! };
-//! let rule: &dyn Rule = &StructureDriftRule;
-//! assert!(run_rules(&[rule], &ctx).is_empty());
+//! assert!(run_rules(&ctx).is_empty());
 //! ```
 
-use harw_types::FindingId;
+use rayon::prelude::*;
 
-use crate::finding::{Finding, RuleChecked};
-use crate::rule::{Rule, RuleContext};
+use crate::finding::{Finding, Raw};
+use crate::rule::RuleContext;
+use crate::rules::ALL_RULES;
 
-/// Führt alle übergebenen Regeln gegen einen Kontext aus und zertifiziert die
-/// Ergebnisse.
-///
-/// # Description
-/// Ruft [`crate::rule::Rule::evaluate`] auf jeder Regel in `rules` auf und
-/// überführt jeden zurückgelieferten `Finding<Raw>` per
-/// `Finding::check` (dieser Crate vorbehalten) in einen `Finding<RuleChecked>`
-/// mit frischer, zufälliger [`FindingId`]. Siehe Moduldoku für die
-/// Begründung, warum die Identitätsvergabe hier und nicht in einer Regel
-/// selbst liegt.
+/// Führt alle bekannten Regeln parallel aus und liefert deren Befunde.
 ///
 /// # Arguments
-/// - `rules` (`&[&dyn Rule]`): die auszuführenden Regeln, in Aufrufreihenfolge.
 /// - `ctx` (`&RuleContext<'_>`): der gemeinsame Eingabekontext für alle Regeln.
 ///
 /// # Returns
-/// Alle ausgelösten Befunde, zertifiziert, in der Reihenfolge: erst alle
-/// Befunde der ersten Regel, dann alle der zweiten, und so weiter. Leer, wenn
-/// keine Regel etwas ausgelöst hat.
+/// Eine flache Liste aller ausgelösten Befunde.
 ///
-/// # Errors
-/// Keine.
-///
-/// # Concurrency
-/// Siehe Moduldoku.
-///
-/// # Examples
-/// Siehe Moduldoku.
-#[must_use]
-pub fn run_rules(rules: &[&dyn Rule], ctx: &RuleContext<'_>) -> Vec<Finding<RuleChecked>> {
-    rules
-        .iter()
+/// # Panics
+/// Wenn eine Regel panikt, wird der Panic-Thread geworfen; `run_rules`
+/// versteckt keinen Fehler.
+pub fn run_rules(ctx: &RuleContext<'_>) -> Vec<Finding<Raw>> {
+    ALL_RULES
+        .par_iter()
         .flat_map(|rule| rule.evaluate(ctx))
-        .map(|raw| raw.check(FindingId::new()))
         .collect()
 }
 
@@ -107,50 +63,48 @@ mod tests {
     use super::*;
     use crate::rules::EgressFlowRule;
     use harw_dod_signals::{EventKind, SecurityEvent};
-    use harw_sandbox::NetworkScope;
     use harw_types::SensorId;
     use jiff::Timestamp;
 
-    fn triggering_event() -> SecurityEvent {
-        SecurityEvent {
-            sensor: SensorId::from_str("net-0"),
-            observed_at: Timestamp::UNIX_EPOCH,
-            actor: None,
-            kind: EventKind::EgressFlow {
-                destination: "evil.example.com".to_owned(),
-                port: 443,
-            },
+    fn ctx_with(events: &[SecurityEvent], scope: &NetworkScope) -> RuleContext<'_> {
+        RuleContext {
+            now: Timestamp::UNIX_EPOCH,
+            samples: &[],
+            events,
+            baselines: &[],
+            network_scope: scope,
         }
     }
 
     #[test]
-    fn test_run_rules_certifies_every_raw_finding_with_an_id() {
-        let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);
-        let events = vec![triggering_event()];
-        let ctx = RuleContext {
-            now: Timestamp::UNIX_EPOCH,
-            samples: &[],
-            events: &events,
-            baselines: &[],
-            network_scope: &scope,
-        };
-        let rule: &dyn Rule = &EgressFlowRule;
-        let checked = run_rules(&[rule], &ctx);
-
-        assert_eq!(checked.len(), 1);
-        assert!(!checked[0].id().as_str().is_empty());
+    fn test_run_rules_on_empty_context_is_empty() {
+        let scope = NetworkScope::empty();
+        let ctx = ctx_with(&[], &scope);
+        assert!(run_rules(&ctx).is_empty());
     }
 
     #[test]
-    fn test_run_rules_with_no_rules_yields_nothing() {
-        let scope = NetworkScope::empty();
-        let ctx = RuleContext {
-            now: Timestamp::UNIX_EPOCH,
-            samples: &[],
-            events: &[],
-            baselines: &[],
-            network_scope: &scope,
-        };
-        assert!(run_rules(&[], &ctx).is_empty());
+    fn test_egress_flow_rule_is_included() {
+        // Keine Exhaustivität, nur ein Rauchtest, dass die Regelliste nicht
+        // leer ist.
+        assert_eq!(ALL_RULES.len(), 1);
+        assert_eq!(ALL_RULES[0].id(), EgressFlowRule.id());
+    }
+
+    #[test]
+    fn test_run_rules_collects_findings() {
+        let scope = NetworkScope::from_hosts(["evil.example".to_owned()]);
+        let events = vec![SecurityEvent {
+            sensor: SensorId::from_str("net"),
+            observed_at: Timestamp::UNIX_EPOCH,
+            kind: EventKind::NetworkConnection {
+                remote_host: "evil.example".to_owned(),
+                remote_port: 443,
+            },
+        }];
+        let ctx = ctx_with(&events, &scope);
+        let findings = run_rules(&ctx);
+        assert!(!findings.is_empty());
+        assert!(findings.iter().any(|f| f.summary.contains("egress")));
     }
 }

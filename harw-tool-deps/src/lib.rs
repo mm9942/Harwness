@@ -20,10 +20,10 @@
 //! - **Read-only.** Es gibt keinen schreibenden Codepfad — weder im Workspace
 //!   noch in der Registry.
 //! - **Eigene Berechtigung.** Der Registry-Zugriff hängt ausschließlich an
-//!   [`harw_sandbox::Permission::ReadCargoRegistry`]. Sie benennt genau einen
+//!   [`harw_authority::Permission::ReadCargoRegistry`]. Sie benennt genau einen
 //!   fest verdrahteten Pfadbaum und keine vom Aufrufer wählbare Position.
 //!   `deps.graph`/`deps.locked` bleiben bei
-//!   [`harw_sandbox::Permission::ReadWorkspace`].
+//!   [`harw_authority::Permission::ReadWorkspace`].
 //! - **Permission vor Deserialisierung.** Der von `#[harw_macros::tool]`
 //!   erzeugte Prolog prüft die Berechtigung, bevor die vom Modell
 //!   kontrollierten Argumente überhaupt geparst werden.
@@ -92,9 +92,7 @@ pub use source_tool::{
 /// Subprozess.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use harw_sandbox::{
-        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-    };
+    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_tools::{ToolCall, ToolExecutionContext, ToolName};
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::fs;

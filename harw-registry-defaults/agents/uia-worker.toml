@@ -16,9 +16,17 @@
 # korrigiert das auf `RegistryProfile::UiaQuickHelper`: lesender
 # Workspace-Zugriff (`fs.read/list/search/glob/grep`) plus `shell.exec`
 # (laeuft wie ueberall ueber Sandbox+Freigabe) plus ausschliesslich
-# `web.fetch` — kein `fs.write`, kein `deps.*`, kein `lens.ask`, kein
-# `browser.*`. Die tatsaechlich erreichbaren Netz-Hosts bestimmt weiterhin
-# die Egress-Policy aus `[network].researcher_web_hosts`.
+# `web.fetch` — kein `fs.write`, kein `deps.*`, kein `lens.ask`. Die
+# tatsaechlich erreichbaren Netz-Hosts bestimmt weiterhin die Egress-Policy
+# aus `[network].researcher_web_hosts`.
+#
+# Nutzerentscheidung (ersetzt den letzten Satz von Addendum I): `uia-worker`
+# darf zusaetzlich `browser.open` benutzen — `RegistryProfile::UiaQuickHelper`
+# registriert und bewirbt genau dieses eine Browser-Werkzeug (siehe
+# `UIA_QUICK_HELPER_BROWSER_TOOLS` in `harw-registry-defaults/src/profile.rs`).
+# Die uebrigen sechs `browser.*`-Werkzeuge (`observe`/`find`/`act`/`wait`/
+# `events`/`close`) bleiben ausdruecklich verboten — keine Rolle admittiert
+# sie, `uia-worker` eingeschlossen.
 
 schema = "harwness.agent/v1"
 id = "harwness.agent.uia-worker@1"
@@ -40,12 +48,6 @@ admitted = [
   "shell.exec",
   "web.fetch",
   "browser.open",
-  "browser.observe",
-  "browser.find",
-  "browser.act",
-  "browser.wait",
-  "browser.events",
-  "browser.close",
 ]
 forbidden = [
   "fs.write",
@@ -57,6 +59,12 @@ forbidden = [
   "deps.source_search",
   "deps.source_list",
   "lens.ask",
+  "browser.observe",
+  "browser.find",
+  "browser.act",
+  "browser.wait",
+  "browser.events",
+  "browser.close",
 ]
 
 [spawn]

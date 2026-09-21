@@ -16,14 +16,16 @@
 //! - [`EgressHost`] — Domain (Punycode, kleingeschrieben, ohne abschließenden
 //!   Punkt) oder IP-Adresse.
 //! - [`EgressUrlError`] — Ablehnungsgründe ohne Echo der Eingabe.
-//! - [`host_matches_suffix`] — die *eine* Punktgrenzen-Regel für Host-Suffixe.
+//! - [`harw_authority::host_matches_suffix`] — die *eine* Punktgrenzen-Regel
+//!   für Host-Suffixe.
 //!
 //! # Nebenläufigkeit
 //! Reine Daten und reine Funktionen: `Send + Sync`, keine Sperren.
 //!
 //! # Beispiele
 //! ```rust
-//! use harw_sandbox::egress::{EgressHost, EgressUrl, host_matches_suffix};
+//! use harw_authority::host_matches_suffix;
+//! use harw_sandbox::egress::{EgressHost, EgressUrl};
 //!
 //! let url = EgressUrl::parse("https://evil.com\\@docs.rs/").unwrap();
 //! assert_eq!(url.host_str(), "evil.com");
@@ -33,6 +35,9 @@
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+#[cfg(test)]
+use harw_authority::host_matches_suffix;
 
 /// Ablehnungsgründe von [`EgressUrl::parse`].
 ///
@@ -288,70 +293,6 @@ impl EgressUrl {
     pub fn is_https(&self) -> bool {
         self.url.scheme() == "https"
     }
-}
-
-/// Punktgrenzen-geschützter Host-Suffix-Vergleich.
-///
-/// # Beschreibung
-/// `allowed = "docs.rs"` trifft `docs.rs` und jeden Namen `*.docs.rs`, nie
-/// `notdocs.rs` oder `docs.rs.evil.com`. Der Vergleich ist ASCII-case-insensitiv
-/// und toleriert je *einen* abschließenden Punkt auf beiden Seiten (`docs.rs.`
-/// ist der absolute Name von `docs.rs`). Ein leerer Eintrag trifft nie, weil er
-/// sonst Suffix jedes Namens wäre. Weitere Normalisierung (Leerzeichen,
-/// führende Punkte, IDNA) ist Sache des Aufrufers.
-///
-/// Die Suffix-Regel gilt **nur für Domain-Namen**. Ist `host` oder `allowed`
-/// ein IP-Literal (erkannt per [`IpAddr::from_str`](std::str::FromStr), IPv4
-/// oder IPv6 ohne Klammern), zählt nur Gleichheit der Adressen: `0.0.1` trifft
-/// nie `10.0.0.1`, `10.0.0.1` nie `::ffff:10.0.0.1`.
-///
-/// # Arguments
-/// - `allowed` (`&str`): erlaubter Name bzw. DNS-Suffix.
-/// - `host` (`&str`): zu prüfender Hostname.
-///
-/// # Returns
-/// `true` bei exakter Übereinstimmung oder Suffix-Treffer an einer Punktgrenze.
-///
-/// # Panics
-/// Nie: es wird nur über prüfende Slice-Zugriffe verglichen.
-///
-/// # Beispiele
-/// ```rust
-/// use harw_sandbox::egress::host_matches_suffix;
-///
-/// assert!(host_matches_suffix("docs.rs", "Static.Docs.RS."));
-/// assert!(!host_matches_suffix("docs.rs", "notdocs.rs"));
-/// assert!(!host_matches_suffix("0.0.1", "10.0.0.1"));
-/// ```
-#[must_use]
-pub fn host_matches_suffix(allowed: &str, host: &str) -> bool {
-    let allowed = allowed.strip_suffix('.').unwrap_or(allowed);
-    let host = host.strip_suffix('.').unwrap_or(host);
-    if allowed.is_empty() || host.is_empty() {
-        return false;
-    }
-    // IP-Literale nur exakt (als Adresse, damit `::1` und `0::1` gleich sind);
-    // ein IP-Literal gegen einen Namen trifft nie.
-    match (allowed.parse::<IpAddr>(), host.parse::<IpAddr>()) {
-        (Ok(allowed_ip), Ok(host_ip)) => return allowed_ip == host_ip,
-        (Ok(_), Err(_)) | (Err(_), Ok(_)) => return false,
-        (Err(_), Err(_)) => {}
-    }
-    if host.eq_ignore_ascii_case(allowed) {
-        return true;
-    }
-    if host.len() <= allowed.len() {
-        return false;
-    }
-    let start = host.len() - allowed.len();
-    // `get` statt Indexierung: bei einer Nicht-Zeichengrenze gibt es keinen
-    // Treffer statt eines Panics.
-    let Some(suffix) = host.get(start..) else {
-        return false;
-    };
-    // `start >= 1`, da `host` echt länger als `allowed` ist. Ein Byte einer
-    // Mehrbyte-Sequenz ist nie `b'.'`, der Grenzvergleich bleibt also korrekt.
-    suffix.eq_ignore_ascii_case(allowed) && host.as_bytes().get(start - 1) == Some(&b'.')
 }
 
 // `localhost` oder `*.localhost`, ASCII-case-insensitiv, ein abschließender
@@ -702,11 +643,23 @@ mod tests {
         assert!(domain("localhost").is_private_or_special());
         assert!(!domain("docs.rs").is_private_or_special());
         // R2-05: frei konstruierte, nicht normalisierte Domains.
-        for name in ["LOCALHOST", "localhost.", "LocalHost.", "Api.LOCALHOST", "a.localhost."] {
+        for name in [
+            "LOCALHOST",
+            "localhost.",
+            "LocalHost.",
+            "Api.LOCALHOST",
+            "a.localhost.",
+        ] {
             assert!(domain(name).is_loopback(), "{name}");
             assert!(domain(name).is_private_or_special(), "{name}");
         }
-        for name in ["localhost..", "notlocalhost.", "LOCALHOST.evil.com", "xlocalhost", "."] {
+        for name in [
+            "localhost..",
+            "notlocalhost.",
+            "LOCALHOST.evil.com",
+            "xlocalhost",
+            ".",
+        ] {
             assert!(!domain(name).is_loopback(), "{name}");
         }
         // Schnittpunkt mitten in `ö`: kein Panic, kein Treffer.

@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+harw-authority = { path = "../harw-authority" }
 serde = { workspace = true }
 jiff = { workspace = true }
 harw-types = { path = "../harw-types" }

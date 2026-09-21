@@ -14,9 +14,7 @@ use harw_core::{
 use harw_extension_api::{
     AgentSpawnError, AgentSpawner, ExtensionRegistry, ExtensionRegistryBuilder, SpawnInput,
 };
-use harw_sandbox::{
-    Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-};
+use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
 use harw_session_store::ChildLeaseStore;
 use harw_types::{
     AgentRole, ApprovalActor, ReasoningEffort, SessionId, TenantId, ToolCallId, WorkspaceId,
@@ -500,6 +498,100 @@ async fn admit_rejects_spawn_forbidden_by_organizational_role_matrix() {
     );
     assert!(!rejected.message.contains("Worker"));
     assert!(!rejected.message.contains("worker"));
+}
+
+/// A session admitted under the `UserInterface` organizational role (§3 DSL
+/// spawn matrix) must never be able to spawn a plain `Worker`-role child —
+/// its spawn set is exactly `RootOrchestrator`, `UiaWorker`, `AgentSteward`
+/// (`harw-agent-dsl/src/roles.rs::can_spawn`). This is the real-world path
+/// that `/explore` and `/research-web` (`harw-ops/src/{explore,research}.rs`)
+/// hit whenever a UIA-governed root session calls them: both operations hand
+/// `run_single_child` the plain `role_names::EXPLORER` /
+/// `role_names::RESEARCHER_WEB` role names, which are registered under the
+/// organizational role `Worker` — the same role a `RootOrchestrator` caller
+/// gets — so a UIA caller is rejected here exactly as
+/// `test_can_spawn_uia_to_normal_worker_denied` predicts at the pure-matrix
+/// level (`harw-agent-dsl/src/roles.rs`). Unlike that unit test, this proves
+/// the rejection through the actual `ManagedAgentSpawner::admit` path with a
+/// role name modeled on the real `explorer` role, not merely the abstract
+/// `AgentRoleId` pair.
+#[tokio::test]
+async fn admit_rejects_uia_caller_spawning_a_registered_worker_role() {
+    let (manager, parent, sandbox) =
+        managed_parent_with_organizational_role(AgentRoleId::UserInterface);
+    let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative()).with_role(
+        "explorer",
+        AgentRole::Agent {
+            name: "explorer".to_owned(),
+        },
+        AgentRoleId::Worker,
+        Arc::new(EmptyChildRegistry),
+    );
+
+    let rejected = spawner
+        .spawn_child("explorer", spawn_input(parent), sandbox, None)
+        .await
+        .expect_err("a UserInterface caller must never spawn a Worker-role child");
+
+    assert_eq!(
+        rejected.message,
+        "no delegation capability is available for this request"
+    );
+    // Admission errors cross the model-facing spawn boundary and must not
+    // become a catalog oracle (see the comment at the `admit()` rejection
+    // site, `harw-core/src/child_controller.rs`).
+    assert!(!rejected.message.contains("explorer"));
+    assert!(!rejected.message.contains("Worker"));
+}
+
+/// The fix for the rejection above: `UserInterface` may spawn its own
+/// `UiaWorker`-role specializations (Addendum J,
+/// `harw-agent-dsl/src/roles.rs::can_spawn`). `uia-explorer` and
+/// `uia-writer` are the contractual role names that `/explore` and
+/// `/research-web` must redirect a UIA caller to instead of the plain
+/// `explorer` / `researcher-web` roles used above — see
+/// `harw_registry_defaults::profile::role_names::UIA_EXPLORER` /
+/// `::UIA_WRITER`. `harw-core` deliberately does not depend on
+/// `harw-registry-defaults` (see that crate's own dependency direction), so
+/// the literal role names are used here directly; they are the fixed
+/// contract this crate's spawn matrix must honor, not a test-local
+/// invention. Once the sibling fix registers these roles under
+/// `AgentRoleId::UiaWorker` in the real `BuiltinRoles` spawner
+/// (`harw-runtime/src/{assembly,children}.rs`), this test documents the
+/// exact admission outcome that registration must produce.
+#[tokio::test]
+async fn admit_allows_uia_caller_spawning_its_uia_worker_specializations() {
+    for role_name in ["uia-explorer", "uia-writer"] {
+        let (manager, parent, sandbox) =
+            managed_parent_with_organizational_role(AgentRoleId::UserInterface);
+        let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative()).with_role(
+            role_name,
+            AgentRole::Agent {
+                name: role_name.to_owned(),
+            },
+            AgentRoleId::UiaWorker,
+            Arc::new(EmptyChildRegistry),
+        );
+
+        let child = spawner
+            .spawn_child(role_name, spawn_input(parent), sandbox, None)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "a UserInterface caller must admit its '{role_name}' UiaWorker \
+                     specialization: {error:?}"
+                )
+            });
+
+        assert_eq!(
+            spawner
+                .child_record(&child)
+                .expect("admitted child is tracked")
+                .depth,
+            1,
+            "role '{role_name}'"
+        );
+    }
 }
 
 #[tokio::test]

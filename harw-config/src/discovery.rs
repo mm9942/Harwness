@@ -23,8 +23,47 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 
+/// Eine nicht-fatale Feststellung aus [`ResolvedConfig::compute_diagnostics`]:
+/// eine hängende Modell-/Provider-Referenz irgendwo im Konfigurations-
+/// universum. Anders als ein Sicherheits-/Autoritätsverstoß (siehe
+/// [`ResolvedConfig::validate`]) bricht so ein Fund den Start **nicht** ab —
+/// der betroffene Eintrag wird bei der Modell-/Provider-Auswahl in
+/// `harw-runtime` übersprungen bzw. gegen ein Ausweichmodell ersetzt. Ein
+/// einzelner Tippfehler in einer selten benutzten Modell- oder
+/// Provider-Referenz darf nicht die ganze Anwendung unbenutzbar machen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigDiagnostic {
+    /// Wo die Referenz gefunden wurde, z. B. `"default_model"`,
+    /// `"uia_provider"`, `"provider 'x' models"` oder `"agent 'y' models"`.
+    pub site: String,
+    /// Die Art der referenzierten Sache: `"model"` oder `"provider"`.
+    pub kind: String,
+    /// Die hängende Referenz selbst (nie geheim — Katalog-Bezeichner).
+    pub reference: String,
+}
+
+impl ConfigDiagnostic {
+    fn new(site: impl Into<String>, kind: &str, reference: &str) -> Self {
+        Self {
+            site: site.into(),
+            kind: kind.to_owned(),
+            reference: reference.to_owned(),
+        }
+    }
+}
+
+impl std::fmt::Display for ConfigDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: unresolved {} reference '{}' (entry disabled, startup continues)",
+            self.site, self.kind, self.reference
+        )
+    }
+}
+
 /// Geladenes Config-Universum nach Discovery + Merge.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ResolvedConfig {
     pub harness: HarnessConfig,
     pub agents: HashMap<String, AgentToml>,
@@ -67,6 +106,12 @@ pub struct ResolvedConfig {
     /// `C-CFG`, siehe `web_toml`). Wird von einem nicht vertrauten Repo-Layer
     /// **nie** beeinflusst (siehe [`apply_restricted_layer`]).
     pub web: WebSection,
+    /// Nicht-fatale Katalog-Diagnosen aus [`Self::compute_diagnostics`],
+    /// von [`discover_config_with_restricted`] automatisch befüllt (nach
+    /// [`compose_legacy_provider_registry`], damit ein komponierter
+    /// Legacy-Provider seine Referenz noch auflöst). Siehe
+    /// [`ConfigDiagnostic`].
+    pub diagnostics: Vec<ConfigDiagnostic>,
 }
 
 impl ResolvedConfig {
@@ -74,15 +119,20 @@ impl ResolvedConfig {
     ///
     /// Discovery deliberately stays permissive so layered configuration can be
     /// assembled first.  Call this before constructing a runtime: it rejects
-    /// dangling catalog references and insecure legacy credential fields.
+    /// security/authority violations (plaintext secrets, an unsafe MCP
+    /// listener, a misconfigured provider, a duplicated channel credential).
+    ///
+    /// Dangling **catalog** references (`default_model`/`default_provider`,
+    /// a provider's `models` list, a cataloged model's `provider` field, an
+    /// agent's `models` list, `uia_model`/`uia_provider`) are **not** checked
+    /// here anymore: one misconfigured
+    /// provider or model must not make the whole application unusable at
+    /// startup. Those are reported instead as non-fatal
+    /// [`ConfigDiagnostic`]s — see [`Self::compute_diagnostics`] and
+    /// [`Self::diagnostics`] — and the affected entry is skipped where it is
+    /// actually selected/used (`harw-runtime`), not at load time.
     pub fn validate(&self) -> ConfigResult<()> {
         validate_mcp_listener(&self.harness)?;
-        if let Some(provider) = &self.harness.default_provider {
-            require_reference(&self.providers, "provider", provider)?;
-        }
-        if let Some(model) = &self.harness.default_model {
-            require_reference(&self.models, "model", model)?;
-        }
         if let Some(definition) = &self.harness.active_agent_definition {
             require_reference(&self.executable_agents, "agent definition", definition)?;
         }
@@ -106,20 +156,12 @@ impl ResolvedConfig {
             }
             provider.validate()?;
 
-            for model in &provider.models {
-                require_reference(&self.models, "model", model)?;
-            }
             for agent in &provider.origin_allowlist.agents {
                 require_reference(&self.agents, "agent", agent)?;
             }
             for channel in &provider.origin_allowlist.channels {
                 require_reference(&self.channels, "channel", channel)?;
             }
-        }
-
-        for model_name in sorted_keys(&self.models) {
-            let model = &self.models[model_name];
-            require_reference(&self.providers, "provider", &model.provider)?;
         }
 
         for agent_name in sorted_keys(&self.agents) {
@@ -131,9 +173,6 @@ impl ResolvedConfig {
                 .chain(agent.primary_provider.iter())
             {
                 require_reference(&self.providers, "provider", provider)?;
-            }
-            for model in &agent.models {
-                require_reference(&self.models, "model", model)?;
             }
             for skill in &agent.skills {
                 require_reference(&self.skills, "skill", skill)?;
@@ -174,6 +213,79 @@ impl ResolvedConfig {
         }
 
         Ok(())
+    }
+
+    /// Berechnet nicht-fatale Katalog-Diagnosen: hängende Modell-/
+    /// Provider-Referenzen, die [`Self::validate`] **nicht** mehr als Fehler
+    /// behandelt (siehe dortige Dokumentation). Rein lesend — verändert
+    /// `self` nicht. [`discover_config_with_restricted`] speichert das
+    /// Ergebnis in [`Self::diagnostics`]; `harw-runtime` protokolliert es
+    /// (`tracing::warn!`) und wählt bei Bedarf ein Ausweichmodell.
+    ///
+    /// # Returns
+    /// Eine [`ConfigDiagnostic`] je hängender Referenz, in deterministischer
+    /// Reihenfolge (sortierte Katalog-Schlüssel).
+    #[must_use]
+    pub fn compute_diagnostics(&self) -> Vec<ConfigDiagnostic> {
+        let mut diagnostics = Vec::new();
+
+        if let Some(provider) = &self.harness.default_provider {
+            if !self.providers.contains_key(provider) {
+                diagnostics.push(ConfigDiagnostic::new("default_provider", "provider", provider));
+            }
+        }
+        if let Some(model) = &self.harness.default_model {
+            if !self.models.contains_key(model) {
+                diagnostics.push(ConfigDiagnostic::new("default_model", "model", model));
+            }
+        }
+        if let Some(provider) = &self.harness.uia_provider {
+            if !self.providers.contains_key(provider) {
+                diagnostics.push(ConfigDiagnostic::new("uia_provider", "provider", provider));
+            }
+        }
+        if let Some(model) = &self.harness.uia_model {
+            if !self.models.contains_key(model) {
+                diagnostics.push(ConfigDiagnostic::new("uia_model", "model", model));
+            }
+        }
+
+        for provider_name in sorted_keys(&self.providers) {
+            for model in &self.providers[provider_name].models {
+                if !self.models.contains_key(model) {
+                    diagnostics.push(ConfigDiagnostic::new(
+                        format!("provider '{provider_name}' models"),
+                        "model",
+                        model,
+                    ));
+                }
+            }
+        }
+
+        for model_name in sorted_keys(&self.models) {
+            let provider = &self.models[model_name].provider;
+            if !self.providers.contains_key(provider) {
+                diagnostics.push(ConfigDiagnostic::new(
+                    format!("model '{model_name}' provider"),
+                    "provider",
+                    provider,
+                ));
+            }
+        }
+
+        for agent_name in sorted_keys(&self.agents) {
+            for model in &self.agents[agent_name].models {
+                if !self.models.contains_key(model) {
+                    diagnostics.push(ConfigDiagnostic::new(
+                        format!("agent '{agent_name}' models"),
+                        "model",
+                        model,
+                    ));
+                }
+            }
+        }
+
+        diagnostics
     }
 }
 
@@ -621,6 +733,11 @@ pub fn discover_config_with_restricted(
 
     compose_legacy_provider_registry(&mut resolved);
 
+    // After the legacy composition, so a composed compat provider (e.g.
+    // `anthropic`) resolves its own reference instead of being reported as
+    // dangling.
+    resolved.diagnostics = resolved.compute_diagnostics();
+
     Ok(resolved)
 }
 
@@ -1006,6 +1123,7 @@ fn legacy_provider(name: &str, enabled: bool) -> Option<ProviderToml> {
             origin_allowlist: Default::default(),
             rate_limit: None,
             max_concurrency: None,
+            originator: None,
         }),
         _ => None,
     }
@@ -1601,15 +1719,103 @@ job_capabilities = ["cancel_workspace"]
     }
 
     #[test]
-    fn validate_rejects_an_unresolved_default_provider() {
+    fn validate_accepts_an_unresolved_default_provider_as_a_diagnostic() {
         let mut config = ResolvedConfig::default();
         config.harness.default_provider = Some("missing".to_owned());
 
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::UnresolvedRef { kind, reference })
-                if kind == "provider" && reference == "missing"
-        ));
+        // A dangling default_provider must not abort startup anymore — it is
+        // reported as a non-fatal diagnostic instead (F-046-style report:
+        // "one misconfigured provider/model makes the whole app unusable").
+        assert!(config.validate().is_ok());
+        let diagnostics = config.compute_diagnostics();
+        assert!(diagnostics.contains(&ConfigDiagnostic::new(
+            "default_provider",
+            "provider",
+            "missing"
+        )));
+    }
+
+    #[test]
+    fn validate_accepts_an_unresolved_default_model_as_a_diagnostic() {
+        let mut config = ResolvedConfig::default();
+        config.harness.default_model = Some("gpt-5.6-terra".to_owned());
+
+        assert!(config.validate().is_ok());
+        let diagnostics = config.compute_diagnostics();
+        assert!(diagnostics.contains(&ConfigDiagnostic::new(
+            "default_model",
+            "model",
+            "gpt-5.6-terra"
+        )));
+    }
+
+    #[test]
+    fn validate_accepts_unresolved_uia_provider_and_model_as_diagnostics() {
+        let mut config = ResolvedConfig::default();
+        config.harness.uia_provider = Some("missing-provider".to_owned());
+        config.harness.uia_model = Some("missing-model".to_owned());
+
+        assert!(config.validate().is_ok());
+        let diagnostics = config.compute_diagnostics();
+        assert!(diagnostics.contains(&ConfigDiagnostic::new(
+            "uia_provider",
+            "provider",
+            "missing-provider"
+        )));
+        assert!(diagnostics.contains(&ConfigDiagnostic::new(
+            "uia_model",
+            "model",
+            "missing-model"
+        )));
+    }
+
+    #[test]
+    fn validate_accepts_a_provider_models_entry_that_is_dangling() {
+        let mut dangling = provider("gateway");
+        dangling.models = vec!["missing-model".to_owned()];
+        let mut config = ResolvedConfig::default();
+        config.providers.insert("gateway".to_owned(), dangling);
+
+        assert!(config.validate().is_ok());
+        let diagnostics = config.compute_diagnostics();
+        assert!(diagnostics.contains(&ConfigDiagnostic::new(
+            "provider 'gateway' models",
+            "model",
+            "missing-model"
+        )));
+    }
+
+    #[test]
+    fn validate_accepts_an_agent_models_entry_that_is_dangling() {
+        let mut config = ResolvedConfig::default();
+        let configured_agent =
+            toml::from_str::<AgentToml>("name = \"planner\"\nmodels = [\"missing\"]\n").unwrap();
+        config.agents.insert("planner".to_owned(), configured_agent);
+
+        assert!(config.validate().is_ok());
+        let diagnostics = config.compute_diagnostics();
+        assert!(diagnostics.contains(&ConfigDiagnostic::new(
+            "agent 'planner' models",
+            "model",
+            "missing"
+        )));
+    }
+
+    #[test]
+    fn discover_config_populates_diagnostics_field_automatically() {
+        let base = test_directory("auto-diagnostics");
+        std::fs::write(base.join("config.toml"), "default_model = \"missing\"\n").unwrap();
+
+        let config = discover_config(std::slice::from_ref(&base)).expect("discover config");
+
+        assert!(config.validate().is_ok());
+        assert!(config.diagnostics.contains(&ConfigDiagnostic::new(
+            "default_model",
+            "model",
+            "missing"
+        )));
+
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
@@ -1652,11 +1858,12 @@ job_capabilities = ["cancel_workspace"]
 
         let config = discover_config(std::slice::from_ref(&base)).expect("discover config");
         assert!(!config.providers.contains_key("unrecognised-provider"));
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::UnresolvedRef { kind, reference })
-                if kind == "provider" && reference == "unrecognised-provider"
-        ));
+        assert!(config.validate().is_ok());
+        assert!(config.diagnostics.contains(&ConfigDiagnostic::new(
+            "default_provider",
+            "provider",
+            "unrecognised-provider"
+        )));
 
         std::fs::remove_dir_all(base).unwrap();
     }
@@ -1789,17 +1996,19 @@ replace = {{ admitted = ["fs.read"], forbidden = ["network.fetch", "shell.exec"]
     }
 
     #[test]
-    fn validate_rejects_models_with_unknown_providers() {
+    fn validate_accepts_models_with_unknown_providers_as_a_diagnostic() {
         let mut config = ResolvedConfig::default();
         config
             .models
             .insert("echo".to_owned(), model("echo", "missing"));
 
-        assert!(matches!(
-            config.validate(),
-            Err(ConfigError::UnresolvedRef { kind, reference })
-                if kind == "provider" && reference == "missing"
-        ));
+        assert!(config.validate().is_ok());
+        let diagnostics = config.compute_diagnostics();
+        assert!(diagnostics.contains(&ConfigDiagnostic::new(
+            "model 'echo' provider",
+            "provider",
+            "missing"
+        )));
     }
 
     #[test]
@@ -1816,7 +2025,6 @@ replace = {{ admitted = ["fs.read"], forbidden = ["network.fetch", "shell.exec"]
                 "secondary_providers = [\"missing\"]\n",
                 "provider",
             ),
-            ("models", "models = [\"missing\"]\n", "model"),
             ("skills", "skills = [\"missing\"]\n", "skill"),
         ];
 

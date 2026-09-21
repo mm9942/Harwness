@@ -322,6 +322,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-deque"
+version = "0.8.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "622f3fc73690be383c7214310406f28a90e6edeadc3cea882f9d71e495b9711a"
+dependencies = [
+ "crossbeam-epoch",
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-epoch"
+version = "0.9.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc74980687109a3b14c72fd458107bf0baa1da1a1a805e178d15501ba9b86d9d"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-utils"
+version = "0.8.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
+
+[[package]]
 name = "defmt"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -377,6 +402,12 @@ name = "dunce"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
+name = "either"
+version = "1.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
 name = "enumflags2"
@@ -546,6 +577,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-authority"
+version = "0.3.0"
+dependencies = [
+ "blake3",
+ "harw-types",
+ "ipnet",
+ "serde",
+ "toml 1.1.6+spec-1.1.0",
+]
+
+[[package]]
 name = "harw-code-graph"
 version = "0.3.0"
 dependencies = [
@@ -574,6 +616,7 @@ dependencies = [
 name = "harw-context"
 version = "0.3.0"
 dependencies = [
+ "harw-authority",
  "harw-lens-types",
  "harw-macros",
  "harw-types",
@@ -585,6 +628,7 @@ dependencies = [
 name = "harw-dod"
 version = "0.3.0"
 dependencies = [
+ "harw-authority",
  "harw-dod-authlog",
  "harw-dod-blockio",
  "harw-dod-bpf",
@@ -646,6 +690,7 @@ dependencies = [
  "harw-macros",
  "harw-types",
  "jiff",
+ "rustix",
  "tempfile",
 ]
 
@@ -653,6 +698,7 @@ dependencies = [
 name = "harw-dod-cap"
 version = "0.3.0"
 dependencies = [
+ "harw-authority",
  "harw-macros",
  "harw-types",
  "serde",
@@ -676,6 +722,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "harw-dod-config"
+version = "0.3.0"
+dependencies = [
+ "blake3",
+ "ipnet",
+ "rustix",
+ "serde",
+ "tempfile",
+ "toml 1.1.6+spec-1.1.0",
+]
+
+[[package]]
 name = "harw-dod-cpu"
 version = "0.3.0"
 dependencies = [
@@ -693,6 +751,7 @@ dependencies = [
 name = "harw-dod-escalate"
 version = "0.3.0"
 dependencies = [
+ "harw-authority",
  "harw-dod-rules",
  "harw-dod-signals",
  "harw-dod-warden-proto",
@@ -725,6 +784,7 @@ dependencies = [
 name = "harw-dod-flow"
 version = "0.3.0"
 dependencies = [
+ "harw-authority",
  "harw-dod-bpf",
  "harw-dod-cap",
  "harw-dod-signals",
@@ -823,6 +883,7 @@ dependencies = [
 name = "harw-dod-netpolicy"
 version = "0.3.0"
 dependencies = [
+ "harw-authority",
  "harw-dod-cap",
  "harw-macros",
  "harw-sandbox",
@@ -857,13 +918,14 @@ dependencies = [
 name = "harw-dod-rules"
 version = "0.3.0"
 dependencies = [
+ "harw-authority",
  "harw-code-graph",
  "harw-dod-signals",
  "harw-knowledge",
  "harw-research",
- "harw-sandbox",
  "harw-types",
  "jiff",
+ "rayon",
  "semver",
  "serde",
  "serde_json",
@@ -890,6 +952,7 @@ dependencies = [
 name = "harw-dod-sentinel"
 version = "0.3.0"
 dependencies = [
+ "harw-authority",
  "harw-dod-cap",
  "harw-dod-rules",
  "harw-dod-signals",
@@ -1036,6 +1099,7 @@ dependencies = [
 name = "harw-macros"
 version = "0.3.0"
 dependencies = [
+ "harw-authority",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -1062,6 +1126,7 @@ dependencies = [
 name = "harw-observe"
 version = "0.3.0"
 dependencies = [
+ "harw-authority",
  "harw-macros",
  "serde",
 ]
@@ -1095,8 +1160,10 @@ name = "harw-probe-bpf"
 version = "0.3.0"
 dependencies = [
  "clap",
+ "harw-authority",
  "harw-dod-bpf",
  "harw-dod-cap",
+ "harw-dod-config",
  "harw-dod-flow",
  "harw-dod-procmon",
  "harw-dod-signals",
@@ -1146,9 +1213,7 @@ dependencies = [
 name = "harw-sandbox"
 version = "0.3.0"
 dependencies = [
- "harw-types",
- "ipnet",
- "serde",
+ "harw-authority",
  "tracing",
  "url",
 ]
@@ -1158,9 +1223,11 @@ name = "harw-sentinel"
 version = "0.3.0"
 dependencies = [
  "clap",
+ "harw-authority",
  "harw-dod-blockio",
  "harw-dod-cap",
  "harw-dod-cgroup",
+ "harw-dod-config",
  "harw-dod-cpu",
  "harw-dod-gpu",
  "harw-dod-listener",
@@ -1889,6 +1956,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
 dependencies = [
  "rand_core",
+]
+
+[[package]]
+name = "rayon"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
+dependencies = [
+ "either",
+ "rayon-core",
+]
+
+[[package]]
+name = "rayon-core"
+version = "1.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
+dependencies = [
+ "crossbeam-deque",
+ "crossbeam-utils",
 ]
 
 [[package]]

@@ -67,11 +67,12 @@
 //!             aliases: &[],
 //!             category: OperationCategory::Misc,
 //!             args_schema: None,
+//!             output_schema: None,
 //!         })
 //!     }
 //!
 //!     fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> harw_operations::operation::OpFuture<'a> {
-//!         Box::pin(async { Ok(OpOutput { text: String::new() }) })
+//!         Box::pin(async { Ok(OpOutput { text: String::new(), data: None }) })
 //!     }
 //! }
 //! ```

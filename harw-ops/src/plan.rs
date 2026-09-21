@@ -1560,7 +1560,7 @@ mod tests {
     use harw_plan::ids::{PlanId, TaskId};
     use harw_plan::types::{PlanNodeKind, PlanNodeStatus};
     use harw_plan::{InMemoryPlanStore, PlanStore, PlanToolConfig};
-    use harw_sandbox::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{
         IngressSurface, PermissionTier, Principal, PrincipalKind, SessionId, TenantId, TurnId,
         WorkspaceId,

@@ -63,12 +63,16 @@ use std::time::Duration;
 
 use harw_agent_dsl::ExecutableAgentIr;
 use harw_agent_dsl::roles::AgentRoleId;
+use harw_authority::{
+    NetworkScope, PermissionRequest, PermissionSet, SandboxSpec, WorkspaceRegistration,
+    WorkspaceRegistry,
+};
 use harw_config::{PermissionsSection, PlanSection, ResolvedConfig, discover_config};
 use harw_context::ContextCeiling;
 use harw_core::{
-    AgentSession, ChildRegistryFactory, DriftObserver, GuardPolicy, ManagedAgentSpawner,
-    ModelProvider, PitfallAdvisor, RoleEffortWeights, SessionActivation, SessionManager,
-    SpawnContext, StateStore, ToolProfile,
+    AgentSession, ChildRegistryFactory, DriftObserver, GuardPolicy, InteractionMode,
+    ManagedAgentSpawner, ModelProvider, PitfallAdvisor, RoleEffortWeights, SessionActivation,
+    SessionManager, SpawnContext, StateStore, ToolProfile,
 };
 use harw_extension_api::allow_rules::{AllowRuleSet, ApprovalRule, RuleDecision, RuleScope};
 use harw_extension_api::approval_mode::{ApprovalMode, ApprovalModeCell};
@@ -95,14 +99,18 @@ use harw_protocol::events::{SessionEvent, TurnEvent};
 use harw_provider_http::SecretResolver;
 use harw_registry_defaults::embedded_agents::builtin_agent_definitions;
 use harw_registry_defaults::profile::{
-    IdentityOverrides, RegistryProfile, assemble_registry_for_project, role_names,
+    HostPermitWiring, IdentityOverrides, RegistryProfile, assemble_registry_for_project,
+    role_names,
 };
-use harw_sandbox::{
-    ExtraRootsCell, HostPermitSessionRegistry, NetworkScope, PermissionSet, ProcessPermitLedger,
-    SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+use harw_sandbox::{ExtraRootsCell, HostPermitSessionRegistry, ProcessPermitLedger};
+use harw_tool_shell::host_permit_prompt::{
+    HostPermitPromptReceiver, HostPermitPromptSender, HostPermitVariant,
+    host_permit_prompt_channel,
 };
 use harw_session_store::{ApprovalStore, JobStore};
-use harw_types::{AgentRole, ModelId, Principal, ProviderId, SessionId, TenantId, TurnId, WorkspaceId};
+use harw_types::{
+    AgentRole, ModelId, Principal, ProviderId, SessionId, TenantId, TurnId, WorkspaceId,
+};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::approval::ApprovalChain;
@@ -377,7 +385,9 @@ fn load_project_permissions(home: &Path, profile: &str, key: &str) -> Permission
 /// Diese Funktion ist der einzige Ort, an dem ein Sandbox-Profil aus
 /// Konfiguration entsteht. Das Profil ist ein vertrauenswürdiger
 /// Runtime-Input und wird an die Registry weitergegeben, nie an ein Tool.
-fn sandbox_profile_from_config(section: &harw_config::SandboxSection) -> harw_sandbox::SandboxProfile {
+fn sandbox_profile_from_config(
+    section: &harw_config::SandboxSection,
+) -> harw_sandbox::SandboxProfile {
     use harw_config::{CargoSandboxModeToml, TmuxOperationModeToml};
     use harw_sandbox::{CargoExecutionMode, SandboxProfile};
 
@@ -469,7 +479,10 @@ fn effective_approval_mode(
 /// # Returns
 /// Eine [`Duration`] in Sekunden; die TUI liest sie über
 /// [`RuntimeAssembly::approval_timeout`] für den Countdown im Freigabe-Panel.
-fn effective_approval_timeout(global: &PermissionsSection, project: &PermissionsSection) -> Duration {
+fn effective_approval_timeout(
+    global: &PermissionsSection,
+    project: &PermissionsSection,
+) -> Duration {
     let secs = project
         .approval_timeout_secs
         .or(global.approval_timeout_secs)
@@ -630,7 +643,10 @@ fn plan_tool_config_from_section(section: &PlanSection) -> Result<PlanToolConfig
     let require_exploration_for = section
         .require_exploration_for
         .iter()
-        .map(|name| name.parse::<PlanNodeKind>().map_err(|error| error.to_string()))
+        .map(|name| {
+            name.parse::<PlanNodeKind>()
+                .map_err(|error| error.to_string())
+        })
         .collect::<Result<Vec<PlanNodeKind>, String>>()?;
 
     Ok(PlanToolConfig {
@@ -1016,7 +1032,7 @@ fn ensure_bound_to(sandbox: &SandboxSpec, expected: &Path) -> RuntimeResult<()> 
 /// `ReadOnlyExplore` ist **keine** Werkzeug-Teilmenge von `Full`: es bringt
 /// `deps.*` mit, das `Full` nicht registriert. Die Whitelist bleibt trotzdem
 /// wie vertraglich festgelegt; abgesichert wird über die Sandbox, weil kein
-/// Einstiegsprofil [`harw_sandbox::Permission::ReadCargoRegistry`] trägt und
+/// Einstiegsprofil [`harw_authority::Permission::ReadCargoRegistry`] trägt und
 /// die geschnittene Sandbox dieses Recht deshalb nie erhalten kann.
 ///
 /// # Fehler
@@ -1028,64 +1044,94 @@ fn narrowed_registry_profile(
 ) -> RuntimeResult<RegistryProfile> {
     use RegistryProfile::{
         AgentStewardship, Full, MemoryStewardship, NoTools, Planning, ReadOnlyExplore, Research,
-        ShellExecution, UiaQuickHelper,
+        ShellExecution, UiaExplorer, UiaQuickHelper, UiaShellWorker, UiaWriter,
     };
 
     match (entry_profile, requested) {
-        // Full darf auf ShellExecution, MemoryStewardship, UiaQuickHelper
-        // oder AgentStewardship verengt werden (alle vier Werkzeugsätze ⊆
-        // Full oder — wie ReadOnlyExplore — über die Sandbox abgesichert,
-        // siehe unten); ShellExecution, MemoryStewardship, UiaQuickHelper
-        // und AgentStewardship selbst dürfen nur identisch bleiben (kein
-        // Aufweiten auf Full, kein Mischen mit ReadOnly-/Planungs-Profilen).
+        // Full darf auf ShellExecution, MemoryStewardship, UiaQuickHelper,
+        // AgentStewardship, UiaExplorer, UiaWriter oder UiaShellWorker
+        // verengt werden (alle sieben Werkzeugsätze ⊆ Full oder — wie
+        // ReadOnlyExplore — über die Sandbox abgesichert, siehe unten);
+        // ShellExecution, MemoryStewardship, UiaQuickHelper,
+        // AgentStewardship, UiaExplorer, UiaWriter und UiaShellWorker
+        // selbst dürfen nur identisch bleiben (kein Aufweiten auf Full,
+        // kein Mischen mit ReadOnly-/Planungs-Profilen — und,
+        // sicherheitsrelevant, kein Wechsel zwischen UiaExplorer und
+        // UiaWriter: `UiaWriter` trägt zusätzlich `fs.write`, das ein
+        // UiaExplorer-Einstieg nie besaß, ein Wechsel wäre also ein
+        // Aufweiten trotz gleicher Organisationsrolle).
         // `AgentStewardship` wird dabei wie `MemoryStewardship`/
         // `UiaQuickHelper` behandelt (Addendum K): nur Full darf zu ihm
         // verengen, und als Einstieg narrowt er ausschließlich auf sich
-        // selbst.
+        // selbst. `UiaExplorer`/`UiaWriter` (Addendum D+E, REG-DE) sind
+        // Spezialisierungen derselben Organisationsrolle
+        // (`AgentRoleId::UiaWorker`) wie `UiaQuickHelper` und folgen
+        // deshalb demselben Muster: nur Full darf zu ihnen verengen, und
+        // sie selbst narrowen ausschließlich auf sich selbst. `UiaShellWorker`
+        // (uia-shell-worker.toml) ist derselbe Zwilling für `shell.exec` statt
+        // Schreibzugriff — dieselbe Organisationsrolle, dieselbe Spawn-Matrix
+        // (`AgentRoleId::UserInterface` kann `UiaWorker`-Rollen spawnen),
+        // deshalb exakt dasselbe Muster: nur Full darf zu ihm verengen, er
+        // narrowt ausschließlich auf sich selbst, und kein Wechsel zwischen
+        // ihm und den anderen UIA-Geschwistern (er trägt `shell.exec`, das
+        // die anderen nie besaßen). Erreichbarkeit bleibt damit identisch zu
+        // UiaExplorer/UiaWriter: ein Einstieg, der diese nicht erreichen
+        // konnte, kann auch UiaShellWorker nicht erreichen; die
+        // Host-Sandbox-Bindung selbst erzwingt ausschließlich der
+        // ProcessPermitLedger, nicht dieses Match.
         (
             Full,
-            Full | ShellExecution
-                | ReadOnlyExplore
-                | NoTools
-                | MemoryStewardship
-                | UiaQuickHelper
-                | AgentStewardship,
+            Full | ShellExecution | ReadOnlyExplore | NoTools | MemoryStewardship | UiaQuickHelper
+            | AgentStewardship | UiaExplorer | UiaWriter | UiaShellWorker,
         )
         | (ShellExecution, ShellExecution)
         | (UiaQuickHelper, UiaQuickHelper)
         | (NoTools, NoTools)
         | (MemoryStewardship, MemoryStewardship)
-        | (AgentStewardship, AgentStewardship) => Ok(requested),
+        | (AgentStewardship, AgentStewardship)
+        | (UiaExplorer, UiaExplorer)
+        | (UiaWriter, UiaWriter)
+        | (UiaShellWorker, UiaShellWorker) => Ok(requested),
         (Full, Research | Planning)
         | (
             ShellExecution,
             Full | ReadOnlyExplore | Research | Planning | NoTools | MemoryStewardship
-                | UiaQuickHelper
-                | AgentStewardship,
+            | UiaQuickHelper | AgentStewardship | UiaExplorer | UiaWriter | UiaShellWorker,
         )
         | (
             UiaQuickHelper,
             Full | ShellExecution | ReadOnlyExplore | Research | Planning | NoTools
-                | MemoryStewardship
-                | AgentStewardship,
+            | MemoryStewardship | AgentStewardship | UiaExplorer | UiaWriter | UiaShellWorker,
         )
         | (
             NoTools,
             Full | ShellExecution | ReadOnlyExplore | Research | Planning | MemoryStewardship
-                | UiaQuickHelper
-                | AgentStewardship,
+            | UiaQuickHelper | AgentStewardship | UiaExplorer | UiaWriter | UiaShellWorker,
         )
         | (
             MemoryStewardship,
             Full | ShellExecution | ReadOnlyExplore | Research | Planning | NoTools
-                | UiaQuickHelper
-                | AgentStewardship,
+            | UiaQuickHelper | AgentStewardship | UiaExplorer | UiaWriter | UiaShellWorker,
         )
         | (
             AgentStewardship,
             Full | ShellExecution | ReadOnlyExplore | Research | Planning | NoTools
-                | MemoryStewardship
-                | UiaQuickHelper,
+            | MemoryStewardship | UiaQuickHelper | UiaExplorer | UiaWriter | UiaShellWorker,
+        )
+        | (
+            UiaExplorer,
+            Full | ShellExecution | ReadOnlyExplore | Research | Planning | NoTools
+            | MemoryStewardship | UiaQuickHelper | AgentStewardship | UiaWriter | UiaShellWorker,
+        )
+        | (
+            UiaWriter,
+            Full | ShellExecution | ReadOnlyExplore | Research | Planning | NoTools
+            | MemoryStewardship | UiaQuickHelper | AgentStewardship | UiaExplorer | UiaShellWorker,
+        )
+        | (
+            UiaShellWorker,
+            Full | ShellExecution | ReadOnlyExplore | Research | Planning | NoTools
+            | MemoryStewardship | UiaQuickHelper | AgentStewardship | UiaExplorer | UiaWriter,
         )
         | (ReadOnlyExplore | Research | Planning, _) => Err(RuntimeError::Registry {
             detail: format!(
@@ -1113,7 +1159,9 @@ fn narrowed_sandbox(
     narrowing: Option<&RuntimeNarrowing>,
 ) -> RuntimeResult<SandboxSpec> {
     let sandbox = match narrowing {
-        Some(narrowing) => sandbox.restrict(&narrowing.permissions),
+        Some(narrowing) => sandbox.restrict(&PermissionRequest::from_permissions(
+            narrowing.permissions.iter(),
+        )),
         None => sandbox,
     };
     if sandbox.permissions().is_subset_of(&profile.permissions) {
@@ -1454,11 +1502,12 @@ impl RuntimeAssemblyBuilder {
         let config = Arc::new(config);
 
         // 2. Projekterkennung — genau einmal je Lauf.
-        let project = discover_project(&spec.cwd, &DiscoveryConfig::default()).map_err(|error| {
-            RuntimeError::Discovery {
-                detail: format!("could not discover the project below the cwd: {error}"),
-            }
-        })?;
+        let project =
+            discover_project(&spec.cwd, &DiscoveryConfig::default()).map_err(|error| {
+                RuntimeError::Discovery {
+                    detail: format!("could not discover the project below the cwd: {error}"),
+                }
+            })?;
 
         // 2b. Projekt-Home nach Contract §3 (`harw_home::project`) —
         //     eigenständig von der Projekterkennung oben: jene speist den
@@ -1470,10 +1519,11 @@ impl RuntimeAssemblyBuilder {
             .project_root_markers
             .clone()
             .unwrap_or_default();
-        let home_project_root =
-            discover_home_project(&spec.cwd, &markers).map_err(|error| RuntimeError::Discovery {
+        let home_project_root = discover_home_project(&spec.cwd, &markers).map_err(|error| {
+            RuntimeError::Discovery {
                 detail: format!("could not discover the project home below the cwd: {error}"),
-            })?;
+            }
+        })?;
         let home_project = ProjectHome::at(&home_project_root);
         if let Err(error) = home_project.ensure() {
             tracing::warn!(
@@ -1487,19 +1537,18 @@ impl RuntimeAssemblyBuilder {
         // best-effort öffnen — ein Fehlschlag (kaputtes Verzeichnis, fehlende
         // Rechte) darf die Montage nie zu Fall bringen, nur den Recall/die
         // Erfassung dieses Laufs abschalten.
-        let memory_capture = match harw_memory::capture::ProjectMemoryCapture::open(
-            &home_project.memories_dir(),
-        ) {
-            Ok(capture) => Some(Arc::new(capture)),
-            Err(error) => {
-                tracing::warn!(
-                    root = %home_project_root.root.display(),
-                    error = %error,
-                    "runtime.memory_capture.open_failed"
-                );
-                None
-            }
-        };
+        let memory_capture =
+            match harw_memory::capture::ProjectMemoryCapture::open(&home_project.memories_dir()) {
+                Ok(capture) => Some(Arc::new(capture)),
+                Err(error) => {
+                    tracing::warn!(
+                        root = %home_project_root.root.display(),
+                        error = %error,
+                        "runtime.memory_capture.open_failed"
+                    );
+                    None
+                }
+            };
 
         // Vorgabe der Projekt-Fakten-Wurzel, falls der Aufrufer keine über
         // `RuntimeAssemblyBuilder::fact_stores` mitgebracht hat (siehe dessen
@@ -1532,7 +1581,8 @@ impl RuntimeAssemblyBuilder {
         let guard_policy = crate::guard_wiring::guard_policy_from_config(&config);
         let role_effort_weights = crate::guard_wiring::role_effort_weights_from_config(&config);
         let pitfall_advisor: Option<Arc<dyn PitfallAdvisor>> = project_facts.clone().map(|store| {
-            Arc::new(crate::guard_wiring::MemoryPitfallAdvisor::new(store)) as Arc<dyn PitfallAdvisor>
+            Arc::new(crate::guard_wiring::MemoryPitfallAdvisor::new(store))
+                as Arc<dyn PitfallAdvisor>
         });
 
         // Freigaben-Konfiguration: Projekt schlägt Global schlägt eingebaute
@@ -1577,7 +1627,10 @@ impl RuntimeAssemblyBuilder {
             &bound_root,
             os_user_home().as_deref(),
         );
-        let sandbox = sandbox.with_extra_roots(extra_roots.clone());
+        // `SandboxSpec` carries the canonical primary workspace only. The
+        // session cell remains available to `/add-workdir` and the operation
+        // surfaces, but is not a mutable authority side channel for a frozen
+        // sandbox specification.
 
         // Agent-Definitionen werden einmal gesenkt. Ein interaktiver Einstieg
         // besitzt zwingend eine konfigurierte UIA; fehlende oder falsch gerollte
@@ -1609,9 +1662,10 @@ impl RuntimeAssemblyBuilder {
             suggestions: None,
             capability_snapshot: None,
             approval_actor: spec.principal.approval_actor(),
-            organizational_role: uia_ir
-                .as_ref()
-                .map_or_else(|| root_organizational_role(profile.spawner), ExecutableAgentIr::role),
+            organizational_role: uia_ir.as_ref().map_or_else(
+                || root_organizational_role(profile.spawner),
+                ExecutableAgentIr::role,
+            ),
             // The root can delegate a child orchestrator only when its frozen
             // active definition lists that exact role. No active definition
             // means no such delegation grant.
@@ -1631,7 +1685,8 @@ impl RuntimeAssemblyBuilder {
             &project_permissions,
         ));
         let allow_rules = seed_allow_rule_set(&global_permissions, &project_permissions);
-        let approval_timeout = effective_approval_timeout(&global_permissions, &project_permissions);
+        let approval_timeout =
+            effective_approval_timeout(&global_permissions, &project_permissions);
         tracing::info!(
             rules = allow_rules.snapshot().len(),
             roots = extra_roots.snapshot().len(),
@@ -1670,14 +1725,15 @@ impl RuntimeAssemblyBuilder {
             let definition_id = uia.id().to_string();
             if let Some(agent_dir) = config.agent_definition_dirs.get(&definition_id) {
                 uia_agent_dir_for_self_document = Some(agent_dir.clone());
-                let fragments = harw_config::load_uia_personalization(agent_dir).map_err(|error| {
-                    RuntimeError::Registry {
-                        detail: format!(
-                            "could not load UIA personalization from {}: {error}",
-                            agent_dir.display()
-                        ),
-                    }
-                })?;
+                let fragments =
+                    harw_config::load_uia_personalization(agent_dir).map_err(|error| {
+                        RuntimeError::Registry {
+                            detail: format!(
+                                "could not load UIA personalization from {}: {error}",
+                                agent_dir.display()
+                            ),
+                        }
+                    })?;
                 overrides.extra_context.extend(fragments);
             }
         }
@@ -1708,6 +1764,31 @@ impl RuntimeAssemblyBuilder {
         // `ShellToolProvider`.
         let host_permit_ledger = Arc::new(ProcessPermitLedger::default());
         let host_permit_registry = Arc::new(HostPermitSessionRegistry::default());
+        // Derselbe Fragekanal-Vertrag wie `harw_tool_shell::exec::ShellExecutor`
+        // ihn sendet (siehe [`harw_tool_shell::host_permit_prompt`]): die Sende-
+        // seite gehört, sobald ein `ShellToolProvider` mit `SandboxProfile::Host`
+        // gebaut wird, über `with_host_permit_prompts` an genau diesen Provider;
+        // die Empfängerseite hält [`RuntimeAssembly::take_host_permit_prompts`]
+        // bis zur ersten Abholung durch den Renderer (z. B. `harw-tui`) fest.
+        let (host_permit_prompt_sender, host_permit_prompt_receiver) =
+            host_permit_prompt_channel();
+        // Verdrahtung für `assemble_registry_for_sandbox_with_definition_access_
+        // and_sandbox_profile_and_permits`: bündelt Ledger, Sitzungs-Registry und
+        // Fragekanal-Sender. Vorauswahl `SessionLease` nur für den Shell-Modus
+        // (`InteractionMode::Shell` — laufende Sitzungsphase); jeder andere
+        // Modus (und `None`, wenn der Lauf keinen Modus-Override trägt) bleibt
+        // beim Default `SingleExecution` aus [`HostPermitWiring::new`].
+        let host_permit_wiring = HostPermitWiring::new(
+            Arc::clone(&host_permit_ledger),
+            Arc::clone(&host_permit_registry),
+            host_permit_prompt_sender.clone(),
+        );
+        let host_permit_wiring = match spec.mode_override {
+            Some(InteractionMode::Shell) => {
+                host_permit_wiring.with_preselected_variant(HostPermitVariant::SessionLease)
+            }
+            _ => host_permit_wiring,
+        };
 
         let assembled = if uia_ir.is_some() {
             let default_model_id = config.harness.default_model.as_deref().unwrap_or_default();
@@ -1741,7 +1822,7 @@ impl RuntimeAssemblyBuilder {
                     &granted,
                     Some(access),
                     &sandbox_profile,
-                    Some((Arc::clone(&host_permit_ledger), Arc::clone(&host_permit_registry))),
+                    Some(host_permit_wiring),
                 )
             }
         } else {
@@ -1756,7 +1837,7 @@ impl RuntimeAssemblyBuilder {
                     &granted,
                     None,
                     &sandbox_profile,
-                    Some((Arc::clone(&host_permit_ledger), Arc::clone(&host_permit_registry))),
+                    Some(host_permit_wiring),
                 )
             }
         }
@@ -2033,6 +2114,8 @@ impl RuntimeAssemblyBuilder {
             responder: Mutex::new(None),
             host_permit_ledger,
             host_permit_registry,
+            host_permit_prompt_sender,
+            host_permit_prompts: Mutex::new(Some(host_permit_prompt_receiver)),
         })
     }
 }
@@ -2072,12 +2155,17 @@ fn resolve_active_uia(
     let name = config.harness.active_uia_definition.as_deref().ok_or_else(|| RuntimeError::Registry {
         detail: "no active UIA is configured; set harness.active_uia_definition to a user-interface agent definition".to_owned(),
     })?;
-    let ir = resolve_active_agent(Some(name), config, builtin)?.ok_or_else(|| RuntimeError::Registry {
-        detail: format!("UIA '{name}' did not resolve"),
+    let ir = resolve_active_agent(Some(name), config, builtin)?.ok_or_else(|| {
+        RuntimeError::Registry {
+            detail: format!("UIA '{name}' did not resolve"),
+        }
     })?;
     if ir.role() != AgentRoleId::UserInterface {
         return Err(RuntimeError::Registry {
-            detail: format!("configured UIA '{name}' has role {:?}, expected user-interface", ir.role()),
+            detail: format!(
+                "configured UIA '{name}' has role {:?}, expected user-interface",
+                ir.role()
+            ),
         });
     }
     Ok(Some(ir))
@@ -2314,16 +2402,16 @@ const MEMORY_KEYWORDS_MAX: usize = 12;
 /// die private Funktion zu duplizieren oder sie öffentlich zu machen (außerhalb
 /// dieses Vertrags).
 const MEMORY_KEYWORD_STOPWORDS: &[&str] = &[
-    "dass", "eine", "einen", "einem", "einer", "eines", "sich", "sind", "wird", "werden",
-    "wurde", "wurden", "haben", "hatte", "hatten", "kann", "könnte", "muss", "müssen", "auch",
-    "aber", "oder", "nicht", "noch", "schon", "wenn", "dann", "diese", "dieser", "dieses",
-    "dabei", "damit", "durch", "über", "unter", "immer", "mehr", "sehr", "nach", "vor", "bei",
-    "bitte", "danke", "bereits", "dafür", "davon", "diesem", "diesen",
-    "that", "this", "these", "those", "with", "from", "have", "has", "had", "will", "would",
-    "could", "should", "please", "about", "what", "when", "where", "which", "your", "the",
-    "and", "for", "are", "was", "were", "been", "being", "into", "onto", "than", "then",
-    "there", "their", "them", "they", "some", "such", "just", "like", "want", "need", "make",
-    "does", "doing", "done", "here", "also", "only", "very",
+    "dass", "eine", "einen", "einem", "einer", "eines", "sich", "sind", "wird", "werden", "wurde",
+    "wurden", "haben", "hatte", "hatten", "kann", "könnte", "muss", "müssen", "auch", "aber",
+    "oder", "nicht", "noch", "schon", "wenn", "dann", "diese", "dieser", "dieses", "dabei",
+    "damit", "durch", "über", "unter", "immer", "mehr", "sehr", "nach", "vor", "bei", "bitte",
+    "danke", "bereits", "dafür", "davon", "diesem", "diesen", "that", "this", "these", "those",
+    "with", "from", "have", "has", "had", "will", "would", "could", "should", "please", "about",
+    "what", "when", "where", "which", "your", "the", "and", "for", "are", "was", "were", "been",
+    "being", "into", "onto", "than", "then", "there", "their", "them", "they", "some", "such",
+    "just", "like", "want", "need", "make", "does", "doing", "done", "here", "also", "only",
+    "very",
 ];
 
 /// Liest den jüngsten Nutzertext aus `ctx.metadata`, falls vorhanden.
@@ -2344,8 +2432,13 @@ fn latest_user_text_from_metadata(ctx: &TurnInputContext) -> Option<String> {
     match &ctx.metadata {
         serde_json::Value::String(text) => Some(text.clone()),
         serde_json::Value::Object(map) => {
-            const CANDIDATE_KEYS: &[&str] =
-                &["user_text", "latest_user_message", "text", "message", "input"];
+            const CANDIDATE_KEYS: &[&str] = &[
+                "user_text",
+                "latest_user_message",
+                "text",
+                "message",
+                "input",
+            ];
             CANDIDATE_KEYS.iter().find_map(|key| match map.get(*key) {
                 Some(serde_json::Value::String(text)) => Some(text.clone()),
                 _ => None,
@@ -2597,7 +2690,11 @@ impl MemoryFactsContextProvider {
                 if entry.symbols.is_empty() {
                     format!("- {} — {summary}", entry.path)
                 } else {
-                    format!("- {} — {summary} [{}]", entry.path, entry.symbols.join(", "))
+                    format!(
+                        "- {} — {summary} [{}]",
+                        entry.path,
+                        entry.symbols.join(", ")
+                    )
                 }
             })
             .collect();
@@ -2652,16 +2749,9 @@ fn resolve_context_window(config: &ResolvedConfig) -> u64 {
         return DEFAULT_CONTEXT_WINDOW_TOKENS;
     };
     let entry = config.models.get(model_id).or_else(|| {
-        config
-            .models
-            .values()
-            .find(|model| {
-                model.id == model_id
-                    || model
-                        .aliases
-                        .iter()
-                        .any(|alias| alias.as_str() == model_id)
-            })
+        config.models.values().find(|model| {
+            model.id == model_id || model.aliases.iter().any(|alias| alias.as_str() == model_id)
+        })
     });
     entry
         .and_then(|model| model.context_window)
@@ -2757,21 +2847,20 @@ fn build_spawner(
     })?;
 
     let spawner_slot = Arc::new(std::sync::OnceLock::new());
-    let factory: Arc<dyn ChildRegistryFactory> =
-        Arc::new(
-            RuntimeChildRegistryFactory::with_definitions(
-                project.clone(),
-                Arc::clone(model),
-                chain.clone(),
-                definitions.clone(),
-            )
-            .with_internal_models(crate::children::resolve_internal_models_for_children(
-                config,
-            ))
-            .with_profile_agents_dir(profile_agents_dir)
-            .with_browser_config(config.browser.clone())
-            .with_spawner_slot(Arc::clone(&spawner_slot)),
-        );
+    let factory: Arc<dyn ChildRegistryFactory> = Arc::new(
+        RuntimeChildRegistryFactory::with_definitions(
+            project.clone(),
+            Arc::clone(model),
+            chain.clone(),
+            definitions.clone(),
+        )
+        .with_internal_models(crate::children::resolve_internal_models_for_children(
+            config,
+        ))
+        .with_profile_agents_dir(profile_agents_dir)
+        .with_browser_config(config.browser.clone())
+        .with_spawner_slot(Arc::clone(&spawner_slot)),
+    );
 
     let model_id = config.harness.default_model.as_deref().unwrap_or_default();
     let manager = Arc::new(std::sync::Mutex::new(SessionManager::new(events)));
@@ -2909,6 +2998,17 @@ pub struct RuntimeAssembly {
     /// Sitzungsseitige Zuordnung von UI-Zustimmungen zu bereits ausgestellten
     /// Host-Permits dieses Laufs (siehe [`harw_sandbox::HostPermitSessionRegistry`]).
     host_permit_registry: Arc<HostPermitSessionRegistry>,
+    /// Sendeseite des Host-Permit-Fragekanals (siehe
+    /// [`harw_tool_shell::host_permit_prompt`]); an jeden `ShellToolProvider`
+    /// weiterzugeben, dessen `sandbox_profile` tatsächlich
+    /// [`harw_sandbox::SandboxProfile::Host`] ist (`with_host_permit_prompts`)
+    /// — derselbe Kanal, dessen Empfängerseite [`Self::take_host_permit_prompts`]
+    /// liefert.
+    host_permit_prompt_sender: HostPermitPromptSender,
+    /// Empfängerseite desselben Kanals, bis zur ersten Abholung gehalten
+    /// (Take-once, wie die Wurzel-Registry) — genau ein Renderer (z. B.
+    /// `harw-tui`) darf ihn übernehmen; ein zweiter Aufruf bekommt `Err`.
+    host_permit_prompts: Mutex<Option<HostPermitPromptReceiver>>,
 }
 
 impl std::fmt::Debug for RuntimeAssembly {
@@ -3025,6 +3125,54 @@ impl RuntimeAssembly {
     #[must_use]
     pub fn host_permit_session_registry(&self) -> &Arc<HostPermitSessionRegistry> {
         &self.host_permit_registry
+    }
+
+    /// Die Sendeseite des Host-Permit-Fragekanals dieses Laufs (siehe
+    /// [`harw_tool_shell::host_permit_prompt`]).
+    ///
+    /// # Beschreibung
+    /// Wer künftig einen `ShellToolProvider` mit
+    /// [`harw_sandbox::SandboxProfile::Host`] baut (heute
+    /// `harw_registry_defaults::profile`, außerhalb dieser Montage), muss
+    /// diesen Sender über
+    /// `ShellToolProvider::with_host_permit_prompts` anhängen — sonst bleibt
+    /// jede Host-Anfrage ohne bereits gemerkten Permit oder laufende
+    /// Sitzungsphase fail-closed abgelehnt, ohne dass je eine Frage entsteht.
+    ///
+    /// # Returns
+    /// Eine Referenz auf den geteilten Sender; `Clone` liefert einen weiteren
+    /// Zeiger auf denselben Kanal (ein `mpsc::UnboundedSender` ist `Clone`).
+    #[must_use]
+    pub fn host_permit_prompt_sender(&self) -> &HostPermitPromptSender {
+        &self.host_permit_prompt_sender
+    }
+
+    /// Händigt die Empfängerseite des Host-Permit-Fragekanals einmalig aus.
+    ///
+    /// # Beschreibung
+    /// Take-once, wie es die Wurzel-Registry dieses Laufs auch tut: der
+    /// erste Aufruf liefert den [`HostPermitPromptReceiver`], den
+    /// `RuntimeAssemblyBuilder::build` beim Aufbau dieses Laufs zusammen mit
+    /// [`Self::host_permit_prompt_sender`] erzeugt hat
+    /// ([`harw_tool_shell::host_permit_prompt::host_permit_prompt_channel`]).
+    /// Ein Renderer (z. B. `harw-tui`) muss ihn ebenso pollen wie den
+    /// normalen Freigabekanal — sonst läuft jede Host-Permit-Frage in den
+    /// Timeout und gilt als Ablehnung (fail-closed, keine Sonderbehandlung).
+    ///
+    /// # Returns
+    /// `Ok(receiver)` beim ersten Aufruf.
+    ///
+    /// # Errors
+    /// [`RuntimeError::Registry`], wenn der Empfänger bereits ausgehändigt
+    /// wurde oder die interne Sperre vergiftet ist.
+    pub fn take_host_permit_prompts(&self) -> RuntimeResult<HostPermitPromptReceiver> {
+        let mut slot = self.host_permit_prompts.lock().map_err(|_| RuntimeError::Registry {
+            detail: "the host permit prompt lock is poisoned".to_owned(),
+        })?;
+        slot.take().ok_or_else(|| RuntimeError::Registry {
+            detail: "this runtime has already handed out its host permit prompt receiver"
+                .to_owned(),
+        })
     }
 
     /// Der Vertrauensbericht der Konfigurationsschichten.
@@ -3358,11 +3506,14 @@ impl RuntimeAssembly {
         // `AgentSession` seinerseits auf den Modell-Vorgabewert abbildet).
         // Jeder andere Einstieg (auch ein `active_agent`-Root ohne UIA) bleibt
         // unverändert bei `spec.reasoning_effort`.
-        let reasoning_effort = if self.spawn_context.organizational_role == AgentRoleId::UserInterface {
-            self.spec.reasoning_effort.or(Some(self.role_effort_weights.uia))
-        } else {
-            self.spec.reasoning_effort
-        };
+        let reasoning_effort =
+            if self.spawn_context.organizational_role == AgentRoleId::UserInterface {
+                self.spec
+                    .reasoning_effort
+                    .or(Some(self.role_effort_weights.uia))
+            } else {
+                self.spec.reasoning_effort
+            };
         let mut session =
             AgentSession::new_with_id(id, AgentRole::Assistant, None, registry, events)
                 .with_spawn_context(self.spawn_context.clone())
@@ -3395,8 +3546,10 @@ impl RuntimeAssembly {
         // Modellstelle `CompactionSummary`, sofern sie nicht auf das
         // Hauptmodell aufgelöst hat (dann bleibt `AgentSession` unverändert
         // beim Vorgabemodell der Sitzung).
-        let summary =
-            harw_config::resolve_internal_model(&self.config, harw_config::InternalModelPoint::CompactionSummary);
+        let summary = harw_config::resolve_internal_model(
+            &self.config,
+            harw_config::InternalModelPoint::CompactionSummary,
+        );
         if !summary.is_main_model() {
             session = session.with_compaction_summary_model(
                 summary.provider.map(ProviderId::from),
@@ -3527,7 +3680,10 @@ mod tests {
             max_total_tokens: 1,
             max_wall: Duration::from_secs(1),
         };
-        assert_eq!(TurnLimits::from_root_budget(&budget).max_tool_calls, u32::MAX);
+        assert_eq!(
+            TurnLimits::from_root_budget(&budget).max_tool_calls,
+            u32::MAX
+        );
     }
 
     /// Der Rustdoc von [`default_approval_mode`] sagt „immer `Delegated`" —
@@ -3535,7 +3691,11 @@ mod tests {
     #[test]
     fn every_entry_starts_delegated() {
         for entry in ALL_ENTRIES {
-            assert_eq!(default_approval_mode(entry), ApprovalMode::Delegated, "{entry:?}");
+            assert_eq!(
+                default_approval_mode(entry),
+                ApprovalMode::Delegated,
+                "{entry:?}"
+            );
         }
     }
 
@@ -3564,10 +3724,15 @@ mod tests {
         let error = resolve_active_uia(EntryKind::Tui, &config, &definitions).unwrap_err();
         assert!(matches!(error, RuntimeError::Registry { .. }));
 
-        let explorer = definitions.get(role_names::EXPLORER).expect("explorer").clone();
+        let explorer = definitions
+            .get(role_names::EXPLORER)
+            .expect("explorer")
+            .clone();
         let mut config = config;
         config.harness.active_uia_definition = Some("not-a-uia".to_owned());
-        config.executable_agents.insert("not-a-uia".to_owned(), explorer);
+        config
+            .executable_agents
+            .insert("not-a-uia".to_owned(), explorer);
         let error = resolve_active_uia(EntryKind::Tui, &config, &definitions).unwrap_err();
         assert!(matches!(error, RuntimeError::Registry { .. }));
     }
@@ -3575,16 +3740,18 @@ mod tests {
     #[test]
     fn non_interactive_entries_do_not_require_a_uia() {
         let (config, definitions) = builtin();
-        assert!(resolve_active_uia(EntryKind::Doctor, &config, &definitions)
-            .expect("doctor has no UIA requirement")
-            .is_none());
+        assert!(
+            resolve_active_uia(EntryKind::Doctor, &config, &definitions)
+                .expect("doctor has no UIA requirement")
+                .is_none()
+        );
     }
 
     #[test]
     fn an_unknown_agent_name_fails_closed() {
         let (config, definitions) = builtin();
-        let error = resolve_active_agent(Some("definitely-not-a-role"), &config, &definitions)
-            .unwrap_err();
+        let error =
+            resolve_active_agent(Some("definitely-not-a-role"), &config, &definitions).unwrap_err();
         assert!(matches!(error, RuntimeError::Registry { .. }));
     }
 
@@ -3857,9 +4024,9 @@ mod tests {
             })
     }
 
-    /// Jede [`harw_sandbox::Permission`] — die weiteste denkbare Obergrenze.
+    /// Jede [`harw_authority::Permission`] — die weiteste denkbare Obergrenze.
     fn every_permission() -> PermissionSet {
-        use harw_sandbox::Permission;
+        use harw_authority::Permission;
         PermissionSet::from_policy([
             Permission::ReadWorkspace,
             Permission::WriteWorkspace,
@@ -3923,7 +4090,12 @@ mod tests {
         let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
         let (turn_events, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
         let root = assembly
-            .new_root_session(assembly.root_session_id().clone(), events, turn_events, None)
+            .new_root_session(
+                assembly.root_session_id().clone(),
+                events,
+                turn_events,
+                None,
+            )
             .expect("Wurzelsitzung entsteht");
 
         assert!(
@@ -3962,7 +4134,9 @@ mod tests {
             .narrowing(RuntimeNarrowing {
                 registry_profile: RegistryProfile::ReadOnlyExplore,
                 identity: IdentityOverrides::default(),
-                permissions: PermissionSet::from_policy([harw_sandbox::Permission::ReadWorkspace]),
+                permissions: PermissionSet::from_policy([
+                    harw_authority::Permission::ReadWorkspace,
+                ]),
                 workspace_root: None,
             })
             .build()
@@ -4074,13 +4248,12 @@ mod tests {
             let granted = assembly.sandbox().permissions();
             assert!(granted.is_subset_of(&profile.permissions), "{entry:?}");
             assert_eq!(
-                granted,
-                &profile.permissions,
+                granted, &profile.permissions,
                 "{entry:?}: die weiteste Obergrenze ergibt genau die Profilrechte"
             );
             assert_eq!(assembly.spawn_context().sandbox.permissions(), granted);
-            assert!(!granted.contains(harw_sandbox::Permission::NetworkAccess));
-            assert!(!granted.contains(harw_sandbox::Permission::ReadCargoRegistry));
+            assert!(!granted.contains(harw_authority::Permission::NetworkAccess));
+            assert!(!granted.contains(harw_authority::Permission::ReadCargoRegistry));
         }
 
         // Eine engere Obergrenze schneidet; ein fremdes Recht kommt nie hinzu.
@@ -4089,8 +4262,8 @@ mod tests {
                 registry_profile: RegistryProfile::Full,
                 identity: IdentityOverrides::default(),
                 permissions: PermissionSet::from_policy([
-                    harw_sandbox::Permission::ReadWorkspace,
-                    harw_sandbox::Permission::NetworkAccess,
+                    harw_authority::Permission::ReadWorkspace,
+                    harw_authority::Permission::NetworkAccess,
                 ]),
                 workspace_root: None,
             })
@@ -4098,7 +4271,7 @@ mod tests {
             .expect("LocalEcho montiert");
         assert_eq!(
             assembly.sandbox().permissions(),
-            &PermissionSet::from_policy([harw_sandbox::Permission::ReadWorkspace])
+            &PermissionSet::from_policy([harw_authority::Permission::ReadWorkspace])
         );
     }
 
@@ -4126,7 +4299,10 @@ mod tests {
         spec.active_agent = Some("explorer".to_owned());
         let with_agent = root_identity(&spec, Some(&narrowing));
         assert_eq!(with_agent.agent_name.as_deref(), Some("explorer"));
-        assert_eq!(with_agent.role_description.as_deref(), Some("research node"));
+        assert_eq!(
+            with_agent.role_description.as_deref(),
+            Some("research node")
+        );
 
         let default = root_identity(&spec, None);
         assert_eq!(default.agent_name.as_deref(), Some("explorer"));
@@ -4148,7 +4324,9 @@ mod tests {
             .narrowing(RuntimeNarrowing {
                 registry_profile: RegistryProfile::ReadOnlyExplore,
                 identity: IdentityOverrides::default(),
-                permissions: PermissionSet::from_policy([harw_sandbox::Permission::ReadWorkspace]),
+                permissions: PermissionSet::from_policy([
+                    harw_authority::Permission::ReadWorkspace,
+                ]),
                 workspace_root: Some(workspace.clone()),
             })
             .build()
@@ -4165,13 +4343,17 @@ mod tests {
             "die Sandbox ist an den Workspace-Unterordner gebunden"
         );
         assert_eq!(
-            assembly.spawn_context().sandbox.workspace().canonical_root(),
+            assembly
+                .spawn_context()
+                .sandbox
+                .workspace()
+                .canonical_root(),
             canonical_workspace.as_path(),
             "der Spawn-Kontext trägt dieselbe engere Bindung"
         );
         assert_eq!(
             assembly.sandbox().permissions(),
-            &PermissionSet::from_policy([harw_sandbox::Permission::ReadWorkspace])
+            &PermissionSet::from_policy([harw_authority::Permission::ReadWorkspace])
         );
 
         // Gleichheit mit dem Projekt-Root ist ebenfalls zugelassen.
@@ -4215,7 +4397,10 @@ mod tests {
                 std::fs::create_dir_all(&evil).expect("prefix sibling");
                 evil
             }),
-            ("Ausbruch über ..", fixture.project.join("..").join("sibling")),
+            (
+                "Ausbruch über ..",
+                fixture.project.join("..").join("sibling"),
+            ),
             ("fehlendes Verzeichnis", fixture.project.join("missing")),
             ("relativer Pfad", PathBuf::from("nested")),
         ] {
@@ -4318,8 +4503,14 @@ mod tests {
             let context = registry_model_context(&assembly);
             assert!(!context.is_empty(), "{entry:?}");
             for text in &context {
-                assert!(!text.contains(AGENTS_MARKER), "{entry:?}: AGENTS.md im Kontext: {text}");
-                assert!(!text.contains("project.doc:"), "{entry:?}: Doku-Fragment: {text}");
+                assert!(
+                    !text.contains(AGENTS_MARKER),
+                    "{entry:?}: AGENTS.md im Kontext: {text}"
+                );
+                assert!(
+                    !text.contains("project.doc:"),
+                    "{entry:?}: Doku-Fragment: {text}"
+                );
                 assert!(
                     !text.contains(canonical_project.to_string_lossy().as_ref()),
                     "{entry:?}: Host-Pfad im Kontext: {text}"
@@ -4361,7 +4552,10 @@ mod tests {
         let shows_agents_doc = |text: &String| {
             text.starts_with("project.doc:AGENTS.md\n") && text.contains(AGENTS_MARKER)
         };
-        assert!(context.iter().any(shows_agents_doc), "Tui zeigt AGENTS.md: {context:?}");
+        assert!(
+            context.iter().any(shows_agents_doc),
+            "Tui zeigt AGENTS.md: {context:?}"
+        );
         let expected_root = format!(
             "project.root\nproject_root={}\ncwd={}",
             canonical_project.display(),
@@ -4391,7 +4585,9 @@ mod tests {
             .narrowing(RuntimeNarrowing {
                 registry_profile: RegistryProfile::ReadOnlyExplore,
                 identity: IdentityOverrides::default(),
-                permissions: PermissionSet::from_policy([harw_sandbox::Permission::ReadWorkspace]),
+                permissions: PermissionSet::from_policy([
+                    harw_authority::Permission::ReadWorkspace,
+                ]),
                 workspace_root: Some(workspace.clone()),
             })
             .build()
@@ -4438,9 +4634,12 @@ mod tests {
             ],
         };
         let profile = EntryKind::JobPlanNode.profile();
-        let narrowed =
-            registry_project_context(&project, &profile, Some(Path::new("/work/space")));
-        let kept: Vec<&str> = narrowed.docs.iter().map(|doc| doc.content.as_str()).collect();
+        let narrowed = registry_project_context(&project, &profile, Some(Path::new("/work/space")));
+        let kept: Vec<&str> = narrowed
+            .docs
+            .iter()
+            .map(|doc| doc.content.as_str())
+            .collect();
         assert_eq!(kept, ["/work/space/AGENTS.md", "/work/space/sub/AGENTS.md"]);
         assert_eq!(narrowed.project_root, PathBuf::from("/work/space"));
         assert_eq!(narrowed.cwd, PathBuf::from("/work/space/sub"));
@@ -4456,7 +4655,10 @@ mod tests {
             Some(Path::new("/work/space")),
         );
         assert!(redacted.docs.is_empty());
-        assert_eq!(redacted.project_root, PathBuf::from(PROJECT_CONTEXT_PLACEHOLDER));
+        assert_eq!(
+            redacted.project_root,
+            PathBuf::from(PROJECT_CONTEXT_PLACEHOLDER)
+        );
         assert_eq!(redacted.cwd, PathBuf::from(PROJECT_CONTEXT_PLACEHOLDER));
     }
 
@@ -4564,10 +4766,16 @@ mod tests {
         );
 
         global.approval_timeout_secs = Some(60);
-        assert_eq!(effective_approval_timeout(&global, &project), Duration::from_secs(60));
+        assert_eq!(
+            effective_approval_timeout(&global, &project),
+            Duration::from_secs(60)
+        );
 
         project.approval_timeout_secs = Some(30);
-        assert_eq!(effective_approval_timeout(&global, &project), Duration::from_secs(30));
+        assert_eq!(
+            effective_approval_timeout(&global, &project),
+            Duration::from_secs(30)
+        );
     }
 
     /// Eine ungültige Extra-Root (hier: nicht existent) wird übersprungen,
@@ -4593,7 +4801,11 @@ mod tests {
 
         let cell = seed_extra_roots(&global, &PermissionsSection::default(), &primary, None);
         let snapshot = cell.snapshot();
-        assert_eq!(snapshot.len(), 1, "nur der gültige Eintrag bleibt: {snapshot:?}");
+        assert_eq!(
+            snapshot.len(),
+            1,
+            "nur der gültige Eintrag bleibt: {snapshot:?}"
+        );
     }
 
     // ── Plan-Dienste: Default an, außer ausdrücklich abgeschaltet (G-024) ────
@@ -4649,8 +4861,9 @@ mod tests {
 
         let explicit = default_tui_plan_services(&project_home);
         let findings = Arc::clone(&explicit.findings);
-        let resolved = resolve_plan_services(EntryKind::Tui, Some(explicit), &section, &project_home)
-            .expect("ein expliziter Builder-Wert bleibt erhalten");
+        let resolved =
+            resolve_plan_services(EntryKind::Tui, Some(explicit), &section, &project_home)
+                .expect("ein expliziter Builder-Wert bleibt erhalten");
         assert!(Arc::ptr_eq(&resolved.findings, &findings));
     }
 

@@ -4,6 +4,15 @@
 **Bindet an:** `philosophy.md` §10 (Operations ≠ Tools ≠ Permissions), §11 (Tool-Design als eigene UI), §12 (monotone Authority-Reduktion), §16 Invarianten 14 & 15.
 **Inspirationen (siehe `docs/research/tool-inventory.md`):** codex-rs, Hermes, OpenClaw.
 
+> **Ist-Stand (2026-09)**: `harw-tool-canon` wurde nie gebaut. Das reale
+> Tool-Vokabular im Baum ist stattdessen `fs.*` (`read`/`write`/`list`/
+> `search`/`glob`/`grep`), `shell.exec`, `web.fetch`/`web.docs_rs`/
+> `web.crates_io`, `lens.ask`, `deps.*`, `browser.*`. Das `#[tool]`-Makro
+> existiert; Typestate-Approval, `ToolHandle` und `SyscallBoundary` aus diesem
+> Dokument existieren nicht. Kanon-Tools ohne Gegenstück im Ist-Code:
+> `apply_patch`, `web_search`, `tool_search`, `request_user_input`,
+> `request_permissions`, `cron_schedule`, `execute_code`.
+
 ---
 
 ## 1. Was Harwness heute schon richtig macht

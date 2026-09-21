@@ -1,0 +1,11 @@
+schema_version = 1
+mode = "observe"
+
+# Monitoriert den kompletten Host (Prozess-Starts und ausgehende TCP-Verbindungen).
+# Achtung: produziert viele Events. Fuer Tests ohne konkrete Cgroups geeignet.
+active_profile = "host"
+
+[profiles.host]
+scope = "host"
+sensors = ["exec", "tcp-connect"]
+egotiation_allow_cidrs = []

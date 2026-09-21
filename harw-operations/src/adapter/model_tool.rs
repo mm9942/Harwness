@@ -580,9 +580,7 @@ mod tests {
         OperationCategory, OperationDomain, OperationMeta, PermissionTier, Surface,
     };
     use harw_extension_api::contributors::ToolProvider;
-    use harw_sandbox::{
-        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-    };
+    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_tools::{
         AdditionalProperties, JsonSchema, JsonSchemaType, ToolCall, ToolExecutionContext, ToolName,
         ToolOutput, ToolSpec, ToolsError,

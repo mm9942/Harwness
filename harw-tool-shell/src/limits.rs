@@ -238,9 +238,7 @@ pub(crate) fn launch_command(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harw_sandbox::{
-        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-    };
+    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{TenantId, WorkspaceId};
     use tempfile::TempDir;
 

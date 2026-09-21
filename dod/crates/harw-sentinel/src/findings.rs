@@ -80,7 +80,7 @@
 //!
 //! # Was dieser Kontext (noch) nicht befüllt
 //! [`harw_dod_rules::rule::RuleContext::network_scope`] ist
-//! [`harw_sandbox::NetworkScope::empty`] — dieses Binary hat heute keine
+//! [`harw_authority::NetworkScope::empty`] — dieses Binary hat heute keine
 //! `--flag`, die einen erlaubten Netzbereich konfiguriert, also gibt es
 //! keinen ehrlichen Wert außer „leer" zu injizieren.
 //! [`harw_dod_rules::rule::RuleContext::baselines`] ist ein leerer Schnitt
@@ -107,11 +107,10 @@
 //! — sie bricht bei keiner Befundzahl ab.
 
 use harw_dod_rules::rule::RuleContext;
-use harw_dod_rules::rules::{BaselineDeviationRule, EgressFlowRule, StructureDriftRule};
-use harw_dod_rules::{Finding, FindingKind, Rule, RuleChecked, run_rules};
+use harw_dod_rules::{FindingKind, run_rules};
 use harw_dod_signals::SecurityEvidence;
 use harw_observe::{FieldValue, MetricValue, TelemetrySink};
-use harw_sandbox::NetworkScope;
+use harw_authority::NetworkScope;
 use jiff::Timestamp;
 
 /// Label-Feldname für die auslösende Regel ([`harw_dod_rules::Rule::id`]).
@@ -201,12 +200,7 @@ pub fn report_findings(sink: &dyn TelemetrySink, evidence: &SecurityEvidence, no
         network_scope: &scope,
     };
 
-    let egress_flow = EgressFlowRule;
-    let structure_drift = StructureDriftRule;
-    let baseline_deviation = BaselineDeviationRule;
-    let rules: [&dyn Rule; 3] = [&egress_flow, &structure_drift, &baseline_deviation];
-
-    let findings: Vec<Finding<RuleChecked>> = run_rules(&rules, &ctx);
+    let findings = run_rules(&ctx);
 
     for finding in &findings {
         tracing::warn!(
@@ -214,7 +208,6 @@ pub fn report_findings(sink: &dyn TelemetrySink, evidence: &SecurityEvidence, no
             kind = finding_kind_label(finding.kind()),
             severity = ?finding.severity(),
             hardness = ?finding.hardness(),
-            id = %finding.id().as_str(),
             summary = %finding.summary(),
             "security rule finding"
         );

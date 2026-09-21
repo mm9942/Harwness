@@ -2,7 +2,7 @@
 //!
 //! # Verantwortungsbereich
 //! [`ReadScope`] modelliert, welche Wurzelverzeichnisse ein Sensor lesen
-//! darf. Wie `harw_sandbox::NetworkScope` (das Vorbild dieser Disziplin) gibt
+//! darf. Wie `harw_authority::NetworkScope` (das Vorbild dieser Disziplin) gibt
 //! es **kein** `add` und **keine** Vereinigung — nur [`ReadScope::intersection`].
 //! Ein Bereich kann auf keinem Weg wachsen; das ist eine Typ-Eigenschaft
 //! dieser API, keine Konvention, die ein Aufrufer versehentlich verletzen

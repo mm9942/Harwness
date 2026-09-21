@@ -54,7 +54,7 @@
 //! ```rust,no_run
 //! use std::{path::PathBuf, sync::Arc};
 //! use harw_egress::EgressPolicy;
-//! use harw_sandbox::NetworkScope;
+//! use harw_authority::NetworkScope;
 //! use harw_tool_web::cache::CacheScope;
 //! use harw_tool_web::fetch::{OutputFormat, WebFetchOptions, WebFetcher};
 //!
@@ -78,7 +78,7 @@ use crate::hop::{HopTarget, check_hop, map_send_error, resolve_location};
 use crate::html::{html_to_markdown, html_to_text, truncate_utf8};
 use harw_egress::EgressPolicy;
 use harw_macros::Tool;
-use harw_sandbox::NetworkScope;
+use harw_authority::NetworkScope;
 use harw_tools::{ToolExecutionContext, ToolOutput, ToolsError};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};

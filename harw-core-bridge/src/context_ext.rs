@@ -73,9 +73,7 @@ mod tests {
 
     use harw_core::{ChildLimits, InMemoryStateStore, ManagedAgentSpawner, SessionManager};
     use harw_operations::context::{OpContext, ServiceMap};
-    use harw_sandbox::{
-        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-    };
+    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
 
     use super::OpContextCoreExt;

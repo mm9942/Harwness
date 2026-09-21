@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+harw-authority = { path = "../harw-authority" }
 harw-plan = { path = "../harw-plan" }
 harw-research = { path = "../harw-research" }
 harw-operations = { path = "../harw-operations" }
@@ -50,7 +51,7 @@ tempfile = "3.27.0"
 # einen privaten Konstruktor zu umgehen. `harw-dod-rules` ist deshalb keine
 # normale Abhängigkeit dieses Crates: der produktive Code nennt nur
 # `Finding<Triaged>`, re-exportiert von `harw-dod-escalate`.
-harw-dod-rules = { path = "../dod/crates/harw-dod-rules" }
+harw-dod-rules = { path = "../dod/crates/harw-dod-rules", features = ["test-support"] }
 harw-sandbox = { path = "../harw-sandbox" }
 
 [lints]

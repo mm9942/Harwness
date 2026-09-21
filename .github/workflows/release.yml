@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: harw
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native build on the runner.
+          - target: x86_64-unknown-linux-gnu
+            use_cross: false
+          # Cross-compiled for the maintainer's Raspberry Pi (64-bit).
+          - target: aarch64-unknown-linux-gnu
+            use_cross: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build (cargo)
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --locked -p harw-cli --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release --locked -p harw-cli --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          stage="harw-${tag}-${{ matrix.target }}"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "$stage/"
+          [ -f README.md ] && cp README.md "$stage/"
+          [ -f LICENSE ] && cp LICENSE "$stage/"
+          tar -czf "${stage}.tar.gz" "$stage"
+          sha256sum "${stage}.tar.gz" > "${stage}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: harw-${{ matrix.target }}
+          path: |
+            harw-*.tar.gz
+            harw-*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Build combined SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum *.tar.gz > SHA256SUMS
+          rm -f *.tar.gz.sha256
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true

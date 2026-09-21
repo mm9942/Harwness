@@ -5,9 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+harw-authority = { path = "../../../harw-authority" }
+harw-home = { path = "../../../harw-home" }
 # Die Sammelstelle selbst: `Sentinel`, `SentinelConfig`. Dieses Binary macht
 # sie zu einem laufenden Prozess (Knoten AW2-19) — siehe `src/main.rs`.
 harw-dod-sentinel = { path = "../harw-dod-sentinel" }
+# Sentinel und BPF-Probe lesen denselben vertrauenswürdigen DoD-Vertrag.
+harw-dod-config = { path = "../harw-dod-config" }
 # Daten-/Erzeugungsvokabular: `trait Sensor`, `SensorReading`, `SecurityEvent`,
 # `EventKind`, `SecurityEvidence`. Nötig, um die Sammelschleife und den
 # IPC-Empfangspfad gegen dieselben Typen zu schreiben, die `harw-dod-sentinel`
@@ -22,9 +26,6 @@ harw-observe = { path = "../../../harw-observe" }
 # `FileSink`, der einzige gelandete `TelemetrySink`-Implementierer — der
 # Standard-Sink dieses Binaries.
 harw-observe-file = { path = "../../../harw-observe-file" }
-# `paths::telemetry_dir`, `paths::home_dir` — Root-Space-Auflösung ohne
-# eigene Zweitimplementierung.
-harw-home = { path = "../../../harw-home" }
 # `SensorId` für jeden hier gebauten `SensorHandle`.
 harw-types = { path = "../../../harw-types" }
 # `#[derive(harw_macros::HarwError)]` für `src/error.rs` und `src/ipc.rs`.

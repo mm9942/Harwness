@@ -394,15 +394,22 @@ mod tests {
 
     #[test]
     fn decode_update_reads_the_update_id_hint_from_an_otherwise_malformed_payload() {
-        // Kein `message`/`edited_message`-Feld, das `RawUpdate` bräuchte, aber
-        // `update_id` bleibt als rohes JSON-Feld lesbar (Poison-Update, S6).
-        let poison = serde_json::json!({ "update_id": 77, "not_a_real_update_shape": true });
+        // `RawUpdate::message`/`edited_message`/`callback_query` sind alle
+        // `#[serde(default)] Option<_>`, weil Telegram-Updatearten, die dieses
+        // Schema nicht modelliert (z. B. `poll`, `chat_member`), legitim
+        // keines dieser Felder setzen. Ein bloß unbekanntes Zusatzfeld ist
+        // also kein Dekodierfehler mehr. Um trotzdem eine wirklich kaputte
+        // Nutzlast zu erzeugen, bekommt `message` hier einen falschen Typ
+        // (String statt Objekt), was `RawMessage`s Deserialisierung sicher
+        // scheitern lässt. `update_id` bleibt als rohes JSON-Feld lesbar
+        // (Poison-Update, S6).
+        let poison = serde_json::json!({ "update_id": 77, "message": "not-a-message-object" });
 
         let (update_id_hint, decoded) = decode_update(poison);
 
         assert_eq!(update_id_hint, Some(77));
         let error = decoded.expect_err("malformed shape must fail RawUpdate decoding");
-        assert!(!error.to_string().contains("not_a_real_update_shape"));
+        assert!(!error.to_string().contains("not-a-message-object"));
     }
 
     #[test]

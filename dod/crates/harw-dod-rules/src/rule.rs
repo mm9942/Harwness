@@ -30,9 +30,9 @@
 //!
 //! # Examples
 //! ```rust
+//! use harw_authority::NetworkScope;
 //! use harw_dod_rules::rule::{Rule, RuleContext};
 //! use harw_dod_rules::rules::EgressFlowRule;
-//! use harw_sandbox::NetworkScope;
 //!
 //! let scope = NetworkScope::empty();
 //! let ctx = RuleContext {
@@ -44,9 +44,9 @@
 //! };
 //! assert!(EgressFlowRule.evaluate(&ctx).is_empty());
 //! ```
-
+//
+use harw_authority::NetworkScope;
 use harw_dod_signals::{HostSample, SecurityEvent};
-use harw_sandbox::NetworkScope;
 use jiff::Timestamp;
 
 use crate::baseline::Baseline;
@@ -67,9 +67,9 @@ use crate::finding::{Finding, Raw};
 ///
 /// # Examples
 /// ```rust
+/// use harw_authority::NetworkScope;
 /// use harw_dod_rules::rule::{Rule, RuleContext};
-/// use harw_dod_rules::rules::StructureDriftRule;
-/// use harw_sandbox::NetworkScope;
+/// use harw_dod_rules::rules::EgressFlowRule;
 ///
 /// let scope = NetworkScope::empty();
 /// let ctx = RuleContext {
@@ -79,7 +79,7 @@ use crate::finding::{Finding, Raw};
 ///     baselines: &[],
 ///     network_scope: &scope,
 /// };
-/// assert_eq!(StructureDriftRule.id(), "structure-drift");
+/// assert_eq!(EgressFlowRule.id(), "egress-flow");
 /// ```
 pub trait Rule: Send + Sync {
     /// Die stabile Kennung dieser Regel.
@@ -112,7 +112,7 @@ pub trait Rule: Send + Sync {
 /// Crate braucht. `network_scope` ist ein Zusatz gegenüber der ursprünglichen
 /// Skizze (die dort vorgesehene Lücke „was die konkreten Regeln unten sonst
 /// brauchen“) — [`crate::rules::EgressFlowRule`] braucht ihn, um
-/// `harw_sandbox::NetworkScope::allows`/`allows_addr` zu benutzen, statt die
+/// `harw_authority::NetworkScope::allows`/`allows_addr` zu benutzen, statt die
 /// Bereichsprüfung selbst zweitzuschreiben.
 ///
 /// # Errors
@@ -120,8 +120,8 @@ pub trait Rule: Send + Sync {
 ///
 /// # Examples
 /// ```rust
+/// use harw_authority::NetworkScope;
 /// use harw_dod_rules::rule::RuleContext;
-/// use harw_sandbox::NetworkScope;
 ///
 /// let scope = NetworkScope::empty();
 /// let ctx = RuleContext {

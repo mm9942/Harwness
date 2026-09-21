@@ -1,10 +1,19 @@
-//! Reale, `aya`-gestützte eBPF-Ladeschicht.
+ //! Reale, `aya`-gestützte eBPF-Ladeschicht.
+ //!
+ //! # V1 production contract
+ //! The historical research notes below predate the standalone C object
+ //! domain and are not the active contract.  Production uses only
+ //! [`BpfObjectContract`]: one exact program, the four named v1 maps, a
+ //! populated scope map before attach, and either a sched tracepoint or the
+ //! target-BTF `FEntry` TCP-connect hook.  Profileless [`BpfLoader::load`]
+ //! intentionally refuses real attachment; [`RealBpfLoader::load_contracts`]
+ //! rolls back all links on a partial failure.
 //!
 //! # Recherche, mit Quellen (Stand dieses Berichts)
 //! Vor dieser Datei stand die Entscheidung von `harw-dod-bpf`s eigener
 //! `crate`-Moduldoku (Abschnitt „Abweichung vom Auftrag: kein Ladeteil in
 //! dieser Lieferung“), **keine** `aya`-Abhängigkeit zu ziehen — mit zwei
-//! Begründungen: (1) `SocketFilter::attach` bräuchte einen bereits offenen
+//! Begründungen: (1) `SocketFilter::attach` bräuchte einen bereits geöffneten
 //! Socket, den eine generische Ladeschicht nicht besitzen darf, und (2) ein
 //! neuer, in dieser Sitzung nicht per `cargo` verifizierbarer
 //! Abhängigkeitszuwachs sei ausgerechnet im späteren `CAP_BPF`-Teil ein zu
@@ -196,30 +205,38 @@
 //! let loader: Box<dyn BpfLoader> = Box::new(RealBpfLoader::new());
 //! drop(loader);
 //! ```
-
-use std::collections::HashMap;
+// 
+use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use aya::maps::{MapData, RingBuf};
-use aya::programs::{KProbe, TracePoint};
-use aya::Ebpf;
+use aya::maps::{Array as AyaArray, HashMap as AyaHashMap, Map, MapData, PerCpuArray, RingBuf};
+use aya::programs::{FEntry, KProbe, TracePoint};
+use aya::{Btf, Ebpf};
 
 use crate::error::BpfError;
+use crate::contract::{
+    BpfObjectContract, EVENTS_MAP_NAME, LOSS_COUNTS_MAP_NAME, REQUIRED_MAP_NAMES,
+    SEQUENCE_MAP_NAME, SCOPE_MAP_NAME,
+};
 use crate::event::{parse_raw_event, RawBpfEvent};
 use crate::handle::BpfHandle;
 use crate::loader::BpfLoader;
 use crate::spec::{BpfProgramKind, BpfProgramSpec};
+use crate::profile::BpfScope;
+use crate::time::{KernelTimeMapper, TimeConfidence};
+use crate::abi::{parse_wire_event, WireEvent};
 
 /// Name der Ringpuffer-Map, die ein geladenes Objekt tragen muss.
 ///
 /// Siehe Moduldoku, Abschnitt „Der Vertrag zwischen dieser Ladeschicht und
 /// dem (künftigen) Objekt“.
-const EVENTS_MAP_NAME: &str = "EVENTS";
-
 /// Bitposition von `CAP_BPF` in der von `/proc/self/status` gemeldeten
 /// Fähigkeitsmaske (Linux ≥ 5.8, `include/uapi/linux/capability.h`).
 const CAP_BPF_BIT: u32 = 39;
+/// `CAP_PERFMON` is needed by the tracing attach path on current kernels.
+const CAP_PERFMON_BIT: u32 = 38;
 
 /// Wartezeit zwischen zwei Prüfungen der Ringpuffer-Map in
 /// [`RealBpfLoader::read_events`], solange der aufrufer-seitige `timeout`
@@ -238,6 +255,7 @@ struct LoadedProgram {
     /// nie gelesen — daher der führende Unterstrich.
     _ebpf: Ebpf,
     ring_buf: RingBuf<MapData>,
+    loss_counts: PerCpuArray<MapData, u64>,
 }
 
 /// Die reale, `aya`-gestützte Implementierung von [`crate::loader::BpfLoader`].
@@ -247,6 +265,30 @@ struct LoadedProgram {
 /// zwischen Ladeschicht und Objekt sowie die Privilegienklasse.
 pub struct RealBpfLoader {
     loaded: Mutex<HashMap<u64, LoadedProgram>>,
+    invalid_wire_events: AtomicU64,
+}
+
+/// A wire event accompanied by the loader's measured conversion from kernel
+/// monotonic time to realtime.  The raw `ktime_ns` remains available in the
+/// inner event for audit and re-mapping after a time discontinuity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimedWireEvent {
+    pub event: WireEvent,
+    pub observed_at: jiff::Timestamp,
+    pub time_confidence: TimeConfidence,
+}
+
+/// Counters exposed by every v1 object.  `ringbuf_reserve` failures are
+/// counted in-kernel per event kind; a caller compares them with the global
+/// event sequence to distinguish a quiet source from a lossy one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BpfLossCounters {
+    pub exec: u64,
+    pub process_exit: u64,
+    pub tcp_connect: u64,
+    /// Records rejected by the host ABI parser, including unknown versions,
+    /// types, lengths, and impossible timestamp mappings.
+    pub invalid_wire_events: u64,
 }
 
 impl RealBpfLoader {
@@ -271,8 +313,192 @@ impl RealBpfLoader {
     pub fn new() -> Self {
         Self {
             loaded: Mutex::new(HashMap::new()),
+            invalid_wire_events: AtomicU64::new(0),
         }
     }
+
+    /// Load one selected ELF program after filling the scope map.  This is
+    /// intentionally separate from the legacy `BpfLoader::load` method: the
+    /// latter has no profile argument and therefore cannot safely attach a
+    /// production object.
+    pub fn load_contract(&self, contract: &BpfObjectContract) -> Result<BpfHandle, BpfError> {
+        contract.validate()?;
+        if !has_attach_capabilities() {
+            return Err(BpfError::AttachCapabilitiesUnavailable);
+        }
+
+        let bytes = contract.source.resolve()?;
+        let mut ebpf = Ebpf::load(bytes.as_ref()).map_err(|_| BpfError::ProgramLoadFailed)?;
+        if !matches_exact_object_contract(&ebpf, contract) {
+            return Err(BpfError::InvalidProgramContract);
+        }
+        validate_sequence_map(&mut ebpf)?;
+        populate_scope_map(&mut ebpf, &contract.scope)?;
+
+        // Selecting by the exact object program name rejects a second,
+        // unexpected program instead of attaching whichever iterator entry
+        // happens to appear first.
+        let program = ebpf.program_mut(&contract.program_name).ok_or(BpfError::InvalidProgramContract)?;
+        match contract.kind {
+            BpfProgramKind::Tracepoint => {
+                let (category, name) = split_tracepoint_attach_point(&contract.attach_point)?;
+                let tracepoint: &mut TracePoint = program.try_into().map_err(|_| BpfError::InvalidProgramContract)?;
+                tracepoint.load().map_err(|_| BpfError::ProgramLoadFailed)?;
+                tracepoint.attach(category, name).map_err(|_| BpfError::ProgramLoadFailed)?;
+            }
+            BpfProgramKind::KProbe => {
+                let kprobe: &mut KProbe = program.try_into().map_err(|_| BpfError::InvalidProgramContract)?;
+                kprobe.load().map_err(|_| BpfError::ProgramLoadFailed)?;
+                kprobe.attach(&contract.attach_point, 0).map_err(|_| BpfError::ProgramLoadFailed)?;
+            }
+            BpfProgramKind::FEntry => {
+                let btf = Btf::from_sys_fs().map_err(|_| BpfError::InvalidProgramContract)?;
+                let fentry: &mut FEntry = program.try_into().map_err(|_| BpfError::InvalidProgramContract)?;
+                fentry.load(&contract.attach_point, &btf).map_err(|_| BpfError::ProgramLoadFailed)?;
+                fentry.attach().map_err(|_| BpfError::ProgramLoadFailed)?;
+            }
+            BpfProgramKind::SocketFilter => return Err(BpfError::UnsupportedProgramKind),
+        }
+        let map = ebpf.take_map(EVENTS_MAP_NAME).ok_or(BpfError::InvalidProgramContract)?;
+        let ring_buf = map.try_into().map_err(|_| BpfError::InvalidProgramContract)?;
+        let loss_map = ebpf.take_map(LOSS_COUNTS_MAP_NAME).ok_or(BpfError::InvalidProgramContract)?;
+        let loss_counts = loss_map.try_into().map_err(|_| BpfError::InvalidProgramContract)?;
+        let handle = BpfHandle::new(contract.sensor.clone(), contract.kind, contract.attach_point.clone());
+        let mut loaded = self.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        loaded.insert(handle.id(), LoadedProgram { _ebpf: ebpf, ring_buf, loss_counts });
+        Ok(handle)
+    }
+
+    /// Attach a profile's complete sensor set as one transaction.  If any
+    /// object cannot be loaded, validated, mapped, or attached, every link
+    /// already created by this call is dropped before the error is returned.
+    /// An empty list is rejected because it cannot establish observation
+    /// readiness.
+    pub fn load_contracts(&self, contracts: &[BpfObjectContract]) -> Result<Vec<BpfHandle>, BpfError> {
+        if contracts.is_empty() {
+            return Err(BpfError::InvalidProgramContract);
+        }
+
+        let mut handles = Vec::with_capacity(contracts.len());
+        for contract in contracts {
+            match self.load_contract(contract) {
+                Ok(handle) => handles.push(handle),
+                Err(error) => {
+                    for handle in &handles {
+                        let _ = self.unload(handle);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(handles)
+    }
+
+    /// Remove one object and its links.  Dropping `Ebpf` is the Aya-owned
+    /// detach operation, so a controlled probe stop cannot leave this
+    /// loader's BPF attachments behind.
+    pub fn unload(&self, handle: &BpfHandle) -> Result<(), BpfError> {
+        let removed = self
+            .loaded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&handle.id())
+            .ok_or(BpfError::UnknownHandle)?;
+        drop(removed);
+        Ok(())
+    }
+
+    /// Decode v1 wire events and apply the supplied clock relation.  The
+    /// mapper is injected so the probe can resample it around suspend or a
+    /// detected realtime step; no `ktime` value is ever treated as epoch time.
+    pub fn read_wire_events(
+        &self,
+        handle: &BpfHandle,
+        timeout: Duration,
+        mapper: KernelTimeMapper,
+    ) -> Result<Vec<TimedWireEvent>, BpfError> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let events = {
+                let mut loaded = self.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let entry = loaded.get_mut(&handle.id()).ok_or(BpfError::UnknownHandle)?;
+                let mut events = Vec::new();
+                while let Some(item) = entry.ring_buf.next() {
+                    let event = match parse_wire_event(&item) {
+                        Ok(event) => event,
+                        Err(_) => {
+                            self.invalid_wire_events.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    };
+                    let Some(observed_at) = mapper.map(event.ktime_ns) else {
+                        self.invalid_wire_events.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    };
+                    events.push(TimedWireEvent { event, observed_at, time_confidence: mapper.confidence() });
+                }
+                events
+            };
+            if !events.is_empty() || Instant::now() >= deadline { return Ok(events); }
+            std::thread::sleep(POLL_INTERVAL.min(timeout));
+        }
+    }
+
+    /// Return the loss counters from the same loaded object as `handle`.
+    /// Per-CPU values are summed with saturation: counter wrap must never
+    /// make a known loss look smaller.
+    pub fn loss_counters(&self, handle: &BpfHandle) -> Result<BpfLossCounters, BpfError> {
+        let loaded = self.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = loaded.get(&handle.id()).ok_or(BpfError::UnknownHandle)?;
+        Ok(BpfLossCounters {
+            exec: sum_loss_slot(&entry.loss_counts, 1)?,
+            process_exit: sum_loss_slot(&entry.loss_counts, 2)?,
+            tcp_connect: sum_loss_slot(&entry.loss_counts, 3)?,
+            invalid_wire_events: self.invalid_wire_events.load(Ordering::Relaxed),
+        })
+    }
+}
+
+fn sum_loss_slot(loss_counts: &PerCpuArray<MapData, u64>, slot: u32) -> Result<u64, BpfError> {
+    let values = loss_counts.get(&slot, 0).map_err(|_| BpfError::ProgramLoadFailed)?;
+    Ok(values.iter().copied().fold(0u64, u64::saturating_add))
+}
+
+/// Check names *and map kinds* before writing profile state or attaching a
+/// hook.  This is intentionally stricter than merely looking up `EVENTS`:
+/// an ELF with an extra map or program is not a DoD v1 object.
+fn matches_exact_object_contract(ebpf: &Ebpf, contract: &BpfObjectContract) -> bool {
+    let program_names: BTreeSet<_> = ebpf.programs().map(|(name, _)| name).collect();
+    if program_names.len() != 1 || !program_names.contains(contract.program_name.as_str()) {
+        return false;
+    }
+
+    let map_names: BTreeSet<_> = ebpf.maps().map(|(name, _)| name).collect();
+    let expected_names: BTreeSet<_> = REQUIRED_MAP_NAMES.into_iter().collect();
+    if map_names != expected_names {
+        return false;
+    }
+
+    ebpf.maps().all(|(name, map)| {
+        matches!(
+            (name, map),
+            (EVENTS_MAP_NAME, Map::RingBuf(_))
+                | (SCOPE_MAP_NAME, Map::HashMap(_))
+                | (LOSS_COUNTS_MAP_NAME, Map::PerCpuArray(_))
+                | (SEQUENCE_MAP_NAME, Map::Array(_))
+        )
+    })
+}
+
+/// `SEQUENCE` is not consumed by host code, but its key/value width is part
+/// of the C/Rust ABI.  Check it while the object is still unattached.
+fn validate_sequence_map(ebpf: &mut Ebpf) -> Result<(), BpfError> {
+    let map = ebpf.map_mut(SEQUENCE_MAP_NAME).ok_or(BpfError::InvalidProgramContract)?;
+    let sequence: AyaArray<_, u64> = AyaArray::try_from(map).map_err(|_| BpfError::InvalidProgramContract)?;
+    if sequence.len() != 1 {
+        return Err(BpfError::InvalidProgramContract);
+    }
+    Ok(())
 }
 
 impl Default for RealBpfLoader {
@@ -300,11 +526,13 @@ impl Default for RealBpfLoader {
 /// # Returns
 /// `true`, wenn Bit [`CAP_BPF_BIT`] gesetzt ist; `false` sonst, auch bei
 /// unlesbarer Eingabe.
-fn cap_bpf_bit_set(cap_eff_hex: &str) -> bool {
+fn capability_bit_set(cap_eff_hex: &str, bit: u32) -> bool {
     u64::from_str_radix(cap_eff_hex.trim(), 16)
-        .map(|mask| mask & (1u64 << CAP_BPF_BIT) != 0)
+        .map(|mask| mask & (1u64 << bit) != 0)
         .unwrap_or(false)
 }
+
+fn cap_bpf_bit_set(cap_eff_hex: &str) -> bool { capability_bit_set(cap_eff_hex, CAP_BPF_BIT) }
 
 /// Prüft, ob der laufende Prozess `CAP_BPF` in seiner effektiven
 /// Fähigkeitsmenge trägt.
@@ -330,13 +558,35 @@ fn has_cap_bpf() -> bool {
         .is_some_and(|hex| cap_bpf_bit_set(&hex))
 }
 
+fn has_attach_capabilities() -> bool {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| status.lines().find_map(|line| line.strip_prefix("CapEff:")).map(str::to_owned))
+        .is_some_and(|hex| has_cap_bpf() && capability_bit_set(&hex, CAP_PERFMON_BIT))
+}
+
+/// Install all profile entries before retrieving/loading/attaching a program.
+/// The BPF objects use key `0` as an explicit host-profile marker; an empty
+/// cgroup map is never interpreted as host observation.
+fn populate_scope_map(ebpf: &mut Ebpf, scope: &BpfScope) -> Result<(), BpfError> {
+    let map = ebpf.map_mut(SCOPE_MAP_NAME).ok_or(BpfError::InvalidProgramContract)?;
+    let mut ids: AyaHashMap<&mut MapData, u64, u8> =
+        AyaHashMap::try_from(map).map_err(|_| BpfError::InvalidProgramContract)?;
+    match scope {
+        BpfScope::Host => ids.insert(0u64, 1u8, 0).map_err(|_| BpfError::InvalidProgramContract),
+        BpfScope::Cgroups { groups, .. } => {
+            for group in groups { ids.insert(group.id, 1u8, 0).map_err(|_| BpfError::InvalidProgramContract)?; }
+            Ok(())
+        }
+    }
+}
+
 /// Zerlegt einen Tracepoint-Anknüpfungspunkt in Kategorie und Name.
 ///
 /// # Description
 /// [`crate::spec::BpfProgramSpec::attach_point`] kodiert einen Tracepoint
-/// als `"kategorie:name"` (z. B. `"sched:sched_process_exec"`,
-/// `"sock:inet_sock_set_state"`) — dieselbe Schreibweise, die beide heutigen
-/// Konsumenten bereits für ihre Anknüpfungspunkte verwenden.
+/// als `"kategorie:name"` (z. B. `"sched:sched_process_exec"`).  TCP uses
+/// the separate FEntry branch and therefore never reaches this helper.
 ///
 /// # Arguments
 /// - `attach_point` (`&str`): der volle Anknüpfungspunkt.
@@ -376,42 +626,10 @@ impl BpfLoader for RealBpfLoader {
     ///   Objekt, Laden/Anheften scheitert, `"EVENTS"`-Map fehlt oder hat
     ///   den falschen Maptyp).
     fn load(&self, program: &BpfProgramSpec) -> Result<BpfHandle, BpfError> {
-        if !has_cap_bpf() {
-            return Err(BpfError::CapabilityUnavailable);
-        }
-
-        let bytes = program.source.resolve()?;
-        let mut ebpf = Ebpf::load(bytes.as_ref()).map_err(|_| BpfError::ProgramLoadFailed)?;
-
-        let (_name, loaded_program) = ebpf.programs_mut().next().ok_or(BpfError::ProgramLoadFailed)?;
-
-        match program.kind {
-            BpfProgramKind::Tracepoint => {
-                let (category, name) = split_tracepoint_attach_point(&program.attach_point)?;
-                let trace_point: &mut TracePoint =
-                    loaded_program.try_into().map_err(|_| BpfError::ProgramLoadFailed)?;
-                trace_point.load().map_err(|_| BpfError::ProgramLoadFailed)?;
-                trace_point
-                    .attach(category, name)
-                    .map_err(|_| BpfError::ProgramLoadFailed)?;
-            }
-            BpfProgramKind::KProbe => {
-                let kprobe: &mut KProbe = loaded_program.try_into().map_err(|_| BpfError::ProgramLoadFailed)?;
-                kprobe.load().map_err(|_| BpfError::ProgramLoadFailed)?;
-                kprobe
-                    .attach(program.attach_point.as_str(), 0)
-                    .map_err(|_| BpfError::ProgramLoadFailed)?;
-            }
-            BpfProgramKind::SocketFilter => return Err(BpfError::UnsupportedProgramKind),
-        }
-
-        let map = ebpf.take_map(EVENTS_MAP_NAME).ok_or(BpfError::ProgramLoadFailed)?;
-        let ring_buf: RingBuf<MapData> = map.try_into().map_err(|_| BpfError::ProgramLoadFailed)?;
-
-        let handle = BpfHandle::new(program.sensor.clone(), program.kind, program.attach_point.clone());
-        let mut loaded = self.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        loaded.insert(handle.id(), LoadedProgram { _ebpf: ebpf, ring_buf });
-        Ok(handle)
+        let _ = program;
+        // A profileless caller cannot prove map setup occurred before attach.
+        // Refuse rather than preserving the prior broad-capture behavior.
+        Err(BpfError::InvalidProgramContract)
     }
 
     /// Siehe [`crate::loader::BpfLoader::read_events`].

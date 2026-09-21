@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+harw-authority = { path = "../../../harw-authority" }
 # Kennungen (`SensorId`) für Gesundheitszustand, Metrik-Labels und Belege.
 harw-types = { path = "../../../harw-types" }
 # `SensorHandle<Bound>`, `SensorError`, `Permanence` — das Zugriffsvokabular,

@@ -82,10 +82,11 @@ pub use agent_definition_tools::{
 };
 pub use authority::{AuthorityReducer, authority_reducer_for_role, tool_permission};
 pub use profile::{
-    AgentDefinitionAccess, IdentityOverrides, RegistryProfile, RestrictedToolProvider,
-    agent_definition_tool_names_for_access, assemble_registry, assemble_registry_for_project,
-    assemble_registry_for_project_with_definition_access, assemble_registry_for_sandbox,
-    assemble_registry_for_sandbox_with_definition_access, profile_for_role, role_names,
+    AgentDefinitionAccess, HostPermitWiring, IdentityOverrides, RegistryProfile,
+    RestrictedToolProvider, agent_definition_tool_names_for_access, assemble_registry,
+    assemble_registry_for_project, assemble_registry_for_project_with_definition_access,
+    assemble_registry_for_sandbox, assemble_registry_for_sandbox_with_definition_access,
+    profile_for_role, role_names,
 };
 pub use research_web::{researcher_web_network_scope, researcher_web_policy};
 

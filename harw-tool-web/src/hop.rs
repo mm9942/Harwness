@@ -10,7 +10,7 @@
 //!    Adressprüfung: der HTTP-Connector ruft für IP-Literale keinen Resolver
 //!    auf (hyper-util `SocketAddrs::try_parse`, siehe Ledger C-EGRESS §4). Die
 //!    Prüfung muss deshalb vor jedem Senden und für jedes Redirect-Ziel laufen.
-//! 3. **Sandbox-Scope:** [`harw_sandbox::NetworkScope::allows`] des aktiven
+//! 3. **Sandbox-Scope:** [`harw_authority::NetworkScope::allows`] des aktiven
 //!    Tool-Aufrufs.
 //!
 //! [`map_send_error`] findet Ablehnungen des Scoped-Resolvers aus
@@ -29,7 +29,7 @@
 //! # Examples
 //! ```rust
 //! use harw_egress::EgressPolicy;
-//! use harw_sandbox::NetworkScope;
+//! use harw_authority::NetworkScope;
 //! use harw_tool_web::hop::check_hop;
 //!
 //! let policy = EgressPolicy::new(vec!["docs.rs".to_owned()], false).unwrap();
@@ -40,7 +40,7 @@
 
 use crate::error::{WebToolError, WebToolResult};
 use harw_egress::{EgressError, EgressPolicy, EgressUrl, EgressUrlError};
-use harw_sandbox::NetworkScope;
+use harw_authority::NetworkScope;
 use std::net::IpAddr;
 
 /// Ein geprüftes Anfrageziel.
@@ -125,7 +125,7 @@ fn redact_host(host: &str) -> String {
 /// # Examples
 /// ```rust
 /// use harw_egress::EgressPolicy;
-/// use harw_sandbox::NetworkScope;
+/// use harw_authority::NetworkScope;
 /// use harw_tool_web::{WebToolError, hop::check_hop};
 ///
 /// let policy = EgressPolicy::new(vec!["docs.rs".to_owned()], false).unwrap();

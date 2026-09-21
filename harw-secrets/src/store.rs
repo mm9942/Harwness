@@ -19,7 +19,9 @@ use serde::{Deserialize, Serialize};
 use crate::audit::chain::{
     AUDIT_FORMAT_VERSION, AUDIT_MAGIC, AuditLog, PersistedChainStatus, canonical_bytes,
 };
-use crate::audit::checkpoint::CheckpointLog;
+use crate::audit::checkpoint::{
+    CHECKPOINT_FORMAT_VERSION, CHECKPOINT_MAGIC, CheckpointLog, PersistedCheckpointStatus,
+};
 use crate::audit::event::{Actor, SubjectRef};
 use crate::error::{AuditResult, SecretsError, SecretsResult};
 use crate::id::{KeyVersion, SecretId};
@@ -226,6 +228,39 @@ impl SecretStore {
     /// "manipulated".
     pub fn verify_persisted_audit_chain(&self) -> AuditResult<PersistedChainStatus> {
         crate::audit::chain::load_and_verify_persisted_chain(&self.root.join(AUDIT_FILE))
+    }
+
+    /// Load this store's persisted `checkpoints.log` from disk and verify it
+    /// end to end against `audit_event_count` — the checkpoint-file
+    /// counterpart to [`Self::verify_persisted_audit_chain`], for the same
+    /// reason kept as a deliberately separate, explicitly-called path rather
+    /// than something `open`/`open_with_key_material` runs automatically.
+    ///
+    /// # Arguments
+    /// - `audit_event_count` (`u64`): the already-verified event count of
+    ///   this store's audit chain (from [`Self::verify_persisted_audit_chain`]).
+    ///   Pass `u64::MAX` when that count could not be established (e.g. the
+    ///   audit chain itself failed to verify) so the range check becomes a
+    ///   no-op instead of comparing against a fabricated `0`.
+    /// - `verification_key` (`Option<&[u8]>`): ML-DSA verification key;
+    ///   `None` explicitly skips signature verification instead of silently
+    ///   reporting it as passed.
+    ///
+    /// # Errors
+    /// See [`crate::audit::checkpoint::load_and_verify_persisted_checkpoints`]
+    /// for the full breakdown of "nothing signed yet" vs. "unreadable" vs.
+    /// "manipulated" (broken chain, non-monotonic, beyond the log, or an
+    /// invalid signature).
+    pub fn verify_persisted_checkpoints(
+        &self,
+        audit_event_count: u64,
+        verification_key: Option<&[u8]>,
+    ) -> AuditResult<PersistedCheckpointStatus> {
+        crate::audit::checkpoint::load_and_verify_persisted_checkpoints(
+            &self.root.join(CHECKPOINT_FILE),
+            audit_event_count,
+            verification_key,
+        )
     }
 
     /// Whether a secret with `id` is present.
@@ -528,7 +563,6 @@ const SECRETS_DIRECTORY: &str = "secrets";
 const SECRETS_STAGE_DIRECTORY: &str = ".secrets-rotation-stage";
 const SECRETS_BACKUP_DIRECTORY: &str = ".secrets-rotation-backup";
 const SECRET_FILE_EXTENSION: &str = "json";
-const CHECKPOINT_MAGIC: &[u8] = b"HARW-CHECKPOINT\0";
 static NEXT_TEMPORARY_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 fn format_secret_id(id: &SecretId) -> String {
@@ -884,7 +918,7 @@ fn persist_audit_state(
     }
 
     let mut checkpoint_bytes = Vec::from(CHECKPOINT_MAGIC);
-    checkpoint_bytes.extend_from_slice(&1u32.to_be_bytes());
+    checkpoint_bytes.extend_from_slice(&CHECKPOINT_FORMAT_VERSION.to_be_bytes());
     checkpoint_bytes.extend_from_slice(&(checkpoints.len() as u64).to_be_bytes());
     for checkpoint in checkpoints.checkpoints() {
         checkpoint_bytes.extend_from_slice(&checkpoint.chain_head_hash);

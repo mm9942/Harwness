@@ -662,7 +662,7 @@ impl AgentSpawner for DeferredManagedSpawner {
         &'a self,
         role: &'a str,
         input: SpawnInput,
-        sandbox: harw_sandbox::SandboxSpec,
+        sandbox: harw_authority::SandboxSpec,
         suggestions: Option<harw_catalog::AgentSuggestions>,
     ) -> SpawnFuture<'a> {
         Box::pin(async move {

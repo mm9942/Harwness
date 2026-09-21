@@ -182,7 +182,7 @@ fn tool_spec_impl(
 }
 
 /// Erlaubte `permission = "..."`-Werte und die zugehörige Variante von
-/// `harw_sandbox::Permission` (re-exportiert als `::harw_tools::Permission`).
+/// `harw_authority::Permission` (re-exportiert als `::harw_tools::Permission`).
 ///
 /// Die Tabelle ist bewusst die *einzige* Stelle, an der ein String auf eine
 /// Berechtigung abgebildet wird: ein unbekannter Wert wird abgelehnt statt
@@ -327,7 +327,7 @@ fn permission_variant(lit: &LitStr) -> syn::Result<Ident> {
         return Ok(Ident::new(variant, lit.span()));
     }
 
-    // `read_cargo_registry` ist seit W1-18 eine echte `harw_sandbox::Permission`-
+    // `read_cargo_registry` ist seit W1-18 eine echte `harw_authority::Permission`-
     // Variante und wird oben regulär aufgelöst; die frühere Sonderdiagnose
     // entfällt damit.
     Err(syn::Error::new(

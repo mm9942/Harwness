@@ -3,18 +3,41 @@
 //! Transport sessions prove only protocol continuity. A configured ingress
 //! resolver creates [`McpRequestContext`] from an authenticated identity; the
 //! client-provided `clientInfo` field is never used as authority.
+//!
+//! # Admission (F-158-Parität)
+//! [`DurableMcpSupervisor::submit_job`] muss dieselbe Admission-Disziplin wie
+//! `harw_core::admission::JobAdmissionService::admit` durchsetzen: Idempotenz,
+//! Ratenbegrenzung und eine Budget-Obergrenze, die nie umgangen werden kann.
+//! Diese Datei kann `JobAdmissionService` selbst **nicht** verwenden — der
+//! Dienst braucht eine `Arc<harw_authority::WorkspaceRegistry>` und eine
+//! `JobAdmissionPolicy`-Implementierung, die an dieser MCP-Einreiseseite nicht
+//! existieren, und ihre Beschaffung würde die Composition Root in
+//! `harw-cli/src/main.rs` verändern — außerhalb des für diesen Fix erlaubten
+//! Änderungsbereichs (`harw-mcp-server/`). Die Budget-Obergrenze gab es hier
+//! bereits ([`McpJobBudgetLimits`]); Idempotenz und Ratenbegrenzung sind daher
+//! als **eigenständige Zweitimplementierung** direkt in diesem Modul
+//! nachgebildet, mit denselben zugrunde liegenden Bausteinen wie der Dienst
+//! (BLAKE3 über [`harw_types::ContentDigest`] für die deterministische
+//! Idempotenz-ID, ein gleitendes Zeitfenster pro `(Tenant, Submitter)` für die
+//! Ratenbegrenzung) — siehe [`McpIdempotencyKey`], [`mcp_idempotent_work_id`]
+//! und [`McpSubmissionRateLimiter`]. Eine Vereinheitlichung bräuchte: (1) die
+//! Composition Root in `harw-cli` reicht eine `Arc<WorkspaceRegistry>` und
+//! eine MCP-taugliche `JobAdmissionPolicy` an `DurableMcpSupervisor` durch,
+//! und (2) `harw_core::admission::SubmissionLimiter`/`idempotent_work_id`
+//! werden `pub(crate)` -> `pub` bzw. in eine gemeinsame Crate ausgelagert,
+//! damit beide Seiten denselben Code statt nur dasselbe Verfahren teilen.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use harw_job_runtime::{
     Budget, Job, JobCompletion, JobKind, JobScope, JobState, Lease, RetryPolicy, StoredJob,
 };
 use harw_session_store::{CancelRequest, JobStore, SessionStoreError};
-use harw_types::{ApprovalActor, TenantId, WorkId, WorkspaceId};
+use harw_types::{ApprovalActor, ContentDigest, TenantId, WorkId, WorkspaceId};
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -222,6 +245,217 @@ where
     }
 }
 
+/// Maximale Länge eines MCP-Idempotenzschlüssels in Byte.
+///
+/// # Description
+/// Parität zu `harw_core::admission::IDEMPOTENCY_KEY_MAX_LEN`; siehe den
+/// Moduldoc oben zur Frage, warum dieser Wert hier separat gepflegt wird.
+pub const MCP_IDEMPOTENCY_KEY_MAX_LEN: usize = 128;
+
+/// Präfix der aus einem MCP-Idempotenzschlüssel abgeleiteten Work-ID.
+pub const MCP_IDEMPOTENT_WORK_ID_PREFIX: &str = "mcp-idem-";
+
+// Domänen-Trenner der MCP-eigenen Idempotenz-Ableitung. Bewusst verschieden
+// von `harw_core::admission`s Trenner, damit die beiden unabhängigen
+// Implementierungen niemals kollidierende Work-IDs erzeugen. Bei
+// Formatänderung erhöhen.
+const MCP_IDEMPOTENCY_DOMAIN: &[u8] = b"harw-mcp-server/job-admission/idempotency/v1";
+
+/// Client-gewählter Deduplizierungsschlüssel für eine MCP-Einreichung.
+///
+/// # Description
+/// 1 bis [`MCP_IDEMPOTENCY_KEY_MAX_LEN`] Byte aus `[A-Za-z0-9._:-]`. Die
+/// abgeleitete Work-ID ist über `(Tenant, Workspace, Submitter, Schlüssel)`
+/// skopiert (siehe [`mcp_idempotent_work_id`]), sodass gleiche Schlüssel
+/// verschiedener Principals sich niemals treffen.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct McpIdempotencyKey(String);
+
+impl McpIdempotencyKey {
+    /// Validiert und verpackt einen rohen Schlüssel.
+    ///
+    /// # Errors
+    /// - [`McpSupervisorError::InvalidIdempotencyKey`]: leer, zu lang, oder
+    ///   ein Byte außerhalb von `[A-Za-z0-9._:-]`.
+    fn parse(raw: &str) -> Result<Self, McpSupervisorError> {
+        if raw.is_empty()
+            || raw.len() > MCP_IDEMPOTENCY_KEY_MAX_LEN
+            || !raw
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._:-".contains(&b))
+        {
+            return Err(McpSupervisorError::InvalidIdempotencyKey {
+                length: raw.len(),
+            });
+        }
+        Ok(Self(raw.to_owned()))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+// Längenpräfigiert ein Feld, damit die Verkettung injektiv bleibt (kein
+// Feld kann durch Grenzverschiebung mit einem Nachbarn kollidieren). Gleicher
+// Aufbau wie `harw_core::admission::push_field`.
+fn push_idempotency_field(material: &mut Vec<u8>, bytes: &[u8]) {
+    material.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    material.extend_from_slice(bytes);
+}
+
+/// Leitet die deterministische Work-ID einer MCP-Idempotenz-Einreichung ab.
+///
+/// # Description
+/// `mcp-idem-` gefolgt vom hex-BLAKE3-Digest über den Domänen-Trenner sowie
+/// die längenpräfigierten Felder Tenant, Workspace, Submitter und Schlüssel.
+/// Gleiches Verfahren wie `harw_core::admission::idempotent_work_id`, aber
+/// mit eigenem Domänen-Trenner und eigenem Präfix (siehe Moduldoc).
+///
+/// # Returns
+/// Eine dateisystemsichere [`WorkId`].
+fn mcp_idempotent_work_id(
+    tenant: &TenantId,
+    workspace: &WorkspaceId,
+    submitter: &ApprovalActor,
+    key: &McpIdempotencyKey,
+) -> WorkId {
+    let mut material = Vec::with_capacity(256);
+    push_idempotency_field(&mut material, MCP_IDEMPOTENCY_DOMAIN);
+    push_idempotency_field(&mut material, tenant.as_str().as_bytes());
+    push_idempotency_field(&mut material, workspace.as_str().as_bytes());
+    match submitter {
+        ApprovalActor::Operator { id } => {
+            push_idempotency_field(&mut material, b"operator");
+            push_idempotency_field(&mut material, id.as_bytes());
+        }
+        ApprovalActor::ChannelPeer { channel, peer } => {
+            push_idempotency_field(&mut material, b"channel_peer");
+            push_idempotency_field(&mut material, channel.as_str().as_bytes());
+            push_idempotency_field(&mut material, peer.as_str().as_bytes());
+        }
+    }
+    push_idempotency_field(&mut material, key.as_str().as_bytes());
+    WorkId::from_str(format!(
+        "{MCP_IDEMPOTENT_WORK_ID_PREFIX}{}",
+        ContentDigest::of(&material)
+    ))
+}
+
+/// Serverseitige Grenzen des gleitenden Zeitfensters der MCP-Ratenbegrenzung.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpAdmissionLimits {
+    max_submissions: u32,
+    window: SignedDuration,
+}
+
+impl McpAdmissionLimits {
+    /// Vorgabe zulässiger Einreichungen pro Zeitfenster.
+    pub const DEFAULT_MAX_SUBMISSIONS: u32 = 30;
+    /// Vorgabe der Fensterlänge in Sekunden.
+    pub const DEFAULT_WINDOW_SECONDS: i64 = 60;
+
+    /// Erzeugt Grenzen; `None` bei `max_submissions == 0` oder `window <= 0`.
+    #[must_use]
+    pub fn new(max_submissions: u32, window: SignedDuration) -> Option<Self> {
+        (max_submissions > 0 && window > SignedDuration::ZERO).then_some(Self {
+            max_submissions,
+            window,
+        })
+    }
+
+    /// Maximale Einreichungen pro Fenster.
+    #[must_use]
+    pub fn max_submissions(&self) -> u32 {
+        self.max_submissions
+    }
+
+    /// Fensterlänge.
+    #[must_use]
+    pub fn window(&self) -> SignedDuration {
+        self.window
+    }
+}
+
+impl Default for McpAdmissionLimits {
+    fn default() -> Self {
+        Self {
+            max_submissions: Self::DEFAULT_MAX_SUBMISSIONS,
+            window: SignedDuration::from_secs(Self::DEFAULT_WINDOW_SECONDS),
+        }
+    }
+}
+
+// Schlüssel eines Ratenfensters.
+type McpSubmitterKey = (TenantId, ApprovalActor);
+
+// Obergrenze verfolgter Submitter, bevor inaktive Fenster ausgekehrt werden.
+const MCP_LIMITER_SWEEP_THRESHOLD: usize = 4096;
+
+// Gleitendes Zeitfenster pro `(Tenant, Submitter)`. Zweitimplementierung von
+// `harw_core::admission::SubmissionLimiter` (dort privat und an eine
+// `JobAdmissionService`-Komposition gebunden, die hier nicht verfügbar ist;
+// siehe Moduldoc). Ein Idempotenz-Treffer wird dem Aufrufer *vor* dem
+// Reservieren eines Slots gemeldet und belastet das Fenster daher nie.
+#[derive(Debug)]
+struct McpSubmissionRateLimiter {
+    limits: McpAdmissionLimits,
+    windows: Mutex<HashMap<McpSubmitterKey, VecDeque<Timestamp>>>,
+}
+
+impl McpSubmissionRateLimiter {
+    fn new(limits: McpAdmissionLimits) -> Self {
+        Self {
+            limits,
+            windows: Mutex::new(HashMap::new()),
+        }
+    }
+
+    // Reserviert einen Slot bei `now`, oder meldet, wann der nächste frei wird.
+    fn try_acquire(&self, key: &McpSubmitterKey, now: Timestamp) -> Result<(), McpSupervisorError> {
+        let window = self.limits.window;
+        let mut windows = self
+            .windows
+            .lock()
+            .map_err(|_| McpSupervisorError::LimiterUnavailable)?;
+        if windows.len() > MCP_LIMITER_SWEEP_THRESHOLD {
+            windows.retain(|_, entries| {
+                entries
+                    .back()
+                    .is_some_and(|last| last.duration_until(now) < window)
+            });
+        }
+        let entries = windows.entry(key.clone()).or_default();
+        while entries
+            .front()
+            .is_some_and(|first| first.duration_until(now) >= window)
+        {
+            entries.pop_front();
+        }
+        if entries.len() >= self.limits.max_submissions as usize {
+            let retry_after = entries.front().map_or(window, |first| {
+                window.saturating_sub(first.duration_until(now))
+            });
+            return Err(McpSupervisorError::RateLimited { retry_after });
+        }
+        entries.push_back(now);
+        Ok(())
+    }
+
+    // Gibt eine bei `at` reservierte Reservierung frei, deren Zulassung nicht
+    // durchdrang (z. B. Race gegen eine gleichzeitige Einreichung verloren).
+    fn release(&self, key: &McpSubmitterKey, at: Timestamp) {
+        let Ok(mut windows) = self.windows.lock() else {
+            return;
+        };
+        if let Some(entries) = windows.get_mut(key)
+            && let Some(position) = entries.iter().rposition(|entry| *entry == at)
+        {
+            entries.remove(position);
+        }
+    }
+}
+
 /// Closed MCP submission input. Scope, identity, retry policy, scheduling,
 /// and work identity are resolved at the durable supervisor boundary.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -229,6 +463,11 @@ where
 pub struct McpJobSubmission {
     pub kind: McpSubmittedJobKind,
     pub input: Value,
+    /// Client-gewählter Deduplizierungsschlüssel (1..128 Byte aus
+    /// `[A-Za-z0-9._:-]`). Fehlt er, wird bei jedem Aufruf ein frischer Job
+    /// zugelassen; `None` verhält sich unverändert zum bisherigen Verhalten.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
     #[serde(default)]
     pub budget: Option<Budget>,
 }
@@ -363,6 +602,17 @@ pub enum McpSupervisorError {
     NotAuthorized,
     InvalidSubmission(String),
     JobStore(SessionStoreError),
+    /// Idempotenzschlüssel verletzt die Schlüsselgrammatik (Schlüssel selbst
+    /// wird nicht gespiegelt).
+    InvalidIdempotencyKey { length: usize },
+    /// Idempotenzschlüssel benennt bereits einen Job mit anderem Input, Kind
+    /// oder Scope. Fail closed: es wird nie ein Job stillschweigend zugelassen.
+    IdempotencyConflict { work_id: WorkId },
+    /// Der Submitter hat sein Einreichungsfenster ausgeschöpft.
+    RateLimited { retry_after: SignedDuration },
+    /// Der Sperrmechanismus der Ratenbegrenzung ist vergiftet (gesperrter
+    /// Mutex nach einem Panic). Fail closed statt stillschweigend zuzulassen.
+    LimiterUnavailable,
 }
 
 impl fmt::Display for McpSupervisorError {
@@ -371,6 +621,18 @@ impl fmt::Display for McpSupervisorError {
             Self::NotAuthorized => f.write_str("MCP principal is not authorized for this job"),
             Self::InvalidSubmission(detail) => write!(f, "invalid MCP job submission: {detail}"),
             Self::JobStore(error) => write!(f, "durable job operation failed: {error}"),
+            Self::InvalidIdempotencyKey { length } => write!(
+                f,
+                "invalid idempotency key of {length} bytes: expected 1-{MCP_IDEMPOTENCY_KEY_MAX_LEN} bytes of [A-Za-z0-9._:-]"
+            ),
+            Self::IdempotencyConflict { work_id } => write!(
+                f,
+                "idempotency key already used for a different submission (job {work_id})"
+            ),
+            Self::RateLimited { retry_after } => {
+                write!(f, "submission rate limit reached; retry after {retry_after}")
+            }
+            Self::LimiterUnavailable => f.write_str("submission rate limiter is unavailable"),
         }
     }
 }
@@ -405,6 +667,8 @@ pub struct DurableMcpSupervisor {
     worker_cancellation_sink: Arc<dyn WorkerCancellationSink>,
     /// Serverseitige Budget-Obergrenzen; nie aus einer Anfrage.
     budget_limits: McpJobBudgetLimits,
+    /// Gleitendes Ratenfenster pro `(Tenant, Submitter)`; siehe Moduldoc.
+    rate_limiter: McpSubmissionRateLimiter,
 }
 
 impl DurableMcpSupervisor {
@@ -425,6 +689,7 @@ impl DurableMcpSupervisor {
             store,
             worker_cancellation_sink,
             budget_limits: McpJobBudgetLimits::server_default(),
+            rate_limiter: McpSubmissionRateLimiter::new(McpAdmissionLimits::default()),
         }
     }
 
@@ -448,6 +713,24 @@ impl DurableMcpSupervisor {
     pub fn budget_limits(&self) -> McpJobBudgetLimits {
         self.budget_limits
     }
+
+    /// Setzt die Ratenbegrenzung der Einreichung auf ein anderes gleitendes
+    /// Zeitfenster als [`McpAdmissionLimits::default`] (setzt alle Fenster
+    /// zurück).
+    ///
+    /// # Returns
+    /// Den Supervisor mit den neuen Grenzen.
+    #[must_use]
+    pub fn with_rate_limits(mut self, rate_limits: McpAdmissionLimits) -> Self {
+        self.rate_limiter = McpSubmissionRateLimiter::new(rate_limits);
+        self
+    }
+
+    /// Die aktive Ratenbegrenzung.
+    #[must_use]
+    pub fn rate_limits(&self) -> McpAdmissionLimits {
+        self.rate_limiter.limits
+    }
 }
 
 impl McpSupervisor for DurableMcpSupervisor {
@@ -468,24 +751,71 @@ impl McpSupervisor for DurableMcpSupervisor {
             // P0.12: das Client-Budget wird gegen die Server-Obergrenzen
             // aufgelöst; ohne Angabe gilt die Obergrenze, nie `unbounded`.
             let budget = self.budget_limits.resolve(submission.budget.as_ref())?;
-
-            let now = Timestamp::now();
-            let mut job = Job::new(
-                WorkId::new(),
-                submission.kind.into_runtime_kind(),
-                budget,
-                default_retry_policy(),
-                now,
+            let kind = submission.kind.into_runtime_kind();
+            let scope = JobScope::new(
+                context.principal.tenant.clone(),
+                context.principal.workspace.clone(),
+                context.principal.actor.clone(),
             );
-            job.mark_ready(now)
-                .map_err(|error| McpSupervisorError::InvalidSubmission(error.to_string()))?;
+
+            // Idempotenz zuerst (F-158-Parität mit
+            // `JobAdmissionService::submit`): ein wiederholter Aufruf mit
+            // demselben Schlüssel trifft denselben Job und kehrt hier
+            // zurück, bevor die Ratenbegrenzung unten überhaupt erreicht
+            // wird — sie belastet das Fenster daher nie. Die erste, echte
+            // Zulassung unter diesem Schlüssel erreicht die Ratenbegrenzung
+            // dagegen wie jede andere Einreichung und wird dort belastet
+            // (siehe Begründung an der Ratenbegrenzung unten).
+            let idempotency_key = match &submission.idempotency_key {
+                Some(raw) => Some(McpIdempotencyKey::parse(raw)?),
+                None => None,
+            };
+            let id = match &idempotency_key {
+                Some(key) => {
+                    let id = mcp_idempotent_work_id(
+                        scope.tenant(),
+                        scope.workspace(),
+                        scope.submitter(),
+                        key,
+                    );
+                    match self.store.get(&id) {
+                        Ok(existing) => {
+                            return duplicate_of(existing, &scope, &kind, &submission.input);
+                        }
+                        Err(SessionStoreError::JobNotFound { .. }) => id,
+                        Err(error) => return Err(McpSupervisorError::JobStore(error)),
+                    }
+                }
+                None => WorkId::new(),
+            };
+
+            // Ratenbegrenzung (F-158-Parität): fail closed bei ausgeschöpftem
+            // Fenster oder vergiftetem Limiter-Lock. Nie stillschweigend
+            // zulassen.
+            //
+            // Jede Zulassung, die diesen Punkt erreicht, belastet das
+            // Fenster — mit oder ohne Idempotenzschlüssel. Nur ein Treffer
+            // im Idempotenz-Cache oben (derselbe Schlüssel trifft bereits
+            // einen existierenden Job) belastet es nicht, weil dieser
+            // Lookup vor `try_acquire` passiert und die Funktion dort
+            // bereits zurückkehrt. Ein Client könnte das Limit sonst durch
+            // einen jeweils neuen Idempotenzschlüssel pro Einreichung
+            // vollständig umgehen; diese Reihenfolge verhindert das.
+            let limiter_key = (
+                context.principal.tenant.clone(),
+                context.principal.actor.clone(),
+            );
+            let now = Timestamp::now();
+            self.rate_limiter.try_acquire(&limiter_key, now)?;
+
+            let mut job = Job::new(id.clone(), kind.clone(), budget, default_retry_policy(), now);
+            if let Err(error) = job.mark_ready(now) {
+                self.rate_limiter.release(&limiter_key, now);
+                return Err(McpSupervisorError::InvalidSubmission(error.to_string()));
+            }
             let record = StoredJob {
                 job,
-                scope: JobScope::new(
-                    context.principal.tenant.clone(),
-                    context.principal.workspace.clone(),
-                    context.principal.actor.clone(),
-                ),
+                scope: scope.clone(),
                 input: submission.input,
                 submitted_at: now,
                 not_before: now,
@@ -499,10 +829,23 @@ impl McpSupervisor for DurableMcpSupervisor {
                 // through yet.
                 trace: None,
             };
-            self.store
-                .admit(&record)
-                .map_err(McpSupervisorError::JobStore)?;
-            Ok(status(&record))
+            match self.store.admit(&record) {
+                Ok(()) => Ok(status(&record)),
+                Err(SessionStoreError::JobAlreadyExists { .. }) if idempotency_key.is_some() => {
+                    // Race gegen eine identische gleichzeitige Einreichung
+                    // verloren: derselbe abgeleitete Idempotenz-Work-ID wurde
+                    // in der Zwischenzeit bereits zugelassen. Der Slot oben
+                    // wurde für diesen Versuch bereits belastet und wird
+                    // hier wieder freigegeben, da kein neuer Job entsteht.
+                    self.rate_limiter.release(&limiter_key, now);
+                    let existing = self.store.get(&id).map_err(McpSupervisorError::JobStore)?;
+                    duplicate_of(existing, &scope, &kind, &record.input)
+                }
+                Err(error) => {
+                    self.rate_limiter.release(&limiter_key, now);
+                    Err(McpSupervisorError::JobStore(error))
+                }
+            }
         })
     }
 
@@ -627,6 +970,23 @@ fn can_cancel(principal: &McpPrincipal, scope: &JobScope) -> bool {
                 .capabilities
                 .contains(&McpJobCapability::CancelOwn)
                 && principal.actor == *scope.submitter()))
+}
+// Akzeptiert einen bestehenden Datensatz nur, wenn es dieselbe logische
+// Einreichung ist (gleicher Scope, gleiche Art, gleicher Input) — sonst
+// [`McpSupervisorError::IdempotencyConflict`] statt eines still vertauschten
+// Jobs. Gleiche Semantik wie `harw_core::admission::duplicate_of`.
+fn duplicate_of(
+    existing: StoredJob,
+    scope: &JobScope,
+    kind: &JobKind,
+    input: &Value,
+) -> Result<McpJobStatus, McpSupervisorError> {
+    if existing.scope != *scope || existing.job.kind != *kind || existing.input != *input {
+        return Err(McpSupervisorError::IdempotencyConflict {
+            work_id: existing.job.id,
+        });
+    }
+    Ok(status(&existing))
 }
 fn status(record: &StoredJob) -> McpJobStatus {
     McpJobStatus {
@@ -977,6 +1337,7 @@ mod tests {
                 McpJobSubmission {
                     kind: McpSubmittedJobKind::Worker,
                     input: serde_json::json!({"task": "durable MCP work"}),
+                    idempotency_key: None,
                     budget: None,
                 },
             )
@@ -1012,6 +1373,7 @@ mod tests {
                 McpJobSubmission {
                     kind: McpSubmittedJobKind::Worker,
                     input: serde_json::json!({"task": "expensive"}),
+                    idempotency_key: None,
                     budget: Some(Budget {
                         max_tokens: Some(MCP_JOB_MAX_TOKENS + 1),
                         max_wall: None,
@@ -1032,6 +1394,7 @@ mod tests {
                 McpJobSubmission {
                     kind: McpSubmittedJobKind::Dream,
                     input: serde_json::json!({"task": "slow"}),
+                    idempotency_key: None,
                     budget: Some(Budget {
                         max_tokens: None,
                         max_wall: Some(SignedDuration::from_secs(MCP_JOB_MAX_WALL_SECONDS + 1)),
@@ -1051,6 +1414,7 @@ mod tests {
                 McpJobSubmission {
                     kind: McpSubmittedJobKind::Worker,
                     input: serde_json::json!({"task": "busy"}),
+                    idempotency_key: None,
                     budget: Some(Budget {
                         max_tokens: None,
                         max_wall: None,
@@ -1083,6 +1447,7 @@ mod tests {
                 McpJobSubmission {
                     kind: McpSubmittedJobKind::Worker,
                     input: serde_json::json!({"task": "bounded"}),
+                    idempotency_key: None,
                     budget: Some(Budget {
                         max_tokens: Some(MCP_JOB_MAX_TOKENS),
                         max_wall: None,
@@ -1116,6 +1481,7 @@ mod tests {
                 McpJobSubmission {
                     kind: McpSubmittedJobKind::Worker,
                     input: serde_json::json!({"task": "over the composed limit"}),
+                    idempotency_key: None,
                     budget: Some(Budget {
                         max_tokens: Some(1_001),
                         max_wall: None,
@@ -1135,6 +1501,7 @@ mod tests {
                 McpJobSubmission {
                     kind: McpSubmittedJobKind::Worker,
                     input: serde_json::json!({"task": "no budget"}),
+                    idempotency_key: None,
                     budget: None,
                 },
             )
@@ -1195,6 +1562,7 @@ mod tests {
                 McpJobSubmission {
                     kind: McpSubmittedJobKind::Dream,
                     input: serde_json::json!({"task": "not allowed"}),
+                    idempotency_key: None,
                     budget: None,
                 },
             )
@@ -1210,6 +1578,7 @@ mod tests {
                 McpJobSubmission {
                     kind: McpSubmittedJobKind::Dream,
                     input: serde_json::json!(["not", "an", "object"]),
+                    idempotency_key: None,
                     budget: None,
                 },
             )
@@ -1225,6 +1594,7 @@ mod tests {
                 McpJobSubmission {
                     kind: McpSubmittedJobKind::Dream,
                     input: serde_json::json!({"task": "bad budget"}),
+                    idempotency_key: None,
                     budget: Some(Budget {
                         max_tokens: Some(0),
                         max_wall: None,
@@ -1237,5 +1607,238 @@ mod tests {
             invalid_budget,
             Err(McpSupervisorError::InvalidSubmission(_))
         ));
+    }
+
+    // ── Idempotency (F-158-Parität) ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn submit_with_idempotency_key_admits_once_and_is_idempotent_on_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(JobStore::new(temp.path()));
+        let supervisor = DurableMcpSupervisor::new(Arc::clone(&store));
+        let submission = || McpJobSubmission {
+            kind: McpSubmittedJobKind::Worker,
+            input: serde_json::json!({"task": "idempotent"}),
+            idempotency_key: Some("node-1".to_owned()),
+            budget: None,
+        };
+
+        let first = supervisor
+            .submit_job(&submit_context(), submission())
+            .await
+            .unwrap();
+        let second = supervisor
+            .submit_job(&submit_context(), submission())
+            .await
+            .unwrap();
+
+        assert_eq!(first.work_id, second.work_id);
+        assert!(
+            first
+                .work_id
+                .as_str()
+                .starts_with(MCP_IDEMPOTENT_WORK_ID_PREFIX)
+        );
+        let page = store
+            .list(&harw_session_store::JobListQuery::default())
+            .unwrap();
+        assert_eq!(
+            page.jobs.len(),
+            1,
+            "a retried idempotent submission must not create a second job"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_with_same_idempotency_key_and_different_input_conflicts() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(JobStore::new(temp.path()));
+        let supervisor = DurableMcpSupervisor::new(Arc::clone(&store));
+
+        supervisor
+            .submit_job(
+                &submit_context(),
+                McpJobSubmission {
+                    kind: McpSubmittedJobKind::Worker,
+                    input: serde_json::json!({"task": "a"}),
+                    idempotency_key: Some("shared-key".to_owned()),
+                    budget: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let conflict = supervisor
+            .submit_job(
+                &submit_context(),
+                McpJobSubmission {
+                    kind: McpSubmittedJobKind::Worker,
+                    input: serde_json::json!({"task": "b"}),
+                    idempotency_key: Some("shared-key".to_owned()),
+                    budget: None,
+                },
+            )
+            .await;
+        assert!(matches!(
+            conflict,
+            Err(McpSupervisorError::IdempotencyConflict { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn submit_rejects_an_invalid_idempotency_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(JobStore::new(temp.path()));
+        let supervisor = DurableMcpSupervisor::new(store);
+
+        let rejected = supervisor
+            .submit_job(
+                &submit_context(),
+                McpJobSubmission {
+                    kind: McpSubmittedJobKind::Worker,
+                    input: serde_json::json!({"task": "bad key"}),
+                    idempotency_key: Some("not a valid key!".to_owned()),
+                    budget: None,
+                },
+            )
+            .await;
+        assert!(matches!(
+            rejected,
+            Err(McpSupervisorError::InvalidIdempotencyKey { .. })
+        ));
+    }
+
+    // ── Rate limiting (F-158-Parität) ───────────────────────────────────
+
+    #[tokio::test]
+    async fn submit_rejects_once_the_submitter_rate_window_is_exhausted() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(JobStore::new(temp.path()));
+        let limits = McpAdmissionLimits::new(1, SignedDuration::from_secs(60)).unwrap();
+        let supervisor = DurableMcpSupervisor::new(Arc::clone(&store)).with_rate_limits(limits);
+        assert_eq!(supervisor.rate_limits(), limits);
+
+        supervisor
+            .submit_job(
+                &submit_context(),
+                McpJobSubmission {
+                    kind: McpSubmittedJobKind::Worker,
+                    input: serde_json::json!({"task": "first"}),
+                    idempotency_key: None,
+                    budget: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let rejected = supervisor
+            .submit_job(
+                &submit_context(),
+                McpJobSubmission {
+                    kind: McpSubmittedJobKind::Worker,
+                    input: serde_json::json!({"task": "second"}),
+                    idempotency_key: None,
+                    budget: None,
+                },
+            )
+            .await;
+        assert!(matches!(
+            rejected,
+            Err(McpSupervisorError::RateLimited { .. })
+        ));
+
+        // Nichts vom zweiten (abgelehnten) Versuch wurde zugelassen.
+        let page = store
+            .list(&harw_session_store::JobListQuery::default())
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn idempotent_retries_do_not_charge_the_rate_limit_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Arc::new(JobStore::new(temp.path()));
+        let limits = McpAdmissionLimits::new(1, SignedDuration::from_secs(60)).unwrap();
+        let supervisor = DurableMcpSupervisor::new(Arc::clone(&store)).with_rate_limits(limits);
+        let submission = || McpJobSubmission {
+            kind: McpSubmittedJobKind::Worker,
+            input: serde_json::json!({"task": "keyed"}),
+            idempotency_key: Some("node-1".to_owned()),
+            budget: None,
+        };
+
+        // (a) Erste Einreichung mit Schlüssel "node-1" verbraucht den
+        // einzigen Slot des Fensters — eine neue Zulassung belastet das
+        // Fenster immer, auch mit Idempotenzschlüssel.
+        let first = supervisor
+            .submit_job(&submit_context(), submission())
+            .await
+            .unwrap();
+
+        // (b) Dieselbe Einreichung noch einmal: trifft den Idempotenz-Cache
+        // (der Lookup passiert vor `try_acquire`) und liefert denselben Job
+        // zurück, obwohl das Fenster bereits ausgeschöpft ist.
+        let duplicate = supervisor
+            .submit_job(&submit_context(), submission())
+            .await
+            .unwrap();
+        assert_eq!(duplicate.work_id, first.work_id);
+
+        // (c) Eine andere Einreichung ohne Schlüssel erreicht die
+        // Ratenbegrenzung wie jede neue Zulassung und findet das Fenster
+        // ausgeschöpft.
+        let rejected_without_key = supervisor
+            .submit_job(
+                &submit_context(),
+                McpJobSubmission {
+                    kind: McpSubmittedJobKind::Worker,
+                    input: serde_json::json!({"task": "distinct"}),
+                    idempotency_key: None,
+                    budget: None,
+                },
+            )
+            .await;
+        assert!(matches!(
+            rejected_without_key,
+            Err(McpSupervisorError::RateLimited { .. })
+        ));
+
+        // (d) Eine andere Einreichung mit einem NEUEN Schlüssel darf das
+        // Limit nicht umgehen: sie ist kein Idempotenz-Treffer (anderer
+        // Schlüssel, kein bestehender Job) und muss daher ebenfalls die
+        // Ratenbegrenzung durchlaufen und abgelehnt werden. Dies verhindert
+        // eine Regression, bei der ein Client das Limit durch einen
+        // jeweils neuen Idempotenzschlüssel pro Einreichung umgehen könnte.
+        let rejected_with_new_key = supervisor
+            .submit_job(
+                &submit_context(),
+                McpJobSubmission {
+                    kind: McpSubmittedJobKind::Worker,
+                    input: serde_json::json!({"task": "distinct"}),
+                    idempotency_key: Some("node-2".to_owned()),
+                    budget: None,
+                },
+            )
+            .await;
+        assert!(matches!(
+            rejected_with_new_key,
+            Err(McpSupervisorError::RateLimited { .. })
+        ));
+
+        // (e) Im Store liegt genau der eine Job aus (a)/(b).
+        let page = store
+            .list(&harw_session_store::JobListQuery::default())
+            .unwrap();
+        assert_eq!(page.jobs.len(), 1);
+    }
+
+    #[test]
+    fn admission_limits_new_rejects_zero() {
+        assert!(McpAdmissionLimits::new(0, SignedDuration::from_secs(1)).is_none());
+        assert!(McpAdmissionLimits::new(1, SignedDuration::ZERO).is_none());
+        assert_eq!(
+            McpAdmissionLimits::default().max_submissions(),
+            McpAdmissionLimits::DEFAULT_MAX_SUBMISSIONS
+        );
     }
 }

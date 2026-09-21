@@ -2,6 +2,12 @@ use std::collections::HashSet;
 
 use harw_types::{ChannelId, PeerId};
 
+/// Default inbound admission ceiling (matches
+/// `harw_config::channel_toml::TelegramRateLimitToml`'s
+/// `max_updates_per_peer_per_min` default) applied whenever a binding is
+/// constructed without an explicit rate-limit override, e.g. in tests.
+pub const DEFAULT_MAX_UPDATES_PER_PEER_PER_MIN: u32 = 20;
+
 /// Whether Telegram forum topics produce separate harness sessions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TopicMode {
@@ -27,6 +33,11 @@ pub struct TelegramChannelConfig {
     pub group_allowed_senders: HashSet<String>,
     pub require_mention_in_groups: bool,
     pub topic_mode: TopicMode,
+    /// Inbound admission ceiling per rate-limit key (§3.5), sourced from
+    /// `[channel.telegram.rate_limit].max_updates_per_peer_per_min`. `0`
+    /// admits nothing for that window (fail closed on a misconfigured `0`,
+    /// rather than silently disabling the gate).
+    pub max_updates_per_peer_per_min: u32,
 }
 
 impl TelegramChannelConfig {
@@ -39,6 +50,7 @@ impl TelegramChannelConfig {
             group_allowed_senders: HashSet::new(),
             require_mention_in_groups: true,
             topic_mode: TopicMode::PerTopicSession,
+            max_updates_per_peer_per_min: DEFAULT_MAX_UPDATES_PER_PEER_PER_MIN,
         }
     }
 
@@ -85,5 +97,14 @@ mod tests {
         config.pinned_sender_ids.insert("123456789".to_owned());
 
         assert!(!config.is_sender_identity_pinned("987654321"));
+    }
+
+    #[test]
+    fn default_config_uses_the_documented_rate_limit_default() {
+        assert_eq!(
+            config().max_updates_per_peer_per_min,
+            super::DEFAULT_MAX_UPDATES_PER_PEER_PER_MIN
+        );
+        assert_eq!(super::DEFAULT_MAX_UPDATES_PER_PEER_PER_MIN, 20);
     }
 }

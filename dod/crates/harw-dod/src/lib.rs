@@ -278,7 +278,7 @@
 //!
 //! ```rust
 //! use harw_dod::{Actor, EgressFlowRule, EventKind, Rule, RuleContext, SecurityEvent, Verdict, run_rules, triage};
-//! use harw_sandbox::NetworkScope;
+//! use harw_authority::NetworkScope;
 //! use harw_types::SensorId;
 //!
 //! let scope = NetworkScope::from_hosts(["docs.rs".to_owned()]);
@@ -374,7 +374,7 @@ pub use harw_dod_bpf::{
 pub use harw_dod_procmon::{DEFAULT_READ_TIMEOUT, ExecEvent, ProcmonError, ProcmonResult, ProcmonSensor, parse_exec_payload};
 
 /// Bpf-Fähigkeit: Egress-Fluss. `observe`/`to_security_event` verlangen ein
-/// `&harw_sandbox::NetworkScope` — diese Fassade re-exportiert
+/// `&harw_authority::NetworkScope` — diese Fassade re-exportiert
 /// `NetworkScope` nicht (siehe `harw-dod-rules`s Begründung oben, Abschnitt
 /// „Bewerte einen Befund"); ein Konsument dieser Funktionen hat
 /// `harw-sandbox` ohnehin bereits vorliegen.

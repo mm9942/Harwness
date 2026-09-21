@@ -22,6 +22,9 @@ sketches — particularly in tool scope detection, typed resource scopes,
 context compilation, severity envelopes, and the TurnScope unification
 point. These are not bugs; they are missing architectural seams.
 
+> **Ist-Stand (2026-09)**: G8, G11, G12, and G14 are resolved (see their
+> Status fields below). G1–G7, G9, G10, and G13 are still open.
+
 ## Gap Register
 
 ### G1. Agent Template vs Concrete AgentProgram (§4, §31)
@@ -188,7 +191,9 @@ compresses before dropping mandatory items.
 
 ### G8. Severity Envelope (§22, §23, §30)
 
-**Status**: Partial — domain-specific only
+**Status**: Resolved (2026-09) — `harw-types/src/impact.rs` now exists.
+
+**Status (original)**: Partial — domain-specific only
 
 `harw-memory` has `Confidence` and `contradiction_index::severity` (u8
 0-100), but there is no cross-cutting `ImpactSeverity` / `ImpactAssessment`
@@ -262,7 +267,9 @@ shell effects.
 
 ### G11. `deny_unknown_fields` Coverage (§11, cross-cutting)
 
-**Status**: Gap — only 4 uses
+**Status**: Resolved (2026-09) — now 263 occurrences across the tree.
+
+**Status (original)**: Gap — only 4 uses
 
 `rg "deny_unknown_fields"` returns 4 hits across the entire codebase.
 Untrusted inputs (TOML configs, MCP wire payloads, channel events, tool
@@ -285,7 +292,9 @@ authority-bearing contract.
 
 ### G12. `unsafe impl Send/Sync` in ShortTermMemory
 
-**Status**: Review needed
+**Status**: Resolved (2026-09) — no `unsafe impl` remains in `harw-memory/src/`.
+
+**Status (original)**: Review needed
 
 `harw-memory/src/short_term.rs:246-247` has `unsafe impl Send` and `unsafe
 impl Sync` for `ShortTermMemory`. This needs review — if `ShortTermMemory`
@@ -323,7 +332,10 @@ that accepts both string and table forms.
 
 ### G14. ApprovalPolicy — Only None/Always (§28)
 
-**Status**: Gap — no risk-class or scope-based approval
+**Status**: Resolved (2026-09) — `ApprovalPolicy` now has `None`, `Always`,
+`RequireForScope`, `RequireForEffect`, `RequireForRiskClass`.
+
+**Status (original)**: Gap — no risk-class or scope-based approval
 
 `ApprovalPolicy` (harw-operations/src/operation.rs:139) has only `None` and
 `Always`. The hardening doc wants approval triggered by: outside declared
@@ -371,19 +383,19 @@ immediate work:
 
 Ordered by leverage (security impact × feasibility):
 
-| Priority | Gap | Effort | Impact |
-|----------|-----|--------|--------|
-| P0 | G11 (deny_unknown_fields) | Low | High — prevents silent authority injection |
-| P0 | G12 (unsafe Send/Sync review) | Low | High — soundness |
-| P1 | G10 (shell write-scope) | Medium | Critical — shell is the broadest effect surface |
-| P1 | G6 (TurnScope) | Medium | High — unifies all authority projections |
-| P2 | G4 (ToolDescriptor + 7 gates) | High | Critical — real tool scope detection |
-| P2 | G7 (ContextCandidate) | High | High — prevents mandatory-context loss |
-| P2 | G8 (ImpactSeverity) | Medium | High — cross-family scheduling |
-| P3 | G3 (ResourceSelector) | High | High — "Harwness Borrow Checker" |
-| P3 | G1 (AgentTemplate) | Medium | Medium — reduces definition duplication |
-| P3 | G2 (Family protocols) | Medium | Medium — typed family contracts |
-| P3 | G9 (Return envelopes) | Medium | High — structured parent-child communication |
-| P4 | G5 (ToolExposure) | Low | Medium — progressive tool loading |
-| P4 | G13 (DefinitionRef strings) | Low | Low — DSL ergonomics |
-| P4 | G14 (ApprovalPolicy) | Medium | Medium — scope-aware approval |
+| Priority | Gap | Effort | Impact | Status (2026-09) |
+|----------|-----|--------|--------|--------|
+| P0 | G11 (deny_unknown_fields) | Low | High — prevents silent authority injection | Resolved |
+| P0 | G12 (unsafe Send/Sync review) | Low | High — soundness | Resolved |
+| P1 | G10 (shell write-scope) | Medium | Critical — shell is the broadest effect surface | Open |
+| P1 | G6 (TurnScope) | Medium | High — unifies all authority projections | Open |
+| P2 | G4 (ToolDescriptor + 7 gates) | High | Critical — real tool scope detection | Open |
+| P2 | G7 (ContextCandidate) | High | High — prevents mandatory-context loss | Open |
+| P2 | G8 (ImpactSeverity) | Medium | High — cross-family scheduling | Resolved |
+| P3 | G3 (ResourceSelector) | High | High — "Harwness Borrow Checker" | Open |
+| P3 | G1 (AgentTemplate) | Medium | Medium — reduces definition duplication | Open |
+| P3 | G2 (Family protocols) | Medium | Medium — typed family contracts | Open |
+| P3 | G9 (Return envelopes) | Medium | High — structured parent-child communication | Open |
+| P4 | G5 (ToolExposure) | Low | Medium — progressive tool loading | Open |
+| P4 | G13 (DefinitionRef strings) | Low | Low — DSL ergonomics | Open |
+| P4 | G14 (ApprovalPolicy) | Medium | Medium — scope-aware approval | Resolved |

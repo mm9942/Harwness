@@ -39,7 +39,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use harw_config::ResolvedConfig;
-use harw_core::{EchoModelProvider, ModelProvider};
+use harw_core::{EchoModelProvider, ModelError, ModelFuture, ModelProvider, ModelRequest};
 use harw_provider_http::SecretResolver;
 
 use crate::error::{RuntimeError, RuntimeResult};
@@ -139,8 +139,44 @@ pub fn build_root_model_with_resolver(
         ModelSource::Override(provider) => Ok(provider),
         ModelSource::Echo(reply) => Ok(Arc::new(EchoModelProvider::new(reply))),
         ModelSource::Configured => {
+            // Fallback-Speicherplatz: nur belegt, wenn `resolve_default_model`
+            // tatsächlich einen abweichenden Vorgabe-Wert wählt (siehe dort).
+            let fallback_holder;
+            let effective_config = match resolve_default_model(config) {
+                DefaultModelResolution::AsConfigured => config,
+                DefaultModelResolution::Fallback { provider, model } => {
+                    tracing::warn!(
+                        configured_provider =
+                            config.harness.default_provider.as_deref().unwrap_or("<none>"),
+                        configured_model =
+                            config.harness.default_model.as_deref().unwrap_or("<none>"),
+                        fallback_provider = %provider,
+                        fallback_model = %model,
+                        "configured default provider/model is unusable — falling back to the \
+                         first usable configured model instead of aborting startup"
+                    );
+                    let mut fallback = config.clone();
+                    fallback.harness.default_provider = Some(provider);
+                    fallback.harness.default_model = Some(model);
+                    fallback_holder = fallback;
+                    &fallback_holder
+                }
+                DefaultModelResolution::NoneUsable => {
+                    tracing::warn!(
+                        "no usable model/provider is configured — starting anyway; any model \
+                         call will fail clearly until an enabled provider is referenced by \
+                         default_provider/default_model or a catalog model"
+                    );
+                    return Ok(Arc::new(UnusableModelProvider::new(
+                        "no usable model/provider is configured; add an enabled provider under \
+                         providers/ and reference it from default_provider/default_model (or a \
+                         models/ entry) before sending a message"
+                            .to_owned(),
+                    )));
+                }
+            };
             let provider = harw_provider_http::build_provider_with_home(
-                config,
+                effective_config,
                 spec.home.as_path(),
                 resolver,
             )
@@ -149,6 +185,115 @@ pub fn build_root_model_with_resolver(
             })?;
             Ok(Arc::from(provider))
         }
+    }
+}
+
+/// Ergebnis der Vorgabe-Provider/-Modell-Auflösung für
+/// [`ModelSource::Configured`] (siehe [`resolve_default_model`]).
+enum DefaultModelResolution {
+    /// `default_provider` zeigt auf einen vorhandenen, aktivierten Provider
+    /// und `default_model` ist gesetzt — unverändert an
+    /// `harw_provider_http::build_provider_with_home` weiterreichen. Das
+    /// Modell muss dafür **nicht** im Katalog (`config.models`) stehen: der
+    /// Provider erhält die Modell-Kennung unverändert (siehe
+    /// `harw-provider-http`).
+    AsConfigured,
+    /// Das Vorgabe-Paar war hängend, fehlte oder der Provider war
+    /// deaktiviert; dieses katalogisierte Modell mit vorhandenem,
+    /// aktiviertem Provider dient stattdessen als Vorgabe.
+    Fallback { provider: String, model: String },
+    /// Kein einziges katalogisiertes Modell hat einen vorhandenen,
+    /// aktivierten Provider — es gibt nichts, worauf ausgewichen werden
+    /// könnte.
+    NoneUsable,
+}
+
+/// `true`, wenn `provider_id` einen tatsächlich konfigurierten, aktivierten
+/// Provider bezeichnet.
+fn provider_is_usable(config: &ResolvedConfig, provider_id: &str) -> bool {
+    config
+        .providers
+        .get(provider_id)
+        .is_some_and(|provider| provider.enabled)
+}
+
+/// Löst das effektive Vorgabe-Provider/-Modell-Paar für
+/// [`ModelSource::Configured`] auf.
+///
+/// # Beschreibung
+/// Ein hängender `default_provider`/`default_model` (siehe
+/// [`harw_config::discovery::ConfigDiagnostic`], `ResolvedConfig::validate`
+/// bricht dafür nicht mehr ab) darf die gesamte Anwendung nicht unbenutzbar
+/// machen: statt `harw_provider_http::build_provider_with_home` sofort mit
+/// einem Konfigurationsfehler scheitern zu lassen, wählt diese Funktion —
+/// deterministisch, sortiert nach Modell-Kennung — das erste katalogisierte
+/// Modell (`config.models`), dessen Provider vorhanden und aktiviert ist.
+///
+/// Das aktuell konfigurierte Paar gilt bereits als nutzbar, sobald
+/// `default_provider` einen vorhandenen, aktivierten Provider bezeichnet und
+/// `default_model` überhaupt gesetzt ist — das Modell muss dafür **nicht**
+/// im Katalog stehen (viele gültige Konfigurationen, u. a. die
+/// Loopback-Testfixtur dieses Moduls, lassen `config.models` bewusst leer).
+///
+/// # Arguments
+/// - `config` (`&ResolvedConfig`): die bereits validierte Konfiguration
+///   dieses Laufs.
+///
+/// # Returns
+/// [`DefaultModelResolution`] — siehe dort für die drei Fälle.
+fn resolve_default_model(config: &ResolvedConfig) -> DefaultModelResolution {
+    let provider_ok = config
+        .harness
+        .default_provider
+        .as_deref()
+        .is_some_and(|provider_id| provider_is_usable(config, provider_id));
+    let model_ok = config.harness.default_model.is_some();
+    if provider_ok && model_ok {
+        return DefaultModelResolution::AsConfigured;
+    }
+
+    let mut model_ids: Vec<&String> = config.models.keys().collect();
+    model_ids.sort();
+    for model_id in model_ids {
+        let provider = &config.models[model_id].provider;
+        if provider_is_usable(config, provider) {
+            return DefaultModelResolution::Fallback {
+                provider: provider.clone(),
+                model: model_id.clone(),
+            };
+        }
+    }
+
+    DefaultModelResolution::NoneUsable
+}
+
+/// Ein Modell-Provider ohne funktionierende Konfiguration.
+///
+/// # Beschreibung
+/// Konstruierbar ohne Fehler — der Lauf startet — scheitert aber mit einer
+/// klaren, statischen Meldung, sobald tatsächlich ein Modell-Aufruf versucht
+/// wird ([`ModelProvider::respond`]). Deckt den Fall ab, in dem
+/// [`resolve_default_model`] kein einziges nutzbares Modell/Provider-Paar
+/// findet: "ein falsch konfigurierter Provider/ein falsch konfiguriertes
+/// Modell darf nicht die gesamte Anwendung unbenutzbar machen" gilt auch,
+/// wenn **gar kein** Provider konfiguriert ist — der Fehler erscheint dann
+/// erst bei tatsächlicher Nutzung, nicht beim Start.
+struct UnusableModelProvider {
+    message: String,
+}
+
+impl UnusableModelProvider {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl ModelProvider for UnusableModelProvider {
+    fn respond<'a>(&'a self, _request: ModelRequest) -> ModelFuture<'a> {
+        let message = self.message.clone();
+        Box::pin(async move { Err(ModelError::RequestFailed(message)) })
     }
 }
 
@@ -209,6 +354,7 @@ mod tests {
                 origin_allowlist: OriginAllowlistToml::default(),
                 rate_limit: None,
                 max_concurrency: None,
+                originator: None,
             },
         );
         config
@@ -272,18 +418,80 @@ mod tests {
             .expect("configured provider");
     }
 
+    /// F-046-style Verhalten: ohne jeden nutzbaren Provider/jedes nutzbare
+    /// Modell startet der Lauf trotzdem — der Fehler erscheint erst, wenn
+    /// tatsächlich ein Modell-Aufruf versucht wird, nicht beim Bau des
+    /// Root-Modells.
     #[test]
-    fn configured_source_without_default_provider_is_a_provider_error() {
+    fn configured_source_without_any_usable_provider_starts_and_fails_only_on_a_model_call() {
         let spec = spec_for(Path::new("/nonexistent-home"));
-        let Err(error) = build_root_model(
-            &spec,
-            &ResolvedConfig::default(),
-            ModelSource::Configured,
-        ) else {
-            panic!("a config without default_provider must not build a provider");
-        };
-        assert!(matches!(error, RuntimeError::Provider { .. }), "{error}");
-        assert!(error.to_string().starts_with("runtime provider error:"));
+        let model = build_root_model(&spec, &ResolvedConfig::default(), ModelSource::Configured)
+            .expect("a config without any usable provider must still start");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let error = runtime
+            .block_on(model.respond(empty_request()))
+            .expect_err("a model call must fail clearly when nothing is configured");
+        assert!(matches!(
+            error,
+            harw_core::ModelError::RequestFailed(ref message)
+                if message.contains("no usable model/provider is configured")
+        ));
+    }
+
+    /// F-046-Regression: ein hängender `default_provider` darf den Start
+    /// nicht abbrechen, solange ein anderer, katalogisierter Provider
+    /// tatsächlich nutzbar ist.
+    #[test]
+    fn configured_source_falls_back_to_first_usable_catalog_model_when_default_is_dangling() {
+        let spec = spec_for(Path::new("/nonexistent-home"));
+        let mut config = loopback_config();
+        config.harness.default_provider = Some("gpt-5.6-terra-provider".to_owned());
+        config.harness.default_model = Some("gpt-5.6-terra".to_owned());
+        config.models.insert(
+            "local-model".to_owned(),
+            harw_config::ModelToml {
+                id: "local-model".to_owned(),
+                name: None,
+                provider: "local".to_owned(),
+                aliases: Vec::new(),
+                context_window: None,
+                max_tokens: None,
+                prompt_caching: None,
+                reasoning: false,
+                input_types: Vec::new(),
+                capabilities: harw_config::ModelCapabilitiesToml::default(),
+            },
+        );
+
+        build_root_model(&spec, &config, ModelSource::Configured)
+            .expect("a dangling default must fall back to the usable catalog model");
+    }
+
+    #[test]
+    fn resolve_default_model_prefers_the_configured_pair_when_usable() {
+        let config = loopback_config();
+        assert!(matches!(
+            resolve_default_model(&config),
+            DefaultModelResolution::AsConfigured
+        ));
+    }
+
+    #[test]
+    fn resolve_default_model_ignores_a_disabled_default_provider() {
+        let mut config = loopback_config();
+        config
+            .providers
+            .get_mut("local")
+            .expect("provider")
+            .enabled = false;
+
+        assert!(matches!(
+            resolve_default_model(&config),
+            DefaultModelResolution::NoneUsable
+        ));
     }
 
     #[test]

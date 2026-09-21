@@ -3,6 +3,16 @@
 Status: design draft. No code exists yet for `harw-secrets` — this document
 specifies the shape it must have before implementation starts.
 
+> **Ist-Stand (2026-09)**: The "no code exists yet" claim above is outdated.
+> `harw-secrets` exists and implements the envelope (DEK/KEK), with
+> ML-KEM-1024 as the default policy, rotation, KEK provenance, the
+> hash-chained audit log, and ML-DSA checkpoints as designed below.
+> `crypt_guard` is pinned to `=3.0.1` (not the `2.0.3`/`"2"` referenced in
+> §2.1/§5.1). Still open: audit events are only emitted for `secret.*`
+> actions (approval/channel/plugin events from §4.4 are not wired up yet),
+> and at-rest encryption of the session journal and knowledge artifacts
+> (§1.b) is not implemented.
+
 ## 0. Why one document
 
 Harwness holds three kinds of material that must not leak in cleartext and

@@ -11,7 +11,7 @@
 use crate::call::ToolCall;
 use crate::error::ToolsError;
 use crate::output::ToolOutput;
-use harw_sandbox::SandboxSpec;
+use harw_authority::SandboxSpec;
 use harw_types::{SessionId, TurnId};
 use std::future::Future;
 use std::pin::Pin;
@@ -214,9 +214,7 @@ mod tests {
     use crate::call::ToolCall;
     use crate::output::ToolOutput;
     use crate::spec::ToolName;
-    use harw_sandbox::{
-        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-    };
+    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::path::PathBuf;
 

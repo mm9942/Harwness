@@ -459,6 +459,78 @@ impl LensStore {
         Ok(Some(serde_json::from_slice(&bytes)?))
     }
 
+    /// Modifikationszeitpunkt des Manifests eines benannten Index
+    /// (Dateisystem-`mtime` von `manifest.json`).
+    ///
+    /// # Description
+    /// [`harw_lens_types::IndexManifest`] trägt selbst kein `built_at`-Feld
+    /// (siehe dessen Moduldokumentation). Ein Aufrufer, der eine grobe
+    /// Auskunft über das Alter eines Index braucht (z. B. `harw lens
+    /// status`), bekommt sie deshalb hier über die Dateisystem-Zeitmarke von
+    /// `manifest.json` — diese Datei wird bei jedem [`LensStore::put_index`]
+    /// atomar neu geschrieben (siehe dessen Dokumentation), ihre `mtime`
+    /// entspricht also exakt dem letzten erfolgreichen Bauzeitpunkt dieses
+    /// Index. Das ist ein Signal, kein Ersatz für eine im Manifest
+    /// mitgeführte Zeitmarke — es weicht ab, sollte je jemand außerhalb
+    /// dieses Crates die Datei berühren, ohne den Inhalt zu ändern.
+    ///
+    /// # Arguments
+    /// - `name` (`&str`): der Indexname; siehe [`validate_index_name`].
+    ///
+    /// # Returns
+    /// `Some(SystemTime)`, wenn ein Manifest unter `name` existiert; `None`,
+    /// wenn nicht — ein fehlender Index ist ein normaler Zustand, wie bei
+    /// [`LensStore::get_index_manifest`].
+    ///
+    /// # Errors
+    /// - [`LensStoreError::InvalidIndexName`]: `name` verstößt gegen die
+    ///   Namensregel.
+    /// - [`LensStoreError::UnexpectedPathType`]: der Pfad ist von einer
+    ///   Nicht-Datei belegt (Symlink-Abwehr).
+    /// - [`LensStoreError::Io`]: sonstiger Lesefehler, einschließlich eines
+    ///   Dateisystems, das keine Modifikationszeit unterstützt.
+    ///
+    /// # Concurrency
+    /// Sperrt nicht, wie [`LensStore::get_index_manifest`].
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_lens_store::LensStore;
+    /// use harw_lens_types::{IndexManifest, Locality, Metric};
+    /// use harw_types::ContentDigest;
+    ///
+    /// let temp = tempfile::tempdir().expect("tempdir");
+    /// let store = LensStore::open(temp.path()).expect("opens");
+    /// assert_eq!(
+    ///     store.index_manifest_modified("missing").expect("no error for a missing index"),
+    ///     None
+    /// );
+    ///
+    /// let manifest = IndexManifest {
+    ///     model: "m".to_owned(),
+    ///     locality: Locality::Local,
+    ///     chunker_version: 1,
+    ///     visibility: "workspace".to_owned(),
+    ///     metric: Metric::Cosine,
+    ///     source_set_digest: ContentDigest::of(b"s"),
+    /// };
+    /// store.put_index("my-index", &manifest, b"raw").expect("stores");
+    /// assert!(store.index_manifest_modified("my-index").expect("reads").is_some());
+    /// ```
+    pub fn index_manifest_modified(&self, name: &str) -> LensStoreResult<Option<std::time::SystemTime>> {
+        let path = self.index_dir(name)?.join(MANIFEST_FILE_NAME);
+        if !path_exists(&path)? {
+            return Ok(None);
+        }
+        if !is_regular_file(&path)? {
+            return Err(LensStoreError::UnexpectedPathType {
+                path: path.display().to_string(),
+            });
+        }
+        let metadata = std::fs::metadata(&path)?;
+        Ok(Some(metadata.modified()?))
+    }
+
     /// Liest die Rohdaten eines benannten Index.
     ///
     /// # Arguments
@@ -736,6 +808,47 @@ mod tests {
 
         assert_eq!(store.get_index_manifest("never-written").unwrap(), None);
         assert_eq!(store.read_index_data("never-written").unwrap(), None);
+    }
+
+    #[test]
+    fn test_index_manifest_modified_unknown_name_returns_none() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = LensStore::open(temp.path()).expect("opens");
+
+        assert_eq!(
+            store.index_manifest_modified("never-written").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_index_manifest_modified_returns_some_after_put_index() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = LensStore::open(temp.path()).expect("opens");
+        let manifest = sample_manifest();
+
+        store
+            .put_index("my-index", &manifest, b"data")
+            .expect("stores");
+
+        assert!(
+            store
+                .index_manifest_modified("my-index")
+                .expect("reads")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_index_manifest_modified_rejects_path_separator_in_name() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = LensStore::open(temp.path()).expect("opens");
+
+        let result = store.index_manifest_modified("a/b");
+        assert!(matches!(
+            result,
+            Err(LensStoreError::InvalidIndexName { .. })
+        ));
     }
 
     #[test]

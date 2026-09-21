@@ -77,6 +77,18 @@ zustimmungspflichtiger Modulmodus; der Standard ist Inspektion.
 
 ## Semantisch angefragter Host-Modus
 
+> **Ist-Stand (2026-09)**: Es gibt inzwischen einen neuen Ausführungsworker
+> `uia-shell-worker` (Rolle `uia-worker`, `shell.exec` plus read-only
+> `fs.*`, immer `SandboxProfile::Host`, Permit weiterhin erforderlich) sowie
+> `InteractionMode::Shell` (`--mode shell`, `/mode shell`). Dieser
+> Interaktionsmodus **gewährt keine Berechtigung** — er wählt in der lokalen
+> Permit-Ansicht nur die Sitzungsphasen-Variante (Variante 2 unten) vor. Die
+> untenstehende Aussage, der Host-Modus sei „kein Slash-Befehl", gilt damit
+> mit einer Einschränkung fort: der **Modus** ist über `/mode shell`
+> auswählbar, die **Berechtigung** selbst bleibt weiterhin ausschließlich an
+> die unveränderbare lokale Bestätigungsansicht gebunden, nicht an den
+> Slash-Befehl.
+
 Der Host-Modus ist **kein** CLI-Flag, keine Startoption und kein Slash-Befehl.
 Ein Prozess kann ihn daher weder beim Programmstart noch durch eine
 wiederholbare Kommandozeile voreinstellen. Auch ein Modell besitzt keine

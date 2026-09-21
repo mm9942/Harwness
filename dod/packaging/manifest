@@ -1,0 +1,20 @@
+# Relative logical destinations installed by dod/scripts/install.sh.
+# The manifest deliberately excludes /etc/harw-dod/config.toml and all state,
+# telemetry, and runtime files so upgrades/uninstall never remove operator data.
+libexec/harw-sentinel
+libexec/harw-probe-bpf
+libexec/harw-probe-fs
+libexec/harw-warden
+bpf/exec.bpf.o
+bpf/exit.bpf.o
+bpf/tcp_v4_connect.bpf.o
+bpf/tcp_v6_connect.bpf.o
+bpf/manifest.json
+systemd/harw-dod.target
+systemd/harw-dod-sentinel.service
+systemd/harw-dod-bpf.service
+systemd/harw-dod-warden.service
+systemd/harw-dod-warden.socket
+sysusers/harw-dod.conf
+tmpfiles/harw-dod.conf
+config/config.toml.example

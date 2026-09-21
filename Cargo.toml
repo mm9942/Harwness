@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "harw-agent-dsl",
+    "harw-authority",
     "harw-code-graph",
     "harw-config",
     "harw-home",

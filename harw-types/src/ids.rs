@@ -163,6 +163,15 @@ newtype_id!(
     WorkspaceId
 );
 newtype_id!(
+    /// Identifies one pending or resolved `ApprovalRequest`
+    /// (`harw-protocol::approvals`, interaction-contract.md §4.1). Distinct
+    /// from [`WorkId`]: an `ApprovalRequest` is addressed at exactly one
+    /// `WorkId`, but the approval decision point itself — which may be one
+    /// of several raised against the same `WorkId` over its lifetime — has
+    /// its own identity.
+    ApprovalId
+);
+newtype_id!(
     /// Stable reference to a persisted conversation thread as seen from outside
     /// `harw-core` (provenance links, pairing records, transcript back-refs).
     ThreadRef
@@ -231,8 +240,8 @@ newtype_id!(
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelId, ItemId, PeerId, SessionId, TenantId, ThreadId, ThreadRef, ToolCallId, TurnId,
-        WorkId, WorkspaceId,
+        ApprovalId, ChannelId, ItemId, PeerId, SessionId, TenantId, ThreadId, ThreadRef,
+        ToolCallId, TurnId, WorkId, WorkspaceId,
     };
 
     macro_rules! assert_fallible_apis_reject_blank_ids {
@@ -258,6 +267,7 @@ mod tests {
         assert_fallible_apis_reject_blank_ids!(TenantId);
         assert_fallible_apis_reject_blank_ids!(WorkspaceId);
         assert_fallible_apis_reject_blank_ids!(ThreadRef);
+        assert_fallible_apis_reject_blank_ids!(ApprovalId);
 
         assert_eq!(
             SessionId::try_from_str(" session ").unwrap().as_str(),

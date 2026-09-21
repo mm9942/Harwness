@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use harw_observe::TraceContext;
 use harw_types::{ApprovalActor, TenantId, WorkspaceId};
 
+use crate::error::{JobRuntimeError, JobRuntimeResult};
+use crate::job::JobState;
 use crate::{Job, Lease, LeaseToken};
 
 /// Immutable server-resolved authority boundary for one durable job.
@@ -134,6 +136,108 @@ pub struct StoredJob {
     pub trace: Option<TraceContext>,
 }
 
+/// Ergebnis eines erfolgreichen Reclaims einer verwaisten Lease (siehe
+/// [`StoredJob::reclaim`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReclaimOutcome {
+    /// Die Lease wurde freigegeben; der Job ist wieder `Ready` und für einen
+    /// erneuten Claim erreichbar.
+    Requeued,
+    /// Die Retry-Policy ist erschöpft; der Job wechselt terminal auf `Failed`.
+    Exhausted,
+}
+
+impl StoredJob {
+    /// Reclaimt eine abgelaufene Lease, deren Halter nicht mehr lebt.
+    ///
+    /// # Beschreibung
+    /// Der Aufrufer übergibt ein Lebendigkeits-Prädikat `is_holder_alive`,
+    /// das prüft, ob der aktuelle Lease-Halter noch existiert (Prozess-,
+    /// Session- oder Heartbeat-Quelle außerhalb dieser Crate — diese Funktion
+    /// sondiert selbst keine Prozesse). Ein Reclaim greift ausschließlich,
+    /// wenn **beide** Bedingungen zutreffen: die Lease ist bereits abgelaufen
+    /// ([`Lease::is_expired`]) **und** das Prädikat meldet den Halter als
+    /// nicht mehr lebendig. Eine noch gültige Lease sowie eine abgelaufene
+    /// Lease eines weiterhin lebenden, nur langsamen Halters bleiben
+    /// unangetastet und lösen [`JobRuntimeError::LeaseContended`] aus.
+    ///
+    /// Beim tatsächlichen Reclaim wird zuerst der Fencing-Epoch erhöht und
+    /// die gespeicherte Lease gelöscht, bevor der Fehlversuch über
+    /// [`Job::record_failure`] verbucht wird (Retry-Zähler hoch, RetryPolicy
+    /// respektiert; bei Erschöpfung terminal `Failed`). Ein späterer
+    /// Complete- oder Renew-Versuch des alten Halters trägt noch den alten,
+    /// jetzt überholten Epoch: jeder künftige Claim vergibt einen Epoch
+    /// größer als `lease_epoch`, sodass das alte Fencing-Token nicht mehr
+    /// gültig sein kann.
+    ///
+    /// # Argumente
+    /// - `now` (`Timestamp`): Zeitpunkt der Reclaim-Prüfung.
+    /// - `is_holder_alive` (`FnOnce(&str) -> bool`): Lebendigkeits-Prädikat
+    ///   für den Namen/die Identität des aktuellen Lease-Halters.
+    ///
+    /// # Rückgabe
+    /// [`ReclaimOutcome::Requeued`], wenn der Job wieder `Ready` ist, sonst
+    /// [`ReclaimOutcome::Exhausted`], wenn die Retry-Policy erschöpft ist und
+    /// der Job terminal auf `Failed` steht.
+    ///
+    /// # Fehler
+    /// - [`JobRuntimeError::InvalidState`]: keine aktive Lease vorhanden
+    ///   (Job ist nicht `Running`).
+    /// - [`JobRuntimeError::LeaseContended`]: die Lease ist noch gültig, oder
+    ///   sie ist zwar abgelaufen, aber der Halter gilt laut Prädikat noch als
+    ///   lebendig — in beiden Fällen ist ein Reclaim nicht zulässig.
+    ///
+    /// # Nebenläufigkeit
+    /// Reine Datenmutation ohne I/O, Locks oder Threads. Die aufrufende
+    /// Store-Schicht ist dafür verantwortlich, konkurrierende Reclaim-/
+    /// Claim-Versuche auf demselben Datensatz zu serialisieren.
+    ///
+    /// # Beispiele
+    /// ```rust,no_run
+    /// use harw_job_runtime::stored::StoredJob;
+    ///
+    /// fn reclaim_if_stranded(record: &mut StoredJob, now: jiff::Timestamp) {
+    ///     // `is_holder_alive` liefert hier bewusst immer `false`, um einen
+    ///     // vollständig verwaisten Halter zu simulieren.
+    ///     let _ = record.reclaim(now, |_holder| false);
+    /// }
+    /// ```
+    pub fn reclaim<F>(&mut self, now: Timestamp, is_holder_alive: F) -> JobRuntimeResult<ReclaimOutcome>
+    where
+        F: FnOnce(&str) -> bool,
+    {
+        let lease = self
+            .lease
+            .as_ref()
+            .ok_or_else(|| JobRuntimeError::InvalidState {
+                work_id: self.job.id.clone(),
+                expected: JobState::Running,
+                actual: self.job.state,
+            })?;
+
+        // Eine noch gültige Lease, oder eine abgelaufene Lease eines nur
+        // langsamen, aber lebenden Halters, darf nicht reclaimt werden.
+        if !lease.is_expired(now) || is_holder_alive(lease.holder.as_str()) {
+            return Err(JobRuntimeError::LeaseContended {
+                work_id: self.job.id.clone(),
+                holder: lease.holder.clone(),
+            });
+        }
+
+        // Fencing zuerst: jeder künftige Claim vergibt einen höheren Epoch,
+        // sodass ein Complete/Renew mit dem alten Token danach nicht mehr
+        // passen kann, selbst wenn der alte Halter doch noch antwortet.
+        self.lease_epoch = self.lease_epoch.saturating_add(1);
+        self.lease = None;
+
+        match self.job.record_failure(now) {
+            Ok(_delay) => Ok(ReclaimOutcome::Requeued),
+            Err(JobRuntimeError::RetryExhausted { .. }) => Ok(ReclaimOutcome::Exhausted),
+            Err(other) => Err(other),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,6 +293,139 @@ mod tests {
             revision: 0,
             trace,
         }
+    }
+
+    /// Builds a `StoredJob` whose job is actually `Running` under a fenced
+    /// lease at `epoch`, so reclaim tests exercise a realistic pre-state.
+    fn claimed_record(now: Timestamp, ttl: SignedDuration, holder: &str, epoch: u64) -> StoredJob {
+        let mut record = record(None); // job.state == Ready already
+        let _ = record
+            .job
+            .claim(holder, now, ttl)
+            .expect("job claims into running");
+        let lease = Lease::acquire_fenced(record.job.id.clone(), holder, now, ttl, epoch, "nonce-under-test")
+            .expect("fenced lease acquires");
+        record.lease_epoch = epoch;
+        record.lease = Some(lease);
+        record
+    }
+
+    #[test]
+    fn reclaim_fails_when_no_lease_is_present() {
+        let mut record = record(None); // job.state == Ready, lease == None
+        let now = Timestamp::now();
+
+        let error = record
+            .reclaim(now, |_holder| false)
+            .expect_err("reclaim without an active lease must fail");
+
+        assert!(matches!(
+            error,
+            JobRuntimeError::InvalidState {
+                expected: JobState::Running,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn reclaim_refuses_a_lease_that_has_not_expired_yet() {
+        let now = Timestamp::now();
+        let mut record = claimed_record(now, SignedDuration::from_secs(60), "worker-a", 1);
+        let before = record.clone();
+
+        let error = record
+            .reclaim(now, |_holder| false) // holder liveness is irrelevant here
+            .expect_err("a still-valid lease must not be reclaimed");
+
+        assert!(matches!(error, JobRuntimeError::LeaseContended { .. }));
+        assert_eq!(record, before, "a rejected reclaim must not mutate the record");
+    }
+
+    #[test]
+    fn reclaim_refuses_an_expired_lease_whose_holder_is_still_alive() {
+        let now = Timestamp::now();
+        let mut record = claimed_record(now, SignedDuration::from_secs(1), "worker-a", 1);
+        let later = now.checked_add(SignedDuration::from_secs(2)).unwrap();
+        let before = record.clone();
+
+        let error = record
+            .reclaim(later, |_holder| true) // live but slow: must not be reclaimed
+            .expect_err("a live-but-slow holder must not be reclaimed");
+
+        assert!(matches!(error, JobRuntimeError::LeaseContended { .. }));
+        assert_eq!(record, before, "a rejected reclaim must not mutate the record");
+    }
+
+    #[test]
+    fn reclaim_requeues_an_expired_lease_whose_holder_is_dead() {
+        let now = Timestamp::now();
+        let mut record = claimed_record(now, SignedDuration::from_secs(1), "worker-a", 1);
+        let old_token = record.lease.as_ref().unwrap().token();
+        let later = now.checked_add(SignedDuration::from_secs(2)).unwrap();
+
+        let outcome = record
+            .reclaim(later, |_holder| false)
+            .expect("an orphaned expired lease must be reclaimable");
+
+        assert_eq!(outcome, ReclaimOutcome::Requeued);
+        assert_eq!(record.job.state, JobState::Ready);
+        assert_eq!(record.job.attempts, 1);
+        assert!(record.lease.is_none(), "the stale lease must be cleared");
+        assert!(
+            record.lease_epoch > old_token.epoch,
+            "fencing must advance the epoch past the reclaimed lease's token"
+        );
+    }
+
+    #[test]
+    fn reclaim_moves_to_failed_once_the_retry_policy_is_exhausted() {
+        let now = Timestamp::now();
+        let mut record = claimed_record(now, SignedDuration::from_secs(1), "worker-a", 1);
+        record.job.retry = RetryPolicy {
+            max_attempts: 1,
+            base_delay: SignedDuration::from_secs(1),
+            factor: 2.0,
+            max_delay: SignedDuration::from_secs(10),
+        };
+        let later = now.checked_add(SignedDuration::from_secs(2)).unwrap();
+
+        let outcome = record
+            .reclaim(later, |_holder| false)
+            .expect("reclaim itself succeeds even when the policy is exhausted");
+
+        assert_eq!(outcome, ReclaimOutcome::Exhausted);
+        assert_eq!(record.job.state, JobState::Failed);
+        assert!(record.lease.is_none());
+    }
+
+    #[test]
+    fn reclaim_fencing_epoch_prevents_the_old_token_from_matching_a_future_lease() {
+        let now = Timestamp::now();
+        let mut record = claimed_record(now, SignedDuration::from_secs(1), "worker-a", 5);
+        let stale_token = record.lease.as_ref().unwrap().token();
+        let later = now.checked_add(SignedDuration::from_secs(2)).unwrap();
+
+        record
+            .reclaim(later, |_holder| false)
+            .expect("orphaned lease reclaims");
+
+        // Any subsequent claim must be issued at an epoch beyond the one the
+        // stranded holder still carries, so its stale token can never match
+        // again (mirrors `harw-session-store`'s claim(): next epoch =
+        // lease_epoch + 1).
+        let next_epoch = record.lease_epoch.saturating_add(1);
+        assert!(next_epoch > stale_token.epoch);
+        let next_lease = Lease::acquire_fenced(
+            record.job.id.clone(),
+            "worker-b",
+            later,
+            SignedDuration::from_secs(60),
+            next_epoch,
+            "nonce-after-reclaim",
+        )
+        .expect("a fresh lease can be issued after reclaim");
+        assert!(!next_lease.matches_token(&stale_token));
     }
 
     #[test]

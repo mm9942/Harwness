@@ -78,8 +78,8 @@ pub use one_shot::{OneShotError, complete_text};
 pub use pinned_model::PinnedModelProvider;
 pub use policy::ConfigApprovalPolicy;
 pub use session::{
-    AgentSession, PendingApproval, PendingHandoff, SessionState, SpawnContext, TurnHandle,
-    TurnRejection,
+    APPROVAL_TIMEOUT_REASON, AgentSession, DEFAULT_APPROVAL_TIMEOUT, PendingApproval,
+    PendingHandoff, SessionState, SpawnContext, TurnHandle, TurnRejection,
 };
 pub use session_manager::SessionManager;
 pub use state_store::{

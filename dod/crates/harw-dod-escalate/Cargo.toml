@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+harw-authority = { path = "../../../harw-authority" }
 # `ApprovalActor` (wer autorisiert hat) — dieselbe Kennung, die
 # `AuthorizationProof::authorized_by` bereits verlangt, statt eine zweite
 # Identitätsdarstellung zu erfinden.

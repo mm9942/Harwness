@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+harw-authority = { path = "../../../harw-authority" }
 # `BpfLoader`-Trait, `RawBpfEvent`, die wiederverwendbaren Byte-Leser
 # (`read_u32_le`), `FixtureBpfLoader` für Tests ohne Kernel, sowie
 # `BpfProgramSpec`/`BpfProgramKind`/`BpfProgramSource` für die

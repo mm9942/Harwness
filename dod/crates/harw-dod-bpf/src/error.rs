@@ -40,6 +40,23 @@ use harw_macros::HarwError;
 /// Feldwert, kein Byte des betroffenen Puffers erscheint in der Meldung.
 #[derive(Debug, HarwError)]
 pub enum BpfError {
+    /// A record uses a newer or otherwise unsupported explicit wire ABI.
+    #[msg("bpf event uses an unsupported wire ABI version")]
+    UnsupportedWireVersion,
+
+    /// A record uses an event kind that this loader does not understand.
+    #[msg("bpf event uses an unsupported wire event type")]
+    UnsupportedWireEvent,
+
+    /// The required BPF object contract or profile-map setup is absent. This
+    /// is deliberately fatal before attaching any hook.
+    #[msg("bpf program contract or profile setup is invalid")]
+    InvalidProgramContract,
+
+    /// The effective capability set does not satisfy the verified attach
+    /// path. This never claims that `CAP_BPF` alone is enough.
+    #[msg("bpf and tracing capabilities required by the attach path are unavailable")]
+    AttachCapabilitiesUnavailable,
     /// Der Host bietet `CAP_BPF` (oder die Fähigkeit, ein Programm zu laden)
     /// nicht an.
     ///
@@ -160,7 +177,11 @@ impl From<BpfError> for harw_dod_cap::SensorError {
             BpfError::CapabilityUnavailable
             | BpfError::ProgramLoadFailed
             | BpfError::UnsupportedProgramKind
-            | BpfError::UnknownHandle => Self::SourceUnavailable,
+            | BpfError::UnknownHandle
+            | BpfError::UnsupportedWireVersion
+            | BpfError::UnsupportedWireEvent
+            | BpfError::InvalidProgramContract
+            | BpfError::AttachCapabilitiesUnavailable => Self::SourceUnavailable,
             BpfError::MalformedEvent => Self::MalformedSource,
             BpfError::Io(io) => Self::Io(io),
         }

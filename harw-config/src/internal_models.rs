@@ -357,6 +357,7 @@ mod tests {
             origin_allowlist: Default::default(),
             rate_limit: None,
             max_concurrency: None,
+            originator: None,
         }
     }
 

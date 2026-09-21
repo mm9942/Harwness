@@ -262,9 +262,7 @@ fn slice8_provider_switch_influences_next_turn() {
 async fn slice9_incompatible_provider_switch_is_atomic() {
     use harw_config::{ModelToml, ProviderToml, ResolvedConfig, SecretRef};
     use harw_operations::{OpInput, Operation, SharedSessionController, context::ServiceMap};
-    use harw_sandbox::{
-        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-    };
+    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
 
     // ── Build a minimal OpContext with a real SandboxSpec ─────────────────────
@@ -316,6 +314,7 @@ async fn slice9_incompatible_provider_switch_is_atomic() {
             origin_allowlist: Default::default(),
             rate_limit: None,
             max_concurrency: None,
+            originator: None,
         },
     );
     config.providers.insert(
@@ -333,6 +332,7 @@ async fn slice9_incompatible_provider_switch_is_atomic() {
             origin_allowlist: Default::default(),
             rate_limit: None,
             max_concurrency: None,
+            originator: None,
         },
     );
     config.models.insert(

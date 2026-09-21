@@ -124,11 +124,23 @@ use tokio::sync::{mpsc, oneshot};
 /// Turn startet wieder bei null.
 pub const MAX_CONSECUTIVE_RESUMES: usize = 32;
 
-/// Voreingestellte Wartezeit auf **eine** Nutzerentscheidung.
+/// Voreingestellte Wartezeit auf **eine** Nutzerentscheidung
+/// (Konstruktorvorgabe von [`TuiApprovalHandler::new`]/
+/// [`TuiApprovalHandler::with_scope`]; [`TuiApprovalHandler::await_resolution`]
+/// wartet genau diese Dauer, bevor sie [`ApprovalResolution::timed_out`]
+/// liefert).
 ///
-/// Läuft sie ab, gilt das als Ablehnung (siehe
-/// [`TuiApprovalHandler::await_resolution`]); der Turn endet dadurch regulär
-/// statt halbfertig zu bleiben.
+/// # Zwei Ebenen, eine Politik
+/// [`ApprovalDriver::resolve`] prüft **zuerst** den kernseitigen
+/// Ablaufzeitpunkt ([`harw_core::PendingApproval::timeout_at`], gesetzt von
+/// [`harw_core::AgentSession::begin_approval`]) und lehnt sofort ab, wenn er
+/// bereits erreicht ist, statt eine neue Wartezeit zu eröffnen — siehe dort.
+/// Ist die Pause noch nicht abgelaufen, wartet [`TuiApprovalHandler::await_resolution`]
+/// anschließend bis zu dieser Konstante auf die tatsächliche Antwort. Beide
+/// Ebenen müssen auf dieselbe Frist eingestellt sein, sonst könnte der Kern
+/// eine Pause für abgelaufen halten, während der Handler noch wartet (oder
+/// umgekehrt); ein `assert_eq!` in den Modultests dieser Datei erzwingt die
+/// Übereinstimmung mit [`harw_core::DEFAULT_APPROVAL_TIMEOUT`] (300 s).
 pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Begründung, die eine wegen eines toten Fragekanals erzwungene Ablehnung trägt.
@@ -138,9 +150,6 @@ const REASON_PROMPT_UNDELIVERABLE: &str =
 /// Begründung, die eine wegen einer fallengelassenen Antwort erzwungene
 /// Ablehnung trägt.
 const REASON_ANSWER_DROPPED: &str = "the terminal UI closed the approval prompt without answering";
-
-/// Begründung, die eine wegen Zeitablaufs erzwungene Ablehnung trägt.
-const REASON_TIMED_OUT: &str = "no approval decision arrived before the prompt timed out";
 
 /// Begründung, die eine wegen eines vergifteten Mutex erzwungene Ablehnung trägt.
 const REASON_REGISTRY_POISONED: &str = "the approval prompt registry is unusable";
@@ -671,14 +680,18 @@ impl TuiApprovalHandler {
                 reject(REASON_ANSWER_DROPPED)
             }
             // Zeitablauf: ebenfalls Ablehnung, damit der Turn regulär endet
-            // statt in `WaitingForApproval` hängenzubleiben.
+            // statt in `WaitingForApproval` hängenzubleiben. Die Begründung
+            // kommt aus `harw_core::ApprovalResolution::timed_out` — derselbe
+            // Text, den auch der kernseitige `timeout_at`-Kurzschluss in
+            // [`ApprovalDriver::resolve`] verwendet (§4.4 des
+            // Interaktionsvertrags: eine Begründung, nicht eine je Front-End).
             Err(_elapsed) => {
                 tracing::warn!(
                     request = %request,
                     timeout_ms = u64::try_from(self.timeout.as_millis()).unwrap_or(u64::MAX),
                     "tui.approval.timed_out_rejects"
                 );
-                reject(REASON_TIMED_OUT)
+                ApprovalResolution::timed_out()
             }
         }
     }
@@ -1199,10 +1212,30 @@ impl ApprovalDriver {
 
     /// Beschafft die Nutzerentscheidung zu einer festgehaltenen Pause.
     ///
-    /// Stellt die Frage nach, wenn die Anfrage-ID von einem anderen
-    /// [`ApprovalHandler`] stammt (z. B. `DefaultApprovalPolicy`). Gelingt das
-    /// nicht, ist das Ergebnis eine Ablehnung — nie eine Freigabe.
+    /// # Description
+    /// Prüft zuerst [`PendingApproval::timeout_at`] gegen die Wanduhr — der
+    /// Kern legt diesen Zeitpunkt bereits bei
+    /// [`harw_core::AgentSession::begin_approval`] fest (Interaktionsvertrag
+    /// §4.4). Ist er bereits erreicht (z. B. weil die TUI neu gestartet
+    /// wurde, während der Turn pausierte, oder weil ein vorheriger
+    /// `resume_after_approval`-Versuch fehlschlug und dieselbe Pause erneut
+    /// vorliegt), wird sofort [`ApprovalResolution::timed_out`] geliefert,
+    /// **ohne** eine neue, volle Wartezeit zu eröffnen — ein bereits
+    /// abgelaufenes Fenster bekommt keine zweite Chance.
+    ///
+    /// Andernfalls stellt sie die Frage nach, wenn die Anfrage-ID von einem
+    /// anderen [`ApprovalHandler`] stammt (z. B. `DefaultApprovalPolicy`).
+    /// Gelingt das nicht, ist das Ergebnis eine Ablehnung — nie eine
+    /// Freigabe.
     async fn resolve(&self, pending: &PendingApproval) -> ApprovalResolution {
+        if pending.is_timed_out(jiff::Timestamp::now()) {
+            tracing::warn!(
+                request = %pending.request,
+                timeout_at = %pending.timeout_at,
+                "tui.approval.already_timed_out"
+            );
+            return ApprovalResolution::timed_out();
+        }
         if !self.handler.has_pending(&pending.request)
             && !self.handler.open_prompt(&pending.request, &pending.call)
         {
@@ -1275,9 +1308,7 @@ mod tests {
         ExtensionRegistry, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolName,
         ToolOutput, ToolProvider, ToolSpec,
     };
-    use harw_sandbox::{
-        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-    };
+    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_tools::serde_json::{Value, json};
     use harw_tools::{FunctionToolSpec, JsonSchema};
     use harw_types::{AgentRole, ApprovalActor, TenantId, WorkspaceId};
@@ -1473,6 +1504,28 @@ mod tests {
         json!({ "path": path, "contents": "hello" })
     }
 
+    /// Baut eine [`PendingApproval`] mit einem weit in der Zukunft liegenden
+    /// `timeout_at` — für Tests, die den Treiber unabhängig von der
+    /// kernseitigen Ablauffrist beobachten wollen.
+    fn test_pending_approval(path: &str) -> PendingApproval {
+        let requested_at = jiff::Timestamp::now();
+        PendingApproval {
+            call: ToolCall {
+                id: ToolCallId::new(),
+                name: ToolName::new(WRITE_TOOL),
+                arguments: write_call(path),
+            },
+            request: ItemId::new(),
+            actor: ApprovalActor::Operator {
+                id: "tui-approval-test".to_owned(),
+            },
+            requested_at,
+            timeout_at: requested_at
+                .checked_add(jiff::SignedDuration::from_secs(3600))
+                .expect("one hour from now stays in range"),
+        }
+    }
+
     /// Treibt den Turn und beantwortet dabei jede eintreffende Frage.
     ///
     /// `answers` wird der Reihe nach verbraucht; ist die Liste erschöpft, wird
@@ -1601,17 +1654,7 @@ mod tests {
     async fn test_driver_opens_the_prompt_that_review_no_longer_opens() {
         let (handler, mut prompts) = TuiApprovalHandler::with_scope(ApprovalScope::AllTools);
         let driver = ApprovalDriver::new(Arc::clone(&handler));
-        let pending = PendingApproval {
-            call: ToolCall {
-                id: ToolCallId::new(),
-                name: ToolName::new(WRITE_TOOL),
-                arguments: write_call("a.txt"),
-            },
-            request: ItemId::new(),
-            actor: ApprovalActor::Operator {
-                id: "tui-approval-test".to_owned(),
-            },
-        };
+        let pending = test_pending_approval("a.txt");
 
         // Der erste Poll öffnet die Frage; danach wartet der Treiber auf die
         // Antwort (der Zeitablauf hier ist nur das Poll-Signal, nicht der
@@ -1630,6 +1673,29 @@ mod tests {
         let resolution = resolve.await;
         assert!(matches!(resolution, ApprovalResolution::Approve));
         assert!(prompts.try_recv().is_err(), "genau eine Frage, nicht zwei");
+    }
+
+    /// Eine bereits zu `timeout_at` abgelaufene Pause wird sofort als
+    /// Zeitablauf abgelehnt — ohne eine neue Frage zu öffnen und ohne eine
+    /// frische Wartezeit zu eröffnen (Interaktionsvertrag §4.4).
+    #[tokio::test]
+    async fn test_resolve_denies_immediately_when_the_core_deadline_already_passed() {
+        let (handler, mut prompts) = TuiApprovalHandler::with_scope(ApprovalScope::AllTools);
+        let driver = ApprovalDriver::new(Arc::clone(&handler));
+        let mut pending = test_pending_approval("a.txt");
+        // `timeout_at` liegt bereits in der Vergangenheit.
+        pending.timeout_at = pending
+            .requested_at
+            .checked_sub(jiff::SignedDuration::from_secs(1))
+            .expect("one second before requested_at stays in range");
+
+        let resolution = driver.resolve(&pending).await;
+
+        assert_eq!(resolution, ApprovalResolution::timed_out());
+        assert!(
+            prompts.try_recv().is_err(),
+            "eine bereits abgelaufene Pause darf keine neue Frage öffnen"
+        );
     }
 
     #[tokio::test]
@@ -1710,7 +1776,20 @@ mod tests {
         let ApprovalResolution::Reject { reason } = resolution else {
             panic!("a timed-out prompt must never approve");
         };
-        assert_eq!(reason, REASON_TIMED_OUT);
+        assert_eq!(reason, harw_core::APPROVAL_TIMEOUT_REASON);
+    }
+
+    /// `DEFAULT_APPROVAL_TIMEOUT` (TUI-Fallback) muss mit der kernseitigen
+    /// Politik übereinstimmen — sonst driften zwei „Vorgabe"-Fristen
+    /// auseinander, obwohl der Kern längst die einzige Quelle sein soll.
+    #[test]
+    fn test_default_approval_timeout_matches_the_core_policy() {
+        let tui_default_secs =
+            i64::try_from(DEFAULT_APPROVAL_TIMEOUT.as_secs()).expect("300 fits in i64");
+        assert_eq!(
+            jiff::SignedDuration::from_secs(tui_default_secs),
+            harw_core::DEFAULT_APPROVAL_TIMEOUT
+        );
     }
 
     // ── Treiber: Freigabe / Ablehnung ────────────────────────────────────────

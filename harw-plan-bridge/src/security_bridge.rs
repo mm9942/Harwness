@@ -284,12 +284,12 @@ mod tests {
     use super::*;
     use harw_dod_rules::rule::{Rule, RuleContext};
     use harw_dod_rules::rules::EgressFlowRule;
-    use harw_dod_rules::{run_rules, triage, Verdict};
+    use harw_dod_rules::{run_rules, triaged_finding_for_test, Verdict};
     use harw_dod_signals::{EventKind, Hardness, Severity, SecurityEvent};
     use harw_plan::admission::PathRule;
     use harw_plan::{PlanNodeStatus, PlanStore};
-    use harw_sandbox::NetworkScope;
-    use harw_types::SensorId;
+    use harw_authority::NetworkScope;
+    use harw_types::{FindingId, SensorId};
 
     fn triaged_finding(severity: Severity, hardness: Hardness, verdict: Verdict) -> Finding<Triaged> {
         triaged_finding_at(severity, hardness, verdict, jiff::Timestamp::UNIX_EPOCH)
@@ -331,9 +331,17 @@ mod tests {
             baselines: &[],
             network_scope: &scope,
         };
-        let rule: &dyn Rule = &EgressFlowRule;
-        let checked = run_rules(&[rule], &ctx);
-        let finding = checked.into_iter().next().expect("EgressFlowRule löst aus");
+        // `run_rules` wertet seit der Engine-Überarbeitung intern immer
+        // `ALL_RULES` aus (kein `&[&dyn Rule]`-Parameter mehr) und liefert
+        // `Vec<Finding<Raw>>` — noch nicht geprüft. Bei leeren
+        // `samples`/`baselines` lösen `BaselineDeviationRule` und
+        // `StructureDriftRule` hier nichts aus; trotzdem wird explizit nach
+        // der Regel-ID gefiltert statt blind das erste Element zu nehmen.
+        let raw_findings = run_rules(&ctx);
+        let finding = raw_findings
+            .into_iter()
+            .find(|f| f.rule_id() == EgressFlowRule.id())
+            .expect("EgressFlowRule löst aus");
         assert_eq!(
             finding.severity(),
             severity,
@@ -344,7 +352,25 @@ mod tests {
             hardness,
             "EgressFlowRule liefert eine feste Hardness"
         );
-        triage(finding, verdict)
+        // `Finding::check` (Raw -> RuleChecked) ist in `harw-dod-rules`
+        // `pub(crate)` — von hier, einer fremden Crate, nicht aufrufbar
+        // (siehe dessen `finding.rs`-Moduldoku samt `compile_fail`-Doctest
+        // an `Finding::check`). `triaged_finding_for_test` ist der einzige
+        // öffentliche Übergang, den Tests abhängiger Crates dafür nutzen
+        // dürfen; er geht intern denselben Pfad (`Finding::raw(..).check(id)`
+        // gefolgt von `triage`). Gefüttert wird er ausschließlich mit den
+        // Feldern des soeben real von `EgressFlowRule` berechneten Befundes
+        // — kein erfundener Kurzschluss von Raw direkt nach Triaged.
+        triaged_finding_for_test(
+            finding.rule_id(),
+            finding.kind(),
+            finding.severity(),
+            finding.hardness(),
+            finding.summary().to_owned(),
+            finding.observed_at(),
+            FindingId::new(),
+            verdict,
+        )
     }
 
     fn sample_security_evidence() -> SecurityEvidence {

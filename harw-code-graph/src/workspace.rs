@@ -638,21 +638,44 @@ mod tests {
     }
 
     #[test]
-    fn load_reads_real_workspace_with_95_members() {
+    fn load_reads_real_workspace_with_member_count_from_manifest() {
         // Lädt den tatsächlichen Repo-Workspace statt eines konstruierten
         // Fixtures. Die bisherigen Tests konstruierten sich stets einen
         // Workspace in der (inzwischen überholten) wörtlichen Versionsform
         // und hätten den AW0-00-Regressionsfehler nie gesehen.
+        //
+        // Die erwartete Mitgliederzahl wird bewusst NICHT als Literal
+        // eingetragen: die Wurzel-`Cargo.toml` wächst und schrumpft mit dem
+        // Workspace (zuletzt 95 → 68 Member), und ein hartkodierter Wert
+        // veraltet bei jeder solchen Änderung stillschweigend. Stattdessen
+        // liest dieser Test `[workspace].members` direkt aus derselben
+        // Wurzel-Manifest-Datei, die auch [`WorkspaceGraph::load`] liest, und
+        // löst sie über dieselbe [`resolve_member_dirs`]-Funktion auf — so
+        // bleibt die Erwartung an die Quelle der Wahrheit gebunden, statt an
+        // eine Momentaufnahme.
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let workspace_root = manifest_dir
             .parent()
             .expect("übergeordnetes Workspace-Verzeichnis von harw-code-graph");
 
+        let root_content = fs::read_to_string(workspace_root.join("Cargo.toml"))
+            .expect("Wurzel-Cargo.toml lesen");
+        let root_manifest: RawRootManifest =
+            toml::from_str(&root_content).expect("Wurzel-Cargo.toml parsen");
+        let member_patterns = root_manifest
+            .workspace
+            .expect("[workspace]-Abschnitt in der Wurzel-Cargo.toml")
+            .members
+            .unwrap_or_default();
+        let expected_member_dirs = resolve_member_dirs(workspace_root, &member_patterns)
+            .expect("Member-Verzeichnisse aus der Wurzel-Cargo.toml auflösen");
+        let expected_count = expected_member_dirs.len();
+
         let graph = WorkspaceGraph::load(workspace_root).expect("echten Workspace laden");
         assert_eq!(
             graph.crates.len(),
-            95,
-            "erwartete 95 Workspace-Member, gefunden: {:?}",
+            expected_count,
+            "erwartete {expected_count} Workspace-Member (aus Cargo.toml), gefunden: {:?}",
             graph.crates.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()
         );
 
@@ -670,8 +693,8 @@ mod tests {
             .collect();
         assert_eq!(
             sorted_names.len(),
-            95,
-            "alle 95 Member müssen in genau einer Ebene auftauchen"
+            expected_count,
+            "alle {expected_count} Member müssen in genau einer Ebene auftauchen"
         );
 
         let secrets = graph.get("harw-secrets").expect("harw-secrets gefunden");

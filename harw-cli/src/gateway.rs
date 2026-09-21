@@ -106,10 +106,12 @@ use std::time::{Duration, Instant};
 use jiff::{SignedDuration, Timestamp};
 
 use harw_channel::{Admission, ChannelAdapter, InboundEvent, PairingStore, SessionKey};
-use harw_channel_telegram::{TelegramChannel, TelegramChannelConfig, TopicMode};
+use harw_channel_telegram::{
+    ThrottleNotice, TelegramChannel, TelegramChannelConfig, TopicMode, WorkRequestStore,
+};
 use harw_channel_telegram_transport::{
-    AdmittedEventConsumer, LongPollConfig, LongPollShutdown, TelegramClient, TelegramOffsetStore,
-    TelegramOutbound, TelegramRenderer, spawn_long_poll_thread,
+    AdmittedEventConsumer, LongPollConfig, LongPollShutdown, RendererConfig, TelegramClient,
+    TelegramOffsetStore, TelegramOutbound, TelegramRenderer, spawn_long_poll_thread,
 };
 use harw_config::{
     ChannelToml, InternalModelPoint, ResolvedConfig, SecretRef, resolve_env_ref,
@@ -127,7 +129,7 @@ use harw_secrets::audit::chain::PersistedChainStatus;
 use harw_secrets::audit::telemetry::AUDIT_CHAIN_BREAK;
 use harw_secrets::{AuditError, AuditResult};
 use harw_session_store::{RecordKind, TranscriptStore};
-use harw_types::{AgentRole, ChannelId, Principal, SessionId, ThreadRef};
+use harw_types::{AgentRole, ChannelId, PeerId, Principal, SessionId, ThreadRef};
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::home::resolve_home;
@@ -230,14 +232,25 @@ enum TelegramIngressMode {
 /// conversational model. Once a peer is paired, old/replayed pairing commands
 /// are still admitted by the channel; discard them here so they cannot trigger
 /// an arbitrary model answer.
+///
+/// Telegram appends `@<bot-username>` to commands sent in groups (and clients
+/// may send it in any letter case), so `/PAIR@LinLinBot` must be recognized
+/// the same as `/pair`. The whole leading token is lowered (ASCII-only —
+/// Telegram command/username characters are always ASCII) before comparison,
+/// which keeps this case-insensitive without risking a byte-boundary panic
+/// from slicing a raw `&str`. It stays strict otherwise: `/pairing` and
+/// `/pairx` do not share the `/pair`/`/pair@` prefix, and plain text
+/// containing "pair" never reaches this check because only the first
+/// whitespace-delimited token is considered.
 fn is_telegram_pairing_command(text: &str) -> bool {
     let command = text
         .trim()
         .split_ascii_whitespace()
         .next()
         .unwrap_or_default();
-    command.eq_ignore_ascii_case("/pair")
-        || command
+    let lowered = command.to_ascii_lowercase();
+    lowered == "/pair"
+        || lowered
             .strip_prefix("/pair@")
             .is_some_and(|bot| !bot.is_empty())
 }
@@ -248,16 +261,111 @@ struct GatewayTelegramConsumer {
     provider: Arc<dyn ModelProvider>,
     transcript_root: PathBuf,
     outbound: Arc<dyn TelegramOutbound>,
+    /// Durable `WorkRequest` lifecycle store for `/request /review /approve
+    /// /deny /cancel` (docs/design/telegram-sandbox-work-requests.md).
+    work_requests: Arc<WorkRequestStore>,
+    /// Authoritative workspace-alias resolver. See this crate's `run`/
+    /// `supervise` docs for why it is currently built with zero registered
+    /// workspaces (no `harw-config` workspace-registration surface exists
+    /// yet): every `/request` fails closed with `WorkspaceUnresolved` until
+    /// that follow-up config surface lands, rather than trusting an alias.
+    workspaces: Arc<harw_authority::WorkspaceRegistry>,
+}
+
+impl GatewayTelegramConsumer {
+    /// Handles one of the closed `/request /review /approve /deny /cancel`
+    /// commands (docs/design/telegram-sandbox-work-requests.md, "Typed
+    /// request boundary"). Only the parsed, already-validated command
+    /// arguments are used — never `event.text`/attachments/callback data
+    /// beyond what `parse_command` extracted, so this cannot select a
+    /// workspace or grant a permission on its own authority.
+    fn handle_work_request_command(
+        &self,
+        key: &SessionKey,
+        event: &InboundEvent,
+        command: harw_channel_telegram_transport::TelegramCommand,
+    ) {
+        use harw_channel_telegram_transport::TelegramCommand;
+
+        let Ok(chat_id) = event.peer.as_str().parse::<i64>() else {
+            tracing::warn!(channel = %key.channel, peer = %key.peer, "Telegram peer is not a numeric chat id");
+            return;
+        };
+        let thread_id = event
+            .thread
+            .as_ref()
+            .and_then(|thread| thread.as_str().parse::<i64>().ok());
+        // The requester is the acting human, never a group's `PeerId`
+        // (docs/design/channel-ingress-telegram.md §3.3).
+        let requester = event
+            .sender
+            .as_ref()
+            .map(|sender| PeerId::from_str(sender.id.clone()))
+            .unwrap_or_else(|| event.peer.clone());
+        let now = Timestamp::now();
+
+        let reply = match command {
+            TelegramCommand::Request {
+                workspace_alias,
+                role,
+                task,
+            } => self
+                .work_requests
+                .submit(
+                    &key.channel,
+                    &requester,
+                    &key.tenant,
+                    &workspace_alias,
+                    &role,
+                    &task,
+                    event.raw_event_id.as_deref().unwrap_or_default(),
+                    self.workspaces.as_ref(),
+                    now,
+                )
+                .map(|record| format!("Requested {} (state: requested)", record.work_id)),
+            TelegramCommand::Review { work_id } => self
+                .work_requests
+                .review(&WorkId::from_str(work_id), now),
+            TelegramCommand::Approve { work_id } => self
+                .work_requests
+                .approve(&WorkId::from_str(work_id), now),
+            TelegramCommand::Deny { work_id } => self
+                .work_requests
+                .deny(&WorkId::from_str(work_id), now),
+            TelegramCommand::Cancel { work_id } => self
+                .work_requests
+                .cancel(&WorkId::from_str(work_id), now),
+        };
+
+        let markdown = match reply {
+            Ok(message) => message,
+            Err(error) => {
+                tracing::warn!(channel = %key.channel, peer = %key.peer, error = %error, "Telegram work-request command failed");
+                format!("Anfrage fehlgeschlagen: {error}")
+            }
+        };
+        if let Err(error) = self.outbound.send(
+            chat_id,
+            thread_id,
+            &harw_channel::OutboundContent::Message { markdown },
+        ) {
+            tracing::error!(error = %error, "Telegram work-request reply delivery failed");
+        }
+    }
 }
 
 impl AdmittedEventConsumer for GatewayTelegramConsumer {
     fn handle_admitted(&self, key: SessionKey, event: InboundEvent) {
-        let Some(text) = event.text.filter(|text| !text.trim().is_empty()) else {
+        let Some(text) = event.text.clone().filter(|text| !text.trim().is_empty()) else {
             tracing::warn!(channel = %key.channel, peer = %key.peer, "Telegram event has no text runtime handoff");
             return;
         };
         if is_telegram_pairing_command(&text) {
             tracing::debug!(channel = %key.channel, peer = %key.peer, "Telegram pairing command consumed outside model runtime");
+            return;
+        }
+        if let Some(command) = harw_channel_telegram_transport::parse_command(&text) {
+            self.handle_work_request_command(&key, &event, command);
             return;
         }
         if !event.attachments.is_empty() {
@@ -386,7 +494,7 @@ pub fn run(
     telemetry: crate::cli::TelemetryArgs,
 ) -> Result<(), String> {
     let home = resolve_home(home_override)?;
-    harw_home::ensure_home(&home).map_err(|error| error.to_string())?;
+    crate::home::ensure_home(&home).map_err(|error| error.to_string())?;
     let cwd = std::env::current_dir()
         .map_err(|error| format!("gateway: Arbeitsverzeichnis nicht lesbar: {error}"))?;
 
@@ -489,21 +597,35 @@ struct GatewayProviders {
     dream: Arc<dyn ModelProvider>,
 }
 
-/// Öffnet den Secret-Resolver für die Gateway-Montagen genau einmal.
+/// Öffnet den Secret-Resolver für die Gateway-Montagen genau einmal, verengt
+/// auf den Provider, den der Gateway-Prozess tatsächlich verwendet.
 ///
 /// # Description
 /// `gateway_assembly` lädt die maßgebliche Konfiguration erst innerhalb von
-/// `RuntimeAssemblyBuilder::build`, aber
-/// [`crate::secret_store::open_configured_secret_resolver`] braucht die
-/// *aufgelöste* Konfiguration vorher, um zu entscheiden, ob ein aktivierter
-/// Provider überhaupt eine `secrets:`-Referenz nutzt. Diese Funktion lädt
-/// deshalb vorab dieselbe vertrauensbewusste Konfiguration über
+/// `RuntimeAssemblyBuilder::build`, aber der Secret-Resolver muss vorher
+/// stehen (er wird per `Arc::clone` an beide Montagen gereicht). Diese
+/// Funktion lädt deshalb vorab dieselbe vertrauensbewusste Konfiguration über
 /// [`harw_runtime::load_config`] — mit der [`harw_runtime::RuntimeSpec`] des
 /// übergebenen `entry` (`entry.entry_kind()`, Befund G4 statt eines hart
-/// codierten `EntryKind::GatewayTelegram`) — und öffnet damit den Resolver.
-/// `load_config` hängt nur von `home`/`cwd` der Spec ab; ein einziger
-/// vorläufiger Ladevorgang gilt deshalb für beide Gateway-Einstiege, und der
-/// Resolver wird per `Arc::clone` geteilt.
+/// codierten `EntryKind::GatewayTelegram`).
+///
+/// **Warum provider-verengt statt eines vollen Scans:** beide
+/// Gateway-Montagen (`GatewayEntry::Telegram`/`Dream`) lesen dasselbe
+/// `home`/`cwd`, also dieselbe aufgelöste Konfiguration, und beide bauen ihr
+/// Modell über `ModelSource::Configured`, das ausschließlich
+/// `config.harness.default_provider` verwendet (siehe
+/// `harw_provider_http::build_provider_with_home`/`build_provider`, dieselbe
+/// Auflösung wie `crate::main::build_serve_provider`). Der Gateway-Prozess
+/// hat — anders als `serve`, das zusätzlich beliebige konfigurierte
+/// MCP-Principals authentifiziert — keine zweite, vom `default_provider`
+/// unabhängige Verwendungsstelle für Provider-Credentials. Diese Funktion
+/// ruft deshalb
+/// [`crate::secret_store::open_configured_secret_resolver_for_active_provider`]
+/// statt [`crate::secret_store::open_configured_secret_resolver`] auf: ein
+/// zweiter, aktivierter, aber von diesem Gateway-Start nie angesprochener
+/// `secrets:`-Provider ohne KEK darf den Start nicht mehr blockieren. Der
+/// tatsächlich genutzte `default_provider` bleibt fail-closed, wenn er
+/// `secrets:` referenziert und kein KEK konfiguriert ist.
 ///
 /// # Arguments
 /// - `entry` ([`GatewayEntry`]): Einstieg der ersten Montage, deren Spec
@@ -514,9 +636,10 @@ struct GatewayProviders {
 ///   vorläufige Spec).
 ///
 /// # Returns
-/// `Some(resolver)`, wenn ein aktivierter Provider `secrets:` nutzt und der
-/// versiegelte Speicher geöffnet werden konnte; `None`, wenn kein aktivierter
-/// Provider `secrets:` nutzt.
+/// `Some(resolver)`, wenn der tatsächlich genutzte Provider (`default_provider`)
+/// `secrets:` nutzt und der versiegelte Speicher geöffnet werden konnte;
+/// `None` sonst — auch dann, wenn ein *anderer*, von diesem Gateway-Start
+/// nicht verwendeter Provider `secrets:` nutzen würde.
 ///
 /// # Errors
 /// `String` mit Präfix `"gateway: "`: Konfigurations-/Vertrauensfehler aus
@@ -532,8 +655,11 @@ fn open_gateway_secret_resolver(
     let spec = crate::runtime_entry::runtime_spec(entry.entry_kind(), home, cwd, principal.clone());
     let (preliminary_config, _trust_report) =
         harw_runtime::load_config(&spec).map_err(|error| format!("gateway: {error}"))?;
-    let resolver = crate::secret_store::open_configured_secret_resolver(home, &preliminary_config)
-        .map_err(|error| format!("gateway: {error}"))?;
+    let resolver = crate::secret_store::open_configured_secret_resolver_for_active_provider(
+        home,
+        &preliminary_config,
+    )
+    .map_err(|error| format!("gateway: {error}"))?;
     Ok(resolver.map(|resolver| Arc::new(resolver) as GatewaySecretResolver))
 }
 
@@ -700,6 +826,22 @@ async fn supervise(
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
+    // Authoritative workspace-alias resolver for Telegram `/request`
+    // (docs/design/telegram-sandbox-work-requests.md, "Typed request
+    // boundary"). Built with **zero** registrations: `harw-config` has no
+    // workspace-registration TOML surface yet (only `harw-cli/src/gateway.rs`
+    // is in this change's file scope, not that config schema), so every
+    // `/request` fails closed with `WorkspaceUnresolved` until a follow-up
+    // change adds registrations here. This is deliberate fail-closed
+    // behavior, not a bug: no alias can select a workspace it was never
+    // configured to resolve to.
+    let workspaces = Arc::new(
+        harw_authority::WorkspaceRegistry::build(
+            home,
+            std::iter::empty::<harw_authority::WorkspaceRegistration>(),
+        )
+        .map_err(|error| format!("gateway: workspace registry: {error}"))?,
+    );
     let channels = async move {
         match telegram_mode {
             TelegramIngressMode::Disabled(reason) => {
@@ -712,7 +854,8 @@ async fn supervise(
                 // der Gateway-Laufzeit stillegen (S6/S9) — beides führt hier
                 // zu einem Neustart mit Backoff statt zu einer aufgegebenen
                 // Aufgabe.
-                supervise_telegram_long_poll(*plan, telegram_provider, telegram_profile).await
+                supervise_telegram_long_poll(*plan, telegram_provider, telegram_profile, workspaces)
+                    .await
             }
         }
     };
@@ -1173,6 +1316,7 @@ async fn start_telegram_long_poll(
     plan: &TelegramIngressPlan,
     provider: Arc<dyn ModelProvider>,
     profile: PathBuf,
+    workspaces: Arc<harw_authority::WorkspaceRegistry>,
 ) -> Result<std::thread::JoinHandle<harw_channel_telegram_transport::TransportResult<()>>, String> {
     let channel_id = ChannelId::try_from(plan.binding.id.clone())
         .map_err(|_| "Telegram channel id is invalid".to_owned())?;
@@ -1194,6 +1338,11 @@ async fn start_telegram_long_poll(
         .cloned()
         .collect();
     channel_config.require_mention_in_groups = plan.binding.groups.require_mention;
+    // §3.5 `max_updates_per_peer_per_min`: without this, `TelegramChannel`
+    // would silently fall back to its own compiled-in default instead of the
+    // operator's configured ceiling.
+    channel_config.max_updates_per_peer_per_min =
+        plan.binding.rate_limit.max_updates_per_peer_per_min;
     channel_config.topic_mode = match plan.binding.topics.mode.as_str() {
         "per_topic_session" => TopicMode::PerTopicSession,
         "shared_session" => TopicMode::SharedSession,
@@ -1206,20 +1355,60 @@ async fn start_telegram_long_poll(
         .get_me()
         .await
         .map_err(|_| "Telegram bot identity lookup failed".to_owned())?;
-    let renderer: Arc<dyn TelegramOutbound> = Arc::new(TelegramRenderer::new(Arc::new(bot_client)));
+    // Feed the configured per-chat outbound ceiling through instead of the
+    // renderer's hardcoded default (§3.5 `max_outbound_per_chat_per_sec`).
+    // `RendererConfig::default()` supplies every other field (message-length
+    // cap, global bucket, cache size, streaming strategy) unchanged.
+    let renderer_config = RendererConfig {
+        per_chat_per_sec: plan.binding.rate_limit.max_outbound_per_chat_per_sec,
+        ..RendererConfig::default()
+    };
+    let renderer: Arc<dyn TelegramOutbound> = Arc::new(TelegramRenderer::with_config(
+        Arc::new(bot_client),
+        renderer_config,
+    ));
+    let throttle_outbound = Arc::clone(&renderer);
+    let work_requests = Arc::new(WorkRequestStore::new(
+        &profile.join("channel-state").join("work-requests"),
+    ));
     let consumer = Arc::new(GatewayTelegramConsumer {
         provider,
         transcript_root: profile.join("sessions"),
         outbound: renderer,
+        work_requests,
+        workspaces,
     });
     let (ingress_tx, ingress_rx) = mpsc::sync_channel(128);
+    let (throttle_tx, throttle_rx) = mpsc::channel::<ThrottleNotice>();
     let adapter = TelegramChannel::with_ingress_receiver(
         channel_config,
         Arc::new(PairingStore::new(
             &profile.join("channel-state").join("pairing"),
         )),
         ingress_rx,
-    );
+    )
+    .with_throttle_sink(throttle_tx);
+    // Delivers at most one "you're sending too fast" reply per rate-limit
+    // window (§3.5): the admission perimeter (`TelegramChannel::admit`) only
+    // decides and emits the notice, it never sends network traffic itself.
+    std::thread::Builder::new()
+        .name("harw-telegram-throttle-notice".to_owned())
+        .spawn(move || {
+            for notice in throttle_rx {
+                let Ok(chat_id) = notice.peer.as_str().parse::<i64>() else {
+                    tracing::warn!("Telegram throttle notice has a non-numeric peer");
+                    continue;
+                };
+                let thread_id = notice
+                    .thread
+                    .as_ref()
+                    .and_then(|thread| thread.as_str().parse::<i64>().ok());
+                if let Err(error) = throttle_outbound.send(chat_id, thread_id, &notice.content) {
+                    tracing::error!(error = %error, "Telegram throttle notice delivery failed");
+                }
+            }
+        })
+        .map_err(|_| "Telegram throttle-notice thread could not start".to_owned())?;
     std::thread::Builder::new()
         .name("harw-telegram-admission".to_owned())
         .spawn(move || {
@@ -1272,10 +1461,18 @@ async fn supervise_telegram_long_poll(
     plan: TelegramIngressPlan,
     provider: Arc<dyn ModelProvider>,
     profile: PathBuf,
+    workspaces: Arc<harw_authority::WorkspaceRegistry>,
 ) -> ! {
     let mut attempt: u32 = 0;
     loop {
-        match start_telegram_long_poll(&plan, Arc::clone(&provider), profile.clone()).await {
+        match start_telegram_long_poll(
+            &plan,
+            Arc::clone(&provider),
+            profile.clone(),
+            Arc::clone(&workspaces),
+        )
+        .await
+        {
             Ok(handle) => {
                 // Ein erfolgreicher Start setzt den Backoff zurück: nur
                 // *aufeinanderfolgende* Fehlschläge sollen länger werden.
@@ -2611,6 +2808,54 @@ pinned_identities = [123456789]
         let resolver =
             open_gateway_secret_resolver(GatewayEntry::Dream, home.path(), cwd.path(), &principal)
                 .expect("an empty home has no sealed provider and needs no KEK");
+
+        assert!(resolver.is_none());
+    }
+
+    /// Legt eine Gateway-Konfiguration mit zwei Providern an: `"plain"`
+    /// (`env:`, `default_provider`) und `"sealed"` (`secrets:`, aktiviert,
+    /// aber nie ausgewählt, ohne `[kek]`).
+    fn write_gateway_home_with_unused_sealed_provider(home: &Path) {
+        std::fs::write(
+            home.join("config.toml"),
+            "default_provider = \"plain\"\ndefault_model = \"model\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.join("providers")).unwrap();
+        std::fs::write(
+            home.join("providers").join("plain.toml"),
+            "name = \"plain\"\napi = \"openai-chat\"\nbase_url = \"https://example.test/v1\"\nauth = \"env:GATEWAY_TEST_PLAIN_TOKEN\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            home.join("providers").join("sealed.toml"),
+            "name = \"sealed\"\napi = \"openai-chat\"\nbase_url = \"https://example.test/v1\"\nauth = \"secrets:provider-token\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.join("models")).unwrap();
+        std::fs::write(
+            home.join("models").join("model.toml"),
+            "id = \"model\"\nprovider = \"plain\"\n",
+        )
+        .unwrap();
+    }
+
+    /// Kernverhalten dieses Reports: ein aktivierter, aber vom Gateway nicht
+    /// ausgewählter `secrets:`-Provider ohne KEK darf den Start nicht
+    /// blockieren — der aktive `default_provider` (`"plain"`, `env:`)
+    /// bestimmt allein, ob ein KEK verlangt wird.
+    #[test]
+    fn test_open_gateway_secret_resolver_ignores_unused_sealed_provider_without_kek() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        write_gateway_home_with_unused_sealed_provider(home.path());
+        let principal = channel_principal(GatewayEntry::Dream, "");
+
+        let resolver =
+            open_gateway_secret_resolver(GatewayEntry::Dream, home.path(), cwd.path(), &principal)
+                .expect(
+                    "an unused sealed provider without a KEK must not block the active plain provider",
+                );
 
         assert!(resolver.is_none());
     }

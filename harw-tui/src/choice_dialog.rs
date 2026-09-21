@@ -133,6 +133,37 @@ impl ChoiceDialog {
         self
     }
 
+    /// Berechnet die Höhe (in Zeilen, inklusive Rahmen), die [`Self::render`]
+    /// benötigt, um jede Option und den Hinweistext ohne Abschneiden
+    /// darzustellen.
+    ///
+    /// # Beschreibung
+    /// Anders als [`crate::approval_dialog::ApprovalDialog::desired_height`]
+    /// nimmt diese Methode keine Breite entgegen: [`Self::render`] bricht
+    /// weder den Hinweistext noch eine Optionsbeschriftung um (beide werden
+    /// als genau eine Zeile gerendert, notfalls vom Terminal seitlich
+    /// abgeschnitten) — die benötigte Zeilenzahl hängt deshalb nicht von der
+    /// Breite ab. Ein Aufrufer, der diesen Dialog wie
+    /// [`crate::approval_dialog::ApprovalDialog`] anstelle des Composers
+    /// zeichnet (statt als Vollflächen-Overlay), bemisst die Layout-Zeile
+    /// damit über diese Methode statt über einen festen Platzhalterwert.
+    ///
+    /// # Rückgabe
+    /// Rahmen (2) plus, falls ein Hinweistext gesetzt ist, dessen eine Zeile
+    /// plus eine Leerzeile (siehe [`Self::render`]) plus eine Zeile je Option
+    /// plus die Fußzeile (1).
+    #[must_use]
+    pub fn desired_height(&self) -> u16 {
+        let border = 2u16;
+        let prompt_rows: u16 = if self.prompt.is_some() { 2 } else { 0 };
+        let option_rows = u16::try_from(self.options.len()).unwrap_or(u16::MAX);
+        let footer_rows = 1u16;
+        border
+            .saturating_add(prompt_rows)
+            .saturating_add(option_rows)
+            .saturating_add(footer_rows)
+    }
+
     /// Verarbeitet einen Tastendruck und gibt eine [`ChoiceAction`] zurück.
     ///
     /// # Beschreibung
@@ -378,5 +409,22 @@ mod tests {
         assert!(rendered.contains("Als Datei speichern"));
         assert!(rendered.contains("Abbrechen"));
         assert!(rendered.contains("wählen"));
+    }
+
+    /// `desired_height` zählt Rahmen, Hinweiszeile plus Leerzeile, eine Zeile
+    /// je Option und die Fußzeile.
+    #[test]
+    fn test_desired_height_counts_prompt_options_and_footer() {
+        let dialog = export_dialog();
+        // 2 (Rahmen) + 2 (Hinweis + Leerzeile) + 3 (Optionen) + 1 (Fußzeile).
+        assert_eq!(dialog.desired_height(), 8);
+    }
+
+    /// Ohne Hinweistext entfallen die zwei dafür reservierten Zeilen.
+    #[test]
+    fn test_desired_height_without_prompt_omits_prompt_rows() {
+        let dialog = ChoiceDialog::new("Export", None, vec!["Ja".to_owned(), "Nein".to_owned()]);
+        // 2 (Rahmen) + 0 (kein Hinweis) + 2 (Optionen) + 1 (Fußzeile).
+        assert_eq!(dialog.desired_height(), 5);
     }
 }

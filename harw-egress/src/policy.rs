@@ -32,7 +32,8 @@
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
-use harw_sandbox::egress::{EgressHost, EgressUrl, host_matches_suffix};
+use harw_authority::host_matches_suffix;
+use harw_sandbox::{EgressHost, EgressUrl};
 
 use crate::classify::{AddrClass, classify};
 use crate::error::EgressError;

@@ -33,6 +33,7 @@ use harw_types::{TokenUsage, ToolCallId};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use std::fmt;
+use std::sync::Arc;
 use std::time::Duration;
 
 const INVALID_CUSTOM_HEADERS_ERROR: &str = "invalid ANTHROPIC_CUSTOM_HEADERS configuration";
@@ -123,6 +124,11 @@ pub struct AnthropicMessagesProvider {
     /// deaktiviert (`ProviderRateLimiter::new(None)`) — dieser Konstruktionsweg
     /// hat keinen Zugriff auf `harw_config::ProviderToml::rate_limit`.
     rate_limiter: std::sync::Arc<crate::rate_limiter::ProviderRateLimiter>,
+    /// `auth.credential_pool[provider_id]`, falls nicht-leer konfiguriert
+    /// (siehe `crate::credential_pool`-Moduldoku „Credential-Pool"). `None`
+    /// heißt: dieser Provider nutzt ausschließlich `credential`/`messages_url`
+    /// oben (unverändertes Verhalten ohne Pool).
+    credential_pool: Option<Arc<crate::credential_pool::CredentialPool<AnthropicCredential>>>,
 }
 
 impl AnthropicMessagesProvider {
@@ -152,6 +158,7 @@ impl AnthropicMessagesProvider {
             request_timeout: super::DEFAULT_REQUEST_TIMEOUT,
             configured_headers: None,
             rate_limiter: std::sync::Arc::new(crate::rate_limiter::ProviderRateLimiter::new(None)),
+            credential_pool: None,
         }
     }
 
@@ -178,6 +185,18 @@ impl AnthropicMessagesProvider {
     /// (`harw_config::ProviderToml::rate_limit`); aufgerufen von
     /// `build_named_provider` im Anthropic-Zweig, da `AnthropicMessagesProvider`
     /// selbst keinen `from_named_config`-Konstruktionsweg besitzt.
+    /// Setzt den Credential-Pool (siehe `crate::credential_pool`-Moduldoku
+    /// „Credential-Pool"); aufgerufen von `build_named_provider` im
+    /// Anthropic-Zweig, wenn `auth.credential_pool[provider_id]` nicht-leer
+    /// ist. `None` lässt das Feld unverändert `None` (kein Pool, unverändertes
+    /// Verhalten über `self.credential`/`self.messages_url`).
+    pub(crate) fn configure_credential_pool(
+        &mut self,
+        pool: Option<crate::credential_pool::CredentialPool<AnthropicCredential>>,
+    ) {
+        self.credential_pool = pool.map(Arc::new);
+    }
+
     pub(crate) fn configure_rate_limit(&mut self, rate_limit: Option<harw_config::RateLimitToml>) {
         self.rate_limiter =
             std::sync::Arc::new(crate::rate_limiter::ProviderRateLimiter::new(rate_limit));
@@ -205,6 +224,30 @@ impl AnthropicMessagesProvider {
             .as_ref()
             .filter(|model_id| !model_id.as_str().is_empty())
             .map_or(self.model.as_str(), |model_id| model_id.as_str()))
+    }
+
+    /// Liefert Credential + vollständige `/v1/messages`-URL für einen Versuch.
+    ///
+    /// # Description
+    /// `credential_idx` wählt (falls `Some` und [`Self::credential_pool`]
+    /// gesetzt) einen konkreten Pool-Eintrag; dessen `base_url`-Override
+    /// wird über [`anthropic_messages_url`] zur vollständigen Endpoint-URL
+    /// normalisiert, wenn gesetzt, sonst bleibt `self.messages_url` die
+    /// URL. Ohne Pool oder mit `credential_idx: None` liefert dies
+    /// unverändert `self.credential`/`self.messages_url` — das bisherige
+    /// Verhalten ohne Credential-Pool.
+    fn request_target(&self, credential_idx: Option<usize>) -> (&AnthropicCredential, String) {
+        match (credential_idx, &self.credential_pool) {
+            (Some(index), Some(pool)) => {
+                let entry = pool.entry(index);
+                let url = match &entry.base_url {
+                    Some(base) => anthropic_messages_url(base),
+                    None => self.messages_url.clone(),
+                };
+                (&entry.value, url)
+            }
+            _ => (&self.credential, self.messages_url.clone()),
+        }
     }
 }
 
@@ -707,117 +750,192 @@ fn apply_anthropic_credential(
     })
 }
 
-impl ModelProvider for AnthropicMessagesProvider {
-    fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
-        Box::pin(async move {
-            let model = self.selected_model(&request)?;
-            let strategy =
-                crate::cache_strategy::resolve_cache_strategy(&self.provider_id, model, None);
-            let mut wire = build_messages_body(model, self.max_tokens, &request);
-            crate::cache_strategy::apply_messages_cache_control(&mut wire, strategy);
-            tracing::debug!(
-                model,
-                strategy = strategy.label(),
-                "sending anthropic messages request"
-            );
+impl AnthropicMessagesProvider {
+    /// Sendet **einen** Versuch mit dem durch `credential_idx` gewählten
+    /// Credential (siehe [`Self::request_target`]). Der eigentliche Körper
+    /// von [`ModelProvider::respond`] vor Einführung des Credential-Pools —
+    /// unverändert bis auf die Credential-/URL-Auswahl und die explizite
+    /// 401/403-Unterscheidung, damit [`ModelProvider::respond`] denselben
+    /// Versuch mit einem anderen Pool-Eintrag wiederholen kann.
+    ///
+    /// # Errors
+    /// Siehe [`ModelProvider::respond`]; zusätzlich [`ModelError::Auth`] bei
+    /// HTTP 401/403 (zuvor Teil von [`ModelError::RequestFailed`] — die
+    /// Unterscheidung ist nötig, damit `credential_pool::should_failover`
+    /// einen ungültigen/entzogenen Schlüssel erkennen kann).
+    async fn respond_once(
+        &self,
+        request: ModelRequest,
+        credential_idx: Option<usize>,
+    ) -> Result<ModelResponse, ModelError> {
+        let (credential, messages_url) = self.request_target(credential_idx);
+        let model = self.selected_model(&request)?;
+        let strategy = crate::cache_strategy::resolve_cache_strategy(&self.provider_id, model, None);
+        let mut wire = build_messages_body(model, self.max_tokens, &request);
+        crate::cache_strategy::apply_messages_cache_control(&mut wire, strategy);
+        tracing::debug!(
+            model,
+            strategy = strategy.label(),
+            "sending anthropic messages request"
+        );
 
-            let mut builder = self
-                .client
-                .post(&self.messages_url)
-                .header("content-type", "application/json")
-                .header("anthropic-version", ANTHROPIC_VERSION);
+        let mut builder = self
+            .client
+            .post(&messages_url)
+            .header("content-type", "application/json")
+            .header("anthropic-version", ANTHROPIC_VERSION);
 
-            // Optionaler Passthrough zusätzlicher Header (z. B. für Cloudflare AI
-            // Gateway: `cf-aig-authorization: Bearer …`). Format aus der Env-Var
-            // `ANTHROPIC_CUSTOM_HEADERS` — kompatibel mit Anthropic's offiziellem
-            // Claude-Code-Client. Mehrere Header via `,` getrennt.
-            let custom_headers = if let Some(headers) = &self.configured_headers {
-                Some(
-                    headers
-                        .iter()
-                        .map(|(name, value)| (name.clone(), value.clone()))
-                        .collect::<Vec<_>>(),
-                )
-            } else {
-                anthropic_custom_headers()?
-            };
+        // Optionaler Passthrough zusätzlicher Header (z. B. für Cloudflare AI
+        // Gateway: `cf-aig-authorization: Bearer …`). Format aus der Env-Var
+        // `ANTHROPIC_CUSTOM_HEADERS` — kompatibel mit Anthropic's offiziellem
+        // Claude-Code-Client. Mehrere Header via `,` getrennt.
+        let custom_headers = if let Some(headers) = &self.configured_headers {
+            Some(
+                headers
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            anthropic_custom_headers()?
+        };
 
-            builder = apply_anthropic_credential(builder, &self.credential)?;
-            if let Some(custom_headers) = custom_headers {
-                for (name, value) in custom_headers {
-                    builder = builder.header(name, value);
-                }
+        builder = apply_anthropic_credential(builder, credential)?;
+        if let Some(custom_headers) = custom_headers {
+            for (name, value) in custom_headers {
+                builder = builder.header(name, value);
             }
+        }
 
-            self.rate_limiter.wait_for_slot().await;
-            let response = builder
-                .json(&wire)
-                .timeout(self.request_timeout)
-                .send()
-                .await
-                .map_err(|error| {
-                    ModelError::RequestFailed(super::HttpProviderError::from(error).to_string())
-                })?;
-
-            self.rate_limiter.observe_headers(response.headers());
-            let status = response.status();
-            let retry_after_header = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned);
-            let request_id = super::provider_request_id(response.headers());
-            let body = response.text().await.map_err(|error| {
+        self.rate_limiter.wait_for_slot().await;
+        let response = builder
+            .json(&wire)
+            .timeout(self.request_timeout)
+            .send()
+            .await
+            .map_err(|error| {
                 ModelError::RequestFailed(super::HttpProviderError::from(error).to_string())
             })?;
 
-            if status.as_u16() == 429 {
-                let retry_after = super::parse_retry_after(retry_after_header.as_deref(), &body);
-                return Err(ModelError::RateLimited {
-                    retry_after_secs: retry_after.as_secs(),
-                    message: super::sanitized_provider_error(
-                        status.as_u16(),
-                        request_id.as_deref(),
-                        &body,
-                    ),
-                });
-            }
+        self.rate_limiter.observe_headers(response.headers());
+        let status = response.status();
+        let retry_after_header = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let request_id = super::provider_request_id(response.headers());
+        let body = response.text().await.map_err(|error| {
+            ModelError::RequestFailed(super::HttpProviderError::from(error).to_string())
+        })?;
 
-            if !status.is_success() {
-                return Err(ModelError::RequestFailed(super::sanitized_provider_error(
+        if status.as_u16() == 429 {
+            let retry_after = super::parse_retry_after(retry_after_header.as_deref(), &body);
+            return Err(ModelError::RateLimited {
+                retry_after_secs: retry_after.as_secs(),
+                message: super::sanitized_provider_error(
                     status.as_u16(),
                     request_id.as_deref(),
                     &body,
-                )));
-            }
+                ),
+            });
+        }
 
-            let value: Value = serde_json::from_str(&body)?;
-            let text = extract_anthropic_text(&value);
-            let names = ToolNameCodec::for_request(&request);
-            let tool_calls = extract_anthropic_tool_calls(&value)
-                .map_err(|_| {
-                    ModelError::RequestFailed(
-                        "Anthropic response contained a tool-use block with invalid input"
-                            .to_owned(),
-                    )
-                })?
-                .into_iter()
-                .map(|call| ToolCall {
-                    name: ToolName::new(names.decode(call.name.as_str())),
-                    ..call
-                })
-                .collect::<Vec<_>>();
-            if text.is_none() && tool_calls.is_empty() {
-                return Err(ModelError::EmptyResponse);
-            }
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            return Err(ModelError::Auth {
+                message: super::sanitized_provider_error(
+                    status.as_u16(),
+                    request_id.as_deref(),
+                    &body,
+                ),
+            });
+        }
 
-            Ok(ModelResponse {
-                message: text,
-                tool_calls,
-                usage: extract_anthropic_usage(&value),
-                stop: extract_anthropic_stop_reason(&value),
-                reasoning: extract_anthropic_reasoning(&value, model),
+        if !status.is_success() {
+            return Err(ModelError::RequestFailed(super::sanitized_provider_error(
+                status.as_u16(),
+                request_id.as_deref(),
+                &body,
+            )));
+        }
+
+        let value: Value = serde_json::from_str(&body)?;
+        let text = extract_anthropic_text(&value);
+        let names = ToolNameCodec::for_request(&request);
+        let tool_calls = extract_anthropic_tool_calls(&value)
+            .map_err(|_| {
+                ModelError::RequestFailed(
+                    "Anthropic response contained a tool-use block with invalid input".to_owned(),
+                )
+            })?
+            .into_iter()
+            .map(|call| ToolCall {
+                name: ToolName::new(names.decode(call.name.as_str())),
+                ..call
             })
+            .collect::<Vec<_>>();
+        if text.is_none() && tool_calls.is_empty() {
+            return Err(ModelError::EmptyResponse);
+        }
+
+        Ok(ModelResponse {
+            message: text,
+            tool_calls,
+            usage: extract_anthropic_usage(&value),
+            stop: extract_anthropic_stop_reason(&value),
+            reasoning: extract_anthropic_reasoning(&value, model),
+        })
+    }
+}
+
+impl ModelProvider for AnthropicMessagesProvider {
+    /// Sendet einen Modell-Request an diesen Provider und liefert die Antwort.
+    ///
+    /// # Description
+    /// Delegiert an [`Self::respond_once`]. Ist [`Self::credential_pool`]
+    /// gesetzt, wird zuerst dessen bevorzugter, nicht abkühlender Eintrag
+    /// gewählt. Schlägt dieser Versuch mit `credential_pool::should_failover`
+    /// fehl (401/403 oder Kontingent-Erschöpfung) **und** hat der Pool mehr
+    /// als einen Eintrag, wird der verwendete Eintrag bounded (siehe
+    /// `credential_pool::DEFAULT_COOLDOWN`) abgekühlt und derselbe Request
+    /// **genau einmal** mit dem nächsten nicht abkühlenden Eintrag
+    /// wiederholt — nie öfter. Ohne Pool bleibt das Verhalten unverändert:
+    /// ein einziger Versuch mit `self.credential`.
+    fn respond<'a>(&'a self, request: ModelRequest) -> ModelFuture<'a> {
+        Box::pin(async move {
+            let Some(pool) = self.credential_pool.as_ref() else {
+                return self.respond_once(request, None).await;
+            };
+            let primary_idx = pool.select(None);
+            match self.respond_once(request.clone(), primary_idx).await {
+                Ok(response) => Ok(response),
+                Err(error) => {
+                    if pool.len() <= 1 || !crate::credential_pool::should_failover(&error) {
+                        return Err(error);
+                    }
+                    let Some(used_idx) = primary_idx else {
+                        return Err(error);
+                    };
+                    pool.mark_cooldown(used_idx);
+                    tracing::warn!(
+                        provider = %self.provider_id,
+                        credential_label = %pool.entry(used_idx).label,
+                        error = %error,
+                        "credential_pool.entry_cooldown"
+                    );
+                    match pool.select(Some(used_idx)) {
+                        Some(next_idx) => {
+                            tracing::info!(
+                                provider = %self.provider_id,
+                                credential_label = %pool.entry(next_idx).label,
+                                "credential_pool.failover_retry"
+                            );
+                            self.respond_once(request, Some(next_idx)).await
+                        }
+                        None => Err(error),
+                    }
+                }
+            }
         })
     }
 }

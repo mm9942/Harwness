@@ -428,6 +428,7 @@ fn add_provider(
         auth: auth_ref,
         auth_header: None,
         api_key: None,
+        originator: None,
         headers: std::collections::HashMap::new(),
         models,
         enabled: true,

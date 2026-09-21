@@ -43,7 +43,7 @@ use harw_runtime::{
     EntryKind, ModelSource, RuntimeAssembly, RuntimeNarrowing, RuntimeStores, plan_node_sandbox,
     root_sandbox,
 };
-use harw_sandbox::SandboxSpec;
+use harw_authority::SandboxSpec;
 use harw_session_store::JobStore;
 use harw_types::{IngressSurface, PermissionTier, Principal, PrincipalKind, SessionId};
 
@@ -241,7 +241,7 @@ mod tests {
     use super::*;
 
     use harw_config::{HarnessConfig, McpListenerSection, McpPrincipalToml, SecretRef};
-    use harw_sandbox::Permission;
+    use harw_authority::Permission;
 
     fn listener_principal(id: &str) -> McpPrincipalToml {
         McpPrincipalToml {

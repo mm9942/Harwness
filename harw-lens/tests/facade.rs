@@ -12,8 +12,8 @@
 //!    selbst nichts berechnet.
 
 use harw_lens::{
-    ask, build, IndexSelector, LensError, QueryError, QueryProvenance, ReadScope, CHUNKER_VERSION,
-    DEFAULT_VISIBILITY, DOCS_DESIGN_INDEX, OPERATOR_ONLY_VISIBILITY,
+    ask, build, index_status, IndexSelector, LensError, QueryError, QueryProvenance, ReadScope,
+    CHUNKER_VERSION, DEFAULT_VISIBILITY, DOCS_DESIGN_INDEX, OPERATOR_ONLY_VISIBILITY,
 };
 use harw_lens_embed::{DeterministicEmbedder, EmbeddingDescriptor};
 use harw_lens_types::{CollapsePolicy, EdgeIndex, Locality, Metric, SourceRef};
@@ -411,4 +411,48 @@ fn test_ask_rejects_a_query_embedded_with_a_different_chunker_version_than_the_i
     .expect_err("a query embedded against a different chunker version must be rejected");
 
     assert!(matches!(err, LensError::Query(QueryError::Index(_))));
+}
+
+/// [`index_status`] ist die im `crate`-`//!`-Block angekündigte
+/// Introspektionsfunktion: `None` vor jedem `build`, `Some(IndexStatus)`
+/// danach, mit `chunk_count`/`dimension` aus den tatsächlich gespeicherten
+/// Einträgen statt nur dem Manifest.
+#[test]
+fn test_index_status_reflects_build_state_through_the_facade() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let embedder = DeterministicEmbedder::new(16);
+    let descriptor = descriptor();
+
+    let before = index_status(home.path(), DOCS_DESIGN_INDEX, DEFAULT_VISIBILITY)
+        .expect("no error before any build");
+    assert_eq!(before, None);
+
+    let documents = vec![document(
+        "Harwness Fassaden binden zehn Crates unter einem Namen.",
+        "intro.md",
+        DEFAULT_VISIBILITY,
+    )];
+    build(
+        home.path(),
+        DOCS_DESIGN_INDEX,
+        &documents,
+        "test-model",
+        Locality::Local,
+        Metric::Cosine,
+        &embedder,
+        &descriptor,
+    )
+    .expect("build succeeds");
+
+    let after = index_status(home.path(), DOCS_DESIGN_INDEX, DEFAULT_VISIBILITY)
+        .expect("reads")
+        .expect("index exists after build");
+    assert_eq!(after.index_name, DOCS_DESIGN_INDEX);
+    assert_eq!(after.visibility, DEFAULT_VISIBILITY);
+    assert_eq!(after.model, "test-model");
+    assert_eq!(after.locality, Locality::Local);
+    assert_eq!(after.chunker_version, CHUNKER_VERSION);
+    assert_eq!(after.dimension, Some(16));
+    assert_eq!(after.chunk_count, 1);
+    assert!(after.modified.is_some());
 }

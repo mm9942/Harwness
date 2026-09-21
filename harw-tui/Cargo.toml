@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+harw-authority = { path = "../harw-authority" }
 crossterm = "0.29.0"
 harw-agent-dsl = { path = "../harw-agent-dsl" }
 harw-catalog = { path = "../harw-catalog" }
@@ -41,6 +42,10 @@ tracing = "0.1.44"
 serde_json = "1"
 harw-home = { version = "0.3.0", path = "../harw-home" }
 harw-runtime = { path = "../harw-runtime" }
+# `PendingApproval::requested_at`/`timeout_at` (harw-core) sind `jiff::Timestamp`;
+# der Freigabe-/Wiederaufnahme-Treiber (`src/approval.rs`) liest den
+# kernseitigen Ablaufzeitpunkt statt eine eigene Frist zu führen.
+jiff = { workspace = true }
 # Uhrzeit und Datum für die einmalige, kontextbezogene TUI-Begrüßung.
 time = { version = "0.3.53", features = ["formatting"] }
 

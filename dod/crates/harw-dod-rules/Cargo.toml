@@ -12,7 +12,7 @@ rust-version.workspace = true
 harw-dod-signals = { path = "../harw-dod-signals" }
 # `EgressFlow`-Regel: `NetworkScope::allows`/`allows_addr`, statt die
 # Bereichsprüfung ein zweites Mal zu schreiben.
-harw-sandbox = { path = "../../../harw-sandbox" }
+harw-authority = { path = "../../../harw-authority" }
 # `FindingId` (Identität ab `RuleChecked`) und `Confidence` (Zielskala von
 # `epistemic_confidence_for`).
 harw-types = { path = "../../../harw-types" }
@@ -34,10 +34,11 @@ harw-code-graph = { path = "../../../harw-code-graph" }
 # eines Zeichenkettenvergleichs (`1.10.0` < `1.9.0` als String, aber nicht als
 # Version) — siehe `src/advisory.rs` Moduldoku.
 semver = { workspace = true }
+rayon = "1.12.0"
 
 [dev-dependencies]
 # Nur für Tests: baut einen `NetworkScope` mit einem `Cidr`-Ziel über dessen
-# öffentliche `Deserialize`-Implementierung (`harw_sandbox::NetworkScope`
+# öffentliche `Deserialize`-Implementierung (`harw_authority::NetworkScope`
 # bietet keinen anderen öffentlichen Konstruktor für ein `Cidr`-Ziel).
 serde_json = { workspace = true }
 # Nur für Tests/Doctest: `crate::rules::baseline_deviation` konstruiert dort

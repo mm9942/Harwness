@@ -46,4 +46,4 @@ pub use mapping::{
 pub use media::{AttachmentIntake, DownloadedAttachment};
 pub use mirror::TelegramMirrorTransport;
 pub use offset::TelegramOffsetStore;
-pub use render::TelegramRenderer;
+pub use render::{RendererConfig, TelegramRenderer};

@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 harw-types = { path = "../harw-types" }
 harw-sandbox = { path = "../harw-sandbox" }
+harw-authority = { path = "../harw-authority" }
 harw-macros = { path = "../harw-macros" }
 # AW5-07: `context.load` (`context_load.rs`) resolves `DetailMode::References`
 # load keys (`SectionName`/`FragmentLabel`) and enforces the same
@@ -25,6 +26,14 @@ tracing = "0.1.44"
 # AW5-07 tests build `harw_context::FragmentOrigin` values directly, which
 # carry a `jiff::Timestamp`.
 jiff = { workspace = true }
+# Nur für Tests: schaltet `harw_authority::SandboxSpec::from_resolved_for_test`
+# frei, das eine Sandbox mit einem echten, nicht-leeren `NetworkScope` baut —
+# die produktive API von `harw-authority` (bereits oben unter
+# `[dependencies]`) erlaubt das sonst nirgends. Nötig, damit
+# `sandbox_guard`-Tests eine Host-Allow-Liste tatsächlich gegen
+# `require_host_access` prüfen können. Wegen `resolver = "2"` nur im
+# Testbuild aktiv, nie im produktiven Build dieser Crate.
+harw-authority = { path = "../harw-authority", features = ["test-support"] }
 
 [lints]
 workspace = true

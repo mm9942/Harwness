@@ -31,9 +31,17 @@ const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
 /// als 5 Minuten Restlaufzeit").
 const PROACTIVE_REFRESH_WINDOW_SECONDS: i64 = 5 * 60;
 
+/// Harw-eigener Default für den `originator`-Header, wenn
+/// [`harw_config::ProviderToml::originator`] nicht gesetzt (oder leer) ist.
+const DEFAULT_ORIGINATOR: &str = "harw";
+
 /// An endpoint-bound, read-only reference to the Codex login.
 pub(crate) struct CodexRoute {
     path: String,
+    /// Wert des `originator`-Headers für diese Route (siehe
+    /// [`harw_config::ProviderToml::originator`]); `"harw"`, wenn der
+    /// Provider keinen eigenen Wert konfiguriert.
+    originator: String,
 }
 
 impl CodexRoute {
@@ -66,7 +74,28 @@ impl CodexRoute {
                 "Codex login requires openai-responses, the official Codex base URL and bearer authentication without account/auth header overrides".into(),
             ));
         }
-        Ok(Some(Self { path: path.clone() }))
+        // `ProviderToml::validate` (aufgerufen beim Konfigurations-Laden,
+        // siehe `harw-config/src/discovery.rs`) erzwingt bereits nicht-leer/
+        // druckbares-ASCII/max. 64 Zeichen. Der Fallback hier ist reine
+        // Verteidigung in der Tiefe für Aufrufer, die eine `ProviderToml`
+        // ohne vorherige Validierung konstruieren (z. B. Tests).
+        let originator = provider
+            .originator
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(DEFAULT_ORIGINATOR)
+            .to_owned();
+        Ok(Some(Self {
+            path: path.clone(),
+            originator,
+        }))
+    }
+
+    /// Der für diese Route konfigurierte `originator`-Header-Wert (siehe
+    /// [`harw_config::ProviderToml::originator`]).
+    pub(crate) fn originator(&self) -> &str {
+        &self.originator
     }
 
     /// Validiert ohne Netzwerkzugriff, dass die Codex-Login-Datei lesbar und
@@ -78,7 +107,7 @@ impl CodexRoute {
             .map_err(|_| login_error())?;
         let document: Value =
             serde_json::from_str(raw.expose_secret()).map_err(|_| login_error())?;
-        login_headers(&document).map(|_headers| ())
+        login_headers(&document, &self.originator).map(|_headers| ())
     }
 
     /// Baut die Auth-Header für einen Request; erneuert das Access-Token
@@ -98,7 +127,7 @@ impl CodexRoute {
             .map_err(|_| login_error())?;
         let document: Value =
             serde_json::from_str(raw.expose_secret()).map_err(|_| login_error())?;
-        login_headers(&document)
+        login_headers(&document, &self.originator)
     }
 
     /// Erneuert das Codex-/ChatGPT-Token-Set über [`harw_oauth::refresh_codex_tokens`]
@@ -141,7 +170,7 @@ fn login_error() -> ModelError {
     }
 }
 
-fn login_headers(document: &Value) -> Result<HeaderMap, ModelError> {
+fn login_headers(document: &Value, originator: &str) -> Result<HeaderMap, ModelError> {
     let token = document
         .pointer(ACCESS_POINTER)
         .and_then(Value::as_str)
@@ -164,7 +193,18 @@ fn login_headers(document: &Value) -> Result<HeaderMap, ModelError> {
             crate::sensitive_header_value(account)?,
         );
     }
-    headers.insert("originator", HeaderValue::from_static("harw"));
+    // `originator` ist bei OpenAI reine Client-Identifikation; siehe
+    // [`harw_config::ProviderToml::originator`] für die Auftrags-/ToS-Hinweise
+    // zu einem vom harw-Default abweichenden Wert. Nicht sensitiv: kein
+    // Tokenmaterial. Ein trotz `ProviderToml::validate` ungültiger Wert
+    // (z. B. bei Konstruktion ohne vorherige Validierung) fällt fail-safe auf
+    // den harw-Default zurück, statt den Request mit einem Header-Fehler
+    // scheitern zu lassen.
+    headers.insert(
+        "originator",
+        HeaderValue::from_str(originator)
+            .unwrap_or_else(|_| HeaderValue::from_static(DEFAULT_ORIGINATOR)),
+    );
     // PROVISIONAL: weder "OpenAI-Beta" noch "session_id" tauchen im
     // Referenzverzeichnis ../codex/codex-rs (model-provider/src/auth.rs,
     // model-provider/src/models_endpoint.rs, login/src/auth/manager.rs) für
@@ -332,6 +372,7 @@ mod tests {
             origin_allowlist: Default::default(),
             rate_limit: None,
             max_concurrency: None,
+            originator: None,
         }
     }
 
@@ -371,25 +412,80 @@ mod tests {
     fn credentials_are_sensitive_and_missing_login_is_actionable() {
         let headers = login_headers(
             &json!({"tokens":{"access_token":"test-token","account_id":"test-account"}}),
+            DEFAULT_ORIGINATOR,
         )
         .unwrap();
         assert_eq!(headers[AUTHORIZATION], "Bearer test-token");
         assert!(headers[AUTHORIZATION].is_sensitive());
         assert!(headers["chatgpt-account-id"].is_sensitive());
-        let error = login_headers(&json!({"tokens":{"access_token":" "}})).unwrap_err();
+        let error =
+            login_headers(&json!({"tokens":{"access_token":" "}}), DEFAULT_ORIGINATOR)
+                .unwrap_err();
         assert!(error.to_string().contains("codex login"));
     }
 
     #[test]
     fn login_headers_include_provisional_openai_beta_and_session_id() {
-        let headers =
-            login_headers(&json!({"tokens":{"access_token":"test-token"}})).unwrap();
+        let headers = login_headers(
+            &json!({"tokens":{"access_token":"test-token"}}),
+            DEFAULT_ORIGINATOR,
+        )
+        .unwrap();
         assert!(headers.contains_key("OpenAI-Beta"));
         assert!(headers.contains_key("session_id"));
         // Provisorische Header, siehe WHY-Kommentar in `login_headers`: kein
         // Tokenmaterial, daher bewusst nicht sensitiv markiert.
         assert!(!headers["OpenAI-Beta"].is_sensitive());
         assert!(!headers["session_id"].is_sensitive());
+    }
+
+    #[test]
+    fn login_headers_default_originator_is_harw() {
+        let headers =
+            login_headers(&json!({"tokens":{"access_token":"t"}}), DEFAULT_ORIGINATOR).unwrap();
+        assert_eq!(headers["originator"], "harw");
+        assert!(!headers["originator"].is_sensitive());
+    }
+
+    #[test]
+    fn login_headers_uses_configured_originator() {
+        let headers =
+            login_headers(&json!({"tokens":{"access_token":"t"}}), "codex_cli_rs").unwrap();
+        assert_eq!(headers["originator"], "codex_cli_rs");
+    }
+
+    #[test]
+    fn login_headers_falls_back_to_default_on_invalid_header_value() {
+        // Steuerzeichen sind kein gültiger HeaderValue-Inhalt; `ProviderToml::validate`
+        // verhindert das beim Konfigurations-Laden, `login_headers` bleibt trotzdem
+        // fail-safe für Aufrufer ohne vorherige Validierung.
+        let headers =
+            login_headers(&json!({"tokens":{"access_token":"t"}}), "bad\nvalue").unwrap();
+        assert_eq!(headers["originator"], DEFAULT_ORIGINATOR);
+    }
+
+    #[test]
+    fn from_provider_defaults_originator_to_harw_when_unset() {
+        let route = CodexRoute::from_provider(&provider(BASE_URL, ACCESS_POINTER))
+            .unwrap()
+            .unwrap();
+        assert_eq!(route.originator(), DEFAULT_ORIGINATOR);
+    }
+
+    #[test]
+    fn from_provider_uses_configured_originator_when_set() {
+        let mut config = provider(BASE_URL, ACCESS_POINTER);
+        config.originator = Some("codex_cli_rs".to_owned());
+        let route = CodexRoute::from_provider(&config).unwrap().unwrap();
+        assert_eq!(route.originator(), "codex_cli_rs");
+    }
+
+    #[test]
+    fn from_provider_defaults_originator_when_blank() {
+        let mut config = provider(BASE_URL, ACCESS_POINTER);
+        config.originator = Some("   ".to_owned());
+        let route = CodexRoute::from_provider(&config).unwrap().unwrap();
+        assert_eq!(route.originator(), DEFAULT_ORIGINATOR);
     }
 
     #[test]
@@ -426,6 +522,7 @@ mod tests {
 
         let route = CodexRoute {
             path: auth_path.to_string_lossy().into_owned(),
+            originator: DEFAULT_ORIGINATOR.to_owned(),
         };
         // Ohne HOME-Bindung an die Allowlist liest `read_external_cli_credential`
         // nichts; direkt aus der Datei prüfen genügt für diesen Unit-Test.

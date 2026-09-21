@@ -233,13 +233,23 @@ pub(crate) fn local_principal(surface: IngressSurface) -> Principal {
 ///
 /// # Beschreibung
 /// Dünner Wrapper um
-/// `crate::secret_store::open_configured_secret_resolver`, der das
-/// konkrete `ConfiguredSecretResolver` auf dasselbe Trait-Objekt castet wie
+/// `crate::secret_store::open_configured_secret_resolver_for_active_provider`,
+/// der das konkrete `ConfiguredSecretResolver` auf dasselbe Trait-Objekt
+/// castet wie
 /// `harw-cli/src/gateway.rs::open_gateway_secret_resolver`
 /// (`Arc::new(resolver) as Arc<dyn harw_provider_http::SecretResolver + Send + Sync>`),
 /// damit lokale Einstiege (TUI, One-Shot, Doctor) denselben Vertrag
 /// nutzen können, ohne den Gateway-spezifischen Fehlerpräfix `"gateway: "`
 /// zu erben.
+///
+/// Anders als der Gateway-Pfad wertet dieser Wrapper die KEK-Pflicht
+/// **verzögert** aus — nur für `config.harness.default_provider`, den
+/// Provider, den `ModelSource::Configured` für diesen Lauf tatsächlich
+/// verwendet (`crate::model::build_root_model_with_resolver`). Ein anderer,
+/// aktivierter Provider mit `secrets:`-Referenz, den dieser Lauf nie
+/// anspricht, verlangt dadurch kein KEK mehr — dieselbe Nicht-Fatal-Haltung
+/// wie hängende Katalog-Referenzen
+/// (`harw_config::ResolvedConfig::compute_diagnostics`).
 ///
 /// # Argumente
 /// - `home` (`&Path`): aufgelöster Root-Space (`~/.harw` bzw. `HARW_HOME`).
@@ -247,19 +257,22 @@ pub(crate) fn local_principal(surface: IngressSurface) -> Principal {
 ///   Laufs (z. B. aus `harw_runtime::load_config`).
 ///
 /// # Rückgabe
-/// `Some(resolver)`, wenn ein aktivierter Provider eine `secrets:`-Referenz
-/// nutzt und der versiegelte Speicher geöffnet werden konnte; `None`, wenn
-/// kein aktivierter Provider `secrets:` nutzt.
+/// `Some(resolver)`, wenn der tatsächlich verwendete Provider
+/// (`default_provider`) eine `secrets:`-Referenz nutzt und der versiegelte
+/// Speicher geöffnet werden konnte; `None` sonst — auch dann, wenn ein
+/// *anderer*, von diesem Lauf nicht verwendeter Provider `secrets:` nutzen
+/// würde.
 ///
 /// # Fehler
 /// `Err(String)` ohne Geheimnisinhalt — fehlendes KEK, nicht ladbares
 /// KEK-Material oder ein nicht zu öffnender versiegelter Speicher (siehe
-/// `crate::secret_store::open_configured_secret_resolver`).
+/// `crate::secret_store::open_configured_secret_resolver_for_active_provider`).
 pub(crate) fn configured_secret_resolver(
     home: &Path,
     config: &ResolvedConfig,
 ) -> Result<Option<Arc<dyn harw_provider_http::SecretResolver + Send + Sync>>, String> {
-    let resolver = crate::secret_store::open_configured_secret_resolver(home, config)?;
+    let resolver =
+        crate::secret_store::open_configured_secret_resolver_for_active_provider(home, config)?;
     Ok(resolver.map(|resolver| {
         Arc::new(resolver) as Arc<dyn harw_provider_http::SecretResolver + Send + Sync>
     }))
@@ -413,6 +426,36 @@ mod tests {
 
         let resolver = configured_secret_resolver(home.path(), &config)
             .expect("no sealed provider must not require a KEK");
+
+        assert!(resolver.is_none());
+    }
+
+    /// F-046-Regression: ein *anderer*, von diesem Lauf nicht als
+    /// `default_provider` gewählter Provider mit `secrets:`-Referenz darf
+    /// kein KEK verlangen — sonst würde ein unbenutzter, versiegelter
+    /// Provider jeden lokalen Einstieg blockieren.
+    #[test]
+    fn test_configured_secret_resolver_ignores_an_unused_sealed_provider_without_a_kek() {
+        let mut config = ResolvedConfig::default();
+        config.providers.insert(
+            "sealed".to_owned(),
+            toml::from_str::<harw_config::ProviderToml>(
+                "name = \"sealed\"\napi = \"openai-compatible\"\nbase_url = \"https://example.test\"\nauth = \"secrets:provider-token\"\n",
+            )
+            .expect("valid test provider"),
+        );
+        config.providers.insert(
+            "plain".to_owned(),
+            toml::from_str::<harw_config::ProviderToml>(
+                "name = \"plain\"\napi = \"openai-compatible\"\nbase_url = \"https://example.test\"\nauth = \"env:PLAIN_TOKEN\"\n",
+            )
+            .expect("valid test provider"),
+        );
+        config.harness.default_provider = Some("plain".to_owned());
+        let home = TempDir::new().expect("home tempdir");
+
+        let resolver = configured_secret_resolver(home.path(), &config)
+            .expect("an unused sealed provider must not require a KEK");
 
         assert!(resolver.is_none());
     }

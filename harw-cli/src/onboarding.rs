@@ -220,6 +220,7 @@ Weiteres das Hauptmodell; änderbar mit `harw models internal`."
         origin_allowlist: harw_config::OriginAllowlistToml::default(),
         rate_limit: None,
         max_concurrency: None,
+        originator: None,
     };
     let providers_dir = profile.join("providers");
     create_dir_all(&providers_dir)?;
@@ -234,6 +235,15 @@ Weiteres das Hauptmodell; änderbar mit `harw models internal`."
 /// Persistiert das Ergebnis des ratatui-Setup-Pickers: schreibt Provider- und
 /// Modell-TOML, ergänzt den `credential_pool` in `auth.toml` und setzt
 /// `default_provider`/`default_model` + `onboarding.seen` im Profil.
+///
+/// Neben dem gewählten Modell wird — sofern der Katalog-Eintrag des Providers
+/// keine Platzhalter-`base_url` hat (siehe [`is_placeholder_base_url`]) — die
+/// gesamte Katalog-Modell-Liste ([`harw_model_catalog::embedded_catalog`])
+/// als `providers/<id>.toml`-`models`-Eintrag und je eine
+/// `models/<modell-id>.toml`-Datei angelegt, damit der `/model`-Picker nach
+/// dem Onboarding die volle Auswahl zeigt. Bereits vorhandene
+/// `models/<id>.toml`-Dateien werden dabei nicht überschrieben. Das gewählte
+/// Modell bleibt in jedem Fall `default_model`.
 ///
 /// # Errors
 /// Ein `String` bei Schreib-, Serialisierungs- oder Validierungsfehlern.
@@ -321,6 +331,13 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
     } else {
         outcome.model.clone()
     };
+    // Die volle Katalog-Modell-Liste dieses Providers ergänzen (nicht nur das
+    // gewählte Modell), damit der `/model`-Picker nach dem Onboarding alle
+    // Modelle anbietet. Das gewählte Modell bleibt `default_model`.
+    let mut models_list = catalog_models_for_provider(&outcome.provider_id);
+    if !models_list.iter().any(|id| id == &model_id) {
+        models_list.push(model_id.clone());
+    }
     let provider = ProviderToml {
         name: outcome.provider_id.clone(),
         api: outcome.api.clone(),
@@ -329,11 +346,12 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
         auth_header: outcome.auth_header.clone(),
         api_key: None,
         headers: std::collections::HashMap::new(),
-        models: vec![model_id.clone()],
+        models: models_list.clone(),
         enabled: true,
         origin_allowlist: harw_config::OriginAllowlistToml::default(),
         rate_limit: None,
         max_concurrency: None,
+        originator: None,
     };
     let providers_dir = profile.join("providers");
     create_dir_all(&providers_dir)?;
@@ -362,6 +380,34 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
         &models_dir.join(model_filename(&model_id)),
         &toml::to_string_pretty(&model).map_err(|e| format!("modell serialisieren: {e}"))?,
     )?;
+
+    // Restliche Katalog-Modelle dieses Providers als Modell-Dateien anlegen,
+    // damit sie im `/model`-Picker erscheinen. Eine bereits vorhandene Datei
+    // (z. B. durch `harw models scan` angereichert) wird nicht überschrieben —
+    // "Never delete anything" gilt auch für schon vorhandene Anreicherungen.
+    for extra_id in models_list.iter().filter(|id| id.as_str() != model_id.as_str()) {
+        let extra_path = models_dir.join(model_filename(extra_id));
+        if extra_path.exists() {
+            continue;
+        }
+        let extra_model = ModelToml {
+            id: extra_id.clone(),
+            name: None,
+            provider: outcome.provider_id.clone(),
+            aliases: Vec::new(),
+            context_window: None,
+            max_tokens: None,
+            reasoning: false,
+            input_types: Vec::new(),
+            capabilities: harw_config::ModelCapabilitiesToml::default(),
+            prompt_caching: None,
+        };
+        write_file(
+            &extra_path,
+            &toml::to_string_pretty(&extra_model)
+                .map_err(|e| format!("modell serialisieren: {e}"))?,
+        )?;
+    }
 
     // Credential-Pool-Eintrag (nur wenn eine Referenz vorliegt).
     if let Some(secret) = &auth_ref {
@@ -427,6 +473,46 @@ fn model_filename(id: &str) -> String {
     }
     name.push_str(".toml");
     name
+}
+
+/// Liefert die vollständige Katalog-Modell-Liste des Providers `provider_id`
+/// aus [`harw_model_catalog::embedded_catalog`], sofern dessen `base_url`
+/// keine Platzhalter-URL ist. Andernfalls (Provider nicht im Katalog, oder
+/// dessen Eintrag ist ein Platzhalter-Template wie Azure Foundry oder ein
+/// generischer Worker) wird eine leere Liste zurückgegeben, und der Aufrufer
+/// fällt auf das einzeln gewählte Modell zurück.
+///
+/// # Description
+/// Wird von [`persist_outcome`] genutzt, damit nach dem Onboarding nicht nur
+/// das gewählte Modell, sondern die gesamte Modell-Liste des Providers als
+/// `models`-Einträge und `models/<id>.toml`-Dateien vorliegt — der
+/// `/model`-Picker zeigt sonst nur einen einzigen Eintrag.
+///
+/// # Arguments
+/// - `provider_id` (`&str`): Katalog-Id des Providers (z. B. `"anthropic"`).
+///
+/// # Returns
+/// `Vec<String>` mit den Modell-Ids aus dem Katalog-Eintrag, oder leer.
+fn catalog_models_for_provider(provider_id: &str) -> Vec<String> {
+    harw_model_catalog::embedded_catalog()
+        .into_iter()
+        .find(|spec| spec.id == provider_id)
+        .filter(|spec| !is_placeholder_base_url(&spec.base_url))
+        .map(|spec| spec.models)
+        .unwrap_or_default()
+}
+
+/// `true`, wenn `base_url` ein Platzhalter-Template ist (kein echter,
+/// direkt nutzbarer Endpunkt), erkannt an `<...>`-Platzhaltern, dem
+/// Beispiel-Domain-Segment `.example/` oder der reservierten Testdomain
+/// `example.invalid`.
+///
+/// Solche Katalog-Einträge (z. B. Azure AI Foundry mit `<resource>` oder ein
+/// generischer Cloudflare-Worker-Eintrag) beschreiben kein konkret
+/// erreichbares Modell-Set und werden deshalb nicht automatisch mit einer
+/// vollständigen Modell-Liste vorbelegt.
+fn is_placeholder_base_url(base_url: &str) -> bool {
+    base_url.contains('<') || base_url.contains(".example/") || base_url.contains("example.invalid")
 }
 
 /// `true`, wenn `value` bereits eine Secret-Referenz ist (kein roher Wert).
@@ -768,10 +854,22 @@ mod tests {
             Some(outcome.model.as_str())
         );
         assert!(config.models.contains_key(&outcome.model));
-        assert_eq!(
-            config.providers["cloudflare"].models,
-            std::slice::from_ref(&outcome.model)
-        );
+        // Die gesamte Katalog-Modell-Liste von "cloudflare" wird mitgeschrieben
+        // (nicht nur das gewählte Modell) — der `/model`-Picker soll die volle
+        // Auswahl anbieten. Das gewählte Modell bleibt Teil der Liste.
+        let mut got_models = config.providers["cloudflare"].models.clone();
+        got_models.sort();
+        got_models.dedup();
+        let mut want_models = harw_model_catalog::embedded_catalog()
+            .into_iter()
+            .find(|spec| spec.id == "cloudflare")
+            .map(|spec| spec.models)
+            .unwrap_or_default();
+        want_models.sort();
+        assert_eq!(got_models, want_models);
+        assert!(config.providers["cloudflare"]
+            .models
+            .contains(&outcome.model));
         let auth = load_auth(&harw_home::auth_path(home.path())).unwrap();
         assert_eq!(auth.credential_pool["cloudflare"].len(), 1);
         assert_ne!(model_filename("a/b"), model_filename("a%2Fb"));
@@ -924,6 +1022,157 @@ mod tests {
                 .expect("replacement metadata")
                 .file_type()
                 .is_symlink()
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── Task: volle Katalog-Modell-Liste nach Onboarding ─────────────────────
+
+    /// Onboarding von `anthropic` muss die gesamte Katalog-Modell-Liste in
+    /// `providers/anthropic.toml` schreiben (nicht nur das gewählte Modell),
+    /// dafür je eine `models/<id>.toml` anlegen, und das gewählte Modell bleibt
+    /// `default_model`.
+    #[test]
+    fn persist_outcome_populates_full_catalog_model_list_for_anthropic() {
+        let home = std::env::temp_dir().join(format!(
+            "harw-onboarding-test-{}-anthropic-full-catalog",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        harw_home::ensure_home(&home).expect("ensure_home");
+
+        let outcome = harw_tui::SetupOutcome {
+            provider_id: "anthropic".into(),
+            base_url: "https://api.anthropic.com/v1".into(),
+            api: "anthropic-messages".into(),
+            model: "claude-opus-4-8".into(),
+            secret_ref: Some("env:ANTHROPIC_API_KEY".into()),
+            auth_header: None,
+        };
+        persist_outcome(&home, &outcome).expect("persist_outcome");
+
+        let profile_name = harw_home::active_profile_name(&home);
+        let profile = harw_home::profile_dir(&home, &profile_name).expect("profile_dir");
+
+        let expected_models = harw_model_catalog::embedded_catalog()
+            .into_iter()
+            .find(|spec| spec.id == "anthropic")
+            .map(|spec| spec.models)
+            .unwrap_or_default();
+        assert!(
+            !expected_models.is_empty(),
+            "test fixture assumption: anthropic catalog entry has models"
+        );
+
+        let layers = harw_home::config_layers(&home).expect("config_layers");
+        let config = harw_config::discover_config(&layers).expect("discover_config");
+        let mut got_models = config.providers["anthropic"].models.clone();
+        got_models.sort();
+        let mut want_models = expected_models.clone();
+        want_models.sort();
+        assert_eq!(
+            got_models, want_models,
+            "provider.models must contain the full catalog model list"
+        );
+        assert_eq!(
+            config.harness.default_model.as_deref(),
+            Some("claude-opus-4-8"),
+            "default_model must stay the chosen model"
+        );
+
+        for id in &expected_models {
+            assert!(
+                profile.join("models").join(model_filename(id)).exists(),
+                "missing model file for catalog model {id}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Katalog-Einträge mit Platzhalter-`base_url` (hier `cf-worker`,
+    /// `https://<dein-worker>.example/v1`) dürfen die Modell-Liste nicht
+    /// automatisch aufblähen — nur das im Setup gewählte Modell landet in
+    /// `providers/<id>.toml`.
+    #[test]
+    fn persist_outcome_skips_catalog_expansion_for_placeholder_base_url_provider() {
+        let home = std::env::temp_dir().join(format!(
+            "harw-onboarding-test-{}-cfworker-placeholder",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        harw_home::ensure_home(&home).expect("ensure_home");
+
+        // Der Katalog-Eintrag "cf-worker" hat absichtlich einen nicht-leeren
+        // `models`-Array *und* eine Platzhalter-`base_url` — genau der Fall, den
+        // die Skip-Regel abdecken muss.
+        let catalog_models = harw_model_catalog::embedded_catalog()
+            .into_iter()
+            .find(|spec| spec.id == "cf-worker")
+            .map(|spec| spec.models)
+            .unwrap_or_default();
+        assert!(
+            catalog_models.len() > 1,
+            "test fixture assumption: cf-worker catalog entry has multiple models"
+        );
+
+        let outcome = harw_tui::SetupOutcome {
+            provider_id: "cf-worker".into(),
+            base_url: "https://my-worker.workers.test/v1".into(),
+            api: "openai-chat".into(),
+            model: "@cf/moonshotai/kimi-k2.7-code".into(),
+            secret_ref: Some("env:CF_WORKER_TOKEN".into()),
+            auth_header: None,
+        };
+        persist_outcome(&home, &outcome).expect("persist_outcome");
+
+        let layers = harw_home::config_layers(&home).expect("config_layers");
+        let config = harw_config::discover_config(&layers).expect("discover_config");
+        assert_eq!(
+            config.providers["cf-worker"].models,
+            vec![outcome.model.clone()],
+            "placeholder catalog entries must not auto-expand the model list"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Ein bereits vorhandenes `models/<id>.toml` (z. B. durch `harw models
+    /// scan` angereichert) darf beim Auffüllen der Katalog-Modell-Liste nicht
+    /// überschrieben werden.
+    #[test]
+    fn persist_outcome_does_not_overwrite_existing_catalog_model_file() {
+        let home = std::env::temp_dir().join(format!(
+            "harw-onboarding-test-{}-anthropic-preserve",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        harw_home::ensure_home(&home).expect("ensure_home");
+
+        let profile_name = harw_home::active_profile_name(&home);
+        let profile = harw_home::profile_dir(&home, &profile_name).expect("profile_dir");
+        let models_dir = profile.join("models");
+        std::fs::create_dir_all(&models_dir).expect("create models dir");
+        let preseeded_path = models_dir.join(model_filename("claude-sonnet-5"));
+        let preseeded_marker =
+            "id = \"claude-sonnet-5\"\nprovider = \"anthropic\"\nname = \"Enriched by harw models scan\"\n";
+        std::fs::write(&preseeded_path, preseeded_marker).expect("preseed model file");
+
+        let outcome = harw_tui::SetupOutcome {
+            provider_id: "anthropic".into(),
+            base_url: "https://api.anthropic.com/v1".into(),
+            api: "anthropic-messages".into(),
+            model: "claude-opus-4-8".into(),
+            secret_ref: Some("env:ANTHROPIC_API_KEY".into()),
+            auth_header: None,
+        };
+        persist_outcome(&home, &outcome).expect("persist_outcome");
+
+        let after = std::fs::read_to_string(&preseeded_path).expect("read preseeded model file");
+        assert_eq!(
+            after, preseeded_marker,
+            "pre-existing model file must not be overwritten"
         );
 
         let _ = std::fs::remove_dir_all(&home);

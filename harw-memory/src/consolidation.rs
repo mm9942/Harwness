@@ -11,6 +11,12 @@
 //!   einen [`FactStore`] aus (`write`/`delete`, danach `write_index`).
 //! - [`ConsolidationLock`] erzwingt „eine Konsolidierung je Wurzel" (§5.3)
 //!   über eine exklusiv angelegte Lock-Datei mit Verfall nach 30 Minuten.
+//! - [`ConsolidationBaseline`] hält einen Content-Digest je Fakt
+//!   (`state.json` unterhalb der Fakt-Wurzel) und liefert per
+//!   [`ConsolidationBaseline::diff`] die seit dem letzten Lauf geänderten
+//!   Fakt-Namen — **kein** Git-Aufruf (§5.3 nennt „den Diff seit der letzten
+//!   Baseline" als Steward-Eingabe; dieses Modul bildet das über einen
+//!   eigenen Digest ab statt über `git diff`, siehe [`fact_digest`]).
 //! - [`steward_prompt`] baut nur den *Text* des Agentenauftrags nach §5.3 —
 //!   dieses Modul ruft den `memory-steward`-Agenten nicht selbst auf.
 //!
@@ -38,11 +44,12 @@
 //! übrigen Fehler von [`FactStore::write`]/[`FactStore::delete`]/
 //! [`FactStore::write_index`] werden durchgereicht.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -381,11 +388,18 @@ pub fn apply_plan(store: &FactStore, plan: &ConsolidationPlan) -> MemoryResult<C
 /// der aktuelle Inhalt von `MEMORY.md`, `incoming` die Kandidaten aus
 /// `facts/_incoming/`, `affected` die davon betroffenen bestehenden Fakten
 /// (typischerweise die Merge-/Konflikt-Ziele aus einem vorherigen
-/// [`plan_consolidation`]-Lauf). Der Text verlangt ausdrücklich: Duplikate
-/// verschmelzen statt anhäufen, Widersprüche auflösen, veraltete Fakten im
-/// Vertrauen senken oder löschen, `MEMORY.md` neu schreiben.
+/// [`plan_consolidation`]-Lauf), `changed_since_baseline` die Fakt-Namen aus
+/// [`ConsolidationBaseline::diff`] (§5.3: „den Diff seit der letzten
+/// Baseline"). Der Text verlangt ausdrücklich: Duplikate verschmelzen statt
+/// anhäufen, Widersprüche auflösen, veraltete Fakten im Vertrauen senken oder
+/// löschen, `MEMORY.md` neu schreiben.
 #[must_use]
-pub fn steward_prompt(index: &str, incoming: &[Fact], affected: &[Fact]) -> String {
+pub fn steward_prompt(
+    index: &str,
+    incoming: &[Fact],
+    affected: &[Fact],
+    changed_since_baseline: &[String],
+) -> String {
     let mut out = String::new();
     out.push_str("# Auftrag: Gedächtnis-Konsolidierung (memory-steward)\n\n");
     out.push_str(
@@ -425,7 +439,7 @@ pub fn steward_prompt(index: &str, incoming: &[Fact], affected: &[Fact]) -> Stri
 
     out.push_str("## Betroffene bestehende Fakten\n\n");
     if affected.is_empty() {
-        out.push_str("(keine)\n");
+        out.push_str("(keine)\n\n");
     } else {
         for fact in affected {
             out.push_str(&format!(
@@ -436,8 +450,173 @@ pub fn steward_prompt(index: &str, incoming: &[Fact], affected: &[Fact]) -> Stri
                 fact.description
             ));
         }
+        out.push('\n');
+    }
+
+    out.push_str("## Diff seit letzter Baseline\n\n");
+    if changed_since_baseline.is_empty() {
+        out.push_str("(keine Änderungen seit der letzten Baseline)\n");
+    } else {
+        for name in changed_since_baseline {
+            out.push_str(&format!("- `{name}`\n"));
+        }
     }
     out
+}
+
+// ---------------------------------------------------------------------
+// ConsolidationBaseline — Diff seit der letzten Konsolidierung
+// ---------------------------------------------------------------------
+
+/// Name der Baseline-Manifest-Datei unterhalb einer Fakt-Wurzel.
+///
+/// Bewusst `state.json` (statt z. B. `baseline.json`): der Aufrufer soll
+/// genau eine Zustandsdatei je Fakt-Wurzel pflegen müssen, keine zwei.
+const BASELINE_FILE_NAME: &str = "state.json";
+
+/// Content-Digest-Manifest der Fakt-Wurzel zum Zeitpunkt der letzten
+/// Konsolidierung (§5.3: „den Diff seit der letzten Baseline").
+///
+/// # Beschreibung
+/// Ersetzt eine git-basierte Baseline durch ein reines Digest-Manifest:
+/// [`Self::from_facts`] baut eine Baseline aus dem aktuellen Fakten-Bestand,
+/// [`Self::read`]/[`Self::write`] persistieren sie unter
+/// `<root>/state.json`, [`Self::diff`] liefert die Namen aller Fakten, deren
+/// Digest von der Baseline abweicht (neu oder geändert). Kein `git`-Aufruf,
+/// keine externe Hash-Crate — `harw-memory` hat keine, siehe [`fact_digest`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct ConsolidationBaseline {
+    /// Fakt-Name → Content-Digest (siehe [`fact_digest`]), sortiert für
+    /// stabile Serialisierung.
+    #[serde(default)]
+    pub digests: BTreeMap<String, String>,
+}
+
+impl ConsolidationBaseline {
+    /// Baut eine Baseline aus dem aktuellen Zustand von `facts`.
+    #[must_use]
+    pub fn from_facts(facts: &[Fact]) -> Self {
+        Self {
+            digests: facts.iter().map(|f| (f.name.clone(), fact_digest(f))).collect(),
+        }
+    }
+
+    /// Liest die Baseline unterhalb `root` (`<root>/state.json`).
+    ///
+    /// Fehlt die Datei, liefert dies eine leere Baseline (erster Lauf) statt
+    /// eines Fehlers — [`Self::diff`] meldet dann jeden bestehenden Fakt als
+    /// „geändert", was für den allerersten Konsolidierungslauf korrekt ist.
+    ///
+    /// # Errors
+    /// [`MemoryError::Io`] bei sonstigen Lesefehlern; [`MemoryError::Serde`]
+    /// bei fehlerhaftem JSON.
+    pub fn read(root: impl AsRef<Path>) -> MemoryResult<Self> {
+        let path = root.as_ref().join(BASELINE_FILE_NAME);
+        match fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| MemoryError::Serde {
+                context: "consolidation baseline lesen",
+                source: e,
+            }),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(MemoryError::Io { path, source: e }),
+        }
+    }
+
+    /// Schreibt die Baseline atomar unterhalb `root` (`<root>/state.json`,
+    /// Tempdatei + `rename`).
+    ///
+    /// # Errors
+    /// [`MemoryError::Io`] bei Schreib-/Rename-Fehlern.
+    pub fn write(&self, root: impl AsRef<Path>) -> MemoryResult<()> {
+        let path = root.as_ref().join(BASELINE_FILE_NAME);
+        let payload = serde_json::to_vec_pretty(self).map_err(|e| MemoryError::Serde {
+            context: "consolidation baseline schreiben",
+            source: e,
+        })?;
+        harw_fsutil::write_atomic(&path, &payload, harw_fsutil::AtomicWriteOptions::with_mode(0o600))
+            .map_err(|e| MemoryError::Io { path, source: e })
+    }
+
+    /// Liefert die Namen aller Fakten in `current`, deren Digest von dieser
+    /// Baseline abweicht oder die neu hinzugekommen sind — sortiert für
+    /// deterministische Ausgabe.
+    ///
+    /// Gelöschte Fakten (in der Baseline, aber nicht mehr in `current`)
+    /// werden hier bewusst nicht gemeldet: ein gelöschter Fakt braucht keine
+    /// Steward-Aufmerksamkeit mehr, er ist bereits fort.
+    #[must_use]
+    pub fn diff(&self, current: &[Fact]) -> Vec<String> {
+        let mut changed: Vec<String> = current
+            .iter()
+            .filter(|fact| {
+                self.digests
+                    .get(&fact.name)
+                    .is_none_or(|digest| *digest != fact_digest(fact))
+            })
+            .map(|fact| fact.name.clone())
+            .collect();
+        changed.sort();
+        changed
+    }
+}
+
+/// Deterministischer Content-Digest eines Fakts (FNV-1a, 64-bit) über alle
+/// inhaltsrelevanten Felder (`description`, `body`, `fact_type`,
+/// `confidence`, `sources`, `tags` — nicht `created`/`updated`, damit ein
+/// reiner Zeitstempel-Touch keinen Digest-Wechsel auslöst).
+///
+/// Kein `git`-Aufruf, keine externe Hash-Crate (`harw-memory` hat keine
+/// `sha2`/`blake3`-Abhängigkeit) — für reine Änderungserkennung reicht ein
+/// nicht-kryptographischer Digest.
+#[must_use]
+pub fn fact_digest(fact: &Fact) -> String {
+    let mut hasher = Fnv1a64::new();
+    hasher.write(fact.description.as_bytes());
+    hasher.write(b"\x1f");
+    hasher.write(fact.body.as_bytes());
+    hasher.write(b"\x1f");
+    hasher.write(fact.fact_type.as_str().as_bytes());
+    hasher.write(b"\x1f");
+    hasher.write(&fact.confidence.to_bits().to_le_bytes());
+    hasher.write(b"\x1f");
+    for source in &fact.sources {
+        hasher.write(source.as_bytes());
+        hasher.write(b",");
+    }
+    hasher.write(b"\x1f");
+    for tag in &fact.tags {
+        hasher.write(tag.as_bytes());
+        hasher.write(b",");
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+/// Minimaler FNV-1a-64-Hasher für [`fact_digest`]. Kein
+/// `std::hash::Hasher`-Trait nötig — dieses Modul braucht nur
+/// `write(bytes)`/`finish() -> u64`, keine Interoperabilität mit
+/// `HashMap`/`Hash`.
+struct Fnv1a64(u64);
+
+impl Fnv1a64 {
+    /// FNV-1a-64-Offset-Basis.
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    /// FNV-1a-64-Prime.
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    fn new() -> Self {
+        Self(Self::OFFSET_BASIS)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(Self::PRIME);
+        }
+    }
+
+    const fn finish(&self) -> u64 {
+        self.0
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -771,12 +950,87 @@ mod tests {
     fn steward_prompt_mentions_candidates_and_instructions() {
         let incoming = vec![fact("cand-1", "Neuer Kandidat", "Text\n")];
         let affected = vec![fact("aff-1", "Betroffener Fakt", "Text\n")];
-        let prompt = steward_prompt("# Gedaechtnis\n", &incoming, &affected);
+        let changed = vec!["geaenderter-fakt".to_owned()];
+        let prompt = steward_prompt("# Gedaechtnis\n", &incoming, &affected, &changed);
 
         assert!(prompt.contains("zusammenführen statt anhäufen"));
         assert!(prompt.contains("cand-1"));
         assert!(prompt.contains("aff-1"));
+        assert!(prompt.contains("geaenderter-fakt"));
         assert!(prompt.contains("MEMORY.md"));
+    }
+
+    #[test]
+    fn steward_prompt_reports_no_changes_since_baseline() {
+        let prompt = steward_prompt("# Gedaechtnis\n", &[], &[], &[]);
+        assert!(prompt.contains("keine Änderungen seit der letzten Baseline"));
+    }
+
+    // -- ConsolidationBaseline / fact_digest -------------------------------
+
+    #[test]
+    fn fact_digest_is_stable_for_identical_content() {
+        let a = fact("stable", "Beschreibung", "Text\n");
+        let b = fact("stable", "Beschreibung", "Text\n");
+        assert_eq!(fact_digest(&a), fact_digest(&b));
+    }
+
+    #[test]
+    fn fact_digest_changes_when_body_changes() {
+        let a = fact("changed", "Beschreibung", "Text A\n");
+        let b = fact("changed", "Beschreibung", "Text B\n");
+        assert_ne!(fact_digest(&a), fact_digest(&b));
+    }
+
+    #[test]
+    fn fact_digest_ignores_created_and_updated_timestamps() {
+        let mut a = fact("touch-only", "Beschreibung", "Text\n");
+        let mut b = a.clone();
+        b.updated += Duration::days(5);
+        b.created -= Duration::days(5);
+        assert_eq!(fact_digest(&a), fact_digest(&b), "reines Zeitstempel-Touch darf den Digest nicht ändern");
+        a.body.push_str("geaendert");
+        assert_ne!(fact_digest(&a), fact_digest(&b));
+    }
+
+    #[test]
+    fn baseline_diff_reports_new_and_changed_facts_only() {
+        let unchanged = fact("unchanged", "Beschreibung", "Text\n");
+        let changed_old = fact("changed", "alte Beschreibung", "alter Text\n");
+        let baseline = ConsolidationBaseline::from_facts(&[unchanged.clone(), changed_old]);
+
+        let changed_new = fact("changed", "neue Beschreibung", "neuer Text\n");
+        let brand_new = fact("brand-new", "Frisch", "Frischer Text\n");
+        let current = vec![unchanged, changed_new, brand_new];
+
+        let diff = baseline.diff(&current);
+        assert_eq!(diff, vec!["brand-new".to_owned(), "changed".to_owned()]);
+    }
+
+    #[test]
+    fn baseline_diff_against_empty_baseline_reports_every_fact() {
+        let baseline = ConsolidationBaseline::default();
+        let current = vec![fact("only", "Beschreibung", "Text\n")];
+        assert_eq!(baseline.diff(&current), vec!["only".to_owned()]);
+    }
+
+    #[test]
+    fn baseline_read_write_round_trips() {
+        let root = tmp_root("baseline-roundtrip");
+        fs::create_dir_all(&root).unwrap();
+
+        let empty = ConsolidationBaseline::read(&root).unwrap();
+        assert!(empty.digests.is_empty(), "fehlende Baseline-Datei liefert leere Baseline");
+
+        let facts = vec![fact("a", "A", "Text A\n"), fact("b", "B", "Text B\n")];
+        let baseline = ConsolidationBaseline::from_facts(&facts);
+        baseline.write(&root).unwrap();
+
+        let read_back = ConsolidationBaseline::read(&root).unwrap();
+        assert_eq!(read_back, baseline);
+        assert_eq!(read_back.digests.len(), 2);
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     // -- ConsolidationLock -------------------------------------------------

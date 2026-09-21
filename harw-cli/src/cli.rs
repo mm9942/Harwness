@@ -331,6 +331,55 @@ pub enum Command {
         #[arg(long)]
         evidence: Option<String>,
     },
+    /// Den Wissensindex des Retrieval-Subsystems (`harw-lens`) bauen,
+    /// aktualisieren oder seinen Status anzeigen.
+    ///
+    /// Baut **niemals** automatisch beim Sitzungsstart — eine Indizierung
+    /// kann bei einem großen Bestand mehrere Minuten dauern; dieser Befehl
+    /// ist der bewusste, vom Betreiber angestoßene Einstiegspunkt (siehe
+    /// `crate::lens`). Ohne dieses Kommando bleiben die von `lens.ask`
+    /// befragten Indizes leer, und `lens.ask` meldet sie als `skipped`
+    /// statt Treffer zu liefern. Ohne Unterbefehl entspricht dies
+    /// `harw lens status`.
+    Lens {
+        /// Auszuführende Lens-Aktion; ohne Angabe wird der Status gezeigt.
+        #[command(subcommand)]
+        action: Option<LensAction>,
+    },
+}
+
+/// Aktionen des `harw lens`-Subcommands.
+#[derive(Debug, Subcommand)]
+pub enum LensAction {
+    /// Baut oder aktualisiert den/die Lens-Index/-Indizes für das aktive
+    /// Profil.
+    ///
+    /// Baut genau die `(index, sichtbarkeit)`-Paare, die `lens.ask`
+    /// tatsächlich befragt (`harw_tool_lens::scope::KNOWN_SELECTORS`):
+    /// `docs.design` aus `docs/` im aktuellen Arbeitsverzeichnis sowie
+    /// `knowledge.palace` aus dem Memory Palace des aktiven Profils. Der
+    /// Bau ist inkrementell (nur neue/geänderte Chunks werden eingebettet,
+    /// siehe `harw_lens_source::build_index`) — ein wiederholter Aufruf
+    /// ohne `--force` ist deshalb günstig und der richtige Weg, einen
+    /// **veralteten** Index (`harw lens status` zeigt sein Alter) nach
+    /// Quelländerungen aufzufrischen.
+    Build {
+        /// Nur diese Quellmenge bauen: `docs` (Design-/Architekturdokumente
+        /// aus `docs/`) oder `knowledge` (Memory-Palace-Artefakte des
+        /// aktiven Profils). Ohne Angabe werden beide gebaut.
+        #[arg(long, value_name = "NAME")]
+        source: Option<String>,
+        /// Bereits gebaute Indexdaten (samt Embedding-Cache) vor dem Bau
+        /// verwerfen, statt inkrementell weiterzubauen — ein garantiert
+        /// vollständiger Neuaufbau, z. B. zur Fehlersuche.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Zeigt, welche von `lens.ask` befragten Indizes existieren: Modell,
+    /// Dimension, Lokalität, Chunker-Fassung, Chunkanzahl und Alter — samt
+    /// eines Hinweises, wenn ein Index fehlt oder sein Alter auf mögliche
+    /// Veraltung gegenüber den Quellen hindeutet.
+    Status,
 }
 
 /// Aktionen des `harw uia`-Subcommands.
@@ -628,6 +677,15 @@ pub enum ModelsAction {
         /// `:free`-Suffix der Modell-ID).
         #[arg(long)]
         free_only: bool,
+        /// Entfernt nicht mehr gemeldete Modelle aus der Auswahl und dem
+        /// lokalen Cache (`models/*.toml`). Ohne dieses Flag ergänzt der
+        /// Scan nur neue/aktuelle Modelle und meldet veraltete Einträge als
+        /// „nicht mehr gemeldet“, ohne sie zu löschen. Ein von der aktiven
+        /// Konfiguration referenziertes Modell (`default_model`,
+        /// `uia_model`, `session.title_model`, `internal_models.*`) wird
+        /// auch mit `--prune` nie entfernt.
+        #[arg(long)]
+        prune: bool,
     },
     /// Fügt ein live entdecktes Modell zur sichtbaren Auswahl hinzu.
     Add {
@@ -1181,6 +1239,7 @@ mod tests {
                     provider,
                     add,
                     free_only,
+                    prune,
                 }),
         }) = cli.command
         else {
@@ -1189,6 +1248,7 @@ mod tests {
         assert_eq!(provider.as_deref(), Some("openrouter"));
         assert!(add);
         assert!(free_only);
+        assert!(!prune);
     }
 
     #[test]
@@ -1203,6 +1263,7 @@ mod tests {
                     provider,
                     add,
                     free_only,
+                    prune,
                 }),
         }) = cli.command
         else {
@@ -1211,6 +1272,22 @@ mod tests {
         assert_eq!(provider, None);
         assert!(!add);
         assert!(!free_only);
+        assert!(!prune);
+    }
+
+    #[test]
+    fn test_models_scan_parses_prune_flag() {
+        let cli = match Cli::try_parse_from(["harw", "models", "scan", "--prune"]) {
+            Ok(cli) => cli,
+            Err(err) => panic!("`harw models scan --prune` sollte parsen: {err}"),
+        };
+        let Some(Command::Models {
+            action: Some(ModelsAction::Scan { prune, .. }),
+        }) = cli.command
+        else {
+            panic!("erwartete Models(Scan), bekam {:?}", cli.command);
+        };
+        assert!(prune);
     }
 
     #[test]
@@ -1393,6 +1470,55 @@ mod tests {
             Some(Command::Mcp {
                 action: McpAction::Check { server }
             }) if server == "cloudflare"
+        ));
+    }
+
+    #[test]
+    fn test_lens_build_parses_with_source_and_force() {
+        let cli = Cli::try_parse_from(["harw", "lens", "build", "--source", "docs", "--force"])
+            .expect("`harw lens build --source docs --force` muss parsen");
+        let Some(Command::Lens {
+            action: Some(LensAction::Build { source, force }),
+        }) = cli.command
+        else {
+            panic!("erwartete Lens(Build), bekam {:?}", cli.command);
+        };
+        assert_eq!(source.as_deref(), Some("docs"));
+        assert!(force);
+    }
+
+    #[test]
+    fn test_lens_build_without_flags_defaults_source_to_none_and_force_to_false() {
+        let cli =
+            Cli::try_parse_from(["harw", "lens", "build"]).expect("`harw lens build` muss parsen");
+        let Some(Command::Lens {
+            action: Some(LensAction::Build { source, force }),
+        }) = cli.command
+        else {
+            panic!("erwartete Lens(Build), bekam {:?}", cli.command);
+        };
+        assert_eq!(source, None);
+        assert!(!force);
+    }
+
+    #[test]
+    fn test_lens_status_parses() {
+        let cli =
+            Cli::try_parse_from(["harw", "lens", "status"]).expect("`harw lens status` muss parsen");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Lens {
+                action: Some(LensAction::Status)
+            })
+        ));
+    }
+
+    #[test]
+    fn test_lens_without_subcommand_parses_with_no_action() {
+        let cli = Cli::try_parse_from(["harw", "lens"]).expect("`harw lens` muss parsen");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Lens { action: None })
         ));
     }
 }

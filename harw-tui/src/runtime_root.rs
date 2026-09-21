@@ -68,23 +68,20 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use ratatui::text::Line;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use time::OffsetDateTime;
 
-use harw_core::turn_loop::{TurnControl, TurnLimits};
-use harw_core::{AgentSession, ConversationHistory, ModelMessage, ModelProvider, StateStore, TurnInput, TurnOutcome};
+use harw_core::{AgentSession, ModelProvider, StateStore};
 use harw_extension_api::ApprovalHandler;
 use harw_operations::SharedSessionController;
 use harw_operations::adapter::CommandAdapter;
 use harw_operations::session_control::UiaSelection;
-use harw_plan::PlanNodeStatus;
 use harw_protocol::events::{SessionEvent, TurnEvent};
-use harw_protocol::items::{ContentPart, TurnItem};
 use harw_runtime::{
-    PlanServices, RootSession, RuntimeAssembly, RuntimeAssemblyBuilder, ServiceSurface,
+    RootSession, RuntimeAssembly, RuntimeAssemblyBuilder, ServiceSurface,
 };
 use harw_session_store::meta::{self, SessionMeta};
 use harw_types::{Clock, SessionId, SystemClock};
@@ -96,6 +93,7 @@ use crate::app::{
 use crate::approval::{ApprovalDriver, ApprovalPromptReceiver, TuiApprovalHandler};
 use crate::events::harw_event_channel;
 use crate::frame_requester::frame_channel;
+use crate::host_permit_dialog::HostPermitPromptReceiver;
 use crate::input_reader::spawn_input_reader;
 use crate::session_controller::TuiSessionController;
 use crate::session_picker::SessionEntry;
@@ -545,6 +543,7 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
         mut turn_event_rx,
         mut approval_driver,
         mut approvals,
+        mut host_permit_prompts,
     } = build_root_runtime(
         &assembly,
         wiring,
@@ -623,6 +622,7 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
                 &frame_req,
                 &approval_driver,
                 &mut approvals,
+                &mut host_permit_prompts,
             )
             .await?
             {
@@ -675,6 +675,7 @@ pub fn run_tui(assembly: Arc<RuntimeAssembly>, options: TuiRunOptions) -> Result
                             // Rückkanäle nicht mehr.
                             approval_driver = next_runtime.approval_driver;
                             approvals = next_runtime.approvals;
+                            host_permit_prompts = next_runtime.host_permit_prompts;
                             let previous = std::mem::replace(&mut current, next_assembly);
                             previous.close_session(previous.root_session_id());
                             tracing::info!(
@@ -742,6 +743,13 @@ struct RootRuntime {
     /// Fragekanal zum Renderer; muss gepollt werden, sonst läuft jede Frage in
     /// den Timeout und gilt als Ablehnung.
     approvals: ApprovalPromptReceiver,
+    /// Empfängerseite des Host-Permit-Fragekanals dieser Montage (siehe
+    /// [`harw_runtime::RuntimeAssembly::take_host_permit_prompts`]). Wer sie
+    /// sendet ist `harw_tool_shell::exec::ShellExecutor::authorize_host_command`
+    /// — muss ebenso gepollt werden wie `approvals`, sonst läuft jede
+    /// Host-Permit-Frage in den Timeout und gilt als Ablehnung (fail-closed,
+    /// keine Sonderbehandlung).
+    host_permit_prompts: HostPermitPromptReceiver,
 }
 
 /// Eine per `/resume` montierte Laufzeit samt fertig hydrierter Sitzung.
@@ -801,6 +809,17 @@ fn build_root_runtime(
     // der Freigabekette der Sitzung und im `ApprovalDriver` liegt.
     let (approval_handler, approvals) = TuiApprovalHandler::new();
     let approval_driver = ApprovalDriver::new(Arc::clone(&approval_handler));
+    // Die Empfängerseite gehört zu genau dieser Montage: der Produzent
+    // (`harw_tool_shell::exec::ShellExecutor::authorize_host_command`) sendet
+    // über `assembly.host_permit_prompt_sender()`; take-once liefert hier den
+    // einzigen Empfänger dieses Laufs. Ein zweiter Aufruf auf derselben
+    // Montage schlägt fehl statt still einen zweiten, nie gepollten Kanal zu
+    // erzeugen (siehe [`RuntimeAssembly::take_host_permit_prompts`]).
+    let host_permit_prompts = assembly.take_host_permit_prompts().map_err(|error| {
+        TuiError::Core(format!(
+            "could not take the host permit prompt receiver: {error}"
+        ))
+    })?;
     let (turn_event_tx, turn_event_rx) = tokio::sync::mpsc::unbounded_channel();
     let root_session_id = assembly.root_session_id().clone();
     let RootSession { session, .. } = assembly
@@ -864,6 +883,7 @@ fn build_root_runtime(
         turn_event_rx,
         approval_driver,
         approvals,
+        host_permit_prompts,
     })
 }
 
@@ -1069,11 +1089,43 @@ mod tests {
         std::fs::create_dir_all(&project).expect("project");
         // Projekt-Marker, damit die Projekterkennung genau hier stehen bleibt.
         std::fs::write(project.join("Cargo.toml"), "[workspace]\n").expect("marker");
+        write_fixture_uia(&home);
         Fixture {
             _dir: dir,
             home,
             project,
         }
+    }
+
+    /// Legt eine minimale, gültige UIA (`role = "user-interface"`) im
+    /// Standardprofil des Test-`home` an und aktiviert sie über
+    /// `harness.active_uia_definition`.
+    ///
+    /// # Beschreibung
+    /// Seit dem UIA-Vertrag (siehe `resolve_active_uia` in
+    /// `harw-runtime/src/assembly.rs`) montieren `EntryKind::Tui` und
+    /// `EntryKind::OneShot` nur mit einer konfigurierten UIA (fail-closed,
+    /// `RuntimeError::Registry`). `fixture()` erzeugt `home` hier ohne
+    /// `harw_home::ensure_home` (kein vorbestehendes Profil-`config.toml`),
+    /// daher genügt ein frisches `std::fs::write` — anders als in
+    /// `harw-cli/src/chat.rs`, wo ein bereits gescaffoldetes
+    /// Profil-`config.toml` mit offener `[mcp_listener]`-Tabelle nicht ans
+    /// Ende angehängt werden darf. Layout spiegelt exakt
+    /// `harw-runtime/src/assembly.rs`s eigenes `write_fixture_uia`.
+    fn write_fixture_uia(home: &std::path::Path) {
+        let profile_dir = home.join("profiles").join("default");
+        let agent_dir = profile_dir.join("agents").join("fixture-uia");
+        std::fs::create_dir_all(&agent_dir).expect("fixture uia dir");
+        std::fs::write(
+            agent_dir.join("definition.toml"),
+            "schema = \"harwness.agent/v1\"\nid = \"harwness.agent.fixture-uia@1\"\nversion = \"1.0.0\"\nrole = \"user-interface\"\nspecialization = \"terminal-ui\"\n",
+        )
+        .expect("fixture uia definition");
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            "active_uia_definition = \"harwness.agent.fixture-uia@1\"\n",
+        )
+        .expect("fixture profile config");
     }
 
     /// Builder einer Echo-Montage mit Einstieg `Tui`.

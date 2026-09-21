@@ -34,12 +34,11 @@
 //!   Teilausgabe bleibt bei Kappung und Timeout erhalten (F-060).
 
 use crate::capture::{BoundedCapture, DrainEnd};
+use crate::host_permit_prompt::{HostPermitPrompt, HostPermitPromptSender, HostPermitVariant};
 use crate::limits::{ShellLimits, ShellLimitsError, launch_command};
 use harw_extension_api::contributors::ToolProvider;
-use harw_sandbox::{
-    BwrapLauncher, HostApprovalScope, HostPermitSessionRegistry, Permission, ProcessEnvironment,
-    ProcessPermitLedger, ProcessPermitRequest, SandboxProfile, SandboxSpec,
-};
+use harw_authority::{Permission, SandboxSpec};
+use harw_sandbox::{BwrapLauncher, HostApprovalScope, HostPermitSessionRegistry, ProcessEnvironment, ProcessPermitLedger, ProcessPermitRequest, SandboxProfile};
 use harw_tools::{
     schema::{AdditionalProperties, JsonSchema, JsonSchemaType},
     spec::{FunctionToolSpec, ToolName, ToolSpec},
@@ -79,6 +78,31 @@ const HOST_WORKER_DEFINITION: &str = "host-process-worker@1";
 /// ohne explizites Sitzungsende automatisch verfällt (Verteidigungslinie
 /// gegen eine vergessene, nie beendete Sitzung).
 const HOST_SESSION_LEASE_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+/// Gültigkeitsdauer eines frisch über eine beantwortete
+/// [`HostPermitVariant::SingleExecution`]-Frage ausgestellten Permits, bis
+/// der genehmigte Auftrag tatsächlich läuft. Deutlich kürzer als
+/// [`HOST_SESSION_LEASE_TTL`]: eine Einzelfreigabe soll nicht als lange
+/// gültiges „stilles Ja" liegen bleiben.
+const HOST_SINGLE_EXECUTION_TTL: Duration = Duration::from_secs(5 * 60);
+/// Vorgabe-Wartezeit auf **eine** Nutzerentscheidung auf eine offene
+/// [`HostPermitPrompt`]. Läuft sie ab, gilt das als Ablehnung
+/// (fail-closed) — deckt sich mit
+/// `harw_tui::host_permit_dialog::DEFAULT_HOST_PERMIT_TIMEOUT`.
+const HOST_PERMIT_PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
+/// Ablehnungsnachricht, wenn weder ein Permit-Ledger noch eine
+/// Sitzungs-Registry konfiguriert sind — Host-Ausführung ist dann
+/// grundsätzlich nicht erreichbar, unabhängig von jedem Fragekanal.
+const NO_PERMIT_LEDGER_MSG: &str =
+    "shell.exec: host execution requires a process permit, but no permit ledger is configured";
+/// Ablehnungsnachricht, wenn eine Frage nötig wäre, aber kein Fragekanal
+/// angehängt ist oder er bereits geschlossen ist (fail-closed).
+const NO_UI_APPROVAL_MSG: &str = "shell.exec: host execution requires local UI approval for \
+     this session, but no approval channel is attached (fail-closed)";
+/// Ablehnungsnachricht für jeden Ausgang einer geöffneten Frage, der keine
+/// ausdrückliche Zustimmung ist: Ablehnung, Zeitablauf oder fallengelassene
+/// Antwort.
+const HOST_PERMIT_DENIED_MSG: &str = "shell.exec: host execution was not approved (denied, \
+     timed out, or the answer channel was dropped)";
 
 // ── ShellExecError ────────────────────────────────────────────────────────────
 
@@ -219,6 +243,19 @@ pub struct ShellExecutor {
     /// verhält sich Host-Ausführung wie ohne jede Sitzungs-Vorgeschichte:
     /// jeder Befehl braucht einen frisch über die UI ausgestellten Permit.
     host_permit_registry: Option<Arc<HostPermitSessionRegistry>>,
+    /// Sendeseite des Host-Permit-Fragekanals (siehe [`crate::host_permit_prompt`]).
+    /// `None` heißt: keine Oberfläche hört zu — jede Anfrage ohne bereits
+    /// gemerkten Permit oder laufende Sitzungsphase wird sofort abgelehnt
+    /// (fail-closed); es gibt keinen Pfad, der das stillschweigend erlaubt.
+    host_permit_prompts: Option<HostPermitPromptSender>,
+    /// Vorauswahl, die eine geöffnete Frage anzeigt; ändert nie das Ergebnis,
+    /// nur die Anzeige. Kommt ausschließlich von der Runtime (siehe
+    /// [`ShellToolProvider::with_preselected_permit_variant`]) — ein
+    /// Modellaufruf kann diesen Wert über `args`/`ToolCall` nicht erreichen.
+    preselected_permit_variant: HostPermitVariant,
+    /// Wartezeit auf eine einzelne Nutzerentscheidung, bevor eine geöffnete
+    /// Frage fail-closed als Ablehnung gilt.
+    host_permit_timeout: Duration,
 }
 
 impl ShellExecutor {
@@ -299,39 +336,56 @@ impl ShellExecutor {
         (stdout, stderr, stdout_truncated || stderr_truncated)
     }
 
-    /// Prüft für Host-Profil-Ausführung, dass ein gültiger Permit
-    /// den konkreten Antrag trägt, und stellt bei Bedarf einen neuen Permit
-    /// für einen bereits sitzungsweit zugestimmten Auftrag aus.
+    /// Prüft für Host-Profil-Ausführung, dass ein gültiger Permit den
+    /// konkreten Antrag trägt, stellt bei Bedarf einen neuen Permit für
+    /// einen bereits sitzungsweit zugestimmten Auftrag aus, oder fragt —
+    /// wenn beides fehlt — über den angehängten Fragekanal nach, **bevor**
+    /// irgendeine Ausführung stattfindet.
     ///
     /// # Description
     /// Baut zunächst den kanonischen [`ProcessPermitRequest`] aus Sitzung,
     /// Worker-Definition, dem exakten Befehlstext und der aufgelösten
-    /// Workspace-Wurzel. Drei Fälle:
+    /// Workspace-Wurzel. Vier Fälle, in dieser Reihenfolge:
     /// 1. Für genau diesen Antrag existiert bereits ein gemerkter Permit
     ///    (siehe [`HostPermitSessionRegistry::lookup_permit`]): er wird über
     ///    [`ProcessPermitLedger::authorize`] direkt verwendet.
-    /// 2. Kein gemerkter Permit, aber die Sitzung hat der lokalen UI bereits
-    ///    einmalig zugestimmt (siehe [`HostPermitSessionRegistry::is_session_approved`]):
-    ///    ein neuer Permit wird für genau diesen Antrag über
-    ///    [`ProcessPermitLedger::issue_after_local_approval`] ausgestellt,
-    ///    gemerkt und sofort autorisiert. So muss die lokale UI nur einmal je
-    ///    Sitzung fragen, nicht für jeden neuen Befehlstext erneut.
-    /// 3. Weder ein gemerkter Permit noch eine Sitzungszustimmung: Ablehnung.
+    /// 2. Kein gemerkter Permit, aber die Sitzung hat bereits eine laufende
+    ///    Host-Arbeitsphase (siehe [`HostPermitSessionRegistry::is_session_approved`]):
+    ///    ein neuer Permit wird für genau diesen Antrag ausgestellt, gemerkt
+    ///    und sofort autorisiert — ohne erneute Frage.
+    /// 3. Weder ein gemerkter Permit noch eine Sitzungsphase, aber ein
+    ///    Fragekanal ist angehängt ([`Self::host_permit_prompts`]): eine
+    ///    [`HostPermitPrompt`] geht an die anzeigende Oberfläche und diese
+    ///    Methode wartet `await`-basiert auf genau eine Antwort, höchstens
+    ///    [`Self::host_permit_timeout`] lang. Eine Zustimmung stellt einen
+    ///    Permit aus (Umfang aus der gewählten [`HostPermitVariant`]) und
+    ///    trägt bei [`HostPermitVariant::SessionLease`] zusätzlich die
+    ///    Sitzungsphase ein — danach fragt kein weiterer Auftrag dieser
+    ///    Sitzung erneut.
+    /// 4. Jeder andere Ausgang — kein Fragekanal angehängt, der Kanal ist
+    ///    geschlossen, die Antwort wurde fallengelassen, die Wartezeit lief
+    ///    ab, oder ausdrücklich abgelehnt — ist eine Ablehnung (fail-closed,
+    ///    Sicherheitsregel „Ablehnung ist der Default").
+    ///
+    /// Die Vorauswahl, die eine geöffnete Frage anzeigt, ist ausschließlich
+    /// [`Self::preselected_permit_variant`]: weder `args`/`ToolCall` noch
+    /// irgendein Modellausgang kann sie erreichen oder die Frage selbst
+    /// umgehen.
     ///
     /// # Errors
     /// Liefert eine für das Modell lesbare Ablehnungsnachricht als `Err(String)`,
     /// niemals interne Details über andere Permits oder Sitzungen.
-    fn authorize_host_command(
+    async fn authorize_host_command(
         &self,
         args: &ShellExecArgs,
         sandbox: &SandboxSpec,
         session_id: &str,
     ) -> Result<(), String> {
         let Some(ledger) = &self.permit_ledger else {
-            return Err(
-                "shell.exec: host execution requires a process permit,                  but no permit ledger is configured"
-                    .to_owned(),
-            );
+            return Err(NO_PERMIT_LEDGER_MSG.to_owned());
+        };
+        let Some(registry) = &self.host_permit_registry else {
+            return Err(NO_PERMIT_LEDGER_MSG.to_owned());
         };
         let request = ProcessPermitRequest {
             session: session_id.to_owned(),
@@ -341,35 +395,99 @@ impl ShellExecutor {
             environment: ProcessEnvironment::LocalHost,
         };
 
-        let Some(registry) = &self.host_permit_registry else {
-            return Err(
-                "shell.exec: host execution requires a process permit,                  but no permit ledger is configured"
-                    .to_owned(),
-            );
-        };
-
         if let Some(id) = registry.lookup_permit(&request) {
             if ledger.authorize(id, &request).is_ok() {
                 return Ok(());
             }
             // Gemerkter Permit ist abgelaufen oder wurde widerrufen; fällt
             // unten zur Neubeantragung durch, falls die Sitzung weiterhin
-            // zugestimmt hat.
+            // zugestimmt hat oder jetzt gefragt werden kann.
         }
 
-        if !registry.is_session_approved(session_id) {
-            return Err(
-                "shell.exec: host execution requires local UI approval for this session"
-                    .to_owned(),
+        if registry.is_session_approved(session_id) {
+            return Self::issue_and_remember(
+                ledger,
+                registry,
+                request,
+                HostApprovalScope::SessionLease,
+                HOST_SESSION_LEASE_TTL,
             );
         }
 
+        self.prompt_for_authorization(ledger, registry, request).await
+    }
+
+    /// Fragt — wenn ein Kanal angehängt ist — über [`HostPermitPrompt`] nach
+    /// und verbucht eine ausdrückliche Zustimmung; jeder andere Ausgang ist
+    /// eine Ablehnung (siehe [`Self::authorize_host_command`], Fälle 3/4).
+    ///
+    /// # Concurrency
+    /// Blockiert keinen Renderer-Thread: die Frage geht über einen
+    /// ungepufferten `mpsc`-Kanal, gewartet wird ausschließlich auf einem
+    /// `tokio::sync::oneshot`, begrenzt durch [`Self::host_permit_timeout`].
+    async fn prompt_for_authorization(
+        &self,
+        ledger: &Arc<ProcessPermitLedger>,
+        registry: &Arc<HostPermitSessionRegistry>,
+        request: ProcessPermitRequest,
+    ) -> Result<(), String> {
+        let Some(sender) = &self.host_permit_prompts else {
+            return Err(NO_UI_APPROVAL_MSG.to_owned());
+        };
+
+        let (prompt, answer) = HostPermitPrompt::new(
+            request.session.clone(),
+            request.worker_definition.clone(),
+            request.command.clone(),
+            request.workspace.clone(),
+            self.preselected_permit_variant,
+        );
+        if sender.send(prompt).is_err() {
+            warn!(session_id = %request.session, "shell.exec: host permit prompt channel closed");
+            return Err(NO_UI_APPROVAL_MSG.to_owned());
+        }
+
+        let decision = match tokio::time::timeout(self.host_permit_timeout, answer).await {
+            Ok(Ok(decision)) => decision,
+            Ok(Err(_)) => {
+                warn!(session_id = %request.session, "shell.exec: host permit answer dropped");
+                None
+            }
+            Err(_elapsed) => {
+                warn!(session_id = %request.session, "shell.exec: host permit prompt timed out");
+                None
+            }
+        };
+
+        let Some(variant) = decision else {
+            return Err(HOST_PERMIT_DENIED_MSG.to_owned());
+        };
+
+        if variant == HostPermitVariant::SessionLease {
+            registry.mark_session_approved(request.session.clone(), HOST_SESSION_LEASE_TTL);
+        }
+        let (scope, ttl) = match variant {
+            HostPermitVariant::SingleExecution => {
+                (HostApprovalScope::SingleExecution, HOST_SINGLE_EXECUTION_TTL)
+            }
+            HostPermitVariant::SessionLease => {
+                (HostApprovalScope::SessionLease, HOST_SESSION_LEASE_TTL)
+            }
+        };
+        Self::issue_and_remember(ledger, registry, request, scope, ttl)
+    }
+
+    /// Stellt einen Permit für `request` aus, merkt ihn in `registry` und
+    /// autorisiert ihn sofort für den auslösenden Aufruf.
+    fn issue_and_remember(
+        ledger: &Arc<ProcessPermitLedger>,
+        registry: &Arc<HostPermitSessionRegistry>,
+        request: ProcessPermitRequest,
+        scope: HostApprovalScope,
+        ttl: Duration,
+    ) -> Result<(), String> {
         let id = ledger
-            .issue_after_local_approval(
-                request.clone(),
-                HostApprovalScope::SessionLease,
-                HOST_SESSION_LEASE_TTL,
-            )
+            .issue_after_local_approval(request.clone(), scope, ttl)
             .map_err(|err| format!("shell.exec: host execution not authorized: {err}"))?;
         registry.remember_permit(request.clone(), id);
         ledger
@@ -409,7 +527,7 @@ impl ShellExecutor {
         let effective_timeout = self.effective_timeout(args)?;
 
         if self.sandbox_profile.is_host() {
-            if let Err(message) = self.authorize_host_command(args, sandbox, session_id) {
+            if let Err(message) = self.authorize_host_command(args, sandbox, session_id).await {
                 warn!(session_id, "shell.exec denied: host permit authorization failed");
                 return Ok(ToolOutput::error(message));
             }
@@ -751,6 +869,17 @@ pub struct ShellToolProvider {
     /// Sitzungsseitige Zuordnung von UI-Zustimmungen zu bereits ausgestellten
     /// Permits; von der Runtime beim Aufbau des Host-Profil-Workers gesetzt.
     pub host_permit_registry: Option<Arc<HostPermitSessionRegistry>>,
+    /// Sendeseite des Host-Permit-Fragekanals (siehe [`crate::host_permit_prompt`]);
+    /// von der Runtime gesetzt, damit `ShellExecutor` vor einer Host-Ausführung
+    /// ohne bereits gemerkten Permit/Sitzungsphase tatsächlich fragen kann.
+    /// `None` heißt fail-closed: keine Frage, keine Ausführung.
+    pub host_permit_prompts: Option<HostPermitPromptSender>,
+    /// Vorauswahl, die eine geöffnete Frage anzeigt (siehe
+    /// [`Self::with_preselected_permit_variant`]); ändert nie das Ergebnis.
+    pub preselected_permit_variant: HostPermitVariant,
+    /// Wartezeit auf eine einzelne Nutzerentscheidung auf eine offene Frage,
+    /// bevor sie fail-closed als Ablehnung gilt.
+    pub host_permit_timeout: Duration,
 }
 
 impl ShellToolProvider {
@@ -795,6 +924,40 @@ impl ShellToolProvider {
     #[must_use]
     pub fn with_host_permit_registry(mut self, registry: Arc<HostPermitSessionRegistry>) -> Self {
         self.host_permit_registry = Some(registry);
+        self
+    }
+
+    /// Hängt die Sendeseite des Host-Permit-Fragekanals an (siehe
+    /// [`crate::host_permit_prompt::host_permit_prompt_channel`]). Ohne
+    /// diesen Aufruf bleibt jede Host-Anfrage ohne bereits gemerkten Permit
+    /// oder laufende Sitzungsphase fail-closed abgelehnt — es gibt keine
+    /// Rückfrage, nur eine Ablehnung.
+    #[must_use]
+    pub fn with_host_permit_prompts(mut self, sender: HostPermitPromptSender) -> Self {
+        self.host_permit_prompts = Some(sender);
+        self
+    }
+
+    /// Setzt die Vorauswahl, die eine geöffnete Host-Permit-Frage anzeigt.
+    ///
+    /// # Description
+    /// Reine Anzeige-Vorauswahl — ändert nie, was tatsächlich genehmigt
+    /// wird, nur was der Dialog vorschlägt. Der Aufrufer (`harw-runtime`)
+    /// leitet sie nach Möglichkeit aus dem aktiven `InteractionMode` der
+    /// Sitzung ab; ohne diesen Aufruf bleibt es bei
+    /// [`HostPermitVariant::SingleExecution`] ([`HostPermitVariant::default`]).
+    #[must_use]
+    pub fn with_preselected_permit_variant(mut self, variant: HostPermitVariant) -> Self {
+        self.preselected_permit_variant = variant;
+        self
+    }
+
+    /// Setzt die Wartezeit auf eine einzelne Nutzerentscheidung, bevor eine
+    /// offene Host-Permit-Frage fail-closed als Ablehnung gilt (Vorgabe:
+    /// [`HOST_PERMIT_PROMPT_TIMEOUT`]).
+    #[must_use]
+    pub fn with_host_permit_timeout(mut self, timeout: Duration) -> Self {
+        self.host_permit_timeout = timeout;
         self
     }
 
@@ -865,6 +1028,9 @@ impl Default for ShellToolProvider {
             sandbox_profile: SandboxProfile::Strict,
             permit_ledger: None,
             host_permit_registry: None,
+            host_permit_prompts: None,
+            preselected_permit_variant: HostPermitVariant::SingleExecution,
+            host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
         }
     }
 }
@@ -937,6 +1103,9 @@ impl ToolProvider for ShellToolProvider {
                 sandbox_profile: self.sandbox_profile.clone(),
                 permit_ledger: self.permit_ledger.clone(),
                 host_permit_registry: self.host_permit_registry.clone(),
+                host_permit_prompts: self.host_permit_prompts.clone(),
+                preselected_permit_variant: self.preselected_permit_variant,
+                host_permit_timeout: self.host_permit_timeout,
             }))
         } else {
             None
@@ -972,9 +1141,7 @@ impl ToolProvider for ShellToolProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harw_sandbox::{
-        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-    };
+    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_tools::{ToolCall, ToolExecutionContext};
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::fs;
@@ -1063,6 +1230,9 @@ mod tests {
             sandbox_profile: SandboxProfile::Strict,
             permit_ledger: None,
             host_permit_registry: None,
+            host_permit_prompts: None,
+            preselected_permit_variant: HostPermitVariant::SingleExecution,
+            host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
         };
 
         for command in ["", " ", "\t\n"] {
@@ -1088,6 +1258,9 @@ mod tests {
             sandbox_profile: SandboxProfile::Strict,
             permit_ledger: None,
             host_permit_registry: None,
+            host_permit_prompts: None,
+            preselected_permit_variant: HostPermitVariant::SingleExecution,
+            host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
         };
         let args = ShellExecArgs {
             command: "echo valid".to_owned(),
@@ -1111,6 +1284,9 @@ mod tests {
             sandbox_profile: SandboxProfile::Strict,
             permit_ledger: None,
             host_permit_registry: None,
+            host_permit_prompts: None,
+            preselected_permit_variant: HostPermitVariant::SingleExecution,
+            host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
         };
         let args = ShellExecArgs {
             command: "echo valid".to_owned(),
@@ -1240,6 +1416,9 @@ mod tests {
             sandbox_profile: SandboxProfile::Strict,
             permit_ledger: None,
             host_permit_registry: None,
+            host_permit_prompts: None,
+            preselected_permit_variant: HostPermitVariant::SingleExecution,
+            host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
         };
         let capture = BoundedCapture::new(16);
 
@@ -1262,6 +1441,9 @@ mod tests {
             sandbox_profile: SandboxProfile::Strict,
             permit_ledger: None,
             host_permit_registry: None,
+            host_permit_prompts: None,
+            preselected_permit_variant: HostPermitVariant::SingleExecution,
+            host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
         };
         let (mut writer, mut stdout) = tokio::io::duplex(1024);
         let (_stderr_writer, mut stderr) = tokio::io::duplex(1024);
@@ -1301,6 +1483,9 @@ mod tests {
             sandbox_profile: SandboxProfile::Strict,
             permit_ledger: None,
             host_permit_registry: None,
+            host_permit_prompts: None,
+            preselected_permit_variant: HostPermitVariant::SingleExecution,
+            host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
         };
         let args = ShellExecArgs {
             command: "echo must_not_run".to_owned(),
@@ -1464,6 +1649,9 @@ mod tests {
             sandbox_profile: SandboxProfile::Strict,
             permit_ledger: None,
             host_permit_registry: None,
+            host_permit_prompts: None,
+            preselected_permit_variant: HostPermitVariant::SingleExecution,
+            host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
         };
         let call = make_call_with_timeout("echo partial_before_timeout; sleep 5", 1);
         let started = std::time::Instant::now();
@@ -1540,6 +1728,9 @@ mod tests {
             sandbox_profile: SandboxProfile::Strict,
             permit_ledger: None,
             host_permit_registry: None,
+            host_permit_prompts: None,
+            preselected_permit_variant: HostPermitVariant::SingleExecution,
+            host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
         };
         // Generate more than the configured output cap.
         let call = make_call("echo 'this_is_a_longer_string_than_ten_bytes'");
@@ -1573,6 +1764,9 @@ mod tests {
             sandbox_profile: SandboxProfile::Strict,
             permit_ledger: None,
             host_permit_registry: None,
+            host_permit_prompts: None,
+            preselected_permit_variant: HostPermitVariant::SingleExecution,
+            host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
         };
         let started = std::time::Instant::now();
 
@@ -1608,6 +1802,9 @@ mod tests {
             sandbox_profile: SandboxProfile::Strict,
             permit_ledger: None,
             host_permit_registry: None,
+            host_permit_prompts: None,
+            preselected_permit_variant: HostPermitVariant::SingleExecution,
+            host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
         };
         // Mit geerbtem Terminal-stdin würde `cat` bis zum Timeout blockieren.
         let call = make_call("cat; echo stdin_reached_eof");
@@ -1864,6 +2061,9 @@ mod tests {
             sandbox_profile: SandboxProfile::Host,
             permit_ledger: Some(Arc::clone(ledger)),
             host_permit_registry: Some(Arc::clone(registry)),
+            host_permit_prompts: None,
+            preselected_permit_variant: HostPermitVariant::SingleExecution,
+            host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
         }
     }
 
@@ -1874,8 +2074,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_authorize_host_command_reuses_remembered_permit_after_session_approval_expires() {
+    #[tokio::test]
+    async fn test_authorize_host_command_reuses_remembered_permit_after_session_approval_expires() {
         // Die Sitzungszustimmung selbst darf verfallen (kurze TTL), ohne dass
         // ein bereits ausgestellter, gemerkter Permit für exakt denselben
         // Antrag verloren geht: `authorize_host_command` prüft `lookup_permit`
@@ -1890,25 +2090,25 @@ mod tests {
         let args = args_for("echo repeat_me");
 
         assert!(
-            executor.authorize_host_command(&args, &sandbox, "s1").is_ok(),
+            executor.authorize_host_command(&args, &sandbox, "s1").await.is_ok(),
             "first call must succeed via a fresh local-approval issuance"
         );
 
-        std::thread::sleep(Duration::from_millis(60));
+        tokio::time::sleep(Duration::from_millis(60)).await;
         assert!(
             !registry.is_session_approved("s1"),
             "the session-level approval must have expired by now"
         );
 
         assert!(
-            executor.authorize_host_command(&args, &sandbox, "s1").is_ok(),
+            executor.authorize_host_command(&args, &sandbox, "s1").await.is_ok(),
             "an identical repeated request must succeed via the remembered permit, \
              without requiring a fresh session approval"
         );
     }
 
-    #[test]
-    fn test_authorize_host_command_different_commands_same_session_both_succeed() {
+    #[tokio::test]
+    async fn test_authorize_host_command_different_commands_same_session_both_succeed() {
         // Eine einmalige Sitzungszustimmung deckt beliebig viele
         // *unterschiedliche* Befehlstexte derselben Sitzung ab; jeder bekommt
         // seinen eigenen, getrennt gemerkten Permit.
@@ -1922,8 +2122,8 @@ mod tests {
         let first = args_for("echo first_command");
         let second = args_for("echo second_command");
 
-        assert!(executor.authorize_host_command(&first, &sandbox, "s1").is_ok());
-        assert!(executor.authorize_host_command(&second, &sandbox, "s1").is_ok());
+        assert!(executor.authorize_host_command(&first, &sandbox, "s1").await.is_ok());
+        assert!(executor.authorize_host_command(&second, &sandbox, "s1").await.is_ok());
 
         let first_request = ProcessPermitRequest {
             session: "s1".to_owned(),
@@ -1951,8 +2151,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_authorize_host_command_different_session_does_not_reuse_remembered_permit() {
+    #[tokio::test]
+    async fn test_authorize_host_command_different_session_does_not_reuse_remembered_permit() {
         // Ein für Sitzung `s1` gemerkter Permit darf nicht für eine andere
         // Sitzung `s2` gefunden werden, selbst bei identischem Befehlstext.
         let tmp = make_temp_workspace();
@@ -1964,12 +2164,177 @@ mod tests {
         let executor = host_executor(&ledger, &registry);
         let args = args_for("echo shared_command_text");
 
-        assert!(executor.authorize_host_command(&args, &sandbox, "s1").is_ok());
+        assert!(executor.authorize_host_command(&args, &sandbox, "s1").await.is_ok());
 
-        let result = executor.authorize_host_command(&args, &sandbox, "s2");
+        let result = executor.authorize_host_command(&args, &sandbox, "s2").await;
         assert!(
             result.is_err(),
             "session s2 has no approval and must not benefit from session s1's remembered permit"
+        );
+    }
+
+    // ── authorize_host_command: neue Frage über den Fragekanal ─────────────
+
+    #[tokio::test]
+    async fn test_authorize_host_command_prompts_and_grants_single_execution() {
+        // Weder gemerkter Permit noch Sitzungsphase, aber ein Kanal ist
+        // angehängt: die Anfrage muss fragen und bei Zustimmung durchgehen.
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        let (sender, mut receiver) = crate::host_permit_prompt::host_permit_prompt_channel();
+
+        let mut executor = host_executor(&ledger, &registry);
+        executor.host_permit_prompts = Some(sender);
+        let args = args_for("echo prompted_ok");
+
+        let responder = tokio::spawn(async move {
+            let prompt = receiver.recv().await.expect("prompt must arrive");
+            assert_eq!(prompt.session(), "s1");
+            assert_eq!(prompt.command(), "echo prompted_ok");
+            assert_eq!(prompt.preselected_variant(), HostPermitVariant::SingleExecution);
+            assert!(prompt.approve(HostPermitVariant::SingleExecution));
+        });
+
+        let result = executor.authorize_host_command(&args, &sandbox, "s1").await;
+        responder.await.expect("responder task must not panic");
+
+        assert!(result.is_ok(), "an approved prompt must authorize the command: {result:?}");
+        assert!(
+            !registry.is_session_approved("s1"),
+            "a single-execution approval must never open a session-wide phase"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_authorize_host_command_prompts_and_session_lease_covers_next_call() {
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        let (sender, mut receiver) = crate::host_permit_prompt::host_permit_prompt_channel();
+
+        let mut executor = host_executor(&ledger, &registry);
+        executor.host_permit_prompts = Some(sender);
+        let first = args_for("echo first");
+        let second = args_for("echo second");
+
+        let responder = tokio::spawn(async move {
+            let prompt = receiver.recv().await.expect("prompt must arrive");
+            assert!(prompt.approve(HostPermitVariant::SessionLease));
+        });
+
+        assert!(executor.authorize_host_command(&first, &sandbox, "s1").await.is_ok());
+        responder.await.expect("responder task must not panic");
+        assert!(registry.is_session_approved("s1"));
+
+        // Der zweite, abweichende Befehl derselben Sitzung darf ohne erneute
+        // Frage durchgehen — die Phase wurde bereits eingetragen.
+        assert!(executor.authorize_host_command(&second, &sandbox, "s1").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_authorize_host_command_prompt_denial_fails_closed() {
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        let (sender, mut receiver) = crate::host_permit_prompt::host_permit_prompt_channel();
+
+        let mut executor = host_executor(&ledger, &registry);
+        executor.host_permit_prompts = Some(sender);
+        let args = args_for("rm -rf /");
+
+        tokio::spawn(async move {
+            let prompt = receiver.recv().await.expect("prompt must arrive");
+            assert!(prompt.deny());
+        });
+
+        let result = executor.authorize_host_command(&args, &sandbox, "s1").await;
+        assert!(result.is_err(), "an explicit denial must fail closed");
+        assert!(!registry.is_session_approved("s1"));
+    }
+
+    #[tokio::test]
+    async fn test_authorize_host_command_without_any_channel_fails_closed() {
+        // Kein Ledger/Registry-Zustand und kein Fragekanal: fail-closed ohne
+        // dass je etwas gesendet wird (kein Empfänger existiert überhaupt).
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        let executor = host_executor(&ledger, &registry);
+        let args = args_for("echo should_not_run");
+
+        let result = executor.authorize_host_command(&args, &sandbox, "s1").await;
+        assert!(
+            result.is_err_and(|message| message.contains("requires local UI approval")),
+            "no channel attached must fail closed with the UI-approval message"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_authorize_host_command_dropped_prompt_fails_closed() {
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        let (sender, mut receiver) = crate::host_permit_prompt::host_permit_prompt_channel();
+
+        let mut executor = host_executor(&ledger, &registry);
+        executor.host_permit_prompts = Some(sender);
+        let args = args_for("echo should_not_run");
+
+        tokio::spawn(async move {
+            let _prompt = receiver.recv().await.expect("prompt must arrive");
+            // Bewusst ohne Antwort fallengelassen.
+        });
+
+        let result = executor.authorize_host_command(&args, &sandbox, "s1").await;
+        assert!(result.is_err(), "a dropped prompt must fail closed");
+    }
+
+    #[tokio::test]
+    async fn test_authorize_host_command_timeout_fails_closed() {
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        let (sender, mut receiver) = crate::host_permit_prompt::host_permit_prompt_channel();
+
+        let mut executor = host_executor(&ledger, &registry);
+        executor.host_permit_prompts = Some(sender);
+        executor.host_permit_timeout = Duration::from_millis(20);
+        let args = args_for("echo should_not_run");
+
+        let _keep_open = tokio::spawn(async move {
+            let prompt = receiver.recv().await.expect("prompt must arrive");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(prompt);
+        });
+
+        let result = executor.authorize_host_command(&args, &sandbox, "s1").await;
+        assert!(result.is_err(), "an elapsed timeout must fail closed");
+    }
+
+    #[tokio::test]
+    async fn test_authorize_host_command_closed_channel_fails_closed() {
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let ledger = Arc::new(ProcessPermitLedger::default());
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        let (sender, receiver) = crate::host_permit_prompt::host_permit_prompt_channel();
+        drop(receiver);
+
+        let mut executor = host_executor(&ledger, &registry);
+        executor.host_permit_prompts = Some(sender);
+        let args = args_for("echo should_not_run");
+
+        let result = executor.authorize_host_command(&args, &sandbox, "s1").await;
+        assert!(
+            result.is_err_and(|message| message.contains("requires local UI approval")),
+            "a closed receiver must fail closed with the UI-approval message"
         );
     }
 }

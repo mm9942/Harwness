@@ -10,7 +10,7 @@
 //!
 //! **Volle Adresse oder Netz?** Diese Crate meldet die volle Adresse
 //! (`IpAddr::to_string()`), nicht ein `/24`- oder `/64`-Netz. Begründung:
-//! [`harw_sandbox::NetworkScope::allows_addr`] entscheidet ohnehin exakt,
+//! [`harw_authority::NetworkScope::allows_addr`] entscheidet ohnehin exakt,
 //! *ob* eine Verbindung überhaupt gemeldet wird (siehe unten) — die
 //! Adresse selbst erscheint nur für Verbindungen, die bereits als
 //! Politikverstoß eingestuft sind. Ein Netz zu melden verwischte genau in
@@ -22,10 +22,10 @@
 //! Diese Crate hängt dafür an `harw_sandbox` — Kantenrichtung geprüft:
 //! `harw-sandbox` hängt selbst an nichts aus dem `harw-dod-*`-Teilbaum (nur
 //! `harw-types`, `ipnet`, `serde`), diese Abhängigkeit schließt also keinen
-//! Zyklus. [`harw_sandbox::NetworkScope`] trägt bereits `allows_addr`, exakt
+//! Zyklus. [`harw_authority::NetworkScope`] trägt bereits `allows_addr`, exakt
 //! für diesen Zweck erweitert. [`to_security_event`] meldet eine
 //! [`harw_dod_signals::SecurityEvent`] **nur**, wenn `remote_addr` **nicht**
-//! im übergebenen [`harw_sandbox::NetworkScope`] liegt — das ist zugleich die
+//! im übergebenen [`harw_authority::NetworkScope`] liegt — das ist zugleich die
 //! aussagekräftigste Wahl (jede Meldung ist ein tatsächlicher
 //! Politikverstoß) und die sparsamste (Verbindungen innerhalb der erlaubten
 //! Richtlinie erzeugen keinen Datenverkehr in der Zeitreihe).
@@ -33,7 +33,7 @@
 //! **Loopback und private Bereiche: Lärm oder Signal?** Diese Crate trifft
 //! dazu **keine** eigene, fest verdrahtete Ausnahme. Ob `127.0.0.1` oder
 //! `10.0.0.0/8` Lärm oder Signal sind, hängt davon ab, was der Betreiber im
-//! [`harw_sandbox::NetworkScope`] tatsächlich autorisiert hat — steht ein
+//! [`harw_authority::NetworkScope`] tatsächlich autorisiert hat — steht ein
 //! solcher Bereich dort, ist er erlaubt und wird nicht gemeldet; steht er
 //! nicht dort, hat der Betreiber ihn nicht autorisiert, und eine
 //! Verbindung dorthin ist derselbe Politikverstoß wie jede andere. Eine
@@ -101,7 +101,7 @@
 //! ```rust
 //! use harw_dod_flow::report::to_security_event;
 //! use harw_dod_flow::event::{Direction, FlowEvent, Protocol};
-//! use harw_sandbox::NetworkScope;
+//! use harw_authority::NetworkScope;
 //! use harw_types::SensorId;
 //! use std::net::{IpAddr, Ipv4Addr};
 //!
@@ -122,7 +122,7 @@
 
 use harw_dod_bpf::RawBpfEvent;
 use harw_dod_signals::{Actor, EventKind, SecurityEvent};
-use harw_sandbox::NetworkScope;
+use harw_authority::NetworkScope;
 use harw_types::SensorId;
 use jiff::Timestamp;
 
@@ -143,7 +143,7 @@ use crate::event::{parse_flow_payload, Direction, FlowEvent};
 /// - `observed_at` (`jiff::Timestamp`): der Beobachtungszeitpunkt — siehe
 ///   Moduldoku, Abschnitt „Der Zeitstempel", für die empfohlene Quelle
 ///   ([`RawBpfEvent::observed_at`]).
-/// - `scope` (`&harw_sandbox::NetworkScope`): der für diesen Host bzw. diese
+/// - `scope` (`&harw_authority::NetworkScope`): der für diesen Host bzw. diese
 ///   Sandbox autorisierte Zielbereich.
 ///
 /// # Returns
@@ -194,7 +194,7 @@ pub fn to_security_event(
 /// - `raw` (`&harw_dod_bpf::RawBpfEvent`): ein von einem
 ///   `harw_dod_bpf::BpfLoader` gelesenes Rohereignis.
 /// - `sensor` (`&harw_types::SensorId`): die Kennung des meldenden Sensors.
-/// - `scope` (`&harw_sandbox::NetworkScope`): siehe [`to_security_event`].
+/// - `scope` (`&harw_authority::NetworkScope`): siehe [`to_security_event`].
 ///
 /// # Returns
 /// `Ok(Some(SecurityEvent))`, wenn die Melderegel greift; `Ok(None)`, wenn
@@ -220,7 +220,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use harw_dod_bpf::RawBpfEvent;
-    use harw_sandbox::{EgressTarget, NetworkScope};
+    use harw_authority::{EgressTarget, NetworkScope};
     use harw_types::SensorId;
     use jiff::Timestamp;
 

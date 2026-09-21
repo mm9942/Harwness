@@ -16,6 +16,7 @@ default = []
 jemalloc = ["dep:tikv-jemallocator"]
 
 [dependencies]
+harw-authority = { path = "../harw-authority" }
 harw-config = { path = "../harw-config" }
 harw-agent-dsl = { path = "../harw-agent-dsl" }
 harw-channel = { path = "../harw-channel" }
@@ -24,6 +25,20 @@ harw-channel-telegram-transport = { path = "../harw-channel-telegram-transport" 
 harw-core = { path = "../harw-core" }
 harw-context = { path = "../harw-context" }
 harw-lens-types = { path = "../harw-lens-types" }
+# `harw lens build`/`harw lens status` (src/lens.rs): der einzige
+# Produktionsaufrufer von `harw_lens::build`/`harw_lens::index_status`
+# außerhalb der Lens-Crates selbst -- siehe `harw-lens-source`s Moduldoku
+# ("Der Build ist ein Job auf der vorhandenen Job-Bridge... aufgerufen von
+# einer Bau-Pipeline außerhalb der Werkzeugoberfläche eines Agenten").
+harw-lens = { path = "../harw-lens" }
+# `harw lens build` baut mit exakt demselben Embedder/Deskriptor/Modellnamen,
+# den `lens.ask` (harw-tool-lens) zum Abfragen verwendet
+# (`harw_tool_lens::provenance::{ask_embedder, ask_descriptor,
+# ask_provenance}`) und mit denselben (index_name, visibility)-Paaren, die
+# `lens.ask` tatsächlich befragt (`harw_tool_lens::scope::KNOWN_SELECTORS`)
+# -- sonst baute dieser Befehl einen Index, den `lens.ask` mangels
+# passendem Modell/passender Chunker-Fassung (K43) doch wieder ablehnt.
+harw-tool-lens = { path = "../harw-tool-lens" }
 harw-operations = { path = "../harw-operations" }
 harw-ops = { path = "../harw-ops" }
 harw-sandbox = { path = "../harw-sandbox" }

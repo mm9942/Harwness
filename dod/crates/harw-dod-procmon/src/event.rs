@@ -123,6 +123,7 @@
 //! ```
 
 use harw_dod_bpf::event::{read_fixed_c_str, read_u32_le};
+use harw_dod_bpf::{TaskIdentity, WireEvent, WireEventType};
 use harw_types::ContentDigest;
 
 use crate::error::ProcmonError;
@@ -188,6 +189,94 @@ pub struct ExecEvent {
     pub argv_digest: ContentDigest,
 }
 
+/// v1 never reads arguments or environment.  This is a positive state, not
+/// a digest of an empty buffer (which would falsely look like evidence).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgvCapture {
+    NotCollected,
+}
+
+/// Whether the bounded executable path was captured.  A missing path is not
+/// converted into an empty string: that would make a read failure look like
+/// evidence of an executable with an empty path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutablePathCapture {
+    Captured,
+    PossiblyTruncated,
+    Unavailable,
+}
+
+/// Versioned exec payload decoded from [`WireEventType::Exec`].  Task
+/// identity is supplied by the common wire header, while the payload is
+/// explicitly `comm[16] | path_len:u16-le | path[path_len]`; no padding and
+/// no implicit C/Rust layout are involved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecEventV1 {
+    pub task: TaskIdentity,
+    pub comm: String,
+    pub path: Option<String>,
+    pub path_capture: ExecutablePathCapture,
+    pub argv: ArgvCapture,
+}
+
+/// A process exit carries identity only in v1.  It deliberately does not
+/// repeat a path or argv from an earlier exec: a PID can be recycled and an
+/// inferred association would be less honest than an absent field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessExitEventV1 {
+    pub task: TaskIdentity,
+}
+
+/// Bit in the shared wire flags byte: the bounded executable path did not
+/// fit in the BPF buffer.  It never applies to argv because argv is absent.
+pub const EXEC_PATH_TRUNCATED: u8 = 0x01;
+/// The kernel could not safely read the tracepoint-provided executable path.
+/// It is a capture status, not an empty path.
+pub const EXEC_PATH_UNAVAILABLE: u8 = 0x02;
+
+/// Parse the versioned exec payload and reject a record of another kind.
+pub fn parse_exec_v1(event: &WireEvent) -> Result<ExecEventV1, ProcmonError> {
+    if event.event_type != WireEventType::Exec
+        || event.payload.len() < 18
+        || event.flags & !(EXEC_PATH_TRUNCATED | EXEC_PATH_UNAVAILABLE) != 0
+        || event.flags & (EXEC_PATH_TRUNCATED | EXEC_PATH_UNAVAILABLE)
+            == (EXEC_PATH_TRUNCATED | EXEC_PATH_UNAVAILABLE)
+    {
+        return Err(ProcmonError::MalformedEvent);
+    }
+    let comm = read_fixed_c_str(&event.payload, 0, 16).map_err(|_| ProcmonError::MalformedEvent)?;
+    let path_len_bytes: [u8; 2] = event.payload[16..18].try_into().map_err(|_| ProcmonError::MalformedEvent)?;
+    let path_len = usize::from(u16::from_le_bytes(path_len_bytes));
+    let path_end = 18usize.checked_add(path_len).ok_or(ProcmonError::MalformedEvent)?;
+    if path_end != event.payload.len() { return Err(ProcmonError::MalformedEvent); }
+    let (path, path_capture) = if event.flags & EXEC_PATH_UNAVAILABLE != 0 {
+        if path_len != 0 {
+            return Err(ProcmonError::MalformedEvent);
+        }
+        (None, ExecutablePathCapture::Unavailable)
+    } else if event.flags & EXEC_PATH_TRUNCATED != 0 {
+        (
+            Some(String::from_utf8_lossy(&event.payload[18..path_end]).into_owned()),
+            ExecutablePathCapture::PossiblyTruncated,
+        )
+    } else {
+        (
+            Some(String::from_utf8_lossy(&event.payload[18..path_end]).into_owned()),
+            ExecutablePathCapture::Captured,
+        )
+    };
+    Ok(ExecEventV1 { task: event.task, comm, path, path_capture, argv: ArgvCapture::NotCollected })
+}
+
+/// Parse the empty v1 exit body.  The task/cgroup identity belongs to the
+/// common header and is captured at `sched_process_exit` in task context.
+pub fn parse_process_exit_v1(event: &WireEvent) -> Result<ProcessExitEventV1, ProcmonError> {
+    if event.event_type != WireEventType::ProcessExit || !event.payload.is_empty() || event.flags != 0 {
+        return Err(ProcmonError::MalformedEvent);
+    }
+    Ok(ProcessExitEventV1 { task: event.task })
+}
+
 /// Deutet das `payload` eines Prozessstart-Ereignisses als [`ExecEvent`].
 ///
 /// # Description
@@ -246,9 +335,38 @@ pub fn parse_exec_payload(payload: &[u8]) -> Result<ExecEvent, ProcmonError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_exec_payload, ARGV_OFFSET, COMM_LEN, FILENAME_LEN};
+    use super::{parse_exec_payload, parse_exec_v1, ArgvCapture, ExecutablePathCapture, ARGV_OFFSET, COMM_LEN, EXEC_PATH_TRUNCATED, FILENAME_LEN};
     use crate::error::ProcmonError;
     use harw_types::ContentDigest;
+    use harw_dod_bpf::{TaskIdentity, WireEvent, WireEventType};
+
+    #[test]
+    fn v1_exec_has_explicit_path_length_and_never_fabricates_argv_evidence() {
+        let mut payload = vec![0; 18];
+        payload[..4].copy_from_slice(b"bash");
+        payload[16..18].copy_from_slice(&8u16.to_le_bytes());
+        payload.extend_from_slice(b"/bin/bash");
+        let event = WireEvent { event_type: WireEventType::Exec, flags: EXEC_PATH_TRUNCATED, ktime_ns: 1, sequence: 1, task: TaskIdentity { tgid: 1, pid: 2, ppid: 3, uid: 4, cgroup_id: 5 }, payload };
+        let parsed = parse_exec_v1(&event).unwrap();
+        assert_eq!(parsed.path.as_deref(), Some("/bin/bash"));
+        assert_eq!(parsed.path_capture, ExecutablePathCapture::PossiblyTruncated);
+        assert_eq!(parsed.argv, ArgvCapture::NotCollected);
+    }
+
+    #[test]
+    fn v1_exit_keeps_the_exiting_tasks_identity_without_fabricating_exec_fields() {
+        let event = WireEvent {
+            event_type: WireEventType::ProcessExit,
+            flags: 0,
+            ktime_ns: 1,
+            sequence: 2,
+            task: TaskIdentity { tgid: 7, pid: 8, ppid: 6, uid: 1000, cgroup_id: 99 },
+            payload: vec![],
+        };
+        let parsed = super::parse_process_exit_v1(&event).unwrap();
+        assert_eq!(parsed.task.pid, 8);
+        assert_eq!(parsed.task.cgroup_id, 99);
+    }
 
     /// Baut einen wohlgeformten `payload`-Puffer aus seinen Feldern.
     ///

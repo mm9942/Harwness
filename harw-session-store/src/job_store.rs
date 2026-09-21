@@ -111,6 +111,34 @@ pub struct CancellationTransition {
     pub revision: u64,
 }
 
+/// A requeue command accepted only from a trusted authority boundary, mirroring
+/// [`CancelRequest`]'s provenance contract.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryRequest {
+    pub retried_at: Timestamp,
+    pub retried_by: ApprovalActor,
+}
+
+/// Durable record of who approved a `Blocked → Ready` transition and why.
+///
+/// # Beschreibung
+/// [`StoredJob`] (`harw-job-runtime`) trägt kein Akteurs-/Freitextfeld für
+/// eine Freigabe — dessen Schema liegt außerhalb dieser Crate. Diese Struktur
+/// wird deshalb als eigenständiger Sidecar-Datensatz unter `jobs/approvals/`
+/// persistiert, adressiert über dieselbe `WorkId` wie der Job-Datensatz
+/// selbst, statt den Job-Datensatz-Typ zu erweitern.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobApproval {
+    pub work_id: WorkId,
+    pub approved_at: Timestamp,
+    pub approved_by: ApprovalActor,
+    /// Optional operator free text, e.g. why the job was approved.
+    pub note: Option<String>,
+    /// The job record revision produced by the unblocking transition, so a
+    /// reader can correlate this sidecar with the exact job state it approved.
+    pub revision: u64,
+}
+
 /// One page of [`JobStore::reconcile_expired`].
 ///
 /// `expired` holds the leases revoked on this page; `next_cursor` is the
@@ -453,7 +481,8 @@ impl JobStore {
         Ok(transition)
     }
 
-    /// Returns a `Blocked` job (e.g. paused for an approval) to `Ready`.
+    /// Returns a `Blocked` job (e.g. paused for an approval) to `Ready`,
+    /// recording who approved it and an optional note as a durable sidecar.
     ///
     /// # Description
     /// A-STORE (G-020): under the per-record lock the job must be
@@ -461,11 +490,16 @@ impl JobStore {
     /// the blocking completion and any stale lease are cleared and the
     /// revision is bumped. `not_before`, attempts and the lease epoch stay
     /// unchanged. A redacted lifecycle event is published after the durable
-    /// write.
+    /// write. Once the job record is durable, `actor` and `note` are written
+    /// to a [`JobApproval`] sidecar (see [`JobStore::get_approval`]) keyed by
+    /// the same `work_id` — [`StoredJob`] itself carries no actor/note field
+    /// (that shape lives in `harw-job-runtime`, outside this crate).
     ///
     /// # Arguments
     /// - `work_id` (`&WorkId`): the blocked job.
     /// - `now` (`Timestamp`): server time of the transition (injected).
+    /// - `actor` (`ApprovalActor`): the trusted approving identity.
+    /// - `note` (`Option<String>`): optional free text explaining the approval.
     ///
     /// # Returns
     /// The published [`JobLifecycleEvent`] (`state == Ready`).
@@ -474,7 +508,10 @@ impl JobStore {
     /// - [`SessionStoreError::JobNotBlocked`]: the job is in another state.
     /// - [`SessionStoreError::JobNotFound`], [`SessionStoreError::CorruptJob`]
     ///   (the record is quarantined), [`SessionStoreError::JobLockContended`],
-    ///   [`SessionStoreError::UnsafeJobPath`], [`SessionStoreError::Io`].
+    ///   [`SessionStoreError::UnsafeJobPath`], [`SessionStoreError::Io`],
+    ///   [`SessionStoreError::Serde`] (approval sidecar write failure — the
+    ///   job's own `Blocked → Ready` transition has already been persisted by
+    ///   the time this can occur and is not rolled back).
     ///
     /// # Concurrency
     /// Takes the job's exclusive try-lock; never blocks. The caller is the
@@ -483,6 +520,8 @@ impl JobStore {
         &self,
         work_id: &WorkId,
         now: Timestamp,
+        actor: ApprovalActor,
+        note: Option<String>,
     ) -> SessionStoreResult<JobLifecycleEvent> {
         let event = self.with_locked(work_id, |record| {
             if record.job.state != JobState::Blocked {
@@ -496,6 +535,230 @@ impl JobStore {
             record.lease = None;
             record.completion = None;
             record.revision = record.revision.saturating_add(1);
+            Ok(JobLifecycleEvent {
+                work_id: work_id.clone(),
+                state: JobState::Ready,
+                revision: record.revision,
+            })
+        })?;
+        self.persist_approval(&JobApproval {
+            work_id: work_id.clone(),
+            approved_at: now,
+            approved_by: actor,
+            note,
+            revision: event.revision,
+        })?;
+        self.publish(event.clone());
+        Ok(event)
+    }
+
+    /// Reads the durable [`JobApproval`] sidecar for `work_id`, if one exists.
+    ///
+    /// # Returns
+    /// `Some(approval)` from the most recent [`JobStore::unblock`] call for
+    /// this `work_id`, or `None` if the job has never been approved.
+    ///
+    /// # Errors
+    /// [`SessionStoreError::Io`] or [`SessionStoreError::Serde`] if the
+    /// sidecar exists but cannot be read or decoded.
+    ///
+    /// # Concurrency
+    /// Lock-free read, like [`JobStore::list`]; may race a concurrent
+    /// [`JobStore::unblock`] and observe either the old or the new sidecar.
+    pub fn get_approval(&self, work_id: &WorkId) -> SessionStoreResult<Option<JobApproval>> {
+        let path = self.approval_path(work_id)?;
+        match read_regular_file(&path) {
+            Ok(bytes) => serde_json::from_slice::<JobApproval>(&bytes)
+                .map(Some)
+                .map_err(SessionStoreError::from),
+            Err(SessionStoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Denies a job that is `Blocked` awaiting an approval, transitioning it
+    /// to `Cancelled`.
+    ///
+    /// # Description
+    /// A-STORE: [`JobStore::cancel`] explicitly excludes [`JobState::Blocked`]
+    /// as a source state, so a job paused on an open approval request cannot
+    /// be denied through it. This transition covers exactly that case: the
+    /// source state must be `Blocked`; every other state is rejected with
+    /// [`SessionStoreError::JobNotDeniable`] (callers should fall back to
+    /// [`JobStore::cancel`] for those). The recorded outcome, cancellation
+    /// provenance and revision bump mirror `cancel` exactly, so both paths
+    /// produce an indistinguishable terminal shape.
+    ///
+    /// # Fencing
+    /// A `Blocked` job's lease is already cleared by the time it reaches
+    /// `Blocked` (see [`JobStore::complete`] with a `Blocked` outcome), so
+    /// there is normally no active lease to fence. This still defensively
+    /// mirrors [`JobStore::cancel`]'s convention: if a lease is nonetheless
+    /// present, the fencing epoch is advanced before it is discarded, so a
+    /// stale holder's token can never validate against a future claim.
+    ///
+    /// # Arguments
+    /// - `work_id` (`&WorkId`): the blocked job.
+    /// - `request` (`&CancelRequest`): denial timestamp, trusted actor and a
+    ///   non-empty reason (reused from [`JobStore::cancel`]'s contract).
+    ///
+    /// # Returns
+    /// The [`CancellationTransition`], `previous_state == Blocked`.
+    ///
+    /// # Errors
+    /// - [`SessionStoreError::InvalidJobCancellationReason`]: empty reason.
+    /// - [`SessionStoreError::JobNotDeniable`]: the job is not `Blocked`.
+    /// - [`SessionStoreError::JobLeaseEpochExhausted`], plus the same
+    ///   record-access errors as [`JobStore::cancel`].
+    ///
+    /// # Concurrency
+    /// Takes the job's exclusive try-lock; never blocks. The caller is the
+    /// trusted approval boundary — model input is not a valid source.
+    pub fn deny_blocked(
+        &self,
+        work_id: &WorkId,
+        request: &CancelRequest,
+    ) -> SessionStoreResult<CancellationTransition> {
+        if request.reason.trim().is_empty() {
+            return Err(SessionStoreError::InvalidJobCancellationReason);
+        }
+        let transition = self.with_locked(work_id, |record| {
+            let previous_state = record.job.state;
+            if previous_state != JobState::Blocked {
+                return Err(SessionStoreError::JobNotDeniable {
+                    work_id: work_id.clone(),
+                    state: previous_state,
+                });
+            }
+
+            let prior_lease = record.lease.take();
+            if prior_lease.is_some() {
+                record.lease_epoch = record.lease_epoch.checked_add(1).ok_or_else(|| {
+                    SessionStoreError::JobLeaseEpochExhausted {
+                        work_id: work_id.clone(),
+                    }
+                })?;
+            }
+            let completion = JobCompletion {
+                completed_at: request.cancelled_at,
+                outcome: JobOutcome::Cancelled {
+                    reason: request.reason.clone(),
+                },
+            };
+            record.job.state = JobState::Cancelled;
+            record.job.updated_at = request.cancelled_at;
+            record.completion = Some(completion.clone());
+            record.cancellation = Some(JobCancellation {
+                cancelled_at: request.cancelled_at,
+                cancelled_by: request.cancelled_by.clone(),
+                reason: request.reason.clone(),
+            });
+            record.revision = record.revision.saturating_add(1);
+            Ok(CancellationTransition {
+                work_id: work_id.clone(),
+                previous_state,
+                prior_lease,
+                completion,
+                revision: record.revision,
+            })
+        })?;
+        self.publish(JobLifecycleEvent {
+            work_id: transition.work_id.clone(),
+            state: JobState::Cancelled,
+            revision: transition.revision,
+        });
+        Ok(transition)
+    }
+
+    /// Requeues a terminally `Failed` or `Cancelled` job for another attempt,
+    /// respecting the job's own [`harw_job_runtime::RetryPolicy`] ceiling.
+    ///
+    /// # Description
+    /// The source state must be [`JobState::Failed`] or
+    /// [`JobState::Cancelled`]; any other state is rejected with
+    /// [`SessionStoreError::JobNotRetryable`]. If `job.attempts` has already
+    /// reached `job.retry.max_attempts`, the job is **not** requeued —
+    /// [`SessionStoreError::JobRetryLimitExhausted`] is returned instead, so a
+    /// caller can never silently retry past its own configured ceiling.
+    /// Otherwise `attempts` is incremented, the job becomes `Ready`,
+    /// `not_before` is set to `now` (immediately eligible — this is an
+    /// explicit, operator-triggered requeue, not the backoff schedule used by
+    /// [`JobStore::reconcile_expired`]), and any stale completion/cancellation
+    /// record is cleared so [`JobStore::get`]/`review` reflect the fresh
+    /// attempt, not the prior terminal one.
+    ///
+    /// # Fencing
+    /// Mirrors [`JobStore::cancel`]'s convention: the fencing epoch is always
+    /// advanced past whatever epoch the job carried in its prior life, so a
+    /// worker holding a token from before the retry — even one for a lease
+    /// that was already logically cleared — can never have it match a future
+    /// claim.
+    ///
+    /// # Arguments
+    /// - `work_id` (`&WorkId`): the job to requeue.
+    /// - `request` (`&RetryRequest`): requeue timestamp and trusted actor.
+    ///
+    /// # Returns
+    /// The published [`JobLifecycleEvent`] (`state == Ready`).
+    ///
+    /// # Errors
+    /// - [`SessionStoreError::JobNotRetryable`]: the job is neither `Failed`
+    ///   nor `Cancelled`.
+    /// - [`SessionStoreError::JobRetryLimitExhausted`]: the retry policy has
+    ///   no attempts left.
+    /// - [`SessionStoreError::JobLeaseEpochExhausted`], plus the same
+    ///   record-access errors as [`JobStore::cancel`].
+    ///
+    /// # Concurrency
+    /// Takes the job's exclusive try-lock; never blocks. The caller is the
+    /// trusted approval boundary — model input is not a valid source.
+    pub fn retry(
+        &self,
+        work_id: &WorkId,
+        request: &RetryRequest,
+    ) -> SessionStoreResult<JobLifecycleEvent> {
+        let event = self.with_locked(work_id, |record| {
+            let previous_state = record.job.state;
+            if !matches!(previous_state, JobState::Failed | JobState::Cancelled) {
+                return Err(SessionStoreError::JobNotRetryable {
+                    work_id: work_id.clone(),
+                    state: previous_state,
+                });
+            }
+            if record.job.attempts >= record.job.retry.max_attempts {
+                return Err(SessionStoreError::JobRetryLimitExhausted {
+                    work_id: work_id.clone(),
+                    attempts: record.job.attempts,
+                    max_attempts: record.job.retry.max_attempts,
+                });
+            }
+
+            // Defense in depth: advance the fencing epoch on every retry, even
+            // though a Failed/Cancelled job's lease is already cleared by the
+            // transition that got it there — mirrors `cancel`'s convention so
+            // no token from a prior life of this job can ever validate again.
+            record.lease = None;
+            record.lease_epoch = record.lease_epoch.saturating_add(1);
+
+            record.job.attempts = record.job.attempts.saturating_add(1);
+            record.job.state = JobState::Ready;
+            record.job.updated_at = request.retried_at;
+            record.not_before = request.retried_at;
+            record.completion = None;
+            record.cancellation = None;
+            record.revision = record.revision.saturating_add(1);
+            // `RetryRequest::retried_by` has no durable home on `StoredJob`
+            // (same constraint as `JobApproval`, see `unblock`'s module doc);
+            // it is logged so the requeue still has an audit trail.
+            tracing::info!(
+                work_id = %work_id,
+                retried_by = ?request.retried_by,
+                attempts = record.job.attempts,
+                max_attempts = record.job.retry.max_attempts,
+                "job requeued for retry"
+            );
             Ok(JobLifecycleEvent {
                 work_id: work_id.clone(),
                 state: JobState::Ready,
@@ -763,6 +1026,27 @@ impl JobStore {
 
     fn locks_dir(&self) -> PathBuf {
         self.root.join("locks")
+    }
+
+    fn approvals_dir(&self) -> PathBuf {
+        self.root.join("approvals")
+    }
+
+    fn approval_path(&self, work_id: &WorkId) -> SessionStoreResult<PathBuf> {
+        Ok(self
+            .approvals_dir()
+            .join(safe_component(work_id)?)
+            .with_extension("json"))
+    }
+
+    /// Atomically writes (or overwrites) the [`JobApproval`] sidecar for
+    /// `approval.work_id`. Called after the job's own `Blocked → Ready`
+    /// transition is already durable, so this failing never leaves the job
+    /// record itself inconsistent — only the audit sidecar is affected.
+    fn persist_approval(&self, approval: &JobApproval) -> SessionStoreResult<()> {
+        std::fs::create_dir_all(self.approvals_dir())?;
+        let path = self.approval_path(&approval.work_id)?;
+        persist_json(&path, approval)
     }
 
     fn record_path(&self, work_id: &WorkId) -> SessionStoreResult<PathBuf> {
@@ -1451,5 +1735,319 @@ mod tests {
         ));
         assert_eq!(std::fs::read(&external).unwrap(), external_bytes);
         assert!(!store.record_path(&work_id).unwrap().exists());
+    }
+
+    fn blocked_record(id: &str) -> StoredJob {
+        let mut job = record(id);
+        job.job.state = JobState::Blocked;
+        job
+    }
+
+    fn terminal_record(id: &str, state: JobState, attempts: u32) -> StoredJob {
+        let mut job = record(id);
+        job.job.state = state;
+        job.job.attempts = attempts;
+        job
+    }
+
+    #[test]
+    fn unblock_moves_a_blocked_job_to_ready_and_persists_the_approval_sidecar() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-approve");
+        store.admit(&blocked_record(work_id.as_str())).unwrap();
+        let now = Timestamp::now();
+
+        let event = store
+            .unblock(
+                &work_id,
+                now,
+                ApprovalActor::Operator {
+                    id: "operator-a".to_owned(),
+                },
+                Some("looks fine".to_owned()),
+            )
+            .unwrap();
+
+        assert_eq!(event.state, JobState::Ready);
+        let persisted = store.get(&work_id).unwrap();
+        assert_eq!(persisted.job.state, JobState::Ready);
+        assert!(persisted.lease.is_none());
+        assert!(persisted.completion.is_none());
+
+        let approval = store
+            .get_approval(&work_id)
+            .unwrap()
+            .expect("approval sidecar recorded");
+        assert_eq!(approval.work_id, work_id);
+        assert_eq!(approval.note.as_deref(), Some("looks fine"));
+        assert_eq!(approval.revision, event.revision);
+        assert!(matches!(
+            approval.approved_by,
+            ApprovalActor::Operator { ref id } if id == "operator-a"
+        ));
+    }
+
+    #[test]
+    fn get_approval_returns_none_for_a_job_that_was_never_approved() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-never-approved");
+        store.admit(&record(work_id.as_str())).unwrap();
+
+        assert_eq!(store.get_approval(&work_id).unwrap(), None);
+    }
+
+    #[test]
+    fn unblock_fails_for_a_job_that_is_not_blocked_and_writes_no_sidecar() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-not-blocked");
+        store.admit(&record(work_id.as_str())).unwrap();
+
+        let error = store
+            .unblock(
+                &work_id,
+                Timestamp::now(),
+                ApprovalActor::Operator {
+                    id: "operator-a".to_owned(),
+                },
+                None,
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, SessionStoreError::JobNotBlocked { .. }));
+        assert_eq!(store.get_approval(&work_id).unwrap(), None);
+    }
+
+    #[test]
+    fn deny_blocked_cancels_a_blocked_job_with_actor_and_reason() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-deny-blocked");
+        store.admit(&blocked_record(work_id.as_str())).unwrap();
+
+        let transition = store
+            .deny_blocked(
+                &work_id,
+                &CancelRequest {
+                    cancelled_at: Timestamp::now(),
+                    cancelled_by: ApprovalActor::Operator {
+                        id: "operator-a".to_owned(),
+                    },
+                    reason: "not safe to proceed".to_owned(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(transition.previous_state, JobState::Blocked);
+        let persisted = store.get(&work_id).unwrap();
+        assert_eq!(persisted.job.state, JobState::Cancelled);
+        assert!(matches!(
+            persisted.cancellation,
+            Some(JobCancellation { ref reason, .. }) if reason == "not safe to proceed"
+        ));
+    }
+
+    #[test]
+    fn deny_blocked_rejects_a_job_that_is_not_blocked() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-deny-not-blocked");
+        store.admit(&record(work_id.as_str())).unwrap();
+
+        let error = store
+            .deny_blocked(
+                &work_id,
+                &CancelRequest {
+                    cancelled_at: Timestamp::now(),
+                    cancelled_by: ApprovalActor::Operator {
+                        id: "operator-a".to_owned(),
+                    },
+                    reason: "not safe to proceed".to_owned(),
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, SessionStoreError::JobNotDeniable { .. }));
+    }
+
+    #[test]
+    fn deny_blocked_rejects_an_empty_reason_before_touching_the_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-deny-empty-reason");
+        store.admit(&blocked_record(work_id.as_str())).unwrap();
+
+        let error = store
+            .deny_blocked(
+                &work_id,
+                &CancelRequest {
+                    cancelled_at: Timestamp::now(),
+                    cancelled_by: ApprovalActor::Operator {
+                        id: "operator-a".to_owned(),
+                    },
+                    reason: "   ".to_owned(),
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionStoreError::InvalidJobCancellationReason
+        ));
+        assert_eq!(store.get(&work_id).unwrap().job.state, JobState::Blocked);
+    }
+
+    #[test]
+    fn retry_requeues_a_failed_job_and_increments_attempts() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-retry-failed");
+        store
+            .admit(&terminal_record(work_id.as_str(), JobState::Failed, 1))
+            .unwrap();
+
+        let event = store
+            .retry(
+                &work_id,
+                &RetryRequest {
+                    retried_at: Timestamp::now(),
+                    retried_by: ApprovalActor::Operator {
+                        id: "operator-a".to_owned(),
+                    },
+                },
+            )
+            .unwrap();
+
+        assert_eq!(event.state, JobState::Ready);
+        let persisted = store.get(&work_id).unwrap();
+        assert_eq!(persisted.job.state, JobState::Ready);
+        assert_eq!(persisted.job.attempts, 2);
+        assert!(persisted.completion.is_none());
+        assert!(persisted.cancellation.is_none());
+    }
+
+    #[test]
+    fn retry_requeues_a_cancelled_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-retry-cancelled");
+        store
+            .admit(&terminal_record(work_id.as_str(), JobState::Cancelled, 0))
+            .unwrap();
+
+        let event = store
+            .retry(
+                &work_id,
+                &RetryRequest {
+                    retried_at: Timestamp::now(),
+                    retried_by: ApprovalActor::Operator {
+                        id: "operator-a".to_owned(),
+                    },
+                },
+            )
+            .unwrap();
+
+        assert_eq!(event.state, JobState::Ready);
+        assert_eq!(store.get(&work_id).unwrap().job.attempts, 1);
+    }
+
+    #[test]
+    fn retry_rejects_a_job_that_is_not_failed_or_cancelled() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-retry-ready");
+        store.admit(&record(work_id.as_str())).unwrap();
+
+        let error = store
+            .retry(
+                &work_id,
+                &RetryRequest {
+                    retried_at: Timestamp::now(),
+                    retried_by: ApprovalActor::Operator {
+                        id: "operator-a".to_owned(),
+                    },
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, SessionStoreError::JobNotRetryable { .. }));
+    }
+
+    #[test]
+    fn retry_returns_a_typed_error_and_does_not_requeue_once_the_limit_is_exhausted() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-retry-exhausted");
+        // `record()`'s fixture policy has max_attempts: 2.
+        store
+            .admit(&terminal_record(work_id.as_str(), JobState::Failed, 2))
+            .unwrap();
+
+        let error = store
+            .retry(
+                &work_id,
+                &RetryRequest {
+                    retried_at: Timestamp::now(),
+                    retried_by: ApprovalActor::Operator {
+                        id: "operator-a".to_owned(),
+                    },
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionStoreError::JobRetryLimitExhausted {
+                attempts: 2,
+                max_attempts: 2,
+                ..
+            }
+        ));
+        // The job must still be exactly as it was — no silent requeue.
+        let persisted = store.get(&work_id).unwrap();
+        assert_eq!(persisted.job.state, JobState::Failed);
+        assert_eq!(persisted.job.attempts, 2);
+    }
+
+    #[test]
+    fn retry_advances_the_fencing_epoch_so_a_stale_token_cannot_complete_the_new_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = JobStore::new(temp.path());
+        let work_id = WorkId::from_str("work-retry-fencing");
+        let mut stale = terminal_record(work_id.as_str(), JobState::Failed, 1);
+        // Simulate the epoch the job carried from its prior (now-stale) lease.
+        stale.lease_epoch = 5;
+        store.admit(&stale).unwrap();
+
+        store
+            .retry(
+                &work_id,
+                &RetryRequest {
+                    retried_at: Timestamp::now(),
+                    retried_by: ApprovalActor::Operator {
+                        id: "operator-a".to_owned(),
+                    },
+                },
+            )
+            .unwrap();
+
+        let after_retry = store.get(&work_id).unwrap();
+        assert!(after_retry.lease_epoch > 5);
+
+        // A fresh claim must issue a token beyond the pre-retry epoch, so a
+        // worker still holding a token minted under epoch 5 can never match.
+        let claim = store
+            .claim(
+                &work_id,
+                &ClaimRequest {
+                    worker_id: "worker-a".to_owned(),
+                    lease_ttl: SignedDuration::from_secs(60),
+                    now: Timestamp::now(),
+                },
+            )
+            .unwrap();
+        assert!(claim.token.epoch > 5);
     }
 }

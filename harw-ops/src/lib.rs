@@ -14,15 +14,30 @@
 //!   registriert (z. B. via `inventory::submit!` durch Extension-Crate).
 //!
 //! # Op-Set
-//! **Grundausstattung** ([`register_all`], 28 Ops): `help`, `status`, `quit`,
+//! **Grundausstattung** ([`register_all`], 33 Ops): `help`, `status`, `quit`,
 //! `new`, `work`, `ps`, `attach`, `stop`, `diff`, `agent`, `skills`, `plugins`,
 //! `model`, `provider`, `uia-model`, `uia-provider`, `permissions`, `compact`,
 //! `memory`, `effort`, `mode`, `context-proposal`, `approval.pending`,
-//! `approval.resolve`, `add-workdir`, `export`, `usage`, `bug-report`.
+//! `approval.resolve`, `add-workdir`, `export`, `usage`, `bug-report`,
+//! `approve`, `deny`, `review`, `cancel`, `retry`.
 //! `bug-report` schreibt einen minimalen, manuell ausgelösten lokalen
 //! Bug-Report nach `<home>/bug-report/` (kein Netzwerk-Versand) — die
 //! automatische Incident-Erkennung ist ein separates, noch ausstehendes
 //! Arbeitspaket, siehe `crate::bug_report`-Moduldoku.
+//! `approve`/`deny`/`review`/`cancel`/`retry` (Interaktionsvertrag §2.3/§4)
+//! bilden die Genehmigungs-Befehlsgruppe: `approve` genehmigt einen wegen
+//! einer Freigabe blockierten Job (`JobStore::unblock`, inklusive Akteur und
+//! optionalem Freitext als Audit-Sidecar, siehe `crate::approve`-Moduldoku),
+//! `deny` lehnt ihn ab — über `JobStore::deny_blocked` für einen `Blocked`-Job,
+//! sonst über `JobStore::cancel` (siehe `crate::deny`-Moduldoku) —, `review`
+//! zeigt den vollständigen Job-Zustand, `cancel` bricht ihn ab (siehe
+//! `crate::cancel`-Moduldoku zum Verhältnis zu `stop`), `retry` fordert einen
+//! terminal `Failed`/`Cancelled`-Job über `JobStore::retry` erneut an, mit
+//! typisiertem Fehler statt stillem Requeue, sobald die Retry-Policy erschöpft
+//! ist (siehe `crate::retry`-Moduldoku). Keine der fünf trägt ein `ModelTool`
+//! außer `cancel` (siehe die jeweilige Moduldoku): das laufende Modell darf
+//! eine gegen seine eigenen Werkzeugaufrufe gerichtete Genehmigungs-
+//! entscheidung nicht selbst treffen.
 //! `uia-model`/`uia-provider` are structural twins of `model`/`provider` that
 //! read/write `uia_model`/`uia_provider` instead of
 //! `default_model`/`default_provider`, so the UIA can pin its own selection
@@ -114,11 +129,14 @@ pub mod add_workdir;
 pub mod agent;
 pub mod analyze;
 pub mod approval;
+pub mod approve;
 pub mod attach;
 pub mod bug_report;
+pub mod cancel;
 pub mod compact;
 pub(crate) mod config_util;
 pub mod context_proposal;
+pub mod deny;
 pub mod diff;
 pub mod effort;
 pub mod explore;
@@ -136,6 +154,8 @@ pub mod provider;
 pub mod ps;
 pub mod quit;
 pub mod research;
+pub mod retry;
+pub mod review;
 pub mod skills;
 pub mod status;
 pub mod stop;
@@ -189,7 +209,7 @@ fn compact_unavailable_output() -> OpOutput {
     OpOutput::from(crate::compact::COMPACT_HINT.to_owned())
 }
 
-/// Registriert alle 28 in dieser Crate definierten Kern-Operationen in der Registry.
+/// Registriert alle 33 in dieser Crate definierten Kern-Operationen in der Registry.
 ///
 /// # Beschreibung
 /// Fügt der übergebenen [`OperationRegistry`] eine `Arc<dyn Operation>`-Instanz
@@ -197,7 +217,7 @@ fn compact_unavailable_output() -> OpOutput {
 /// `help, status, quit, new, work, ps, attach, stop, diff, agent, skills,
 /// plugins, model, provider, uia-model, uia-provider, permissions, compact,
 /// memory, effort, mode, context-proposal, approval.pending, approval.resolve,
-/// add-workdir, export, usage, bug-report`.
+/// add-workdir, export, usage, bug-report, approve, deny, review, cancel, retry`.
 ///
 /// Die Reihenfolge steuert nur die `iter()`-Reihenfolge und den Fallback-Namens-
 /// Vorschlag; die eigentliche Auflösung erfolgt über `find_by_name` /
@@ -217,7 +237,7 @@ fn compact_unavailable_output() -> OpOutput {
 ///
 /// let mut registry = OperationRegistry::new();
 /// harw_ops::register_all(&mut registry);
-/// assert_eq!(registry.len(), 28);
+/// assert_eq!(registry.len(), 33);
 /// assert!(registry.find_by_name("help").is_some());
 /// assert!(registry.find_by_command("/uia-provider").is_some());
 /// assert!(registry.find_by_command("/uia-model").is_some());
@@ -231,9 +251,14 @@ fn compact_unavailable_output() -> OpOutput {
 /// assert!(registry.find_by_command("/export").is_some());
 /// assert!(registry.find_by_command("/usage").is_some());
 /// assert!(registry.find_by_command("/bug-report").is_some());
+/// assert!(registry.find_by_command("/approve").is_some());
+/// assert!(registry.find_by_command("/deny").is_some());
+/// assert!(registry.find_by_command("/review").is_some());
+/// assert!(registry.find_by_command("/cancel").is_some());
+/// assert!(registry.find_by_command("/retry").is_some());
 /// ```
 pub fn register_all(registry: &mut OperationRegistry) {
-    let ops: [Arc<dyn Operation>; 28] = [
+    let ops: [Arc<dyn Operation>; 33] = [
         Arc::new(help::HelpOperation),
         Arc::new(status::StatusOperation),
         Arc::new(quit::QuitOperation),
@@ -287,6 +312,14 @@ pub fn register_all(registry: &mut OperationRegistry) {
         // Moduldoku): reine Session-/Diagnose-Fläche wie `usage` oben,
         // deshalb Grundausstattung statt Planungsfläche.
         Arc::new(bug_report::BugReportOperation),
+        // Genehmigungs-Befehlsgruppe (Interaktionsvertrag §2.3/§4): siehe
+        // Moduldoku, Abschnitt „Op-Set", und die jeweiligen Modul-Dokus für
+        // Umfang und bekannte Lücken gegenüber dem Vertrag.
+        Arc::new(approve::ApproveOperation),
+        Arc::new(deny::DenyOperation),
+        Arc::new(review::ReviewOperation),
+        Arc::new(cancel::CancelOperation),
+        Arc::new(retry::RetryOperation),
     ];
     for op in ops {
         registry.register(op);
@@ -592,10 +625,10 @@ mod tests {
     }
 
     #[test]
-    fn register_all_adds_twenty_eight_operations() {
+    fn register_all_adds_thirty_three_operations() {
         let mut reg = OperationRegistry::new();
         register_all(&mut reg);
-        assert_eq!(reg.len(), 28);
+        assert_eq!(reg.len(), 33);
     }
 
     #[test]
@@ -678,6 +711,11 @@ mod tests {
             "/add-workdir",
             "/export",
             "/usage",
+            "/approve",
+            "/deny",
+            "/review",
+            "/cancel",
+            "/retry",
         ] {
             assert!(
                 reg.find_by_command(path).is_some(),
@@ -756,6 +794,12 @@ mod tests {
             "add-workdir",
             "export",
             "usage",
+            "bug-report",
+            "approve",
+            "deny",
+            "review",
+            "cancel",
+            "retry",
             "plan",
             "goal",
             "explore",
@@ -804,8 +848,8 @@ mod tests {
         register_all(&mut reg);
         assert_eq!(
             reg.len(),
-            28,
-            "first register_all must produce exactly 28 ops"
+            33,
+            "first register_all must produce exactly 33 ops"
         );
 
         // Attempt to register HelpOperation a second time via the fallible path.
@@ -819,8 +863,8 @@ mod tests {
         // Registry must not have grown — the rejected op was not inserted.
         assert_eq!(
             reg.len(),
-            28,
-            "registry must stay at 28 after a rejected duplicate"
+            33,
+            "registry must stay at 33 after a rejected duplicate"
         );
     }
 }

@@ -1290,7 +1290,16 @@ mod tests {
     fn test_existing_explore_node_is_not_duplicated() {
         let mut explore = research_node("t-1-explore", PlanNodeStatus::Draft);
         explore.kind = PlanNodeKind::Explore;
-        let plan = plan_with(vec![coding_node("t-1", PlanNodeStatus::Draft), explore]);
+        // The explore node must already be wired up as `t-1`'s dependency
+        // (fully linked, not a half-state per rule c / G-038): only then does
+        // "must not propose a duplicate" mean "no InsertExplore step at all".
+        // Without this edge, `t-1-explore` existing-but-unlinked is exactly
+        // the half-state InsertExplore is documented to repair (see
+        // `PlanController::reconcile` rule c) — asserting zero steps there
+        // would reintroduce the silent-deadlock G-038 was written to avoid.
+        let mut coding = coding_node("t-1", PlanNodeStatus::Draft);
+        coding.dependencies = vec![TaskId::new("t-1-explore")];
+        let plan = plan_with(vec![coding, explore]);
         let config = exploration_config();
 
         let steps = PlanController::reconcile(input(&plan, &[], &[], &config, None));

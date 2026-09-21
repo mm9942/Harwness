@@ -137,7 +137,7 @@ use std::sync::Arc;
 use harw_operations::context::{OpContext, ServiceMap};
 use harw_operations::operation::PermissionTier;
 use harw_runtime::{RuntimeAssembly, ServiceSurface};
-use harw_sandbox::SandboxSpec;
+use harw_authority::SandboxSpec;
 use harw_session_store::approval::ApprovalStore;
 use harw_types::{SessionId, TurnId};
 use harw_web::events::WebEventBus;
@@ -379,7 +379,7 @@ mod tests {
     use super::*;
     use harw_operations::registry::OperationRegistry;
     use harw_runtime::EntryKind;
-    use harw_sandbox::Permission;
+    use harw_authority::Permission;
     use harw_types::Principal;
 
     // Montage aus leerem Temp-Home ohne Netz/Provider (`ModelSource::Echo`).
@@ -608,8 +608,25 @@ mod tests {
     async fn test_approval_resolve_derives_the_actor_from_peer_credentials_not_the_body() {
         use harw_operations::operation::OpInput;
         use harw_session_store::approval::ApprovalRecord;
-        use harw_types::{ApprovalActor, ItemId, ToolCallId};
+        use harw_types::{ApprovalActor, Clock, ItemId, ToolCallId};
         use jiff::Timestamp;
+
+        // Feste Testuhr (siehe `harw-types/src/clock.rs`, Modul-Doku
+        // "Serveruhr" in `harw-ops/src/approval.rs`): `resolve_approval`
+        // prüft die TTL gegen den registrierten `Arc<dyn Clock>`-Service,
+        // niemals gegen ein vom Client mitgeschicktes `resolved_at`. Ohne
+        // diesen Service fällt `server_clock` auf `SystemClock` (die echte
+        // Wanduhr) zurück — die fixe `issued_at` von 1970 wäre dann relativ
+        // zur echten Gegenwart immer abgelaufen. Der Fixture-Fehler lag
+        // also im Test, der bislang keine Uhr injizierte, nicht in der
+        // Ablaufprüfung selbst.
+        struct FixedClock(Timestamp);
+        impl Clock for FixedClock {
+            fn now(&self) -> Timestamp {
+                self.0
+            }
+        }
+        let issued_at = Timestamp::constant(1, 0);
 
         let mut registry = OperationRegistry::new();
         harw_ops::register_all(&mut registry);
@@ -628,7 +645,7 @@ mod tests {
                 actor: ApprovalActor::Operator {
                     id: "owner".to_owned(),
                 },
-                issued_at: Timestamp::constant(1, 0),
+                issued_at,
             })
             .expect("issue succeeds against a fresh store");
 
@@ -642,8 +659,11 @@ mod tests {
                 .find_by_name("approval.resolve")
                 .expect("approval.resolve ist registriert"),
         );
+        let mut services = registry_map(&registry);
+        let clock: Arc<dyn Clock> = Arc::new(FixedClock(issued_at));
+        services.insert(clock);
         let ctx = web_op_context(
-            registry_map(&registry),
+            services,
             Some(&approval_store),
             &root,
             &approver,

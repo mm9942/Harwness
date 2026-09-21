@@ -155,9 +155,15 @@ impl ProcessPermitLedger {
         let expires_at = Instant::now()
             .checked_add(ttl)
             .ok_or(ProcessPermitError::TtlOverflow)?;
-        let mut state = self.state.lock().map_err(|_| ProcessPermitError::Poisoned)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProcessPermitError::Poisoned)?;
         let id = ProcessPermitId(state.next_id);
-        state.next_id = state.next_id.checked_add(1).ok_or(ProcessPermitError::IdExhausted)?;
+        state.next_id = state
+            .next_id
+            .checked_add(1)
+            .ok_or(ProcessPermitError::IdExhausted)?;
         state.permits.insert(
             id,
             StoredPermit {
@@ -181,7 +187,10 @@ impl ProcessPermitLedger {
         actual: &ProcessPermitRequest,
     ) -> Result<GrantedProcessPermit, ProcessPermitError> {
         actual.validate()?;
-        let mut state = self.state.lock().map_err(|_| ProcessPermitError::Poisoned)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProcessPermitError::Poisoned)?;
         let expired = state
             .permits
             .get(&id)
@@ -228,9 +237,14 @@ impl ProcessPermitLedger {
     /// absichtlich exakt; keine Präfix- oder Teiltreffer dürfen fremde Sessions
     /// beeinflussen.
     pub fn revoke_session(&self, session: &str) -> Result<usize, ProcessPermitError> {
-        let mut state = self.state.lock().map_err(|_| ProcessPermitError::Poisoned)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProcessPermitError::Poisoned)?;
         let before = state.permits.len();
-        state.permits.retain(|_, permit| permit.request.session != session);
+        state
+            .permits
+            .retain(|_, permit| permit.request.session != session);
         Ok(before - state.permits.len())
     }
 }
@@ -292,20 +306,38 @@ mod tests {
     use super::*;
 
     fn request(environment: ProcessEnvironment) -> ProcessPermitRequest {
-        request_for_workspace("local-session", "host-process-worker@1", "tmux ls", Path::new("/workspace"), environment)
+        request_for_workspace(
+            "local-session",
+            "host-process-worker@1",
+            "tmux ls",
+            Path::new("/workspace"),
+            environment,
+        )
     }
 
     #[test]
     fn single_execution_is_bound_and_consumed() {
         let ledger = ProcessPermitLedger::default();
         let request = request(ProcessEnvironment::LocalHost);
-        let id = ledger.issue_after_local_approval(request.clone(), HostApprovalScope::SingleExecution, Duration::from_secs(30)).unwrap();
+        let id = ledger
+            .issue_after_local_approval(
+                request.clone(),
+                HostApprovalScope::SingleExecution,
+                Duration::from_secs(30),
+            )
+            .unwrap();
         assert!(ledger.authorize(id, &request).is_ok());
-        assert_eq!(ledger.authorize(id, &request), Err(ProcessPermitError::AlreadyConsumed));
+        assert_eq!(
+            ledger.authorize(id, &request),
+            Err(ProcessPermitError::AlreadyConsumed)
+        );
 
         let mut changed = request;
         changed.command = "tmux kill-server".to_owned();
-        assert_eq!(ledger.authorize(id, &changed), Err(ProcessPermitError::BindingMismatch));
+        assert_eq!(
+            ledger.authorize(id, &changed),
+            Err(ProcessPermitError::BindingMismatch)
+        );
     }
 
     #[test]
@@ -313,14 +345,27 @@ mod tests {
         let ledger = ProcessPermitLedger::default();
         let strict = request(ProcessEnvironment::StrictSandbox);
         assert_eq!(
-            ledger.issue_after_local_approval(strict, HostApprovalScope::SessionLease, Duration::from_secs(30)),
+            ledger.issue_after_local_approval(
+                strict,
+                HostApprovalScope::SessionLease,
+                Duration::from_secs(30)
+            ),
             Err(ProcessPermitError::SessionLeaseRequiresHost)
         );
         let host = request(ProcessEnvironment::LocalHost);
-        let id = ledger.issue_after_local_approval(host.clone(), HostApprovalScope::SessionLease, Duration::from_secs(30)).unwrap();
+        let id = ledger
+            .issue_after_local_approval(
+                host.clone(),
+                HostApprovalScope::SessionLease,
+                Duration::from_secs(30),
+            )
+            .unwrap();
         assert!(ledger.authorize(id, &host).is_ok());
         assert!(ledger.authorize(id, &host).is_ok());
         assert_eq!(ledger.revoke_session("local-session"), Ok(1));
-        assert_eq!(ledger.authorize(id, &host), Err(ProcessPermitError::UnknownPermit));
+        assert_eq!(
+            ledger.authorize(id, &host),
+            Err(ProcessPermitError::UnknownPermit)
+        );
     }
 }

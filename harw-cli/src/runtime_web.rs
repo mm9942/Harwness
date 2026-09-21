@@ -25,12 +25,12 @@
 //! (Profil-Obergrenze); [`narrow_web_sandbox`] schneidet sie zusätzlich mit
 //! [`harw_runtime::permissions_for_tier`] auf das Tier des anfragenden Peers —
 //! die Autorität kann dadurch nur sinken, nie steigen
-//! ([`harw_sandbox::SandboxSpec::restrict`]).
+//! ([`harw_authority::SandboxSpec::restrict`]).
 //!
 //! # Typen
 //! Reine Komposition; dieses Modul definiert keine eigenen Datentypen,
 //! sondern verkettet [`Principal`], [`harw_runtime::RuntimeSpec`],
-//! [`harw_runtime::RuntimeStores`] und [`harw_sandbox::SandboxSpec`] aus den
+//! [`harw_runtime::RuntimeStores`] und [`harw_authority::SandboxSpec`] aus den
 //! Verträgen von `harw-types`, `harw-runtime` und `crate::runtime_entry`.
 //!
 //! # Nebenläufigkeit
@@ -57,7 +57,7 @@
 //! )
 //! .map_err(|error| error.to_string())?;
 //! let sandbox = crate::runtime_web::narrow_web_sandbox(&root, PermissionTier::Observer);
-//! assert!(sandbox.permissions().contains(harw_sandbox::Permission::ReadWorkspace));
+//! assert!(sandbox.permissions().contains(harw_authority::Permission::ReadWorkspace));
 //! # Ok(())
 //! # }
 //! ```
@@ -65,10 +65,10 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use harw_authority::{PermissionRequest, SandboxSpec};
 use harw_runtime::{
     EntryKind, ModelSource, PlanServices, RuntimeAssembly, RuntimeSpec, RuntimeStores,
 };
-use harw_sandbox::SandboxSpec;
 use harw_session_store::ApprovalStore;
 use harw_types::{IngressSurface, PermissionTier, Principal, PrincipalKind, SessionId, ThreadRef};
 
@@ -224,13 +224,15 @@ pub(crate) fn web_assembly(
 /// [`harw_runtime::permissions_for_tier`]`(tier)` sind.
 #[must_use]
 pub(crate) fn narrow_web_sandbox(root: &SandboxSpec, tier: PermissionTier) -> SandboxSpec {
-    root.restrict(&harw_runtime::permissions_for_tier(tier))
+    root.restrict(&PermissionRequest::from_permissions(
+        harw_runtime::permissions_for_tier(tier).iter(),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use harw_sandbox::Permission;
+    use harw_authority::Permission;
 
     const ALL_TIERS: [PermissionTier; 4] = [
         PermissionTier::Observer,

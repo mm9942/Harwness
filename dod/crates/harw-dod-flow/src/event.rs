@@ -95,6 +95,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use harw_dod_bpf::event::read_u32_le;
+use harw_dod_bpf::{TaskIdentity, WireEvent, WireEventType};
 
 use crate::error::FlowError;
 
@@ -237,6 +238,32 @@ pub struct FlowEvent {
     pub remote_port: u16,
 }
 
+/// A TCP connect emitted at the initiating task's connect hook.  The v1 body
+/// is `family:u8 | port:u16-be | address:[u8;16]`; it has no direction or
+/// protocol byte because both are fixed by the program contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpConnectEventV1 {
+    pub task: TaskIdentity,
+    pub sequence: u64,
+    pub remote_addr: IpAddr,
+    pub remote_port: u16,
+}
+
+pub fn parse_tcp_connect_v1(event: &WireEvent) -> Result<TcpConnectEventV1, FlowError> {
+    if event.event_type != WireEventType::TcpConnect || event.flags != 0 || event.payload.len() != 19 {
+        return Err(FlowError::MalformedEvent);
+    }
+    let family = event.payload[0];
+    let remote_port = u16::from_be_bytes(event.payload[1..3].try_into().map_err(|_| FlowError::MalformedEvent)?);
+    let addr: [u8; 16] = event.payload[3..19].try_into().map_err(|_| FlowError::MalformedEvent)?;
+    let remote_addr = match family {
+        4 if addr[4..].iter().all(|byte| *byte == 0) => IpAddr::V4(Ipv4Addr::from([addr[0], addr[1], addr[2], addr[3]])),
+        6 => IpAddr::V6(Ipv6Addr::from(addr)),
+        _ => return Err(FlowError::MalformedEvent),
+    };
+    Ok(TcpConnectEventV1 { task: event.task, sequence: event.sequence, remote_addr, remote_port })
+}
+
 /// Liest den Port aus dem Flow-Payload — **Network Byte Order (Big-Endian)**,
 /// anders als der Rest des Layouts.
 ///
@@ -359,6 +386,19 @@ mod tests {
     use super::{Direction, Protocol, ADDR_OFFSET, PAYLOAD_LEN};
     use crate::error::FlowError;
     use crate::event::parse_flow_payload;
+    use harw_dod_bpf::{TaskIdentity, WireEvent, WireEventType};
+
+    #[test]
+    fn v1_tcp_connect_keeps_initiating_task_and_ipv6_port() {
+        let mut payload = vec![6, 0x20, 0xfb];
+        payload.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        let event = WireEvent { event_type: WireEventType::TcpConnect, flags: 0, ktime_ns: 1, sequence: 1, task: TaskIdentity { tgid: 9, pid: 10, ppid: 8, uid: 1000, cgroup_id: 77 }, payload };
+        let parsed = super::parse_tcp_connect_v1(&event).unwrap();
+        assert_eq!(parsed.task.cgroup_id, 77);
+        assert_eq!(parsed.sequence, 1);
+        assert_eq!(parsed.remote_port, 8443);
+        assert_eq!(parsed.remote_addr, IpAddr::V6(Ipv6Addr::LOCALHOST));
+    }
 
     /// Baut einen wohlgeformten 32-Byte-Payload von Hand, ohne die
     /// Produktionsfunktion selbst zu wiederholen.

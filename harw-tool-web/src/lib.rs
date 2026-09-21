@@ -19,7 +19,7 @@
 //!
 //! 1. **Berechtigung vor Argumenten.** Jedes Tool trägt
 //!    `#[harw_macros::tool(permission = "network_access")]`; der Prolog prüft
-//!    [`harw_sandbox::Permission::NetworkAccess`] vor der Deserialisierung.
+//!    [`harw_authority::Permission::NetworkAccess`] vor der Deserialisierung.
 //! 2. **Egress-Client und -Policy.** Der HTTP-Client entsteht nur über
 //!    [`harw_egress::build_client`] (Scoped-Resolver, Adressklassen, kein
 //!    Proxy, keine Auto-Redirects). Die [`harw_egress::EgressPolicy`] wird über

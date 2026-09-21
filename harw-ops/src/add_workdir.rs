@@ -27,17 +27,21 @@
 //!   Zelle und (bestes Bemühen) aus der Projekt-Datei.
 //!
 //! # Fehlermeldungen
-//! Alle Validierungsfehler ([`harw_sandbox::ExtraRootError`]) tragen bereits
-//! deutsche Klartext-Begründungen (`/` abgelehnt, `$HOME` abgelehnt, Vorfahre
-//! des Projekt-Roots, maximal 8 Wurzeln) — diese Operation reicht sie
-//! unverändert als [`OpError::InvalidArguments`] durch.
+//! [`harw_sandbox::ExtraRootError`] liefert englische Klartext-Begründungen
+//! (`/` abgelehnt, `$HOME` abgelehnt, Vorfahre des Projekt-Roots, maximal 8
+//! Wurzeln). Diese Operation reicht sie grundsätzlich unverändert als
+//! [`OpError::InvalidArguments`] durch, übersetzt aber
+//! [`harw_sandbox::ExtraRootError::UserHome`] in eine deutsche Meldung, die
+//! ausdrücklich das Home-Verzeichnis nennt — der wichtigste der abgelehnten
+//! Fälle, weil ein zu weit gefasster zusätzlicher Root hier am ehesten
+//! versehentlich (statt bewusst) angefragt wird.
 
 use std::path::PathBuf;
 
 use harw_config::{ConfigWriter, SettingScope};
 use harw_macros::operation;
 use harw_operations::{FromRawArgs, OpContext, OpError, OpOutput};
-use harw_sandbox::ExtraRootsCell;
+use harw_sandbox::{ExtraRootError, ExtraRootsCell};
 
 /// Meldung für den Fall, dass keine [`ExtraRootsCell`] registriert ist.
 pub(crate) const NO_EXTRA_ROOTS_CELL: &str = crate::permissions::NO_EXTRA_ROOTS_CELL;
@@ -136,7 +140,7 @@ fn add_one_workdir(ctx: &OpContext, path_str: &str, save: bool) -> Result<OpOutp
 
     let added = cell
         .add(&candidate, save, primary_root, user_home.as_deref())
-        .map_err(|error| OpError::InvalidArguments(format!("/add-workdir: {error}")))?;
+        .map_err(|error| OpError::InvalidArguments(format_extra_root_error(&error)))?;
 
     let mut note = String::new();
     if save {
@@ -166,6 +170,33 @@ fn add_one_workdir(ctx: &OpContext, path_str: &str, save: bool) -> Result<OpOutp
         candidate.display(),
         verb
     )))
+}
+
+/// Formatiert einen [`ExtraRootError`] für die Fehlermeldung des Aufrufers.
+///
+/// # Beschreibung
+/// [`ExtraRootError::UserHome`] wird in eine deutsche Meldung übersetzt, die
+/// den abgelehnten Pfad ausdrücklich als Home-Verzeichnis benennt — die
+/// eigene `Display`-Implementierung von `harw-sandbox` liefert dafür nur
+/// englischen Text. Alle anderen Varianten laufen unverändert per `Display`
+/// durch (siehe Moduldoku „Fehlermeldungen").
+///
+/// # Arguments
+/// - `error` (`&ExtraRootError`): der von [`ExtraRootsCell::add`]
+///   zurückgegebene Validierungsfehler.
+///
+/// # Returns
+/// Der `/add-workdir: …`-präfigierte Meldungstext für
+/// [`OpError::InvalidArguments`].
+fn format_extra_root_error(error: &ExtraRootError) -> String {
+    match error {
+        ExtraRootError::UserHome { path } => format!(
+            "/add-workdir: '{}' ist das Home-Verzeichnis des Nutzers und kann nicht als \
+             zusätzliches Arbeitsverzeichnis registriert werden.",
+            path.display()
+        ),
+        other => format!("/add-workdir: {other}"),
+    }
 }
 
 /// Entfernt `path_str` aus der Sitzungs-Zelle und, bestes Bemühen, aus der
@@ -208,10 +239,8 @@ mod tests {
     use super::{AddWorkdirArgs, add_workdir};
     use crate::testutil::toks;
     use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
-    use harw_sandbox::{
-        ExtraRootsCell, Permission, PermissionSet, SandboxSpec, WorkspaceRegistration,
-        WorkspaceRegistry,
-    };
+    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_sandbox    ::ExtraRootsCell;
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -334,9 +363,9 @@ mod tests {
     async fn add_workdir_rejects_user_home() {
         let (ctx, root) = test_context(true);
         let home = std::env::var_os("HOME").map(PathBuf::from);
-        std::fs::remove_dir_all(&root).ok();
         let Some(home) = home else {
             // Kein $HOME in dieser Umgebung gesetzt — Test übersprungen statt fälschlich zu bestehen.
+            std::fs::remove_dir_all(&root).ok();
             return;
         };
         let result = add_workdir(
@@ -346,9 +375,17 @@ mod tests {
             },
         )
         .await;
+        // Erst NACH dem Aufruf aufräumen: `validate_extra_root`
+        // (`harw-sandbox/src/extra_roots.rs`) kanonisiert `primary_root` (den
+        // hier von `root` abgeleiteten Workspace-Root) noch VOR dem
+        // Home-Vergleich. Ein vorzeitiges `remove_dir_all(&root)` ließ diese
+        // Kanonisierung mit einem `ExtraRootError::Io` scheitern, bevor der
+        // `UserHome`-Zweig je erreicht wurde — die Meldung enthielt dann nie
+        // "Home-Verzeichnis", unabhängig von `format_extra_root_error`.
+        std::fs::remove_dir_all(&root).ok();
         match result {
             Err(OpError::InvalidArguments(message)) => {
-                assert!(message.contains("Home-Verzeichnis"));
+                assert!(message.contains("Home-Verzeichnis"), "{message}");
             }
             other => panic!("expected invalid arguments, got {other:?}"),
         }

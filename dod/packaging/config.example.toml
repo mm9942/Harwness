@@ -1,0 +1,28 @@
+schema_version = 1
+mode = "observe"
+
+# Installation never selects a profile implicitly. Add exactly one explicit
+# selection before running `make -C dod enable`.
+# active_profile = "selected-services"
+
+[profiles.selected-services]
+scope = "cgroups"
+cgroup_paths = [
+  "/system.slice/example-a.service",
+  "/system.slice/example-b.service",
+]
+include_descendants = true
+sensors = ["exec", "tcp-connect"]
+egress_allow_cidrs = []
+
+[profiles.user-workloads]
+scope = "cgroups"
+cgroup_paths = ["/user.slice"]
+include_descendants = true
+sensors = ["exec", "tcp-connect"]
+egress_allow_cidrs = []
+
+[profiles.host]
+scope = "host"
+sensors = ["exec", "tcp-connect"]
+egress_allow_cidrs = []

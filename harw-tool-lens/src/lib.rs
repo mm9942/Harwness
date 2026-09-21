@@ -18,7 +18,7 @@
 //! das `harw-tools/src/sandbox_guard.rs` für jede andere Grenze verwendet.
 //!
 //! **Der Befund, den dieser Knoten mitbringt:** zum Zeitpunkt dieses Knotens
-//! kennt [`harw_sandbox::SandboxSpec`] keinen Operator-Begriff -- es gibt
+//! kennt [`harw_authority::SandboxSpec`] keinen Operator-Begriff -- es gibt
 //! keine Berechtigung und kein Feld, aus dem sich ableiten ließe, ob ein
 //! Aufrufer `"operator-only"`-Sichtbarkeit sehen darf. [`derive_read_scope`]
 //! liefert deshalb **immer** genau [`harw_lens::DEFAULT_VISIBILITY`] --

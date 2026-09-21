@@ -1,5 +1,12 @@
 //! Prozessstart-Ereignisse über eBPF: wer hat was gestartet (Knoten **AW7-01b**).
 //!
+//! > **V1-Betriebsvertrag.** Der ältere `ProcmonSensor`/`RawBpfEvent`-Pfad
+//! > und sein `argv_digest` bleiben nur für Fixture-Kompatibilität bestehen.
+//! > Produktionscode erstellt [`procmon_contracts`] und verarbeitet
+//! > `ExecEventV1` sowie `ProcessExitEventV1` aus versionierten Wire-Records.
+//! > V1 sammelt kein argv und erfindet deshalb auch keinen Digest:
+//! > [`ArgvCapture::NotCollected`] ist die vollständige Aussage dazu.
+//!
 //! # Verantwortungsbereich
 //! Diese Crate deutet das art-spezifische `payload` eines
 //! Prozessstart-Ereignisses aus dem Ringpuffer ([`event::parse_exec_payload`])
@@ -52,9 +59,9 @@
 //! Code sichtbar und testbar macht, mit welcher `harw_dod_bpf::BpfProgramSpec`
 //! ein echter Lader das Programm dieser Geschwister-Crate laden würde. Diese
 //! Crate hatte bislang kein Gegenstück: ein Aufrufer musste sich Programmart
-//! und Anknüpfungspunkt (`syscalls:sys_enter_execve`, ein
+//! und Anknüpfungspunkt (`sched:sched_process_exec`, ein
 //! `harw_dod_bpf::BpfProgramKind::Tracepoint`, der wie
-//! `harw_dod_flow::FLOW_TRACEPOINT_ATTACH_POINT` ohne bereits offenen Socket
+//! `harw_dod_flow::FLOW_TCP_V4_CONNECT_ATTACH_POINT` ohne bereits offenen Socket
 //! auskommt) **aus dieser Moduldoku abschreiben**, statt sie aus Code zu
 //! übernehmen — derselbe Fehlertyp wie K40, wo eine Sicherheitsregel ihre
 //! Einstufung aus Textmustern statt aus einem Typ rekonstruierte.
@@ -142,28 +149,68 @@ pub mod event;
 pub mod sensor;
 
 pub use error::{ProcmonError, ProcmonResult};
-pub use event::{parse_exec_payload, ExecEvent};
+pub use event::{
+    parse_exec_payload, parse_exec_v1, parse_process_exit_v1, ArgvCapture,
+    ExecutablePathCapture, ExecEvent, ExecEventV1, ProcessExitEventV1,
+    EXEC_PATH_TRUNCATED, EXEC_PATH_UNAVAILABLE,
+};
 pub use sensor::{ProcmonSensor, DEFAULT_READ_TIMEOUT};
 
 /// Der Kernel-Tracepoint, an den das eBPF-Programm dieser Crate angehängt
 /// wird.
 ///
 /// # Description
-/// `syscalls:sys_enter_execve` feuert beim Eintritt in den
+/// `sched:sched_process_exec` feuert nach dem erfolgreichen
 /// `execve`-Systemaufruf und trägt bereits Prozesskontext und den
 /// auszuführenden Pfad — alles, was [`event::parse_exec_payload`] deutet
 /// (siehe dortige Moduldoku für die vollständige Byte-Tabelle). Ein
 /// `harw_dod_bpf::BpfProgramKind::Tracepoint` darauf braucht keinen bereits
 /// offenen Socket oder ein anderes vorab beschafftes Objekt — derselbe Grund,
-/// aus dem `harw_dod_flow::FLOW_TRACEPOINT_ATTACH_POINT` einen Tracepoint statt
+/// aus dem `harw_dod_flow::FLOW_TCP_V4_CONNECT_ATTACH_POINT` einen BTF-Hook statt
 /// eines `SocketFilter` wählt (siehe dortige Moduldoku, Abschnitt „Warum ein
 /// Tracepoint").
 ///
 /// # Examples
 /// ```rust
-/// assert_eq!(harw_dod_procmon::PROCMON_TRACEPOINT_ATTACH_POINT, "syscalls:sys_enter_execve");
+/// assert_eq!(harw_dod_procmon::PROCMON_TRACEPOINT_ATTACH_POINT, "sched:sched_process_exec");
 /// ```
-pub const PROCMON_TRACEPOINT_ATTACH_POINT: &str = "syscalls:sys_enter_execve";
+pub const PROCMON_TRACEPOINT_ATTACH_POINT: &str = harw_dod_bpf::EXEC_ATTACH_POINT;
+/// Exact symbol of the successful-exec C BPF program.
+pub const PROCMON_EXEC_PROGRAM_NAME: &str = harw_dod_bpf::EXEC_PROGRAM_NAME;
+/// Exact symbol of the process-exit C BPF program.
+pub const PROCMON_EXIT_PROGRAM_NAME: &str = harw_dod_bpf::EXIT_PROGRAM_NAME;
+pub const PROCMON_EXIT_TRACEPOINT_ATTACH_POINT: &str = harw_dod_bpf::EXIT_ATTACH_POINT;
+
+/// Build the two profile-bound v1 process contracts.  A production caller
+/// must use these with `RealBpfLoader::load_contract`; the older
+/// `procmon_program_spec` remains a fixture description only because it has
+/// no scope argument and therefore cannot safely attach a real object.
+#[must_use]
+pub fn procmon_contracts(
+    sensor: harw_types::SensorId,
+    exec_source: harw_dod_bpf::BpfProgramSource,
+    exit_source: harw_dod_bpf::BpfProgramSource,
+    scope: harw_dod_bpf::BpfScope,
+) -> [harw_dod_bpf::BpfObjectContract; 2] {
+    [
+        harw_dod_bpf::BpfObjectContract::new(
+            sensor.clone(),
+            PROCMON_EXEC_PROGRAM_NAME,
+            harw_dod_bpf::BpfProgramKind::Tracepoint,
+            PROCMON_TRACEPOINT_ATTACH_POINT,
+            exec_source,
+            scope.clone(),
+        ),
+        harw_dod_bpf::BpfObjectContract::new(
+            sensor,
+            PROCMON_EXIT_PROGRAM_NAME,
+            harw_dod_bpf::BpfProgramKind::Tracepoint,
+            PROCMON_EXIT_TRACEPOINT_ATTACH_POINT,
+            exit_source,
+            scope,
+        ),
+    ]
+}
 
 /// Baut die Programmbeschreibung, mit der ein echter `harw_dod_bpf::BpfLoader`
 /// das eBPF-Programm dieser Crate laden würde.
@@ -198,7 +245,7 @@ pub const PROCMON_TRACEPOINT_ATTACH_POINT: &str = "syscalls:sys_enter_execve";
 ///     BpfProgramSource::Embedded(Cow::Borrowed(b"\0asm".as_slice())),
 /// );
 /// assert_eq!(spec.kind, BpfProgramKind::Tracepoint);
-/// assert_eq!(spec.attach_point, "syscalls:sys_enter_execve");
+/// assert_eq!(spec.attach_point, "sched:sched_process_exec");
 /// ```
 #[must_use]
 pub fn procmon_program_spec(
@@ -215,7 +262,7 @@ pub fn procmon_program_spec(
 
 #[cfg(test)]
 mod tests {
-    use super::{procmon_program_spec, PROCMON_TRACEPOINT_ATTACH_POINT};
+    use super::{procmon_contracts, procmon_program_spec, PROCMON_TRACEPOINT_ATTACH_POINT};
 
     #[test]
     fn test_procmon_program_spec_uses_a_tracepoint_at_the_documented_attach_point() {
@@ -230,11 +277,25 @@ mod tests {
 
         assert_eq!(spec.kind, harw_dod_bpf::BpfProgramKind::Tracepoint);
         assert_eq!(spec.attach_point, PROCMON_TRACEPOINT_ATTACH_POINT);
-        assert_eq!(spec.attach_point, "syscalls:sys_enter_execve");
+        assert_eq!(spec.attach_point, "sched:sched_process_exec");
     }
 
     #[test]
     fn test_procmon_tracepoint_attach_point_is_the_documented_syscall_tracepoint() {
-        assert_eq!(PROCMON_TRACEPOINT_ATTACH_POINT, "syscalls:sys_enter_execve");
+        assert_eq!(PROCMON_TRACEPOINT_ATTACH_POINT, "sched:sched_process_exec");
+    }
+
+    #[test]
+    fn v1_contracts_select_successful_exec_and_exit_with_one_scope() {
+        use std::borrow::Cow;
+
+        let contracts = procmon_contracts(
+            harw_types::SensorId::from_str("procmon-0"),
+            harw_dod_bpf::BpfProgramSource::Embedded(Cow::Borrowed(b"exec")),
+            harw_dod_bpf::BpfProgramSource::Embedded(Cow::Borrowed(b"exit")),
+            harw_dod_bpf::BpfScope::Host,
+        );
+        assert_eq!(contracts[0].program_name, "dod_sched_process_exec");
+        assert_eq!(contracts[1].program_name, "dod_sched_process_exit");
     }
 }

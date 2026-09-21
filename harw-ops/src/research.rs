@@ -48,6 +48,8 @@
 //! assert_eq!(args.question.as_deref(), Some("welche MSRV"));
 //! ```
 
+use harw_agent_dsl::roles::AgentRoleId;
+use harw_core_bridge::OpContextCoreExt;
 use harw_macros::operation;
 use harw_operations::args::join_all_optional;
 use harw_operations::{FromRawArgs, OpContext, OpError, OpOutput};
@@ -438,11 +440,27 @@ async fn research_deps(ctx: &OpContext, args: ResearchArgs) -> Result<OpOutput, 
     )
 )]
 async fn research_web(ctx: &OpContext, args: ResearchArgs) -> Result<OpOutput, OpError> {
+    // UIA-Chat-Sessions (`organizational_role == AgentRoleId::UserInterface`)
+    // dürfen keine `Worker`-Rolle spawnen — `researcher-web` trägt
+    // `organizational_role = AgentRoleId::Worker`, den die Spawn-Matrix für
+    // UIA-Aufrufer nicht zulässt. Für diese Aufrufer weicht der Kind-Lauf
+    // deshalb auf `UIA_EXPLORER` aus (`organizational_role =
+    // AgentRoleId::UiaWorker`, eigenes read-only Tool-Profil inklusive
+    // `web.fetch`, deckt denselben Bedarf ab). Kann die Rolle der
+    // aufrufenden Session nicht ermittelt werden, bleibt das bisherige
+    // Verhalten unverändert.
+    let role = match ctx
+        .managed_spawner()
+        .and_then(|spawner| spawner.session_organizational_role(ctx.session_id()))
+    {
+        Some(AgentRoleId::UserInterface) => role_names::UIA_EXPLORER,
+        _ => role_names::RESEARCHER_WEB,
+    };
     run_research(
         ctx,
         args,
         &ResearchProfile {
-            role: role_names::RESEARCHER_WEB,
+            role,
             slug_prefix: "research-web",
             actor: ACTOR_RESEARCH_WEB,
             expected_output: WEB_EXPECTED_OUTPUT,
@@ -466,7 +484,7 @@ mod tests {
     use harw_operations::{FromRawArgs, OpContext, OpError, Operation, Surface};
     use harw_registry_defaults::profile::role_names;
     use harw_research::SourceClass;
-    use harw_sandbox::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::sync::atomic::{AtomicU64, Ordering};
 

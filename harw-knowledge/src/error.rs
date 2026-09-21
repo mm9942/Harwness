@@ -11,7 +11,8 @@
 //! Spec: `docs/design/knowledge-surfaces.md` §8.1 (verbatim message variants),
 //! extended with `MalformedFrontmatter`, `IllegalTransition` and `Json` for the
 //! pure-logic bodies this skeleton implements (frontmatter split, §6.3 card
-//! transitions, index cache).
+//! transitions, index cache), and with `ClaimRequiresApproval`/`TomlEncode`/
+//! `TomlDecode` for the §6.4 approval gate and `board.toml` persistence.
 
 use harw_macros::HarwError;
 
@@ -57,6 +58,14 @@ pub enum KnowledgeError {
     #[msg("illegal card transition from {from} to {to}")]
     IllegalTransition { from: String, to: String },
 
+    /// A `claim` (Ready -> Running, §6.3) on a worker lane whose bound role
+    /// carries `RiskLevel::High` or above was attempted without a passed-in
+    /// `ApprovalProof` resolving to a positive `ReviewDecision` (§6.4). This
+    /// crate never contacts an approval service itself — the caller must
+    /// already hold the proof before calling `claim`.
+    #[msg("card {card_id} cannot claim on a lane with risk level {risk_level}: a positive approval proof is required")]
+    ClaimRequiresApproval { card_id: String, risk_level: String },
+
     /// A `ContextProposal` was read with a kind other than `ContextProposal`
     /// (AW5-09) — `from_artifact` refuses to guess a mismatched payload.
     #[msg("artifact {id} has kind {actual}, expected {expected}")]
@@ -100,7 +109,22 @@ pub enum KnowledgeError {
     #[from]
     Json(serde_json::Error),
 
+    /// `kanban/boards/<board-id>/board.toml` (de)serialization failure —
+    /// encode side (§1.2, §6 persistence).
+    #[from]
+    TomlEncode(toml::ser::Error),
+
+    /// `kanban/boards/<board-id>/board.toml` (de)serialization failure —
+    /// decode side (§1.2, §6 persistence).
+    #[from]
+    TomlDecode(toml::de::Error),
+
     /// A governed-work operation (claim/charge) failed in `harw-job-runtime`.
     #[from]
     Job(harw_job_runtime::JobError),
+
+    /// Zeitarithmetik hat den von `jiff` darstellbaren Bereich überschritten
+    /// (z. B. beim Berechnen des Diary-Rollup-Cutoffs aus `retention_days`).
+    #[from]
+    Time(jiff::Error),
 }

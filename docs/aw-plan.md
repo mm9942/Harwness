@@ -1119,6 +1119,12 @@ Kette zu hängen, die niemand betritt, verschöbe das Problem nur.
 werden repoweit **nirgends produktiv aufgerufen**. Drei unverdrahtete
 Fassaden — nicht durch dieses Programm entstanden, aber durch es gefunden.
 
+> **Ist-Stand (2026-09)**: `McpRequestContext::from_trusted_ingress` hat
+> inzwischen einen Produktionsaufrufer (`harw-mcp-server/src/transport.rs:780`)
+> — diese Fassade gilt als geschlossen. `JobAdmissionService::admit` und
+> `PlanJobBridge::admit_ready_nodes` bleiben ohne Produktionsaufrufer, also
+> weiterhin offen.
+
 ### K31 · Fünf Fehler im Contract-Master, von den Agenten gefunden
 
 Alle fünf wurden von Agenten gemeldet statt umgangen, und alle sind zentral
@@ -1248,14 +1254,14 @@ des Bauens und noch offen:
 
 | Befund | Quelle | Stand (nachgeprüft) |
 |---|---|---|
-| `TraceContext` hat keinen Wurzel-Erzeuger | AW1-01b | **erledigt** — `harw-cli/src/chat.rs::new_one_shot_root_trace` und das Gegenstück in `job_worker.rs` erzeugen die Wurzel; `child_controller.rs:120` leitet Kindspannen daraus ab. Die Kette ist von einem echten Eintrittspunkt aus geschlossen. |
+| `TraceContext` hat keinen Wurzel-Erzeuger | AW1-01b | **erledigt** — `harw-cli/src/chat.rs::new_one_shot_root_trace` und das Gegenstück in `job_worker.rs` erzeugen die Wurzel; `child_controller.rs:120` leitet Kindspannen daraus ab. Die Kette ist von einem echten Eintrittspunkt aus geschlossen. **Ist-Stand (2026-09)**: bestätigt — `harw-runtime/src/trace.rs::new_root_trace` wird von `harw-runtime/src/assembly.rs` aufgerufen. |
 | `ContextProgram` hat keinen öffentlichen Konstruktor | AW1-03 | **verschoben, nicht geschlossen** — `ContextProgram::from_resolved_program` existiert (`executable.rs:746`). Aber **jede** Aufrufstelle liegt in `#[cfg(test)]` oder in einem Doc-Beispiel derselben Crate. Der Konstruktor fehlt nicht mehr; der Aufrufer fehlt weiterhin. |
 | `validate_patch` hat workspace-weit keinen Aufrufer | AW1-05 | **steht, und der Grund ist tiefer** (K66): nicht der Aufrufer fehlt, sondern die **Eingabe** — nirgends im Baum entsteht ein `UnifiedDiff`. Die richtige Stelle ist benannt: `harw-cli/src/job_worker.rs`, zwischen Turn-Ende und `report_plan_node_outcome`. |
 | `JobClaim` trägt `StoredJob.trace` nicht weiter | Nachzugs-Knoten | **steht, ausführlich belegt** — `job_worker.rs:376-392` dokumentiert, dass ein frisch erfundener Trace *schlechter* wäre als keiner (er behauptete eine Verwandtschaft, die nicht besteht), gibt `None` zurück und hat den Parameter bereits durchgereicht, damit ein künftiges `JobClaim.trace` nur noch anzuschließen ist. |
 | `JobAdmissionService::admit`, `admit_ready_nodes`, `McpRequestContext::from_trusted_ingress` — drei unverdrahtete Fassaden | Nachzugs-Knoten | steht (Bestand, nicht durch dieses Programm entstanden) |
 | `MetricKey` trägt keinen Beschreibungstext, `# HELP` bleibt leer | AW3-04 | steht |
 | `sensor_suite!` braucht einen zweiten Fixture-Begriff für Backend-Sensoren | K41, K48 | **steht** — K48 hat Bereichsdichtheit und „leere Quelle" getrennt, das filesystem-zentrierte Fixture-Modell bleibt |
-| `DetailMode::References` erreicht die Turn-Schleife nicht | AW5-07 | **weitgehend geschlossen** (K70, K75): `ContextProgram` trägt den `DetailMode`, `ToolExecutor::as_context_load_executor` wird in `turn_loop` aufgerufen, `contribute_v2` hat einen Produktionsaufrufer, und `harw-core/tests/detail_mode_references.rs` belegt die Auflösung über `context.load`. **Offen bleibt** der Anschluss der Montage: `Assembly::gather` hat weiterhin keinen Produktionsaufrufer, weil `gather_context` sofort auf `ContextFragment` zurückwandelt — nötig wäre `ModelRequest::with_context_budget` in `harw-core/src/model.rs`. |
+| `DetailMode::References` erreicht die Turn-Schleife nicht | AW5-07 | **geschlossen (Ist-Stand 2026-09)** — vollständig verdrahtet über `ContextProgram`: `ToolExecutor::as_context_load_executor` wird in `turn_loop` aufgerufen, `contribute_v2` hat einen Produktionsaufrufer, `harw-core/tests/detail_mode_references.rs` belegt die Auflösung über `context.load`, und `Assembly::gather` hat jetzt einen Produktionsaufrufer: `ModelRequest::with_context_program` (`harw-core/src/model.rs`) ruft `Assembly::gather` auf und wird seinerseits aus `turn_loop.rs` aufgerufen. Vormals als offen geführter Anschluss der Montage ist damit geschlossen. |
 | `harw-dod-flow` implementiert `Sensor` nicht; der einzige Konsument musste einen Adapter bauen | K52 | **behoben** (K72): `FlowSensor` implementiert `Sensor`, `observe()` bleibt als Ein-Ereignis-Schritt, aus dem `poll()` gebaut ist. Der Adapter in `harw-probe-bpf` ist dadurch überflüssig, wurde aber nicht entfernt. |
 | `harw-dod-procmon` exportiert keine zu `flow_program_spec()` symmetrische Konstante | AW7-01d | **behoben** (K72): `PROCMON_TRACEPOINT_ATTACH_POINT` und `procmon_program_spec(...)`. |
 | `SnapshotId` hat weder `Serialize`/`Deserialize` noch einen öffentlichen Konstruktor | AW5-09 | **behoben** (K76) über zwei Typen: `SnapshotId` bleibt berechnet und nur intern konstruierbar, `ReferencedSnapshotId` ist die einlesbare **Behauptung**, die erst `confirm()` in eine Identität verwandelt. Die Domänenfassung ist ein sichtbares Serde-Feld. |

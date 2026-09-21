@@ -1132,7 +1132,7 @@ mod tests {
         DEFAULT_ORGANIZATION_ID, RESEARCH_CLAN_ID, ResolvedOrganization, clan_cell,
         default_organization,
     };
-    use harw_sandbox::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_authority::{PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};

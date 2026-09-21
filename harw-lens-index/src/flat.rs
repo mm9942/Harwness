@@ -229,6 +229,44 @@ impl FlatIndex {
         self.entries.is_empty()
     }
 
+    /// Die Embedding-Länge dieses Index, falls bekannt.
+    ///
+    /// # Description
+    /// Von [`FlatIndex::build`]/[`FlatIndex::load`] aus dem ersten Eintrag
+    /// festgestellt und gegen jeden weiteren geprüft (siehe
+    /// [`dimension_of`]). Ein Konsument, der nur wissen will, wie viele
+    /// Dimensionen dieser Index tatsächlich trägt (z. B. eine
+    /// Status-/Introspektionsausgabe wie `harw lens status`), muss dafür
+    /// nicht `manifest()` heranziehen — die Dimension ist kein
+    /// [`harw_lens_types::IndexManifest`]-Feld, sondern eine Eigenschaft der
+    /// tatsächlich gespeicherten Einträge.
+    ///
+    /// # Returns
+    /// `Some(dimension)`, wenn dieser Index mindestens einen Eintrag hält;
+    /// `None` bei einem leeren Index.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_lens_index::FlatIndex;
+    /// use harw_lens_types::{IndexManifest, Locality, Metric};
+    /// use harw_types::ContentDigest;
+    ///
+    /// let manifest = IndexManifest {
+    ///     model: "m".to_owned(),
+    ///     locality: Locality::Local,
+    ///     chunker_version: 1,
+    ///     visibility: "workspace".to_owned(),
+    ///     metric: Metric::Cosine,
+    ///     source_set_digest: ContentDigest::of(b"s"),
+    /// };
+    /// let index = FlatIndex::build(manifest, Vec::new()).expect("empty corpus has no dimension");
+    /// assert_eq!(index.dimension(), None);
+    /// ```
+    #[must_use]
+    pub fn dimension(&self) -> Option<usize> {
+        self.dimension
+    }
+
     /// Speichert diesen Index unter `name` in `store`.
     ///
     /// # Description
@@ -658,6 +696,18 @@ mod tests {
         let manifest = manifest_with("m", 1, Metric::Cosine);
         let index = FlatIndex::build(manifest, Vec::new()).expect("empty corpus is always valid");
         assert!(index.is_empty());
+        assert_eq!(index.dimension(), None);
+    }
+
+    #[test]
+    fn test_dimension_reports_embedding_length_of_non_empty_index() {
+        let manifest = manifest_with("m", 1, Metric::Cosine);
+        let index = FlatIndex::build(
+            manifest,
+            vec![(chunk("a"), vec![1.0, 0.0, 0.0]), (chunk("b"), vec![0.0, 1.0, 0.0])],
+        )
+        .expect("uniform dimension is accepted");
+        assert_eq!(index.dimension(), Some(3));
     }
 
     #[test]

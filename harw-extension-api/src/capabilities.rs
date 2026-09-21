@@ -2,7 +2,7 @@
 
 use harw_catalog::AgentSuggestions;
 use harw_context::ContextCeiling;
-use harw_sandbox::SandboxSpec;
+use harw_authority::SandboxSpec;
 use harw_types::{SessionId, ToolCallId};
 use jiff::Timestamp;
 use std::future::Future;

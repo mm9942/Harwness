@@ -17,9 +17,7 @@ use harw_core::context_budget::Assembly;
 use harw_core::history::ConversationHistory;
 use harw_core::history_tail::{render_history_tail, HISTORY_TAIL_GUARANTEED_GROUPS};
 use harw_lens_types::{BudgetSpec, BytesOverFour};
-use harw_sandbox::{
-    Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-};
+use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
 use harw_tools::context_load::{ContextLoadExecutor, InMemoryReferenceStore};
 use harw_tools::{ToolCall, ToolExecutionContext, ToolExecutor, ToolOutput};
 use harw_types::{SessionId, TenantId, ToolCallId, WorkspaceId};

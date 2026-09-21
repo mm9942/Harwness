@@ -22,11 +22,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use harw_agent_dsl::roles::AgentRoleId;
 use harw_core::{ChildRegistryFactory, EchoModelProvider, InMemoryStateStore, StateStore};
 use harw_extension_api::allow_rules::AllowRuleSet;
 use harw_extension_api::approval_mode::ApprovalModeCell;
 use harw_extension_api::contributors::ApprovalHandlerKind;
-use harw_extension_api::{ApprovalDecision, ApprovalHandler, ExtFuture, ToolCall};
+use harw_extension_api::{AgentSpawner, ApprovalDecision, ApprovalHandler, ExtFuture, ToolCall};
 use harw_operations::operation::Surface;
 use harw_registry_defaults::profile::role_names;
 use harw_runtime::approval::{ApprovalChain, AskResolutionPolicy, DEFAULT_POLICY_LABEL};
@@ -965,4 +966,140 @@ fn the_fixture_project_is_a_directory() {
     let project: &Path = fixture.project.as_path();
     assert!(project.is_dir());
     assert!(fixture.home.is_dir());
+}
+
+// The next two tests close the end-to-end gap left by
+// `harw-core/tests/child_controller.rs` (a hand-built spawner, never a real
+// assembled run) and by this crate's own
+// `harw-registry-defaults/tests/uia_spawn_authority.rs` (registry roles,
+// never a mounted `ManagedAgentSpawner`): a UIA chat session — the real
+// production shape of `EntryKind::Tui` with an active UIA definition
+// (`write_fixture_uia`, `resolve_active_uia` in
+// `harw-runtime/src/assembly.rs`) — drives the **same** `ManagedAgentSpawner`
+// the assembled run registers as its child spawner (`RuntimeAssembly::spawner`,
+// built in `build_spawner`). This is the exact object `/explore` and
+// `/research-web` (`harw-ops/src/{explore,research}.rs::run_single_child`)
+// hand their role name to via `OpContext`/`fanout_children`.
+
+/// Builds `assembled`'s root session (precondition-verifying it as the
+/// `UserInterface` organizational role, `write_fixture_uia` sets
+/// `role = "user-interface"`) and returns the real `ManagedAgentSpawner`
+/// `/explore` / `/research-web` would use, plus a ready `SandboxSpec` and the
+/// root's own session id for building a `SpawnInput`.
+async fn uia_spawner_fixture(
+    assembled: &Assembled,
+) -> (
+    Arc<harw_core::ManagedAgentSpawner>,
+    harw_authority::SandboxSpec,
+    SessionId,
+) {
+    let (turn_events, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEventAlias>();
+    let root = assembled
+        .assembly
+        .new_root_session(
+            assembled.assembly.root_session_id().clone(),
+            assembled.events.clone(),
+            turn_events,
+            None,
+        )
+        .expect("Wurzelsitzung");
+    let organizational_role = root
+        .session
+        .spawn_context()
+        .expect("root session carries a trusted spawn context")
+        .organizational_role;
+    assert_eq!(
+        organizational_role,
+        AgentRoleId::UserInterface,
+        "precondition: the fixture UIA governs this root as UserInterface"
+    );
+
+    let spawner = Arc::clone(
+        assembled
+            .assembly
+            .spawner()
+            .expect("EntryKind::Tui mounts a BuiltinRoles spawner"),
+    );
+    let sandbox = assembled.assembly.sandbox().clone();
+    let parent = assembled.assembly.root_session_id().clone();
+    (spawner, sandbox, parent)
+}
+
+/// Builds a minimal, trusted `SpawnInput` for the given parent session.
+fn uia_child_input(parent_session_id: SessionId) -> harw_extension_api::SpawnInput {
+    harw_extension_api::SpawnInput {
+        parent_session_id,
+        handoff_call_id: ToolCallId::new(),
+        instructions: None,
+        context: serde_json::json!({"task": "uia rights-matrix probe"}),
+        ceiling: None,
+    }
+}
+
+/// Case 1 (regression, already true today): the plain
+/// `role_names::EXPLORER` / `role_names::RESEARCHER_WEB` roles that
+/// `/explore` / `/research-web`
+/// (`harw-ops/src/{explore,research}.rs::run_single_child`) pass today
+/// resolve to organizational role `Worker` (`build_spawner`'s
+/// `definitions.get(role).map_or(Worker, role())`), which
+/// `harw_agent_dsl::roles::can_spawn` never lets a `UserInterface` caller
+/// spawn. A UIA session calling `/explore` or `/research-web` fails here —
+/// this is the design conflict as it stands before the sibling fix, proven
+/// against the same `ManagedAgentSpawner` a mounted `EntryKind::Tui` run
+/// actually registers, not a hand-built stand-in.
+#[tokio::test]
+async fn uia_root_session_is_denied_the_plain_explore_and_research_roles() {
+    let fixture = fixture();
+    let assembled = assemble(EntryKind::Tui, &fixture).expect("montiert");
+    let (spawner, sandbox, parent) = uia_spawner_fixture(&assembled).await;
+
+    for plain_role in [role_names::EXPLORER, role_names::RESEARCHER_WEB] {
+        let rejected = spawner
+            .spawn_child(
+                plain_role,
+                uia_child_input(parent.clone()),
+                sandbox.clone(),
+                None,
+            )
+            .await
+            .expect_err("a UIA root session must never spawn a plain Worker-role child");
+        assert_eq!(
+            rejected.message,
+            "no delegation capability is available for this request",
+            "role '{plain_role}'"
+        );
+    }
+}
+
+/// Case 2 (the fix; needs the sibling change to compile):
+/// `role_names::UIA_EXPLORER` / `role_names::UIA_WRITER` resolve to
+/// organizational role `UiaWorker`, which `can_spawn(UserInterface,
+/// UiaWorker)` already permits at the matrix level
+/// (`harw-agent-dsl/src/roles.rs::test_can_spawn_uia_to_uia_worker_ok`).
+/// `build_spawner` needs **no** change of its own to admit them once
+/// `role_names::ALL` includes both names and an embedded TOML backs each
+/// with `role = "uia-worker"` — it iterates `role_names::ALL`
+/// unconditionally (`harw-runtime/src/assembly.rs::build_spawner`). This
+/// test is the proof that registration is sufficient, once
+/// `harw-ops/src/{explore,research}.rs` redirects a UIA caller to these
+/// role names.
+#[tokio::test]
+async fn uia_root_session_is_admitted_its_uia_explorer_and_uia_writer_specializations() {
+    let fixture = fixture();
+    let assembled = assemble(EntryKind::Tui, &fixture).expect("montiert");
+    let (spawner, sandbox, parent) = uia_spawner_fixture(&assembled).await;
+
+    for uia_role in [role_names::UIA_EXPLORER, role_names::UIA_WRITER] {
+        spawner
+            .spawn_child(
+                uia_role,
+                uia_child_input(parent.clone()),
+                sandbox.clone(),
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("a UIA root session must admit its '{uia_role}' specialization: {error:?}")
+            });
+    }
 }

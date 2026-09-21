@@ -13,9 +13,7 @@ use harw_extension_api::{
     ExtensionRegistryBuilder, SpawnFuture, SpawnInput, ToolExecutor, ToolExecutorFuture, ToolName,
     ToolOutput, ToolProvider, ToolSpec,
 };
-use harw_sandbox::{
-    Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-};
+use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
 use harw_session_store::ApprovalStore;
 use harw_tools::schema::JsonSchema;
 use harw_tools::spec::FunctionToolSpec;

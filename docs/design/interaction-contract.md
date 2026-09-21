@@ -279,6 +279,44 @@ grammar, up from the TUI annex's headline count of 56 (which undercounted
 the knowledge surfaces at one line each and left both catalog domains as
 flag-based placeholders rather than full subcommand sets).
 
+### 2.6 Ist-Stand (2026-09) — im Code vorhanden, Vertrag nachgezogen
+
+Die folgenden Commands existieren bereits in `harw-ops/src/`, sind in diesem
+Vertrag aber (noch) nicht erfasst. Je eine Zeile, Zweck aus dem
+Modul-Doc-Kommentar:
+
+- **`/analyze`** — Bottom-up-Analyse eines Workspace über Analyst-Kindagenten,
+  fan-out von Crate-Ebene zu Crate-Ebene mit abschließender Synthese.
+- **`/add-workdir`** — gibt zusätzliche Arbeitsverzeichnisse für die laufende
+  Sitzung frei (registriert sie in der geteilten `ExtraRootsCell`).
+- **`/bug-report`** — löst manuell einen lokalen Bug-Report aus und schreibt
+  ihn über `harw_ops::bug_report::write_bug_report`.
+- **`/diff`** — read-only Git-Diff-Operation, delegiert ausschließlich an
+  `shell.exec` über einen gehärteten `GitDiffPlan`.
+- **`/explore`** — stellt eine gebundene Frage an ein read-only Kind
+  (`explorer`) und validiert das Ergebnis gegen den `ResearchFinding`-Vertrag.
+- **`/context-proposal`** — Prüffläche für `ContextProposal`: auflisten,
+  ansehen, annehmen, ablehnen (Annehmen markiert nur, ändert kein
+  Kontextprogramm).
+- **`/goal`** — Ziel-Operation über `harw-plan`; beschreibt den gewünschten
+  Endzustand, `achieve`/`abandon` sind command-only (nicht modellseitig).
+- **`/mode`** — Anzeige und Wechselabsicht des Interaktionsmodus (`chat`,
+  `plan`, `explore`, `work`, `shell`); TUI-only, kein Modell-Tool, damit ein
+  Modell nicht sein eigenes Werkzeug-Ceiling anheben kann.
+- **`/research-deps`** und **`/research-web`** — gebundene Recherche durch
+  read-only Kinder; gleiche Struktur, unterscheiden sich nur in Kindrolle und
+  Vorgabe-Quellklassen.
+- **`/plan`** — Plan-Operation über `harw-plan`/`harw-plan-bridge`, Command
+  und Modell-Tool, jede Mutation läuft über `PlanStore::apply`.
+- **`/usage`** — zeigt aufgezeichnete Token-Nutzung und Wächter-Ereignisse der
+  aktuellen Sitzung aus dem `StateStore`-Snapshot.
+- **`/stop`** — bricht einen laufenden Job kontrolliert ab; Command und
+  Modell-Tool mit `approval = "always"`.
+- **`/permissions`** — Übersicht über Workspace-Identität, Sandbox-Rechte,
+  Freigabemodus und Allow-/Deny-Regeln.
+- **`/effort`** — setzt die providerneutrale Reasoning-Stärke für nachfolgende
+  Turns; operator-only, TUI-only, kein Modell-Tool.
+
 ---
 
 ## 3. `$` prefix — reserved, unassigned for v1

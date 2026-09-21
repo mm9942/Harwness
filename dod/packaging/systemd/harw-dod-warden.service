@@ -1,0 +1,23 @@
+[Unit]
+Description=HARW DoD Warden (disabled enforcement service)
+Requires=harw-dod-warden.socket
+After=harw-dod-warden.socket
+ConditionPathExists=@SYSCONFDIR@/warden.enable
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=@LIBEXECDIR@/harw-warden --cgroup-root /sys/fs/cgroup
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+ReadOnlyPaths=/sys/fs/cgroup
+
+# No [Install] section: installation and the observation target never enable
+# this service. The condition is an additional explicit operator opt-in.

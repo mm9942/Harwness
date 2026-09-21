@@ -95,3 +95,71 @@ Die bestehende Rollenmatrix und die exakte
 fail-closed Admission-Grenze bestehen. Folgeschritte ersetzen die freie
 rollenbasierte Modell-Eingabe durch capability-identifizierte Requests und
 projizieren die sichtbare Menge in Tool-Schemas und Kontextprogramme.
+
+## Root vs. Sub-Orchestrator: positionell, nicht kategorisch
+
+Projektsetzung (bindende Vorgabe des Projektinhabers, nicht Gegenstand
+dieser Analyse):
+
+> Ein Root-Orchestrator ist ein Orchestrator, der nur deshalb so heißt, weil
+> es unter ihm Sub-Orchestratoren gibt.
+
+Die Unterscheidung `RootOrchestrator`/`ChildOrchestrator` ist damit
+**positionell** (Ort im Baum: besitzt der Agent selbst einen Orchestrator-
+Parent, oder ist er die Wurzel des aktuellen Auftrags), nicht **kategorisch**
+(keine grundverschiedene Rechteklasse mit Fähigkeiten, die der jeweils
+anderen Rolle grundsätzlich verwehrt sind).
+
+### Aktuelle Abweichungen von der Zielarchitektur
+
+Der heutige Code-Stand behandelt beide Rollen an drei Stellen als
+kategorisch verschieden. Das sind keine Fehler und keine Rechtfertigung der
+Trennung — nur der dokumentierte Ist-Zustand gegenüber der oben zitierten
+Zielsetzung:
+
+1. **Spawn-Matrix — `AgentSteward` nur von `RootOrchestrator`.**
+   `harw-agent-dsl/src/roles.rs`, Funktion `can_spawn` (ab Zeile 92): Zeile
+   106 gewährt `(RootOrchestrator, AgentSteward) => true`, der
+   `ChildOrchestrator`-Block (Zeilen 111–113) trägt jedoch keinen
+   `AgentSteward`-Arm und fällt auf `(ChildOrchestrator, _) => false`
+   zurück. Ein `ChildOrchestrator` kann `AgentSteward` also nicht spawnen,
+   selbst wenn er positionell als Root für seinen eigenen Teilbaum
+   fungiert.
+2. **Unterschiedliche Standard-Reasoning-Effort-Gewichte.**
+   `harw-core/src/child_controller.rs`, `struct RoleEffortWeights` (ab Zeile
+   848) mit `impl Default for RoleEffortWeights` (Zeilen 857–868):
+   `root_orchestrator: High`, `root_orchestrator_with_subs: Medium`,
+   `sub_orchestrator: Medium`. `RoleEffortWeights::for_child` (Zeilen
+   886–913) liest bei `ChildOrchestrator` immer `self.sub_orchestrator`
+   (fest `Medium`), während `RootOrchestrator` nur dann auf `Medium`
+   absinkt, wenn er selbst Sub-Orchestrator-Freigaben trägt
+   (`has_child_orchestrator_grants`). Ein `ChildOrchestrator` ohne eigene
+   Sub-Orchestrator-Freigaben bekommt damit dasselbe Gewicht wie ein
+   `RootOrchestrator` MIT solchen Freigaben — nicht dasselbe wie ein
+   `RootOrchestrator` ohne sie.
+3. **`ChildOrchestrator` hat keine eingebaute Instanz.** Unter
+   `harw-registry-defaults/agents/` trägt aktuell kein Agent
+   `role = "child-orchestrator"` als tatsächliche Rollenzuweisung. Der
+   String taucht nur in zwei Begründungskommentaren auf —
+   `harw-registry-defaults/agents/families/security/security.toml:236` und
+   `harw-registry-defaults/agents/organization/default.toml:109` — beide
+   erklären ausdrücklich, warum die dort beschriebene Leader-Rolle
+   (`analyst` bzw. `context-steward`) stattdessen `role = "worker"` trägt
+   und nicht `role = "child-orchestrator"`. Die Rolle existiert damit nur im
+   Typsystem (`AgentRoleId::ChildOrchestrator`) und in der Spawn-Matrix,
+   nicht in einer gelebten Konfiguration.
+
+### Kein Umbau in dieser Welle
+
+Eine Zusammenführung zu einer einzigen Orchestrator-Rolle mit
+Positionsmerkmal (statt zwei getrennten `AgentRoleId`-Varianten) ist ein
+**separates, noch nicht begonnenes Umbau-Vorhaben**. Es berührt die
+Spawn-Matrix (`can_spawn`) und ihre Tests in `harw-agent-dsl/src/roles.rs`
+direkt sowie `RoleEffortWeights` in `harw-core/src/child_controller.rs`.
+
+Dieses Vorhaben wird bewusst **nicht** parallel zum aktuell laufenden
+Spawn-Delegations-Fix umgesetzt: Liefen beide Änderungen gleichzeitig, wäre
+bei einem auftretenden Problem nicht mehr zuordenbar, ob die Ursache im
+Delegations-Fix oder im Rollen-Umbau liegt. Die Vereinheitlichung folgt als
+eigener, isoliert testbarer Schritt, sobald der Spawn-Delegations-Fix
+abgeschlossen und verifiziert ist.

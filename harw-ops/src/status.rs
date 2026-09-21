@@ -43,7 +43,7 @@ pub struct StatusArgs {}
 /// # Beschreibung
 /// Liest Session-ID, Turn-ID und Sandbox-Informationen aus dem [`OpContext`]
 /// und formatiert sie als lesbare mehrzeilige Textausgabe. Der Berechtigungs-
-/// zähler ergibt sich aus der Anzahl der im [`harw_sandbox::PermissionSet`]
+/// zähler ergibt sich aus der Anzahl der im [`harw_authority::PermissionSet`]
 /// enthaltenen Einträge.
 ///
 /// # Argumente

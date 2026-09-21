@@ -26,9 +26,7 @@ use harw_core::activation::{SessionActivation, ToolProfile};
 use harw_core::mode::InteractionMode;
 use harw_core::session::{AgentSession, SpawnContext};
 use harw_extension_api::ExtensionRegistryBuilder;
-use harw_sandbox::{
-    Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-};
+use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
 use harw_tools::ToolName;
 use harw_types::{AgentRole, SessionId, TenantId, WorkspaceId};
 use std::path::PathBuf;

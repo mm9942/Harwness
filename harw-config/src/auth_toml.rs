@@ -138,7 +138,24 @@ pub struct CredentialEntry {
     /// Menschenlesbares Label zur Unterscheidung von Einträgen.
     #[serde(default)]
     pub label: Option<String>,
-    /// Auswahlpriorität (höher = bevorzugt); Standard `0`.
+    /// Auswahlpriorität für die Runtime-Auswahl unter den Pool-Einträgen:
+    /// **aufsteigend** sortiert probiert (`0` zuerst = am meisten
+    /// bevorzugt), bei Gleichstand gewinnt die Reihenfolge in der Datei
+    /// (siehe [`AuthConfig::credential_pool_ordered`]). Standard `0` — neue,
+    /// per Onboarding angehängte Einträge landen damit automatisch am Ende
+    /// gleich-priorisierter Einträge, ohne bestehende Priorisierungen zu
+    /// verdrängen.
+    ///
+    /// Wichtig: `priority` ordnet nur die Pool-Einträge **untereinander**.
+    /// Das primäre Credential — `provider.auth` (die einzelne `SecretRef`
+    /// in `providers/<name>.toml`), bei Anthropic ersatzweise dessen
+    /// implizite Umgebungs-Auflösung — wird von `harw-provider-http`
+    /// immer zuerst versucht, unabhängig von jeder hier gesetzten
+    /// `priority`; der Pool liefert ausschließlich Failover-Kandidaten
+    /// dahinter (siehe `harw_provider_http::credential_pool`-Moduldoku).
+    /// Nur wenn `provider.auth` fehlt (und bei Anthropic auch die implizite
+    /// Auflösung keinen Treffer liefert), wird der nach `priority`
+    /// niedrigste Pool-Eintrag selbst zum primären Credential.
     #[serde(default)]
     pub priority: u32,
     /// Optionale Basis-URL, die diesem Credential zugeordnet ist.
@@ -159,6 +176,56 @@ pub struct AuthConfig {
     /// priorisierte Provider-Credentials.
     #[serde(default)]
     pub credential_pool: std::collections::HashMap<String, Vec<CredentialEntry>>,
+}
+
+impl AuthConfig {
+    /// Liefert die `credential_pool`-Einträge eines Providers in
+    /// Auswahlreihenfolge: **aufsteigend** nach [`CredentialEntry::priority`]
+    /// sortiert (`0` zuerst), bei Gleichstand stabil in der Reihenfolge, in
+    /// der die Einträge in der TOML-Datei stehen (`Vec::sort_by_key` ist
+    /// stabil).
+    ///
+    /// Aufrufer (z. B. `harw-provider-http`) nutzen dies, um bei mehreren
+    /// Credentials für denselben Provider (z. B. mehrere `openai`- oder
+    /// `cloudflare`-Schlüssel) deterministisch zu wählen, welcher zuerst
+    /// versucht wird, und welcher als Nächstes an der Reihe ist, wenn der
+    /// aktuell aktive Eintrag ausfällt (Failover).
+    ///
+    /// # Arguments
+    /// - `provider` (`&str`): Providername, wie er auch als TOML-Array-Name
+    ///   in `[[credential_pool.<provider>]]` erscheint.
+    ///
+    /// # Returns
+    /// Eine leere `Vec`, wenn `provider` keinen Pool besitzt; sonst die
+    /// Referenzen in Auswahlreihenfolge.
+    ///
+    /// # Examples
+    /// ```rust
+    /// use harw_config::AuthConfig;
+    ///
+    /// let toml_src = r#"
+    ///     [[credential_pool.openai]]
+    ///     secret = "env:OPENAI_KEY_B"
+    ///     priority = 5
+    ///
+    ///     [[credential_pool.openai]]
+    ///     secret = "env:OPENAI_KEY_A"
+    /// "#;
+    /// let cfg: AuthConfig = toml::from_str(toml_src).expect("valid auth.toml");
+    /// let ordered = cfg.credential_pool_ordered("openai");
+    /// assert_eq!(ordered[0].secret.as_ref_string(), "env:OPENAI_KEY_A");
+    /// assert_eq!(ordered[1].secret.as_ref_string(), "env:OPENAI_KEY_B");
+    /// ```
+    #[must_use]
+    pub fn credential_pool_ordered(&self, provider: &str) -> Vec<&CredentialEntry> {
+        let mut entries: Vec<&CredentialEntry> = self
+            .credential_pool
+            .get(provider)
+            .map(|pool| pool.iter().collect())
+            .unwrap_or_default();
+        entries.sort_by_key(|entry| entry.priority);
+        entries
+    }
 }
 
 #[cfg(test)]
@@ -291,5 +358,41 @@ mod tests {
         "#;
 
         assert!(toml::from_str::<AuthConfig>(toml_src).is_err());
+    }
+
+    #[test]
+    fn test_credential_pool_ordered_sorts_ascending_by_priority() {
+        let toml_src = r#"
+            [[credential_pool.openai]]
+            secret = "env:OPENAI_KEY_HIGH_PRIORITY_NUMBER"
+            priority = 10
+
+            [[credential_pool.openai]]
+            secret = "env:OPENAI_KEY_DEFAULT_A"
+
+            [[credential_pool.openai]]
+            secret = "env:OPENAI_KEY_DEFAULT_B"
+        "#;
+        let cfg: AuthConfig = toml::from_str(toml_src).unwrap();
+        let ordered = cfg.credential_pool_ordered("openai");
+        // Aufsteigend nach priority (0 vor 10); bei Gleichstand (0 == 0)
+        // gewinnt die Datei-Reihenfolge (A vor B) — stabile Sortierung.
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|entry| entry.secret.as_ref_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "env:OPENAI_KEY_DEFAULT_A".to_owned(),
+                "env:OPENAI_KEY_DEFAULT_B".to_owned(),
+                "env:OPENAI_KEY_HIGH_PRIORITY_NUMBER".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_credential_pool_ordered_empty_for_unknown_provider() {
+        let cfg = AuthConfig::default();
+        assert!(cfg.credential_pool_ordered("openai").is_empty());
     }
 }

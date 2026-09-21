@@ -109,7 +109,7 @@
 //! [`FlowSensor`] ist `Send + Sync + Debug` (Anforderung von
 //! `harw_dod_signals::Sensor`): `SensorHandle<Bound>`,
 //! `Box<dyn harw_dod_bpf::BpfLoader>`, `harw_dod_bpf::BpfHandle`,
-//! `harw_sandbox::NetworkScope` und `std::time::Duration` sind alle
+//! `harw_authority::NetworkScope` und `std::time::Duration` sind alle
 //! `Send + Sync`. `poll` nimmt `&self` und führt keine innere
 //! Veränderlichkeit — konkurrierende Polls auf demselben Sensor sind sicher
 //! (auch wenn der gehaltene Lader selbst innere Veränderlichkeit einsetzen
@@ -129,7 +129,7 @@
 //! ```rust,ignore
 //! use crate::sensors::{build_flow_sensor, build_procmon_sensor};
 //! use harw_dod_bpf::BpfProgramSource;
-//! use harw_sandbox::NetworkScope;
+//! use harw_authority::NetworkScope;
 //! use harw_types::SensorId;
 //! use std::borrow::Cow;
 //!
@@ -155,7 +155,7 @@ use harw_dod_cap::{Bound, Capability, ReadScope, SensorError, SensorHandle};
 use harw_dod_flow::FlowError;
 use harw_dod_procmon::ProcmonSensor;
 use harw_dod_signals::{Sensor, SensorReading};
-use harw_sandbox::NetworkScope;
+use harw_authority::NetworkScope;
 use harw_types::SensorId;
 use jiff::Timestamp;
 
@@ -246,7 +246,7 @@ pub fn build_procmon_sensor(
 ///   Sensor seine Ereignisse meldet.
 /// - `source` (`harw_dod_bpf::BpfProgramSource`): woher der Programmrumpf
 ///   kommt.
-/// - `scope` (`harw_sandbox::NetworkScope`): der Zielbereich, den
+/// - `scope` (`harw_authority::NetworkScope`): der Zielbereich, den
 ///   `harw_dod_flow::observe` gegen jede beobachtete Verbindung prüft.
 ///
 /// # Returns
@@ -291,7 +291,7 @@ impl FlowSensor {
     ///   über die [`Sensor::poll`] Rohereignisse liest.
     /// - `bpf_handle` (`harw_dod_bpf::BpfHandle`): der Griff eines bereits
     ///   erfolgreich geladenen Programms.
-    /// - `scope` (`harw_sandbox::NetworkScope`): die Melderegel-Eingabe für
+    /// - `scope` (`harw_authority::NetworkScope`): die Melderegel-Eingabe für
     ///   `harw_dod_flow::observe`.
     ///
     /// # Returns
@@ -448,7 +448,7 @@ mod tests {
     use harw_dod_bpf::{BpfError, BpfProgramSource};
     use harw_dod_cap::{Capability, SensorError};
     use harw_dod_signals::{EventKind, Sensor};
-    use harw_sandbox::{EgressTarget, NetworkScope};
+    use harw_authority::{EgressTarget, NetworkScope};
     use harw_types::SensorId;
     use jiff::Timestamp;
 

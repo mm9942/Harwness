@@ -1,0 +1,12 @@
+# Declarative inputs for the standalone C BPF build.
+# The target is deliberately fixed: v1 multibyte wire fields are little endian.
+schema_version = 1
+bpf_target = "bpfel"
+vmlinux_btf = "/sys/kernel/btf/vmlinux"
+wire_abi_version = 1
+
+[objects]
+exec = { source = "src/exec.bpf.c", program = "dod_sched_process_exec", attach = "sched:sched_process_exec" }
+exit = { source = "src/exit.bpf.c", program = "dod_sched_process_exit", attach = "sched:sched_process_exit" }
+tcp_v4 = { source = "src/tcp_v4_connect.bpf.c", program = "dod_tcp_v4_connect", attach = "tcp_v4_connect" }
+tcp_v6 = { source = "src/tcp_v6_connect.bpf.c", program = "dod_tcp_v6_connect", attach = "tcp_v6_connect" }

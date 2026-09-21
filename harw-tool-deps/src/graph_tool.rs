@@ -8,7 +8,7 @@
 //! wird hier nicht berührt (das ist `source_tool.rs`).
 //!
 //! # Sicherheitskontrakt
-//! - Permission: [`harw_sandbox::Permission::ReadWorkspace`], geprüft vom
+//! - Permission: [`harw_authority::Permission::ReadWorkspace`], geprüft vom
 //!   Makro-Prolog vor der Deserialisierung der Argumente.
 //! - Ein optionales `root`-Argument wird **nie** direkt verwendet, sondern über
 //!   `WorkspaceBinding::resolve_existing` aufgelöst; damit sind `../`-Traversal
@@ -242,7 +242,7 @@ async fn deps_graph(
 mod tests {
     use super::*;
     use crate::test_support::{block_on, mini_workspace, sandbox_context, tool_call};
-    use harw_sandbox::Permission;
+    use harw_authority::Permission;
     use harw_tools::ToolExecutor as _;
     use std::fs;
 

@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+harw-authority = { path = "../harw-authority" }
 # W5 N-WEB: HTTP-Client und Egress-Policy ausschließlich aus harw-egress
 # (Scoped-Resolver, Adressklassen, keine Auto-Redirects, kein Proxy).
 harw-egress = { path = "../harw-egress" }

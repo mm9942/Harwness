@@ -32,7 +32,9 @@ pub use error::{JobRuntimeError, JobRuntimeResult};
 pub use job::{Job, JobKind, JobState};
 pub use lease::{Lease, LeaseToken};
 pub use retry::RetryPolicy;
-pub use stored::{JobCancellation, JobClaim, JobCompletion, JobOutcome, JobScope, StoredJob};
+pub use stored::{
+    JobCancellation, JobClaim, JobCompletion, JobOutcome, JobScope, ReclaimOutcome, StoredJob,
+};
 
 /// Re-export of the shared work identifier so consumers can write
 /// `harw_job_runtime::WorkId` (knowledge-surfaces §6.1, §8.1). It is the *same*

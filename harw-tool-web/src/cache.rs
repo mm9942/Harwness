@@ -36,7 +36,7 @@
 //! ```rust
 //! use std::path::Path;
 //! use harw_egress::EgressPolicy;
-//! use harw_sandbox::NetworkScope;
+//! use harw_authority::NetworkScope;
 //! use harw_tool_web::cache::{CacheScope, cache_key, cache_path};
 //!
 //! let policy = EgressPolicy::new(vec!["docs.rs".into()], false).unwrap();
@@ -47,7 +47,7 @@
 
 use crate::error::{WebToolError, WebToolResult};
 use harw_fsutil::{AtomicWriteOptions, OpenMode, ensure_private_regular, open_nofollow, write_atomic};
-use harw_sandbox::{EgressTarget, NetworkScope};
+use harw_authority::{EgressTarget, NetworkScope};
 use harw_tools::ToolExecutionContext;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, DirBuilder, Permissions};
@@ -114,7 +114,7 @@ impl CacheScope {
     ///
     /// # Examples
     /// ```rust
-    /// use harw_sandbox::NetworkScope;
+    /// use harw_authority::NetworkScope;
     /// use harw_tool_web::cache::CacheScope;
     ///
     /// let a = CacheScope::new("t1", "w", &NetworkScope::empty());

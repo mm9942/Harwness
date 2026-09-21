@@ -87,7 +87,8 @@ pub mod code_graph {
 }
 
 pub mod sandbox {
-    //! Re-exports of `harw-sandbox` (Berechtigungen, Sandbox-Spezifikation, Netzbereich).
+    //! Re-exports of sandbox backends and their authority contract.
+    pub use harw_authority::{Permission, SandboxSpec};
     pub use harw_sandbox::*;
 }
 

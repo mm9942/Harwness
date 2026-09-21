@@ -30,14 +30,18 @@ pub use confidence::Confidence;
 pub use digest::ContentDigest;
 pub use error::{ImpactAssessmentError, InvalidDigest, InvalidId};
 pub use ids::{
-    ActionId, ApprovalActor, BaselineId, CgroupId, ChannelId, FindingId, HostId, ItemId, PeerId,
-    SensorId, SessionId, TenantId, ThreadId, ThreadRef, ToolCallId, TurnId, WorkId, WorkspaceId,
+    ActionId, ApprovalActor, ApprovalId, BaselineId, CgroupId, ChannelId, FindingId, HostId,
+    ItemId, PeerId, SensorId, SessionId, TenantId, ThreadId, ThreadRef, ToolCallId, TurnId,
+    WorkId, WorkspaceId,
 };
 pub use impact::{ImpactAssessment, ImpactConfidence, ImpactDomain, ImpactSeverity};
 pub use principal::{IngressSurface, PermissionTier, Principal, PrincipalKind};
 pub use provider_ids::{AgentName, CustomerId, ModelId, ModelName, ProviderId, ProviderName};
 pub use reasoning::ReasoningEffort;
-pub use roles::{AgentRole, MessagePhase, ReviewDecision, RiskLevel};
+pub use roles::{
+    APPROVAL_TIMEOUT_REASON, AgentRole, DEFAULT_APPROVAL_TIMEOUT, MessagePhase, ReviewDecision,
+    RiskLevel,
+};
 pub use usage::TokenUsage;
 
 #[cfg(test)]
@@ -65,6 +69,7 @@ mod tests {
         assert_public_fallible_id_api_rejects_blank!(TenantId);
         assert_public_fallible_id_api_rejects_blank!(WorkspaceId);
         assert_public_fallible_id_api_rejects_blank!(ThreadRef);
+        assert_public_fallible_id_api_rejects_blank!(ApprovalId);
         assert_public_fallible_id_api_rejects_blank!(ProviderId);
         assert_public_fallible_id_api_rejects_blank!(ProviderName);
         assert_public_fallible_id_api_rejects_blank!(ModelId);

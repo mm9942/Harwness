@@ -133,6 +133,12 @@ pub struct Baseline {
     pub id: ArtifactId,
     /// Human-readable description of what this baseline characterizes.
     pub title: String,
+    /// Metric this baseline establishes an expected range for.
+    pub metric: String,
+    /// Inclusive lower bound of the expected metric range.
+    pub min: f64,
+    /// Inclusive upper bound of the expected metric range.
+    pub max: f64,
     /// Epistemic distance of the evidence this baseline was derived from
     /// (`harw_dod_signals::Hardness`).
     pub hardness: Hardness,
@@ -155,12 +161,18 @@ impl Baseline {
     pub fn new(
         id: ArtifactId,
         title: impl Into<String>,
+        metric: impl Into<String>,
+        min: f64,
+        max: f64,
         hardness: Hardness,
         evidence: SecurityEvidence,
     ) -> Self {
         Self {
             id,
             title: title.into(),
+            metric: metric.into(),
+            min,
+            max,
             hardness,
             evidence,
             status: PalaceStatus::Provisional,
@@ -201,7 +213,7 @@ impl Baseline {
     ///
     /// # Description
     /// See module doc, section "Why `Baseline` converts...". Copies
-    /// `title`/`hardness`/`evidence`/`tags` unchanged, formats `id` via its
+    /// `title`/metric range/`hardness`/`evidence`/`tags` unchanged, formats `id` via its
     /// `Display` impl (matching `harw_dod_rules::baseline::Baseline::new`'s
     /// `impl std::fmt::Display` parameter), and maps `status` one-for-one
     /// onto `harw_dod_rules::baseline::PalaceStatus`'s matching variant —
@@ -215,6 +227,9 @@ impl Baseline {
         harw_dod_rules::baseline::Baseline {
             id: self.id.to_string(),
             title: self.title.clone(),
+            metric: self.metric.clone().into(),
+            min: self.min,
+            max: self.max,
             hardness: self.hardness,
             evidence: self.evidence.clone(),
             status: match self.status {
@@ -261,6 +276,9 @@ mod tests {
         let baseline = Baseline::new(
             ArtifactId::new("baseline/example"),
             "example baseline",
+            "cpu-load",
+            0.0,
+            100.0,
             Hardness::Observed,
             evidence(),
         );
@@ -273,6 +291,9 @@ mod tests {
         let mut baseline = Baseline::new(
             ArtifactId::new("baseline/example"),
             "example baseline",
+            "cpu-load",
+            0.0,
+            100.0,
             Hardness::Observed,
             evidence(),
         );
@@ -290,6 +311,9 @@ mod tests {
         let mut baseline = Baseline::new(
             ArtifactId::new("baseline/example"),
             "example baseline",
+            "cpu-load",
+            0.0,
+            100.0,
             Hardness::Observed,
             evidence(),
         );
@@ -308,6 +332,9 @@ mod tests {
         let mut baseline = Baseline::new(
             ArtifactId::new("baseline/example"),
             "example baseline",
+            "cpu-load",
+            0.0,
+            100.0,
             Hardness::Observed,
             evidence(),
         );
@@ -319,6 +346,9 @@ mod tests {
 
         assert_eq!(rule_baseline.id, "baseline/example");
         assert_eq!(rule_baseline.title, "example baseline");
+        assert_eq!(rule_baseline.metric, "cpu-load");
+        assert_eq!(rule_baseline.min, 0.0);
+        assert_eq!(rule_baseline.max, 100.0);
         assert_eq!(rule_baseline.evidence, evidence());
         assert_eq!(
             rule_baseline.status,
@@ -335,6 +365,9 @@ mod tests {
         let provisional = Baseline::new(
             ArtifactId::new("baseline/a"),
             "a",
+            "cpu-load",
+            0.0,
+            100.0,
             Hardness::Observed,
             evidence(),
         )
@@ -344,6 +377,9 @@ mod tests {
         let mut established_source = Baseline::new(
             ArtifactId::new("baseline/b"),
             "b",
+            "cpu-load",
+            0.0,
+            100.0,
             Hardness::Observed,
             evidence(),
         );
@@ -355,14 +391,26 @@ mod tests {
         let mut superseded_source = Baseline::new(
             ArtifactId::new("baseline/c"),
             "c",
+            "cpu-load",
+            0.0,
+            100.0,
             Hardness::Observed,
             evidence(),
         );
         superseded_source.status = PalaceStatus::Superseded;
         let superseded = superseded_source.to_rule_baseline().status;
 
-        assert_eq!(provisional, harw_dod_rules::baseline::PalaceStatus::Provisional);
-        assert_eq!(established, harw_dod_rules::baseline::PalaceStatus::Established);
-        assert_eq!(superseded, harw_dod_rules::baseline::PalaceStatus::Superseded);
+        assert_eq!(
+            provisional,
+            harw_dod_rules::baseline::PalaceStatus::Provisional
+        );
+        assert_eq!(
+            established,
+            harw_dod_rules::baseline::PalaceStatus::Established
+        );
+        assert_eq!(
+            superseded,
+            harw_dod_rules::baseline::PalaceStatus::Superseded
+        );
     }
 }

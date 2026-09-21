@@ -2,7 +2,7 @@
 //!
 //! # Verantwortungsbereich
 //! Ein [`NetRule`] ist die Plan-Ebene-Entsprechung genau eines
-//! `harw_sandbox::EgressTarget`. Diese Crate übernimmt jede Zielart
+//! `harw_authority::EgressTarget`. Diese Crate übernimmt jede Zielart
 //! verlustfrei — keine Zielart wird in eine andere übersetzt, keine wird
 //! erweitert (siehe die Moduldoc von `crate` zum `DnsSuffix`-Fall). Die
 //! Übersetzung in echte Firewall-Mechanik bleibt Sache eines
@@ -14,7 +14,7 @@
 
 use std::net::IpAddr;
 
-use harw_sandbox::EgressTarget;
+use harw_authority::EgressTarget;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
@@ -55,7 +55,7 @@ pub enum NetRule {
     },
     /// Erlaubt ausgehende Verbindungen zu diesem Namen und allem darunter,
     /// an Punktgrenzen — identische Semantik zu
-    /// `harw_sandbox::NetworkScope::allows`. Namensbasiert — siehe
+    /// `harw_authority::NetworkScope::allows`. Namensbasiert — siehe
     /// Typ-Dokumentation.
     AllowDnsSuffix {
         /// Das aus dem Bereich ererbte DNS-Suffix.
@@ -71,7 +71,7 @@ pub enum NetRule {
 }
 
 impl From<EgressTarget> for NetRule {
-    /// Übernimmt ein `harw_sandbox::EgressTarget` unverändert als `NetRule`.
+    /// Übernimmt ein `harw_authority::EgressTarget` unverändert als `NetRule`.
     ///
     /// # Description
     /// Reine, verlustfreie Struktur-Umbenennung: kein Feld wird verändert,
@@ -99,10 +99,10 @@ impl NetRule {
     ///
     /// # Description
     /// Repliziert exakt die Vergleichsregel von
-    /// `harw_sandbox::NetworkScope::allows` für die jeweilige Zielart:
+    /// `harw_authority::NetworkScope::allows` für die jeweilige Zielart:
     /// [`Self::AllowHost`] vergleicht case-insensitiv exakt,
     /// [`Self::AllowDnsSuffix`] verlangt einen Treffer an einer Punktgrenze
-    /// (siehe [`host_matches`], das an `harw_sandbox::host_matches_suffix`
+    /// (siehe [`host_matches`], das an `harw_authority::host_matches_suffix`
     /// delegiert). [`Self::AllowCidr`] ist nie ein Host-Treffer.
     ///
     /// # Arguments
@@ -140,7 +140,7 @@ impl NetRule {
 /// Kanonische Vergleichsform eines Hostnamens.
 ///
 /// # Description
-/// Identische Regel zu `harw_sandbox::NetworkScope`s (nicht exportierter)
+/// Identische Regel zu `harw_authority::NetworkScope`s (nicht exportierter)
 /// Normalisierung: Leerzeichen entfernen, ASCII-Kleinschreibung, führende
 /// Punkte entfernen. Dupliziert, weil `harw-sandbox` diese Funktion nicht
 /// öffentlich macht — siehe die Moduldoc von `crate` zum Kopplungsrisiko.
@@ -156,14 +156,14 @@ pub(crate) fn normalize_host(host: &str) -> String {
 
 // Exakter Treffer oder Suffix-Treffer an einer Punktgrenze. `needle` muss
 // bereits über `normalize_host` normalisiert sein; `allowed` wird defensiv
-// behandelt. Delegiert an `harw_sandbox::host_matches_suffix` (Re-Export von
+// behandelt. Delegiert an `harw_authority::host_matches_suffix` (Re-Export von
 // `harw_sandbox::egress::host_matches_suffix`, `harw-sandbox/src/lib.rs:45`)
 // statt einer eigenen Kopie: zwei Kopien derselben Sicherheitsregel drifteten
 // bereits einmal auseinander (Review Z0-R2, Befund R2-02) — `harw-sandbox`
 // toleriert seit W0B-04 je einen abschließenden Punkt auf beiden Seiten
 // (`egress.rs:305-326`), diese Crate hatte das nicht nachgezogen.
 fn host_matches(allowed: &str, needle: &str) -> bool {
-    harw_sandbox::host_matches_suffix(allowed, needle)
+    harw_authority::host_matches_suffix(allowed, needle)
 }
 
 #[cfg(test)]
@@ -221,7 +221,7 @@ mod tests {
         assert!(!rule.allows_addr("10.0.0.1".parse().expect("valid IP")));
     }
 
-    /// `host_matches` delegiert an `harw_sandbox::host_matches_suffix`
+    /// `host_matches` delegiert an `harw_authority::host_matches_suffix`
     /// (`harw-sandbox/src/egress.rs:305-326`), das seit W0B-04 je einen
     /// abschließenden Punkt auf beiden Seiten toleriert (Review Z0-R2,
     /// Befund R2-02). Ein FQDN mit abschließendem Punkt aus einem

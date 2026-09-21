@@ -2,9 +2,7 @@
 //! against the real `harw_tools` types.
 
 use harw_macros::{Tool, tool};
-use harw_sandbox::{
-    Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-};
+use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
 use harw_tools::{
     JsonSchemaType, ToolCall, ToolExecutionContext, ToolExecutor, ToolName, ToolOutput, ToolSpec,
     ToolsError,

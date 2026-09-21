@@ -135,7 +135,7 @@ use harw_core::child_controller::{
     AgentBudget, ChildRegistryFactory, ChildRunResult, JoinSemantics, ManagedAgentSpawner,
 };
 use harw_core::turn_loop::{TurnInput, TurnOutcome};
-use harw_sandbox::{Permission, PermissionSet, SandboxSpec};
+use harw_authority::{Permission, PermissionRequest, PermissionSet, SandboxSpec};
 use harw_types::{ReasoningEffort, SessionId};
 use serde_json::{Value, json};
 
@@ -1782,7 +1782,10 @@ fn resolve_authority_reducer(name: &str) -> fn(&SandboxSpec) -> SandboxSpec {
 /// ein leerer Scope ist die strengere Aussage).
 fn restrict_without_network(parent: &SandboxSpec, name: &str) -> SandboxSpec {
     let ceiling = reducer_ceiling(name).unwrap_or_else(PermissionSet::empty);
-    parent.restrict_with(&ceiling, &harw_sandbox::NetworkScope::empty())
+    parent.restrict(
+        &PermissionRequest::from_permissions(ceiling.iter())
+            .with_network_scope(harw_authority::NetworkScope::empty()),
+    )
 }
 
 /// Reduziert eine Sandbox auf ausschließlich lesenden Workspace-Zugriff.
@@ -1816,9 +1819,18 @@ fn reduce_to_read_registry(parent: &SandboxSpec) -> SandboxSpec {
 /// Host-Scope des Parents bleibt als Obergrenze unverändert (`restrict`);
 /// verengt wird er von der Composition (`researcher_web_network_scope`), nie
 /// erweitert. `NetworkAccess` bleibt nur, wenn der Parent es selbst hat.
+///
+/// `PermissionRequest::from_permissions` setzt `network_scope` standardmäßig
+/// auf `NetworkScope::empty()`, und `restrict` schneidet immer nur (leer ∩
+/// irgendwas = leer). Ohne den expliziten `.with_network_scope(...)`-Aufruf
+/// unten würde dieser Reduzierer den Host-Scope des Parents also entgegen der
+/// Doku oben stets leeren, statt ihn als Obergrenze durchzureichen.
 fn reduce_to_read_network(parent: &SandboxSpec) -> SandboxSpec {
     let ceiling = reducer_ceiling("reduce_to_read_network").unwrap_or_else(PermissionSet::empty);
-    parent.restrict(&ceiling)
+    parent.restrict(
+        &PermissionRequest::from_permissions(ceiling.iter())
+            .with_network_scope(parent.network_scope().clone()),
+    )
 }
 
 // ── Fan-out ──────────────────────────────────────────────────────────────────
@@ -2371,8 +2383,9 @@ mod tests {
     use harw_core::turn_loop::TurnOutcome;
     use harw_core::{ChildLimits, InMemoryStateStore, ModelProvider, SessionManager, StateStore};
     use harw_extension_api::{AgentSpawnError, ExtensionRegistry, SpawnInput};
-    use harw_sandbox::{
-        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
+    use harw_authority::{
+        NetworkScope, Permission, PermissionSet, SandboxSpec, WorkspaceRegistration,
+        WorkspaceRegistry,
     };
     use harw_types::{ItemId, ReasoningEffort, SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
 
@@ -3392,10 +3405,14 @@ contract = "{contract}"
                 .or_else(|| reducer_ceiling("reduce_to_read_only"))
                 .expect("read_only ist bekannt");
             for granted in every_permission_subset() {
-                let parent = SandboxSpec::from_resolved(binding.clone(), granted.clone())
-                    .with_network_scope(harw_sandbox::NetworkScope::from_hosts([
-                        "docs.rs".to_owned(),
-                    ]));
+                // `SandboxSpec` hat keinen `with_network_scope`-Setter mehr: die reale API
+                // erlaubt außerhalb von harw-authority nur `NetworkScope::empty()` über
+                // `from_resolved`; ein nicht-leerer Scope entsteht ausschließlich über
+                // `PolicyBootstrap::issue` gegen eine echte Policy-Datei
+                // (harw-authority/src/lib.rs:591-599, :849). Diese Prüfung testet nur die
+                // Permission-Monotonie, nicht den Netz-Scope — der leere Scope aus
+                // `from_resolved` genügt dafür unverändert.
+                let parent = SandboxSpec::from_resolved(binding.clone(), granted.clone());
                 let child = reducer(&parent);
                 assert!(
                     child.permissions().is_subset_of(parent.permissions()),
@@ -3408,9 +3425,18 @@ contract = "{contract}"
                     "{name}: Kind {:?} überschreitet die Obergrenze {ceiling:?}",
                     child.permissions()
                 );
+                // `PermissionSet::intersection` existiert nicht (bewusst: die einzige
+                // Verengungsoperation ist `restrict`/`is_subset_of`). Der Schnitt wird
+                // hier über die öffentliche API (`iter`, `contains`, `from_policy`)
+                // nachgebildet — semantisch identisch zur Mengen-Schnittmenge.
+                let expected_intersection = PermissionSet::from_policy(
+                    granted
+                        .iter()
+                        .filter(|permission| ceiling.contains(*permission)),
+                );
                 assert_eq!(
                     child.permissions(),
-                    &granted.intersection(&ceiling),
+                    &expected_intersection,
                     "{name}: die Reduktion muss exakt der Schnitt sein"
                 );
                 assert!(
@@ -3443,21 +3469,32 @@ contract = "{contract}"
         }
     }
 
+    /// `reduce_to_read_network` reicht die Parent-Hosts unverändert durch,
+    /// während die drei anderen Reduzierer den Host-Scope leeren. Der Parent
+    /// trägt hierfür über `SandboxSpec::from_resolved_for_test` (Feature
+    /// `test-support` von `harw-authority`, nur in `[dev-dependencies]`) eine
+    /// echte, nicht-leere Host-Allow-Liste — vorher konnte von außerhalb von
+    /// `harw-authority` nur `NetworkScope::empty()` erzeugt werden, wodurch
+    /// dieser Test vakuos war (siehe git-Historie).
     #[test]
     fn test_reduce_to_read_network_never_reads_the_workspace_and_keeps_only_parent_hosts() {
         let (ctx, tmp) = make_test_ctx();
         let binding = ctx.sandbox().workspace().clone();
         std::fs::remove_dir_all(tmp).ok();
-        let parent = SandboxSpec::from_resolved(
+        let parent = SandboxSpec::from_resolved_for_test(
             binding,
             PermissionSet::from_policy(ALL_PERMISSIONS),
-        )
-        .with_network_scope(harw_sandbox::NetworkScope::from_hosts(["docs.rs".to_owned()]));
+            NetworkScope::from_hosts(["docs.rs".to_owned()]),
+        );
 
         let network = resolve_authority_reducer("reduce_to_read_network")(&parent);
         assert!(!network.permissions().contains(Permission::ReadWorkspace));
         assert!(network.permissions().contains(Permission::NetworkAccess));
         assert_eq!(network.network_scope(), parent.network_scope());
+        assert!(
+            network.network_scope().allows("docs.rs"),
+            "reduce_to_read_network muss die Parent-Hosts durchreichen"
+        );
 
         for name in ["reduce_to_read_only", "reduce_to_read_registry", "reduce_to_read_execute"] {
             let child = resolve_authority_reducer(name)(&parent);

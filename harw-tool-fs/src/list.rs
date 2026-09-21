@@ -22,7 +22,7 @@ use crate::tree::{
     HARD_MAX_ENTRIES, StopReason, WALK_DEADLINE, Workspace, normalize_relative, read_dir_limited,
 };
 use harw_fsutil::EntryType;
-use harw_sandbox::Permission;
+use harw_authority::Permission;
 use harw_tools::{
     ToolCall, ToolOutput,
     error::ToolsError,
@@ -213,9 +213,7 @@ impl ToolExecutor for FsListExecutor {
 mod tests {
     use super::*;
     use crate::test_support::{Fixture, SECRET, call, render};
-    use harw_sandbox::{
-        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-    };
+    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::fs;
     use std::path::{Path, PathBuf};

@@ -23,6 +23,13 @@
 //! - `forget <name>` (Design §6) — löscht den Fakt `<name>` aus Projekt
 //!   **und** Global, wo immer er existiert (bestes Bemühen je Wurzel).
 //! - `maintain` — führt den idempotenten v2-Konsolidierungslauf aus.
+//! - `consolidate [--project|--global]` (Default `--project`, Design
+//!   §5.3/§6) — stößt Phase 2 (Konsolidierung) sofort an, siehe
+//!   [`consolidate_dispatch`]. Führt nur den **deterministischen** Teil aus
+//!   (Lock, `plan_consolidation`/`apply_plan`, Baseline-Digest aktualisieren)
+//!   — der `memory-steward`-Agentenlauf selbst (Widersprüche auflösen,
+//!   Confidence-Verfall/Löschung) kann von dieser Operation nicht gestartet
+//!   werden, siehe dort.
 //!
 //! # Scopes und Wurzeln (Contract §2, Design §2)
 //! - `Project`: `<projekt-root>/.harw/memories/` — bleibt im Repo,
@@ -44,7 +51,8 @@
 //! - [`OpError::Execution`] — Backend-/Dateisystemfehler (I/O, Serde,
 //!   Tier-Overflow, Lock, Projekt-Erkennung).
 
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use harw_macros::operation;
@@ -67,7 +75,8 @@ const DESCRIPTION_MAX_CHARS: usize = 80;
 /// seinen `tail` selbst (siehe Moduldoku).
 #[derive(Default, serde::Deserialize)]
 pub struct MemoryArgs {
-    /// Subcommand: `list`, `stats`, `recall`, `record`, `forget`, `maintain`.
+    /// Subcommand: `list`, `stats`, `recall`, `record`, `forget`,
+    /// `maintain`, `consolidate`.
     #[serde(default)]
     pub sub: Option<String>,
     /// Weitere Tokens nach dem Subcommand (Keywords, Text, Flags, …).
@@ -113,8 +122,9 @@ async fn memory(ctx: &OpContext, args: MemoryArgs) -> Result<OpOutput, OpError> 
         "record" => record_dispatch(ctx, &args.tail),
         "forget" => forget_fact(ctx, &args.tail),
         "maintain" => run_maintain(&*memory_store(ctx)?),
+        "consolidate" => consolidate_dispatch(ctx, &args.tail),
         other => Err(OpError::InvalidArguments(format!(
-            "unbekannter /memory-Subcommand: {other} (list, stats, recall, record, forget, maintain)"
+            "unbekannter /memory-Subcommand: {other} (list, stats, recall, record, forget, maintain, consolidate)"
         ))),
     }
 }
@@ -271,7 +281,18 @@ fn unique_slug(store: &FactStore, base: &str, body: &str) -> Result<String, OpEr
             .map_err(|error| OpError::Execution(format!("Fakt lesen fehlgeschlagen: {error}")))?
         {
             None => return Ok(candidate),
-            Some(existing) if existing.body == body => return Ok(candidate),
+            // `FactStore::write` (harw-memory/src/facts.rs::to_markdown) hängt
+            // an jeden nicht-leeren Body genau einen abschließenden
+            // Zeilenumbruch an, bevor er auf die Platte geschrieben wird — ein
+            // zurückgelesener `body` trägt diesen also immer, während der hier
+            // übergebene `body` (frisch getrimmter Eingabetext aus
+            // `record_fact`) ihn nie trägt. Ohne den Vergleich davon zu lösen,
+            // würde derselbe erneut aufgezeichnete Text nie als „identisch"
+            // erkannt und bekäme bei jedem Aufruf einen neuen Suffix statt
+            // denselben Fakt zu aktualisieren.
+            Some(existing) if existing.body.trim_end_matches('\n') == body.trim_end_matches('\n') => {
+                return Ok(candidate);
+            }
             Some(_) => candidate = format!("{base}-{suffix}"),
         }
     }
@@ -431,6 +452,147 @@ fn forget_fact(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpError> {
     }
 }
 
+// ── Konsolidierung (Phase 2, Design §5.3/§6) ────────────────────────────────
+
+/// `/memory consolidate [--project|--global]` (Default `--project`).
+///
+/// # Errors
+/// Siehe [`run_consolidate`].
+fn consolidate_dispatch(ctx: &OpContext, tail: &[String]) -> Result<OpOutput, OpError> {
+    let (_positional, scope) = parse_memory_scope_flags(tail, FactScope::Project)?;
+    let root = match scope {
+        FactScope::Project => project_memories_root(ctx)?,
+        FactScope::Global => global_memories_root()?,
+    };
+    run_consolidate(&root, scope)
+}
+
+/// Stößt Phase 2 der Konsolidierung (Design §5.3) an der Fakt-Wurzel `root`
+/// an und meldet, was dabei ausgeführt wurde — und was **nicht**.
+///
+/// # Beschreibung
+/// Erwirbt [`harw_memory::consolidation::ConsolidationLock`] an `root`; bei
+/// Kontention (eine andere Konsolidierung läuft bereits) wird das ohne
+/// Fehler gemeldet. Andernfalls:
+/// 1. Liest die Baseline ([`harw_memory::consolidation::ConsolidationBaseline::read`])
+///    und den aktuellen Fakten-Bestand, bildet den Diff seit der letzten
+///    Baseline.
+/// 2. Nimmt alle Kandidaten aus `facts/_incoming/` (`IncomingStore::take_all`).
+///    Sind keine vorhanden, endet der Lauf hier — nur der Baseline-Diff wird
+///    gemeldet, nichts wird geschrieben.
+/// 3. Plant ([`harw_memory::consolidation::plan_consolidation`]) und wendet
+///    den **deterministischen** Teil an (`apply_plan`: Duplikate
+///    verschmelzen, Kandidaten übernehmen, `MEMORY.md` neu schreiben).
+///    `plan.deletions` ist dabei laut Vertrag immer leer — Löschentscheidungen
+///    sind Sache des Stewards, nicht dieser Operation.
+/// 4. Schreibt die Baseline auf den neuen Fakten-Bestand zurück (§5.3:
+///    „Baseline zurücksetzen" — hier als Digest-Manifest statt als
+///    git-Commit, siehe `consolidation`-Moduldoku).
+/// 5. Baut den `memory-steward`-Auftragstext
+///    ([`harw_memory::consolidation::steward_prompt`]) aus Index, Kandidaten,
+///    betroffenen Fakten und Baseline-Diff — **ruft den Agenten aber nicht
+///    auf**: [`OpContext`] löst ausschließlich Services (`ctx.service::<T>()`)
+///    und Werkzeuge auf, es hat keinen Agenten-Runner. Der Bericht macht das
+///    ausdrücklich sichtbar, statt die fehlende Ermessens-Entscheidung
+///    (Widersprüche auflösen, veraltete Fakten senken/löschen) still zu
+///    überspringen.
+///
+/// # Errors
+/// [`OpError::Execution`] bei Lock-/I/O-/Serde-Fehlern der beteiligten
+/// [`FactStore`]/`IncomingStore`/`ConsolidationBaseline`-Aufrufe.
+fn run_consolidate(root: &Path, scope: FactScope) -> Result<OpOutput, OpError> {
+    use harw_memory::consolidation::{ConsolidationBaseline, ConsolidationLock, apply_plan, plan_consolidation, steward_prompt};
+    use harw_memory::{IncomingStore, MemoryError};
+
+    let lock = match ConsolidationLock::try_acquire(root) {
+        Ok(lock) => lock,
+        Err(MemoryError::LockContention { .. }) => {
+            return Ok(OpOutput::from(format!(
+                "Konsolidierung ({scope}) übersprungen: Lock bereits belegt (läuft schon, oder ein Absturz liegt < 30 Minuten zurück)."
+            )));
+        }
+        Err(error) => {
+            return Err(OpError::Execution(format!("Konsolidierungs-Lock fehlgeschlagen: {error}")));
+        }
+    };
+
+    let outcome = (|| -> Result<String, OpError> {
+        let incoming_store = IncomingStore::open(root)
+            .map_err(|error| OpError::Execution(format!("Incoming-Speicher öffnen fehlgeschlagen: {error}")))?;
+        let fact_store = FactStore::open(root, scope)
+            .map_err(|error| OpError::Execution(format!("Fakt-Speicher öffnen fehlgeschlagen: {error}")))?;
+
+        let baseline = ConsolidationBaseline::read(root)
+            .map_err(|error| OpError::Execution(format!("Baseline lesen fehlgeschlagen: {error}")))?;
+        let existing_before = fact_store
+            .list()
+            .map_err(|error| OpError::Execution(format!("Bestehende Fakten lesen fehlgeschlagen: {error}")))?;
+        let changed_since_baseline = baseline.diff(&existing_before);
+
+        let taken = incoming_store
+            .take_all()
+            .map_err(|error| OpError::Execution(format!("Kandidaten übernehmen fehlgeschlagen: {error}")))?;
+        if taken.is_empty() {
+            return Ok(format!(
+                "Konsolidierung ({scope}): keine Kandidaten in facts/_incoming/ — nichts zu tun. \
+                 {} Fakt(en) seit letzter Baseline geändert.",
+                changed_since_baseline.len()
+            ));
+        }
+        let candidate_count = taken.len();
+
+        let plan = plan_consolidation(&existing_before, &taken);
+        let affected_names: std::collections::HashSet<&str> =
+            plan.merges.iter().map(|merge| merge.target.as_str()).collect();
+        let affected: Vec<Fact> = existing_before
+            .into_iter()
+            .filter(|fact| affected_names.contains(fact.name.as_str()))
+            .collect();
+        let merges = plan.merges.len();
+        let conflicts = plan.conflicts.len();
+
+        let report = apply_plan(&fact_store, &plan)
+            .map_err(|error| OpError::Execution(format!("Plan anwenden fehlgeschlagen: {error}")))?;
+
+        let existing_after = fact_store
+            .list()
+            .map_err(|error| OpError::Execution(format!("Fakten nach Anwendung lesen fehlgeschlagen: {error}")))?;
+        ConsolidationBaseline::from_facts(&existing_after)
+            .write(root)
+            .map_err(|error| OpError::Execution(format!("Baseline schreiben fehlgeschlagen: {error}")))?;
+
+        let index = fs::read_to_string(root.join("MEMORY.md")).unwrap_or_default();
+        let prompt = steward_prompt(&index, &taken, &affected, &changed_since_baseline);
+        let affected_names_display = if affected.is_empty() {
+            "keine".to_owned()
+        } else {
+            affected.iter().map(|fact| fact.name.as_str()).collect::<Vec<_>>().join(", ")
+        };
+
+        Ok(format!(
+            "Konsolidierung ({scope}) — deterministischer Teil abgeschlossen:\n\
+             · Kandidaten: {candidate_count}\n\
+             · Merges: {merges} (betroffene Fakten: {affected_names_display})\n\
+             · geschrieben: {} · gelöscht: {}\n\
+             · Ungelöste Widersprüche: {conflicts}\n\
+             · Fakten seit letzter Baseline geändert: {}\n\n\
+             FEHLT: der `memory-steward`-Agentenlauf (Widersprüche auflösen, Confidence-Verfall/Löschung \
+             veralteter Fakten, Design §5.3). Dieser Op-Kontext kann keine Subagenten starten — `OpContext` \
+             löst ausschließlich Services/Werkzeuge auf, es hat keinen Agenten-Runner. Der fertige \
+             Auftragstext für den Steward wurde gebaut ({} Zeichen, enthält Index, Kandidaten, betroffene \
+             Fakten und den Baseline-Diff), muss aber von außerhalb dieser Operation an den \
+             `memory-steward`-Agenten übergeben werden.",
+            report.written,
+            report.deleted,
+            changed_since_baseline.len(),
+            prompt.len(),
+        ))
+    })();
+
+    let _ = lock.release();
+    outcome.map(OpOutput::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -588,10 +750,76 @@ mod tests {
         store.write(&fact).expect("write fact");
 
         let read_back = store.read("mein-fakt").expect("read").expect("fact must exist");
-        assert_eq!(read_back.body, fact.body);
+        // `FactStore::write` normalisiert jeden nicht-leeren Body auf genau
+        // einen abschließenden Zeilenumbruch (harw-memory/src/facts.rs::
+        // to_markdown) — dieselbe Konvention, die harw-memory's eigener
+        // Rundlauf-Test `write_then_read_round_trips_umlauts_and_multiline_body`
+        // voraussetzt (dessen Body-Fixture endet bewusst mit `\n`). Der Store
+        // ist hier korrekt; diese Zeile erwartete zuvor fälschlich
+        // Bytegleichheit ohne diese Normalisierung.
+        assert_eq!(read_back.body, format!("{}\n", fact.body));
 
         let deleted = store.delete("mein-fakt").expect("delete");
         assert!(deleted);
         assert!(store.read("mein-fakt").expect("read after delete").is_none());
+    }
+
+    // -- run_consolidate ---------------------------------------------------
+    //
+    // `run_consolidate` nimmt bewusst `&Path`/`FactScope` statt `&OpContext`
+    // entgegen (siehe Funktionsdoku) — genau deshalb ist es hier direkt
+    // testbar, ohne `harw_home`/Projekt-Erkennung zu berühren (vgl. Kommentar
+    // bei `test_record_fact_and_forget_round_trip_via_fact_store_directly`).
+
+    fn tmp_consolidate_root(tag: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("harw-memory-consolidate-{tag}-"))
+            .tempdir()
+            .expect("tempdir")
+    }
+
+    #[test]
+    fn run_consolidate_reports_nothing_to_do_without_candidates() {
+        let dir = tmp_consolidate_root("empty");
+        let out = super::run_consolidate(dir.path(), FactScope::Project).expect("run_consolidate");
+        assert!(out.text.contains("nichts zu tun"), "text was: {}", out.text);
+        assert!(out.text.contains("Fakt(en) seit letzter Baseline geändert"));
+    }
+
+    #[test]
+    fn run_consolidate_merges_candidate_into_existing_fact_and_reports_missing_steward() {
+        let dir = tmp_consolidate_root("merge");
+        let store = FactStore::open(dir.path(), FactScope::Project).expect("open fact store");
+        let mut existing = sample_fact("tui-approval-arming", "alte Beschreibung");
+        existing.sources = vec!["session:old".to_owned()];
+        store.write(&existing).expect("seed existing fact");
+
+        let incoming = harw_memory::extraction::IncomingStore::open(dir.path()).expect("open incoming store");
+        let mut candidate = sample_fact("tui-approval-arming", "neue Beschreibung");
+        candidate.sources = vec!["session:new".to_owned()];
+        // Explizit später als `existing.updated`, damit `merge_facts` deterministisch
+        // die neuere Beschreibung wählt (siehe `consolidation.rs`s eigene Tests).
+        candidate.updated = existing.updated + time::Duration::seconds(1);
+        incoming.write_candidates(&[candidate]).expect("write candidate");
+
+        let out = super::run_consolidate(dir.path(), FactScope::Project).expect("run_consolidate");
+
+        assert!(out.text.contains("Merges: 1"), "text was: {}", out.text);
+        assert!(out.text.contains("memory-steward"), "muss auf den fehlenden Agentenlauf hinweisen");
+        assert!(out.text.contains("FEHLT"));
+
+        // Kandidat wurde konsumiert, Fakt wurde verschmolzen (neuere Beschreibung gewinnt).
+        assert!(incoming.list().expect("list incoming").is_empty());
+        let merged = store.read("tui-approval-arming").expect("read merged").expect("must exist");
+        assert_eq!(merged.description, "neue Beschreibung");
+
+        // Baseline wurde geschrieben und deckt den frisch verschmolzenen Fakt ab.
+        let baseline = harw_memory::consolidation::ConsolidationBaseline::read(dir.path()).expect("read baseline");
+        assert!(baseline.digests.contains_key("tui-approval-arming"));
+
+        // Zweiter Lauf ohne neue Kandidaten: nichts zu tun, keine weiteren Änderungen seit Baseline.
+        let second = super::run_consolidate(dir.path(), FactScope::Project).expect("second run_consolidate");
+        assert!(second.text.contains("nichts zu tun"));
+        assert!(second.text.contains("0 Fakt(en) seit letzter Baseline geändert"));
     }
 }

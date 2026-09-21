@@ -6,19 +6,29 @@
 //!    erwartete Profil und den erwarteten Reducer.
 //! 2. **Profil × Rechtesatz** (`RegistryProfile::ALL.len()` × 2⁷):
 //!    `tool_names_for(granted)` registriert nie ein Werkzeug ohne gewährtes
-//!    Recht; `fs.write` nur in `Full`/`MemoryStewardship`, `shell.exec` nur
-//!    in `Full`/`ShellExecution`/`UiaQuickHelper` (Addendum I)/
-//!    `UiaShellWorker`, jeweils nur mit dem passenden Recht;
+//!    Recht; `fs.write` nur in `Full`/`MemoryStewardship`/`UiaWriter`,
+//!    `shell.exec` nur in `Full`/`ShellExecution`/`UiaQuickHelper`
+//!    (Addendum I)/`UiaShellWorker`, jeweils nur mit dem passenden Recht;
 //!    `deps.source_*` nur mit `ReadCargoRegistry`; `web.*` nur in `Research`
-//!    (alle drei Werkzeuge) oder `UiaQuickHelper` (nur `web.fetch`), jeweils
-//!    nur mit `NetworkAccess`; `browser.*` in keinem Profil.
+//!    (alle drei Werkzeuge), `UiaQuickHelper`, `UiaExplorer` oder `UiaWriter`
+//!    (nur `web.fetch`), jeweils nur mit `NetworkAccess`; `browser.*` in
+//!    keinem Profil — **außer** `browser.open` in `UiaQuickHelper`
+//!    (Nutzerentscheidung, siehe `UIA_QUICK_HELPER_BROWSER_TOOLS`).
 //! 3. **Rolle × Rechtesatz**: nach dem Rollen-Reducer sieht keine Rolle
-//!    `fs.write`, `shell.exec` oder `browser.*`; `researcher-web` sieht nie
-//!    `fs.*`, `deps.*` oder `lens.ask`.
+//!    `fs.write`, `shell.exec` oder `browser.*` — auch `uia-worker` nicht:
+//!    ihre `browser.open`-Ausnahme kommt aus der festen Profilzuweisung
+//!    (`UiaQuickHelper`) bei der Registry-Montage, nie aus dem Reducer;
+//!    `ReadOnly` (ihr Reducer) deckelt `NetworkAccess` ohnehin weg.
+//!    `researcher-web` sieht nie `fs.*`, `deps.*` oder `lens.ask`.
 //! 4. **TOML-Seite** (andere Quelle): keine Rolle admittiert `fs.write`,
-//!    `shell.exec` oder `browser.*`; `researcher-web` admittiert nur `web.*`
-//!    und verbietet `fs.*`/`deps.*` ausdrücklich.
-//! 5. **Montage**: die tatsächlich gebaute Registry entspricht Punkt 2.
+//!    `shell.exec` oder `browser.*` — außer `uia-worker`, die einzige Rolle
+//!    mit der einzigen `browser.*`-Ausnahme `browser.open`;
+//!    `researcher-web` admittiert nur `web.*` und verbietet `fs.*`/`deps.*`
+//!    ausdrücklich.
+//! 5. **Montage**: die tatsächlich gebaute Registry entspricht Punkt 2 — mit
+//!    der dokumentierten Ausnahme `UiaQuickHelper`/`browser.open`, das ohne
+//!    einen tatsächlichen `BrowserOpenGrant` (Feature `browser`, hier nicht
+//!    verdrahtet) nicht real registriert wird (siehe `expected_tool_names`).
 //!
 //! # Determinismus
 //! Keine Netz- oder Prozessabhängigkeit; die Montage liest nur das
@@ -76,6 +86,7 @@ fn every_permission_subset() -> Vec<PermissionSet> {
 /// Erwartete Rollentabelle: Rolle → (Profil, Reducer).
 fn expected_role_table() -> Vec<(&'static str, RegistryProfile, AuthorityReducer)> {
     vec![
+        (role_names::ROOT_ORCHESTRATOR, RegistryProfile::Planning, AuthorityReducer::ReadRegistry),
         (role_names::EXPLORER, RegistryProfile::ReadOnlyExplore, AuthorityReducer::ReadRegistry),
         (
             role_names::RESEARCHER_DEPS,
@@ -135,6 +146,13 @@ fn expected_role_table() -> Vec<(&'static str, RegistryProfile, AuthorityReducer
             RegistryProfile::UiaShellWorker,
             AuthorityReducer::ReadOnly,
         ),
+        // Read-only Erkundungsspezialisierung der UIA: `RegistryProfile::
+        // UiaExplorer` mit dem `uia-worker`-Muster als Reducer-Ausnahme
+        // (siehe `authority_reducer_for_role`).
+        (role_names::UIA_EXPLORER, RegistryProfile::UiaExplorer, AuthorityReducer::ReadOnly),
+        // Schreibende Erkundungsspezialisierung der UIA: `RegistryProfile::
+        // UiaWriter` mit demselben Reducer-Muster.
+        (role_names::UIA_WRITER, RegistryProfile::UiaWriter, AuthorityReducer::ReadOnly),
     ]
 }
 
@@ -160,14 +178,29 @@ fn test_profile_by_permission_matrix_never_registers_ungranted_tools() {
                 let needed = harw_registry_defaults::tool_permission(tool)
                     .unwrap_or_else(|| panic!("{profile:?}: {tool} ohne bekanntes Recht"));
                 assert!(granted.contains(needed), "{profile:?}: {tool} ohne {needed:?}");
-                assert!(!BROWSER.contains(tool), "{profile:?}: {tool} ohne Grant");
+                // Nutzerentscheidung: einzige Ausnahme ist `browser.open`
+                // unter `UiaQuickHelper` — alle übrigen sechs
+                // `browser.*`-Werkzeuge bleiben für jedes Profil ohne Grant.
+                let is_the_documented_exception =
+                    *tool == "browser.open" && *profile == RegistryProfile::UiaQuickHelper;
+                assert!(
+                    is_the_documented_exception || !BROWSER.contains(tool),
+                    "{profile:?}: {tool} ohne Grant"
+                );
             }
             let has = |name: &str| tools.iter().any(|tool| *tool == name);
-            // `fs.write` gehört zu `Full` und `MemoryStewardship`; `shell.exec`
-            // zu `Full`, `ShellExecution`, `UiaQuickHelper` (Addendum I) und
-            // `UiaShellWorker`.
-            let may_write =
-                matches!(*profile, RegistryProfile::Full | RegistryProfile::MemoryStewardship);
+            // `fs.write` gehört zu `Full`, `MemoryStewardship` und
+            // `UiaWriter` (schreibende Erkundungsspezialisierung der UIA,
+            // siehe `agents/uia-writer.toml` und die Begründung bei
+            // `RegistryProfile::UiaWriter` in `harw-registry-defaults/src/
+            // profile.rs`); `shell.exec` zu `Full`, `ShellExecution`,
+            // `UiaQuickHelper` (Addendum I) und `UiaShellWorker`.
+            let may_write = matches!(
+                *profile,
+                RegistryProfile::Full
+                    | RegistryProfile::MemoryStewardship
+                    | RegistryProfile::UiaWriter
+            );
             let may_exec = matches!(
                 *profile,
                 RegistryProfile::Full
@@ -189,11 +222,15 @@ fn test_profile_by_permission_matrix_never_registers_ungranted_tools() {
                 assert!(granted.contains(Permission::ReadCargoRegistry), "{profile:?}");
             }
             if tools.iter().any(|tool| tool.starts_with("web.")) {
-                // `Research` führt alle drei `web.*`-Werkzeuge, `UiaQuickHelper`
-                // (Addendum I) ausschließlich `web.fetch`.
+                // `Research` führt alle drei `web.*`-Werkzeuge; `UiaQuickHelper`
+                // (Addendum I), `UiaExplorer` und `UiaWriter` ausschließlich
+                // `web.fetch` (`UIA_QUICK_HELPER_WEB_TOOLS`).
                 assert!(matches!(
                     *profile,
-                    RegistryProfile::Research | RegistryProfile::UiaQuickHelper
+                    RegistryProfile::Research
+                        | RegistryProfile::UiaQuickHelper
+                        | RegistryProfile::UiaExplorer
+                        | RegistryProfile::UiaWriter
                 ));
                 assert!(granted.contains(Permission::NetworkAccess));
             }
@@ -281,11 +318,20 @@ fn test_role_tomls_never_admit_write_shell_or_browser_and_researcher_web_is_web_
             !profile.required_permissions().is_subset_of(&reducer.ceiling());
         let admitted = ir.tool_surface().admitted();
         for tool in admitted {
+            // Nutzerentscheidung: `uia-worker` darf `browser.open` benutzen —
+            // die einzige zulässige `browser.*`-Ausnahme, für genau diese
+            // eine Rolle und genau dieses eine Werkzeug (siehe
+            // `RegistryProfile::UiaQuickHelper` und
+            // `UIA_QUICK_HELPER_BROWSER_TOOLS` in
+            // `harw-registry-defaults/src/profile.rs`).
+            if tool == "browser.open" && *role == role_names::UIA_WORKER {
+                continue;
+            }
             if is_documented_gated_exception && profile.registered_tool_names().contains(&tool.as_str())
             {
-                // Erwartete, dokumentierte Ausnahme — siehe oben. `browser.*`
-                // gehört zu keinem Profil (W5 RD), bleibt also für jede Rolle
-                // verboten.
+                // Erwartete, dokumentierte Ausnahme — siehe oben. Jedes
+                // übrige `browser.*`-Werkzeug gehört zu keinem Profil (W5 RD),
+                // bleibt also für jede Rolle verboten.
                 assert!(!tool.starts_with("browser."), "{role} admittiert {tool}");
                 continue;
             }
@@ -339,8 +385,8 @@ fn test_role_tomls_never_admit_write_shell_or_browser_and_researcher_web_is_web_
 const FS_READ_ONLY: &[&str] = &["fs.read", "fs.list", "fs.search", "fs.glob", "fs.grep"];
 
 /// Erwartete beworbene/registrierte Werkzeuge unter `granted` — für jedes
-/// Profil außer `AgentStewardship` unverändert `tool_names_for(granted)`
-/// (die statische Vertrags-Obermenge).
+/// Profil außer `AgentStewardship` und `UiaQuickHelper` unverändert
+/// `tool_names_for(granted)` (die statische Vertrags-Obermenge).
 ///
 /// # Nachtrag K3 (`AgentStewardship`)
 /// Ohne `AgentDefinitionAccess` (der Standardpfad über
@@ -351,6 +397,16 @@ const FS_READ_ONLY: &[&str] = &["fs.read", "fs.list", "fs.search", "fs.glob", "f
 /// `RegistryProfile::registered_tool_names` und
 /// `tests/tool_admission_coverage.rs`), taugt hier also nicht als
 /// Erwartungswert für die tatsächlich montierte Registry.
+///
+/// # Nutzerentscheidung (`UiaQuickHelper`)
+/// `RegistryProfile::UiaQuickHelper::tool_names_for` bewirbt `browser.open`
+/// statisch (siehe `harw-registry-defaults/src/profile.rs::
+/// UIA_QUICK_HELPER_BROWSER_TOOLS`). Der tatsächliche Laufzeit-Provider
+/// braucht dafür weiterhin einen `harw_tool_browser::BrowserOpenGrant` über
+/// `profile::browser_tool_provider` (Feature `browser`, standardmäßig aus),
+/// den `assemble_registry_for_sandbox` (der Standardpfad, den dieser Test
+/// verwendet) nicht baut — die tatsächlich montierte Registry bleibt also
+/// ohne `browser.open`, unabhängig vom gewährten `NetworkAccess`.
 fn expected_tool_names(profile: RegistryProfile, granted: &PermissionSet) -> Vec<String> {
     if profile == RegistryProfile::AgentStewardship {
         let raw: Vec<&'static str> = FS_READ_ONLY
@@ -366,6 +422,14 @@ fn expected_tool_names(profile: RegistryProfile, granted: &PermissionSet) -> Vec
                 harw_registry_defaults::tool_permission(tool)
                     .is_some_and(|needed| granted.contains(needed))
             })
+            .map(|tool| tool.to_owned())
+            .collect();
+    }
+    if profile == RegistryProfile::UiaQuickHelper {
+        return profile
+            .tool_names_for(granted)
+            .into_iter()
+            .filter(|tool| *tool != "browser.open")
             .map(|tool| tool.to_owned())
             .collect();
     }

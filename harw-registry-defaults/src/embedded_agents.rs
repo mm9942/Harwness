@@ -1107,7 +1107,7 @@ pub fn builtin_organization_knowledge(role: AgentRoleId) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{BTreeSet, HashSet};
 
     use super::*;
     use harw_agent_dsl::organization::{CellBarrier, CellKind, CellWritePartition};
@@ -2077,9 +2077,17 @@ mod tests {
                 two_level_roles.push(role.as_str());
             }
         }
+        // `definitions` ist eine `HashMap`: ihre Iterationsreihenfolge ist
+        // nicht deterministisch, `two_level_roles` würde also je nach Lauf
+        // in unterschiedlicher Reihenfolge befüllt. Der Vergleich sortiert
+        // deshalb beide Seiten (ein `BTreeSet`, da nur die **Menge** der
+        // Zwei-Ebenen-Rollen geprüft wird, keine Reihenfolge), statt sich auf
+        // eine zufällige `HashMap`-Reihenfolge zu verlassen.
+        let two_level_roles: BTreeSet<&str> = two_level_roles.into_iter().collect();
+        let expected_two_level_roles: BTreeSet<&str> =
+            [role_names::ANALYST, role_names::ROOT_ORCHESTRATOR].into_iter().collect();
         assert_eq!(
-            two_level_roles,
-            [role_names::ANALYST, role_names::ROOT_ORCHESTRATOR],
+            two_level_roles, expected_two_level_roles,
             "genau Analyst und Root-Orchestrator dürfen zwei Ebenen"
         );
         let analyst = &definitions[role_names::ANALYST];

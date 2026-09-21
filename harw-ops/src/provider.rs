@@ -934,9 +934,7 @@ mod tests {
         FromRawArgs, NullSessionController, OpContext, OpError, SharedSessionController,
         context::ServiceMap,
     };
-    use harw_sandbox::{
-        Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry,
-    };
+    use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
     use std::sync::Arc;
 
@@ -1063,6 +1061,7 @@ mod tests {
                 origin_allowlist: Default::default(),
                 rate_limit: None,
                 max_concurrency: None,
+                originator: None,
             },
         );
 

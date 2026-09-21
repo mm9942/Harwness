@@ -15,7 +15,7 @@ use std::time::Duration;
 use harw_core::mode::InteractionMode;
 use harw_extension_api::contributors::ApprovalHandlerKind;
 use harw_registry_defaults::profile::RegistryProfile;
-use harw_sandbox::{Permission, PermissionSet};
+use harw_authority::{Permission, PermissionSet};
 use harw_types::{ApprovalActor, Principal, ReasoningEffort};
 
 /// Art des Einstiegs in die Runtime.
