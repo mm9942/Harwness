@@ -1,6 +1,8 @@
 #!/bin/sh
 set -u
 
+script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+
 pass=0
 warn=0
 fail=0
@@ -23,6 +25,25 @@ check_cmd() {
         pass=$((pass + 1))
     else
         printf 'MISS %-22s %s\n' "$label" "$cmd"
+        fail=$((fail + 1))
+    fi
+}
+# bpftool (and the rest of the standalone C BPF toolchain) commonly installs
+# to /usr/sbin, which is outside an unprivileged user's PATH; a plain
+# `command -v bpftool` then falsely reports it missing. Reuse
+# ensure-bpf-toolchain.sh's own read-only --check search instead of
+# duplicating its PATH/`/usr/sbin`/`/sbin` lookup here. doctor stays
+# read-only: --check never installs anything.
+check_bpf_tool() {
+    label=$1
+    tool=$2
+    line=$("$script_dir/ensure-bpf-toolchain.sh" --check 2>/dev/null | grep "^${tool}=")
+    path=${line#"${tool}="}
+    if [ -n "$path" ] && [ "$path" != 'MISSING' ]; then
+        printf 'OK   %-22s %s\n' "$label" "$path"
+        pass=$((pass + 1))
+    else
+        printf 'MISS %-22s %s\n' "$label" "$tool"
         fail=$((fail + 1))
     fi
 }
@@ -52,8 +73,7 @@ check_cmd python3 'python3'
 check_cmd rustc 'rustc'
 check_cmd cargo 'cargo'
 check_cmd clang 'clang'
-check_cmd bpftool 'bpftool'
-check_cmd bpf-linker 'bpf-linker'
+check_bpf_tool bpftool 'bpftool'
 if command -v rustup >/dev/null 2>&1; then
     printf 'INFO %-22s %s\n' 'rustup toolchain' "$(rustup toolchain list 2>/dev/null | tr '\n' ';' || true)"
 else

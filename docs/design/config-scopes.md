@@ -270,18 +270,25 @@ in 1.1 gelistet).
 Legende: 🔒 = vom Nutzer als sicherheits-/beschränkungsrelevant markiert
 (Freigaben, Sandbox, Netzwerk, Secrets, Listener, Berechtigungen).
 
+**Status: Tabelle vom Nutzer bestätigt (2026-09-21).** Alle vormals
+**OFFEN** markierten Zeilen sind unten durch die Nutzerentscheidung ersetzt
+und mit „(entschieden 2026-09-21)" gekennzeichnet. Die Spalte „Merge-Regel"
+verweist ab jetzt auf die exakten `MergeRule`-Varianten aus Abschnitt 6; die
+vollständige, feldgenaue Zuordnung aller 88 Felder steht in Abschnitt 6.3 (die
+Gruppierung hier fasst strukturgleiche Unterfelder weiterhin zusammen).
+
 | TOML-Pfad | Vorschlag | Merge-Regel | Begründung | 🔒 |
 |---|---|---|---|---|
-| `config_version` | **OFFEN** | — | Kein Scope im eigentlichen Sinn: vermutlich pro *Datei* zur Migrationssteuerung gedacht, nicht pro Ebene mergebar. Optionen: (A) GLOBAL, ein kanonischer Schema-Stand; (B) pro Layer eigenständig, gar nicht Teil dieses Scope-Modells. | |
-| `workspace_root` | **OFFEN** | — | Überschreibt die Arbeitswurzel direkt. Optionen: (A) GLOBAL, damit ein Admin die Wurzel diktiert (Pfad-Traversal-Risiko, wenn ein Profil sie frei setzen darf); (B) PROFIL, da jedes Profil einen eigenen Arbeitskontext braucht. | 🔒 |
+| `config_version` | Kein Scope — **pro Datei geprüft, nicht gemergt** (entschieden 2026-09-21) | `PerFileValidated` | Jede Layer-`config.toml` deklariert ihren eigenen `config_version`-Wert zur Migrations-/Kompatibilitätssteuerung; er wird nicht über Layer hinweg zusammengeführt, sondern pro Datei gegen die unterstützte(n) Schema-Version(en) geprüft. `resolved.harness.config_version` übernimmt danach schlicht den Wert des zuletzt geladenen vertrauten Layers (heutiges `cfg`-Zuweisungsverhalten bleibt hier unverändert), ist aber kein „gemergter" Wert im Sinne dieses Modells. | |
+| `workspace_root` | **PROFIL** (entschieden 2026-09-21) | `ProfileReplaces` | Jedes Profil braucht einen eigenen Arbeitskontext. Das Pfad-Traversal-Risiko ist keine Merge-Scope-Frage, sondern wird von der bestehenden Sandbox-/Root-Validierung beim Runtime-Aufbau abgefangen; dieses Feld beschreibt nur die *bevorzugte* Wurzel, keine eigenständige Berechtigungsgrenze. | 🔒 |
 | `default_provider` | PROFIL | letzter gesetzter Wert gewinnt (bereits korrekt implementiert) | Aktive Modellwahl ist Profil-Alltag, keine Beschränkung. | |
 | `default_model` | PROFIL | letzter gesetzter Wert gewinnt (bereits korrekt implementiert) | s.o. | |
 | `active_agent_definition` | PROFIL | letzter gesetzter Wert gewinnt | Auswahl einer Agenten-Definition ist Nutzerpräferenz. | |
 | `active_uia_definition` | PROFIL | letzter gesetzter Wert gewinnt (bereits korrekt implementiert) | s.o. | |
 | `uia_provider` | PROFIL | letzter gesetzter Wert gewinnt | Pinning ist Profil-spezifisch. | |
 | `uia_model` | PROFIL | letzter gesetzter Wert gewinnt | s.o. | |
-| `policy_profile` | **OFFEN** | — | Bisher kein Consumer im Code gefunden (nur deklariert + per CLI setzbar, `harw-cli/src/settings.rs`); Name legt eine sicherheitsrelevante Policy-Auswahl nahe. Optionen: (A) GLOBAL, Admin erzwingt eine Policy-Familie; (B) PROFIL, jedes Profil wählt seine eigene. | 🔒 |
-| `project_root_markers` | **OFFEN** | — | Reine Heuristik zur Root-Erkennung, aber beeinflusst indirekt, was als „Projekt“ (und damit als Sandbox-Grenze) gilt. Optionen: (A) PROFIL, reine Bequemlichkeit; (B) GLOBAL mit „nur verengen“, falls Root-Erkennung Sicherheitsgrenzen berührt. | |
+| `policy_profile` | **GLOBAL** (entschieden 2026-09-21) | `GlobalOnly` | Admin erzwingt eine Policy-Familie zentral; ein Profil kann sie nicht umgehen. Bisher kein Consumer im Code gefunden (nur deklariert + per CLI setzbar, `harw-cli/src/settings.rs`) — die Entscheidung gilt vorsorglich für den Moment, in dem ein Consumer entsteht. | 🔒 |
+| `project_root_markers` | **PROFIL** (entschieden 2026-09-21) | `ProfileReplaces` | Reine Heuristik zur Root-Erkennung ohne eigene Sicherheitswirkung — die eigentliche Sandbox-Grenze ziehen `sandbox.*` (GLOBAL exklusiv) und `permissions.extra_roots` (GLOBAL-Obergrenze), nicht die Root-*Erkennung*. Ein Profil darf seine eigene Projekterkennung frei anpassen. | |
 | `logging.level` | PROFIL | letzter gesetzter Wert gewinnt | Ausgabe-Verbosität, keine Beschränkung. | |
 | `logging.target_module_paths` | PROFIL | letzter gesetzter Wert gewinnt | s.o. | |
 | `logging.json` | PROFIL | letzter gesetzter Wert gewinnt | s.o. | |
@@ -289,15 +296,15 @@ Legende: 🔒 = vom Nutzer als sicherheits-/beschränkungsrelevant markiert
 | `tui.keybindings_file` | PROFIL | letzter gesetzter Wert gewinnt | s.o. | |
 | `session.store_dir` | PROFIL | letzter gesetzter Wert gewinnt | Ablagepfad ist Profil-lokal. | |
 | `session.journal_format` | PROFIL | letzter gesetzter Wert gewinnt | Reines Format. | |
-| `session.retention_days` | **OFFEN** | — | Kann Compliance-/Audit-Anforderung sein (Admin will Mindest-Aufbewahrung) oder Datenschutz-Wunsch (Profil will kürzer löschen) — Richtung des „strengeren“ Werts ist nicht eindeutig. Optionen: (A) GLOBAL, Profil darf nur verkürzen (Datenschutz-Sicht); (B) GLOBAL, Profil darf nur verlängern (Audit-Sicht); (C) PROFIL, freie Wahl. | |
+| `session.retention_days` | **GLOBAL als Obergrenze (Minimum)** (entschieden 2026-09-21) | `MinBound` | Admin erzwingt eine Höchst-Aufbewahrung als Compliance-Leitplanke; das Profil darf nur kürzer aufbewahren, nie länger als global erlaubt. | |
 | `session.title_generation` | PROFIL | letzter gesetzter Wert gewinnt | Komfort-Feature. | |
 | `session.title_model` | PROFIL | letzter gesetzter Wert gewinnt | Legacy-Modellwahl, wie `internal_models`. | |
-| `policy.default_visibility_scope` | **OFFEN** | — | Sicherheitsrelevant (Standard-Sichtbarkeit neuer Sessions), aber als freier String ohne definierte Ordnung („self“ vs. andere Werte) nicht eindeutig „strenger/lockerer“ vergleichbar. Optionen: (A) GLOBAL gewinnt immer; (B) GLOBAL mit einer noch zu definierenden Rangfolge, Profil darf nur restriktiver wählen. | 🔒 |
+| `policy.default_visibility_scope` | **GLOBAL, nur ein engerer Wert gilt** (entschieden 2026-09-21) | `StricterOf(ordering)` — Minimalordnung `"self"` < `"everyone"` (Abschnitt 6.2); jeder dritte/unbekannte String wird abgelehnt statt eingeordnet (entschieden 2026-09-21, Risiko R1 Abschnitt 8; Absicherungstest Abschnitt 7h #24) | Sicherheitsrelevant (Standard-Sichtbarkeit neuer Sessions), aber als freier String ohne `validate()`-Einschränkung im Code nur unvollständig ordbar — nur die beiden im Code belegten Werte (`harness_config.rs:438-440`, `discovery.rs:1428`) sind eindeutig ordbar. | 🔒 |
 | `policy.require_approval_for` | GLOBAL (Baseline) + Profil erweitert | **Vereinigung** | Direkt vom Nutzer vorgegebenes Beispiel; bereits identisch für den untrusted Projekt-Layer implementiert (`merge_restricted_harness:958-964`) — dasselbe Muster auf GLOBAL/PROFIL übertragen. | 🔒 |
 | `mcp_listener.enabled` | GLOBAL (Baseline) + Profil darf nur verengen | **AND** (analog `browser.enabled`, `merge_restricted_browser:912-914`) | Öffnet eine lokale Netzwerk-Angriffsfläche; ein Profil darf einen global deaktivierten Listener nicht aktivieren. | 🔒 |
 | `mcp_listener.listen_addr` | GLOBAL | global gewinnt | Bind-Adresse ist Angriffsfläche; Profil soll sie nicht verschieben können (Analogie zu `web.bind`, das nie vom Repo beeinflussbar ist). | 🔒 |
 | `mcp_listener.path` | GLOBAL | global gewinnt | s.o. | 🔒 |
-| `mcp_listener.principals` (inkl. `id`/`credential_ref`/`tenant`/`workspace`/`job_capabilities`) | **OFFEN** | — | Enthält Credential-Referenzen und Autorisierungs-Capabilities. Optionen: (A) GLOBAL, Admin verwaltet alle zugelassenen Identitäten zentral; (B) PROFIL, jedes Profil bringt eigene Principals für seine eigene Listener-Instanz mit — dann aber nur wirksam, wenn `mcp_listener.enabled` global erlaubt ist. | 🔒 |
+| `mcp_listener.principals` (inkl. `id`/`credential_ref`/`tenant`/`workspace`/`job_capabilities`) | **GLOBAL, Profil darf nur entfernen** (entschieden 2026-09-21) | `Intersection` nach Vergleichsschlüssel `id` (entschieden 2026-09-21, Risiko R2 Abschnitt 8) — Unterfelder `id`/`credential_ref`/`tenant`/`workspace`/`job_capabilities` sind `CompositeMember` (Abschnitt 6.3) | Enthält Credential-Referenzen und Autorisierungs-Capabilities; ein Profil darf einzelne Principals per Weglassen ihrer `id` aus der Liste entfernen, aber niemals eine neue `id` hinzufügen oder Felder eines bestehenden Principal-Eintrags ändern (z. B. `job_capabilities` erweitern) — nur Principals, deren `id` exakt in der globalen Liste vorkommt, dürfen im Profil-Ergebnis auftauchen, und ihre Felder stammen dabei ausschließlich aus der globalen Fassung (kein Feld-Merge innerhalb eines Principal-Eintrags). | 🔒 |
 | `onboarding.seen.*` | PROFIL | letzter gesetzter Wert gewinnt (bereits korrekt implementiert, nur ganze Sektion statt Feld) | Reiner First-Run-Fortschritt pro Profil. | |
 | `tools.plan.enabled` | PROFIL | letzter gesetzter Wert gewinnt | Feature-Umschalter, kein Zugriffsschutz. | |
 | `tools.plan.persist` | PROFIL | letzter gesetzter Wert gewinnt | Speicherverhalten. | |
@@ -314,15 +321,15 @@ Legende: 🔒 = vom Nutzer als sicherheits-/beschränkungsrelevant markiert
 | `research.max_fetch_bytes` | GLOBAL (Baseline) + Profil darf nur verengen | **Minimum** (Vorbild: `merge_restricted_harness:977-980`) | Ressourcengrenze für Netzwerk-Fetches. | 🔒 |
 | `research.fetch_timeout_secs` | GLOBAL (Baseline) + Profil darf nur verengen | **Minimum** (Vorbild: `merge_restricted_harness:981-986`) | s.o. | 🔒 |
 | `research.cache_ttl_secs` | PROFIL | letzter gesetzter Wert gewinnt | Reine Cache-Lebensdauer, kein Zugriffsschutz (im Unterschied zu den übrigen `[research]`-Feldern heute inkonsistent unbehandelt, s. Fund 3). | |
-| `permissions.default_mode` | **OFFEN** | — | Zentraler Freigabe-Schalter (`ask`/`auto`/`full`). Eine Rangfolge „strenger“ existiert konzeptionell (`ask` > `auto` > `full`), ist im Code aber nirgends kodiert; es gibt (anders als bei `require_approval_for`) kein Vorbild. Optionen: (A) GLOBAL gewinnt immer; (B) GLOBAL mit Ordinalskala, Profil darf nur strenger wählen. | 🔒 |
+| `permissions.default_mode` | **GLOBAL als Obergrenze** (entschieden 2026-09-21) | `StricterOf(ordering)` — `ask` > `auto` > `full` (Abschnitt 6.2) | `ask` fragt immer nach (am sichersten), `full` nie (am offensten). Die Rangfolge war im Code bisher nirgends kodiert (`ALLOWED_MODES`, `permissions_toml.rs:17`, ist nur eine ungeordnete Werteliste); dieses Dokument legt sie erstmals fest. Ein Profil darf nur Richtung `ask` verschärfen, nie Richtung `full` lockern. | 🔒 |
 | `permissions.approval_timeout_secs` | GLOBAL (Baseline) + Profil darf nur verengen | **Minimum** | Kürzerer Timeout = konservativer (Auto-Ablehnung greift früher); analog zu `research.*_secs`. | 🔒 |
-| `permissions.allow` | **OFFEN (sicherheitskritisch)** | — | `allow`-Regeln umgehen die Freigabe-Abfrage — das Gegenteil von `require_approval_for`. Eine Vereinigung wäre hier eine **Lockerung**, kein Verengen. Optionen: (A) GLOBAL exklusiv, Profil darf `allow` gar nicht setzen; (B) Profil darf nur eine **Teilmenge** der global erlaubten Regeln referenzieren (Schnittmenge statt Vereinigung). Kein bestehendes Vorbild in `discovery.rs` deckt diesen Fall ab. | 🔒 |
+| `permissions.allow` | **GLOBAL, Schnittmenge** (entschieden 2026-09-21) | `Intersection` | `allow`-Regeln umgehen die Freigabe-Abfrage — das Gegenteil von `require_approval_for`. Eine Vereinigung wäre eine **Lockerung**; korrekt ist die Schnittmenge: ein Profil kann nichts Neues öffnen, nur global erlaubte Regeln nicht referenzieren (effektiv entfernen). | 🔒 |
 | `permissions.deny` | GLOBAL (Baseline) + Profil erweitert | **Vereinigung** | Gegenstück zu `allow`: mehr `deny`-Regeln bedeuten nur mehr Ablehnungen, also sicher zu vereinigen — gleiches Muster wie `require_approval_for`. | 🔒 |
-| `permissions.extra_roots` | **OFFEN (sicherheitskritisch)** | — | Erweitert erlaubte Arbeitswurzeln — analog zu `allow` eine potenzielle Rechteausweitung, keine Verengung. Optionen: (A) GLOBAL exklusiv; (B) Profil darf nur eine Teilmenge der global gesetzten Wurzeln referenzieren. | 🔒 |
+| `permissions.extra_roots` | **GLOBAL, Schnittmenge** (entschieden 2026-09-21) | `Intersection` | Erweitert erlaubte Arbeitswurzeln — analog zu `permissions.allow` eine potenzielle Rechteausweitung; dieselbe Schnittmengen-Logik: ein Profil kann nur eine Teilmenge der global gesetzten Wurzeln referenzieren, nichts Neues öffnen. | 🔒 |
 | `sandbox.cargo.*` | GLOBAL exklusiv | Profil darf nicht setzen/überschreiben | Vertrauensanker für die Cargo-Sandbox; Moduldoku (`harness_config.rs:70-74`) verlangt ausdrücklich, dass diese Werte nur beim Runtime-Aufbau aus der (vertrauten) Konfiguration gelesen werden. Direkte Analogie zu `browser.geckodriver_path`/`geckodriver_sha256` und `dod.proof_key_dir`, die bereits nie aus einem Repo-Layer übernommen werden (`browser_toml.rs:18-25`, `dod_toml.rs:22-31`). | 🔒 |
 | `sandbox.tmux.*` | GLOBAL exklusiv | Profil darf nicht setzen/überschreiben | s.o. | 🔒 |
 | `internal_models.*` (alle 9 Felder) | PROFIL | letzter gesetzter Wert gewinnt (bereits korrekt implementiert) | Modell-Routing für Hilfsaufgaben ist Nutzerpräferenz/Kostensteuerung, keine Zugriffsbeschränkung. | |
-| `compaction.absolute_ceiling_tokens` | **OFFEN** | — | Reine Ressourcen-/Kostengrenze. Optionen: (A) PROFIL, freie Wahl; (B) GLOBAL mit „Profil darf nur senken“ (Minimum), falls Admin eine Kostenobergrenze erzwingen will. | |
+| `compaction.absolute_ceiling_tokens` | **GLOBAL als Obergrenze (Minimum)** (entschieden 2026-09-21) | `MinBound` | Admin erzwingt eine Kostenobergrenze; das Profil darf nur senken, nie über die globale Grenze hinausgehen. | |
 | `reasoning.*` (alle 6 Felder) | PROFIL | letzter gesetzter Wert gewinnt | Reasoning-Effort ist ein Kosten-/Geschwindigkeits-Kompromiss, keine Zugriffsbeschränkung. | |
 | `guards.enabled` | GLOBAL (Baseline) + Profil darf nur verschärfen | **OR** (Wert `true` gewinnt) | Sicherheits-/Stabilitäts-Wächter; Abschalten wäre eine Lockerung, analog `tools.plan.validate_*`. | |
 | `guards.repeated_failure_warn` | GLOBAL (Baseline) + Profil darf nur verengen | **Minimum** | Niedrigere Schwelle = empfindlicherer (strengerer) Wächter. | |
@@ -374,6 +381,11 @@ ein direktes Vorbild für die Umsetzung (Abschnitt 5), deckt aber aktuell nur
 9 von 89 Feldern ab — eine Erweiterung auf alle als „GLOBAL, Profil darf nur
 verschärfen“ vorgeschlagenen Felder wäre konsequent, wurde aber bisher nicht
 umgesetzt.
+
+**Nachtrag (2026-09-21):** Die oben als „je nach Nutzerentscheidung zu den
+OFFEN-Punkten“ offen gelassene Frage ist entschieden — siehe Abschnitt 2
+(alle elf Zeilen aufgelöst) und Abschnitt 7d für die konkrete Einordnung der
+Projekt-Ebene unterhalb PROFIL.
 
 ---
 
@@ -449,7 +461,880 @@ Layer, der die Sektion nicht schreibt, überschreibt den vorigen Wert nicht,
 
 ---
 
+## 6. MergeRule-Taxonomie
+
+### 6.1 Das `MergeRule`-Enum
+
+Zehn Varianten decken alle 88 Felder exakt ab (Herleitung und Feldzahl je
+Variante: Abschnitt 6.3). Keine weitere Variante (z. B. ein separates
+`MaxBound`) wird gebraucht — jeder Fall „profil darf nur *mehr* erlauben“
+ist bereits `Union`/`OrBool`, jeder Fall „profil darf nur *weniger*
+erlauben“ bereits `Intersection`/`MinBound`/`AndBool`.
+
+```rust
+/// Legt fest, wie ein einzelnes `HarnessConfig`-Blattfeld über die
+/// vertrauten Layer (Home → aktives Profil) hinweg zusammengeführt wird,
+/// und — mit denselben Varianten, aber eingeschränkter Anwendung (siehe
+/// Abschnitt 7c) — gegen einen nicht vertrauten Projekt-Layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeRule {
+    /// Der zuletzt **explizit gesetzte** Wert gewinnt. Ein Layer, der das
+    /// Feld nicht setzt, lässt den Wert des vorigen Layers unverändert
+    /// stehen (kein Reset auf den Section-Default — behebt die
+    /// „ERSETZT“-Regression aus Abschnitt 4 für alle so eingestuften
+    /// Felder). Nie vom nicht vertrauten Projekt-Layer angewendet.
+    ProfileReplaces,
+    /// Nur der Wert des vertrauten Home-Layers gilt je. Ein späterer Layer
+    /// (Profil **oder** nicht vertrautes Projekt), der einen *anderen*
+    /// Wert setzt, wird ignoriert und löst eine [`ScopeDiagnostic`]-Warnung
+    /// aus; denselben Wert erneut zu setzen ist ein stiller No-op.
+    GlobalOnly,
+    /// Vereinigung aller Layer, die das Feld setzen (einschränkende
+    /// Listen: mehr Einträge sind immer sicher — z. B. mehr
+    /// Freigabepflichten).
+    Union,
+    /// Schnittmenge aller Layer, die das Feld setzen, mit dem Home-Wert als
+    /// Startmenge (rechte-erweiternde Listen: ein späterer Layer kann nur
+    /// Einträge entfernen, niemals welche hinzufügen, die im Home-Layer
+    /// fehlen). Der Vergleichsschlüssel für „ist derselbe Eintrag" ist pro
+    /// Feld in `FIELD_TABLE`/der jeweiligen Merge-Doku festgelegt: für
+    /// Listen von Primitivwerten (`String`, `PathBuf`) ist er implizit die
+    /// volle Wertgleichheit; für Listen von Structs kann er entweder die
+    /// volle Struct-Gleichheit sein (z. B. `RuleToml` als vollständiges
+    /// `(tool, pattern)`-Tupel, Abschnitt 6.3/1.11 — kein Teilabgleich nur
+    /// über `tool`) oder ein einzelnes Identitätsfeld (z. B.
+    /// `McpPrincipalToml` über `id` allein, Abschnitt 6.3/1.6, entschieden
+    /// 2026-09-21/R2). Bei einem engeren Identitätsfeld gewinnt für die
+    /// überlebenden Einträge immer die vollständige Home-Fassung des
+    /// Elements — die übrigen Felder eines übereinstimmenden Eintrags
+    /// werden nie aus einem späteren Layer übernommen, selbst wenn dieser
+    /// Layer denselben Schlüssel mit abweichenden Werten erneut setzt (kein
+    /// Feld-Merge innerhalb eines Listenelements). Keine separate
+    /// `MergeRule`-Variante nötig — dieselbe `Intersection` deckt beide
+    /// Spielarten ab, nur der Vergleichsschlüssel unterscheidet sich.
+    Intersection,
+    /// Numerische Obergrenze: effektiver Wert = Minimum aller Layer, die
+    /// das Feld setzen (bestehende `min_positive`-Konvention aus
+    /// `discovery.rs:1008-1014` wiederverwendet: `0`/der jeweilige
+    /// Unset-Sentinel-Wert eines späteren Layers senkt die Obergrenze nie
+    /// weiter).
+    MinBound,
+    /// Bool-Feld, bei dem `true` der **lockere/erlaubende** Wert ist:
+    /// effektiv = UND-Verknüpfung aller Layer, die das Feld setzen. Ein
+    /// späterer Layer darf nur abschalten (verschärfen), nie einschalten.
+    AndBool,
+    /// Bool-Feld, bei dem `true` der **strenge/sichere** Wert ist: effektiv
+    /// = ODER-Verknüpfung aller Layer, die das Feld setzen. Ein späterer
+    /// Layer darf nur einschalten (verschärfen), nie abschalten.
+    OrBool,
+    /// Ordinalwert mit expliziter, in `FieldScope::ordering` hinterlegter
+    /// Strenge-Reihenfolge (strengster Wert zuerst). Effektiv = der
+    /// strengste unter allen Layern, die das Feld setzen gesetzte Wert; ein
+    /// Versuch, einen lockereren Wert zu wählen, wird ignoriert + gewarnt.
+    StricterOf,
+    /// Kein eigenständiges Merge: Dieses Feld reist nur als Teil eines
+    /// umschließenden atomaren Werts (Listenelement oder Punkt-Struct), der
+    /// selbst unter der Regel eines anderen Feldes gemergt wird. Existiert,
+    /// damit der Exhaustivitäts-Test (Abschnitt 7a) auch solche Felder
+    /// nachweislich erfasst.
+    CompositeMember,
+    /// Wird über Layer hinweg **nie** zusammengeführt: Jeder Layer prüft
+    /// seinen eigenen Wert unabhängig gegen die unterstützte(n)
+    /// Schema-Version(en) beim Laden dieser einen Datei. Nur für
+    /// `config_version` verwendet.
+    PerFileValidated,
+}
+
+/// Wo ein Feld herkommen darf, bevor `MergeRule` bestimmt, *wie* mehrere
+/// Layer-Werte kombiniert werden.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Der Home-Layer (`~/.harw`) legt die Baseline fest; das Profil ist
+    /// ihr untergeordnet (Details je nach `MergeRule`).
+    Global,
+    /// Betrifft nur das aktive Profil; die Profil-Ebene ersetzt dort den
+    /// globalen Wert (`MergeRule::ProfileReplaces`).
+    Profile,
+    /// Kein Scope im GLOBAL/PROFIL-Sinn — aktuell nur `config_version`
+    /// (`MergeRule::PerFileValidated`).
+    NotScoped,
+}
+
+/// Ein Eintrag der zentralen Deklarationstabelle (Abschnitt 7a).
+pub struct FieldScope {
+    /// Gepunkteter `HarnessConfig`-Pfad, exakt wie in Abschnitt 1/6.3,
+    /// z. B. `"mcp_listener.enabled"` oder
+    /// `"internal_models.session_title"`.
+    pub path: &'static str,
+    pub scope: Scope,
+    pub merge: MergeRule,
+    /// Strenge-Reihenfolge für `MergeRule::StricterOf`, strengster Wert
+    /// zuerst. `None` für jede andere Regel.
+    pub ordering: Option<&'static [&'static str]>,
+}
+```
+
+### 6.2 Explizite Strenge-Ordnungen für `StricterOf`
+
+Nur zwei Felder nutzen `StricterOf`; beide Ordnungen sind bewusst **neu
+festgelegt**, da sie im heutigen Code an keiner Stelle kodiert sind:
+
+- **`permissions.default_mode`**: `["ask", "auto", "full"]` (Index 0 =
+  strengster Wert). `ask` fragt bei jeder Aktion nach — keine automatische
+  Freigabe möglich, also die sicherste Einstellung. `full` fragt nie nach —
+  die offenste Einstellung. `auto` liegt dazwischen (fragt nur, wo
+  `policy.require_approval_for`/`permissions.deny` es verlangen). Quelle der
+  Wertemenge: `ALLOWED_MODES` (`permissions_toml.rs:17`); die Reihenfolge
+  dort ist rein deklarativ und trägt heute keine Bedeutung — dieses Dokument
+  legt die Strenge-Ordnung hiermit erstmals normativ fest.
+- **`policy.default_visibility_scope`**: `["self", "everyone"]` (Index 0 =
+  strengster Wert), aber **nur eine Teilordnung**: Dies sind die einzigen
+  beiden im Code belegten Werte (`default_visibility_scope()` liefert
+  `"self"`, `harness_config.rs:438-440`; `"everyone"` taucht als einziger
+  Alternativwert in einem Testfixture auf, `discovery.rs:1428`). Es gibt
+  **keine** `validate()`-Einschränkung auf eine feste Wertemenge (anders als
+  bei `permissions.default_mode`), also auch keine vollständige Ordnung für
+  einen beliebigen dritten String. **Entschieden (2026-09-21, Risiko R1,
+  Abschnitt 8):** Die Ordnung bleibt exakt diese Zweier-Teilordnung; für
+  jeden Wert außerhalb von `{"self", "everyone"}` fällt `stricter_of` auf
+  `GlobalOnly`-Verhalten zurück (kein Vergleichsversuch — der abweichende
+  Layer-Wert wird ignoriert und löst eine `ScopeDiagnostic` aus), damit ein
+  dritter Wert nie stillschweigend in die Ordnung einsortiert wird;
+  abgesichert durch Test #24 (Abschnitt 7h).
+
+### 6.3 Vollständige Feld-für-Feld-Zuordnung (alle 88 Felder)
+
+Eine Zeile je Blattfeld aus Abschnitt 1, in derselben Reihenfolge und mit
+denselben Unterabschnittsnummern, damit die Tabelle 1:1 gegen Abschnitt 1
+geprüft werden kann. „Scope" = `Scope`-Variante, „Regel" = `MergeRule`-
+Variante.
+
+**1.1 Top-Level** (10 Felder)
+
+| Pfad | Scope | Regel |
+|---|---|---|
+| `config_version` | NotScoped | `PerFileValidated` |
+| `workspace_root` | Profile | `ProfileReplaces` |
+| `default_provider` | Profile | `ProfileReplaces` |
+| `default_model` | Profile | `ProfileReplaces` |
+| `active_agent_definition` | Profile | `ProfileReplaces` |
+| `active_uia_definition` | Profile | `ProfileReplaces` |
+| `uia_provider` | Profile | `ProfileReplaces` |
+| `uia_model` | Profile | `ProfileReplaces` |
+| `policy_profile` | Global | `GlobalOnly` |
+| `project_root_markers` | Profile | `ProfileReplaces` |
+
+**1.2 `[logging]`** (3): `logging.level`, `logging.target_module_paths`,
+`logging.json` — alle Profile / `ProfileReplaces`.
+
+**1.3 `[tui]`** (2): `tui.theme`, `tui.keybindings_file` — alle Profile /
+`ProfileReplaces`.
+
+**1.4 `[session]`** (5 Felder)
+
+| Pfad | Scope | Regel |
+|---|---|---|
+| `session.store_dir` | Profile | `ProfileReplaces` |
+| `session.journal_format` | Profile | `ProfileReplaces` |
+| `session.retention_days` | Global | `MinBound` |
+| `session.title_generation` | Profile | `ProfileReplaces` |
+| `session.title_model` | Profile | `ProfileReplaces` |
+
+**1.5 `[policy]`** (2 Felder)
+
+| Pfad | Scope | Regel |
+|---|---|---|
+| `policy.default_visibility_scope` | Global | `StricterOf` (`["self","everyone"]`, Teilordnung, s. 6.2) |
+| `policy.require_approval_for` | Global | `Union` |
+
+**1.6 `[mcp_listener]`** (9 Felder)
+
+| Pfad | Scope | Regel |
+|---|---|---|
+| `mcp_listener.enabled` | Global | `AndBool` (`true` = Listener aktiv = lockerer Wert) |
+| `mcp_listener.listen_addr` | Global | `GlobalOnly` |
+| `mcp_listener.path` | Global | `GlobalOnly` |
+| `mcp_listener.principals` | Global | `Intersection` (Vergleichsschlüssel: `id` allein, nicht der volle Struct — entschieden 2026-09-21, Risiko R2; bis dahin galt hier `GlobalOnly`) |
+| `mcp_listener.principals[].id` | Global | `CompositeMember` (Identitätsfeld des `Intersection`-Vergleichs von `mcp_listener.principals`, s. o.) |
+| `mcp_listener.principals[].credential_ref` | Global | `CompositeMember` (reist mit dem Element; bei übereinstimmender `id` gewinnt immer die globale Fassung, kein Feld-Merge) |
+| `mcp_listener.principals[].tenant` | Global | `CompositeMember` (s. o.) |
+| `mcp_listener.principals[].workspace` | Global | `CompositeMember` (s. o.) |
+| `mcp_listener.principals[].job_capabilities` | Global | `CompositeMember` (s. o.) |
+
+**1.7 `[onboarding]`** (4 Felder)
+
+| Pfad | Scope | Regel |
+|---|---|---|
+| `onboarding.seen` (Tabelle) | Profile | `ProfileReplaces` — **auf Section-Ebene atomar**, wie heute (`discovery.rs:640-642`): nicht pro Flag, sondern die ganze `OnboardingSeen`-Struktur wird gemeinsam ersetzt, wenn der Layer `[onboarding]` überhaupt enthält |
+| `onboarding.seen.provider` | Profile | `CompositeMember` (Teil der atomaren `onboarding.seen`-Struktur, s. o.) |
+| `onboarding.seen.model` | Profile | `CompositeMember` |
+| `onboarding.seen.channel` | Profile | `CompositeMember` |
+
+**1.8 `[tools.plan]`** (9 Felder)
+
+| Pfad | Scope | Regel |
+|---|---|---|
+| `tools.plan.enabled` | Profile | `ProfileReplaces` |
+| `tools.plan.persist` | Profile | `ProfileReplaces` |
+| `tools.plan.require_for_complex_work` | Profile | `ProfileReplaces` |
+| `tools.plan.validate_dependency_cycles` | Global | `OrBool` (`true` = Prüfung aktiv = strenger Wert) |
+| `tools.plan.validate_write_conflicts` | Global | `OrBool` |
+| `tools.plan.max_nodes` | Global | `MinBound` |
+| `tools.plan.require_exploration_for` | Profile | `ProfileReplaces` |
+| `tools.plan.exploration_ttl_secs` | Profile | `ProfileReplaces` |
+| `tools.plan.max_expand_depth` | Global | `MinBound` |
+
+**1.9 `[mode]`** (1): `mode.default` — Profile / `ProfileReplaces`.
+
+**1.10 `[research]`** (5 Felder)
+
+| Pfad | Scope | Regel |
+|---|---|---|
+| `research.network_allow_hosts` | Global | `Intersection` |
+| `research.cargo_registry_read` | Global | `AndBool` (`true` = Lesezugriff erlaubt = lockerer Wert) |
+| `research.max_fetch_bytes` | Global | `MinBound` |
+| `research.fetch_timeout_secs` | Global | `MinBound` |
+| `research.cache_ttl_secs` | Profile | `ProfileReplaces` |
+
+**1.11 `[permissions]`** (7 Felder)
+
+| Pfad | Scope | Regel |
+|---|---|---|
+| `permissions.default_mode` | Global | `StricterOf` (`["ask","auto","full"]`, s. 6.2) |
+| `permissions.approval_timeout_secs` | Global | `MinBound` |
+| `permissions.allow` | Global | `Intersection` |
+| `permissions.deny` | Global | `Union` |
+| `permissions.extra_roots` | Global | `Intersection` |
+| `RuleToml.tool` (Feld von `allow[]`/`deny[]`) | — | `CompositeMember` (reist als Teil des `RuleToml`-Listenelements unter der Regel der jeweiligen Liste — `Intersection` bei `allow`, `Union` bei `deny`; Vergleichsschlüssel ist das vollständige `(tool, pattern)`-Tupel) |
+| `RuleToml.pattern` | — | `CompositeMember` |
+
+**1.12 `[sandbox]`** (8 Felder) — alle Global / `GlobalOnly`:
+`sandbox.cargo`, `sandbox.cargo.mode`, `sandbox.cargo.cargo_bin`,
+`sandbox.cargo.rustup_home`, `sandbox.cargo.cargo_home`, `sandbox.tmux`,
+`sandbox.tmux.mode`, `sandbox.tmux.socket_path`.
+
+**1.13 `[internal_models]`** (10 Felder)
+
+| Pfad | Scope | Regel |
+|---|---|---|
+| `internal_models.use_openrouter_defaults` | Profile | `ProfileReplaces` |
+| `internal_models.session_title` | Profile | `ProfileReplaces` (atomar pro Stelle, wie heute `merge_internal_models`) |
+| `internal_models.compaction_summary` | Profile | `ProfileReplaces` |
+| `internal_models.memory_consolidation` | Profile | `ProfileReplaces` |
+| `internal_models.dream_reflection` | Profile | `ProfileReplaces` |
+| `internal_models.explorer` | Profile | `ProfileReplaces` |
+| `internal_models.research` | Profile | `ProfileReplaces` |
+| `internal_models.worker_simple` | Profile | `ProfileReplaces` |
+| `internal_models.worker_complex` | Profile | `ProfileReplaces` |
+| `InternalModelChoice.provider`/`.model` (Feld jeder Stelle) | — | `CompositeMember` (reist als Teil der atomaren `Option<InternalModelChoice>` der jeweiligen Stelle, s. o.; nie einzeln gemergt) |
+
+**1.14 `[compaction]`** (1): `compaction.absolute_ceiling_tokens` — Global /
+`MinBound`.
+
+**1.15 `[reasoning]`** (6): `reasoning.uia`, `.root_orchestrator`,
+`.root_orchestrator_with_subs`, `.sub_orchestrator`, `.worker_complex`,
+`.worker_simple` — alle Profile / `ProfileReplaces`.
+
+**1.16 `[guards]`** (6 Felder)
+
+| Pfad | Scope | Regel |
+|---|---|---|
+| `guards.enabled` | Global | `OrBool` (`true` = Wächter aktiv = strenger Wert) |
+| `guards.repeated_failure_warn` | Global | `MinBound` |
+| `guards.repeated_failure_abort` | Global | `MinBound` |
+| `guards.no_progress_rounds_warn` | Global | `MinBound` |
+| `guards.no_progress_rounds_abort` | Global | `MinBound` |
+| `guards.plan_stale_rounds` | Global | `MinBound` |
+
+**Verteilung (Kontrollsumme = 88, Stand 2026-09-21 nach R1/R2-Entscheidung):**
+`ProfileReplaces` 40 · `GlobalOnly` 11 · `MinBound` 12 · `CompositeMember` 11 ·
+`Intersection` 4 · `OrBool` 3 · `Union` 2 · `AndBool` 2 · `StricterOf` 2 ·
+`PerFileValidated` 1. (Vor der R2-Entscheidung: `GlobalOnly` 17 ·
+`CompositeMember` 6 · `Intersection` 3 — die Ummappung von
+`mcp_listener.principals` auf `Intersection` zieht zwingend auch dessen fünf
+Unterfelder von `GlobalOnly` auf `CompositeMember`, da sie laut
+`CompositeMember`-Definition (Abschnitt 6.1) nicht eigenständig gemergt
+werden dürfen, sondern nur als Teil des durch `Intersection` gemergten
+Listenelements reisen — netto `GlobalOnly` −6, `CompositeMember` +5,
+`Intersection` +1, Summe unverändert 88.)
+
+---
+
+## 7. Umsetzungsspezifikation (verbindlich)
+
+Operationalisiert die Skizze aus Abschnitt 5 vollständig; wo sich beide
+widersprechen, gilt dieser Abschnitt.
+
+### 7a. Wo der Geltungsbereich deklariert wird
+
+**Eine zentrale, öffentliche Tabelle** `FIELD_TABLE: &[FieldScope]` in
+`harw-config/src/scope.rs` (Typen: Abschnitt 6.1) — kein verstreutes
+Rust-Attribut pro Feld, damit ein Review-Ort für jede künftige
+Feld-Ergänzung existiert.
+
+**Exhaustivitäts-Garantie:** Eine neue `HarnessConfig`- oder
+Section-Struct-Feld ohne `FIELD_TABLE`-Eintrag löst einen **Compile-Fehler**
+aus (E0027 „pattern does not mention field"), nicht nur einen
+Test-Fehlschlag zur Laufzeit. Mechanismus: für `HarnessConfig` selbst sowie
+für **jede** Section-Struct mit benannten Feldern (`LoggingSection`,
+`TuiSection`, `SessionSection`, `PolicySection`, `McpListenerSection`,
+`McpPrincipalToml`, `OnboardingSection`, `OnboardingSeen`, `ToolsSection`
+(bzw. `PlanToml`), `ModeSection`, `ResearchSection`, `PermissionsSection`,
+`RuleToml`, `SandboxSection`, `CargoSandboxToml`, `TmuxSandboxToml`,
+`InternalModelsToml`, je Modellstelle `InternalModelChoice`,
+`CompactionToml`, `ReasoningWeightsToml`, `GuardsToml`) gibt es einen Test
+der Form:
+
+```rust
+#[test]
+fn test_field_table_exhaustive_harness_config() {
+    let HarnessConfig {
+        config_version,
+        workspace_root,
+        default_provider,
+        default_model,
+        active_agent_definition,
+        active_uia_definition,
+        uia_provider,
+        uia_model,
+        policy_profile,
+        logging: _,
+        tui: _,
+        session: _,
+        policy: _,
+        mcp_listener: _,
+        onboarding: _,
+        tools: _,
+        mode: _,
+        research: _,
+        permissions: _,
+        sandbox: _,
+        project_root_markers,
+        internal_models: _,
+        compaction: _,
+        reasoning: _,
+        guards: _,
+        base_dir: _, // #[serde(skip)], kein TOML-Feld, keine FIELD_TABLE-Zeile
+    } = HarnessConfig::default();
+    // Kein `..` — ein neues Feld auf HarnessConfig, das hier nicht
+    // aufgeführt wird, ist ein Compile-Fehler (E0027), keine Laufzeitprobe.
+    let _ = (
+        config_version, workspace_root, default_provider, default_model,
+        active_agent_definition, active_uia_definition, uia_provider,
+        uia_model, policy_profile, project_root_markers,
+    ); // unused-Warnungen vermeiden
+    for path in [
+        "config_version", "workspace_root", "default_provider",
+        "default_model", "active_agent_definition", "active_uia_definition",
+        "uia_provider", "uia_model", "policy_profile", "project_root_markers",
+    ] {
+        assert!(
+            FIELD_TABLE.iter().any(|f| f.path == path),
+            "FIELD_TABLE fehlt Eintrag für {path}"
+        );
+    }
+}
+```
+
+Dasselbe Muster (Struct-Destructuring ohne `..` + Pfad-Assert-Schleife) für
+jede der oben gelisteten Section-Structs, mit dem jeweils vollständig
+gepunkteten Pfad (z. B. `"sandbox.cargo.mode"`, `"internal_models.session_title"`,
+`"mcp_listener.principals"` — für `Vec`-/`Option`-Felder wird nur der
+Container-Pfad destrukturiert, nicht seine Elemente; Elemente wie
+`RuleToml`/`McpPrincipalToml`/`InternalModelChoice` bekommen ihre eigene,
+separate Destructuring-Test-Funktion). Alle diese Tests leben in **Paket C**
+(Abschnitt 7g), nicht verteilt über die Produktivdateien.
+
+### 7b. Neue Dateien, Module, Typen, Funktionssignaturen
+
+**Neu:** `harw-config/src/scope.rs` — `MergeRule`, `Scope`, `FieldScope`,
+`FIELD_TABLE` (Abschnitt 6.1/6.3), rein deklarativ, keine Merge-Logik.
+
+**Neu:** `harw-config/src/merge.rs` — die generische Merge-Engine:
+
+```rust
+/// Grober Vertrauens-/Ebenen-Kontext dieses Merge-Aufrufs (bestimmt, welche
+/// `MergeRule`-Varianten überhaupt wirken — Tabelle in Abschnitt 7c).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerRole {
+    /// Der erste vertraute Layer (`~/.harw`, `layer_index == 0`). Jede
+    /// Regel verhält sich hier identisch zu `ProfileReplaces` — es gibt
+    /// noch keinen GLOBAL-Vorzustand, gegen den verengt werden könnte.
+    Baseline,
+    /// Jeder weitere vertraute Layer (aktives Profil, `layer_index >= 1`).
+    Refinement,
+    /// Der nicht vertraute Projekt-Layer aus `apply_restricted_layer`.
+    UntrustedProject,
+}
+
+/// Modelliert auf [`ConfigDiagnostic`] (nicht-fatal, sichtbar aber
+/// blockiert den Start nicht), trägt aber die für eine
+/// Scope-Verletzung nötigen Zusatzfelder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeDiagnostic {
+    /// Gepunkteter Feldpfad, z. B. `"mcp_listener.enabled"`.
+    pub field: String,
+    /// `config.toml`, die den Lockerungsversuch enthielt.
+    pub file: String,
+    /// Der verworfene Wert, `Debug`-formatiert. Nie ein Secret: jedes
+    /// Feld, das eine `ScopeDiagnostic` auslösen kann, ist ein
+    /// nicht-geheimer Skalar/Enum/Pfad/Regel-Eintrag — `credential_ref`
+    /// nimmt nie teil, da `mcp_listener.principals` `GlobalOnly` ist.
+    pub rejected_value: String,
+}
+
+impl std::fmt::Display for ScopeDiagnostic { /* "{field} in {file}: …" */ }
+
+/// Wendet `incoming` (bereits vollständig deserialisierte
+/// `HarnessConfig` dieses Layers, inkl. dessen eigener Section-Defaults für
+/// alles, was der Layer nicht selbst setzt) gemäß `FIELD_TABLE` und `role`
+/// auf `trusted` (der bisher akkumulierte Stand) an. `raw` ist das
+/// **rohe**, noch nicht `strip_new_sections`-bereinigte `toml::Value`
+/// dieses Layers und entscheidet je Feld per Präsenzprüfung (Muster
+/// `field_present`, `discovery.rs:872-878`, wiederverwendet), ob dieser
+/// Layer das Feld überhaupt selbst gesetzt hat.
+///
+/// Ersetzt `resolved.harness = cfg` (`discovery.rs:649`) für vertraute
+/// Layer und `merge_restricted_harness` (`discovery.rs:942-1003`) für den
+/// nicht vertrauten Projekt-Layer — beide Aufrufer unterscheiden sich nur
+/// im übergebenen `role`.
+///
+/// # Returns
+/// Jede `ScopeDiagnostic`, die durch einen abgelehnten
+/// Lockerungs-/Erweiterungsversuch entstanden ist (Abschnitt 7c/7e). Leer,
+/// wenn kein Layer-Wert verworfen wurde. `tracing::warn!` wird zusätzlich
+/// synchron für jeden Eintrag ausgelöst — der Rückgabewert ist für
+/// `ResolvedConfig::scope_warnings` und Tests gedacht, nicht der einzige
+/// Sichtbarkeitskanal.
+pub fn merge_layer_into(
+    trusted: &mut HarnessConfig,
+    incoming: HarnessConfig,
+    raw: &toml::Value,
+    role: LayerRole,
+    layer_path: &Path,
+) -> Vec<ScopeDiagnostic>;
+```
+
+Intern ist `merge_layer_into` **kein** reflektierendes Generikum — Rust hat
+keine Laufzeit-Reflection über heterogene Struct-Felder. Es ist eine
+Sequenz handgeschriebener Sektions-Helfer (`merge_top_level`,
+`merge_logging`, `merge_tui`, `merge_session`, `merge_policy`,
+`merge_mcp_listener`, `merge_onboarding`, `merge_tools_plan`, `merge_mode`,
+`merge_research`, `merge_permissions`, `merge_sandbox`, `merge_internal_models`
+(erweitert die bestehende Funktion, s. u.), `merge_compaction`,
+`merge_reasoning`, `merge_guards`), jeweils
+`fn(trusted: &mut X, incoming: X, raw: &toml::Value, role: LayerRole) -> Vec<ScopeDiagnostic>`,
+die für jedes ihrer Felder die passende **generische Regel-Anwendung**
+aufrufen — einmal in `merge.rs` definiert, von allen Sektions-Helfern
+wiederverwendet:
+
+```rust
+fn profile_replaces<T: Clone>(trusted: &mut T, incoming: T, present: bool, role: LayerRole);
+fn global_only<T: Clone + PartialEq + std::fmt::Debug>(
+    trusted: &mut T, incoming: T, present: bool, role: LayerRole,
+    field: &str, layer_path: &Path, out: &mut Vec<ScopeDiagnostic>,
+);
+fn union_list<T: Clone + PartialEq>(trusted: &mut Vec<T>, incoming: &[T], present: bool, role: LayerRole);
+fn intersection_list<T: Clone + PartialEq + std::fmt::Debug>(
+    trusted: &mut Vec<T>, incoming: &[T], present: bool, role: LayerRole,
+    field: &str, layer_path: &Path, out: &mut Vec<ScopeDiagnostic>,
+);
+fn min_bound<T: Ord + Default + Copy + std::fmt::Debug>(
+    trusted: &mut T, incoming: T, present: bool, role: LayerRole,
+    field: &str, layer_path: &Path, out: &mut Vec<ScopeDiagnostic>,
+); // nutzt intern das bestehende `min_positive` (discovery.rs:1008-1014)
+fn and_bool(trusted: &mut bool, incoming: bool, present: bool, role: LayerRole, field: &str, layer_path: &Path, out: &mut Vec<ScopeDiagnostic>);
+fn or_bool(trusted: &mut bool, incoming: bool, present: bool, role: LayerRole, field: &str, layer_path: &Path, out: &mut Vec<ScopeDiagnostic>);
+fn stricter_of(
+    trusted: &mut String, incoming: String, present: bool, role: LayerRole,
+    ordering: &[&str], field: &str, layer_path: &Path, out: &mut Vec<ScopeDiagnostic>,
+);
+```
+
+Jeder Helfer bekommt `present` bereits von seinem Aufrufer über
+`field_present(raw, &[...])` berechnet (kein Helfer liest `raw` selbst).
+Bei `role == LayerRole::Baseline` geben **alle** Helfer sofort
+`profile_replaces`-Verhalten zurück (Abschnitt 7c) — implementiert als
+früher `if role == LayerRole::Baseline { ...; return; }` am Kopf jedes
+Helfers außer `profile_replaces` selbst (das ist für `Baseline` ohnehin
+identisch).
+
+**Ersetzung von `discovery.rs:649`:**
+
+```rust
+// vorher (discovery.rs:648-649):
+// cfg.base_dir = Some(base.clone());
+// resolved.harness = cfg;
+
+// nachher:
+cfg.base_dir = Some(base.clone());
+let role = if layer_index == 0 { LayerRole::Baseline } else { LayerRole::Refinement };
+let mut warnings = merge_layer_into(&mut resolved.harness, cfg, &fields, role, base);
+resolved.scope_warnings.append(&mut warnings);
+```
+
+Die fünf Sonderfall-`if`-Blöcke (Zeilen 631-647) und `merge_internal_models`
+entfallen an dieser Stelle **nicht ersatzlos** — sie werden zu den
+konkreten `ProfileReplaces`-Implementierungen für genau diese fünf Felder
+innerhalb von `merge_top_level`/`merge_onboarding`/`merge_internal_models`
+(Details: Abschnitt 7f). `merge_internal_models` selbst bleibt als
+Funktion bestehen (Signatur unverändert) und wird von `merge.rs`s
+`merge_internal_models`-Sektionshelfer aufgerufen statt inline in der
+Discovery-Schleife.
+
+`ResolvedConfig` (Typdefinition in `discovery.rs`) bekommt ein neues
+öffentliches Feld:
+
+```rust
+/// Abgelehnte Scope-Lockerungsversuche aus `merge_layer_into`
+/// (Abschnitt 7e), gesammelt über alle Layer inkl. des nicht vertrauten
+/// Projekt-Layers. Getrennt von `diagnostics` (hängende Modell-/
+/// Provider-Referenzen) gehalten, da semantisch verschieden — beide sind
+/// nicht-fatal.
+pub scope_warnings: Vec<ScopeDiagnostic>,
+```
+
+### 7c. Verhältnis zu `merge_restricted_*`
+
+**`merge_restricted_network`/`_browser`/`_dod`** (`discovery.rs:883-939`)
+bleiben **unverändert bestehen** — sie behandeln `[network]`/`[browser]`/
+`[dod]`, die außerhalb von `HarnessConfig` liegen (Abschnitt 1, Randnotiz)
+und damit außerhalb des Geltungsbereichs dieser Spezifikation. Eine
+künftige Vereinheitlichung unter derselben `MergeRule`-Engine wäre
+konsequent, ist aber **nicht** Teil dieser Arbeitspakete (siehe Risiko R3,
+Abschnitt 8).
+
+**`merge_restricted_harness`** (`discovery.rs:942-1003`) wird **entfernt**
+und durch denselben `merge_layer_into`-Aufruf ersetzt, den auch die
+vertrauten Layer nutzen — `apply_restricted_layer` ruft ihn mit
+`role = LayerRole::UntrustedProject` auf, statt eine eigene 62-Zeilen-Funktion
+zu pflegen. `min_positive` wird aus `merge.rs` heraus weiterhin von dort
+importiert (nicht dupliziert).
+
+Damit eine bestehende Schutzwirkung **nicht** verloren geht, gilt je
+`MergeRule`-Variante für `LayerRole::UntrustedProject` exakt dieselbe
+Anwendung wie für `LayerRole::Refinement` (trusted Profil), **mit genau
+zwei Ausnahmen**, die beide bereits identisch für Refinement/Baseline
+gelten:
+
+| `MergeRule` | `Refinement` (Profil) | `UntrustedProject` |
+|---|---|---|
+| `ProfileReplaces` | Wert übernehmen, wenn gesetzt, sonst `trusted` behalten | **nie angewendet** — Feld bleibt unberührt (entspricht der heutigen Ausschlussliste `discovery.rs:542-558`: `default_provider`/`default_model`, `active_agent_definition`, `[session]`, `[tui]`, `[logging]`, `[mode]` etc.) |
+| `GlobalOnly` | abweichender Wert ignoriert + gewarnt | identisch: abweichender Wert ignoriert + gewarnt |
+| `Union`/`Intersection`/`MinBound`/`AndBool`/`OrBool`/`StricterOf` | wendet die Regel monoton verengend an (per Konstruktion niemals lockernd) | **identisch** — dieselbe monotone Regel; da jede dieser sechs Regeln per Konstruktion nur verengen kann, ist die Anwendung durch einen nicht vertrauten Layer ebenso sicher wie durch ein vertrautes Profil |
+| `CompositeMember` | reist mit dem Elternwert | reist mit dem Elternwert |
+| `PerFileValidated` | pro Datei geprüft | pro Datei geprüft (auch der Projekt-Layer darf keinen nicht unterstützten `config_version`-Wert einschleusen) |
+
+**Konsequenz (bewusste, dokumentierte Erweiterung gegenüber heute):** Die
+heutige Abdeckung von neun Feldern für den nicht vertrauten Layer
+(`policy.require_approval_for`, 4× `research.*`, 4× `tools.plan.*`) wächst
+auf **alle 25 Felder** mit `Union`/`Intersection`/`MinBound`/`AndBool`/
+`OrBool`/`StricterOf` (Abschnitt 6.3-Kontrollsumme: 2+4+12+2+3+2 = 25, minus
+die bereits neun abgedeckten = 16 neu geschützte Felder, u. a.
+`permissions.deny`, `guards.*`, `session.retention_days`,
+`compaction.absolute_ceiling_tokens`, `permissions.approval_timeout_secs`).
+Das ist eine reine Erweiterung des Schutzes (nie eine Lockerung) und damit
+mit der Vorgabe „keine bestehende Schutzwirkung darf verloren gehen"
+vereinbar — sollte aber im Review explizit als beabsichtigte
+Verhaltensänderung markiert werden, nicht als Nebeneffekt.
+
+### 7d. Einordnung der vertrauten Projekt-Ebene
+
+Es gibt in diesem Modell **keine eigene** „vertraute Projekt-Ebene" (anders
+als der Wortlaut der Aufgabenstellung suggeriert) — die heutige
+Implementierung kennt nur (1) vertraute Layer (`~/.harw` → aktives Profil,
+iteriert als `layers: &[PathBuf]`) und (2) den einen nicht vertrauten
+Projekt-Layer (`restricted_repo`). Eine „vertraute Projekt-Ebene" im
+Sinne einer dritten, zusätzlichen `config.toml` (etwa ein vom Nutzer
+selbst — nicht vom Repo — verwaltetes Projekt-Overlay) existiert im
+heutigen Code nicht als eigener Begriff; **falls** eine solche Ebene
+künftig eingeführt wird, ist der im Auftrag vorgeschlagene Ansatz
+(„wie Profil, also unter global") direkt umsetzbar: Sie würde als
+zusätzlicher Eintrag in `layers` mit `role = LayerRole::Refinement`
+behandelt, genau wie eine zweite Profil-Ebene — die Engine unterscheidet
+ohnehin nicht zwischen „Profil" und „vertrautes Projekt", beide sind
+`Refinement` in Präzedenz-Reihenfolge. Diese Aussage ist eine
+Bereitschaftserklärung für eine mögliche künftige Ebene, keine Umsetzung in
+den vier Arbeitspaketen.
+
+### 7e. Warnungsformat
+
+`ScopeDiagnostic` (Abschnitt 7b) — modelliert auf dem bestehenden
+`ConfigDiagnostic`-Muster (`discovery.rs:34-63`: nicht-fataler Fund mit
+`Display`), aber mit den drei geforderten Feldern `field`, `file`,
+`rejected_value` statt `site`/`kind`/`reference`.
+
+**Auslöser:** jede `MergeRule`-Anwendung außer `ProfileReplaces` /
+`CompositeMember` / `PerFileValidated`, bei der (a) der aktuelle Layer das
+Feld laut `field_present` **explizit gesetzt** hat, **und** (b) der
+resultierende effektive Wert **nicht** dem entspricht, was dieser Layer
+gesetzt hat (die Regel hat seinen Versuch also verworfen oder begrenzt —
+sei es eine `GlobalOnly`-Abweichung, ein `Intersection`/`Union`-Eintrag
+außerhalb der erlaubten Richtung, eine `MinBound`-Überschreitung, ein
+`AndBool`/`OrBool` in falscher Richtung, oder ein `StricterOf`-Wert
+lockerer als der bisherige).
+
+**Sofortige Sichtbarkeit:** jeder Fund wird **synchron** per
+`tracing::warn!` mit strukturierten Feldern ausgelöst (Projekt-Konvention,
+siehe `CLAUDE.md`-Tracing-Standards):
+
+```rust
+tracing::warn!(
+    field = %diagnostic.field,
+    file = %diagnostic.file,
+    rejected_value = %diagnostic.rejected_value,
+    "scope loosening attempt ignored"
+);
+```
+
+**Gesammelte Sichtbarkeit:** zusätzlich landet jeder Fund in
+`ResolvedConfig::scope_warnings` (Abschnitt 7b), unabhängig vom
+Tracing-Log auswertbar (z. B. für eine künftige `harw doctor`-artige
+Diagnose-Ausgabe oder für Tests).
+
+### 7f. Die fünf heute schon übernommenen Sonderfälle
+
+`default_provider`, `default_model`, `active_uia_definition`, `onboarding`,
+`internal_models` sind alle als `ProfileReplaces` eingestuft (Abschnitt
+6.3) — ihr heutiges Verhalten darf sich **nicht** ändern. Konkret:
+
+- `default_provider`/`default_model`/`active_uia_definition`: Die
+  `profile_replaces`-Implementierung für genau diese drei Top-Level-Felder
+  muss das bestehende Muster (`if cfg.<feld>.is_none() { cfg.<feld> = resolved.harness.<feld>.clone() }`,
+  `discovery.rs:631-639`) **wortgleich reproduzieren** — nicht durch eine
+  neue, unabhängig geschriebene generische Implementierung ersetzen, deren
+  Verhalten erst durch einen Test bewiesen werden müsste. Am einfachsten:
+  `merge_top_level` ruft für diese drei Felder exakt diesen bestehenden
+  Code auf (als kleine private Hilfsfunktion extrahiert, nicht neu
+  geschrieben).
+- `onboarding`: `merge_onboarding` reproduziert exakt
+  `discovery.rs:640-642` (`if fields.get("onboarding").is_none() { cfg.onboarding = resolved.harness.onboarding.clone(); }`)
+  — Section-Ebene, nicht Flag-Ebene (Abschnitt 6.3, 1.7).
+- `internal_models`: `merge_internal_models` (bestehende Funktion,
+  `discovery.rs:846-866`) wird **unverändert wiederverwendet**, nur der
+  Aufrufort wandert von der Discovery-Schleife in den
+  `merge_internal_models`-Sektionshelfer von `merge.rs`.
+
+Alle **anderen** ~35 `ProfileReplaces`-Felder bekommen dagegen eine **neu
+geschriebene** generische `profile_replaces`-Implementierung — für sie gab
+es bisher **keinen** korrekten Code (sie waren als „ERSETZT" markiert,
+Abschnitt 4); das ist die eigentliche Bugfix-Wirkung dieser Arbeit.
+
+### 7g. Arbeitspakete (3, disjunkte Dateimengen)
+
+| Paket | Dateien | Inhalt | Abhängigkeit |
+|---|---|---|---|
+| **A — Scope & Merge-Engine** | `harw-config/src/scope.rs` (neu), `harw-config/src/merge.rs` (neu), `harw-config/src/lib.rs` (2 Zeilen: `pub mod scope; pub mod merge;` + Re-Exports von `MergeRule`, `Scope`, `FieldScope`, `FIELD_TABLE`, `LayerRole`, `ScopeDiagnostic`, `merge_layer_into`) | `MergeRule`/`Scope`/`FieldScope`/`FIELD_TABLE` (Abschnitt 6.1/6.3) + `LayerRole`/`ScopeDiagnostic`/`merge_layer_into` + alle Sektions-Helfer + generischen Regel-Helfer (Abschnitt 7b) | keine |
+| **B — Discovery-Integration** | `harw-config/src/discovery.rs` (nur diese Datei: `use`-Zeilen für `crate::scope::*`/`crate::merge::*` ergänzen; Ersetzung von Zeile 649, Abschnitt 7b; `apply_restricted_layer` auf `merge_layer_into(..., LayerRole::UntrustedProject, ...)` umstellen; `merge_restricted_harness` entfernen; `ResolvedConfig::scope_warnings`-Feld + Befüllung ergänzen, Abschnitt 7b) | Verdrahtung der Engine in den bestehenden Discovery-Ablauf | A |
+| **C — Tests** | `harw-config/tests/config_scope_merge.rs` (neu; bei Bedarf zusätzlich `harw-config/tests/config_scope_exhaustive.rs`) | Alle Tests aus Abschnitt 7a (Exhaustivität) und 7h (Merge-Verhalten, Regression), ausschließlich über die öffentliche API (`FIELD_TABLE`, `merge_layer_into`, `discover_config_with_restricted`) — keine Änderung an den Dateien aus A/B nötig, da alle beteiligten Felder `pub` sind | A, B |
+
+Reihenfolge zwingend A → B → C (jedes Paket braucht die fertige API des
+vorigen). Kein Paket überschneidet sich mit einem anderen in der
+Dateimenge.
+
+### 7h. Testliste
+
+**Pro `MergeRule`-Variante mindestens ein Test** (in `config_scope_merge.rs`,
+über `merge_layer_into` direkt oder über zwei synthetische Layer):
+
+1. `ProfileReplaces`: Profil setzt das Feld nicht → Home-Wert bleibt
+   erhalten (nicht Default) — der eigentliche Kernbeweis für den Bugfix.
+2. `ProfileReplaces` (Spezialfall `internal_models`): Profil setzt nur
+   `session_title` → `compaction_summary` aus Home bleibt erhalten (Beweis,
+   dass `merge_internal_models` unverändert eingebunden ist).
+3. `GlobalOnly`: Profil versucht `sandbox.cargo.cargo_bin` zu ändern →
+   Home-Wert bleibt effektiv, `ScopeDiagnostic` mit
+   `field == "sandbox.cargo.cargo_bin"` erzeugt.
+4. `Union`: Home setzt `require_approval_for = ["shell.exec"]`, Profil
+   setzt `["fs.write"]` → effektiv beide Einträge vorhanden.
+5. `Intersection`: Home setzt `permissions.allow = [A, B]`, Profil setzt
+   `[A, C]` → effektiv nur `[A]` (C wird verworfen + `ScopeDiagnostic`).
+6. `MinBound`: Home setzt `guards.repeated_failure_warn = 2`, Profil setzt
+   `5` → effektiv `2`, `ScopeDiagnostic` erzeugt; Profil setzt `1` →
+   effektiv `1`, keine Diagnostic.
+7. `AndBool`: Home setzt `mcp_listener.enabled = false`, Profil setzt
+   `true` → effektiv `false`, `ScopeDiagnostic` erzeugt.
+8. `OrBool`: Home setzt `guards.enabled = true`, Profil setzt `false` →
+   effektiv `true`, `ScopeDiagnostic` erzeugt.
+9. `StricterOf`: Home setzt `permissions.default_mode = "auto"`, Profil
+   setzt `"full"` → effektiv `"auto"`, `ScopeDiagnostic` erzeugt; Profil
+   setzt `"ask"` → effektiv `"ask"`, keine Diagnostic.
+10. `CompositeMember`: `RuleToml`-Element wird nur als Ganzes verglichen —
+    zwei `allow`-Regeln mit gleichem `tool`, aber unterschiedlichem
+    `pattern` gelten als **unterschiedliche** Einträge in der
+    `Intersection` (kein teilweiser Abgleich nur über `tool`).
+11. `PerFileValidated`: `config_version` eines Layers wird nicht vom
+    vorigen Layer „geerbt" — zwei aufeinanderfolgende Layer mit
+    unterschiedlichem `config_version` behalten je ihren eigenen Wert bis
+    zur Prüfung (kein Merge-Effekt).
+
+**Ein Test pro sicherheitskritischem (🔒) Feld — Lockerung wird ignoriert
+und gewarnt** (mindestens folgende, je nach `MergeRule`-Form; für die
+übrigen 🔒-Felder aus Abschnitt 2/6.3 gilt dasselbe Muster analog):
+
+12. `mcp_listener.enabled`: Home `false` → Profil `true` verworfen (s. 7).
+13. `mcp_listener.listen_addr`: Home `"127.0.0.1:1337"` → Profil
+    `"0.0.0.0:1337"` verworfen + `ScopeDiagnostic`.
+14. `mcp_listener.principals`: Profil versucht einen zusätzlichen Principal
+    einzutragen → ignoriert + `ScopeDiagnostic`, Home-Liste unverändert
+    (seit R2, entschieden 2026-09-21: Regel ist `Intersection` nach `id`,
+    nicht mehr `GlobalOnly` — Entfernen- und Überschreiben-Fälle sind
+    gesondert in Test 25–27 abgedeckt).
+15. `permissions.allow`: s. 5.
+16. `permissions.extra_roots`: Home `["/a"]`, Profil `["/a", "/b"]` →
+    effektiv `["/a"]`, `ScopeDiagnostic` für `/b`.
+17. `permissions.default_mode`: s. 9.
+18. `sandbox.cargo.*`/`sandbox.tmux.*`: s. 3.
+19. `research.network_allow_hosts`: Home `["docs.rs"]`, Profil
+    `["docs.rs", "evil.example"]` → effektiv `["docs.rs"]`,
+    `ScopeDiagnostic` für `evil.example`.
+
+**Regressionstest** (in `config_scope_merge.rs`, über
+`discover_config_with_restricted` mit zwei echten Temp-Layer-Verzeichnissen):
+
+20. „globales `require_approval_for` überlebt eine Profil-`config.toml`":
+    Home-`config.toml` setzt `[policy] require_approval_for = ["shell.exec"]`;
+    Profil-`config.toml` setzt `[mcp_listener]` (o. ä.), aber **kein**
+    `[policy]` → `resolved.harness.policy.require_approval_for` enthält
+    weiterhin `"shell.exec"` (der exakte, vom Nutzer beschriebene Fall aus
+    Abschnitt 0/4).
+
+**Schutzwirkung nicht vertrauter Projekt-Layer bleibt erhalten:**
+
+21. Alle neun heute schon per `merge_restricted_harness` abgedeckten Fälle
+    (`policy.require_approval_for` Union, 4× `research.*`, 4×
+    `tools.plan.*` — Abschnitt 3/6.3) werden 1:1 als Tests gegen
+    `discover_config_with_restricted(..., Some(&restricted_repo))`
+    reproduziert und müssen weiterhin bestehen (Nicht-Regression bei der
+    Umstellung von `merge_restricted_harness` auf `merge_layer_into`).
+22. Ein Feld, das laut Abschnitt 7c **neu** für den Projekt-Layer geschützt
+    wird (z. B. `permissions.deny`, `guards.repeated_failure_warn`): Ein
+    Projekt-`.harw/config.toml` mit einem lockernden Versuch wird
+    verworfen — Beweis der bewussten Schutz-**Erweiterung**.
+23. `[mcp_listener]`/`sandbox.*` bleiben für den Projekt-Layer weiterhin
+    komplett unerreichbar (identisch zu heute, `discovery.rs:542-558`).
+
+**Neu durch die R1/R2-Entscheidung vom 2026-09-21 nötig gewordene Tests:**
+
+24. `StricterOf`-Fallback für `policy.default_visibility_scope` (R1): Home
+    setzt `default_visibility_scope = "self"`, Profil setzt einen
+    dritten/unbekannten Wert (z. B. `"team"`) → effektiv bleibt `"self"`
+    (Home-Wert); der Profil-Wert wird **nicht** in die Ordnung einsortiert
+    (weder als strenger noch als lockerer behandelt als `"self"`/
+    `"everyone"`), sondern wie eine `GlobalOnly`-Abweichung verworfen —
+    `ScopeDiagnostic` mit `field == "policy.default_visibility_scope"` und
+    `rejected_value == "team"` wird erzeugt. Der Test muss fehlschlagen,
+    falls eine künftige Implementierung den unbekannten Wert stattdessen
+    stillschweigend als „lockerer" oder „strenger" einsortiert (z. B. durch
+    einen String-Vergleich anstelle eines expliziten `ordering`-Lookups).
+25. `mcp_listener.principals` — Entfernen (R2): Home setzt
+    `principals = [P1, P2]` (verschiedene `id`), Profil setzt
+    `principals = [P1]` → effektiv `[P1]`; `P2` fehlt im Ergebnis, **keine**
+    `ScopeDiagnostic` (reines Entfernen ist erlaubt und kein
+    Lockerungsversuch).
+26. `mcp_listener.principals` — Hinzufügen verworfen (R2): Home setzt
+    `principals = [P1]`, Profil setzt `principals = [P1, P3]` (`P3` mit
+    einer `id`, die in Home nicht vorkommt) → effektiv `[P1]`; `P3` wird
+    verworfen und löst eine `ScopeDiagnostic` (`field ==
+    "mcp_listener.principals"`, `rejected_value` nennt die verworfene `id`)
+    aus.
+27. `mcp_listener.principals` — Rechteausweitung verworfen (R2): Home setzt
+    `P1` mit `job_capabilities = ["ReadOwn"]`, Profil setzt einen Eintrag
+    mit derselben `id` `P1`, aber erweiterten `job_capabilities =
+    ["ReadOwn", "CancelWorkspace"]` (bzw. abweichendem `credential_ref`/
+    `tenant`/`workspace`) → effektiv gewinnt die vollständige Home-Fassung
+    von `P1` unverändert (kein Feld-Merge innerhalb des Principal-Eintrags);
+    eine `ScopeDiagnostic` wird erzeugt, da der vom Profil gesetzte Wert für
+    `P1` vom effektiven Ergebnis abweicht.
+
+---
+
+## 8. Risiken und offene Punkte
+
+**R1 — `policy.default_visibility_scope`: unvollständige Ordnung — entschieden
+2026-09-21.** Die in Abschnitt 6.2 festgelegte Ordnung `["self", "everyone"]`
+deckt nur die beiden im Code belegten Werte ab. `PolicySection.default_visibility_scope`
+hat kein `validate()`, das die Wertemenge einschränkt (anders als
+`permissions.default_mode`/`ALLOWED_MODES`) — ein Layer könnte
+theoretisch jeden beliebigen String setzen. **Entscheidung:** Die feste
+Reihenfolge `"self" < "everyone"` wird festgeschrieben und bleibt
+`MergeRule::StricterOf` mit genau dieser Ordnung (Abschnitt 6.2/6.3) — das
+entspricht Weg (b) der ursprünglichen Analyse: Für jeden Wert außerhalb
+`{"self", "everyone"}` fällt `stricter_of` auf `GlobalOnly`-Verhalten
+zurück (kein Vergleich wird versucht; der abweichende Profil-/Projekt-Wert
+wird ignoriert und löst eine `ScopeDiagnostic` aus), statt ihn
+stillschweigend in die Ordnung einzusortieren. Zusätzlich zur reinen
+Verhaltensfestlegung verlangt die Nutzerentscheidung einen expliziten
+**Absicherungstest** (Abschnitt 7h, Test #24), der genau diesen Fallback
+beweist und rot werden muss, falls eine künftige Implementierung einen
+dritten Wert stattdessen fälschlich als „lockerer" oder „strenger"
+behandelt. Weg (a) — `default_visibility_scope` vor dieser Arbeit per
+`validate()` auf eine feste Wertemenge einzuschränken — wurde nicht
+gewählt; die Absicherung erfolgt ausschließlich über den Merge-Fallback
+plus Test.
+
+**R2 — `mcp_listener.principals`: Entfernen-Vorschlag bestätigt — entschieden
+2026-09-21.** Die ursprüngliche Analyse delegierte die Frage „darf ein
+Profil Principals per Schnittmenge entfernen" mit einem markierten
+Vorschlag an diese Spezifikation. **Entscheidung:** Ja — die Regel wechselt
+von `GlobalOnly` auf `Intersection` nach dem Vergleichsschlüssel `id`
+(Abschnitt 6.1/6.3, Zeile zu `mcp_listener.principals`). Ein Profil darf
+`principals` auf eine Teilmenge der von Home gesetzten IDs einschränken
+(reines Entfernen), aber **nie** eine neue `id` hinzufügen und **nie**
+`credential_ref`/`tenant`/`workspace`/`job_capabilities` zu einer
+bestehenden `id` verändern (z. B. Rechte erweitern) — nur Principals, deren
+`id` exakt in der globalen Liste vorkommt, dürfen im Profil-Ergebnis
+auftauchen, und für sie gewinnt immer die vollständige globale Fassung
+(kein Feld-Merge innerhalb eines Principal-Eintrags). Damit ist Abschnitt
+6.3/7 vollständig auf `Intersection` umgestellt (nicht mehr `GlobalOnly`);
+die fünf Principal-Unterfelder sind entsprechend `CompositeMember`
+(Kontrollsummen-Update in Abschnitt 6.3). Absicherungstests: Abschnitt 7h,
+Tests #25 (Entfernen), #26 (Hinzufügen verworfen), #27 (Rechteausweitung
+verworfen).
+
+**R3 — `[network]`/`[browser]`/`[dod]`/`[web]` bleiben außen vor.** Diese
+vier Sektionen liegen außerhalb von `HarnessConfig` (Abschnitt 1, Randnotiz)
+und damit außerhalb des mit „88 `HarnessConfig`-Felder" abgesteckten
+Umfangs dieser Aufgabe. Ihr heutiges Merge-Verhalten (sticky
+Ganze-Sektion-Ersetzung bei Anwesenheit, `discovery.rs:607-624`) bleibt
+unangetastet; `merge_restricted_network/_browser/_dod` bleiben als
+separate, nicht generalisierte Funktionen bestehen. Eine Vereinheitlichung
+unter derselben `MergeRule`-Engine wäre folgerichtig, ist aber nicht
+Bestandteil der Arbeitspakete in Abschnitt 7g und müsste gesondert
+beauftragt werden.
+
+**R4 — „Vertraute Projekt-Ebene" ist ein Begriff aus dem Auftrag, nicht aus
+dem Code.** Abschnitt 7d erklärt, dass der heutige Code nur „vertraute
+Layer" (Home + Profil, ununterschieden) und den einen nicht vertrauten
+Projekt-Layer kennt. Falls mit „vertraute Projekt-Ebene" etwas anderes
+gemeint war (z. B. eine dritte, vom Nutzer aber nicht vom Repo verwaltete
+Konfigurationsdatei, die heute noch gar nicht existiert), konnte ich das
+im Code nicht verifizieren und rate hier bewusst nicht weiter — Abschnitt
+7d beschreibt nur, wie sich eine solche Ebene *falls sie eingeführt wird*
+in dieses Modell einfügen würde.
+
+**R5 — `session.retention_days`/`compaction.absolute_ceiling_tokens` als
+`MinBound`: Datenschutz- vs. Audit-Zielkonflikt bleibt bestehen.** Die
+Nutzerentscheidung wählt „GLOBAL als Obergrenze (Minimum)" für beide Felder
+explizit aus den zwei ursprünglich zur Wahl gestellten Optionen — das
+Spannungsfeld selbst (ein Admin könnte eine *Mindest*-Aufbewahrung aus
+Audit-Gründen wollen, was mit `MinBound` nicht ausdrückbar ist) ist damit
+zwar entschieden, aber nicht aufgelöst; sollte ein Audit-Mindesthaltezeitraum
+künftig gebraucht werden, braucht es ein zusätzliches, hier nicht
+spezifiziertes Feld (z. B. `session.min_retention_days` mit `MaxBound`),
+kein Umwidmen von `retention_days` selbst.
+
+---
+
 ## Antwort-Zusammenfassung
+
+> **Hinweis (2026-09-21):** Dieser Abschnitt ist die Zusammenfassung der
+> **ursprünglichen Analyse** (Bestandsaufnahme + 11 OFFEN-Punkte, vor der
+> Nutzerentscheidung). Er wird bewusst nicht überschrieben, um den
+> Analysestand nachvollziehbar zu halten. Der **aktuelle, entschiedene**
+> Stand steht in Abschnitt 2 (Tabelle, alle 11 Zeilen aufgelöst), Abschnitt
+> 6 (vollständige `MergeRule`-Taxonomie für alle 88 Felder) und Abschnitt 7
+> (verbindliche Umsetzungsspezifikation).
 
 - **Dokument:** `/home/mia/Harwness-neu/docs/design/config-scopes.md`
 - **Felder gesamt (dokumentiert):** 88 `HarnessConfig`-Blattfelder (Abschnitt

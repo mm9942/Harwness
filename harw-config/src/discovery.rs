@@ -7,6 +7,7 @@ use crate::dotenv::load_env_layer;
 use crate::error::{ConfigError, ConfigResult};
 use crate::harness_config::HarnessConfig;
 use crate::mcp_toml::McpServerToml;
+use crate::merge::{LayerRole, ScopeDiagnostic, merge_layer_into};
 use crate::model_toml::ModelToml;
 use crate::network_toml::NetworkSection;
 use crate::plugin_toml::PluginToml;
@@ -112,6 +113,12 @@ pub struct ResolvedConfig {
     /// Legacy-Provider seine Referenz noch auflöst). Siehe
     /// [`ConfigDiagnostic`].
     pub diagnostics: Vec<ConfigDiagnostic>,
+    /// Abgelehnte Scope-Lockerungsversuche aus [`merge_layer_into`]
+    /// (`docs/design/config-scopes.md` Abschnitt 7e), akkumuliert über jeden
+    /// vertrauten Layer (`discover_config_with_restricted`) und den nicht
+    /// vertrauten Projekt-Layer (`apply_restricted_layer`). Nicht-fatal,
+    /// sichtbar, blockiert den Start nicht — siehe [`ScopeDiagnostic`].
+    pub scope_warnings: Vec<ScopeDiagnostic>,
 }
 
 impl ResolvedConfig {
@@ -628,25 +635,25 @@ pub fn discover_config_with_restricted(
             let mut cfg: HarnessConfig = harness_fields
                 .try_into()
                 .map_err(|e: toml::de::Error| ConfigError::TomlParse(e.to_string()))?;
-            if cfg.default_provider.is_none() {
-                cfg.default_provider = resolved.harness.default_provider.clone();
-            }
-            if cfg.default_model.is_none() {
-                cfg.default_model = resolved.harness.default_model.clone();
-            }
-            if cfg.active_uia_definition.is_none() {
-                cfg.active_uia_definition = resolved.harness.active_uia_definition.clone();
-            }
-            if fields.get("onboarding").is_none() {
-                cfg.onboarding = resolved.harness.onboarding.clone();
-            }
-            merge_internal_models(
-                &mut cfg,
-                &resolved.harness.internal_models,
-                fields.get("internal_models"),
-            );
             cfg.base_dir = Some(base.clone());
-            resolved.harness = cfg;
+            // Erster vertrauter Layer (`~/.harw`) ist die Baseline, jeder
+            // weitere vertraute Layer (aktives Profil) eine Refinement —
+            // siehe `LayerRole`-Doku in `merge.rs`. `merge_layer_into`
+            // wendet dabei je `FIELD_TABLE`-Eintrag die passende
+            // `MergeRule` an, inklusive der zuvor hier manuell
+            // fortgeschriebenen Sonderfaelle (`default_provider`,
+            // `default_model`, `active_uia_definition`, `onboarding`,
+            // `internal_models` — siehe `merge_top_level`/`merge_onboarding`/
+            // `merge_internal_models` in `merge.rs`, die dieses Verhalten
+            // wortgleich nachbilden).
+            let role = if layer_index == 0 {
+                LayerRole::Baseline
+            } else {
+                LayerRole::Refinement
+            };
+            let scope_diagnostics =
+                merge_layer_into(&mut resolved.harness, cfg, &fields, role, &config_path);
+            resolved.scope_warnings.extend(scope_diagnostics);
         }
 
         // agents/*/agent.toml
@@ -773,7 +780,14 @@ fn apply_restricted_layer(base: &Path, resolved: &mut ResolvedConfig) -> ConfigR
     let restricted: HarnessConfig = harness_fields
         .try_into()
         .map_err(|e: toml::de::Error| ConfigError::TomlParse(e.to_string()))?;
-    merge_restricted_harness(&mut resolved.harness, &restricted, &fields);
+    let scope_diagnostics = merge_layer_into(
+        &mut resolved.harness,
+        restricted,
+        &fields,
+        LayerRole::UntrustedProject,
+        base,
+    );
+    resolved.scope_warnings.extend(scope_diagnostics);
 
     // [network]/[browser]/[dod]: nur verengend, nie erweiternd (siehe je
     // Merge-Funktion). `geckodriver_path`/`geckodriver_sha256`/`proof_key_dir`
@@ -834,41 +848,12 @@ fn extract_section<T: serde::de::DeserializeOwned>(
     }
 }
 
-/// Merged `[internal_models]` pro Feld statt pro Datei (Addendum C, Punkt
-/// 3): `cfg.internal_models` kommt bereits aus der vollständigen
-/// Deserialisierung dieser Layer (inkl. deren eigener Feld-Defaults), enthält
-/// also für Felder, die diese Layer nicht selbst setzt, wieder
-/// `InternalModelsToml`-Defaults statt der Werte vorheriger Layer. Diese
-/// Funktion ersetzt solche Defaults durch `previous`, wenn das jeweilige Feld
-/// im rohen TOML-Dokument dieser Layer (`raw`, vor `strip_new_sections`)
-/// tatsächlich fehlt — nur ein Feld, das die Layer selbst schreibt,
-/// überschreibt `previous`.
-fn merge_internal_models(
-    cfg: &mut HarnessConfig,
-    previous: &crate::internal_models::InternalModelsToml,
-    raw: Option<&toml::Value>,
-) {
-    let Some(raw_table) = raw else {
-        // Diese Layer hat gar keine `[internal_models]`-Tabelle: die
-        // vorherigen Layer bleiben vollständig bestehen.
-        cfg.internal_models = previous.clone();
-        return;
-    };
-    if raw_table.get("use_openrouter_defaults").is_none() {
-        cfg.internal_models.use_openrouter_defaults = previous.use_openrouter_defaults;
-    }
-    for point in crate::internal_models::InternalModelPoint::ALL {
-        if raw_table.get(point.key()).is_none() {
-            cfg.internal_models
-                .set_choice(point, previous.choice(point).cloned());
-        }
-    }
-}
-
 /// Ob `path` (Kette verschachtelter Tabellen-Keys) im geparsten Dokument
-/// `fields` ausdrücklich gesetzt ist. Gemeinsame Präsenzprüfung für alle
-/// `merge_restricted_*`-Funktionen dieses Moduls (gleiche Logik wie die
-/// lokale `present`-Closure in [`merge_restricted_harness`]).
+/// `fields` ausdrücklich gesetzt ist. Gemeinsame Präsenzprüfung für die
+/// verbliebenen `merge_restricted_*`-Funktionen dieses Moduls
+/// (`network`/`browser`/`dod`) — für [`HarnessConfig`] übernimmt
+/// [`merge_layer_into`] die Präsenzprüfung mittlerweile über seine eigene,
+/// private `field_present`-Kopie in `crate::merge`.
 fn field_present(fields: &toml::Value, path: &[&str]) -> bool {
     let mut value = Some(fields);
     for key in path {
@@ -935,70 +920,6 @@ fn merge_restricted_dod(trusted: &mut DodSection, restricted: &DodSection, field
         trusted
             .allowed_cgroup_prefixes
             .retain(|prefix| restricted.allowed_cgroup_prefixes.contains(prefix));
-    }
-}
-
-/// Monotone Übernahme: jede Zeile kann den vertrauten Stand nur verengen.
-fn merge_restricted_harness(
-    trusted: &mut HarnessConfig,
-    restricted: &HarnessConfig,
-    fields: &toml::Value,
-) {
-    let present = |path: &[&str]| {
-        let mut value = Some(fields);
-        for key in path {
-            value = value.and_then(|table| table.get(*key));
-        }
-        value.is_some()
-    };
-
-    // [policy] require_approval_for: Vereinigung. `harw_core::ConfigApprovalPolicy`
-    // fragt für jeden gelisteten Namen nach und erlaubt alle übrigen — mehr
-    // Namen bedeuten nur mehr Nachfragen.
-    if present(&["policy", "require_approval_for"]) {
-        for tool in &restricted.policy.require_approval_for {
-            if !trusted.policy.require_approval_for.contains(tool) {
-                trusted.policy.require_approval_for.push(tool.clone());
-            }
-        }
-    }
-
-    // [research]: Allowlist nur schneiden, Grenzen nur senken.
-    let research = &restricted.research;
-    if present(&["research", "network_allow_hosts"]) {
-        trusted
-            .research
-            .network_allow_hosts
-            .retain(|host| research.network_allow_hosts.contains(host));
-    }
-    if present(&["research", "cargo_registry_read"]) {
-        trusted.research.cargo_registry_read &= research.cargo_registry_read;
-    }
-    if present(&["research", "max_fetch_bytes"]) {
-        trusted.research.max_fetch_bytes =
-            min_positive(trusted.research.max_fetch_bytes, research.max_fetch_bytes);
-    }
-    if present(&["research", "fetch_timeout_secs"]) {
-        trusted.research.fetch_timeout_secs = min_positive(
-            trusted.research.fetch_timeout_secs,
-            research.fetch_timeout_secs,
-        );
-    }
-
-    // [tools.plan]: nur zusätzliche Prüfungen und kleinere Grenzen.
-    let plan = &restricted.tools.plan;
-    if present(&["tools", "plan", "validate_dependency_cycles"]) {
-        trusted.tools.plan.validate_dependency_cycles |= plan.validate_dependency_cycles;
-    }
-    if present(&["tools", "plan", "validate_write_conflicts"]) {
-        trusted.tools.plan.validate_write_conflicts |= plan.validate_write_conflicts;
-    }
-    if present(&["tools", "plan", "max_nodes"]) {
-        trusted.tools.plan.max_nodes = min_positive(trusted.tools.plan.max_nodes, plan.max_nodes);
-    }
-    if present(&["tools", "plan", "max_expand_depth"]) {
-        trusted.tools.plan.max_expand_depth =
-            min_positive(trusted.tools.plan.max_expand_depth, plan.max_expand_depth);
     }
 }
 
@@ -1484,7 +1405,8 @@ validate_write_conflicts = false
         let repo = test_directory("restricted-repo");
         // `PlanSection::enabled`/`persist` (`harw-config/src/plan_toml.rs`)
         // sind mit `default_true` gepflegt: "Der Planmodus ist standardmäßig
-        // aktiv" (Moduldoku dort). `merge_restricted_harness` mischt für
+        // aktiv" (Moduldoku dort). `merge_layer_into` (Rolle
+        // `LayerRole::UntrustedProject`) mischt für
         // `[tools.plan]` bewusst nur `validate_dependency_cycles`,
         // `validate_write_conflicts`, `max_nodes` und `max_expand_depth`
         // ein -- `enabled`/`persist` sind dort absichtlich nicht

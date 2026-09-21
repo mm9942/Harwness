@@ -34,7 +34,7 @@ INSTALL_ENV = DESTDIR='$(DESTDIR)' PREFIX='$(PREFIX)' \
 # DESTDIR staging is requested (packaging sandboxes must never invoke sudo).
 PRIV_ESC := $(shell if [ "$$(id -u)" -ne 0 ] && [ -z "$(DESTDIR)" ]; then printf 'sudo -E'; fi)
 
-.PHONY: help doctor check-config ensure-bpf-linker install-bpf-linker build-bpf build check fmt clippy test verify \
+.PHONY: help doctor check-config ensure-bpf-toolchain build-bpf build check fmt clippy test verify \
 	install install-existing stage enable enable-warden disable restart status logs smoke uninstall stage-test
 
 help:
@@ -42,8 +42,8 @@ help:
 		'DoD packaging targets:' \
 		'  doctor       read-only host/toolchain prerequisite report' \
 		'  check-config validate TOML and print the selected profile' \
+		'  ensure-bpf-toolchain  locate/install clang, bpftool, llvm-objdump' \
 		'  build-bpf    build externally pinned BPF ELF artifacts' \
-		'  install-bpf-linker  optional Rust BPF linker setup' \
 		'  build        build release host binaries and BPF artifacts' \
 		'  check/fmt/clippy/test/verify  DoD workspace quality gates' \
 		'  install      build unprivileged, then install and start DoD on the host' \
@@ -67,33 +67,43 @@ doctor:
 check-config:
 	@exec scripts/check-config.sh $(if $(CONFIG),--config '$(CONFIG)',)
 
-# Install the Rust BPF linker into the invoking user's Cargo bin directory
-# when it is not already available.  This is deliberately a separate,
-# explicit-capability step and never runs from the read-only `doctor` target.
-ensure-bpf-linker:
-	@set -eu; \
-	if command -v bpf-linker >/dev/null 2>&1 || [ -x "$(HOME)/.cargo/bin/bpf-linker" ]; then \
-		echo 'bpf-linker already installed'; \
-	else \
-		test "$$(id -u)" -ne 0 || { echo 'bpf-linker installation must run unprivileged' >&2; exit 2; }; \
-		command -v cargo >/dev/null 2>&1 || { echo 'cargo is required; run make doctor first' >&2; exit 2; }; \
-		if command -v cargo-binstall >/dev/null 2>&1; then \
-			cargo binstall --no-confirm bpf-linker; \
-		else \
-			echo 'cargo install bpf-linker is unsupported here because it requires a matching LLVM build.' >&2; \
-			echo 'Install cargo-binstall, then rerun: make install-bpf-linker' >&2; \
-			echo 'Or download the ARM64 release from:' >&2; \
-			echo 'https://github.com/aya-rs/bpf-linker/releases/latest/download/bpf-linker-aarch64-unknown-linux-musl.tar.zst' >&2; \
-			exit 2; \
-		fi; \
-	fi
-
-install-bpf-linker: ensure-bpf-linker
+# Locate (and, if genuinely missing and explicitly allowed, install via
+# apt-get) the standalone C BPF build domain's external tools: clang,
+# bpftool, llvm-objdump. There is no Rust eBPF toolchain here (the DoD BPF
+# programs are plain C, built by dod/bpf/Makefile with clang/bpftool/
+# llvm-objdump directly) — no bpf-linker is involved anywhere in this repo.
+#
+# This is the first step of `install` (and of `build`, via `build-bpf`'s own
+# dependency below) precisely because bpftool commonly lives in /usr/sbin,
+# which is outside an unprivileged user's PATH; earlier a plain `command -v
+# bpftool` in doctor/verify-toolchain silently reported it missing even when
+# installed. Installing the missing apt package(s) is deliberately this dod
+# Makefile's responsibility, not dod/bpf/Makefile's: that Makefile is a
+# self-contained, standalone build domain with no dependency-install target
+# by design, and stays that way (unchanged).
+#
+# Privilege escalation is used ONLY for `apt-get install`, and only when a
+# tool is actually missing; the BPF build itself always runs unprivileged.
+# Without PRIV_ESC/root, without apt-get, or with DESTDIR set (a staging
+# build must never touch the host), a missing tool aborts with an actionable
+# command instead of installing anything. Version pinning is untouched: the
+# fail-closed comparison against bpf/toolchain.lock.toml still happens in
+# bpf/scripts/verify-toolchain.sh, unchanged by this step.
+ensure-bpf-toolchain:
+	@PRIV_ESC='$(PRIV_ESC)' DESTDIR='$(DESTDIR)' exec scripts/ensure-bpf-toolchain.sh
 
 # These recipes are deliberately explicit.  The installer never invokes any
 # of them as root; missing artifacts produce an actionable error instead.
-build-bpf:
-	@BPF_ARTIFACT_DIR='$(BPF_ARTIFACT_DIR)' exec scripts/build-bpf.sh
+# CLANG/BPFTOOL/LLVM_OBJDUMP are resolved to absolute paths (searching PATH,
+# then /usr/sbin, /sbin) so dod/bpf/Makefile's tools are found even when a
+# package (e.g. bpftool) installs outside PATH; the standalone BPF Makefile
+# itself is untouched, it just receives these as ordinary variable overrides.
+build-bpf: ensure-bpf-toolchain
+	@BPF_ARTIFACT_DIR='$(BPF_ARTIFACT_DIR)' \
+		CLANG='$(shell scripts/ensure-bpf-toolchain.sh --print-var clang)' \
+		BPFTOOL='$(shell scripts/ensure-bpf-toolchain.sh --print-var bpftool)' \
+		LLVM_OBJDUMP='$(shell scripts/ensure-bpf-toolchain.sh --print-var llvm-objdump)' \
+		exec scripts/build-bpf.sh
 
 build:
 	@set -eu; test "$$(id -u)" -ne 0 || { echo 'build must run unprivileged; do not invoke Cargo as root' >&2; exit 2; }; \
@@ -137,7 +147,7 @@ _run_install = \
 # After installing the files, enable and start the DoD observation target.
 # The first sudo prompt covers both the file installation and the service
 # activation.
-install: build
+install: ensure-bpf-toolchain build
 	@set -eu; \
 	$(_run_install); \
 	$(PRIV_ESC) CONFIG='$(SYSCONFDIR)/config.toml' scripts/service.sh enable

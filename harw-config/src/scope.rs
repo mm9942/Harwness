@@ -91,6 +91,384 @@ impl FromStr for SettingScope {
     }
 }
 
+// ---------------------------------------------------------------------------
+// MergeRule-Taxonomie (docs/design/config-scopes.md, Abschnitt 6/7a/7b).
+//
+// Getrennt von `SettingScope` oberhalb: `SettingScope` ordnet die
+// Lebensdauer einer *Laufzeit*-Einstellung (Global/Project/Session, siehe
+// Moduldoku oben). Die folgenden Typen ordnen dagegen jedes einzelne
+// `HarnessConfig`-TOML-Blattfeld einem Geltungsbereich (Home vs. aktives
+// Profil) und einer Merge-Regel über die Config-Layer hinweg zu — ein
+// unabhängiges, rein deklaratives Modell ohne Merge-Logik (die lebt in
+// `crate::merge`).
+// ---------------------------------------------------------------------------
+
+/// Legt fest, wie ein einzelnes `HarnessConfig`-Blattfeld über die
+/// vertrauten Layer (Home → aktives Profil) hinweg zusammengeführt wird,
+/// und — mit denselben Varianten, aber eingeschränkter Anwendung
+/// (`docs/design/config-scopes.md` Abschnitt 7c) — gegen einen nicht
+/// vertrauten Projekt-Layer. Die tatsächliche Merge-Logik pro Variante lebt
+/// in `crate::merge`; dieses Enum ist rein deklarativ.
+///
+/// # Examples
+/// ```rust
+/// use harw_config::{FIELD_TABLE, MergeRule};
+///
+/// let entry = FIELD_TABLE
+///     .iter()
+///     .find(|f| f.path == "mcp_listener.principals")
+///     .expect("mcp_listener.principals is declared");
+/// assert_eq!(entry.merge, MergeRule::Intersection);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeRule {
+    /// Der zuletzt **explizit gesetzte** Wert gewinnt. Ein Layer, der das
+    /// Feld nicht setzt, lässt den Wert des vorigen Layers unverändert
+    /// stehen (kein Reset auf den Section-Default — behebt die
+    /// „ERSETZT"-Regression aus Abschnitt 4 der Spezifikation für alle so
+    /// eingestuften Felder). Nie vom nicht vertrauten Projekt-Layer
+    /// angewendet.
+    ProfileReplaces,
+    /// Nur der Wert des vertrauten Home-Layers gilt je. Ein späterer Layer
+    /// (Profil **oder** nicht vertrautes Projekt), der einen *anderen* Wert
+    /// setzt, wird ignoriert und löst eine `ScopeDiagnostic`-Warnung aus;
+    /// denselben Wert erneut zu setzen ist ein stiller No-op.
+    GlobalOnly,
+    /// Vereinigung aller Layer, die das Feld setzen (einschränkende Listen:
+    /// mehr Einträge sind immer sicher — z. B. mehr Freigabepflichten).
+    Union,
+    /// Schnittmenge aller Layer, die das Feld setzen, mit dem Home-Wert als
+    /// Startmenge (rechte-erweiternde Listen: ein späterer Layer kann nur
+    /// Einträge entfernen, niemals welche hinzufügen, die im Home-Layer
+    /// fehlen). Der Vergleichsschlüssel für „ist derselbe Eintrag" ist
+    /// standardmäßig die volle Wertgleichheit (`FieldScope::intersection_key
+    /// == None`); für Listen von Structs mit einem engeren
+    /// Identitätsfeld (z. B. `McpPrincipalToml` über `id` allein) trägt
+    /// `FieldScope::intersection_key` den Feldnamen. Bei einem engeren
+    /// Identitätsfeld gewinnt für die überlebenden Einträge immer die
+    /// vollständige Home-Fassung des Elements — kein Feld-Merge innerhalb
+    /// eines Listenelements, selbst wenn ein späterer Layer denselben
+    /// Schlüssel mit abweichenden Werten erneut setzt. Keine separate
+    /// `MergeRule`-Variante nötig — dieselbe `Intersection` deckt beide
+    /// Spielarten ab, nur der Vergleichsschlüssel unterscheidet sich.
+    Intersection,
+    /// Numerische Obergrenze: effektiver Wert = Minimum aller Layer, die
+    /// das Feld setzen (bestehende `min_positive`-Konvention wiederverwendet:
+    /// `0`/der jeweilige Unset-Sentinel-Wert eines späteren Layers senkt die
+    /// Obergrenze nie weiter).
+    MinBound,
+    /// Bool-Feld, bei dem `true` der **lockere/erlaubende** Wert ist:
+    /// effektiv = UND-Verknüpfung aller Layer, die das Feld setzen. Ein
+    /// späterer Layer darf nur abschalten (verschärfen), nie einschalten.
+    AndBool,
+    /// Bool-Feld, bei dem `true` der **strenge/sichere** Wert ist: effektiv
+    /// = ODER-Verknüpfung aller Layer, die das Feld setzen. Ein späterer
+    /// Layer darf nur einschalten (verschärfen), nie abschalten.
+    OrBool,
+    /// Ordinalwert mit expliziter, in `FieldScope::ordering` hinterlegter
+    /// Strenge-Reihenfolge (strengster Wert zuerst, siehe
+    /// [`PERMISSIONS_DEFAULT_MODE_ORDER`]/[`POLICY_VISIBILITY_SCOPE_ORDER`]).
+    /// Effektiv = der strengste unter allen Layern, die das Feld setzen,
+    /// gesetzte Wert; ein Versuch, einen lockereren Wert zu wählen, wird
+    /// ignoriert + gewarnt. Ein Wert außerhalb der Ordnung wird **nicht**
+    /// eingeordnet, sondern verhält sich wie `GlobalOnly` (Risiko R1,
+    /// Abschnitt 8 der Spezifikation).
+    StricterOf,
+    /// Kein eigenständiges Merge: Dieses Feld reist nur als Teil eines
+    /// umschließenden atomaren Werts (Listenelement oder Punkt-Struct), der
+    /// selbst unter der Regel eines anderen Feldes gemergt wird. Existiert,
+    /// damit ein Exhaustivitäts-Test (Paket C) auch solche Felder
+    /// nachweislich erfasst.
+    CompositeMember,
+    /// Wird über Layer hinweg **nie** zusammengeführt: Jeder Layer prüft
+    /// seinen eigenen Wert unabhängig gegen die unterstützte(n)
+    /// Schema-Version(en) beim Laden dieser einen Datei. Nur für
+    /// `config_version` verwendet.
+    PerFileValidated,
+}
+
+/// Wo ein Feld herkommen darf, bevor [`MergeRule`] bestimmt, *wie* mehrere
+/// Layer-Werte kombiniert werden. Unabhängig von [`SettingScope`] (siehe
+/// Moduldoku oben) — dieses Enum beschreibt Config-*Datei*-Layer
+/// (Home/Profil), nicht die Laufzeit-Lebensdauer einer einzelnen Einstellung.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// Der Home-Layer (`~/.harw`) legt die Baseline fest; das Profil ist ihr
+    /// untergeordnet (Details je nach [`MergeRule`]).
+    Global,
+    /// Betrifft nur das aktive Profil; die Profil-Ebene ersetzt dort den
+    /// globalen Wert ([`MergeRule::ProfileReplaces`]).
+    Profile,
+    /// Kein Scope im GLOBAL/PROFIL-Sinn — aktuell nur `config_version`
+    /// ([`MergeRule::PerFileValidated`]).
+    NotScoped,
+}
+
+/// Strenge-Reihenfolge für `FieldScope::ordering` von
+/// `permissions.default_mode` (Abschnitt 6.2): Index 0 = strengster Wert.
+/// `ask` fragt bei jeder Aktion nach (sicherste Einstellung), `full` nie
+/// (offenste Einstellung), `auto` liegt dazwischen. Quelle der Wertemenge:
+/// `permissions_toml::ALLOWED_MODES`; die Reihenfolge selbst ist neu von der
+/// Spezifikation festgelegt (im bisherigen Code nirgends kodiert).
+pub const PERMISSIONS_DEFAULT_MODE_ORDER: &[&str] = &["ask", "auto", "full"];
+
+/// Strenge-Reihenfolge (bewusste **Teilordnung**, Risiko R1 Abschnitt 8) für
+/// `policy.default_visibility_scope`: Index 0 = strengster Wert. Deckt nur
+/// die beiden im Code belegten Werte ab; jeder dritte/unbekannte String wird
+/// **nicht** eingeordnet, sondern von `crate::merge::stricter_of` wie eine
+/// `GlobalOnly`-Abweichung behandelt (ignoriert + `ScopeDiagnostic`).
+pub const POLICY_VISIBILITY_SCOPE_ORDER: &[&str] = &["self", "everyone"];
+
+/// Ein Eintrag der zentralen Deklarationstabelle [`FIELD_TABLE`]
+/// (`docs/design/config-scopes.md` Abschnitt 7a).
+#[derive(Debug, Clone, Copy)]
+pub struct FieldScope {
+    /// Gepunkteter `HarnessConfig`-Pfad, exakt wie in Abschnitt 1/6.3 der
+    /// Spezifikation, z. B. `"mcp_listener.enabled"` oder
+    /// `"internal_models.session_title"`. Für Listenelement-Unterfelder mit
+    /// `[]`-Notation wie in der Spezifikation, z. B.
+    /// `"mcp_listener.principals[].id"`. Zwei Sonderfälle, die keinem
+    /// eindeutigen einzelnen TOML-Container zugeordnet werden können
+    /// (`RuleToml` wird sowohl von `permissions.allow[]` als auch von
+    /// `permissions.deny[]` verwendet; `InternalModelChoice` von jeder der
+    /// acht `internal_models.<stelle>`-Stellen), übernehmen die exakte
+    /// Pfad-Schreibweise aus Abschnitt 6.3 der Spezifikation
+    /// (`"RuleToml.tool"`, `"RuleToml.pattern"`,
+    /// `"InternalModelChoice.provider/.model"`).
+    pub path: &'static str,
+    /// Ob das Feld Home- oder Profil-Ebene zugeordnet ist (siehe
+    /// [`MergeRule`] für die tatsächliche Merge-Semantik).
+    pub scope: Scope,
+    /// Die anzuwendende Merge-Regel.
+    pub merge: MergeRule,
+    /// Strenge-Reihenfolge für `MergeRule::StricterOf`, strengster Wert
+    /// zuerst (siehe [`PERMISSIONS_DEFAULT_MODE_ORDER`]/
+    /// [`POLICY_VISIBILITY_SCOPE_ORDER`]). `None` für jede andere Regel.
+    pub ordering: Option<&'static [&'static str]>,
+    /// Nur für `MergeRule::Intersection` auf einer Liste von Structs
+    /// relevant: der Feldname, der als Vergleichsschlüssel dient (z. B.
+    /// `Some("id")` für `mcp_listener.principals`). `None` bedeutet volle
+    /// Wertgleichheit des Elements (Default-Fall laut `MergeRule::Intersection`-
+    /// Doku) oder — für jede andere `MergeRule`-Variante — schlicht „nicht
+    /// zutreffend".
+    pub intersection_key: Option<&'static str>,
+    /// `true` für vom Nutzer als sicherheits-/beschränkungsrelevant markierte
+    /// Felder (🔒 in Abschnitt 2/6 der Spezifikation: Freigaben, Sandbox,
+    /// Netzwerk, Secrets, Listener, Berechtigungen). Zusätzliches Feld
+    /// gegenüber dem in Abschnitt 6.1 skizzierten `FieldScope` — dort nicht
+    /// vorgesehen, aber als reine Metadaten-Ergänzung (kein Einfluss auf die
+    /// Merge-Logik) mit der Spezifikation vereinbar.
+    pub security_critical: bool,
+}
+
+/// Die zentrale, öffentliche Deklarationstabelle: ein Eintrag pro
+/// `HarnessConfig`-Blattfeld (`docs/design/config-scopes.md` Abschnitt 6.3),
+/// in derselben Reihenfolge wie Abschnitt 1/6.3 der Spezifikation, damit die
+/// Tabelle 1:1 dagegen geprüft werden kann. Exakt 88 Einträge (Abschnitt 6.3
+/// Kontrollsumme: `ProfileReplaces` 40 · `GlobalOnly` 11 · `MinBound` 12 ·
+/// `CompositeMember` 11 · `Intersection` 4 · `OrBool` 3 · `Union` 2 ·
+/// `AndBool` 2 · `StricterOf` 2 · `PerFileValidated` 1).
+///
+/// Rein deklarativ — keine Merge-Logik (die lebt in `crate::merge`). Der
+/// Exhaustivitäts-Test, der jedes `HarnessConfig`-/Section-Struct-Feld
+/// gegen diese Tabelle prüft, lebt bewusst in Paket C
+/// (`harw-config/tests/config_scope_exhaustive.rs`), nicht hier (Abschnitt
+/// 7a der Spezifikation).
+#[rustfmt::skip]
+pub static FIELD_TABLE: &[FieldScope] = &[
+    // 1.1 Top-Level (10)
+    FieldScope { path: "config_version", scope: Scope::NotScoped, merge: MergeRule::PerFileValidated, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "workspace_root", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "default_provider", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "default_model", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "active_agent_definition", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "active_uia_definition", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "uia_provider", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "uia_model", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "policy_profile", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "project_root_markers", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    // 1.2 [logging] (3)
+    FieldScope { path: "logging.level", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "logging.target_module_paths", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "logging.json", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    // 1.3 [tui] (2)
+    FieldScope { path: "tui.theme", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "tui.keybindings_file", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    // 1.4 [session] (5)
+    FieldScope { path: "session.store_dir", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "session.journal_format", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "session.retention_days", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "session.title_generation", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "session.title_model", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    // 1.5 [policy] (2)
+    FieldScope { path: "policy.default_visibility_scope", scope: Scope::Global, merge: MergeRule::StricterOf, ordering: Some(POLICY_VISIBILITY_SCOPE_ORDER), intersection_key: None, security_critical: true },
+    FieldScope { path: "policy.require_approval_for", scope: Scope::Global, merge: MergeRule::Union, ordering: None, intersection_key: None, security_critical: true },
+    // 1.6 [mcp_listener] (9)
+    FieldScope { path: "mcp_listener.enabled", scope: Scope::Global, merge: MergeRule::AndBool, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "mcp_listener.listen_addr", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "mcp_listener.path", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "mcp_listener.principals", scope: Scope::Global, merge: MergeRule::Intersection, ordering: None, intersection_key: Some("id"), security_critical: true },
+    FieldScope { path: "mcp_listener.principals[].id", scope: Scope::Global, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "mcp_listener.principals[].credential_ref", scope: Scope::Global, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "mcp_listener.principals[].tenant", scope: Scope::Global, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "mcp_listener.principals[].workspace", scope: Scope::Global, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "mcp_listener.principals[].job_capabilities", scope: Scope::Global, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: true },
+    // 1.7 [onboarding] (4)
+    FieldScope { path: "onboarding.seen", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "onboarding.seen.provider", scope: Scope::Profile, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "onboarding.seen.model", scope: Scope::Profile, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "onboarding.seen.channel", scope: Scope::Profile, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: false },
+    // 1.8 [tools.plan] (9)
+    FieldScope { path: "tools.plan.enabled", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "tools.plan.persist", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "tools.plan.require_for_complex_work", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "tools.plan.validate_dependency_cycles", scope: Scope::Global, merge: MergeRule::OrBool, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "tools.plan.validate_write_conflicts", scope: Scope::Global, merge: MergeRule::OrBool, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "tools.plan.max_nodes", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "tools.plan.require_exploration_for", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "tools.plan.exploration_ttl_secs", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "tools.plan.max_expand_depth", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    // 1.9 [mode] (1)
+    FieldScope { path: "mode.default", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    // 1.10 [research] (5)
+    FieldScope { path: "research.network_allow_hosts", scope: Scope::Global, merge: MergeRule::Intersection, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "research.cargo_registry_read", scope: Scope::Global, merge: MergeRule::AndBool, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "research.max_fetch_bytes", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "research.fetch_timeout_secs", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "research.cache_ttl_secs", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    // 1.11 [permissions] (7)
+    FieldScope { path: "permissions.default_mode", scope: Scope::Global, merge: MergeRule::StricterOf, ordering: Some(PERMISSIONS_DEFAULT_MODE_ORDER), intersection_key: None, security_critical: true },
+    FieldScope { path: "permissions.approval_timeout_secs", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "permissions.allow", scope: Scope::Global, merge: MergeRule::Intersection, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "permissions.deny", scope: Scope::Global, merge: MergeRule::Union, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "permissions.extra_roots", scope: Scope::Global, merge: MergeRule::Intersection, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "RuleToml.tool", scope: Scope::Global, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "RuleToml.pattern", scope: Scope::Global, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: true },
+    // 1.12 [sandbox] (8)
+    FieldScope { path: "sandbox.cargo", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "sandbox.cargo.mode", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "sandbox.cargo.cargo_bin", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "sandbox.cargo.rustup_home", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "sandbox.cargo.cargo_home", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "sandbox.tmux", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "sandbox.tmux.mode", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    FieldScope { path: "sandbox.tmux.socket_path", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
+    // 1.13 [internal_models] (10)
+    FieldScope { path: "internal_models.use_openrouter_defaults", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "internal_models.session_title", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "internal_models.compaction_summary", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "internal_models.memory_consolidation", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "internal_models.dream_reflection", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "internal_models.explorer", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "internal_models.research", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "internal_models.worker_simple", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "internal_models.worker_complex", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "InternalModelChoice.provider/.model", scope: Scope::Profile, merge: MergeRule::CompositeMember, ordering: None, intersection_key: None, security_critical: false },
+    // 1.14 [compaction] (1)
+    FieldScope { path: "compaction.absolute_ceiling_tokens", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    // 1.15 [reasoning] (6)
+    FieldScope { path: "reasoning.uia", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "reasoning.root_orchestrator", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "reasoning.root_orchestrator_with_subs", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "reasoning.sub_orchestrator", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "reasoning.worker_complex", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "reasoning.worker_simple", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    // 1.16 [guards] (6)
+    FieldScope { path: "guards.enabled", scope: Scope::Global, merge: MergeRule::OrBool, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "guards.repeated_failure_warn", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "guards.repeated_failure_abort", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "guards.no_progress_rounds_warn", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "guards.no_progress_rounds_abort", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "guards.plan_stale_rounds", scope: Scope::Global, merge: MergeRule::MinBound, ordering: None, intersection_key: None, security_critical: false },
+];
+
+#[cfg(test)]
+mod merge_rule_tests {
+    use super::*;
+
+    #[test]
+    fn test_field_table_has_exactly_88_entries() {
+        assert_eq!(FIELD_TABLE.len(), 88);
+    }
+
+    #[test]
+    fn test_field_table_paths_are_unique() {
+        let mut paths: Vec<&str> = FIELD_TABLE.iter().map(|f| f.path).collect();
+        let before = paths.len();
+        paths.sort_unstable();
+        paths.dedup();
+        assert_eq!(paths.len(), before, "FIELD_TABLE enthaelt doppelte Pfade");
+    }
+
+    #[test]
+    fn test_merge_rule_variant_control_sum_matches_abschnitt_6_3() {
+        let count = |rule: MergeRule| FIELD_TABLE.iter().filter(|f| f.merge == rule).count();
+        assert_eq!(count(MergeRule::ProfileReplaces), 40);
+        assert_eq!(count(MergeRule::GlobalOnly), 11);
+        assert_eq!(count(MergeRule::MinBound), 12);
+        assert_eq!(count(MergeRule::CompositeMember), 11);
+        assert_eq!(count(MergeRule::Intersection), 4);
+        assert_eq!(count(MergeRule::OrBool), 3);
+        assert_eq!(count(MergeRule::Union), 2);
+        assert_eq!(count(MergeRule::AndBool), 2);
+        assert_eq!(count(MergeRule::StricterOf), 2);
+        assert_eq!(count(MergeRule::PerFileValidated), 1);
+    }
+
+    #[test]
+    fn test_only_stricter_of_entries_carry_an_ordering() {
+        for entry in FIELD_TABLE {
+            if entry.merge == MergeRule::StricterOf {
+                assert!(entry.ordering.is_some(), "{} sollte eine ordering tragen", entry.path);
+            } else {
+                assert!(entry.ordering.is_none(), "{} sollte keine ordering tragen", entry.path);
+            }
+        }
+    }
+
+    #[test]
+    fn test_only_mcp_listener_principals_carries_an_intersection_key() {
+        for entry in FIELD_TABLE {
+            if entry.path == "mcp_listener.principals" {
+                assert_eq!(entry.intersection_key, Some("id"));
+            } else {
+                assert!(
+                    entry.intersection_key.is_none(),
+                    "{} sollte keinen intersection_key tragen",
+                    entry.path
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_security_critical_fields_match_abschnitt_2_lock_marks() {
+        assert!(FIELD_TABLE.iter().find(|f| f.path == "workspace_root").unwrap().security_critical);
+        assert!(FIELD_TABLE.iter().find(|f| f.path == "policy_profile").unwrap().security_critical);
+        assert!(
+            FIELD_TABLE
+                .iter()
+                .find(|f| f.path == "mcp_listener.principals")
+                .unwrap()
+                .security_critical
+        );
+        assert!(
+            !FIELD_TABLE
+                .iter()
+                .find(|f| f.path == "session.retention_days")
+                .unwrap()
+                .security_critical
+        );
+        assert!(
+            !FIELD_TABLE
+                .iter()
+                .find(|f| f.path == "compaction.absolute_ceiling_tokens")
+                .unwrap()
+                .security_critical
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

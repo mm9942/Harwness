@@ -17,6 +17,7 @@ pub mod harness_config;
 pub mod internal_models;
 pub mod loader;
 pub mod mcp_toml;
+pub mod merge;
 pub mod mode_toml;
 pub mod model_toml;
 pub mod network_toml;
@@ -56,6 +57,7 @@ pub use loader::{
     load_skill_instructions, load_system_prompt, load_uia_personalization, load_uia_user_name,
 };
 pub use mcp_toml::{McpServerToml, McpTransportToml};
+pub use merge::{LayerRole, ScopeDiagnostic, merge_layer_into};
 pub use mode_toml::ModeSection;
 pub use model_toml::{ModelCapabilitiesToml, ModelToml, PromptCachingMode};
 pub use network_toml::NetworkSection;
@@ -64,7 +66,7 @@ pub use plan_toml::{PlanSection, ToolsSection};
 pub use plugin_toml::{PluginCapabilitiesToml, PluginToml};
 pub use provider_toml::{OriginAllowlistToml, ProviderToml, RateLimitToml};
 pub use research_toml::ResearchSection;
-pub use scope::SettingScope;
+pub use scope::{FIELD_TABLE, FieldScope, MergeRule, Scope, SettingScope};
 pub use skill_toml::SkillToml;
 pub use web_toml::WebSection;
 pub use writer::{ConfigWriter, RuleKind};
