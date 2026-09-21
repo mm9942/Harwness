@@ -31,6 +31,7 @@ fn make_request(effort: Option<ReasoningEffort>) -> ModelRequest {
         data_block: None,
         max_output_tokens: None,
         tool_result_max_bytes: None,
+        cancel: None,
     }
 }
 

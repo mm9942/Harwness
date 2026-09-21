@@ -958,6 +958,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         }
     }
 
@@ -1103,6 +1104,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
 
         let body = build_messages_body("claude-sonnet-5", 1024, &request);
@@ -1147,6 +1149,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
         let body = build_messages_body("m", 256, &request);
         assert!(body.get("system").is_none());
@@ -1169,6 +1172,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
 
         let body = build_messages_body("claude-opus-4-8", 1024, &request);
@@ -1193,6 +1197,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
 
         let body = build_messages_body("anthropic-deployment-alias", 1024, &request);
@@ -1218,6 +1223,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
 
         let body = build_messages_body("claude-opus-4-8", 1024, &request);
@@ -1243,6 +1249,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         }
     }
 
@@ -1375,6 +1382,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
 
         let body = build_messages_body("claude-sonnet-5", 256, &request);
@@ -1427,6 +1435,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
 
         let body = build_messages_body("claude-sonnet-5", 256, &request);
@@ -1476,6 +1485,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
         let body = build_messages_body("m", 256, &request);
         assert!(body.get("tools").is_none());
@@ -1502,6 +1512,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
         let body = build_messages_body("m", 256, &request);
         let messages = body
@@ -1556,6 +1567,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
         let body = build_messages_body("m", 256, &request);
         let messages = body
@@ -1602,6 +1614,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
         let body = build_messages_body("m", 256, &request);
         let messages = body
@@ -1658,6 +1671,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
         let body = build_messages_body("m", 256, &request);
         let messages = body
@@ -1749,6 +1763,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
         let body = build_messages_body("m", 256, &request);
         let messages = body
@@ -1788,6 +1803,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
         let body = build_messages_body("m", 256, &request);
         let messages = body

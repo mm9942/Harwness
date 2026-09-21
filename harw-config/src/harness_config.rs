@@ -37,6 +37,15 @@ pub struct HarnessConfig {
     /// `default_model`. `None` → die UIA nutzt `default_model` wie bisher.
     #[serde(default)]
     pub uia_model: Option<String>,
+    /// Pinnt das Modell der uia-worker-Rollenfamilie (`uia-worker`,
+    /// `uia-explorer`, `uia-writer`, `uia-shell-worker`) unabhängig von
+    /// `default_model`/`uia_model`. Der Provider ist hier bewusst **nicht**
+    /// separat wählbar — er muss zwingend mit dem effektiven `uia_provider`
+    /// übereinstimmen (Kopplungsregel, wird an anderer Stelle durchgesetzt,
+    /// hier nur die Feld-Deklaration). `None` → die Rollenfamilie nutzt
+    /// `uia_model`.
+    #[serde(default)]
+    pub uia_worker_model: Option<String>,
     #[serde(default)]
     pub policy_profile: Option<String>,
     #[serde(default)]
@@ -524,6 +533,23 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.uia_provider.as_deref(), Some("anthropic"));
         assert_eq!(cfg.uia_model.as_deref(), Some("claude-x"));
+    }
+
+    #[test]
+    fn test_uia_worker_model_defaults_to_none() {
+        let cfg: HarnessConfig = toml::from_str("default_provider = \"anthropic\"").unwrap();
+        assert_eq!(cfg.uia_worker_model, None);
+    }
+
+    #[test]
+    fn test_uia_worker_model_reads_exact_value() {
+        let cfg: HarnessConfig = toml::from_str(
+            r#"
+                uia_worker_model = "claude-worker-x"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.uia_worker_model.as_deref(), Some("claude-worker-x"));
     }
 
     #[test]

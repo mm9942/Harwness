@@ -15,6 +15,7 @@ use harw_operations::{
     OpOutput, Operation, OperationCategory, OperationDomain, OperationMeta, PermissionTier,
     ServiceMap, Surface, WebMethod,
 };
+use harw_operations::operation::BusyAvailability;
 use harw_operations::adapter::WebAdapter;
 use harw_operations::registry::OperationRegistry;
 use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
@@ -46,6 +47,7 @@ impl Operation for EchoOp {
             category: OperationCategory::Misc,
             args_schema: None,
             output_schema: None,
+            busy: BusyAvailability::DeferredUntilTurnEnd,
         })
     }
 
@@ -81,6 +83,7 @@ impl Operation for FailingOp {
             category: OperationCategory::Misc,
             args_schema: None,
             output_schema: None,
+            busy: BusyAvailability::DeferredUntilTurnEnd,
         })
     }
 
@@ -515,6 +518,7 @@ impl Operation for WebOp {
             category: OperationCategory::Misc,
             args_schema: None,
             output_schema: None,
+            busy: BusyAvailability::DeferredUntilTurnEnd,
         })
     }
 

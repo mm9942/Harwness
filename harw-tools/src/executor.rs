@@ -12,6 +12,7 @@ use crate::call::ToolCall;
 use crate::error::ToolsError;
 use crate::output::ToolOutput;
 use harw_authority::SandboxSpec;
+use harw_types::cancel::CancelToken;
 use harw_types::{SessionId, TurnId};
 use std::future::Future;
 use std::pin::Pin;
@@ -27,11 +28,24 @@ pub type ToolExecutorFuture<'a> =
 /// process, MCP, and plugin executors must use [`Self::sandbox`] as their
 /// syscall boundary rather than accepting workspace or permission data from
 /// `call.arguments`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// # Cancellation (W3/C-CANCEL, F-160/G-017)
+///
+/// [`Self::cancel`] carries the same [`CancelToken`] the turn-loop derives
+/// for the active turn (analogous to `ModelRequest::cancel` in
+/// `harw-core/src/model.rs`), so long-running tool executors (process, MCP,
+/// context-load) can observe `Ctrl+C`, a budget breach, or lease loss
+/// mid-call. `CancelToken` lives in `harw_types::cancel` — not
+/// `harw_core::cancel` — specifically so this crate (which `harw-core`
+/// depends on, ruling out the reverse direction) can name it without a
+/// dependency cycle; `harw_core::cancel` re-exports the same type
+/// unchanged for existing callers.
+#[derive(Debug, Clone)]
 pub struct ToolExecutionContext {
     session_id: SessionId,
     turn_id: TurnId,
     sandbox: SandboxSpec,
+    cancel: Option<CancelToken>,
 }
 
 impl ToolExecutionContext {
@@ -41,7 +55,24 @@ impl ToolExecutionContext {
             session_id,
             turn_id,
             sandbox,
+            cancel: None,
         }
+    }
+
+    /// Attaches a [`CancelToken`] to this context, consuming and returning
+    /// `self` for builder-style chaining.
+    ///
+    /// # Arguments
+    /// - `cancel` (`CancelToken`): the turn-scoped (or narrower) cancellation
+    ///   handle a long-running executor should observe.
+    ///
+    /// # Returns
+    /// The same context with [`Self::cancel`] now returning
+    /// `Some(&cancel)`.
+    #[must_use]
+    pub fn with_cancel(mut self, cancel: CancelToken) -> Self {
+        self.cancel = Some(cancel);
+        self
     }
 
     #[must_use]
@@ -58,7 +89,40 @@ impl ToolExecutionContext {
     pub fn sandbox(&self) -> &SandboxSpec {
         &self.sandbox
     }
+
+    /// Returns the attached [`CancelToken`], if this context was built with
+    /// [`Self::with_cancel`].
+    ///
+    /// # Returns
+    /// `None` for a context built only via [`Self::new`] — an executor that
+    /// does not check cancellation runs exactly as before this field was
+    /// added.
+    #[must_use]
+    pub fn cancel(&self) -> Option<&CancelToken> {
+        self.cancel.as_ref()
+    }
 }
+
+/// Compares every field except [`ToolExecutionContext::cancel`].
+///
+/// `cancel` is a volatile per-call handle (a live [`CancelToken`], which
+/// itself has no `PartialEq` impl — it wraps a
+/// `tokio_util::sync::CancellationToken`) without bearing on the identity or
+/// equality of the execution context it rides along with: two contexts
+/// built from the same session/turn/sandbox are equal regardless of which
+/// (if any) cancellation handle happens to be attached.
+impl PartialEq for ToolExecutionContext {
+    fn eq(&self, other: &Self) -> bool {
+        self.session_id == other.session_id
+            && self.turn_id == other.turn_id
+            && self.sandbox == other.sandbox
+    }
+}
+
+/// `PartialEq` above only ever compares `SessionId`/`TurnId`/`SandboxSpec`,
+/// all three of which are themselves `Eq`, so the relation is reflexive,
+/// symmetric and transitive — `Eq` holds as a marker with no extra method.
+impl Eq for ToolExecutionContext {}
 
 /// Führt eine [`ToolCall`] aus und liefert eine [`ToolOutput`].
 pub trait ToolExecutor: Send + Sync {
@@ -215,6 +279,7 @@ mod tests {
     use crate::output::ToolOutput;
     use crate::spec::ToolName;
     use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
+    use harw_types::cancel::CancelToken;
     use harw_types::{SessionId, TenantId, ToolCallId, TurnId, WorkspaceId};
     use std::path::PathBuf;
 
@@ -287,5 +352,43 @@ mod tests {
 
         let future = executor.execute(&ctx, &call);
         drop(future);
+    }
+
+    #[test]
+    fn test_new_context_has_no_cancel_token() {
+        let ctx = make_ctx("new_context_has_no_cancel_token");
+
+        assert!(
+            ctx.cancel().is_none(),
+            "ToolExecutionContext::new must leave cancel unset"
+        );
+    }
+
+    #[test]
+    fn test_with_cancel_attaches_token_and_cancel_reads_it_back() {
+        let ctx = make_ctx("with_cancel_attaches_token").with_cancel(CancelToken::new());
+
+        let attached = ctx.cancel();
+
+        assert!(
+            attached.is_some(),
+            "with_cancel must make cancel() report Some"
+        );
+        assert!(
+            !attached.unwrap().is_cancelled(),
+            "a freshly attached, uncancelled token must report not-cancelled through the context"
+        );
+    }
+
+    #[test]
+    fn test_partial_eq_ignores_cancel_field() {
+        let base = make_ctx("partial_eq_ignores_cancel_field");
+        let without_cancel = base.clone();
+        let with_cancel = base.with_cancel(CancelToken::new());
+
+        assert_eq!(
+            without_cancel, with_cancel,
+            "two contexts that differ only in `cancel` (None vs. Some) must still be equal"
+        );
     }
 }

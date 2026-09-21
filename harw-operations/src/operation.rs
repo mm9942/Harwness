@@ -11,6 +11,7 @@
 //! - [`Surface`] — deklarierte Expositionsfläche (Command / ModelTool / Web / AgentTool)
 //! - [`WebMethod`] — explizite HTTP-Methode einer `Surface::Web`-Route (F-031)
 //! - [`OperationMeta`] — statische Metadaten einer Operation
+//! - [`BusyAvailability`] — Verfügbarkeit einer Operation während eines laufenden Turns
 //! - [`OpInput`] — fläche-neutrale Eingabe
 //! - [`OpOutput`] — fläche-neutrales Ergebnis (Text plus optionale strukturierte Nutzlast, F-222)
 //! - [`Operation`] — ausführbarer Kern-Trait
@@ -91,6 +92,38 @@ impl OperationCategory {
             Self::Misc => "misc",
         }
     }
+}
+
+/// Verfügbarkeit einer Operation während eines laufenden ("busy") Turns.
+///
+/// # Beschreibung
+/// Solange ein Turn läuft, werden eingehende Befehle standardmäßig
+/// eingereiht und erst nach Turn-Ende ausgeführt ([`DeferredUntilTurnEnd`],
+/// heutiges Verhalten aller Befehle). Eine Operation kann sich stattdessen als
+/// [`Immediate`] deklarieren, wenn sie während eines laufenden Turns sofort
+/// ausgeführt werden darf — das ist ausschließlich für reine Lese-/
+/// Steuerbefehle gedacht, die keine Session-Mutation über die Turn-Grenze
+/// hinweg vornehmen.
+///
+/// [`DeferredUntilTurnEnd`]: BusyAvailability::DeferredUntilTurnEnd
+/// [`Immediate`]: BusyAvailability::Immediate
+///
+/// # Beispiel
+/// ```rust
+/// use harw_operations::operation::BusyAvailability;
+///
+/// assert_eq!(BusyAvailability::default(), BusyAvailability::DeferredUntilTurnEnd);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum BusyAvailability {
+    /// Standard: Der Befehl wird während eines laufenden Turns eingereiht und
+    /// erst nach Turn-Ende ausgeführt (heutiges Verhalten aller Befehle).
+    #[default]
+    DeferredUntilTurnEnd,
+    /// Der Befehl darf während eines laufenden ("busy") Turns sofort
+    /// ausgeführt werden — nur für reine Lese-/Steuerbefehle ohne
+    /// Session-Mutation über die Turn-Grenze gedacht.
+    Immediate,
 }
 
 /// Geordnete Mindest-Berechtigungsstufe für eine Operation.
@@ -510,6 +543,7 @@ impl<T> NoArgsSchema for &ArgsSchemaProbe<T> {
 ///     category: OperationCategory::Misc,
 ///     args_schema: None,
 ///     output_schema: None,
+///     busy: Default::default(),
 /// };
 /// assert_eq!(meta.name, "session.list");
 /// ```
@@ -551,6 +585,14 @@ pub struct OperationMeta {
     /// bedeutet, dass eine strukturierte Web-Ansicht `data` ungetypt behandeln
     /// muss (Rohtext bleibt in [`OpOutput::text`] immer verfügbar).
     pub output_schema: Option<ArgsSchemaFn>,
+    /// Verfügbarkeit dieser Operation während eines laufenden ("busy") Turns.
+    ///
+    /// `BusyAvailability::DeferredUntilTurnEnd` (Standard) — der Befehl wird
+    /// eingereiht und erst nach Turn-Ende ausgeführt. `Immediate` — der
+    /// Befehl darf während busy sofort ausgeführt werden; nur für reine
+    /// Lese-/Steuerbefehle ohne Session-Mutation über die Turn-Grenze
+    /// gedacht.
+    pub busy: BusyAvailability,
 }
 
 impl Default for OperationMeta {
@@ -581,6 +623,7 @@ impl Default for OperationMeta {
             category: OperationCategory::Misc,
             args_schema: None,
             output_schema: None,
+            busy: BusyAvailability::default(),
         }
     }
 }
@@ -860,6 +903,7 @@ pub type OpFuture<'a> =
 ///             category: OperationCategory::Misc,
 ///             args_schema: None,
 ///             output_schema: None,
+///             busy: Default::default(),
 ///         })
 ///     }
 ///
@@ -903,9 +947,9 @@ pub trait Operation: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovalPolicy, ArgsSchemaProbe, CommandVisibility, DerivedArgsSchema as _,
-        NoArgsSchema as _, OpInput, OpOutput, Operation, OperationCategory, OperationDomain,
-        OperationMeta, PermissionTier, Surface, WebMethod,
+        ApprovalPolicy, ArgsSchemaProbe, BusyAvailability, CommandVisibility,
+        DerivedArgsSchema as _, NoArgsSchema as _, OpInput, OpOutput, Operation,
+        OperationCategory, OperationDomain, OperationMeta, PermissionTier, Surface, WebMethod,
     };
     use crate::context::{OpContext, ServiceMap};
     use crate::error::OpError;
@@ -933,6 +977,7 @@ mod tests {
                 category: OperationCategory::Misc,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             })
         }
 
@@ -962,6 +1007,7 @@ mod tests {
                 category: OperationCategory::Misc,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             })
         }
 
@@ -990,6 +1036,7 @@ mod tests {
                 category: OperationCategory::Misc,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             })
         }
 
@@ -1014,6 +1061,7 @@ mod tests {
                 category: OperationCategory::Misc,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             })
         }
 
@@ -1047,6 +1095,7 @@ mod tests {
                 category: OperationCategory::Session,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             })
         }
 
@@ -1230,6 +1279,43 @@ mod tests {
         let p = ApprovalPolicy::Always;
         let p2 = p;
         assert_eq!(p, p2);
+    }
+
+    // ── BusyAvailability ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_busy_availability_default_is_deferred_until_turn_end() {
+        assert_eq!(
+            BusyAvailability::default(),
+            BusyAvailability::DeferredUntilTurnEnd
+        );
+    }
+
+    #[test]
+    fn test_busy_availability_equality() {
+        assert_eq!(
+            BusyAvailability::Immediate,
+            BusyAvailability::Immediate
+        );
+        assert_eq!(
+            BusyAvailability::DeferredUntilTurnEnd,
+            BusyAvailability::DeferredUntilTurnEnd
+        );
+    }
+
+    #[test]
+    fn test_busy_availability_inequality() {
+        assert_ne!(
+            BusyAvailability::Immediate,
+            BusyAvailability::DeferredUntilTurnEnd
+        );
+    }
+
+    #[test]
+    fn test_busy_availability_is_copy() {
+        let b = BusyAvailability::Immediate;
+        let b2 = b;
+        assert_eq!(b, b2);
     }
 
     // ── Surface ───────────────────────────────────────────────────────────────
@@ -1483,6 +1569,7 @@ mod tests {
             category: OperationCategory::Misc,
             args_schema: None,
             output_schema: None,
+            busy: BusyAvailability::DeferredUntilTurnEnd,
         };
         assert_eq!(meta.name, "test.op");
         assert_eq!(meta.summary, "Eine Testoperation.");
@@ -1503,6 +1590,7 @@ mod tests {
             category: OperationCategory::Misc,
             args_schema: None,
             output_schema: None,
+            busy: BusyAvailability::DeferredUntilTurnEnd,
         };
         assert!(meta.surfaces.is_empty());
     }
@@ -1519,6 +1607,7 @@ mod tests {
             category: OperationCategory::Misc,
             args_schema: None,
             output_schema: None,
+            busy: BusyAvailability::DeferredUntilTurnEnd,
         };
         let cloned = meta.clone();
         assert_eq!(cloned.name, meta.name);
@@ -1986,6 +2075,7 @@ mod tests {
         assert_eq!(meta.category, OperationCategory::Misc);
         assert!(meta.surfaces.is_empty());
         assert!(meta.aliases.is_empty());
+        assert_eq!(meta.busy, BusyAvailability::DeferredUntilTurnEnd);
     }
 
     #[test]

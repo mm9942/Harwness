@@ -68,6 +68,7 @@
 //!             category: OperationCategory::Misc,
 //!             args_schema: None,
 //!             output_schema: None,
+//!             busy: Default::default(),
 //!         })
 //!     }
 //!

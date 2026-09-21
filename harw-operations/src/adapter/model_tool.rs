@@ -306,7 +306,7 @@ fn map_operation_error(name: &str, error: OpError) -> ToolsError {
 /// use harw_operations::adapter::ModelToolAdapter;
 /// use harw_operations::operation::{
 ///     Operation, OperationMeta, OperationCategory, OperationDomain, PermissionTier, Surface,
-///     ApprovalPolicy, OpInput, OpOutput, OpFuture,
+///     ApprovalPolicy, BusyAvailability, OpInput, OpOutput, OpFuture,
 /// };
 /// use harw_operations::context::OpContext;
 ///
@@ -325,6 +325,7 @@ fn map_operation_error(name: &str, error: OpError) -> ToolsError {
 ///             category: OperationCategory::Misc,
 ///             args_schema: None,
 ///             output_schema: None,
+///             busy: BusyAvailability::DeferredUntilTurnEnd,
 ///         })
 ///     }
 ///     fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
@@ -576,8 +577,9 @@ mod tests {
         OpArgsSchema, described_object_schema, enum_string_schema, string_schema,
     };
     use crate::operation::{
-        ApprovalPolicy, ArgsSchemaFn, CommandVisibility, OpFuture, OpInput, OpOutput, Operation,
-        OperationCategory, OperationDomain, OperationMeta, PermissionTier, Surface,
+        ApprovalPolicy, ArgsSchemaFn, BusyAvailability, CommandVisibility, OpFuture, OpInput,
+        OpOutput, Operation, OperationCategory, OperationDomain, OperationMeta, PermissionTier,
+        Surface,
     };
     use harw_extension_api::contributors::ToolProvider;
     use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
@@ -645,6 +647,7 @@ mod tests {
                 category: OperationCategory::Misc,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             })
         }
         fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
@@ -671,6 +674,7 @@ mod tests {
                 category: OperationCategory::Misc,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             })
         }
         fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
@@ -697,6 +701,7 @@ mod tests {
                 category: OperationCategory::Misc,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             })
         }
         fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
@@ -729,6 +734,7 @@ mod tests {
                 category: OperationCategory::Misc,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             })
         }
         fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
@@ -755,6 +761,7 @@ mod tests {
                 category: OperationCategory::Misc,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             })
         }
         fn run<'a>(&'a self, _ctx: &'a OpContext, input: OpInput) -> OpFuture<'a> {
@@ -789,6 +796,7 @@ mod tests {
                 category: OperationCategory::Misc,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             })
         }
         fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
@@ -814,6 +822,7 @@ mod tests {
                 category: OperationCategory::Misc,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             })
         }
 
@@ -871,6 +880,7 @@ mod tests {
                 category: OperationCategory::Misc,
                 args_schema,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             },
         })
     }
@@ -1021,6 +1031,7 @@ mod tests {
                     category: OperationCategory::Misc,
                     args_schema: None,
                     output_schema: None,
+                    busy: BusyAvailability::DeferredUntilTurnEnd,
                 })
             }
             fn run<'a>(&'a self, _ctx: &'a OpContext, input: OpInput) -> OpFuture<'a> {

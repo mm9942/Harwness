@@ -57,6 +57,7 @@ fn test_field_table_exhaustive_harness_config() {
         active_uia_definition,
         uia_provider,
         uia_model,
+        uia_worker_model,
         policy_profile,
         logging: _,
         tui: _,
@@ -87,6 +88,7 @@ fn test_field_table_exhaustive_harness_config() {
         active_uia_definition,
         uia_provider,
         uia_model,
+        uia_worker_model,
         policy_profile,
         project_root_markers,
     );
@@ -99,6 +101,7 @@ fn test_field_table_exhaustive_harness_config() {
         "active_uia_definition",
         "uia_provider",
         "uia_model",
+        "uia_worker_model",
         "policy_profile",
         "project_root_markers",
     ] {

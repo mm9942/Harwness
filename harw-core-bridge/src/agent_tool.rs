@@ -114,6 +114,7 @@
 //!             category: harw_operations::OperationCategory::Agent,
 //!             args_schema: None,
 //!             output_schema: None,
+//!             busy: Default::default(),
 //!         })
 //!     }
 //!     fn run<'a>(&'a self, _c: &'a OpContext, _i: OpInput) -> OpFuture<'a> {
@@ -2399,8 +2400,8 @@ mod tests {
     use harw_operations::context::{OpContext, ServiceMap};
     use harw_operations::error::OpError;
     use harw_operations::operation::{
-        OpFuture, OpInput, OpOutput, Operation, OperationDomain, OperationMeta, PermissionTier,
-        Surface,
+        BusyAvailability, OpFuture, OpInput, OpOutput, Operation, OperationDomain, OperationMeta,
+        PermissionTier, Surface,
     };
 
     // ── test helpers ──────────────────────────────────────────────────────────
@@ -2550,6 +2551,7 @@ contract = "{contract}"
                 category: harw_operations::OperationCategory::Agent,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             })
         }
 
@@ -2579,6 +2581,7 @@ contract = "{contract}"
                 category: harw_operations::OperationCategory::Agent,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             })
         }
 

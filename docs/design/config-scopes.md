@@ -82,7 +82,8 @@ Section-Default zurückgesetzt (Bug); **ÜBERNOMMEN** = explizite Ausnahme
 | `active_uia_definition` | `Option<String>` | `None` | `harness_config.rs:24-28` | ÜBERNOMMEN (nur falls `cfg`-Wert `None`) |
 | `uia_provider` | `Option<String>` | `None` | `harness_config.rs:29-35` | ERSETZT |
 | `uia_model` | `Option<String>` | `None` | `harness_config.rs:36-39` | ERSETZT |
-| `policy_profile` | `Option<String>` | `None` | `harness_config.rs:40-41` | ERSETZT |
+| `uia_worker_model` | `Option<String>` | `None` | `harness_config.rs:40-48` | ERSETZT |
+| `policy_profile` | `Option<String>` | `None` | `harness_config.rs:49-50` | ERSETZT |
 | `project_root_markers` | `Option<Vec<String>>` | `None` | `harness_config.rs:76-80` | ERSETZT |
 | `base_dir` | `Option<PathBuf>` | — | `harness_config.rs:101-102` | `#[serde(skip)]` — **kein TOML-Feld**, wird pro Layer intern auf `Some(base.clone())` gesetzt (`discovery.rs:648`), reine Buchführung |
 
@@ -239,10 +240,10 @@ Section-Default zurückgesetzt (Bug); **ÜBERNOMMEN** = explizite Ausnahme
 | `guards.no_progress_rounds_abort` | `Option<u32>` | `None` → `8` | `harness_config.rs:171` | ERSETZT |
 | `guards.plan_stale_rounds` | `Option<u32>` | `None` → `6` | `harness_config.rs:174` | ERSETZT |
 
-**Gesamtzahl dokumentierter `HarnessConfig`-Felder: 88** (Blattfelder inkl.
+**Gesamtzahl dokumentierter `HarnessConfig`-Felder: 89** (Blattfelder inkl.
 verschachtelter Typen wie `McpPrincipalToml`, `RuleToml`,
 `CargoSandboxToml`/`TmuxSandboxToml`, `InternalModelChoice`,
-`OnboardingSeen`; dazu `base_dir` als 89. Tabellenzeile in Abschnitt 1.1,
+`OnboardingSeen`; dazu `base_dir` als 90. Tabellenzeile in Abschnitt 1.1,
 aber **kein TOML-Feld** — `#[serde(skip)]`, daher nicht mitgezählt).
 
 Außerhalb der `HarnessConfig` selbst, aber im selben `config.toml` und mit
@@ -260,8 +261,8 @@ Layer-Datei mit demselben Namen gewinnt vollständig; `auth.toml` wird pro
 Layer ganz ersetzt, `discovery.rs:679-686`). Die einzigen tatsächlichen
 „Provider-/Modell-Felder“ *innerhalb* `HarnessConfig` sind
 `default_provider`, `default_model`, `uia_provider`, `uia_model`,
-`active_agent_definition`, `active_uia_definition`, `policy_profile` (bereits
-in 1.1 gelistet).
+`uia_worker_model`, `active_agent_definition`, `active_uia_definition`,
+`policy_profile` (bereits in 1.1 gelistet).
 
 ---
 
@@ -274,7 +275,7 @@ Legende: 🔒 = vom Nutzer als sicherheits-/beschränkungsrelevant markiert
 **OFFEN** markierten Zeilen sind unten durch die Nutzerentscheidung ersetzt
 und mit „(entschieden 2026-09-21)" gekennzeichnet. Die Spalte „Merge-Regel"
 verweist ab jetzt auf die exakten `MergeRule`-Varianten aus Abschnitt 6; die
-vollständige, feldgenaue Zuordnung aller 88 Felder steht in Abschnitt 6.3 (die
+vollständige, feldgenaue Zuordnung aller 89 Felder steht in Abschnitt 6.3 (die
 Gruppierung hier fasst strukturgleiche Unterfelder weiterhin zusammen).
 
 | TOML-Pfad | Vorschlag | Merge-Regel | Begründung | 🔒 |
@@ -287,6 +288,7 @@ Gruppierung hier fasst strukturgleiche Unterfelder weiterhin zusammen).
 | `active_uia_definition` | PROFIL | letzter gesetzter Wert gewinnt (bereits korrekt implementiert) | s.o. | |
 | `uia_provider` | PROFIL | letzter gesetzter Wert gewinnt | Pinning ist Profil-spezifisch. | |
 | `uia_model` | PROFIL | letzter gesetzter Wert gewinnt | s.o. | |
+| `uia_worker_model` | PROFIL | letzter gesetzter Wert gewinnt | Pinning der uia-worker-Rollenfamilie ist Profil-spezifisch, wie `uia_model`. | |
 | `policy_profile` | **GLOBAL** (entschieden 2026-09-21) | `GlobalOnly` | Admin erzwingt eine Policy-Familie zentral; ein Profil kann sie nicht umgehen. Bisher kein Consumer im Code gefunden (nur deklariert + per CLI setzbar, `harw-cli/src/settings.rs`) — die Entscheidung gilt vorsorglich für den Moment, in dem ein Consumer entsteht. | 🔒 |
 | `project_root_markers` | **PROFIL** (entschieden 2026-09-21) | `ProfileReplaces` | Reine Heuristik zur Root-Erkennung ohne eigene Sicherheitswirkung — die eigentliche Sandbox-Grenze ziehen `sandbox.*` (GLOBAL exklusiv) und `permissions.extra_roots` (GLOBAL-Obergrenze), nicht die Root-*Erkennung*. Ein Profil darf seine eigene Projekterkennung frei anpassen. | |
 | `logging.level` | PROFIL | letzter gesetzter Wert gewinnt | Ausgabe-Verbosität, keine Beschränkung. | |
@@ -465,7 +467,7 @@ Layer, der die Sektion nicht schreibt, überschreibt den vorigen Wert nicht,
 
 ### 6.1 Das `MergeRule`-Enum
 
-Zehn Varianten decken alle 88 Felder exakt ab (Herleitung und Feldzahl je
+Zehn Varianten decken alle 89 Felder exakt ab (Herleitung und Feldzahl je
 Variante: Abschnitt 6.3). Keine weitere Variante (z. B. ein separates
 `MaxBound`) wird gebraucht — jeder Fall „profil darf nur *mehr* erlauben“
 ist bereits `Union`/`OrBool`, jeder Fall „profil darf nur *weniger*
@@ -602,14 +604,14 @@ festgelegt**, da sie im heutigen Code an keiner Stelle kodiert sind:
   dritter Wert nie stillschweigend in die Ordnung einsortiert wird;
   abgesichert durch Test #24 (Abschnitt 7h).
 
-### 6.3 Vollständige Feld-für-Feld-Zuordnung (alle 88 Felder)
+### 6.3 Vollständige Feld-für-Feld-Zuordnung (alle 89 Felder)
 
 Eine Zeile je Blattfeld aus Abschnitt 1, in derselben Reihenfolge und mit
 denselben Unterabschnittsnummern, damit die Tabelle 1:1 gegen Abschnitt 1
 geprüft werden kann. „Scope" = `Scope`-Variante, „Regel" = `MergeRule`-
 Variante.
 
-**1.1 Top-Level** (10 Felder)
+**1.1 Top-Level** (11 Felder)
 
 | Pfad | Scope | Regel |
 |---|---|---|
@@ -621,6 +623,7 @@ Variante.
 | `active_uia_definition` | Profile | `ProfileReplaces` |
 | `uia_provider` | Profile | `ProfileReplaces` |
 | `uia_model` | Profile | `ProfileReplaces` |
+| `uia_worker_model` | Profile | `ProfileReplaces` |
 | `policy_profile` | Global | `GlobalOnly` |
 | `project_root_markers` | Profile | `ProfileReplaces` |
 
@@ -746,8 +749,9 @@ Variante.
 | `guards.no_progress_rounds_abort` | Global | `MinBound` |
 | `guards.plan_stale_rounds` | Global | `MinBound` |
 
-**Verteilung (Kontrollsumme = 88, Stand 2026-09-21 nach R1/R2-Entscheidung):**
-`ProfileReplaces` 40 · `GlobalOnly` 11 · `MinBound` 12 · `CompositeMember` 11 ·
+**Verteilung (Kontrollsumme = 89, Stand 2026-09-21 nach R1/R2-Entscheidung
+plus Ergänzung `uia_worker_model`):**
+`ProfileReplaces` 41 · `GlobalOnly` 11 · `MinBound` 12 · `CompositeMember` 11 ·
 `Intersection` 4 · `OrBool` 3 · `Union` 2 · `AndBool` 2 · `StricterOf` 2 ·
 `PerFileValidated` 1. (Vor der R2-Entscheidung: `GlobalOnly` 17 ·
 `CompositeMember` 6 · `Intersection` 3 — die Ummappung von
@@ -756,7 +760,10 @@ Unterfelder von `GlobalOnly` auf `CompositeMember`, da sie laut
 `CompositeMember`-Definition (Abschnitt 6.1) nicht eigenständig gemergt
 werden dürfen, sondern nur als Teil des durch `Intersection` gemergten
 Listenelements reisen — netto `GlobalOnly` −6, `CompositeMember` +5,
-`Intersection` +1, Summe unverändert 88.)
+`Intersection` +1, Summe unverändert 88 zu diesem Zeitpunkt. Die spätere
+Ergänzung von `uia_worker_model` als `ProfileReplaces` erhöht die Summe auf
+89 und `ProfileReplaces` von 40 auf 41, ohne die übrigen Varianten zu
+berühren.)
 
 ---
 
@@ -797,6 +804,7 @@ fn test_field_table_exhaustive_harness_config() {
         active_uia_definition,
         uia_provider,
         uia_model,
+        uia_worker_model,
         policy_profile,
         logging: _,
         tui: _,
@@ -821,12 +829,13 @@ fn test_field_table_exhaustive_harness_config() {
     let _ = (
         config_version, workspace_root, default_provider, default_model,
         active_agent_definition, active_uia_definition, uia_provider,
-        uia_model, policy_profile, project_root_markers,
+        uia_model, uia_worker_model, policy_profile, project_root_markers,
     ); // unused-Warnungen vermeiden
     for path in [
         "config_version", "workspace_root", "default_provider",
         "default_model", "active_agent_definition", "active_uia_definition",
-        "uia_provider", "uia_model", "policy_profile", "project_root_markers",
+        "uia_provider", "uia_model", "uia_worker_model", "policy_profile",
+        "project_root_markers",
     ] {
         assert!(
             FIELD_TABLE.iter().any(|f| f.path == path),
@@ -1294,7 +1303,7 @@ verworfen).
 
 **R3 — `[network]`/`[browser]`/`[dod]`/`[web]` bleiben außen vor.** Diese
 vier Sektionen liegen außerhalb von `HarnessConfig` (Abschnitt 1, Randnotiz)
-und damit außerhalb des mit „88 `HarnessConfig`-Felder" abgesteckten
+und damit außerhalb des mit „89 `HarnessConfig`-Felder" abgesteckten
 Umfangs dieser Aufgabe. Ihr heutiges Merge-Verhalten (sticky
 Ganze-Sektion-Ersetzung bei Anwesenheit, `discovery.rs:607-624`) bleibt
 unangetastet; `merge_restricted_network/_browser/_dod` bleiben als

@@ -213,8 +213,8 @@ mod tests {
     use crate::context::ServiceMap;
     use crate::error::OpError;
     use crate::operation::{
-        OpFuture, OpInput, Operation, OperationCategory, OperationDomain, OperationMeta,
-        PermissionTier,
+        BusyAvailability, OpFuture, OpInput, Operation, OperationCategory, OperationDomain,
+        OperationMeta, PermissionTier,
     };
     use crate::registry::{OperationRegistry, RegistryError};
     use std::any::Any;
@@ -298,6 +298,7 @@ mod tests {
                 category: OperationCategory::Misc,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             }))
         }
 
@@ -324,6 +325,7 @@ mod tests {
                 category: OperationCategory::Misc,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             })
         }
 

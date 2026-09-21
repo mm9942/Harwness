@@ -18,6 +18,7 @@ mod command;
 pub(crate) mod command_exec;
 pub(crate) mod command_popup;
 pub(crate) mod choice_dialog;
+pub(crate) mod model_switch_picker;
 pub mod clipboard;
 mod error;
 pub mod export;

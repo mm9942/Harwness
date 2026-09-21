@@ -328,6 +328,70 @@ async fn test_triple_surface(_ctx: &OpContext, _args: TripleArgs) -> Result<OpOu
     Ok(OpOutput::from("ok".to_owned()))
 }
 
+// ── `busy` sub-key of `command(...)` → top-level `OperationMeta::busy` ────────
+
+#[derive(Default, Deserialize)]
+struct BusyImmediateArgs {}
+
+impl FromRawArgs for BusyImmediateArgs {
+    fn from_raw_args(_tokens: &[String]) -> Result<Self, OpError> {
+        Ok(Self {})
+    }
+}
+
+#[operation(
+    name = "test_busy_immediate",
+    summary = "Befehl mit busy = \"immediate\".",
+    domain = "misc",
+    permission = "observer",
+    command(path = "/test_busy_immediate", visibility = "tui_only", busy = "immediate")
+)]
+async fn test_busy_immediate(
+    _ctx: &OpContext,
+    _args: BusyImmediateArgs,
+) -> Result<OpOutput, OpError> {
+    Ok(OpOutput::from("ok".to_owned()))
+}
+
+#[test]
+fn command_busy_immediate_sets_operation_meta_busy_immediate() {
+    use harw_operations::operation::BusyAvailability;
+
+    let op = TestBusyImmediateOperation;
+    assert_eq!(op.meta().busy, BusyAvailability::Immediate);
+}
+
+#[derive(Default, Deserialize)]
+struct BusyDefaultArgs {}
+
+impl FromRawArgs for BusyDefaultArgs {
+    fn from_raw_args(_tokens: &[String]) -> Result<Self, OpError> {
+        Ok(Self {})
+    }
+}
+
+#[operation(
+    name = "test_busy_default",
+    summary = "Befehl ohne busy-Schlüssel.",
+    domain = "misc",
+    permission = "observer",
+    command(path = "/test_busy_default", visibility = "tui_only")
+)]
+async fn test_busy_default(
+    _ctx: &OpContext,
+    _args: BusyDefaultArgs,
+) -> Result<OpOutput, OpError> {
+    Ok(OpOutput::from("ok".to_owned()))
+}
+
+#[test]
+fn command_without_busy_key_defaults_to_deferred_until_turn_end() {
+    use harw_operations::operation::BusyAvailability;
+
+    let op = TestBusyDefaultOperation;
+    assert_eq!(op.meta().busy, BusyAvailability::DeferredUntilTurnEnd);
+}
+
 #[test]
 fn command_model_tool_and_web_surfaces_all_coexist() {
     use harw_operations::{ApprovalPolicy, CommandVisibility, Surface, WebMethod};

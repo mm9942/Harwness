@@ -823,6 +823,7 @@ mod tests {
                     data_block: None,
                     max_output_tokens: None,
                     tool_result_max_bytes: None,
+                    cancel: None,
                 })
                 .await
                 .unwrap();

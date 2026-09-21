@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use harw_operations::context::OpContext;
 use harw_operations::operation::{
-    ApprovalPolicy, OpFuture, OpInput, OpOutput, Operation, OperationCategory, OperationDomain,
-    OperationMeta, PermissionTier, Surface, WebMethod,
+    ApprovalPolicy, BusyAvailability, OpFuture, OpInput, OpOutput, Operation, OperationCategory,
+    OperationDomain, OperationMeta, PermissionTier, Surface, WebMethod,
 };
 use harw_operations::registry::OperationRegistry;
 use harw_web::authz::StaticUidTierMap;
@@ -82,6 +82,7 @@ fn counting_op(
             category: OperationCategory::Misc,
             args_schema: None,
             output_schema: None,
+            busy: BusyAvailability::DeferredUntilTurnEnd,
         },
         runs: Arc::clone(runs),
     })

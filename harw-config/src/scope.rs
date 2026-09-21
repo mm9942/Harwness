@@ -264,8 +264,8 @@ pub struct FieldScope {
 /// Die zentrale, öffentliche Deklarationstabelle: ein Eintrag pro
 /// `HarnessConfig`-Blattfeld (`docs/design/config-scopes.md` Abschnitt 6.3),
 /// in derselben Reihenfolge wie Abschnitt 1/6.3 der Spezifikation, damit die
-/// Tabelle 1:1 dagegen geprüft werden kann. Exakt 88 Einträge (Abschnitt 6.3
-/// Kontrollsumme: `ProfileReplaces` 40 · `GlobalOnly` 11 · `MinBound` 12 ·
+/// Tabelle 1:1 dagegen geprüft werden kann. Exakt 89 Einträge (Abschnitt 6.3
+/// Kontrollsumme: `ProfileReplaces` 41 · `GlobalOnly` 11 · `MinBound` 12 ·
 /// `CompositeMember` 11 · `Intersection` 4 · `OrBool` 3 · `Union` 2 ·
 /// `AndBool` 2 · `StricterOf` 2 · `PerFileValidated` 1).
 ///
@@ -276,7 +276,7 @@ pub struct FieldScope {
 /// 7a der Spezifikation).
 #[rustfmt::skip]
 pub static FIELD_TABLE: &[FieldScope] = &[
-    // 1.1 Top-Level (10)
+    // 1.1 Top-Level (11)
     FieldScope { path: "config_version", scope: Scope::NotScoped, merge: MergeRule::PerFileValidated, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "workspace_root", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "default_provider", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
@@ -285,6 +285,7 @@ pub static FIELD_TABLE: &[FieldScope] = &[
     FieldScope { path: "active_uia_definition", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "uia_provider", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "uia_model", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
+    FieldScope { path: "uia_worker_model", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     FieldScope { path: "policy_profile", scope: Scope::Global, merge: MergeRule::GlobalOnly, ordering: None, intersection_key: None, security_critical: true },
     FieldScope { path: "project_root_markers", scope: Scope::Profile, merge: MergeRule::ProfileReplaces, ordering: None, intersection_key: None, security_critical: false },
     // 1.2 [logging] (3)
@@ -387,8 +388,8 @@ mod merge_rule_tests {
     use super::*;
 
     #[test]
-    fn test_field_table_has_exactly_88_entries() {
-        assert_eq!(FIELD_TABLE.len(), 88);
+    fn test_field_table_has_exactly_89_entries() {
+        assert_eq!(FIELD_TABLE.len(), 89);
     }
 
     #[test]
@@ -403,7 +404,7 @@ mod merge_rule_tests {
     #[test]
     fn test_merge_rule_variant_control_sum_matches_abschnitt_6_3() {
         let count = |rule: MergeRule| FIELD_TABLE.iter().filter(|f| f.merge == rule).count();
-        assert_eq!(count(MergeRule::ProfileReplaces), 40);
+        assert_eq!(count(MergeRule::ProfileReplaces), 41);
         assert_eq!(count(MergeRule::GlobalOnly), 11);
         assert_eq!(count(MergeRule::MinBound), 12);
         assert_eq!(count(MergeRule::CompositeMember), 11);

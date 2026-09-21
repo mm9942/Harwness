@@ -131,8 +131,8 @@ impl ResolvedConfig {
     ///
     /// Dangling **catalog** references (`default_model`/`default_provider`,
     /// a provider's `models` list, a cataloged model's `provider` field, an
-    /// agent's `models` list, `uia_model`/`uia_provider`) are **not** checked
-    /// here anymore: one misconfigured
+    /// agent's `models` list, `uia_model`/`uia_provider`/`uia_worker_model`)
+    /// are **not** checked here anymore: one misconfigured
     /// provider or model must not make the whole application unusable at
     /// startup. Those are reported instead as non-fatal
     /// [`ConfigDiagnostic`]s — see [`Self::compute_diagnostics`] and
@@ -254,6 +254,11 @@ impl ResolvedConfig {
         if let Some(model) = &self.harness.uia_model {
             if !self.models.contains_key(model) {
                 diagnostics.push(ConfigDiagnostic::new("uia_model", "model", model));
+            }
+        }
+        if let Some(model) = &self.harness.uia_worker_model {
+            if !self.models.contains_key(model) {
+                diagnostics.push(ConfigDiagnostic::new("uia_worker_model", "model", model));
             }
         }
 
@@ -1688,6 +1693,20 @@ job_capabilities = ["cancel_workspace"]
             "uia_model",
             "model",
             "missing-model"
+        )));
+    }
+
+    #[test]
+    fn validate_accepts_an_unresolved_uia_worker_model_as_a_diagnostic() {
+        let mut config = ResolvedConfig::default();
+        config.harness.uia_worker_model = Some("missing-worker-model".to_owned());
+
+        assert!(config.validate().is_ok());
+        let diagnostics = config.compute_diagnostics();
+        assert!(diagnostics.contains(&ConfigDiagnostic::new(
+            "uia_worker_model",
+            "model",
+            "missing-worker-model"
         )));
     }
 

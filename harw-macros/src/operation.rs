@@ -11,14 +11,18 @@
 //! `<ArgsType as OpArgsSchema>::json_schema` gebunden wird (siehe
 //! `expand_operation`), sowie `OperationMeta::output_schema`, das derzeit
 //! unbedingt auf `None` gesetzt wird (kein Attribut-Schlüssel dafür, Stand
-//! W3/C-OPS). `map_domain`, `map_permission`, `map_visibility`, `map_approval`
-//! und `map_web_method` übersetzen die jeweiligen String-Literale in
-//! `::harw_operations`-Enum-Varianten — `map_web_method` mappt den
-//! verpflichtenden `method`-Schlüssel von `web(...)` auf
+//! W3/C-OPS). `map_domain`, `map_permission`, `map_visibility`, `map_approval`,
+//! `map_web_method` und `map_busy_availability` übersetzen die jeweiligen
+//! String-Literale in `::harw_operations`-Enum-Varianten — `map_web_method`
+//! mappt den verpflichtenden `method`-Schlüssel von `web(...)` auf
 //! `harw_operations::operation::WebMethod` (W3/C-OPS, F-031: die HTTP-Methode
 //! einer `Surface::Web`-Route wurde zuvor aus `model_tool(readonly)`
 //! abgeleitet; `method` macht sie zu einer eigenständigen Pflichtangabe, ein
-//! fehlender Schlüssel ist ein Compile-Fehler). Diese Funktionen sind die
+//! fehlender Schlüssel ist ein Compile-Fehler); `map_busy_availability` mappt
+//! den optionalen `busy`-Schlüssel von `command(...)` (Werte `"immediate"` /
+//! `"deferred"`, Default `"deferred"`) auf das TOP-LEVEL-Feld
+//! `OperationMeta::busy` (`harw_operations::operation::BusyAvailability`) —
+//! nicht auf ein `Surface::Command`-Feld. Diese Funktionen sind die
 //! Einstiegspunkte, die die `#[proc_macro_attribute] operation`-Funktion im
 //! Crate-Root (`lib.rs`) aufruft.
 
@@ -59,6 +63,11 @@ pub(crate) struct OperationArgs {
     has_command: bool,
     cmd_path: Option<LitStr>,
     cmd_visibility: Option<LitStr>,
+    /// `busy = "..."` sub-key of `command(...)` → top-level `busy` field of
+    /// `OperationMeta` (not a `Surface::Command` field — mapped via
+    /// `map_busy_availability`). Absent ⇒ `BusyAvailability::DeferredUntilTurnEnd`
+    /// (today's behavior for every command).
+    cmd_busy: Option<LitStr>,
     has_model_tool: bool,
     mt_readonly: bool,
     mt_approval: Option<LitStr>,
@@ -125,6 +134,7 @@ pub(crate) fn parse_operation_args(
     // command(...) fields
     let mut cmd_path: Option<LitStr> = None;
     let mut cmd_visibility: Option<LitStr> = None;
+    let mut cmd_busy: Option<LitStr> = None;
     let mut has_command = false;
     // model_tool(...) fields
     let mut mt_readonly = false;
@@ -172,9 +182,13 @@ pub(crate) fn parse_operation_args(
                     let lit: LitStr = nested.value()?.parse()?;
                     cmd_visibility = Some(lit);
                     Ok(())
+                } else if nested.path.is_ident("busy") {
+                    let lit: LitStr = nested.value()?.parse()?;
+                    cmd_busy = Some(lit);
+                    Ok(())
                 } else {
                     Err(nested.error(
-                        "unsupported `operation` `command` key (expected `path` or `visibility`)",
+                        "unsupported `operation` `command` key (expected `path`, `visibility`, or `busy`)",
                     ))
                 }
             })
@@ -276,6 +290,7 @@ pub(crate) fn parse_operation_args(
         has_command,
         cmd_path,
         cmd_visibility,
+        cmd_busy,
         has_model_tool,
         mt_readonly,
         mt_approval,
@@ -324,6 +339,7 @@ pub(crate) fn expand_operation(
         has_command,
         cmd_path,
         cmd_visibility,
+        cmd_busy,
         has_model_tool,
         mt_readonly,
         mt_approval,
@@ -373,6 +389,19 @@ pub(crate) fn expand_operation(
     // --- Build aliases token -------------------------------------------------
     let alias_lits = &op_aliases;
     let aliases_tokens = quote! { &[ #( #alias_lits ),* ] };
+
+    // --- Build busy-availability token (top-level `OperationMeta::busy`) -----
+    // `busy` is a sub-key of `command(...)` but sets the TOP-LEVEL
+    // `OperationMeta::busy` field, not a `Surface::Command` field — see the
+    // `cmd_busy` doc comment on `OperationArgs`. Absent ⇒ the default
+    // (`DeferredUntilTurnEnd`), exactly like every other optional key here.
+    let busy_tokens = cmd_busy
+        .as_ref()
+        .map(map_busy_availability)
+        .transpose()?
+        .unwrap_or_else(|| {
+            quote! { ::harw_operations::operation::BusyAvailability::DeferredUntilTurnEnd }
+        });
 
     // --- Build category token (explicit or derived from domain) --------------
     let category_tokens = match op_category.as_ref().map(|l| l.value()) {
@@ -647,6 +676,7 @@ pub(crate) fn expand_operation(
                     // this the same way `args_schema` is bound above, without
                     // breaking this contract again.
                     output_schema: ::core::option::Option::None,
+                    busy: #busy_tokens,
                 })
             }
 
@@ -750,6 +780,33 @@ fn map_visibility(lit: &LitStr) -> syn::Result<proc_macro2::TokenStream> {
                 "unknown `visibility` value `{other}`; \
                  expected one of: tui_only, channel_parity, channel_reduced"
             ),
+        )),
+    }
+}
+
+/// Map a `command(...)` `busy` string literal to its
+/// `::harw_operations::operation::BusyAvailability` variant tokens.
+///
+/// `BusyAvailability` is not re-exported at the `harw_operations` crate root
+/// (as `ApprovalPolicy`/`Surface` are), so the emitted tokens qualify through
+/// the `operation` module — the same pattern this file already uses for
+/// `WebMethod`.
+///
+/// # Errors
+/// Returns `syn::Error` when the string is neither `"immediate"` nor
+/// `"deferred"`.
+///
+/// # Design-doc reference
+/// Plan-Referenz: `recursive-cooking-lobster.md`, Abschnitt "Welle 1 — 1b".
+fn map_busy_availability(lit: &LitStr) -> syn::Result<proc_macro2::TokenStream> {
+    match lit.value().as_str() {
+        "immediate" => Ok(quote! { ::harw_operations::operation::BusyAvailability::Immediate }),
+        "deferred" => {
+            Ok(quote! { ::harw_operations::operation::BusyAvailability::DeferredUntilTurnEnd })
+        }
+        other => Err(syn::Error::new_spanned(
+            lit,
+            format!("busy muss 'immediate' oder 'deferred' sein, war: '{other}'"),
         )),
     }
 }
@@ -1105,6 +1162,92 @@ mod operation_tests {
             error
                 .to_string()
                 .contains("unsupported `operation` `web` key"),
+            "unerwartete Fehlermeldung: {error}"
+        );
+    }
+
+    // ── `command(...)` `busy` sub-key ────────────────────────────────────────
+
+    #[test]
+    fn expand_operation_command_busy_immediate_is_honored() {
+        let flat = expand_with_attr(quote! {
+            name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
+            command(path = "/demo", visibility = "tui_only", busy = "immediate")
+        });
+
+        assert!(
+            flat.contains("busy:::harw_operations::operation::BusyAvailability::Immediate"),
+            "`busy = \"immediate\"` muss auf BusyAvailability::Immediate abgebildet werden"
+        );
+    }
+
+    #[test]
+    fn expand_operation_command_busy_deferred_is_honored() {
+        let flat = expand_with_attr(quote! {
+            name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
+            command(path = "/demo", visibility = "tui_only", busy = "deferred")
+        });
+
+        assert!(
+            flat.contains(
+                "busy:::harw_operations::operation::BusyAvailability::DeferredUntilTurnEnd"
+            ),
+            "`busy = \"deferred\"` muss auf BusyAvailability::DeferredUntilTurnEnd abgebildet werden"
+        );
+    }
+
+    #[test]
+    fn expand_operation_without_busy_key_defaults_to_deferred() {
+        let flat = expand_with_attr(quote! {
+            name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
+            command(path = "/demo", visibility = "tui_only")
+        });
+
+        assert!(
+            flat.contains(
+                "busy:::harw_operations::operation::BusyAvailability::DeferredUntilTurnEnd"
+            ),
+            "ein fehlender `busy`-Schlüssel muss auf den Default DeferredUntilTurnEnd fallen"
+        );
+    }
+
+    #[test]
+    fn expand_operation_rejects_unknown_busy_value() {
+        let attr = quote! {
+            name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
+            command(path = "/demo", visibility = "tui_only", busy = "invalid-wert")
+        };
+        let Ok(args) = parse_operation_args(attr) else {
+            panic!("`busy = \"invalid-wert\"` muss beim Parsen noch durchgehen");
+        };
+        let func: ItemFn = syn::parse_quote! {
+            async fn demo_op(ctx: &OpContext, args: DemoArgs) -> Result<OpOutput, OpError> {
+                let _ = (ctx, args);
+                Ok(OpOutput { text: String::new() })
+            }
+        };
+        let Err(error) = expand_operation(func, args) else {
+            panic!("ein unbekannter `busy`-Wert muss beim Expandieren fehlschlagen");
+        };
+        assert_eq!(
+            error.to_string(),
+            "busy muss 'immediate' oder 'deferred' sein, war: 'invalid-wert'"
+        );
+    }
+
+    #[test]
+    fn parse_operation_args_rejects_unknown_command_key() {
+        let Err(error) = parse_operation_args(quote! {
+            name = "demo", summary = "Demo.", domain = "misc", permission = "observer",
+            command(path = "/demo", bogus = "x")
+        }) else {
+            panic!("ein unbekannter `command`-Schlüssel muss abgewiesen werden");
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported `operation` `command` key"),
             "unerwartete Fehlermeldung: {error}"
         );
     }

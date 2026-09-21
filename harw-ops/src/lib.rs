@@ -166,6 +166,7 @@ pub mod work;
 
 use std::sync::{Arc, OnceLock};
 
+use harw_operations::operation::BusyAvailability;
 use harw_operations::registry::OperationRegistry;
 use harw_operations::{
     CommandVisibility, OpContext, OpFuture, OpInput, OpOutput, Operation, OperationCategory,
@@ -197,6 +198,7 @@ impl Operation for UnavailableCompactOperation {
             category: OperationCategory::Session,
             args_schema: None,
             output_schema: None,
+            busy: BusyAvailability::DeferredUntilTurnEnd,
         })
     }
 

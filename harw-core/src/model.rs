@@ -91,6 +91,7 @@
 //! gelten als retryable — insbesondere `QuotaExceeded` **nicht** (ein
 //! erschöpftes Kontingent behebt ein erneuter Versuch nicht).
 
+use crate::cancel::CancelToken;
 use crate::context_budget::{Assembly, ContextAssembly, ContextAssemblyError, ContextBudget, assemble};
 use crate::history::ConversationHistory;
 use harw_agent_dsl::executable::ContextProgram;
@@ -147,6 +148,15 @@ pub struct ModelRequest {
     /// Provider in sein Wire-Format rendert (`render_tool_result`, W3/C-PROTO).
     /// `None` lässt den Provider seine eigene Grenze wählen.
     pub tool_result_max_bytes: Option<usize>,
+    /// Optionaler Abbruch-Token (W3/C-CANCEL), gegen den ein Provider seinen
+    /// laufenden Modell-Aufruf racen kann (z. B. via `tokio::select!` mit
+    /// [`CancelToken::cancelled`]). `None` heißt: kein Abbruchpfad für diesen
+    /// Request — der Aufruf läuft unabbrechbar bis zur regulären
+    /// Antwort/zum regulären Fehler. Ein cancelter Token führt zu
+    /// [`ModelError::Cancelled`]; diese Struktur bereitet nur das Feld vor,
+    /// die tatsächliche `select!`-Verdrahtung ist Folgearbeit in
+    /// `harw-provider-http`/`turn_loop.rs`.
+    pub cancel: Option<CancelToken>,
 }
 
 impl ModelRequest {
@@ -194,6 +204,7 @@ impl ModelRequest {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         }
     }
 
@@ -319,6 +330,7 @@ impl ModelRequest {
                     data_block,
                     max_output_tokens: None,
                     tool_result_max_bytes: None,
+                    cancel: None,
                 })
             }
             _ => {
@@ -380,6 +392,14 @@ impl ModelRequest {
     #[must_use]
     pub fn with_tool_result_max_bytes(mut self, tool_result_max_bytes: Option<usize>) -> Self {
         self.tool_result_max_bytes = tool_result_max_bytes;
+        self
+    }
+
+    /// Sets the cancel token a provider can race its request against
+    /// (W3/C-CANCEL). `None` (the default) leaves the request unabbrechbar.
+    #[must_use]
+    pub fn with_cancel_token(mut self, cancel: CancelToken) -> Self {
+        self.cancel = Some(cancel);
         self
     }
 }
@@ -767,6 +787,26 @@ mod tests {
 
         assert!(req.model_id.is_none());
         assert!(req.provider_id.is_none());
+    }
+
+    #[test]
+    fn test_model_request_cancel_defaults_to_none() {
+        let req = empty_request();
+
+        assert!(req.cancel.is_none());
+    }
+
+    #[test]
+    fn test_model_request_with_cancel_token_sets_field() {
+        let token = crate::cancel::CancelToken::new();
+
+        let req = empty_request().with_cancel_token(token.clone());
+
+        assert!(req.cancel.is_some());
+        // Same underlying node: cancelling the stored token must be observed
+        // through the clone we kept for the assertion.
+        req.cancel.as_ref().unwrap().cancel(crate::cancel::CancelReason::User);
+        assert!(token.is_cancelled());
     }
 
     #[test]

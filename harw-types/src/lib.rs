@@ -13,6 +13,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cancel;
 pub mod clock;
 pub mod confidence;
 pub mod digest;

@@ -405,8 +405,8 @@ mod tests {
     use std::sync::OnceLock;
 
     use harw_operations::operation::{
-        OpFuture, OpInput, OpOutput, Operation, OperationCategory, OperationDomain,
-        OperationMeta, PermissionTier, Surface,
+        BusyAvailability, OpFuture, OpInput, OpOutput, Operation, OperationCategory,
+        OperationDomain, OperationMeta, PermissionTier, Surface,
     };
     use harw_operations::registry::OperationRegistry;
 
@@ -442,6 +442,7 @@ mod tests {
                 category: OperationCategory::Misc,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             }))
         }
 
@@ -464,6 +465,7 @@ mod tests {
                 category: OperationCategory::Misc,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             })
         }
         fn run<'a>(&'a self, _ctx: &'a harw_operations::context::OpContext, _input: OpInput) -> OpFuture<'a> {

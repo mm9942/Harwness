@@ -33,8 +33,8 @@
 //! use std::sync::Arc;
 //! use harw_operations::adapter::CommandAdapter;
 //! use harw_operations::operation::{
-//!     CommandVisibility, OpFuture, OpInput, OpOutput, Operation, OperationCategory,
-//!     OperationDomain, OperationMeta, PermissionTier, Surface,
+//!     BusyAvailability, CommandVisibility, OpFuture, OpInput, OpOutput, Operation,
+//!     OperationCategory, OperationDomain, OperationMeta, PermissionTier, Surface,
 //! };
 //! use harw_operations::context::OpContext;
 //!
@@ -55,6 +55,7 @@
 //!             category: OperationCategory::Misc,
 //!             args_schema: None,
 //!             output_schema: None,
+//!             busy: BusyAvailability::DeferredUntilTurnEnd,
 //!         })
 //!     }
 //!     fn run<'a>(&'a self, _ctx: &'a OpContext, _input: OpInput) -> OpFuture<'a> {
@@ -346,8 +347,8 @@ mod tests {
     use crate::context::{OpContext, ServiceMap};
     use crate::error::OpError;
     use crate::operation::{
-        ApprovalPolicy, CommandVisibility, OpFuture, OpInput, OpOutput, Operation,
-        OperationCategory, OperationDomain, OperationMeta, PermissionTier, Surface,
+        ApprovalPolicy, BusyAvailability, CommandVisibility, OpFuture, OpInput, OpOutput,
+        Operation, OperationCategory, OperationDomain, OperationMeta, PermissionTier, Surface,
     };
 
     // ── test helpers ─────────────────────────────────────────────────────────
@@ -406,6 +407,7 @@ mod tests {
                 category: OperationCategory::Misc,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             })
         }
 
@@ -433,6 +435,7 @@ mod tests {
                 category: OperationCategory::Misc,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             })
         }
 
@@ -466,6 +469,7 @@ mod tests {
                 category: OperationCategory::Misc,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             })
         }
 
@@ -499,6 +503,7 @@ mod tests {
                 category: OperationCategory::Misc,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             })
         }
 
@@ -526,6 +531,7 @@ mod tests {
                 category: OperationCategory::Misc,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             })
         }
 
@@ -558,6 +564,7 @@ mod tests {
                 category: OperationCategory::Misc,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             })
         }
 

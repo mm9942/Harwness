@@ -674,6 +674,7 @@ fn merge_top_level(
     );
     profile_replaces(&mut trusted.uia_provider, incoming.uia_provider.clone(), present("uia_provider"), role);
     profile_replaces(&mut trusted.uia_model, incoming.uia_model.clone(), present("uia_model"), role);
+    profile_replaces(&mut trusted.uia_worker_model, incoming.uia_worker_model.clone(), present("uia_worker_model"), role);
     profile_replaces(
         &mut trusted.project_root_markers,
         incoming.project_root_markers.clone(),
@@ -1345,6 +1346,48 @@ mod tests {
             &layer_path(),
         );
         assert_eq!(trusted.logging.level, "debug");
+        assert!(diagnostics.is_empty());
+    }
+
+    // uia_worker_model (Abschnitt 6.3, 1.1): ProfileReplaces — ein
+    // vertrautes Profil setzt einen neuen Wert und ersetzt den Home-Wert.
+    #[test]
+    fn test_uia_worker_model_profile_replaces_overrides_trusted_value() {
+        let mut trusted = HarnessConfig::default();
+        trusted.uia_worker_model = Some("claude-old".to_owned());
+        let mut incoming = HarnessConfig::default();
+        incoming.uia_worker_model = Some("claude-new".to_owned());
+        let raw = raw_from("uia_worker_model = \"claude-new\"");
+        let diagnostics = merge_layer_into(
+            &mut trusted,
+            incoming,
+            &raw,
+            LayerRole::Refinement,
+            &layer_path(),
+        );
+        assert_eq!(trusted.uia_worker_model.as_deref(), Some("claude-new"));
+        assert!(diagnostics.is_empty());
+    }
+
+    // uia_worker_model gegen einen nicht vertrauten Projekt-Layer: `profile_replaces`
+    // gibt bei `LayerRole::UntrustedProject` sofort zurueck (Abschnitt 7c) —
+    // der Projekt-Layer kann den Wert nicht setzen, auch wenn er ihn im
+    // rohen TOML traegt.
+    #[test]
+    fn test_uia_worker_model_untrusted_project_layer_cannot_set_it() {
+        let mut trusted = HarnessConfig::default();
+        trusted.uia_worker_model = Some("claude-trusted".to_owned());
+        let mut incoming = HarnessConfig::default();
+        incoming.uia_worker_model = Some("claude-evil".to_owned());
+        let raw = raw_from("uia_worker_model = \"claude-evil\"");
+        let diagnostics = merge_layer_into(
+            &mut trusted,
+            incoming,
+            &raw,
+            LayerRole::UntrustedProject,
+            &layer_path(),
+        );
+        assert_eq!(trusted.uia_worker_model.as_deref(), Some("claude-trusted"));
         assert!(diagnostics.is_empty());
     }
 

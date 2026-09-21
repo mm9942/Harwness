@@ -492,6 +492,7 @@ mod tests {
     };
     use harw_operations::adapter::CommandAdapter;
     use harw_operations::registry::OperationRegistry;
+    use harw_operations::operation::BusyAvailability;
     use harw_operations::{
         CommandVisibility, OpContext, OpFuture, OpInput, OpOutput, Operation, OperationCategory,
         OperationDomain, OperationMeta, PermissionTier, Surface,
@@ -574,6 +575,7 @@ mod tests {
                     // Kein Ausgabeschema: Dieser Test-Helfer prüft nur Dispatch/Meta-Zugriffe,
                     // keine strukturierte Ausgabe (siehe harw-ops/src/lib.rs, help.rs: gleiches Muster).
                     output_schema: None,
+                    busy: BusyAvailability::DeferredUntilTurnEnd,
                 },
                 meta_reads: AtomicUsize::new(0),
                 dispatches: AtomicUsize::new(0),

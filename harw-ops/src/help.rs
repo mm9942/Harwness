@@ -269,6 +269,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::testutil::toks;
+    use harw_operations::operation::BusyAvailability;
     use harw_operations::{
         ApprovalPolicy, CommandVisibility, FromRawArgs, OpContext, OpFuture, OpInput, OpOutput,
         Operation, OperationCategory, OperationDomain, OperationMeta, PermissionTier, Surface,
@@ -308,6 +309,7 @@ mod tests {
                     category: self.category,
                     args_schema: None,
                     output_schema: None,
+                    busy: BusyAvailability::DeferredUntilTurnEnd,
                 }))
             }
 

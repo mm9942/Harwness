@@ -690,8 +690,8 @@ mod tests {
 
     use super::OperationRegistry;
     use crate::operation::{
-        ApprovalPolicy, CommandVisibility, OpFuture, OpInput, Operation, OperationCategory,
-        OperationDomain, OperationMeta, PermissionTier, Surface, WebMethod,
+        ApprovalPolicy, BusyAvailability, CommandVisibility, OpFuture, OpInput, Operation,
+        OperationCategory, OperationDomain, OperationMeta, PermissionTier, Surface, WebMethod,
     };
 
     // ── Fixtures ─────────────────────────────────────────────────────────────
@@ -720,6 +720,7 @@ mod tests {
                 category: OperationCategory::Misc,
                 args_schema: None,
                 output_schema: None,
+                busy: BusyAvailability::DeferredUntilTurnEnd,
             }))
         }
 
@@ -1116,6 +1117,7 @@ mod tests {
                     category: OperationCategory::Misc,
                     args_schema: None,
                     output_schema: None,
+                    busy: BusyAvailability::DeferredUntilTurnEnd,
                 })
             }
             fn run<'a>(
@@ -1144,6 +1146,7 @@ mod tests {
                     category: OperationCategory::Misc,
                     args_schema: None,
                     output_schema: None,
+                    busy: BusyAvailability::DeferredUntilTurnEnd,
                 })
             }
             fn run<'a>(
@@ -1182,6 +1185,7 @@ mod tests {
                     category: OperationCategory::Misc,
                     args_schema: None,
                     output_schema: None,
+                    busy: BusyAvailability::DeferredUntilTurnEnd,
                 })
             }
             fn run<'a>(
@@ -1238,6 +1242,7 @@ mod tests {
                     category: OperationCategory::Misc,
                     args_schema: None,
                     output_schema: None,
+                    busy: BusyAvailability::DeferredUntilTurnEnd,
                 })
             }
 

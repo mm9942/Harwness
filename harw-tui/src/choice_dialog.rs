@@ -74,6 +74,10 @@ pub struct ChoiceDialog {
     options: Vec<String>,
     /// Index in `options`, der aktuell markiert ist.
     selected: usize,
+    /// Optionaler Fußzeilen-Hinweis, der [`FOOTER_HINT`] überschreibt (siehe
+    /// [`Self::with_footer_hint`]). `None` (der Standard bei [`Self::new`])
+    /// belässt es beim Standardtext.
+    footer_hint: Option<String>,
 }
 
 impl ChoiceDialog {
@@ -107,6 +111,7 @@ impl ChoiceDialog {
             prompt,
             options,
             selected: 0,
+            footer_hint: None,
         }
     }
 
@@ -130,6 +135,26 @@ impl ChoiceDialog {
         } else {
             index.min(self.options.len() - 1)
         };
+        self
+    }
+
+    /// Überschreibt den Fußzeilen-Hinweis (Standard: [`FOOTER_HINT`]) und
+    /// gibt `self` für Builder-Verkettung zurück.
+    ///
+    /// # Beschreibung
+    /// Für Aufrufer, die dem Nutzer stufen-spezifische Tastaturhinweise
+    /// geben müssen (z. B. `crate::model_switch_picker::ModelSwitchPicker`,
+    /// das der Modell-Stufe einen zusätzlichen "← zurück"-Hinweis gibt, den
+    /// die Provider-Stufe nicht hat).
+    ///
+    /// # Argumente
+    /// - `hint` (`impl Into<String>`): der Ersatztext für die Fußzeile.
+    ///
+    /// # Rückgabe
+    /// `Self` für Builder-Verkettung.
+    #[must_use]
+    pub fn with_footer_hint(mut self, hint: impl Into<String>) -> Self {
+        self.footer_hint = Some(hint.into());
         self
     }
 
@@ -290,9 +315,10 @@ impl ChoiceDialog {
         }
 
         if footer_reserved == 1 {
+            let footer_text = self.footer_hint.as_deref().unwrap_or(FOOTER_HINT);
             let footer_area = Rect::new(inner.x, bottom - 1, inner.width, 1);
             Widget::render(
-                Line::styled(FOOTER_HINT, style::dim_style(theme)),
+                Line::styled(footer_text, style::dim_style(theme)),
                 footer_area,
                 buf,
             );
@@ -426,5 +452,43 @@ mod tests {
         let dialog = ChoiceDialog::new("Export", None, vec!["Ja".to_owned(), "Nein".to_owned()]);
         // 2 (Rahmen) + 0 (kein Hinweis) + 2 (Optionen) + 1 (Fußzeile).
         assert_eq!(dialog.desired_height(), 5);
+    }
+
+    /// `with_footer_hint` überschreibt den gerenderten Fußzeilentext.
+    #[test]
+    fn test_with_footer_hint_overrides_rendered_footer() {
+        let dialog = export_dialog().with_footer_hint("↑↓ wählen · ← zurück · Enter bestätigen · Esc abbrechen");
+        let area = Rect::new(0, 0, 60, 8);
+        let mut buf = Buffer::empty(area);
+        dialog.render(area, &mut buf, style::Theme::Dark);
+
+        let rendered: String = buf
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(rendered.contains("zurück"));
+        assert!(!rendered.contains(FOOTER_HINT));
+    }
+
+    /// Ohne `with_footer_hint`-Aufruf bleibt der gerenderte Fußzeilentext
+    /// beim Standard [`FOOTER_HINT`].
+    #[test]
+    fn test_without_footer_hint_override_uses_default_footer() {
+        let dialog = export_dialog();
+        let area = Rect::new(0, 0, 60, 8);
+        let mut buf = Buffer::empty(area);
+        dialog.render(area, &mut buf, style::Theme::Dark);
+
+        let rendered: String = buf
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(rendered.contains(FOOTER_HINT));
     }
 }

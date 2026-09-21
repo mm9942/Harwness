@@ -27,6 +27,24 @@ jiff = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
+# `CancelToken` (verschoben aus harw-core, F-160/G-017) wickelt
+# `tokio_util::sync::CancellationToken` — die einzige async-Abhängigkeit
+# dieser sonst reinen Sync-/Datentyp-Crate, bewusst minimal (kein
+# tokio-Runtime-Feature, nur der Cancellation-Primitive). Version/Feature-Zeile
+# identisch zu `harw-core/Cargo.toml`.
+tokio-util = "0.7.18"
+
+[dev-dependencies]
+# BEFUND (dieser Auftrag): `harw-core/src/cancel.rs` enthält nicht nur den
+# `tokio_util`-Import, sondern auch `#[tokio::test]`-Funktionen (u. a.
+# `test_cancelled_future_completes_after_cancel`, die `tokio::spawn` nutzt)
+# sowie einen `#[tokio::main(flavor = "current_thread")]`-Doctest im
+# Moduldoc. Beides kompiliert nicht ohne `tokio` selbst — nur `tokio-util`
+# (oben) reicht nicht. Da beides ausschließlich in Tests/Doctests auftritt,
+# genügt `tokio` als Dev-Dependency; Features `rt` + `macros` sind das
+# Minimum, das `#[tokio::test]`, `tokio::spawn` und `#[tokio::main]`
+# brauchen (kein `sync`/`time`, die harw-core nur für andere Module bindet).
+tokio = { version = "1", features = ["rt", "macros"] }
 
 [lints]
 workspace = true

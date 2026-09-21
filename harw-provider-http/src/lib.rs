@@ -3425,6 +3425,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         }
     }
 
@@ -3785,6 +3786,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
 
         let body = build_chat_body(&request, "gpt-4o-mini");
@@ -3832,6 +3834,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
 
         let body = build_chat_body(&request, "m");
@@ -3975,6 +3978,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
 
         let req = build_request("gpt-test", &request);
@@ -4000,6 +4004,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
 
         let req = build_request("gpt-test", &request);
@@ -4131,6 +4136,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
         let req = build_request("gpt-test", &request);
         assert_eq!(req.tools.len(), 1);
@@ -4159,6 +4165,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
         let req = build_request("gpt-test", &request);
         assert_eq!(req.input.len(), 1);
@@ -4197,6 +4204,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
         let body = build_chat_body(&request, "gpt-4o-mini");
         let tools = body
@@ -4234,6 +4242,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
         let body = build_chat_body(&request, "gpt-4o-mini");
         assert!(body.get("tools").is_none());
@@ -4260,6 +4269,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
         let body = build_chat_body(&request, "gpt-4o-mini");
         let messages = body
@@ -4319,6 +4329,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
         let body = build_chat_body(&request, "gpt-4o-mini");
         let messages = body
@@ -4372,6 +4383,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
         let body = build_chat_body(&request, "gpt-4o-mini");
         let messages = body
@@ -4443,6 +4455,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
         let body = build_chat_body(&request, "gpt-4o-mini");
         let messages = body
@@ -4493,6 +4506,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
         let body = build_chat_body(&request, "gpt-4o-mini");
         let messages = body
@@ -5448,6 +5462,7 @@ mod tests {
             data_block: None,
             max_output_tokens: None,
             tool_result_max_bytes: None,
+            cancel: None,
         };
         let response = provider.respond(request).await.expect("live respond");
         assert!(response.message.is_some());
