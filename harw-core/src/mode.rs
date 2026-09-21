@@ -120,15 +120,27 @@ Fundstellen, nicht mit Änderungen.";
 /// Prompt-Abschnitt für [`InteractionMode::Work`].
 const WORK_PROMPT: &str = "Modus: work. Voller Werkzeugsatz inklusive Schreiben \
 und Shell. Der Modus hebt keine Sandbox-Grenze auf: es gilt weiterhin genau \
-die Autorität, die die Session beim Start bekommen hat.";
+die Autorität, die die Session beim Start bekommen hat. Host-Zugriff \
+(Nutzer-Toolchains, Netz) gibt es nur nach Freigabe über das Werkzeug \
+`sandbox-lease` (`action = \"request\"`, mit Grund).";
 
 /// Prompt-Abschnitt für [`InteractionMode::Shell`].
 const SHELL_PROMPT: &str = "Modus: shell. Der Nutzer will handfeste Hilfe auf \
-seinem echten System, nicht nur im Workspace. Bevorzuge, Host-Befehle an den \
-`uia-shell-worker` zu delegieren, statt sie selbst auszuführen. Erkläre vor \
-jedem vorgeschlagenen Befehl in einfachen Worten, was er tut, bevor du ihn \
-vorschlägst. Du kannst eine Host-Freigabe niemals selbst erteilen — \
-ausschließlich der Nutzer bestätigt sie in der Oberfläche.";
+seinem echten System, nicht nur im Workspace. Ein normaler `shell.exec`-Aufruf \
+läuft in einer hermetischen Sandbox: nur der Workspace, ein minimaler PATH, \
+keine Nutzer-Toolchains (kein `~/.cargo`, kein `~/.rustup`), kein Netz, keine \
+Root-Rechte. Braucht eine Aufgabe Host-Werkzeuge — `cargo`/`rustc` oder andere \
+Toolchains unter `~`, Netzzugriff, Dateien außerhalb des Workspace —, rufe \
+zuerst das Werkzeug `sandbox-lease` mit `action = \"request\"` und einem \
+konkreten Grund auf; der Nutzer bestätigt die Freigabe im Dialog. Danach \
+laufen deine `shell.exec`-Aufrufe dieser Sitzung auf dem Host mit seiner \
+Umgebung (das Ergebnis trägt `\"executed_on\": \"host\"`). Versuche nie, \
+Toolchains per `apt`/Download in der Sandbox nachzuinstallieren. Erkläre vor \
+jedem vorgeschlagenen Befehl kurz in einfachen Worten, was er tut. Du kannst \
+eine Host-Freigabe niemals selbst erteilen — nur `sandbox-lease` anfragen; \
+ausschließlich der Nutzer bestätigt sie in der Oberfläche. Bei Ablehnung \
+schlage eine Alternative vor: der Nutzer kann den Befehl selbst mit `!` \
+ausführen.";
 
 /// Betriebsmodus einer Session. Er bestimmt, welche Werkzeuge das Modell sieht
 /// und welche Autorität die Sandbox höchstens tragen darf.
@@ -167,10 +179,12 @@ pub enum InteractionMode {
     Explore,
     /// Ausführung: voller Werkzeugsatz inkl. Schreiben und Shell.
     Work,
-    /// Host-Arbeit: voller Werkzeugsatz wie `Work`; das Modell soll Host-Befehle
-    /// bevorzugt an den `uia-shell-worker` delegieren und kann eine
-    /// Host-Freigabe nie selbst erteilen — das bleibt allein dem Nutzer in der
-    /// Oberfläche vorbehalten.
+    /// Host-Arbeit: voller Werkzeugsatz wie `Work`; `shell.exec` läuft
+    /// normal weiter hermetisch in der Sandbox. Für echte Host-Werkzeuge
+    /// (Nutzer-Toolchains, Netz, Pfade außerhalb des Workspace) soll das
+    /// Modell zuerst das Werkzeug `sandbox-lease` (`action = "request"`)
+    /// aufrufen; eine Host-Freigabe kann es nie selbst erteilen — das
+    /// bleibt allein dem Nutzer im Bestätigungsdialog vorbehalten.
     Shell,
 }
 
@@ -639,6 +653,33 @@ mod tests {
                 "der Prompt-Abschnitt von {mode} muss den Modusnamen nennen"
             );
         }
+    }
+
+    #[test]
+    fn test_shell_and_work_prompts_name_the_sandbox_lease_tool() {
+        // Ohne diese Nennung findet die UIA das Modell-Tool `sandbox-lease`
+        // nie von selbst — das genau war der reale Fehler (cargo build in
+        // der Sandbox, apt-get-Versuch, Bitte um Host-Ausführung durch den
+        // Nutzer statt eines `sandbox-lease`-Antrags).
+        for prompt in [SHELL_PROMPT, WORK_PROMPT] {
+            assert!(
+                prompt.contains("sandbox-lease"),
+                "Prompt muss den Werkzeugnamen 'sandbox-lease' nennen: {prompt}"
+            );
+        }
+        assert!(
+            SHELL_PROMPT.contains("action = \"request\""),
+            "SHELL_PROMPT muss die Anfrage-Aktion des Werkzeugs nennen"
+        );
+        assert!(
+            SHELL_PROMPT.contains("hermetisch"),
+            "SHELL_PROMPT muss die Sandbox als hermetisch beschreiben"
+        );
+        assert!(
+            !SHELL_PROMPT.contains("uia-shell-worker"),
+            "SHELL_PROMPT darf nicht mehr auf den für die UIA unerreichbaren \
+             uia-shell-worker verweisen"
+        );
     }
 
     #[test]

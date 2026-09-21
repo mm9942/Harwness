@@ -1367,30 +1367,40 @@ fn profile_tool_providers(
     profile: RegistryProfile,
     agent_definition_access: AgentDefinitionAccess,
     sandbox_profile: &SandboxProfile,
-    // Nur für Host-Profil-Worker relevant (siehe `host-process-worker.toml`):
-    // die Runtime-Montage reicht hier die einmal instanziierte
-    // `HostPermitWiring` (Ledger + Sitzungs-Registry + Fragekanal-Sender)
-    // durch, damit jeder gebaute `ShellToolProvider` sowohl
-    // `run_command`s tatsächliche `authorize()`-Prüfung als auch eine
-    // Rückfrage über den Sender erreichen kann. `None` verhält sich exakt wie
-    // vor dieser Ergänzung (Host-Ausführung bleibt dann fail-closed ohne
-    // Ledger).
+    // Reicht die einmal je Lauf instanziierte `HostPermitWiring` (Ledger +
+    // Sitzungs-Registry + Fragekanal-Sender) durch, damit jeder gebaute
+    // `ShellToolProvider` sowohl `run_command`s tatsächliche
+    // `authorize()`-Prüfung (Host-Profil) als auch die sitzungs-/prozessweite
+    // Freigabeprüfung über die Registry (jedes andere Profil, siehe
+    // `harw_tool_shell::exec::ShellExecutor::determine_effective_host`)
+    // erreichen kann. `None` verhält sich exakt wie vor dieser Ergänzung
+    // (Host-Ausführung bleibt dann fail-closed ohne Ledger; ein
+    // `sandbox-lease` auf einem Strict/Cargo/Tmux-Profil bleibt wirkungslos,
+    // weil keine Registry angehängt ist, die die Freigabe sehen könnte).
     host_permits: Option<&HostPermitWiring>,
 ) -> Vec<Arc<dyn ToolProvider>> {
-    // Baut einen `ShellToolProvider` für `sandbox_profile` und hängt bei
-    // Host-Profil (falls übergeben) Ledger, Sitzungs-Registry, Fragekanal-
-    // Sender und vorausgewählte Variante an.
+    // Baut einen `ShellToolProvider` für `sandbox_profile` und hängt, sobald
+    // `host_permits` übergeben wurde, Ledger, Sitzungs-Registry,
+    // Fragekanal-Sender und vorausgewählte Variante an — unabhängig davon,
+    // ob `sandbox_profile.is_host()` gilt. Ein `sandbox-lease` soll
+    // prozessweit wirken (Root-Session **und** jede Kind-Session, siehe
+    // `HostPermitSessionRegistry::mark_global_approval`), also muss jeder
+    // gebaute `ShellToolProvider` dieselbe Registry sehen, nicht nur der des
+    // Host-Profil-Workers. Das ändert das Sicherheitsverhalten von
+    // Strict/Cargo/Tmux **nicht**: `determine_effective_host`
+    // (`harw-tool-shell/src/exec.rs`) prüft für ein nicht-Host-Profil
+    // weiterhin ausschließlich, ob die angehängte Registry eine aktive
+    // Sitzungs- oder Einmalfreigabe für die aufrufende Session meldet — ohne
+    // eine solche Freigabe läuft der Aufruf unverändert in bwrap.
     let build_shell_provider = |sandbox_profile: &SandboxProfile| -> Arc<dyn ToolProvider> {
         let mut provider =
             ShellToolProvider::default().with_sandbox_profile(sandbox_profile.clone());
-        if sandbox_profile.is_host() {
-            if let Some(wiring) = host_permits {
-                provider = provider
-                    .with_permit_ledger(Arc::clone(&wiring.ledger))
-                    .with_host_permit_registry(Arc::clone(&wiring.registry))
-                    .with_host_permit_prompts(wiring.prompt_sender.clone())
-                    .with_preselected_permit_variant(wiring.preselected_variant);
-            }
+        if let Some(wiring) = host_permits {
+            provider = provider
+                .with_permit_ledger(Arc::clone(&wiring.ledger))
+                .with_host_permit_registry(Arc::clone(&wiring.registry))
+                .with_host_permit_prompts(wiring.prompt_sender.clone())
+                .with_preselected_permit_variant(wiring.preselected_variant);
         }
         Arc::new(provider)
     };
@@ -1517,8 +1527,9 @@ fn profile_tool_providers(
         // `SandboxProfile::Host` an, nicht das von der Runtime übergebene
         // `sandbox_profile` — siehe die Begründung bei
         // `RegistryProfile::UiaShellWorker`. Ledger und Sitzungs-Registry
-        // hängt `build_shell_provider` bereits automatisch an, sobald
-        // `is_host()` gilt und `host_permits` übergeben wurde.
+        // hängt `build_shell_provider` immer an, sobald `host_permits`
+        // übergeben wurde (unabhängig vom Profil); für dieses `Host`-Profil
+        // greift zusätzlich `authorize_host_command` bei jedem Aufruf.
         RegistryProfile::UiaShellWorker => {
             let filesystem: Arc<dyn ToolProvider> = Arc::new(RestrictedToolProvider::new(
                 Arc::new(FsToolProvider::default()),
@@ -1999,20 +2010,29 @@ pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile(
 /// `harw_runtime::assembly::RuntimeAssembly`).
 ///
 /// # Beschreibung
-/// Alle drei Werte werden nur an einen [`ShellToolProvider`] gehängt, dessen
-/// `sandbox_profile` tatsächlich [`SandboxProfile::Host`] ist —
-/// Strict/Cargo/Tmux bleiben unverändert, weil für sie die Sandbox selbst die
-/// Grenze ist, nicht der Permit. Die Runtime muss über beide Aufrufstellen
-/// (Host- und Nicht-Host-Zweig, siehe `harw-runtime/src/assembly.rs`)
-/// **dieselbe** `Arc`-Instanz von Ledger und Registry sowie denselben
-/// Sender-Klon durchreichen: ein zweiter, unabhängig instanziierter Ledger
-/// hätte keine Kenntnis von den bereits gemerkten Sitzungszustimmungen und
-/// würde jede Host-Ausführung erneut ablehnen; ein anderer Sender ließe die
-/// Frage nie beim Empfänger ankommen, den die Runtime tatsächlich pollt.
+/// Alle drei Werte werden an **jeden** gebauten [`ShellToolProvider`]
+/// gehängt, unabhängig davon, ob dessen `sandbox_profile` tatsächlich
+/// [`SandboxProfile::Host`] ist — ein `sandbox-lease` soll prozessweit gelten
+/// (Root-Session und jede Kind-Session, siehe
+/// [`harw_sandbox::HostPermitSessionRegistry::mark_global_approval`]), also
+/// muss jeder Shell-Provider dieselbe Registry sehen können, um eine aktive
+/// Freigabe zu erkennen. Für Strict/Cargo/Tmux ändert das die
+/// Sicherheitsgrenze **nicht**: ohne eine aktive Sitzungs- oder
+/// Einmalfreigabe in der Registry bleibt die Sandbox weiterhin die Grenze
+/// (`ShellExecutor::determine_effective_host`, `harw-tool-shell/src/exec.rs`,
+/// prüft für ein nicht-Host-Profil ausschließlich die Registry, nie den
+/// Permit-Ledger selbst). Die Runtime muss über beide Aufrufstellen (Host-
+/// und Nicht-Host-Zweig, siehe `harw-runtime/src/assembly.rs`) **dieselbe**
+/// `Arc`-Instanz von Ledger und Registry sowie denselben Sender-Klon
+/// durchreichen: ein zweiter, unabhängig instanziierter Ledger hätte keine
+/// Kenntnis von den bereits gemerkten Sitzungszustimmungen und würde jede
+/// Host-Ausführung erneut ablehnen; ein anderer Sender ließe die Frage nie
+/// beim Empfänger ankommen, den die Runtime tatsächlich pollt.
 ///
 /// `None` verhält sich exakt wie
 /// [`assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile`]:
-/// Host-Ausführung bleibt dann fail-closed, weil kein Ledger konfiguriert ist.
+/// Host-Ausführung bleibt dann fail-closed, weil kein Ledger konfiguriert ist,
+/// und kein Shell-Provider kann eine `sandbox-lease`-Freigabe überhaupt sehen.
 ///
 /// # Argumente
 /// - `profile` ([`RegistryProfile`]): Werkzeug-/Identitätsprofil.
@@ -2037,10 +2057,12 @@ pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile(
 /// registrierten Werkzeuge. Für ein Profil ohne `shell.exec`
 /// (`ShellExecution`/`Full`/`UiaQuickHelper`/`UiaShellWorker` ausgenommen)
 /// bleibt `host_permits` wirkungslos, weil kein [`ShellToolProvider`]
-/// entsteht, an den es gehängt werden könnte. `UiaShellWorker` hängt seinen
-/// `ShellToolProvider` zudem immer an `SandboxProfile::Host` (unabhängig vom
-/// übergebenen `sandbox_profile`), sodass `host_permits` für diese Rolle
-/// **immer** greift, sobald es übergeben wird.
+/// entsteht, an den es gehängt werden könnte. Für jedes Profil, das einen
+/// [`ShellToolProvider`] baut, hängt `host_permits` (sobald übergeben) immer
+/// an — `UiaShellWorker` hängt seinen `ShellToolProvider` zusätzlich immer
+/// an `SandboxProfile::Host` (unabhängig vom übergebenen `sandbox_profile`),
+/// sodass dessen `authorize_host_command`-Pfad zusätzlich zur Registry
+/// **immer** greift, sobald `host_permits` übergeben wird.
 ///
 /// # Fehler
 /// - [`RegistryDefaultsError::ContextProviderRegistration`]: der Namensraum des
@@ -2978,13 +3000,16 @@ mod tests {
     // ── `assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits` ──
     //
     // Diese Tests decken die eigentliche Ergänzung dieses Auftrags ab: die
-    // Funktion muss `host_permits` tatsächlich an den gebauten
-    // `ShellToolProvider` durchreichen (statt es nur entgegenzunehmen), und
-    // zwar ausschließlich für `SandboxProfile::Host`. Sie führen den echten
-    // `shell.exec`-Executor aus (wie `harw-tool-shell::exec::tests`), weil nur
-    // die Ausführung selbst beweist, dass der Ledger tatsächlich erreicht
-    // wird — ein Blick auf `registered_tool_names()` allein würde die
-    // Verdrahtung nicht zeigen.
+    // Funktion muss `host_permits` tatsächlich an jeden gebauten
+    // `ShellToolProvider` durchreichen (statt es nur entgegenzunehmen) —
+    // unabhängig vom `sandbox_profile` (siehe „volle Sandbox-Deaktivierung“,
+    // Nutzerwunsch 2026-09-21: eine `sandbox-lease`-Freigabe muss auch
+    // `SandboxProfile::Strict`-Provider erreichen, nicht nur `Host`). Sie
+    // führen den echten `shell.exec`-Executor aus (wie
+    // `harw-tool-shell::exec::tests`), weil nur die Ausführung selbst
+    // beweist, dass Ledger bzw. Registry tatsächlich erreicht werden — ein
+    // Blick auf `registered_tool_names()` allein würde die Verdrahtung nicht
+    // zeigen.
 
     mod permits_wiring {
         use super::*;
@@ -3267,12 +3292,16 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_and_permits_is_ignored_for_non_host_sandbox_profile() {
-            // Selbst wenn Ledger+Registry übergeben werden, dürfen sie nur an
-            // ein `SandboxProfile::Host`-Provider gehängt werden: für Strict
-            // ist die Sandbox die Grenze, nicht der Permit — die Ausführung
-            // darf deshalb nie mit einer Permit-Fehlermeldung scheitern.
-            let project_root = make_temp_project("permits-strict-ignored");
+        async fn test_and_permits_without_active_approval_runs_in_sandbox_for_non_host_profile() {
+            // Der Registry-Eintrag wird jetzt auch an ein
+            // `SandboxProfile::Strict`-Provider gehängt (Nutzerwunsch „volle
+            // Sandbox-Deaktivierung“ — siehe `build_shell_provider`), aber
+            // ohne eine aktive Sitzungs- oder Einmalfreigabe in der Registry
+            // bleibt die Sandbox unverändert die Grenze: die Ausführung darf
+            // deshalb nie mit einer Permit-Fehlermeldung scheitern (der
+            // Ledger wird für Strict nie befragt, nur die Registry — und die
+            // meldet hier keine Freigabe).
+            let project_root = make_temp_project("permits-strict-no-approval");
             let ledger = Arc::new(ProcessPermitLedger::default());
             let registry = Arc::new(HostPermitSessionRegistry::default());
             let executor = shell_executor_for(
@@ -3294,10 +3323,63 @@ mod tests {
                     assert!(
                         !message.contains("host execution requires a process permit")
                             && !message.contains("requires local UI approval"),
-                        "Strict profile must never trigger a permit denial, got: {message:?}"
+                        "Strict profile without an active approval must never trigger a \
+                         permit denial, got: {message:?}"
                     );
                 }
-                ToolOutput::Json { .. } | ToolOutput::Text { .. } => {}
+                ToolOutput::Json { content } => {
+                    assert!(
+                        content.get("executed_on").is_none(),
+                        "without an active approval the Strict profile must not run on \
+                         the host: {content}"
+                    );
+                }
+                ToolOutput::Text { .. } => {}
+            }
+        }
+
+        /// Beweist die eigentliche Behebung dieses Auftrags: ein
+        /// `/sandbox-lease` auf der prozessweit geteilten Registry muss auch
+        /// `shell.exec`-Aufrufe erreichen, deren `ShellToolProvider` mit
+        /// `SandboxProfile::Strict` gebaut wurde (die Root-Session ist immer
+        /// Strict) — vor dieser Behebung hängte `build_shell_provider` Ledger
+        /// und Registry nur an einen `SandboxProfile::Host`-Provider, sodass
+        /// `determine_effective_host` für Strict immer `false` lieferte, egal
+        /// welche Freigabe in der Registry stand.
+        #[tokio::test]
+        async fn test_and_permits_with_active_session_approval_runs_on_host_for_strict_profile() {
+            let project_root = make_temp_project("permits-strict-approved");
+            let ledger = Arc::new(ProcessPermitLedger::default());
+            let registry = Arc::new(HostPermitSessionRegistry::default());
+            let executor = shell_executor_for(
+                &SandboxProfile::Strict,
+                Some(wiring_with_closed_channel(
+                    Arc::clone(&ledger),
+                    Arc::clone(&registry),
+                )),
+                &project_root,
+            );
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let ctx = make_ctx(make_sandbox(tmp.path(), vec![Permission::ExecuteProcess]));
+            registry.mark_session_approved(ctx.session_id().as_str(), Duration::from_secs(60));
+            let call = make_call("echo strict_lease_ok");
+
+            let output = executor
+                .execute(&ctx, &call)
+                .await
+                .expect("execute must not return Err");
+
+            match &output {
+                ToolOutput::Json { content } => {
+                    assert_eq!(
+                        content["executed_on"], "host",
+                        "an active sandbox-lease approval must run a Strict-profile \
+                         shell.exec call on the host, got: {content}"
+                    );
+                }
+                other => panic!(
+                    "expected a successful host-executed JSON output, got: {other:?}"
+                ),
             }
         }
 

@@ -14,13 +14,13 @@
 //!   registriert (z. B. via `inventory::submit!` durch Extension-Crate).
 //!
 //! # Op-Set
-//! **Grundausstattung** ([`register_all`], 36 Ops): `help`, `status`, `quit`,
+//! **Grundausstattung** ([`register_all`], 37 Ops): `help`, `status`, `quit`,
 //! `new`, `work`, `ps`, `attach`, `stop`, `diff`, `agent`, `skills`, `plugins`,
 //! `model`, `provider`, `uia-model`, `uia-provider`, `permissions`, `compact`,
 //! `memory`, `effort`, `mode`, `context-proposal`, `approval.pending`,
 //! `approval.resolve`, `add-workdir`, `export`, `usage`, `bug-report`,
 //! `approve`, `deny`, `review`, `cancel`, `retry`, `provider-concurrency`,
-//! `uia-worker-model`, `uia-effort`.
+//! `uia-worker-model`, `uia-effort`, `sandbox-lease`.
 //! `uia-worker-model` (Welle 2, harw-ops/src/model.rs) und `uia-effort`
 //! (harw-ops/src/effort.rs) waren implementiert, aber bis zu diesem Knoten
 //! nicht in `register_all` eingetragen — dadurch existierten `/uia-worker-model`
@@ -56,6 +56,14 @@
 //! read/write `uia_model`/`uia_provider` instead of
 //! `default_model`/`default_provider`, so the UIA can pin its own selection
 //! independent of the session default.
+//! `sandbox-lease` (Plan `recursive-cooking-lobster.md` Teil B5) ist der
+//! einzige Weg, über den ein Modell selbst eine Host-Freigabe für
+//! `shell.exec` anfordern kann: der Bestätigungsdialog, den es auslöst, ist
+//! die Freigabe selbst, deshalb trägt sein `model_tool` bewusst `approval =
+//! "none"` — anders als jede andere mutierende Operation dieser Crate. Sie
+//! benötigt einen `Arc<harw_tool_shell::HostPermitHandles>`-Service im
+//! `OpContext` (siehe `crate::sandbox_lease`-Moduldoku); ohne ihn meldet sie
+//! das statt eine Freigabe vorzutäuschen.
 //! `usage` liest `harw_core::state_store::SessionStateSnapshot::total_usage`
 //! über `harw_core_bridge::OpContextCoreExt::state_store` — reine
 //! Session-Introspektion wie `mode`/`context-proposal`, deshalb ebenfalls
@@ -170,6 +178,7 @@ pub mod quit;
 pub mod research;
 pub mod retry;
 pub mod review;
+pub mod sandbox_lease;
 pub mod skills;
 pub mod status;
 pub mod stop;
@@ -234,7 +243,7 @@ fn compact_unavailable_output() -> OpOutput {
 /// plugins, model, provider, uia-model, uia-provider, permissions, compact,
 /// memory, effort, mode, context-proposal, approval.pending, approval.resolve,
 /// add-workdir, export, usage, bug-report, approve, deny, review, cancel, retry,
-/// provider-concurrency, uia-worker-model, uia-effort`.
+/// provider-concurrency, uia-worker-model, uia-effort, sandbox-lease`.
 ///
 /// Die Reihenfolge steuert nur die `iter()`-Reihenfolge und den Fallback-Namens-
 /// Vorschlag; die eigentliche Auflösung erfolgt über `find_by_name` /
@@ -254,7 +263,7 @@ fn compact_unavailable_output() -> OpOutput {
 ///
 /// let mut registry = OperationRegistry::new();
 /// harw_ops::register_all(&mut registry);
-/// assert_eq!(registry.len(), 36);
+/// assert_eq!(registry.len(), 37);
 /// assert!(registry.find_by_name("help").is_some());
 /// assert!(registry.find_by_command("/uia-provider").is_some());
 /// assert!(registry.find_by_command("/uia-model").is_some());
@@ -275,9 +284,10 @@ fn compact_unavailable_output() -> OpOutput {
 /// assert!(registry.find_by_command("/review").is_some());
 /// assert!(registry.find_by_command("/cancel").is_some());
 /// assert!(registry.find_by_command("/retry").is_some());
+/// assert!(registry.find_by_command("/sandbox-lease").is_some());
 /// ```
 pub fn register_all(registry: &mut OperationRegistry) {
-    let ops: [Arc<dyn Operation>; 36] = [
+    let ops: [Arc<dyn Operation>; 37] = [
         Arc::new(help::HelpOperation),
         Arc::new(status::StatusOperation),
         Arc::new(quit::QuitOperation),
@@ -357,6 +367,11 @@ pub fn register_all(registry: &mut OperationRegistry) {
         // `uia_effort`, independent of the session's default reasoning
         // effort. Same registration gap and fix as `uia-worker-model`.
         Arc::new(effort::UiaEffortOperation),
+        // Plan `recursive-cooking-lobster.md` Teil B5: der einzige Weg, über
+        // den ein Modell selbst eine Host-Freigabe für `shell.exec`
+        // anfordern kann (siehe Moduldoku, Abschnitt „Op-Set", und
+        // `crate::sandbox_lease`-Moduldoku).
+        Arc::new(sandbox_lease::SandboxLeaseOperation),
     ];
     for op in ops {
         registry.register(op);
@@ -662,10 +677,10 @@ mod tests {
     }
 
     #[test]
-    fn register_all_adds_thirty_six_operations() {
+    fn register_all_adds_thirty_seven_operations() {
         let mut reg = OperationRegistry::new();
         register_all(&mut reg);
-        assert_eq!(reg.len(), 36);
+        assert_eq!(reg.len(), 37);
     }
 
     #[test]
@@ -755,6 +770,7 @@ mod tests {
             "/review",
             "/cancel",
             "/retry",
+            "/sandbox-lease",
         ] {
             assert!(
                 reg.find_by_command(path).is_some(),
@@ -855,6 +871,10 @@ mod tests {
             // This node: implemented, now registered, now listed.
             "uia-worker-model",
             "uia-effort",
+            // Plan `recursive-cooking-lobster.md` Teil B5: der einzige Weg,
+            // über den ein Modell selbst eine Host-Freigabe für
+            // `shell.exec` anfordern kann.
+            "sandbox-lease",
             "plan",
             "goal",
             "explore",
@@ -903,8 +923,8 @@ mod tests {
         register_all(&mut reg);
         assert_eq!(
             reg.len(),
-            36,
-            "first register_all must produce exactly 36 ops"
+            37,
+            "first register_all must produce exactly 37 ops"
         );
 
         // Attempt to register HelpOperation a second time via the fallible path.
@@ -918,8 +938,8 @@ mod tests {
         // Registry must not have grown — the rejected op was not inserted.
         assert_eq!(
             reg.len(),
-            36,
-            "registry must stay at 36 after a rejected duplicate"
+            37,
+            "registry must stay at 37 after a rejected duplicate"
         );
     }
 }

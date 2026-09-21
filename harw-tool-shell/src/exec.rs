@@ -1,8 +1,21 @@
 //! Shell-execution tool provider and executor for Harwness.
 //!
-//! **Security note**: This executor launches `/bin/sh -c` only through a Bubblewrap
-//! plan derived from the per-call sandbox. Failure to build or spawn that plan rejects
-//! execution rather than falling back to the host.
+//! Spec source: `/home/mia/.claude/plans/recursive-cooking-lobster.md`, Teil B1
+//! ("Echte Host-Ausführung") and Teil C2 (`ShellToolProvider::with_host_path`).
+//!
+//! **Security note**: By default this executor launches `/bin/sh -c` only through a
+//! Bubblewrap plan derived from the per-call sandbox; failure to build or spawn that
+//! plan rejects execution rather than falling back to the host. The one exception is
+//! explicit, pre-approved host execution (Plan Teil B1): when
+//! [`SandboxProfile::is_host`] is true and [`ShellExecutor::authorize_host_command`]
+//! grants the request, or a [`HostPermitSessionRegistry`] already holds a session
+//! lease ([`HostPermitSessionRegistry::is_session_approved`]) or a single-use approval
+//! ([`HostPermitSessionRegistry::take_single_use`]) for the calling session, the
+//! command runs directly on the host (`/bin/sh -c`, no `bwrap`) with the harness's own
+//! inherited environment (no `env_clear`) and the sandbox's canonical workspace root as
+//! `cwd`. There is no other path to host execution: every other combination of
+//! profile/registry state still requires a successful Bubblewrap plan, unchanged from
+//! before.
 //!
 //! # Responsibility scope
 //! - Owns [`ShellToolProvider`] (implements [`harw_extension_api::contributors::ToolProvider`])
@@ -38,7 +51,10 @@ use crate::host_permit_prompt::{HostPermitPrompt, HostPermitPromptSender, HostPe
 use crate::limits::{ShellLimits, ShellLimitsError, launch_command};
 use harw_extension_api::contributors::ToolProvider;
 use harw_authority::{Permission, SandboxSpec};
-use harw_sandbox::{BwrapLauncher, HostApprovalScope, HostPermitSessionRegistry, ProcessEnvironment, ProcessPermitLedger, ProcessPermitRequest, SandboxProfile};
+use harw_sandbox::{
+    BwrapLauncher, HostApprovalScope, HostPathBinding, HostPermitSessionRegistry,
+    ProcessEnvironment, ProcessPermitLedger, ProcessPermitRequest, SandboxProfile,
+};
 use harw_tools::{
     schema::{AdditionalProperties, JsonSchema, JsonSchemaType},
     spec::{FunctionToolSpec, ToolName, ToolSpec},
@@ -77,8 +93,12 @@ const KILL_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const HOST_WORKER_DEFINITION: &str = "host-process-worker@1";
 /// Dauer einer per lokaler UI bestätigten Host-Sitzungsfreigabe, bevor sie
 /// ohne explizites Sitzungsende automatisch verfällt (Verteidigungslinie
-/// gegen eine vergessene, nie beendete Sitzung).
-const HOST_SESSION_LEASE_TTL: Duration = Duration::from_secs(12 * 60 * 60);
+/// gegen eine vergessene, nie beendete Sitzung). Öffentlich (Plan
+/// `recursive-cooking-lobster.md` Teil B5), weil `harw-ops`'
+/// `sandbox-lease`-Operation dieselbe TTL für
+/// [`harw_sandbox::HostPermitSessionRegistry::mark_session_approved`]
+/// verwendet, statt sie eigenständig zu duplizieren.
+pub const HOST_SESSION_LEASE_TTL: Duration = Duration::from_secs(12 * 60 * 60);
 /// Gültigkeitsdauer eines frisch über eine beantwortete
 /// [`HostPermitVariant::SingleExecution`]-Frage ausgestellten Permits, bis
 /// der genehmigte Auftrag tatsächlich läuft. Deutlich kürzer als
@@ -88,8 +108,11 @@ const HOST_SINGLE_EXECUTION_TTL: Duration = Duration::from_secs(5 * 60);
 /// Vorgabe-Wartezeit auf **eine** Nutzerentscheidung auf eine offene
 /// [`HostPermitPrompt`]. Läuft sie ab, gilt das als Ablehnung
 /// (fail-closed) — deckt sich mit
-/// `harw_tui::host_permit_dialog::DEFAULT_HOST_PERMIT_TIMEOUT`.
-const HOST_PERMIT_PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
+/// `harw_tui::host_permit_dialog::DEFAULT_HOST_PERMIT_TIMEOUT`. Öffentlich
+/// (Plan `recursive-cooking-lobster.md` Teil B5), weil `harw-ops`'
+/// `sandbox-lease`-Operation dieselbe Wartezeit für ihre eigene
+/// [`HostPermitPrompt`] verwendet.
+pub const HOST_PERMIT_PROMPT_TIMEOUT: Duration = Duration::from_secs(300);
 /// Ablehnungsnachricht, wenn weder ein Permit-Ledger noch eine
 /// Sitzungs-Registry konfiguriert sind — Host-Ausführung ist dann
 /// grundsätzlich nicht erreichbar, unabhängig von jedem Fragekanal.
@@ -257,6 +280,11 @@ pub struct ShellExecutor {
     /// Wartezeit auf eine einzelne Nutzerentscheidung, bevor eine geöffnete
     /// Frage fail-closed als Ablehnung gilt.
     host_permit_timeout: Duration,
+    /// Host-PATH-Bindung für den `bwrap`-Sandbox-Pfad (Plan Teil C2). Nur
+    /// wirksam, solange `run_command` tatsächlich einen `bwrap`-Plan baut —
+    /// der Host-Pfad (Plan Teil B1) ignoriert dieses Feld, weil dort ohnehin
+    /// kein `bwrap` läuft und die Umgebung bereits vollständig geerbt wird.
+    host_path: Option<HostPathBinding>,
 }
 
 impl ShellExecutor {
@@ -497,24 +525,74 @@ impl ShellExecutor {
             .map_err(|err| format!("shell.exec: host execution not authorized: {err}"))
     }
 
+    /// Determines whether this call runs directly on the host without `bwrap`
+    /// (Plan Teil B1).
+    ///
+    /// # Description
+    /// `true` in exactly three cases, in this order (a session lease is
+    /// checked before a single-use approval so the latter is only consumed
+    /// when no session lease already covers the call — the one-shot approval
+    /// must not be spent for nothing):
+    /// 1. [`Self::sandbox_profile`] is [`SandboxProfile::Host`]: delegates to
+    ///    [`Self::authorize_host_command`] (unchanged ledger/prompt flow).
+    /// 2. A [`HostPermitSessionRegistry`] is attached and
+    ///    [`HostPermitSessionRegistry::is_session_approved`] is `true` for
+    ///    `session_id` — an active `/sandbox-lease` session lease, checked
+    ///    without touching the ledger and without a renewed prompt.
+    /// 3. A registry is attached and
+    ///    [`HostPermitSessionRegistry::take_single_use`] atomically consumes a
+    ///    pending single-use approval for `session_id`.
+    ///
+    /// Every other combination — no registry attached, or neither approval
+    /// present — returns `false`: the caller then falls through to the
+    /// unchanged Bubblewrap path.
+    ///
+    /// # Errors
+    /// Returns the same `Err(String)` as [`Self::authorize_host_command`]
+    /// when the profile is [`SandboxProfile::Host`] and authorization is
+    /// denied (fail-closed; propagated to the caller as a `ToolOutput::error`
+    /// without falling back to any other path).
+    async fn determine_effective_host(
+        &self,
+        args: &ShellExecArgs,
+        sandbox: &SandboxSpec,
+        session_id: &str,
+    ) -> Result<bool, String> {
+        if self.sandbox_profile.is_host() {
+            self.authorize_host_command(args, sandbox, session_id).await?;
+            return Ok(true);
+        }
+
+        Ok(self.host_permit_registry.as_ref().is_some_and(|registry| {
+            registry.is_session_approved(session_id) || registry.take_single_use(session_id)
+        }))
+    }
+
     /// Executes the shell command described by `args` in the given sandbox.
     ///
     /// # Description
-    /// Core async logic extracted for readability. Resolves the pinned `bwrap`/`prlimit`
-    /// binaries, spawns the subprocess with stdin `/dev/null`, streams stdout/stderr under
-    /// one byte budget and applies the timeout to reading and waiting together.
+    /// Determines the effective host state via
+    /// [`Self::determine_effective_host`] (Plan Teil B1) and dispatches to
+    /// exactly one of two paths:
+    /// - effective host: [`Self::run_host_command`] — `/bin/sh -c` runs
+    ///   directly, no `bwrap`.
+    /// - otherwise (unchanged): resolves the pinned `bwrap`/`prlimit`
+    ///   binaries, builds a Bubblewrap plan (with [`Self::host_path`] applied
+    ///   if set — Plan Teil C2), and hands the resulting `TokioCommand` to
+    ///   [`Self::spawn_and_collect`].
     ///
-    /// For [`SandboxProfile::Host`] this first calls [`Self::authorize_host_command`];
-    /// Strict/Cargo/Tmux profiles are unaffected because the sandbox itself is
-    /// their enforcement boundary, not a permit.
+    /// Both paths share spawn, drain, timeout, cancel-race, and process
+    /// termination through [`Self::spawn_and_collect`]; only the
+    /// `TokioCommand` construction differs.
     ///
-    /// If `cancel` is `Some`, both waits below (draining stdout/stderr, and waiting
-    /// for the exit status after EOF) additionally race the token's
-    /// [`CancelToken::cancelled`] future. A cancellation hit kills the process tree
-    /// via the existing [`terminate`] function (the same SIGKILL path timeout and
-    /// output-limit overflow already use) and returns [`ToolsError::Cancelled`]
-    /// instead of a timeout `ToolOutput`. With `cancel = None` both waits behave
-    /// exactly as before (plain `timeout_at`, no race).
+    /// If `cancel` is `Some`, both waits inside [`Self::spawn_and_collect`]
+    /// (draining stdout/stderr, and waiting for the exit status after EOF)
+    /// additionally race the token's [`CancelToken::cancelled`] future. A
+    /// cancellation hit kills the process tree via the existing [`terminate`]
+    /// function (the same SIGKILL path timeout and output-limit overflow
+    /// already use) and returns [`ToolsError::Cancelled`] instead of a
+    /// timeout `ToolOutput`. With `cancel = None` both waits behave exactly
+    /// as before (plain `timeout_at`, no race).
     ///
     /// # Errors
     /// Returns `Ok(ToolOutput::error(...))` for denied-permission, missing sandbox binaries,
@@ -538,11 +616,18 @@ impl ShellExecutor {
     ) -> Result<ToolOutput, ToolsError> {
         let effective_timeout = self.effective_timeout(args)?;
 
-        if self.sandbox_profile.is_host() {
-            if let Err(message) = self.authorize_host_command(args, sandbox, session_id).await {
+        let effective_host = match self.determine_effective_host(args, sandbox, session_id).await {
+            Ok(effective_host) => effective_host,
+            Err(message) => {
                 warn!(session_id, "shell.exec denied: host permit authorization failed");
                 return Ok(ToolOutput::error(message));
             }
+        };
+
+        if effective_host {
+            return self
+                .run_host_command(args, sandbox, effective_timeout, session_id, cancel)
+                .await;
         }
 
         debug!(
@@ -565,9 +650,18 @@ impl ShellExecutor {
         }
 
         let launcher = match BwrapLauncher::discover() {
-            Ok(launcher) => launcher
-                .with_tmpfs_size(tmpfs_size)
-                .with_profile(&self.sandbox_profile),
+            Ok(launcher) => {
+                let launcher = launcher
+                    .with_tmpfs_size(tmpfs_size)
+                    .with_profile(&self.sandbox_profile);
+                match &self.host_path {
+                    // Plan Teil C2: bindet den zsh-PATH (und ggf. RUSTUP_HOME/CARGO_HOME)
+                    // in den bwrap-Plan, statt der hermetischen Minimal-PATH. Ohne
+                    // `with_host_path` (kein Aufruf hier) bleibt der Plan unverändert.
+                    Some(binding) => launcher.with_host_path(binding.clone()),
+                    None => launcher,
+                }
+            }
             Err(err) => {
                 warn!(error = %err, "shell.exec bubblewrap unavailable");
                 return Ok(ToolOutput::error(format!(
@@ -597,20 +691,146 @@ impl ShellExecutor {
             prlimit.as_deref(),
             &self.limits,
             launcher.executable(),
-            &plan,
+            plan.args(),
         );
         let mut command = TokioCommand::new(&launch.program);
         command.args(&launch.args);
-        let mut child = match configure_stdio(&mut command).spawn() {
+
+        self.spawn_and_collect(
+            &mut command,
+            "Bubblewrap",
+            effective_timeout,
+            session_id,
+            cancel,
+            false,
+        )
+        .await
+    }
+
+    /// Runs `args.command` directly on the host, without `bwrap` (Plan Teil
+    /// B1). Bubblewrap is skipped entirely for this call.
+    ///
+    /// # Description
+    /// Only reached once [`Self::run_command`] has already established via
+    /// [`Self::determine_effective_host`] that a valid approval exists (Host
+    /// profile via [`Self::authorize_host_command`], or a session/single-use
+    /// approval from the [`HostPermitSessionRegistry`] for any other
+    /// profile) — this method performs no authorization check itself.
+    ///
+    /// Builds `/bin/sh -c <command>` with `current_dir` set to the sandbox's
+    /// canonical workspace root, the harness's own environment fully
+    /// inherited (no `env_clear`, unlike the `bwrap` path), stdin `/dev/null`
+    /// and its own process group (`process_group(0)`) — this isolates the
+    /// host command from harw's own process group (e.g. terminal signals)
+    /// the same way the `bwrap` path's PID namespace isolates its process
+    /// tree, and lets [`terminate`] kill it independently. `prlimit` limits
+    /// are applied through the same [`crate::limits::launch_command`]
+    /// mechanism the `bwrap` path uses ([`Self::resolve_limits`]); if
+    /// `prlimit` is unavailable and `require_rlimits == false`, the host
+    /// command runs deliberately without rlimits, exactly like the `bwrap`
+    /// path's fallback (only the tmpfs limit does not apply here, because
+    /// there is no `bwrap` `/tmp` in the host path).
+    ///
+    /// Timeout, cancel-race, output truncation and [`terminate`] all run
+    /// through [`Self::spawn_and_collect`] — the same helper the `bwrap` path
+    /// uses. The result is marked `"executed_on": "host"` in the JSON output
+    /// (and a `[host] ` prefix on a timeout error) so callers can tell host
+    /// execution apart from the sandboxed path; the sandboxed path's output
+    /// shape is unchanged.
+    ///
+    /// # Errors
+    /// See [`Self::run_command`].
+    async fn run_host_command(
+        &self,
+        args: &ShellExecArgs,
+        sandbox: &SandboxSpec,
+        effective_timeout: u64,
+        session_id: &str,
+        cancel: Option<&CancelToken>,
+    ) -> Result<ToolOutput, ToolsError> {
+        debug!(
+            command_len = args.command.len(),
+            cwd = %sandbox.workspace().canonical_root().display(),
+            timeout_secs = effective_timeout,
+            "shell.exec preparing host process"
+        );
+
+        // Nur der `prlimit`-Teil von `resolve_limits` ist hier relevant: die tmpfs-
+        // Größe gilt ausschließlich für den bwrap-Plan (kein bwrap läuft hier), wird
+        // aber weiterhin mitvalidiert, damit dieselbe `ShellLimits::validate`-Regel wie
+        // im bwrap-Pfad gilt.
+        let (_tmpfs_size, prlimit) = match self.resolve_limits() {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                let err = ShellExecError::ResourceLimits(err);
+                warn!(error = %err, "shell.exec resource limits unavailable");
+                return Ok(ToolOutput::error(err.to_string()));
+            }
+        };
+        if prlimit.is_none() {
+            warn!(
+                "shell.exec (host) runs WITHOUT rlimits: prlimit missing and require_rlimits=false"
+            );
+        }
+
+        let sh = PathBuf::from("/bin/sh");
+        let shell_args = [OsString::from("-c"), OsString::from(&args.command)];
+        let launch = launch_command(prlimit.as_deref(), &self.limits, &sh, &shell_args);
+
+        let mut command = TokioCommand::new(&launch.program);
+        command.args(&launch.args);
+        command.current_dir(sandbox.workspace().canonical_root());
+        // Eigene Prozessgruppe, analog zur eigenen Prozessbaum-Isolation des
+        // bwrap-Pfads (PID-Namespace + `--die-with-parent`): trennt den Host-Befehl
+        // von harws eigener Prozessgruppe, unabhängig von ihr per `terminate` tötbar.
+        command.process_group(0);
+        // Umgebung wird bewusst NICHT gecleart (kein `env_clear`): der Host-Pfad erbt
+        // den vollen zsh-Kontext des Nutzers (PATH/HOME/CARGO_HOME/…), im Unterschied
+        // zum hermetischen bwrap-Pfad.
+
+        self.spawn_and_collect(
+            &mut command,
+            "host shell",
+            effective_timeout,
+            session_id,
+            cancel,
+            true,
+        )
+        .await
+    }
+
+    /// Spawns an already-configured, not-yet-started `TokioCommand`, drains
+    /// stdout/stderr together under one byte budget, applies the timeout and
+    /// optional cancel-race, and returns the finished `ToolOutput`. Shared
+    /// core for the sandboxed (`bwrap`) and host (`/bin/sh -c`, no `bwrap`)
+    /// paths (Plan Teil B1) — only the `command` construction differs
+    /// between [`Self::run_command`] and [`Self::run_host_command`].
+    ///
+    /// # Errors
+    /// Returns `Ok(ToolOutput::error(...))` for spawn failure, missing
+    /// stdio pipes, I/O errors, or timeout. Returns
+    /// `Err(ToolsError::Cancelled)` when `cancel` fires before completion —
+    /// the process tree is killed via [`terminate`] before this is returned.
+    ///
+    /// # Concurrency
+    /// Timeout, cancellation, and output overflow all kill and reap the
+    /// child explicitly via [`terminate`]; `kill_on_drop(true)` still covers
+    /// a dropped future.
+    async fn spawn_and_collect(
+        &self,
+        command: &mut TokioCommand,
+        spawn_error_context: &str,
+        effective_timeout: u64,
+        session_id: &str,
+        cancel: Option<&CancelToken>,
+        executed_on_host: bool,
+    ) -> Result<ToolOutput, ToolsError> {
+        let mut child = match configure_stdio(command).spawn() {
             Ok(child) => child,
             Err(err) => {
-                warn!(
-                    error = %err,
-                    program = %launch.program.display(),
-                    "shell.exec spawn failed"
-                );
+                warn!(error = %err, "shell.exec spawn failed");
                 return Ok(ToolOutput::error(format!(
-                    "shell.exec: failed to spawn Bubblewrap: {err}"
+                    "shell.exec: failed to spawn {spawn_error_context}: {err}"
                 )));
             }
         };
@@ -643,7 +863,7 @@ impl ShellExecutor {
             Err(_elapsed) => {
                 terminate(&mut child).await;
                 warn!(timeout_secs = effective_timeout, "shell.exec timed out");
-                return Ok(self.timeout_output(effective_timeout, &capture));
+                return Ok(self.timeout_output(effective_timeout, &capture, executed_on_host));
             }
             Ok(Err(err)) => {
                 terminate(&mut child).await;
@@ -660,7 +880,7 @@ impl ShellExecutor {
                     max_output_bytes = self.max_output_bytes,
                     "shell.exec output limit exceeded; process tree killed"
                 );
-                return Ok(self.completed_output(status, &capture, true));
+                return Ok(self.completed_output(status, &capture, true, executed_on_host));
             }
             Ok(Ok(DrainEnd::Eof)) => {
                 let waited = match cancel {
@@ -688,13 +908,13 @@ impl ShellExecutor {
                     Err(_elapsed) => {
                         terminate(&mut child).await;
                         warn!(timeout_secs = effective_timeout, "shell.exec timed out");
-                        return Ok(self.timeout_output(effective_timeout, &capture));
+                        return Ok(self.timeout_output(effective_timeout, &capture, executed_on_host));
                     }
                 }
             }
         };
 
-        Ok(self.completed_output(Some(status), &capture, false))
+        Ok(self.completed_output(Some(status), &capture, false, executed_on_host))
     }
 
     /// Prüft die Limits und löst `prlimit` an den festen Pfaden auf.
@@ -713,11 +933,15 @@ impl ShellExecutor {
     ///
     /// `killed_by_output_limit` ist der Kürzungshinweis für den Aufrufer: Die Ausgabe ist
     /// gekappt **und** das Kommando lief nicht zu Ende; `exit_code` ist dann `-1` (Signal).
+    /// `executed_on_host` fügt (nur wenn `true`, Plan Teil B1) das Feld
+    /// `"executed_on": "host"` hinzu — die bestehende Sandbox-Ausgabe (`false`) bleibt
+    /// byte-identisch zu vorher, ohne dieses Feld.
     fn completed_output(
         &self,
         status: Option<ExitStatus>,
         capture: &BoundedCapture,
         killed_by_output_limit: bool,
+        executed_on_host: bool,
     ) -> ToolOutput {
         let exit_code = status.and_then(|status| status.code()).unwrap_or(-1);
         let (stdout_str, stderr_str, truncated) = Self::truncate_combined_output(
@@ -727,27 +951,42 @@ impl ShellExecutor {
         );
         let truncated = truncated || killed_by_output_limit;
 
-        info!(exit_code, truncated, killed_by_output_limit, "shell.exec completed");
+        info!(
+            exit_code,
+            truncated, killed_by_output_limit, executed_on_host, "shell.exec completed"
+        );
 
-        ToolOutput::json(json!({
+        let mut output = json!({
             "exit_code": exit_code,
             "stdout": stdout_str,
             "stderr": stderr_str,
             "truncated": truncated,
             "killed_by_output_limit": killed_by_output_limit,
-        }))
+        });
+        if executed_on_host {
+            output["executed_on"] = json!("host");
+        }
+        ToolOutput::json(output)
     }
 
     /// Fehlerergebnis bei Timeout, das die bis dahin gelesene Teilausgabe (im selben
-    /// Byte-Budget gekürzt) mitliefert.
-    fn timeout_output(&self, timeout_secs: u64, capture: &BoundedCapture) -> ToolOutput {
+    /// Byte-Budget gekürzt) mitliefert. `executed_on_host` stellt (nur wenn `true`,
+    /// Plan Teil B1) ein `[host] `-Präfix voran; die bestehende Sandbox-Meldung
+    /// (`false`) bleibt unverändert.
+    fn timeout_output(
+        &self,
+        timeout_secs: u64,
+        capture: &BoundedCapture,
+        executed_on_host: bool,
+    ) -> ToolOutput {
         let (stdout, stderr, truncated) = Self::truncate_combined_output(
             capture.stdout(),
             capture.stderr(),
             self.max_output_bytes,
         );
+        let prefix = if executed_on_host { "[host] " } else { "" };
         ToolOutput::error(format!(
-            "shell.exec timed out after {timeout_secs}s; process tree killed. \
+            "{prefix}shell.exec timed out after {timeout_secs}s; process tree killed. \
              Partial output (truncated: {truncated}):\n[stdout]\n{stdout}\n[stderr]\n{stderr}"
         ))
     }
@@ -928,6 +1167,13 @@ pub struct ShellToolProvider {
     /// Wartezeit auf eine einzelne Nutzerentscheidung auf eine offene Frage,
     /// bevor sie fail-closed als Ablehnung gilt.
     pub host_permit_timeout: Duration,
+    /// Host-PATH-Bindung für den `bwrap`-Sandbox-Pfad (Plan
+    /// `recursive-cooking-lobster.md` Teil C2, gesetzt über
+    /// [`Self::with_host_path`]). Reicht unverändert an
+    /// [`harw_sandbox::BwrapLauncher::with_host_path`] durch, sobald
+    /// `run_command` tatsächlich einen `bwrap`-Plan baut; wirkungslos für den
+    /// Host-Pfad aus Plan Teil B1, der ohnehin ohne `bwrap` läuft.
+    pub host_path: Option<HostPathBinding>,
 }
 
 impl ShellToolProvider {
@@ -1009,6 +1255,22 @@ impl ShellToolProvider {
         self
     }
 
+    /// Setzt die Host-PATH-Bindung für den `bwrap`-Sandbox-Pfad (Plan
+    /// `recursive-cooking-lobster.md` Teil C2).
+    ///
+    /// # Description
+    /// Reicht `binding` unverändert an
+    /// [`harw_sandbox::BwrapLauncher::with_host_path`] durch, sobald
+    /// `run_command` einen `bwrap`-Plan baut — nur dieser Pfad hat
+    /// `--ro-bind-try`-Einträge für den zsh-PATH nötig. Wirkungslos für den
+    /// direkten Host-Pfad aus Plan Teil B1: dort läuft der Befehl ohnehin ohne
+    /// `bwrap` mit der vollständig geerbten Umgebung.
+    #[must_use]
+    pub fn with_host_path(mut self, binding: HostPathBinding) -> Self {
+        self.host_path = Some(binding);
+        self
+    }
+
     /// Builds the [`JsonSchema`] for the `shell.exec` parameters.
     ///
     /// # Description
@@ -1079,6 +1341,7 @@ impl Default for ShellToolProvider {
             host_permit_prompts: None,
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
+            host_path: None,
         }
     }
 }
@@ -1154,6 +1417,7 @@ impl ToolProvider for ShellToolProvider {
                 host_permit_prompts: self.host_permit_prompts.clone(),
                 preselected_permit_variant: self.preselected_permit_variant,
                 host_permit_timeout: self.host_permit_timeout,
+                host_path: self.host_path.clone(),
             }))
         } else {
             None
@@ -1281,6 +1545,7 @@ mod tests {
             host_permit_prompts: None,
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
+            host_path: None,
         };
 
         for command in ["", " ", "\t\n"] {
@@ -1309,6 +1574,7 @@ mod tests {
             host_permit_prompts: None,
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
+            host_path: None,
         };
         let args = ShellExecArgs {
             command: "echo valid".to_owned(),
@@ -1335,6 +1601,7 @@ mod tests {
             host_permit_prompts: None,
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
+            host_path: None,
         };
         let args = ShellExecArgs {
             command: "echo valid".to_owned(),
@@ -1467,10 +1734,11 @@ mod tests {
             host_permit_prompts: None,
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
+            host_path: None,
         };
         let capture = BoundedCapture::new(16);
 
-        match executor.completed_output(None, &capture, true) {
+        match executor.completed_output(None, &capture, true, false) {
             ToolOutput::Json { content } => {
                 assert_eq!(content["exit_code"], -1);
                 assert_eq!(content["truncated"], true);
@@ -1492,6 +1760,7 @@ mod tests {
             host_permit_prompts: None,
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
+            host_path: None,
         };
         let (mut writer, mut stdout) = tokio::io::duplex(1024);
         let (_stderr_writer, mut stderr) = tokio::io::duplex(1024);
@@ -1506,7 +1775,7 @@ mod tests {
         )
         .await;
 
-        match executor.timeout_output(1, &capture) {
+        match executor.timeout_output(1, &capture, false) {
             ToolOutput::Error { message } => {
                 assert!(message.contains("timed out after 1s"), "{message}");
                 assert!(message.contains("partial-"), "{message}");
@@ -1534,6 +1803,7 @@ mod tests {
             host_permit_prompts: None,
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
+            host_path: None,
         };
         let args = ShellExecArgs {
             command: "echo must_not_run".to_owned(),
@@ -1700,6 +1970,7 @@ mod tests {
             host_permit_prompts: None,
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
+            host_path: None,
         };
         let call = make_call_with_timeout("echo partial_before_timeout; sleep 5", 1);
         let started = std::time::Instant::now();
@@ -1779,6 +2050,7 @@ mod tests {
             host_permit_prompts: None,
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
+            host_path: None,
         };
         // Generate more than the configured output cap.
         let call = make_call("echo 'this_is_a_longer_string_than_ten_bytes'");
@@ -1815,6 +2087,7 @@ mod tests {
             host_permit_prompts: None,
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
+            host_path: None,
         };
         let started = std::time::Instant::now();
 
@@ -1853,6 +2126,7 @@ mod tests {
             host_permit_prompts: None,
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
+            host_path: None,
         };
         // Mit geerbtem Terminal-stdin würde `cat` bis zum Timeout blockieren.
         let call = make_call("cat; echo stdin_reached_eof");
@@ -1925,6 +2199,7 @@ mod tests {
             host_permit_prompts: None,
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
+            host_path: None,
         }
     }
 
@@ -2003,6 +2278,260 @@ mod tests {
         test_exec_cancel_none_behaves_as_before,
         test_exec_cancel_none_behaves_as_before_required,
         cancel_none_behaves_exactly_as_before
+    );
+
+    // ── Host-Pfad-Tests (Plan `recursive-cooking-lobster.md` Teil B1) ──────
+
+    #[tokio::test]
+    async fn test_determine_effective_host_strict_without_registry_is_false() {
+        // Kein Registry angehängt: fällt auf den (unveränderten) bwrap-Pfad
+        // zurück, unabhängig von der Sitzung.
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let executor = plain_executor(DEFAULT_TIMEOUT_SECS);
+        let args = ShellExecArgs {
+            command: "echo hi".to_owned(),
+            timeout_secs: None,
+        };
+
+        let effective_host = executor
+            .determine_effective_host(&args, &sandbox, "s1")
+            .await
+            .expect("must not error without a registry");
+        assert!(!effective_host);
+    }
+
+    #[tokio::test]
+    async fn test_determine_effective_host_strict_with_registry_but_no_approval_is_false() {
+        // Registry angehängt, aber weder Sitzungs- noch Einmalfreigabe für
+        // diese Sitzung: bleibt beim bwrap-Pfad.
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        let mut executor = plain_executor(DEFAULT_TIMEOUT_SECS);
+        executor.host_permit_registry = Some(Arc::clone(&registry));
+        let args = ShellExecArgs {
+            command: "echo hi".to_owned(),
+            timeout_secs: None,
+        };
+
+        let effective_host = executor
+            .determine_effective_host(&args, &sandbox, "s1")
+            .await
+            .expect("must not error");
+        assert!(!effective_host);
+    }
+
+    #[tokio::test]
+    async fn test_determine_effective_host_strict_with_session_lease_is_true() {
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        registry.mark_session_approved("s1", Duration::from_secs(60));
+        let mut executor = plain_executor(DEFAULT_TIMEOUT_SECS);
+        executor.host_permit_registry = Some(Arc::clone(&registry));
+        let args = ShellExecArgs {
+            command: "echo hi".to_owned(),
+            timeout_secs: None,
+        };
+
+        let effective_host = executor
+            .determine_effective_host(&args, &sandbox, "s1")
+            .await
+            .expect("must not error");
+        assert!(effective_host, "an active session lease must authorize the host path");
+    }
+
+    #[tokio::test]
+    async fn test_determine_effective_host_single_use_approval_is_consumed_exactly_once() {
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        registry.mark_single_use("s1".to_owned());
+        let mut executor = plain_executor(DEFAULT_TIMEOUT_SECS);
+        executor.host_permit_registry = Some(Arc::clone(&registry));
+        let args = ShellExecArgs {
+            command: "echo hi".to_owned(),
+            timeout_secs: None,
+        };
+
+        let first = executor
+            .determine_effective_host(&args, &sandbox, "s1")
+            .await
+            .expect("must not error");
+        assert!(first, "the pending single-use approval must authorize the first call");
+
+        let second = executor
+            .determine_effective_host(&args, &sandbox, "s1")
+            .await
+            .expect("must not error");
+        assert!(
+            !second,
+            "a single-use approval must be consumed after exactly one call"
+        );
+        assert!(!registry.has_single_use("s1"));
+    }
+
+    #[tokio::test]
+    async fn test_determine_effective_host_session_lease_preserves_pending_single_use() {
+        // Vertrag: eine Einmal-Freigabe wird nur verbraucht, wenn keine
+        // Sitzungsfreigabe besteht — die Sitzungsfreigabe muss also Vortritt
+        // haben, ohne die Einmal-Freigabe anzutasten.
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        registry.mark_session_approved("s1", Duration::from_secs(60));
+        registry.mark_single_use("s1".to_owned());
+        let mut executor = plain_executor(DEFAULT_TIMEOUT_SECS);
+        executor.host_permit_registry = Some(Arc::clone(&registry));
+        let args = ShellExecArgs {
+            command: "echo hi".to_owned(),
+            timeout_secs: None,
+        };
+
+        let effective_host = executor
+            .determine_effective_host(&args, &sandbox, "s1")
+            .await
+            .expect("must not error");
+        assert!(effective_host);
+        assert!(
+            registry.has_single_use("s1"),
+            "a session lease must satisfy the call without consuming a pending single-use approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_strict_profile_with_session_lease_runs_directly_on_the_host() {
+        // Kein `sandbox_test!`-Guard nötig: der Host-Pfad läuft nie über
+        // bwrap, muss also auch ohne installiertes bwrap erfolgreich sein —
+        // das allein ist hier schon ein Beleg, dass tatsächlich der
+        // Host-Pfad lief (bwrap setzt HOME immer fest auf `/tmp/home`, siehe
+        // unten für den expliziten Gegen-Test).
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let ctx = make_ctx(sandbox);
+        let call = make_call("pwd");
+
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        registry.mark_session_approved(ctx.session_id().as_str(), Duration::from_secs(60));
+
+        let provider = ShellToolProvider::default()
+            .with_sandbox_profile(SandboxProfile::Strict)
+            .with_host_permit_registry(Arc::clone(&registry));
+        let executor = provider
+            .executor(&ToolName::new(TOOL_NAME))
+            .expect("executor must be returned");
+
+        let output = executor
+            .execute(&ctx, &call)
+            .await
+            .expect("execute must not return Err");
+
+        match output {
+            ToolOutput::Json { content } => {
+                assert_eq!(content["exit_code"], 0, "pwd must succeed on the host, got: {content}");
+                assert_eq!(
+                    content["executed_on"], "host",
+                    "the JSON output must mark this call as host-executed: {content}"
+                );
+                let stdout = content["stdout"].as_str().unwrap_or("").trim();
+                let expected = sandbox_root(&tmp);
+                assert_eq!(
+                    Path::new(stdout),
+                    expected.as_path(),
+                    "pwd must report the sandbox's canonical workspace root as cwd"
+                );
+            }
+            other => panic!(
+                "expected Json output for host execution via session lease, got: {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_strict_profile_single_use_approval_runs_on_host_exactly_once() {
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let ctx = make_ctx(sandbox);
+        let call = make_call("echo single_use_ok");
+
+        let registry = Arc::new(HostPermitSessionRegistry::default());
+        registry.mark_single_use(ctx.session_id().as_str().to_owned());
+
+        let provider = ShellToolProvider::default()
+            .with_sandbox_profile(SandboxProfile::Strict)
+            .with_host_permit_registry(Arc::clone(&registry));
+        let executor = provider
+            .executor(&ToolName::new(TOOL_NAME))
+            .expect("executor must be returned");
+
+        let first = executor
+            .execute(&ctx, &call)
+            .await
+            .expect("execute must not return Err");
+        match first {
+            ToolOutput::Json { content } => {
+                assert_eq!(content["exit_code"], 0, "{content}");
+                assert_eq!(content["executed_on"], "host", "{content}");
+            }
+            other => panic!("expected Json output for the single-use host call, got: {other:?}"),
+        }
+        assert!(
+            !registry.has_single_use(ctx.session_id().as_str()),
+            "a single-use approval must be consumed after exactly one call"
+        );
+
+        // Der zweite Aufruf hat keine Freigabe mehr: er darf kein
+        // `"executed_on": "host"` mehr tragen, egal ob er als Json oder
+        // Error zurückkommt (bwrap ist in der Testumgebung ggf. nicht
+        // installiert).
+        let second = executor
+            .execute(&ctx, &call)
+            .await
+            .expect("execute must not return Err");
+        if let ToolOutput::Json { content } = second {
+            assert!(
+                content.get("executed_on").is_none(),
+                "the single-use approval must not still authorize a second host call: {content}"
+            );
+        }
+    }
+
+    async fn strict_without_any_approval_runs_via_bwrap() {
+        // Ohne jede Registry-Freigabe bleibt Strict beim unveränderten
+        // bwrap-Pfad: bwrap setzt `HOME` in jedem Fall fest auf `/tmp/home`
+        // (siehe `harw_sandbox::bwrap`), was der echte Host-`$HOME` so gut
+        // wie nie ist — ein sichtbarer, konkreter Beleg, dass hier tatsächlich
+        // sandboxed statt auf dem Host gelaufen wurde.
+        let output = run_with(
+            &ShellToolProvider::new().with_sandbox_profile(SandboxProfile::Strict),
+            &make_call("echo $HOME"),
+        )
+        .await;
+
+        match output {
+            ToolOutput::Json { content } => {
+                assert!(
+                    content.get("executed_on").is_none(),
+                    "without any registry approval this must run under bwrap, not the host \
+                     path: {content}"
+                );
+                let stdout = content["stdout"].as_str().unwrap_or("").trim();
+                assert_eq!(
+                    stdout, "/tmp/home",
+                    "bwrap always sets HOME to /tmp/home, proving the command ran sandboxed, \
+                     got: {stdout:?}"
+                );
+            }
+            other => panic!(
+                "expected Json output for strict profile without approval, got: {other:?}"
+            ),
+        }
+    }
+    sandbox_test!(
+        test_exec_strict_without_any_approval_runs_via_bwrap,
+        test_exec_strict_without_any_approval_runs_via_bwrap_required,
+        strict_without_any_approval_runs_via_bwrap
     );
 
     // ── Permit-/Profil-Tests ───────────────────────────────────────────────
@@ -2205,6 +2734,7 @@ mod tests {
             host_permit_prompts: None,
             preselected_permit_variant: HostPermitVariant::SingleExecution,
             host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
+            host_path: None,
         }
     }
 

@@ -33,10 +33,11 @@
 //! bzw. `Option::None` bei der Konstruktion signalisiert, nicht über Panics.
 //!
 //! # Verdrahtungshinweis
-//! Dieses Modul wird von einem späteren Agenten in `harw-tui/src/app.rs`
-//! eingehängt (siehe Auftragskontext der Welle, die dieses Widget
-//! eingeführt hat). Bis dahin bleiben die `pub(crate)`-Items dieses Moduls
-//! ungenutzt; das ist erwartet und kein Hinweis auf einen Fehler.
+//! Dieses Modul ist in `harw-tui/src/app.rs` eingehängt: `ChatApp::overlay`
+//! trägt die (dortige, private) Variante `Overlay::ModelSwitch`, die
+//! [`ModelSwitchPicker::on_key`] aufruft und `PickerAction::Accept` je nach
+//! [`ModelSwitchPicker::target`] in `/model switch …`- bzw.
+//! `/uia model …`-Befehle übersetzt.
 #![allow(dead_code)]
 
 use crossterm::event::{KeyCode, KeyEvent};

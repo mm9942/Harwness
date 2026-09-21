@@ -65,6 +65,7 @@ use harw_plan_bridge::{FindingStore, register_plan_services};
 use harw_provider_http::ProviderLoadRegistry;
 use harw_sandbox::ExtraRootsCell;
 use harw_session_store::JobStore;
+use harw_tool_shell::HostPermitHandles;
 use harw_types::Principal;
 
 // ── ServiceSurface ────────────────────────────────────────────────────────────
@@ -283,6 +284,13 @@ pub struct RuntimeServicesParts {
     /// [`crate::model::build_uia_model_with_registry_and_resolver`],
     /// zusammengeführt in `RuntimeAssemblyBuilder::build`.
     pub provider_load_registry: ProviderLoadRegistry,
+    /// Gebündelte Host-Permit-Handles dieses Laufs (Ledger, Sitzungs-Registry,
+    /// Fragekanal-Sender — Plan Teil B3). `None`, wenn dieser Einstieg keine
+    /// Host-Freigabe-Verdrahtung trägt (etwa Tests oder fremde Kompositionen,
+    /// die dieses Feld noch nicht setzen). Gebaut aus `assembly.rs`s einmal
+    /// je Montage instanziiertem `host_permit_ledger`/`host_permit_registry`/
+    /// `host_permit_prompt_sender` (siehe dort, ~1770).
+    pub host_permit_handles: Option<Arc<HostPermitHandles>>,
 }
 
 // ── RuntimeServices ───────────────────────────────────────────────────────────
@@ -435,6 +443,7 @@ impl RuntimeServices {
     /// | [`ProviderLoadRegistry`] | ✓ | ✓ | ✓ | ✓ |
     /// | `Arc<dyn Memory>` (falls vorhanden) | ✓ | ✓ | ✓ | ✓ |
     /// | `Arc<JobStore>` (falls vorhanden) | ✓ | ✓ | ✓ | ✓ |
+    /// | `Arc<`[`HostPermitHandles`]`>` (falls vorhanden, Plan Teil B3) | ✓ | ✓ | ✓ | ✓ |
     /// | Plan-Dienste (falls vorhanden) | ✓ | ✓ | ✓ | ✓ |
     /// | `Arc<ManagedAgentSpawner>` (falls vorhanden) | ✓ | ✓ | — | — |
     /// | [`SharedSessionController`] (falls vorhanden) | ✓ | ✓ | — | — |
@@ -537,6 +546,9 @@ impl RuntimeServices {
         if let Some(job_store) = &self.parts.job_store {
             insert_service(&mut map, &mut names, Arc::clone(job_store));
         }
+        if let Some(host_permit_handles) = &self.parts.host_permit_handles {
+            insert_service(&mut map, &mut names, Arc::clone(host_permit_handles));
+        }
         // Die beiden deklarierten Differenzen — und nur sie.
         if let Some(spawner) = self
             .parts
@@ -592,8 +604,9 @@ mod tests {
     use harw_plan::{GoalStore, InMemoryGoalStore, InMemoryPlanStore, PlanStore, PlanToolConfig};
     use harw_provider_http::ProviderLoadRegistry;
     use harw_plan_bridge::FindingStore;
-    use harw_sandbox::ExtraRootsCell;
+    use harw_sandbox::{ExtraRootsCell, HostPermitSessionRegistry, ProcessPermitLedger};
     use harw_session_store::JobStore;
+    use harw_tool_shell::HostPermitHandles;
     use harw_types::{IngressSurface, PermissionTier, Principal, PrincipalKind};
     use std::any::type_name;
     use std::path::Path;
@@ -652,6 +665,16 @@ mod tests {
         }
     }
 
+    /// Host-Permit-Handles-Attrappe (Plan Teil B3): eigener Ledger/eigene
+    /// Sitzungs-Registry je Aufruf, kein Fragekanal (nie benutzt).
+    fn test_host_permit_handles() -> Arc<HostPermitHandles> {
+        Arc::new(HostPermitHandles {
+            ledger: Arc::new(ProcessPermitLedger::default()),
+            registry: Arc::new(HostPermitSessionRegistry::default()),
+            prompts: None,
+        })
+    }
+
     /// Komposition mit jedem optionalen Dienst gesetzt.
     fn full_parts() -> RuntimeServicesParts {
         RuntimeServicesParts {
@@ -668,6 +691,7 @@ mod tests {
             principal: test_principal(),
             session_controller: Some(Arc::new(NullSessionController::new())),
             provider_load_registry: ProviderLoadRegistry::new(),
+            host_permit_handles: Some(test_host_permit_handles()),
         }
     }
 
@@ -687,6 +711,7 @@ mod tests {
             principal: test_principal(),
             session_controller: None,
             provider_load_registry: ProviderLoadRegistry::new(),
+            host_permit_handles: None,
         }
     }
 
@@ -715,6 +740,7 @@ mod tests {
         let mut names = always_present();
         names.push(type_name::<Arc<dyn Memory>>());
         names.push(type_name::<Arc<JobStore>>());
+        names.push(type_name::<Arc<HostPermitHandles>>());
         names.push(type_name::<Arc<dyn PlanStore>>());
         names.push(type_name::<Arc<dyn GoalStore>>());
         names.push(type_name::<Arc<FindingStore>>());
@@ -988,6 +1014,60 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Plan Teil B3: [`HostPermitHandles`] geht — sofern in den `Parts`
+    /// gesetzt — auf jede Fläche, genau wie [`Arc<JobStore>`]/`Arc<dyn
+    /// Memory>` (Muster nach `provider_load_registry`, hier aber `Option`,
+    /// weil nicht jede Komposition eine Host-Permit-Verdrahtung trägt).
+    #[test]
+    fn host_permit_handles_present_on_every_surface_when_set() {
+        let services = RuntimeServices::new(full_parts());
+        for surface in ServiceSurface::ALL {
+            let map = services.service_map(surface);
+            assert!(
+                map.get::<Arc<HostPermitHandles>>().is_some(),
+                "HostPermitHandles fehlt auf {} (Plan Teil B3)",
+                surface.as_str()
+            );
+        }
+    }
+
+    /// Ohne gesetzte Handles (`minimal_parts`) darf keine Fläche einen
+    /// `HostPermitHandles`-Eintrag erfinden.
+    #[test]
+    fn host_permit_handles_absent_on_every_surface_without_parts() {
+        let services = RuntimeServices::new(minimal_parts());
+        for surface in ServiceSurface::ALL {
+            let map = services.service_map(surface);
+            assert!(
+                map.get::<Arc<HostPermitHandles>>().is_none(),
+                "HostPermitHandles darf ohne Parts-Eintrag nicht auf {} erscheinen",
+                surface.as_str()
+            );
+        }
+    }
+
+    /// Dieselbe [`Arc`]-Instanz erreicht jede Fläche — kein Klon des inneren
+    /// Ledgers/der Sitzungs-Registry (Plan Teil B3: nur der Zeiger wird
+    /// geklont, siehe [`RuntimeServices::service_map`]-Doku).
+    #[test]
+    fn host_permit_handles_share_the_same_ledger_arc_across_surfaces() {
+        let handles = test_host_permit_handles();
+        let mut parts = full_parts();
+        parts.host_permit_handles = Some(Arc::clone(&handles));
+        let services = RuntimeServices::new(parts);
+
+        let slash = services.service_map(ServiceSurface::Slash);
+        let web = services.service_map(ServiceSurface::Web);
+        let (Some(via_slash), Some(via_web)) = (
+            slash.get::<Arc<HostPermitHandles>>(),
+            web.get::<Arc<HostPermitHandles>>(),
+        ) else {
+            panic!("beide Flächen brauchen HostPermitHandles");
+        };
+        assert!(Arc::ptr_eq(&via_slash.ledger, &handles.ledger));
+        assert!(Arc::ptr_eq(&via_web.ledger, &handles.ledger));
     }
 
     // ── Abgrenzung ────────────────────────────────────────────────────────────

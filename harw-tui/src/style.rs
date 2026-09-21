@@ -233,6 +233,57 @@ pub(crate) fn warning_color(theme: Theme) -> Color {
     }
 }
 
+/// Gibt die Akzentfarbe für den Composer-Shell-Modus zurück (Plan Teil F:
+/// `!`-Modus wie in Claude Code).
+///
+/// # Description
+/// Magenta/Pink, angelehnt an Claude Codes Bash-Modus-Akzent — bewusst
+/// getrennt von [`accent_color`] (Cyan/Blue), damit der Shell-Modus im
+/// Composer auf den ersten Blick von der normalen Chat-Eingabe zu
+/// unterscheiden ist. Theme-abhängig für ausreichenden Kontrast auf hellem
+/// wie dunklem Grund, analog zu den übrigen semantischen Farben in diesem
+/// Modul (`user_color`, `tool_color`, …).
+///
+/// # Arguments
+/// - `theme` (`Theme`): das aktive Farbschema.
+///
+/// # Returns
+/// Eine Magenta/Pink-`Color`, dunkler auf [`Theme::Light`], heller auf
+/// [`Theme::Dark`].
+///
+/// # Concurrency
+/// Rein; kein Shared State.
+pub(crate) fn shell_mode_color(theme: Theme) -> Color {
+    if is_light(theme) {
+        Color::Rgb(0xA3, 0x1D, 0x8C)
+    } else {
+        Color::Rgb(0xF2, 0x7B, 0xE0)
+    }
+}
+
+/// Baut den Stil für den Composer-Shell-Modus (Rahmen, Titel, Prompt).
+///
+/// # Description
+/// Nutzt [`shell_mode_color`] mit `BOLD`-Modifikator, analog zu
+/// [`selected_style`]. Vom Rendering-Code (`app.rs::draw_viewport`) für
+/// Rahmen-Farbe, Titel und den `!`-Prompt des Composers verwendet, sobald
+/// der getippte Text mit `!` beginnt (`is_shell_mode_input`).
+///
+/// # Arguments
+/// - `theme` (`Theme`): das aktive Farbschema.
+///
+/// # Returns
+/// [`Style`] mit Shell-Modus-Akzentfarbe als Vordergrund und
+/// `Modifier::BOLD`.
+///
+/// # Concurrency
+/// Rein; kein Shared State.
+pub(crate) fn shell_mode_style(theme: Theme) -> Style {
+    Style::default()
+        .fg(shell_mode_color(theme))
+        .add_modifier(Modifier::BOLD)
+}
+
 /// Gibt die Rahmenfarbe zurück (semantische Palette).
 pub(crate) fn border_color(theme: Theme) -> Color {
     if is_light(theme) {
@@ -389,6 +440,24 @@ mod tests {
     #[test]
     fn test_selected_style_contains_bold() {
         let style = selected_style(Theme::Dark);
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    /// Prüft, dass der Shell-Modus-Akzent (Plan Teil F) sich von der
+    /// normalen Akzentfarbe unterscheidet — sonst wäre der Composer-Modus
+    /// visuell nicht von normaler Chat-Eingabe zu unterscheiden.
+    #[test]
+    fn test_shell_mode_color_differs_from_accent_color() {
+        assert_ne!(shell_mode_color(Theme::Dark), accent_color(Theme::Dark));
+        assert_ne!(shell_mode_color(Theme::Light), accent_color(Theme::Light));
+    }
+
+    /// Prüft, dass `shell_mode_style` BOLD-Modifikator und die
+    /// Shell-Modus-Akzentfarbe trägt.
+    #[test]
+    fn test_shell_mode_style_uses_shell_mode_color_and_bold() {
+        let style = shell_mode_style(Theme::Dark);
+        assert_eq!(style.fg, Some(shell_mode_color(Theme::Dark)));
         assert!(style.add_modifier.contains(Modifier::BOLD));
     }
 

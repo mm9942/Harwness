@@ -2,7 +2,16 @@
 //!
 //! The core only carries a [`SandboxSpec`](harw_authority::SandboxSpec); this module is
 //! the syscall-adjacent consumer that turns it into a minimal `bwrap` command.
-//! It never mounts a host home, parent workspace, or arbitrary environment.
+//! By default it never mounts a host home, parent workspace, or arbitrary
+//! environment; [`BwrapLauncher::with_host_path`] is the sole, explicit
+//! opt-in that binds Host-`PATH` directories (Plan Teil C1).
+//!
+//! Jeder Plan bindet unabhängig von einem Profil `/etc/passwd`, `/etc/group`
+//! und `/etc/nsswitch.conf` (`--ro-bind-try`) und setzt, wenn ermittelbar,
+//! `--uid`/`--gid`/`--unshare-user` auf die echte Prozessidentität des
+//! `harw`-Prozesses sowie `USER`/`LOGNAME`: `whoami`/`id` sollen in der
+//! Sandbox denselben Nutzer zeigen wie außerhalb, statt mit einer uid ohne
+//! `passwd`-Eintrag zu scheitern (siehe [`BwrapLauncher::with_identity`]).
 //!
 //! W1-03 (F-021): Das `bwrap`-Binary wird ausschließlich an festen,
 //! root-kontrollierten Pfaden gesucht ([`BWRAP_CANDIDATES`]), niemals über
@@ -29,6 +38,7 @@
 //! [`SandboxError::InvalidSandboxWorkspaceDestination`],
 //! [`SandboxError::SandboxProcessSpawn`], [`SandboxError::Io`].
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::num::NonZeroU64;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -66,6 +76,71 @@ pub const SANDBOX_CARGO_HOME: &str = "/var/cache/harw/cargo";
 /// Schrittweite wiederholt, geracet gegen `CancelToken::cancelled`.
 const WAIT_OR_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+/// Host-`PATH` (und optional Host-Cargo/-Rustup-Verzeichnisse), die
+/// [`BwrapLauncher::with_host_path`] in den Plan übernimmt (Teil C1, Plan
+/// `recursive-cooking-lobster.md`).
+///
+/// # Description
+/// Reiner Werte-Typ ohne eigene Invarianten-Prüfung — [`BwrapLauncher::plan`]
+/// entscheidet, welche Einträge tatsächlich gebunden werden (siehe dort).
+/// `home`/`rustup_home`/`cargo_home` sind unabhängig von `path` optional:
+/// fehlen sie, greifen die in `plan` dokumentierten Defaults bzw. entfällt
+/// die jeweilige Zusatzbindung.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HostPathBinding {
+    /// Der vollständige, unveränderte Host-`PATH` (colon-separiert).
+    pub path: String,
+    /// Host-`HOME`, nur zum Ausschließen aus den Zusatzbindungen und als
+    /// Default-Wurzel für `rustup_home`/`cargo_home` genutzt. Die Sandbox
+    /// selbst bekommt weiterhin `/tmp/home` als `HOME`.
+    pub home: Option<PathBuf>,
+    /// Host-`RUSTUP_HOME`, falls explizit gesetzt (sonst `home/.rustup`).
+    pub rustup_home: Option<PathBuf>,
+    /// Host-`CARGO_HOME`, falls explizit gesetzt (sonst `home/.cargo`).
+    pub cargo_home: Option<PathBuf>,
+}
+
+impl HostPathBinding {
+    /// Liest `PATH`, `HOME`, `RUSTUP_HOME` und `CARGO_HOME` aus der eigenen
+    /// Prozessumgebung.
+    ///
+    /// # Description
+    /// `harw-tui`/`harw-tool-shell` lesen den zsh-`PATH` des Nutzers beim
+    /// Start (Plan Teil C, Nutzerentscheidung 2026-09-21); dieser Konstruktor
+    /// spiegelt genau das für den Sandbox-Planer.
+    ///
+    /// # Returns
+    /// `None`, wenn `PATH` in der Umgebung fehlt oder leer ist — ohne
+    /// Host-`PATH` gäbe es nichts zu binden. `home`/`rustup_home`/
+    /// `cargo_home` sind unabhängig davon jeweils `None`, wenn die
+    /// entsprechende Variable fehlt.
+    ///
+    /// # Concurrency
+    /// Liest nur `std::env`; kein geteilter Zustand.
+    ///
+    /// # Examples
+    /// ```rust,no_run
+    /// use harw_sandbox::HostPathBinding;
+    ///
+    /// if let Some(binding) = HostPathBinding::from_env() {
+    ///     assert!(!binding.path.is_empty());
+    /// }
+    /// ```
+    #[must_use]
+    pub fn from_env() -> Option<Self> {
+        let path = std::env::var("PATH").ok()?;
+        if path.is_empty() {
+            return None;
+        }
+        Some(Self {
+            path,
+            home: std::env::var_os("HOME").map(PathBuf::from),
+            rustup_home: std::env::var_os("RUSTUP_HOME").map(PathBuf::from),
+            cargo_home: std::env::var_os("CARGO_HOME").map(PathBuf::from),
+        })
+    }
+}
+
 /// A fully determined Bubblewrap invocation. Keeping it inspectable makes
 /// policy tests possible without launching a process on the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +169,14 @@ pub struct BwrapLauncher {
     /// beim Aufbau validierten Socket unter
     /// [`SANDBOX_TMUX_SOCKET_PATH`] in die Sandbox.
     tmux_profile: Option<TmuxSandboxProfile>,
+    /// Optionale Host-`PATH`-Bindung (Teil C1); ohne sie bleibt der Plan
+    /// byte-identisch zum bisherigen Minimal-`PATH`.
+    host_path: Option<HostPathBinding>,
+    /// Überschreibt die uid/gid, die [`plan`](Self::plan) als `--uid`/`--gid`
+    /// einträgt (Zusatzauftrag „echte Prozessidentität in der Sandbox“).
+    /// Ohne [`Self::with_identity`] ermittelt `plan` die echte uid/gid des
+    /// laufenden `harw`-Prozesses aus `/proc/self`.
+    identity: Option<(u32, u32)>,
 }
 
 impl Default for BwrapLauncher {
@@ -117,6 +200,8 @@ impl BwrapLauncher {
             network_mode: NetworkMode::None,
             cargo_profile: None,
             tmux_profile: None,
+            host_path: None,
+            identity: None,
         }
     }
 
@@ -232,10 +317,46 @@ impl BwrapLauncher {
         self.tmux_profile.as_ref()
     }
 
+    /// Bindet den Host-`PATH` (und optional Host-Cargo/-Rustup-Verzeichnisse)
+    /// an diesen Launcher; siehe [`plan`](Self::plan) für die genaue Wirkung
+    /// (Teil C1, Plan `recursive-cooking-lobster.md`). Ohne Aufruf bleibt der
+    /// Plan byte-identisch zum bisherigen Minimal-`PATH`.
+    #[must_use]
+    pub fn with_host_path(mut self, binding: HostPathBinding) -> Self {
+        self.host_path = Some(binding);
+        self
+    }
+
+    /// Die konfigurierte Host-`PATH`-Bindung, falls per
+    /// [`Self::with_host_path`] gesetzt.
+    #[must_use]
+    pub fn host_path(&self) -> Option<&HostPathBinding> {
+        self.host_path.as_ref()
+    }
+
+    /// Überschreibt die uid/gid, die [`plan`](Self::plan) als `--uid`/`--gid`
+    /// in den Plan einträgt. Ohne Aufruf ermittelt `plan` die echte uid/gid
+    /// des laufenden `harw`-Prozesses aus `/proc/self`; dieser Builder dient
+    /// vor allem Tests eine feste, von der tatsächlichen Prozessidentität
+    /// unabhängige uid/gid vorzugeben.
+    #[must_use]
+    pub fn with_identity(mut self, uid: u32, gid: u32) -> Self {
+        self.identity = Some((uid, gid));
+        self
+    }
+
+    /// Die per [`Self::with_identity`] gesetzte uid/gid-Überschreibung, falls
+    /// vorhanden.
+    #[must_use]
+    pub fn identity(&self) -> Option<(u32, u32)> {
+        self.identity
+    }
+
     /// Setzt ein gebündeltes [`SandboxProfile`] und konfiguriert damit alle
     /// Module in einem Schritt. `Strict` löscht Cargo/tmux; `Cargo` und `Tmux`
     /// setzen das jeweilige Profil; `Host` ist ein Marker, der hier keine
-    /// Sandbox-Bindungen aktiviert (Host-Ausführung wird separat behandelt).
+    /// Sandbox-Bindungen aktiviert — die eigentliche Host-Ausführung läuft in
+    /// harw-tool-shell ohne bwrap.
     ///
     /// Diese Methode ist der bevorzugte Weg, ein Profil zu setzen. Sie ersetzt
     /// nicht die individuellen Builder, erlaubt aber dem Runtime-Aufbau, ein
@@ -256,8 +377,8 @@ impl BwrapLauncher {
                 self.tmux_profile = Some(tmux.clone());
             }
             SandboxProfile::Host => {
-                // Host-Modus aktiviert keine Sandbox-Bindungen.
-                // Die eigentliche Host-Ausführung wird separat behandelt.
+                // Host-Ausführung erfolgt in harw-tool-shell ohne bwrap:
+                // dieser Launcher plant dafür keine Sandbox-Bindungen.
                 self.cargo_profile = None;
                 self.tmux_profile = None;
             }
@@ -314,6 +435,27 @@ impl BwrapLauncher {
             OsString::from("--unshare-all"),
             OsString::from("--unshare-net"),
         ];
+        // Zusatzauftrag „echte Prozessidentität in der Sandbox“: `--uid`/
+        // `--gid` verlangen laut bwrap(1) zwingend ein explizites
+        // `--unshare-user` — das in `--unshare-all` bereits enthaltene
+        // `--unshare-user-try` genügt dafür nicht (bwrap lehnt `--uid`/
+        // `--gid` sonst beim Start ab). Das macht den Sandbox-Start hart
+        // abhängig von einem verfügbaren unprivilegierten User-Namespace
+        // statt wie bisher best-effort; bewusste Entscheidung, damit
+        // `whoami`/`id` in der Sandbox stabil auf die echte
+        // Prozessidentität auflösen (siehe `/etc/passwd`-Bindung unten).
+        // Scheitert die Identitätsermittlung, bleibt der Plan ohne
+        // `--uid`/`--gid`/`--unshare-user` (siehe `resolve_process_identity`).
+        let identity = self.identity.or_else(resolve_process_identity);
+        if let Some((uid, gid)) = identity {
+            args.extend([
+                OsString::from("--unshare-user"),
+                OsString::from("--uid"),
+                OsString::from(uid.to_string()),
+                OsString::from("--gid"),
+                OsString::from(gid.to_string()),
+            ]);
+        }
         args.extend([
             OsString::from("--clearenv"),
             OsString::from("--proc"),
@@ -327,14 +469,39 @@ impl BwrapLauncher {
         }
         args.extend([OsString::from("--tmpfs"), OsString::from("/tmp")]);
         args.extend([OsString::from("--dir"), OsString::from("/tmp/home")]);
+        // C1: Mit `with_host_path` gesetzter Launcher setzt sofort den
+        // vollen Host-`PATH` statt des bisherigen Minimal-`PATH`; ohne
+        // Aufruf bleibt der Minimal-`PATH` unverändert (Plan bleibt
+        // byte-identisch zu vorher). `HOME` bleibt in jedem Fall
+        // `/tmp/home` (unverändert, siehe Plan Teil C1).
+        let minimal_path = "/usr/local/bin:/usr/bin:/bin";
+        let base_path = self
+            .host_path
+            .as_ref()
+            .map_or_else(|| minimal_path.to_owned(), |binding| binding.path.clone());
         args.extend([
             OsString::from("--setenv"),
             OsString::from("HOME"),
             OsString::from("/tmp/home"),
             OsString::from("--setenv"),
             OsString::from("PATH"),
-            OsString::from("/usr/local/bin:/usr/bin:/bin"),
+            OsString::from(base_path),
         ]);
+        // Zusatzauftrag „echte Prozessidentität in der Sandbox“: `USER`/
+        // `LOGNAME` aus der Umgebung des `harw`-Prozesses übernehmen, damit
+        // Tools, die den Namen statt der uid lesen, denselben Nutzer sehen
+        // wie `--uid`/`--gid` oben. Weggelassen, wenn keine der beiden
+        // Host-Variablen gesetzt ist.
+        if let Some(username) = host_username() {
+            args.extend([
+                OsString::from("--setenv"),
+                OsString::from("USER"),
+                OsString::from(username.clone()),
+                OsString::from("--setenv"),
+                OsString::from("LOGNAME"),
+                OsString::from(username),
+            ]);
+        }
         if let Some(spec) = relay {
             args.extend([
                 OsString::from("--setenv"),
@@ -351,6 +518,13 @@ impl BwrapLauncher {
             {
                 return Err(SandboxError::CargoFetchNetworkDenied);
             }
+            // C1: bei gesetztem `host_path` bleibt der bisherige Vortritt des
+            // Sandbox-Cargo-bin-Verzeichnisses erhalten; nur der Rest des
+            // `PATH` wird der volle Host-`PATH` statt des Minimal-`PATH`.
+            let cargo_path_tail = self
+                .host_path
+                .as_ref()
+                .map_or_else(|| minimal_path.to_owned(), |binding| binding.path.clone());
             args.extend([
                 OsString::from("--setenv"),
                 OsString::from("RUSTUP_HOME"),
@@ -361,7 +535,7 @@ impl BwrapLauncher {
                 OsString::from("--setenv"),
                 OsString::from("PATH"),
                 OsString::from(format!(
-                    "{}:/usr/local/bin:/usr/bin:/bin",
+                    "{}:{cargo_path_tail}",
                     sandbox_cargo_dir.display()
                 )),
             ]);
@@ -403,6 +577,23 @@ impl BwrapLauncher {
                 ]);
             }
         }
+        // Zusatzauftrag „echte Prozessidentität in der Sandbox“: glibc-NSS
+        // (`whoami`/`id`) braucht `/etc/passwd`, `/etc/group` und
+        // `/etc/nsswitch.conf`, um die oben gesetzte `--uid`/`--gid` auf
+        // einen Namen aufzulösen. `--ro-bind-try` statt `--ro-bind`, weil
+        // keine dieser Dateien in jeder Host-Umgebung existieren muss (wie
+        // bei der tmux-Socket-Bindung wird nur der Elternpfad per
+        // `append_destination_dirs` angelegt, nicht die Zieldatei selbst).
+        // Kein anderer Teil dieses Plans bindet bisher etwas unter `/etc`,
+        // also genügt ein einzelner Aufruf für den gemeinsamen Elternpfad.
+        append_destination_dirs(&mut args, Path::new("/etc"))?;
+        for nss_file in ["/etc/passwd", "/etc/group", "/etc/nsswitch.conf"] {
+            args.extend([
+                OsString::from("--ro-bind-try"),
+                OsString::from(nss_file),
+                OsString::from(nss_file),
+            ]);
+        }
         if let Some(profile) = &self.cargo_profile {
             let cargo_dir = profile
                 .cargo_bin()
@@ -433,6 +624,96 @@ impl BwrapLauncher {
                 profile.cargo_home().as_os_str().to_owned(),
                 OsString::from(SANDBOX_CARGO_HOME),
             ]);
+        }
+        if let Some(binding) = &self.host_path {
+            let mut created_dirs: HashSet<PathBuf> = HashSet::new();
+            let mut seen_entries: HashSet<&str> = HashSet::new();
+            let stdlib_prefixes = [
+                Path::new("/usr"),
+                Path::new("/bin"),
+                Path::new("/lib"),
+                Path::new("/lib64"),
+            ];
+            // Für jeden PATH-Eintrag (in Reihenfolge, Duplikate raus): leer/
+            // relativ überspringen; `/` und exakt `home` überspringen;
+            // Einträge unter /usr,/bin,/lib,/lib64 (oben bereits gebunden)
+            // nicht erneut binden; Einträge gleich/unter dem Workspace nicht
+            // binden (der folgt gleich selbst); sonst `--ro-bind-try`.
+            for entry in binding.path.split(':') {
+                if entry.is_empty() {
+                    continue;
+                }
+                let dir = Path::new(entry);
+                if !dir.is_absolute() {
+                    continue;
+                }
+                if !seen_entries.insert(entry) {
+                    continue;
+                }
+                if dir == Path::new("/") {
+                    continue;
+                }
+                if binding.home.as_deref().is_some_and(|home| dir == home) {
+                    continue;
+                }
+                if stdlib_prefixes.iter().any(|prefix| dir.starts_with(prefix)) {
+                    continue;
+                }
+                if dir.starts_with(workspace) {
+                    continue;
+                }
+                append_destination_dirs_dedup(&mut args, dir, &mut created_dirs)?;
+                args.extend([
+                    OsString::from("--ro-bind-try"),
+                    dir.as_os_str().to_owned(),
+                    dir.as_os_str().to_owned(),
+                ]);
+            }
+
+            // rustup-Proxies unter `<cargo_home>/bin` brauchen zusätzlich den
+            // gesamten `rustup_home`/`cargo_home`-Baum (Toolchains,
+            // Registry-Cache), nicht nur das `bin`-Verzeichnis aus der
+            // Schleife oben. Ist ein `cargo_profile` aktiv, hat dessen
+            // eigene, oben bereits gesetzte Bindung/Umgebung Vorrang: kein
+            // doppeltes/konkurrierendes `--setenv CARGO_HOME`/`RUSTUP_HOME`
+            // bzw. `--ro-bind-try` auf denselben Sandbox-Zielpfad.
+            let cargo_home = binding
+                .cargo_home
+                .clone()
+                .or_else(|| binding.home.as_ref().map(|home| home.join(".cargo")));
+            if let Some(cargo_home) = cargo_home {
+                let cargo_bin = cargo_home.join("bin");
+                let path_has_cargo_bin = binding
+                    .path
+                    .split(':')
+                    .any(|entry| !entry.is_empty() && Path::new(entry) == cargo_bin.as_path());
+                if path_has_cargo_bin && self.cargo_profile.is_none() {
+                    let rustup_home = binding
+                        .rustup_home
+                        .clone()
+                        .or_else(|| binding.home.as_ref().map(|home| home.join(".rustup")));
+                    if let Some(rustup_home) = rustup_home {
+                        append_destination_dirs_dedup(&mut args, &rustup_home, &mut created_dirs)?;
+                        args.extend([
+                            OsString::from("--ro-bind-try"),
+                            rustup_home.as_os_str().to_owned(),
+                            rustup_home.as_os_str().to_owned(),
+                            OsString::from("--setenv"),
+                            OsString::from("RUSTUP_HOME"),
+                            rustup_home.as_os_str().to_owned(),
+                        ]);
+                    }
+                    append_destination_dirs_dedup(&mut args, &cargo_home, &mut created_dirs)?;
+                    args.extend([
+                        OsString::from("--ro-bind-try"),
+                        cargo_home.as_os_str().to_owned(),
+                        cargo_home.as_os_str().to_owned(),
+                        OsString::from("--setenv"),
+                        OsString::from("CARGO_HOME"),
+                        cargo_home.as_os_str().to_owned(),
+                    ]);
+                }
+            }
         }
         append_destination_dirs(&mut args, workspace)?;
         let write_allowed = sandbox.permissions().contains(Permission::WriteWorkspace);
@@ -776,6 +1057,79 @@ fn append_destination_dirs(args: &mut Vec<OsString>, destination: &Path) -> Sand
         }
     }
     Ok(())
+}
+
+/// Wie [`append_destination_dirs`], überspringt aber bereits erzeugte
+/// Zielverzeichnisse: verhindert doppelte `--dir`-Einträge, wenn mehrere
+/// Host-Pfade (Teil C1) denselben Elternpfad teilen, z. B. `~/.cargo/bin`
+/// und `~/.cargo`. `created` wird über mehrere Aufrufe hinweg vom Aufrufer
+/// weitergereicht.
+fn append_destination_dirs_dedup(
+    args: &mut Vec<OsString>,
+    destination: &Path,
+    created: &mut HashSet<PathBuf>,
+) -> SandboxResult<()> {
+    if !destination.is_absolute() {
+        return Err(SandboxError::InvalidSandboxWorkspaceDestination {
+            path: destination.to_path_buf(),
+        });
+    }
+    let mut current = PathBuf::new();
+    for component in destination.components() {
+        match component {
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::Normal(part) => {
+                current.push(part);
+                if created.insert(current.clone()) {
+                    args.extend([OsString::from("--dir"), current.as_os_str().to_owned()]);
+                }
+            }
+            _ => {
+                return Err(SandboxError::InvalidSandboxWorkspaceDestination {
+                    path: destination.to_path_buf(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Ermittelt die echte uid/gid des laufenden `harw`-Prozesses über
+/// `/proc/self` (kein `unsafe`, keine neue Abhängigkeit: `libc::getuid`
+/// bräuchte beides). [`std::fs::metadata`] auf `/proc/self` liefert die
+/// effektive uid/gid des aufrufenden Prozesses als Eigentümer dieses
+/// (virtuellen) `procfs`-Eintrags.
+///
+/// # Returns
+/// `Some((uid, gid))` bei Erfolg; `None` (mit `tracing::warn!`), wenn
+/// `/proc/self` nicht gelesen werden kann (z. B. `procfs` nicht gemountet) —
+/// [`BwrapLauncher::plan`] lässt `--uid`/`--gid`/`--unshare-user` dann
+/// einfach weg, statt den Plan scheitern zu lassen.
+fn resolve_process_identity() -> Option<(u32, u32)> {
+    match std::fs::metadata("/proc/self") {
+        Ok(metadata) => Some((metadata.uid(), metadata.gid())),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "failed to resolve process uid/gid from /proc/self; sandbox plan omits --uid/--gid"
+            );
+            None
+        }
+    }
+}
+
+/// Anzeigename des `harw`-Prozesses für `--setenv USER`/`--setenv LOGNAME`
+/// in der Sandbox: `USER` aus der eigenen Umgebung, sonst `LOGNAME`.
+///
+/// # Returns
+/// `Some(name)`, wenn mindestens eine der beiden Variablen gesetzt ist;
+/// sonst `None` — der Aufrufer lässt `USER`/`LOGNAME` dann in der Sandbox
+/// unverändert (aus `--clearenv` gelöscht) statt einen falschen Namen zu
+/// setzen.
+fn host_username() -> Option<String> {
+    std::env::var("USER")
+        .ok()
+        .or_else(|| std::env::var("LOGNAME").ok())
 }
 
 #[cfg(test)]
@@ -1519,5 +1873,444 @@ mod tests {
     fn tmux_profile_absent_by_default() {
         let launcher = BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"));
         assert!(launcher.tmux_profile().is_none());
+    }
+
+    // ---- C1: HostPathBinding / BwrapLauncher::with_host_path ----
+
+    #[test]
+    fn from_env_reads_real_process_path_when_set() {
+        if let Ok(expected) = std::env::var("PATH") {
+            if expected.is_empty() {
+                assert_eq!(HostPathBinding::from_env(), None);
+            } else {
+                let binding = HostPathBinding::from_env().expect("PATH is set and non-empty");
+                assert_eq!(binding.path, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn test_with_host_path_sets_host_path_getter() {
+        let launcher = BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"));
+        assert!(launcher.host_path().is_none());
+        let binding = HostPathBinding {
+            path: "/opt/tool/bin".to_owned(),
+            ..HostPathBinding::default()
+        };
+        let launcher = launcher.with_host_path(binding.clone());
+        assert_eq!(launcher.host_path(), Some(&binding));
+    }
+
+    #[test]
+    fn plan_with_host_path_binds_each_directory_and_sets_full_path() {
+        let binding = HostPathBinding {
+            path: "/opt/tool-a/bin:/opt/tool-b/bin".to_owned(),
+            home: Some(PathBuf::from("/home/tester")),
+            rustup_home: None,
+            cargo_home: None,
+        };
+        let args = strings(
+            &BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
+                .with_host_path(binding)
+                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
+                .unwrap(),
+        );
+        assert_eq!(
+            count_window(
+                &args,
+                &["--ro-bind-try", "/opt/tool-a/bin", "/opt/tool-a/bin"]
+            ),
+            1,
+            "{args:?}"
+        );
+        assert_eq!(
+            count_window(
+                &args,
+                &["--ro-bind-try", "/opt/tool-b/bin", "/opt/tool-b/bin"]
+            ),
+            1,
+            "{args:?}"
+        );
+        assert_eq!(
+            count_window(
+                &args,
+                &["--setenv", "PATH", "/opt/tool-a/bin:/opt/tool-b/bin"]
+            ),
+            1,
+            "{args:?}"
+        );
+        // HOME bleibt unverändert im Sandbox-tmpfs (Plan Teil C1).
+        assert_eq!(count_window(&args, &["--setenv", "HOME", "/tmp/home"]), 1);
+    }
+
+    #[test]
+    fn plan_with_host_path_excludes_root_home_stdlib_and_workspace_entries() {
+        let base = execute_sandbox();
+        let workspace = base.workspace().canonical_root().to_path_buf();
+        let nested_workspace_dir = workspace.join("node_modules/.bin");
+        let binding = HostPathBinding {
+            path: format!(
+                "/:/home/tester:/usr/local/sbin:/lib/extra:{}:/opt/tool/bin",
+                nested_workspace_dir.display()
+            ),
+            home: Some(PathBuf::from("/home/tester")),
+            rustup_home: None,
+            cargo_home: None,
+        };
+        let args = strings(
+            &BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
+                .with_host_path(binding)
+                .plan(&base, &[OsString::from("/bin/true")])
+                .unwrap(),
+        );
+        assert_eq!(
+            count_window(&args, &["--ro-bind-try", "/", "/"]),
+            0,
+            "the bare root entry must never be bound: {args:?}"
+        );
+        assert!(!args.iter().any(|a| a == "/home/tester"), "{args:?}");
+        assert!(!args.iter().any(|a| a == "/usr/local/sbin"), "{args:?}");
+        assert!(!args.iter().any(|a| a == "/lib/extra"), "{args:?}");
+        let nested_str = nested_workspace_dir.display().to_string();
+        assert!(!args.iter().any(|a| a == &nested_str), "{args:?}");
+        assert_eq!(
+            count_window(&args, &["--ro-bind-try", "/opt/tool/bin", "/opt/tool/bin"]),
+            1,
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn plan_with_host_path_dedupes_repeated_entries() {
+        let binding = HostPathBinding {
+            path: "/opt/tool/bin:/opt/tool/bin:/opt/tool/bin".to_owned(),
+            home: None,
+            rustup_home: None,
+            cargo_home: None,
+        };
+        let args = strings(
+            &BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
+                .with_host_path(binding)
+                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
+                .unwrap(),
+        );
+        assert_eq!(
+            count_window(&args, &["--ro-bind-try", "/opt/tool/bin", "/opt/tool/bin"]),
+            1,
+            "{args:?}"
+        );
+        assert_eq!(count_window(&args, &["--dir", "/opt"]), 1, "{args:?}");
+        assert_eq!(count_window(&args, &["--dir", "/opt/tool"]), 1, "{args:?}");
+        assert_eq!(
+            count_window(&args, &["--dir", "/opt/tool/bin"]),
+            1,
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn plan_with_host_path_binds_rustup_and_cargo_home_when_cargo_bin_in_path() {
+        let binding = HostPathBinding {
+            path: "/home/tester/.cargo/bin:/usr/bin".to_owned(),
+            home: Some(PathBuf::from("/home/tester")),
+            rustup_home: None,
+            cargo_home: None,
+        };
+        let args = strings(
+            &BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
+                .with_host_path(binding)
+                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
+                .unwrap(),
+        );
+        assert_eq!(
+            count_window(
+                &args,
+                &[
+                    "--ro-bind-try",
+                    "/home/tester/.rustup",
+                    "/home/tester/.rustup"
+                ]
+            ),
+            1,
+            "{args:?}"
+        );
+        assert_eq!(
+            count_window(
+                &args,
+                &[
+                    "--ro-bind-try",
+                    "/home/tester/.cargo",
+                    "/home/tester/.cargo"
+                ]
+            ),
+            1,
+            "{args:?}"
+        );
+        assert_eq!(
+            count_window(
+                &args,
+                &["--setenv", "RUSTUP_HOME", "/home/tester/.rustup"]
+            ),
+            1,
+            "{args:?}"
+        );
+        assert_eq!(
+            count_window(&args, &["--setenv", "CARGO_HOME", "/home/tester/.cargo"]),
+            1,
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn plan_with_host_path_without_cargo_bin_in_path_skips_rustup_and_cargo_home() {
+        let binding = HostPathBinding {
+            path: "/usr/bin:/opt/tool/bin".to_owned(),
+            home: Some(PathBuf::from("/home/tester")),
+            rustup_home: None,
+            cargo_home: None,
+        };
+        let args = strings(
+            &BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
+                .with_host_path(binding)
+                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
+                .unwrap(),
+        );
+        assert!(
+            !args.iter().any(|a| a == "/home/tester/.rustup"),
+            "{args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "/home/tester/.cargo"),
+            "{args:?}"
+        );
+        assert!(!args.iter().any(|a| a == "RUSTUP_HOME"), "{args:?}");
+    }
+
+    #[test]
+    fn plan_with_host_path_prefers_explicit_rustup_and_cargo_home_over_home_derived() {
+        let binding = HostPathBinding {
+            path: "/custom/cargo/bin:/usr/bin".to_owned(),
+            home: Some(PathBuf::from("/home/tester")),
+            rustup_home: Some(PathBuf::from("/custom/rustup")),
+            cargo_home: Some(PathBuf::from("/custom/cargo")),
+        };
+        let args = strings(
+            &BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
+                .with_host_path(binding)
+                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
+                .unwrap(),
+        );
+        assert_eq!(
+            count_window(&args, &["--setenv", "RUSTUP_HOME", "/custom/rustup"]),
+            1,
+            "{args:?}"
+        );
+        assert_eq!(
+            count_window(&args, &["--setenv", "CARGO_HOME", "/custom/cargo"]),
+            1,
+            "{args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "/home/tester/.rustup"),
+            "{args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "/home/tester/.cargo"),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn plan_with_host_path_and_cargo_profile_gives_cargo_profile_precedence() {
+        let dir = std::env::temp_dir().join(format!(
+            "harwness-bwrap-host-path-cargo-{}",
+            std::process::id()
+        ));
+        let bin_dir = dir.join("bin");
+        let rustup_home = dir.join("rustup");
+        let cargo_home = dir.join("cargo");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&rustup_home).unwrap();
+        std::fs::create_dir_all(&cargo_home).unwrap();
+        let cargo_bin = bin_dir.join("cargo");
+        std::fs::write(&cargo_bin, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&cargo_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let profile = crate::CargoSandboxProfile::new(
+            crate::CargoExecutionMode::Inspect,
+            &cargo_bin,
+            &rustup_home,
+            &cargo_home,
+        )
+        .unwrap();
+
+        let binding = HostPathBinding {
+            path: "/home/tester/.cargo/bin:/usr/bin".to_owned(),
+            home: Some(PathBuf::from("/home/tester")),
+            rustup_home: None,
+            cargo_home: None,
+        };
+
+        let args = strings(
+            &BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
+                .with_cargo_profile(profile)
+                .with_host_path(binding)
+                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
+                .unwrap(),
+        );
+
+        // Das Cargo-Profil hat Vorrang: genau eine RUSTUP_HOME/CARGO_HOME-
+        // Umgebung (die des Profils), keine zusätzliche Bindung/Umgebung der
+        // Host-`.cargo`/`.rustup`-Verzeichnisse.
+        assert_eq!(
+            args.iter().filter(|a| *a == "RUSTUP_HOME").count(),
+            1,
+            "{args:?}"
+        );
+        assert_eq!(
+            args.iter().filter(|a| *a == "CARGO_HOME").count(),
+            1,
+            "{args:?}"
+        );
+        assert_eq!(
+            count_window(&args, &["--setenv", "RUSTUP_HOME", SANDBOX_RUSTUP_HOME]),
+            1,
+            "{args:?}"
+        );
+        assert_eq!(
+            count_window(&args, &["--setenv", "CARGO_HOME", SANDBOX_CARGO_HOME]),
+            1,
+            "{args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "/home/tester/.rustup"),
+            "{args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "/home/tester/.cargo"),
+            "{args:?}"
+        );
+        // PATH: Cargo-bin der Sandbox vorangestellt, dahinter der volle
+        // Host-PATH (C1: "bei gesetztem cargo_profile: dessen bin-Dir
+        // voranstellen wie heute").
+        let sandbox_cargo_dir = Path::new(SANDBOX_CARGO_PATH).parent().unwrap();
+        let expected_path = format!(
+            "{}:/home/tester/.cargo/bin:/usr/bin",
+            sandbox_cargo_dir.display()
+        );
+        assert_eq!(
+            count_window(&args, &["--setenv", "PATH", expected_path.as_str()]),
+            1,
+            "{args:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- Zusatzauftrag: echte Prozessidentität in der Sandbox ----
+
+    #[test]
+    fn test_with_identity_sets_identity_getter() {
+        let launcher = BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"));
+        assert_eq!(launcher.identity(), None);
+        let launcher = launcher.with_identity(7, 8);
+        assert_eq!(launcher.identity(), Some((7, 8)));
+    }
+
+    #[test]
+    fn plan_with_identity_sets_uid_gid_and_unshare_user_in_valid_order() {
+        let args = strings(
+            &BwrapLauncher::new(PathBuf::from("/usr/bin/bwrap"))
+                .with_identity(4242, 4343)
+                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
+                .unwrap(),
+        );
+        assert_eq!(count_window(&args, &["--uid", "4242"]), 1, "{args:?}");
+        assert_eq!(count_window(&args, &["--gid", "4343"]), 1, "{args:?}");
+        assert_eq!(
+            args.iter().filter(|a| *a == "--unshare-user").count(),
+            1,
+            "{args:?}"
+        );
+        // bwrap(1): `--uid`/`--gid` verlangen ein explizites `--unshare-user`;
+        // es muss vor beiden stehen, damit bwrap den Start nicht ablehnt.
+        let unshare_user = args.iter().position(|a| a == "--unshare-user").unwrap();
+        let uid_flag = args.iter().position(|a| a == "--uid").unwrap();
+        let gid_flag = args.iter().position(|a| a == "--gid").unwrap();
+        assert!(unshare_user < uid_flag, "{args:?}");
+        assert!(unshare_user < gid_flag, "{args:?}");
+    }
+
+    #[test]
+    fn plan_uses_resolved_process_identity_by_default() {
+        let args = strings(
+            &BwrapLauncher::default()
+                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
+                .unwrap(),
+        );
+        match resolve_process_identity() {
+            Some((uid, gid)) => {
+                assert_eq!(
+                    count_window(&args, &["--uid", uid.to_string().as_str()]),
+                    1,
+                    "{args:?}"
+                );
+                assert_eq!(
+                    count_window(&args, &["--gid", gid.to_string().as_str()]),
+                    1,
+                    "{args:?}"
+                );
+                assert!(args.contains(&"--unshare-user".to_owned()), "{args:?}");
+            }
+            None => {
+                assert!(!args.contains(&"--uid".to_owned()), "{args:?}");
+                assert!(!args.contains(&"--gid".to_owned()), "{args:?}");
+                assert!(!args.contains(&"--unshare-user".to_owned()), "{args:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn plan_binds_etc_nss_files_for_every_profile() {
+        let args = strings(
+            &BwrapLauncher::default()
+                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
+                .unwrap(),
+        );
+        for nss_file in ["/etc/passwd", "/etc/group", "/etc/nsswitch.conf"] {
+            assert_eq!(
+                count_window(&args, &["--ro-bind-try", nss_file, nss_file]),
+                1,
+                "{args:?}"
+            );
+        }
+        assert_eq!(count_window(&args, &["--dir", "/etc"]), 1, "{args:?}");
+    }
+
+    #[test]
+    fn plan_user_and_logname_match_host_username_resolution() {
+        let args = strings(
+            &BwrapLauncher::default()
+                .plan(&execute_sandbox(), &[OsString::from("/bin/true")])
+                .unwrap(),
+        );
+        match host_username() {
+            Some(name) => {
+                assert_eq!(
+                    count_window(&args, &["--setenv", "USER", name.as_str()]),
+                    1,
+                    "{args:?}"
+                );
+                assert_eq!(
+                    count_window(&args, &["--setenv", "LOGNAME", name.as_str()]),
+                    1,
+                    "{args:?}"
+                );
+            }
+            None => {
+                assert!(!args.contains(&"USER".to_owned()), "{args:?}");
+                assert!(!args.contains(&"LOGNAME".to_owned()), "{args:?}");
+            }
+        }
     }
 }

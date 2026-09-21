@@ -89,10 +89,84 @@ zustimmungspflichtiger Modulmodus; der Standard ist Inspektion.
 > die unveränderbare lokale Bestätigungsansicht gebunden, nicht an den
 > Slash-Befehl.
 
-Der Host-Modus ist **kein** CLI-Flag, keine Startoption und kein Slash-Befehl.
-Ein Prozess kann ihn daher weder beim Programmstart noch durch eine
-wiederholbare Kommandozeile voreinstellen. Auch ein Modell besitzt keine
-Operation, die den Modus unmittelbar aktiviert.
+Der Host-Modus ist **kein** CLI-Flag und keine Startoption. Ein Prozess kann
+ihn daher weder beim Programmstart noch durch eine wiederholbare
+Kommandozeile voreinstellen.
+
+> **Nutzerentscheidung (2026-09-21)**: Seither existiert ein direktes
+> Modell-Tool, `sandbox-lease` (`harw-ops/src/sandbox_lease.rs`,
+> `model_tool` ohne Zusatz-Approval — der Dialog *ist* die Freigabe;
+> Aktionen `request`/`status`/`revoke`, Argument `reason`). Ein `request`
+> löst einen `HostPermitPrompt` an die lokale UI aus (`worker_definition =
+> "sandbox-lease"`, `command = reason`, Vorauswahl `SessionLease`) und
+> wartet bis zu 300 s auf eine Entscheidung:
+>
+> - **`SessionLease`** — `mark_global_approval` (TTL-befristet): ab
+>   Bestätigung laufen alle `shell.exec`-Aufrufe dieser harw-Sitzung **und
+>   aller ihrer Kind-Agenten** auf dem Host — ohne bwrap, mit der von harw
+>   geerbten Nutzerumgebung (inklusive PATH, HOME,
+>   `CARGO_HOME`/`RUSTUP_HOME`), `cwd` = Workspace-Wurzel, weiterhin unter
+>   den bestehenden `prlimit`-Limits; die Tool-Ausgabe trägt zur
+>   Unterscheidung `"executed_on": "host"`. Der Slash-Befehl
+>   `/sandbox-lease revoke` (`busy = "immediate"`) beendet die Freigabe
+>   sofort — prozessweit, siehe „Nachtrag (2026-09-21) — prozessweite
+>   Freigabe" unten —, danach läuft der nächste Aufruf wieder in der
+>   strikten Sandbox.
+> - **`SingleExecution`** — `mark_global_single_use`: nur der unmittelbar
+>   nächste `shell.exec`-Aufruf **einer beliebigen Session dieses
+>   Prozesses** läuft auf dem Host, danach gilt automatisch wieder das
+>   strikte Standardprofil.
+> - Ablehnung oder Timeout liefern dem Modell einen Fehlertext statt einer
+>   Freigabe; es entsteht keine Berechtigung.
+>
+> Damit gilt die Aussage „auch ein Modell besitzt keine Operation, die den
+> Modus unmittelbar aktiviert" nur noch für jeden anderen Weg (CLI-Flag,
+> Startoption, ein `/mode`-artiger, selbst aktivierender Slash-Befehl);
+> `sandbox-lease` ist der eine bewusst geschaffene direkte Weg. Das Tool
+> aktiviert dabei selbst nichts — es sendet nur die strukturierte Anfrage an
+> dieselbe unveränderbare lokale Bestätigungsansicht, die auch die indirekte
+> Klassifikation weiter unten auslöst; die Freigabe bleibt ausschließlich
+> ein bewusstes UI-`Ja` (siehe „Nutzerzustimmung" unten). `/sandbox-lease`
+> selbst (Command `status`/`revoke`) aktiviert ebenfalls nichts — es liest
+> nur den Status oder beendet eine bestehende Freigabe.
+>
+> Kind-Registries (`build_registry`, `harw-runtime/src/children.rs`)
+> bekommen dieselbe Permit-Verdrahtung jetzt auch als Kinder, nicht nur an
+> der Root — `uia-shell-worker` und `host-process-worker` können also selbst
+> unter einem aktiven Lease auf dem Host ausführen. Die TUI pollt
+> `host_permit_prompts` jetzt auch während eines laufenden Turns
+> (`drive_turn_animated`s `select!`), der Dialog erscheint also nicht mehr
+> ausschließlich zwischen Turns.
+>
+> **Nachtrag (2026-09-21) — prozessweite Freigabe statt nur Host-Profil:**
+> Ein realer Lauf zeigte zwei Lücken. Erstens hängte
+> `harw-registry-defaults/src/profile.rs::build_shell_provider` Ledger,
+> Sitzungs-Registry und Fragekanal-Sender nur an einen `ShellToolProvider`
+> mit `sandbox_profile.is_host()` — die Root-Session läuft aber mit
+> `SandboxProfile::Strict`, sodass ihr `ShellExecutor.host_permit_registry`
+> immer `None` blieb und `determine_effective_host`
+> (`harw-tool-shell/src/exec.rs`) für sie nie `true` liefern konnte, egal
+> welche Freigabe erteilt wurde. Behoben: `build_shell_provider` hängt die
+> Verdrahtung jetzt an **jeden** gebauten `ShellToolProvider`, unabhängig vom
+> `sandbox_profile` — für Strict/Cargo/Tmux bleibt die Sandbox trotzdem die
+> Grenze, weil `determine_effective_host` für ein nicht-Host-Profil
+> weiterhin ausschließlich die Registry-Freigabe prüft, nie den Ledger
+> selbst. Zweitens galt eine Freigabe bis dahin nur für exakt die
+> Session-ID, die sie beantragt hatte — `shell.exec`-Aufrufe aus einer
+> Kind-Session (anderer Session-ID, z. B. `uia-shell-worker`) sahen sie
+> nicht. Nutzerwunsch: die Freigabe soll für den **ganzen harw-Prozess**
+> gelten (Root-Session **und** alle Kind-Agenten), bis TTL-Ablauf oder
+> `/sandbox-lease revoke`. Dazu trägt
+> [`harw_sandbox::HostPermitSessionRegistry`] jetzt zusätzlich einen
+> *globalen* Freigabezustand (`mark_global_approval`/
+> `global_approval_remaining`/`mark_global_single_use`/
+> `has_global_single_use`/`revoke_global_approval`), den `is_session_approved`,
+> `take_single_use`, `has_single_use` und `session_approval_remaining`
+> zusätzlich zur sitzungseigenen Freigabe berücksichtigen (globale
+> Einmalfreigabe wird atomar zuerst nach der sitzungseigenen verbraucht).
+> `/sandbox-lease request` setzt seither ausschließlich noch die globale
+> Freigabe (nicht mehr `mark_session_approved`/`mark_single_use`), `revoke`
+> entfernt beide Zustände.
 
 Der Benutzer darf den Wunsch natürlichsprachlich und indirekt äußern, etwa
 „zeig mir bitte meine laufende tmux-Session“ oder „das muss auf meinem echten
@@ -189,6 +263,26 @@ bindet read-only, `Write` bindet read-write.
 - `with_profile(&SandboxProfile)` setzt alle Module in einem Aufruf.
 - `with_cargo_profile()` und `with_tmux_profile()` bleiben für einzelnen Zugriff.
 - `plan()` bindet Cargo-Toolchain und/oder tmux-Socket anhand des Profils.
+- **Nutzerwunsch (2026-09-21):** `plan()` setzt für **alle** Profile
+  `--unshare-user` sowie `--uid`/`--gid` auf die effektiven IDs des
+  harw-Prozesses (aus `metadata("/proc/self")`, injizierbar für Tests) und
+  bindet `/etc/passwd`, `/etc/group` sowie `/etc/nsswitch.conf` read-only per
+  `--ro-bind-try`; `USER`/`LOGNAME` werden aus der harw-Umgebung gesetzt.
+  Damit funktionieren `whoami` und `id` auch in der strikten Sandbox. Die
+  Host-Ausführung (siehe „Semantisch angefragter Host-Modus" oben) läuft
+  ohnehin bereits als Nutzerprozess und ist davon nicht betroffen.
+- Neuer Builder `with_host_path(path: &str)`: bindet für jedes im
+  übergebenen PATH existierende Verzeichnis, das nicht bereits unter
+  `/usr /bin /lib /lib64` oder dem Workspace liegt, `--ro-bind-try dir dir`
+  (ausgenommen `/` und exakt `$HOME`) und setzt `--setenv PATH <host PATH>`.
+  Enthält der PATH `~/.cargo/bin`, wird zusätzlich `$RUSTUP_HOME` (Default
+  `~/.rustup`) und `$CARGO_HOME` (Default `~/.cargo`) per `--ro-bind-try`
+  gebunden und `RUSTUP_HOME`/`CARGO_HOME` gesetzt, damit die
+  rustup-Proxy-Binaries funktionieren. Ohne Aufruf bleibt das Verhalten
+  unverändert (hermetischer Minimal-PATH). Genutzt vom `!`-Befehl der TUI
+  (Teil C, siehe ShellExecutor/ShellToolProvider unten) — die normale
+  Modell-`shell.exec` in der Projekt-Sandbox ruft `with_host_path` nicht auf
+  und bleibt hermetisch.
 
 ### ShellExecutor/ShellToolProvider (harw-tool-shell/src/exec.rs)
 
@@ -197,6 +291,38 @@ bindet read-only, `Write` bindet read-write.
 - `with_sandbox_profile()` und `with_permit_ledger()` Builder.
 - Host-Profil ohne Ledger → fail-closed.
 - Strict/Cargo/Tmux ohne Ledger → normal (Sandbox ist die Grenze).
+- **Nutzerentscheidung (2026-09-21):** `run_command` bildet
+  `effective_host = sandbox_profile.is_host() ||
+  registry.is_session_approved(session_id) ||
+  registry.take_single_use(session_id)`. Ist `effective_host` wahr, startet
+  der Aufruf nach `authorize_host_command` **ohne bwrap**:
+  `tokio::process::Command::new("/bin/sh").args(["-c", cmd])`, `cwd` =
+  Workspace-Wurzel, Umgebung von harw vollständig geerbt (also der
+  zsh-Kontext des Nutzers inklusive PATH/HOME/CARGO_HOME), weiterhin unter
+  den bestehenden `prlimit`-Limits. Timeout, Cancel und
+  `terminate()`/Output-Kappung bleiben dieselben Pfade wie im
+  Sandbox-Fall. Modell-`shell.exec` **ohne** aktive Sitzungs- oder
+  Einzelfreigabe bleibt weiterhin hermetisch in bwrap mit Minimal-PATH —
+  `effective_host` wird nur durch `SandboxProfile::Host`, einen aktiven
+  `sandbox-lease` oder eine verbrauchte Einzelfreigabe wahr, nie durch den
+  Tool-Aufruf selbst. Diese Formel selbst ist unverändert; `is_session_approved`
+  und `take_single_use` fragen seit dem Nachtrag unten intern zusätzlich
+  einen *prozessweiten* Freigabezustand ab (`HostPermitSessionRegistry`), den
+  `session_id` gar nicht selbst gesetzt haben muss — `ShellExecutor` kennt
+  diesen Unterschied nicht, er fragt nur "ist diese `session_id` erlaubt".
+  Ob er die Frage überhaupt stellen kann, hängt an
+  `self.host_permit_registry.is_some()` — siehe „Nachtrag (2026-09-21) —
+  prozessweite Freigabe" oben für die zugehörige Verdrahtungslücke in
+  `profile.rs`.
+- Neuer Builder `with_host_path()` auf `ShellToolProvider`, reicht an
+  `BwrapLauncher::with_host_path` durch (siehe oben). Aufrufer ist der
+  `!`-Befehl der TUI (`harw-tui/src/command_exec.rs::execute_shell`), der
+  den beim Programmstart gelesenen `PATH` der harw-eigenen zsh-Umgebung
+  übergibt — unabhängig von einem `sandbox-lease`. `!`-Befehle laufen also
+  immer mit dem zsh-PATH des harw-Prozesses (PATH-Verzeichnisse per
+  `--ro-bind-try`, `~/.cargo/bin` zusätzlich mit
+  `RUSTUP_HOME`/`CARGO_HOME`), bleiben aber in bwrap — sie laufen nicht auf
+  dem Host, auch nicht bei aktivem Lease.
 
 ### Registry (harw-registry-defaults/src/profile.rs)
 
@@ -204,6 +330,18 @@ bindet read-only, `Write` bindet read-write.
 - `assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile()`
   nimmt das Profil explizit entgegen; die bestehende Funktion delegiert mit
   `Strict` als Default.
+- **Nachtrag (2026-09-21):** `build_shell_provider` (in
+  `profile_tool_providers`) hängt Ledger, Sitzungs-Registry und
+  Fragekanal-Sender aus `HostPermitWiring` jetzt an **jeden** gebauten
+  `ShellToolProvider`, sobald `host_permits` übergeben wurde — unabhängig
+  davon, ob `sandbox_profile.is_host()` gilt. Vorher geschah das nur für ein
+  `SandboxProfile::Host`-Profil; die Root-Session läuft aber mit `Strict`,
+  sodass ein `/sandbox-lease` sie nie erreichte
+  (`ShellExecutor.host_permit_registry` blieb `None`,
+  `determine_effective_host` lieferte immer `false`). Sicherheitsgrenze
+  bleibt unverändert: für Strict/Cargo/Tmux prüft `determine_effective_host`
+  weiterhin ausschließlich die Registry-Freigabe (nie den Permit-Ledger
+  selbst), ohne aktive Freigabe bleibt die Sandbox die Grenze.
 
 ### Runtime (harw-runtime/src/assembly.rs)
 

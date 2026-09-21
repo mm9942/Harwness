@@ -103,7 +103,7 @@ use harw_registry_defaults::profile::{
 };
 use harw_sandbox::{ExtraRootsCell, HostPermitSessionRegistry, ProcessPermitLedger};
 use harw_tool_shell::host_permit_prompt::{
-    HostPermitPromptReceiver, HostPermitPromptSender, HostPermitVariant,
+    HostPermitHandles, HostPermitPromptReceiver, HostPermitPromptSender, HostPermitVariant,
     host_permit_prompt_channel,
 };
 use harw_session_store::{ApprovalStore, JobStore};
@@ -1794,6 +1794,19 @@ impl RuntimeAssemblyBuilder {
             }
             _ => host_permit_wiring,
         };
+        // Teil B3/B4: `host_permit_wiring` wird unten von
+        // `assemble_registry_for_sandbox_with_definition_access_and_sandbox_
+        // profile_and_permits` (Root-Registry) per Wert konsumiert. Kind-
+        // Registries (`build_spawner`s `factory`/`uia_worker_factory`)
+        // brauchen dieselbe Verdrahtung aber erst deutlich später — deshalb
+        // hier ein Klon (`HostPermitWiring` ist `#[derive(Clone)]`: Ledger
+        // und Sitzungs-Registry sind `Arc`, der Fragekanal-Sender ein
+        // `mpsc::UnboundedSender`-Klon), als `Option` verpackt, weil
+        // [`RuntimeChildRegistryFactory::with_host_permits`] (und damit
+        // [`SpawnerInputs::host_permit_wiring`]) generell `Option<HostPermitWiring>`
+        // erwartet — auf diesem Pfad ist sie immer `Some`, die Root-Montage
+        // baut `host_permit_wiring` bedingungslos.
+        let host_permit_wiring_for_children = Some(host_permit_wiring.clone());
 
         let assembled = if uia_ir.is_some() {
             let default_model_id = config.harness.default_model.as_deref().unwrap_or_default();
@@ -1958,6 +1971,13 @@ impl RuntimeAssemblyBuilder {
                 // (Kompatibilitäts-Default, siehe
                 // `RuntimeChildRegistryFactory::with_reasoning_effort_config`).
                 reasoning_effort_config: Arc::clone(&config),
+                // Teil B4: dasselbe Sandbox-Profil und dieselbe (geklonte)
+                // Host-Permit-Verdrahtung wie die Root-Registry — reicht
+                // `build_spawner` an `RuntimeChildRegistryFactory::with_host_permits`
+                // für `factory` **und** `uia_worker_factory` durch (`uia-shell-worker`,
+                // `host-process-worker`).
+                sandbox_profile: &sandbox_profile,
+                host_permit_wiring: &host_permit_wiring_for_children,
             },
             session_events,
         )?;
@@ -2053,6 +2073,17 @@ impl RuntimeAssemblyBuilder {
             principal: spec.principal.clone(),
             session_controller,
             provider_load_registry: provider_load_registry.clone(),
+            // Teil B3: derselbe Wurzel-Ledger/-Registry/-Sender wie
+            // `Self::host_permit_ledger`/`host_permit_session_registry`/
+            // `host_permit_prompt_sender` (siehe deren Accessoren unten) —
+            // nur `Arc::clone`/Sender-Klon, kein zweiter Ledger. Der
+            // `RuntimeAssembly`-Literal am Ende dieser Funktion bewegt die
+            // ungeklonten Originale, darum wird hier geklont statt bewegt.
+            host_permit_handles: Some(Arc::new(HostPermitHandles {
+                ledger: Arc::clone(&host_permit_ledger),
+                registry: Arc::clone(&host_permit_registry),
+                prompts: Some(host_permit_prompt_sender.clone()),
+            })),
         }));
 
         // 12. Modell-Tool-Fläche der Operationen — **nur** für
@@ -3016,6 +3047,18 @@ struct SpawnerInputs<'a> {
     /// bekommt sie — ohne diesen Aufruf lieferten die neuen Kind-Effort-
     /// Vorgaben unverändert `(None, None)`.
     reasoning_effort_config: Arc<ResolvedConfig>,
+    /// Das Sandbox-Profil der Wurzel (Teil B4), reicht über
+    /// [`RuntimeChildRegistryFactory::with_host_permits`] an jede über diesen
+    /// Spawner gebaute Kind-Fabrik (`factory` **und** `uia_worker_factory`)
+    /// durch — dieselbe Instanz, mit der auch die Root-Registry montiert
+    /// wurde ([`sandbox_profile_from_config`]).
+    sandbox_profile: &'a harw_sandbox::SandboxProfile,
+    /// Die Host-Permit-Verdrahtung der Wurzel (Ledger, Sitzungs-Registry,
+    /// Fragekanal-Sender; Teil B3/B4), `None` ohne Verdrahtung. Wie
+    /// [`Self::sandbox_profile`] an `factory` **und** `uia_worker_factory`
+    /// durchgereicht — damit erreichen auch `uia-shell-worker` und
+    /// `host-process-worker` dieselbe Freigabekette wie die Wurzel.
+    host_permit_wiring: &'a Option<HostPermitWiring>,
 }
 
 /// Montiert den Spawner eines Laufs nach seiner [`SpawnerPolicy`].
@@ -3052,6 +3095,8 @@ fn build_spawner(
         pitfall_advisor,
         profile_agents_dir,
         reasoning_effort_config,
+        sandbox_profile,
+        host_permit_wiring,
     } = inputs;
 
     let events = session_events.ok_or_else(|| RuntimeError::Spawner {
@@ -3074,7 +3119,19 @@ fn build_spawner(
         .with_profile_agents_dir(profile_agents_dir.clone())
         .with_browser_config(config.browser.clone())
         .with_spawner_slot(Arc::clone(&spawner_slot))
-        .with_reasoning_effort_config(Arc::clone(&reasoning_effort_config)),
+        .with_reasoning_effort_config(Arc::clone(&reasoning_effort_config))
+        // Teil B4: dasselbe Sandbox-Profil und dieselbe Host-Permit-
+        // Verdrahtung wie die Root-Registry — ohne diesen Aufruf bliebe jede
+        // Kind-Registry bei `SandboxProfile::Strict`/`None` (Strict-Fallback
+        // in `RuntimeChildRegistryFactory::with_definitions`), unabhängig
+        // vom konfigurierten Root-Profil.
+        .with_host_permits(sandbox_profile.clone(), host_permit_wiring.clone())
+        // Teil D: schließt die Effort-Lücke für Kinder auf dem Hauptmodell
+        // (`resolved.is_main_model()` in `reasoning_effort_defaults_for_point`).
+        .with_main_model_selection(
+            config.harness.default_provider.clone(),
+            config.harness.default_model.clone(),
+        ),
     );
     // Welle 3a, Teil A: eine zweite Fabrik-Instanz, ausschließlich für die
     // `uia-worker`-Rollenfamilie (`AgentRoleId::UiaWorker`). Gleiches Projekt,
@@ -3084,6 +3141,25 @@ fn build_spawner(
     // `.with_internal_models(...)` — `internal_point_for_role` liefert für
     // diese vier Rollen ohnehin `None` (Welle 3a, Teil A, Schritt 1), eine
     // interne Modellstelle könnte hier nichts mehr überschreiben.
+    // Teil D: derselbe „`uia_provider` mit Fallback auf `default_provider`"-
+    // Vorrang wie an anderer Stelle der Montage
+    // (`resolve_root_uia_reasoning_effort_defaults`); das Modell folgt der
+    // in `with_main_model_selection`s Doku festgelegten Rangfolge
+    // `uia_worker_model` > `uia_model` > `default_model` — dieselben
+    // Konfigurationsfelder, aus denen auch [`crate::model::build_uia_worker_model`]
+    // (dort privat, deshalb hier dupliziert statt importiert) das tatsächliche
+    // Modell dieser Rollenfamilie ableitet.
+    let uia_worker_provider = config
+        .harness
+        .uia_provider
+        .clone()
+        .or_else(|| config.harness.default_provider.clone());
+    let uia_worker_model_id = config
+        .harness
+        .uia_worker_model
+        .clone()
+        .or_else(|| config.harness.uia_model.clone())
+        .or_else(|| config.harness.default_model.clone());
     let uia_worker_factory: Arc<dyn ChildRegistryFactory> = Arc::new(
         RuntimeChildRegistryFactory::with_definitions(
             project.clone(),
@@ -3094,7 +3170,12 @@ fn build_spawner(
         .with_profile_agents_dir(profile_agents_dir)
         .with_browser_config(config.browser.clone())
         .with_spawner_slot(Arc::clone(&spawner_slot))
-        .with_reasoning_effort_config(Arc::clone(&reasoning_effort_config)),
+        .with_reasoning_effort_config(Arc::clone(&reasoning_effort_config))
+        // Teil B4: dieselbe Verdrahtung wie `factory` — erreicht damit auch
+        // `uia-shell-worker` und `host-process-worker` (beide Rollen der
+        // `uia-worker`-Familie).
+        .with_host_permits(sandbox_profile.clone(), host_permit_wiring.clone())
+        .with_main_model_selection(uia_worker_provider, uia_worker_model_id),
     );
 
     let model_id = config.harness.default_model.as_deref().unwrap_or_default();
@@ -4609,6 +4690,31 @@ mod tests {
         assert!(assembly.memory().is_none());
         assert!(assembly.services().memory().is_none());
         assert!(assembly.plan_services().is_none());
+    }
+
+    /// Plan Teil B3: die Root-`ServiceMap` trägt `Arc<HostPermitHandles>` mit
+    /// demselben Ledger wie [`RuntimeAssembly::host_permit_ledger`] — kein
+    /// zweiter, unabhängig instanziierter Ledger.
+    #[test]
+    fn test_root_service_map_shares_the_host_permit_ledger_with_the_assembly() {
+        let fixture = build_fixture();
+        let assembly = fixture_builder(EntryKind::LocalEcho, &fixture)
+            .build()
+            .expect("LocalEcho montiert");
+
+        let map = assembly.services().service_map(ServiceSurface::Slash);
+        let Some(handles) = map.get::<Arc<HostPermitHandles>>() else {
+            panic!("Root-ServiceMap muss HostPermitHandles tragen (Plan Teil B3)");
+        };
+        assert!(
+            Arc::ptr_eq(&handles.ledger, assembly.host_permit_ledger()),
+            "HostPermitHandles.ledger muss derselbe Arc wie assembly.host_permit_ledger() sein"
+        );
+        assert!(
+            Arc::ptr_eq(&handles.registry, assembly.host_permit_session_registry()),
+            "HostPermitHandles.registry muss derselbe Arc wie \
+             assembly.host_permit_session_registry() sein"
+        );
     }
 
     /// Addendum B: eine Montage in einem frischen Tempdir-Projekt öffnet die

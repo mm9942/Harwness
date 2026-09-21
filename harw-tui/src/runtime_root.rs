@@ -853,12 +853,21 @@ fn build_root_runtime(
     if let Some(plan) = assembly.plan_services() {
         app = app.with_plan_services(TuiPlanServices::from(plan));
     }
-    // Schritt 7: Titel-Job-Kontext nur bestücken, wenn eine Sidecar-Wurzel
-    // bekannt ist (`/resume` konfiguriert) und die Konfiguration die
-    // Titelerzeugung nicht abgeschaltet hat. `ChatApp::with_title_job_context`
-    // ist eine noch zu ergänzende Erwartung an `crate::app` (siehe
-    // [`TitleJobContext`]-Dokumentation).
     if let Some(store_root) = session_store_root {
+        // Aufgabe 2 (Plan `recursive-cooking-lobster.md` Teil F): die
+        // Session-Store-Wurzel wird IMMER hinterlegt, wenn sie bekannt ist —
+        // unabhängig von `[session] title_generation`. Das ist die einzige
+        // zuverlässige Grundlage für `apply_session_store_started_at`
+        // (`app.rs`), das für JEDE fortgesetzte Sitzung das tatsächliche
+        // Sitzungsstart-Datum statt des TUI-Startzeitpunkts auflösen soll.
+        app = app.with_session_store_root(store_root.to_path_buf());
+
+        // Schritt 7: der Titel-Job-Kontext bleibt zusätzlich an
+        // `[session] title_generation` gebunden — er stößt tatsächlich einen
+        // Modell-Aufruf an, den eine abgeschaltete Titelerzeugung bewusst
+        // unterbindet. `ChatApp::with_title_job_context` ist eine noch zu
+        // ergänzende Erwartung an `crate::app` (siehe
+        // [`TitleJobContext`]-Dokumentation).
         let session_config = &assembly.config().harness.session;
         if session_config.title_generation {
             app = app.with_title_job_context(TitleJobContext {

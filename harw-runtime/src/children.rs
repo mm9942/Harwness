@@ -19,9 +19,10 @@
 //!    auf, das je Kind erneut `discover_project` ausführte — ein Kind konnte
 //!    damit in einem anderen Projekt-Root landen als sein Elternteil (die TUI
 //!    prüfte das nach, die CLI gar nicht). Diese Fabrik hält den
-//!    [`ProjectContext`] des Elternteils und benutzt
-//!    [`assemble_registry_for_project`], das **keinen Pfad** entgegennimmt und
-//!    deshalb gar nicht erkennen *kann*.
+//!    [`ProjectContext`] des Elternteils und benutzt (seit Teil B4)
+//!    `assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits`
+//!    (`harw_registry_defaults::profile`), das **keinen Pfad** entgegennimmt
+//!    und deshalb gar nicht erkennen *kann*.
 //! 3. **Kette nicht vererbt (F-018).** `assemble_registry_for_project`
 //!    registriert nur die `DefaultApprovalPolicy`. Die Config-Politik des
 //!    Elternteils erreichte den Fan-out nie. Diese Fabrik installiert
@@ -39,7 +40,9 @@ use harw_extension_api::{
 use harw_project_discovery::ProjectContext;
 use harw_registry_defaults::embedded_agents::builtin_agent_definitions;
 use harw_registry_defaults::profile::{
-    IdentityOverrides, assemble_registry_for_project, profile_for_role, role_names,
+    HostPermitWiring, IdentityOverrides,
+    assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits,
+    profile_for_role, role_names,
 };
 
 use crate::approval::ApprovalChain;
@@ -270,6 +273,29 @@ pub struct RuntimeChildRegistryFactory {
     /// (Kompatibilitäts-Default, § dort) — dieselbe fail-open-Bedeutung wie
     /// bei [`Self::internal_models`].
     reasoning_effort_config: Option<Arc<harw_config::ResolvedConfig>>,
+    /// Explizite Provider-/Modell-Auswahl für den Hauptmodell-Fallback
+    /// (`ResolvedInternalModel::is_main_model`) in
+    /// [`Self::reasoning_effort_defaults_for_point`] (Teil D, schließt die
+    /// Effort-Lücke für Kinder auf dem Hauptmodell). `None`, solange
+    /// [`Self::with_main_model_selection`] nicht aufgerufen wurde — die
+    /// Auswahl wird dann bei jedem Nachschlagen direkt aus
+    /// `config.harness.default_provider`/`default_model` abgeleitet
+    /// (derselbe Default, den eine explizit mit diesen Werten aufgerufene
+    /// Fabrik ergäbe).
+    main_model_selection: Option<(Option<String>, Option<String>)>,
+    /// Das Sandbox-Profil, mit dem jeder für ein Kind gebaute
+    /// [`harw_tool_shell::ShellToolProvider`] montiert wird (Teil B4). Vorgabe
+    /// [`harw_sandbox::SandboxProfile::Strict`] — bit-identisch zum
+    /// Verhalten vor dieser Ergänzung — solange
+    /// [`Self::with_host_permits`] nicht aufgerufen wurde.
+    sandbox_profile: harw_sandbox::SandboxProfile,
+    /// Die einmal je Lauf instanziierte Host-Permit-Verdrahtung (Ledger,
+    /// Sitzungs-Registry, Fragekanal-Sender), die an jeden mit
+    /// [`harw_sandbox::SandboxProfile::Host`] gebauten
+    /// [`harw_tool_shell::ShellToolProvider`] gehängt wird (Teil B4). `None`,
+    /// solange [`Self::with_host_permits`] nicht aufgerufen wurde — Host-
+    /// Ausführung bleibt dann fail-closed, genau wie vor dieser Ergänzung.
+    host_permit_wiring: Option<HostPermitWiring>,
 }
 
 impl std::fmt::Debug for RuntimeChildRegistryFactory {
@@ -348,6 +374,9 @@ impl RuntimeChildRegistryFactory {
             browser: harw_config::BrowserSection::default(),
             spawner_slot: Arc::new(OnceLock::new()),
             reasoning_effort_config: None,
+            main_model_selection: None,
+            sandbox_profile: harw_sandbox::SandboxProfile::Strict,
+            host_permit_wiring: None,
         }
     }
 
@@ -434,19 +463,105 @@ impl RuntimeChildRegistryFactory {
         self
     }
 
+    /// Legt die Provider-/Modell-Auswahl fest, die für den Hauptmodell-
+    /// Fallback (`resolved.is_main_model()`) in
+    /// [`Self::reasoning_effort_defaults_for_point`] verwendet wird (Teil D).
+    ///
+    /// # Description
+    /// Schließt die Effort-Lücke für Kinder auf dem Hauptmodell: bis zu
+    /// dieser Ergänzung lieferte [`Self::reasoning_effort_defaults_for_point`]
+    /// im `resolved.is_main_model()`-Fall bedingungslos `(None, None)`, obwohl
+    /// das Kind tatsächlich mit dem Hauptmodell dieser Fabrik läuft — dessen
+    /// `default_reasoning_effort` wurde nie nachgeschlagen, weil
+    /// [`harw_config::ResolvedInternalModel`] für den Hauptmodell-Fallback
+    /// selbst kein `provider`/`model` trägt (siehe
+    /// [`harw_config::resolve_internal_model`]).
+    ///
+    /// Die Montage (`assembly.rs`) ruft diese Methode für **beide**
+    /// Fabrik-Arten mit der jeweils zutreffenden Auswahl auf:
+    /// - Hauptfabrik (gewöhnliche Kinder): `provider =
+    ///   config.harness.default_provider`, `model =
+    ///   config.harness.default_model`.
+    /// - UIA-Worker-Fabrik (`uia-worker`-Rollenfamilie): `provider =
+    ///   config.harness.uia_provider` (mit demselben Fallback auf
+    ///   `default_provider`, den die Montage bereits an anderer Stelle
+    ///   durchsetzt), `model = uia_worker_model`, oder — falls `None` —
+    ///   `uia_model`/`default_model`.
+    ///
+    /// Ohne Aufruf leitet [`Self::reasoning_effort_defaults_for_point`] die
+    /// Auswahl bei jedem Nachschlagen selbst aus
+    /// `config.harness.default_provider`/`default_model` ab — bit-identisch
+    /// zu einer explizit mit genau diesen Werten aufgerufenen Fabrik.
+    ///
+    /// # Arguments
+    /// - `provider` (`Option<String>`): die Provider-ID des effektiven
+    ///   Hauptmodells dieser Fabrik, oder `None`, wenn keine gewählt ist.
+    /// - `model` (`Option<String>`): die Modell-ID des effektiven
+    ///   Hauptmodells dieser Fabrik, oder `None`.
+    #[must_use]
+    pub fn with_main_model_selection(mut self, provider: Option<String>, model: Option<String>) -> Self {
+        self.main_model_selection = Some((provider, model));
+        self
+    }
+
+    /// Ergänzt Sandbox-Profil und Host-Permit-Verdrahtung, mit denen jede
+    /// Kind-Registry montiert wird (Teil B4).
+    ///
+    /// # Description
+    /// Reiner Erbauer-Schritt, analog [`Self::with_internal_models`]:
+    /// [`Self::new`]/[`Self::with_definitions`] bleiben unverändert. Ohne
+    /// Aufruf bleiben [`Self::sandbox_profile`]
+    /// [`harw_sandbox::SandboxProfile::Strict`] und
+    /// [`Self::host_permit_wiring`] `None` — [`Self::build_registry`] montiert
+    /// dann bit-identisch zum Verhalten vor dieser Ergänzung.
+    ///
+    /// Mit Aufruf reicht [`Self::build_registry`] beide Werte an
+    /// [`assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits`]
+    /// durch; nur ein mit [`harw_sandbox::SandboxProfile::Host`] gebauter
+    /// `ShellToolProvider` hängt die Verdrahtung tatsächlich an (siehe deren
+    /// Dokumentation) — `uia-shell-worker` und `host-process-worker` erreicht
+    /// diese Ergänzung damit auf demselben Weg wie jedes andere Kind.
+    ///
+    /// # Arguments
+    /// - `sandbox_profile` ([`harw_sandbox::SandboxProfile`]): das Profil, mit
+    ///   dem jeder für ein Kind gebaute `ShellToolProvider` montiert wird.
+    /// - `wiring` (`Option<`[`HostPermitWiring`]`>`): die einmal je Lauf
+    ///   instanziierte Host-Permit-Verdrahtung des Elternteils
+    ///   (`HostPermitWiring` ist bereits `#[derive(Clone)]` — Ledger und
+    ///   Sitzungs-Registry sind `Arc`, der Fragekanal-Sender ist ein
+    ///   `mpsc::UnboundedSender`-Klon; kein zusätzliches `Arc` um den
+    ///   gesamten Typ nötig). `None` verhält sich wie ohne Aufruf dieser
+    ///   Methode.
+    #[must_use]
+    pub fn with_host_permits(
+        mut self,
+        sandbox_profile: harw_sandbox::SandboxProfile,
+        wiring: Option<HostPermitWiring>,
+    ) -> Self {
+        self.sandbox_profile = sandbox_profile;
+        self.host_permit_wiring = wiring;
+        self
+    }
+
     /// Liefert Provider-/Modell-Reasoning-Effort-Defaults für eine bereits
     /// aufgelöste interne Modellstelle.
     ///
     /// # Description
     /// `(None, None)`, wenn [`Self::with_reasoning_effort_config`] nie
-    /// aufgerufen wurde, `point` in [`Self::internal_models`] nicht aufgelöst
-    /// ist, oder die aufgelöste Stelle das Hauptmodell trägt
-    /// ([`ResolvedInternalModel::is_main_model`] — die tatsächliche
-    /// Provider-/Modell-ID des aktiven Hauptmodells kennt diese Fabrik nicht,
-    /// siehe [`ChildRegistryFactory::reasoning_effort_defaults_for_role_task`]
-    /// unten). Sonst: die `default_reasoning_effort`-Felder der in
-    /// `config.providers`/`config.models` unter der aufgelösten ID
-    /// hinterlegten Einträge, je `None` bei fehlendem Eintrag.
+    /// aufgerufen wurde oder `point` in [`Self::internal_models`] nicht
+    /// aufgelöst ist. Trägt die aufgelöste Stelle das Hauptmodell
+    /// ([`ResolvedInternalModel::is_main_model`] — sie selbst führt dann kein
+    /// eigenes `provider`/`model`), bestimmt diese Methode Provider und
+    /// Modell stattdessen aus [`Self::main_model_selection`] (Teil D, schließt
+    /// die zuvor offene Effort-Lücke für Kinder auf dem Hauptmodell): mit über
+    /// [`Self::with_main_model_selection`] gesetzter Auswahl genau diese
+    /// Werte, sonst abgeleitet aus
+    /// `config.harness.default_provider`/`default_model`. In jedem Fall
+    /// (Hauptmodell-Fallback wie regulär aufgelöste Stelle): die
+    /// `default_reasoning_effort`-Felder der in
+    /// `config.providers`/`config.models` unter der so bestimmten ID
+    /// hinterlegten Einträge, je `None` bei fehlendem Eintrag oder fehlender
+    /// ID.
     fn reasoning_effort_defaults_for_point(
         &self,
         point: InternalModelPoint,
@@ -458,7 +573,21 @@ impl RuntimeChildRegistryFactory {
             return (None, None);
         };
         if resolved.is_main_model() {
-            return (None, None);
+            let (provider_id, model_id): (Option<&str>, Option<&str>) =
+                match &self.main_model_selection {
+                    Some((provider, model)) => (provider.as_deref(), model.as_deref()),
+                    None => (
+                        config.harness.default_provider.as_deref(),
+                        config.harness.default_model.as_deref(),
+                    ),
+                };
+            let provider_default = provider_id
+                .and_then(|id| config.providers.get(id))
+                .and_then(|provider| provider.default_reasoning_effort);
+            let model_default = model_id
+                .and_then(|id| config.models.get(id))
+                .and_then(|model| model.default_reasoning_effort);
+            return (provider_default, model_default);
         }
         let provider_default = resolved
             .provider
@@ -547,19 +676,40 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
         // ([`ApprovalModeCell::detached`]), Geschwister beeinflussen sich also
         // nicht.
         let child_chain = self.chain.for_child();
-        let assembled = assemble_registry_for_project(
+        // Teil B4: ruft dieselbe Delegationskette wie zuvor
+        // `assemble_registry_for_project` mit exakt deren bisherigen
+        // Default-Werten auf (`granted = profile.required_permissions()`,
+        // `access = None`, `sandbox_profile = SandboxProfile::Strict`,
+        // `host_permits = None` — siehe die Delegation
+        // `assemble_registry_for_project` →
+        // `assemble_registry_for_project_with_definition_access(.., None)` →
+        // `assemble_registry_for_sandbox_with_definition_access(..,
+        // &profile.required_permissions(), ..)` →
+        // `..._and_sandbox_profile(.., &SandboxProfile::Strict)` →
+        // `..._and_permits(.., None)` in
+        // harw-registry-defaults/src/profile.rs), ergänzt um
+        // `self.sandbox_profile`/`self.host_permit_wiring` — ohne
+        // [`Self::with_host_permits`] bleiben das `SandboxProfile::Strict`/
+        // `None` und das Verhalten ist bit-identisch zu vorher.
+        let assembled = assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits(
             profile,
             &self.project,
             overrides,
             child_chain.mode().clone(),
+            &profile.required_permissions(),
+            None,
+            &self.sandbox_profile,
+            self.host_permit_wiring.clone(),
         )
         .map_err(|error| AgentSpawnError {
             message: format!("could not assemble child registry for role '{role}': {error}"),
         })?;
-        // `install_over_default`, nicht `install`: `assemble_registry_for_project`
+        // `install_over_default`, nicht `install`:
+        // `assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits`
         // hat die `DefaultApprovalPolicy` über `child_chain.mode()` bereits
-        // registriert (harw-registry-defaults/src/profile.rs:921-922). Eine
-        // zweite wäre wirkungsgleich, aber eine Dublette (Befund Z2c-06).
+        // registriert (harw-registry-defaults/src/profile.rs, `approval_handler`
+        // in der letzten Stufe der Delegationskette). Eine zweite wäre
+        // wirkungsgleich, aber eine Dublette (Befund Z2c-06).
         let mut registry_builder = child_chain
             .install_over_default(assembled.registry)
             .spawner(Arc::new(DeferredManagedSpawner {
@@ -1218,5 +1368,137 @@ mod tests {
             factory.reasoning_effort_defaults_for_role_task(role_names::PLANNER, None);
         assert_eq!(provider_default, None);
         assert_eq!(model_default, None);
+    }
+
+    // -------------------------------------------------------------------
+    // Teil D — Effort-Lücke: `reasoning_effort_defaults_for_point` im
+    // `resolved.is_main_model()`-Fall.
+    // -------------------------------------------------------------------
+
+    /// Baut eine Fabrik mit `InternalModelPoint::Explorer` als
+    /// Hauptmodell-Fallback (`source = MainModel`, `provider`/`model` =
+    /// `None`, wie [`harw_config::resolve_internal_model`] ihn tatsächlich
+    /// liefert) über der übergebenen Config.
+    fn factory_with_explorer_main_model_fallback(
+        config: harw_config::ResolvedConfig,
+    ) -> RuntimeChildRegistryFactory {
+        let chain = test_chain(&config);
+        let mut internal_models = HashMap::new();
+        internal_models.insert(
+            InternalModelPoint::Explorer,
+            harw_config::ResolvedInternalModel {
+                point: InternalModelPoint::Explorer,
+                provider: None,
+                model: None,
+                source: harw_config::InternalModelSource::MainModel,
+            },
+        );
+        RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            chain,
+        )
+        .expect("factory builds")
+        .with_internal_models(internal_models)
+        .with_reasoning_effort_config(Arc::new(config))
+    }
+
+    #[test]
+    fn reasoning_effort_defaults_for_role_uses_provider_default_for_main_model_fallback_without_selection()
+     {
+        // Ohne `with_main_model_selection` leitet der Hauptmodell-Fallback
+        // Provider/Modell aus `config.harness.default_provider`/
+        // `default_model` ab — derselbe Default, den die Hauptfabrik trägt.
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.default_provider = Some("acme".to_owned());
+        config
+            .providers
+            .insert("acme".to_owned(), test_provider_toml(Some("high")));
+        let factory = factory_with_explorer_main_model_fallback(config);
+        let (provider_default, model_default) =
+            factory.reasoning_effort_defaults_for_role(role_names::EXPLORER);
+        assert_eq!(provider_default, Some(harw_types::ReasoningEffort::High));
+        assert_eq!(model_default, None);
+    }
+
+    #[test]
+    fn reasoning_effort_defaults_for_role_uses_model_default_for_main_model_fallback_when_provider_has_none()
+     {
+        // `with_main_model_selection` liefert eine ausdrückliche Auswahl (wie
+        // die UIA-Worker-Fabrik sie über `uia_provider`/`uia_worker_model`
+        // setzt): der Provider ist konfiguriert, trägt aber kein
+        // `default_reasoning_effort`, das Modell schon.
+        let mut config = harw_config::ResolvedConfig::default();
+        config
+            .providers
+            .insert("acme".to_owned(), test_provider_toml(None));
+        config
+            .models
+            .insert("acme-model".to_owned(), test_model_toml(Some("low")));
+        let factory = factory_with_explorer_main_model_fallback(config)
+            .with_main_model_selection(Some("acme".to_owned()), Some("acme-model".to_owned()));
+        let (provider_default, model_default) =
+            factory.reasoning_effort_defaults_for_role(role_names::EXPLORER);
+        assert_eq!(provider_default, None);
+        assert_eq!(model_default, Some(harw_types::ReasoningEffort::Low));
+    }
+
+    #[test]
+    fn reasoning_effort_defaults_for_role_yields_none_for_unknown_main_model_provider_and_model() {
+        let config = harw_config::ResolvedConfig::default();
+        let factory = factory_with_explorer_main_model_fallback(config).with_main_model_selection(
+            Some("missing-provider".to_owned()),
+            Some("missing-model".to_owned()),
+        );
+        let (provider_default, model_default) =
+            factory.reasoning_effort_defaults_for_role(role_names::EXPLORER);
+        assert_eq!(provider_default, None);
+        assert_eq!(model_default, None);
+    }
+
+    // -------------------------------------------------------------------
+    // Teil B4 — `with_host_permits`: Sandbox-Profil + Host-Permit-Verdrahtung
+    // der Kind-Fabrik.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn with_host_permits_defaults_to_strict_and_none_without_call() {
+        let config = harw_config::ResolvedConfig::default();
+        let chain = test_chain(&config);
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            chain,
+        )
+        .expect("factory builds");
+        assert_eq!(factory.sandbox_profile, harw_sandbox::SandboxProfile::Strict);
+        assert!(factory.host_permit_wiring.is_none());
+    }
+
+    #[test]
+    fn with_host_permits_stores_sandbox_profile_and_wiring_when_called() {
+        let config = harw_config::ResolvedConfig::default();
+        let chain = test_chain(&config);
+        let ledger = Arc::new(harw_sandbox::ProcessPermitLedger::default());
+        let registry = Arc::new(harw_sandbox::HostPermitSessionRegistry::default());
+        // Der Empfänger wird sofort verworfen: dieser Test prüft nur, dass die
+        // Fabrik die Verdrahtung speichert, nicht dass ein tatsächlicher
+        // Host-Permit-Dialog beantwortet wird (das deckt
+        // harw-registry-defaults/src/profile.rs's `permits_wiring`-Testmodul
+        // bereits ab).
+        let (sender, receiver) = harw_tool_shell::host_permit_prompt_channel();
+        drop(receiver);
+        let wiring = HostPermitWiring::new(Arc::clone(&ledger), Arc::clone(&registry), sender);
+
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            chain,
+        )
+        .expect("factory builds")
+        .with_host_permits(harw_sandbox::SandboxProfile::Host, Some(wiring));
+
+        assert_eq!(factory.sandbox_profile, harw_sandbox::SandboxProfile::Host);
+        assert!(factory.host_permit_wiring.is_some());
     }
 }

@@ -138,7 +138,11 @@ impl From<std::io::Error> for ExportError {
 /// # Felder
 /// - `include_tool_calls` (`bool`): Werkzeugaufrufe als `- ⚙ <label>` einschließen.
 /// - `include_reasoning` (`bool`): Denkschritte als Zitatblock einschließen.
-/// - `max_chars` (`Option<usize>`): harte Obergrenze in Unicode-Zeichen.
+/// - `max_chars` (`Option<usize>`): harte Obergrenze in Unicode-Zeichen für
+///   das gesamte gerenderte Dokument.
+/// - `max_chars_per_entry` (`Option<usize>`): Obergrenze in Unicode-Zeichen
+///   je gerendertem JSON-/Text-Block innerhalb eines ToolCall-/
+///   ToolResult-Eintrags (siehe [`render_json_block`]). Standard: `Some(4000)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportOptions {
     /// Werkzeugaufrufe und -ergebnisse im Export anzeigen (Standard: an).
@@ -147,6 +151,9 @@ pub struct ExportOptions {
     pub include_reasoning: bool,
     /// Harte Obergrenze der Ausgabelänge in Unicode-Zeichen.
     pub max_chars: Option<usize>,
+    /// Obergrenze je gerendertem JSON-/Text-Block eines ToolCall-/
+    /// ToolResult-Eintrags in Unicode-Zeichen (Standard: `Some(4000)`).
+    pub max_chars_per_entry: Option<usize>,
 }
 
 impl Default for ExportOptions {
@@ -157,6 +164,9 @@ impl Default for ExportOptions {
             include_tool_calls: true,
             include_reasoning: false,
             max_chars: None,
+            // Verhindert, dass einzelne ToolCall-/ToolResult-Blöcke (bis zu
+            // 70.000 Zeichen in einer einzigen Zeile) den Export dominieren.
+            max_chars_per_entry: Some(4000),
         }
     }
 }
@@ -360,10 +370,21 @@ enum Section {
 /// Gesprächsabschnitte in der Reihenfolge von `entries`. Aufeinanderfolgende
 /// `User`- bzw. `Assistant`-Einträge teilen sich eine `## Du`- bzw.
 /// `## harw`-Überschrift; ein Rollenwechsel erzeugt eine neue Überschrift.
-/// `Tool`-, `ToolCall`- und `ToolResult`-Einträge werden nur bei
+/// `ToolCall`-, `ToolResult`- und (bei `opts.include_reasoning`)
+/// `Reasoning`-Einträge schalten stets auf die `## harw`-Überschrift um,
+/// auch direkt nach einer Nutzernachricht — inhaltlich gehören sie zu harws
+/// Turn. `Tool`-, `ToolCall`- und `ToolResult`-Einträge werden nur bei
 /// `opts.include_tool_calls` gerendert, `Reasoning`-Einträge nur bei
-/// `opts.include_reasoning` als Zitatblock. Fremdtext und strukturierte
-/// Werte werden zentral redigiert und danach über
+/// `opts.include_reasoning` als Zitatblock. ATX-Überschriften (`#…######`)
+/// in `User`- und `Assistant`-Text werden über [`demote_markdown_headings`]
+/// um zwei Ebenen herabgestuft, damit sie nicht mit den Export-eigenen
+/// `#`/`##`-Ebenen kollidieren; Fenced-Code-Blöcke bleiben dabei
+/// unangetastet. ToolCall-Argumente und ToolResult-Ergebnisse werden über
+/// [`render_json_block`] dargestellt: mehrzeilige String-Blätter (insb.
+/// `value`) landen in einem eigenen ```text-Block mit echten
+/// Zeilenumbrüchen statt als escapte JSON-Zeile, und jeder Block wird
+/// unabhängig über `opts.max_chars_per_entry` gekappt. Fremdtext und
+/// strukturierte Werte werden zentral redigiert und danach über
 /// [`crate::sanitize::sanitize_display`] bzw.
 /// [`crate::sanitize::sanitize_inline`] terminal- und markdown-sicher
 /// aufbereitet; Fenced-Code-Blöcke (dreifache Backticks) bleiben dabei
@@ -424,7 +445,14 @@ pub fn render_markdown_with_extensions(
     out.push_str(&sanitize_inline(&redact_text(&meta.session_id)));
     out.push('\n');
     out.push_str("- **Datum:** ");
-    out.push_str(&meta.started_at.as_deref().map(redact_text).map(|text| sanitize_inline(&text)).unwrap_or_else(|| UNKNOWN_PLACEHOLDER.to_owned()));
+    out.push_str(
+        &meta
+            .started_at
+            .as_deref()
+            .map(format_started_at_for_display)
+            .map(|text| sanitize_inline(&redact_text(&text)))
+            .unwrap_or_else(|| UNKNOWN_PLACEHOLDER.to_owned()),
+    );
     out.push('\n');
     out.push_str("- **Verzeichnis:** ");
     out.push_str(&meta.cwd.as_deref().map(redact_text).map(|text| sanitize_inline(&text)).unwrap_or_else(|| UNKNOWN_PLACEHOLDER.to_owned()));
@@ -452,7 +480,7 @@ pub fn render_markdown_with_extensions(
                     out.push_str("## Du\n\n");
                     current = Some(Section::Du);
                 }
-                out.push_str(&sanitize_display(&redact_text(text)));
+                out.push_str(&sanitize_display(&redact_text(&demote_markdown_headings(text))));
                 out.push_str("\n\n");
             }
             ExportEntry::Assistant(text) => {
@@ -460,7 +488,7 @@ pub fn render_markdown_with_extensions(
                     out.push_str("## harw\n\n");
                     current = Some(Section::Harw);
                 }
-                out.push_str(&sanitize_display(&redact_text(text)));
+                out.push_str(&sanitize_display(&redact_text(&demote_markdown_headings(text))));
                 out.push_str("\n\n");
             }
             ExportEntry::System(text) => {
@@ -498,6 +526,12 @@ pub fn render_markdown_with_extensions(
                 if !opts.include_tool_calls {
                     continue;
                 }
+                // Ein Werkzeugaufruf gehört inhaltlich zu harws Turn, auch wenn
+                // er unmittelbar nach einer Nutzernachricht rendert wird.
+                if current != Some(Section::Harw) {
+                    out.push_str("## harw\n\n");
+                    current = Some(Section::Harw);
+                }
                 render_tool_call_markdown(
                     &mut out,
                     call_id,
@@ -506,6 +540,7 @@ pub fn render_markdown_with_extensions(
                     *duration_ms,
                     trust.as_deref(),
                     agent.as_ref(),
+                    opts.max_chars_per_entry,
                 );
             }
             ExportEntry::ToolResult {
@@ -521,6 +556,10 @@ pub fn render_markdown_with_extensions(
                 if !opts.include_tool_calls {
                     continue;
                 }
+                if current != Some(Section::Harw) {
+                    out.push_str("## harw\n\n");
+                    current = Some(Section::Harw);
+                }
                 render_tool_result_markdown(
                     &mut out,
                     call_id,
@@ -531,11 +570,16 @@ pub fn render_markdown_with_extensions(
                     *duration_ms,
                     trust.as_deref(),
                     agent.as_ref(),
+                    opts.max_chars_per_entry,
                 );
             }
             ExportEntry::Reasoning(text) => {
                 if !opts.include_reasoning {
                     continue;
+                }
+                if current != Some(Section::Harw) {
+                    out.push_str("## harw\n\n");
+                    current = Some(Section::Harw);
                 }
                 let sanitized = sanitize_display(&redact_text(text));
                 for line in sanitized.lines() {
@@ -595,6 +639,57 @@ pub fn render_json_with_extensions(
 
 fn display_json(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| "null".to_owned())
+}
+
+/// Formatiert einen Unix-Sekunden-Zeitstempel als lesbares Datum mit
+/// lokalem UTC-Offset.
+///
+/// # Beschreibung
+/// Wandelt `unix_secs` über [`jiff::Timestamp::from_second`] und
+/// [`jiff::Timestamp::to_zoned`] (Systemzeitzone,
+/// [`jiff::tz::TimeZone::system`]) in ein lokal aufgeschlüsseltes Datum um
+/// und formatiert es im Stil `%Y-%m-%d %H:%M:%S %:z`. Damit zeigt der Export
+/// ein lesbares Datum statt der rohen Sekundenzahl (`app.rs`s
+/// `export_timestamp_now()` liefert Unix-Sekunden). Schlägt die Umwandlung
+/// fehl (Wert außerhalb des darstellbaren Bereichs), wird `unix_secs`
+/// unverändert als Dezimalstring zurückgegeben, damit der Export nie
+/// abbricht.
+///
+/// # Argumente
+/// - `unix_secs` (`i64`): Unix-Zeitstempel in Sekunden.
+///
+/// # Rückgabe
+/// Lesbares Datum, z. B. `2026-09-14 07:30:00 +02:00`, oder `unix_secs` als
+/// Dezimalstring bei einem ungültigen Zeitstempel.
+///
+/// # Beispiele
+/// ```ignore
+/// use harw_tui::export::format_export_timestamp;
+///
+/// let formatted = format_export_timestamp(1_700_000_000);
+/// assert!(formatted.contains("2023"));
+/// ```
+#[must_use]
+pub fn format_export_timestamp(unix_secs: i64) -> String {
+    match jiff::Timestamp::from_second(unix_secs) {
+        Ok(timestamp) => {
+            let zoned = timestamp.to_zoned(jiff::tz::TimeZone::system());
+            zoned.strftime("%Y-%m-%d %H:%M:%S %:z").to_string()
+        }
+        Err(_) => unix_secs.to_string(),
+    }
+}
+
+/// Formatiert `text` für die Kopfzeile: ist `text` rein numerisch (ein
+/// Unix-Sekunden-Zeitstempel als Dezimalstring), wird er über
+/// [`format_export_timestamp`] lesbar gemacht. Jeder andere Text (z. B.
+/// bereits vorformatierte Daten aus `app.rs`) bleibt unverändert, damit der
+/// Fix auch ohne eine parallele `app.rs`-Änderung wirkt.
+fn format_started_at_for_display(text: &str) -> String {
+    match text.parse::<i64>() {
+        Ok(unix_secs) => format_export_timestamp(unix_secs),
+        Err(_) => text.to_owned(),
+    }
 }
 
 fn optional_string(value: Option<&str>) -> Value {
@@ -750,6 +845,165 @@ fn entry_to_json(entry: &ExportEntry, opts: &ExportOptions) -> Option<Value> {
     })
 }
 
+/// Trennt einen (bereits redigierten) JSON-Wert in eine kompakte Struktur
+/// ohne mehrzeilige String-Blätter und eine geordnete Liste ausgelagerter
+/// Freitextblöcke.
+///
+/// # Beschreibung
+/// Rekursiert durch Objekte und Arrays. Ein String-Blatt, das selbst
+/// gültiges JSON ist, wird geparst und an derselben Stelle eingebettet, so
+/// dass es beim finalen Pretty-Print verschachtelt erscheint. Ein
+/// String-Blatt mit einem echten Zeilenumbruch (`\n`) wird aus der Struktur
+/// entfernt (Objektschlüssel entfallen ersatzlos, Array-Positionen werden zu
+/// `null`) und stattdessen unter seinem Feldpfad in `text_blocks` gesammelt
+/// — genau der Fall, der zuvor als eine einzige, bis zu 70.000 Zeichen lange
+/// escapte JSON-Zeile im Export landete (insbesondere ein Feld `value`).
+/// Kurze, einzeilige Strings bleiben unverändert im JSON-Block.
+///
+/// # Argumente
+/// - `value` (`&Value`): der zu trennende, bereits redigierte Wert.
+/// - `path` (`&str`): Feldpfad des aktuellen Werts (leer an der Wurzel).
+/// - `text_blocks` (`&mut Vec<(String, String)>`): Sammelziel für
+///   `(Feldpfad, Text)`-Paare ausgelagerter mehrzeiliger Strings.
+///
+/// # Rückgabe
+/// `Some(Value)` mit der reduzierten Struktur, oder `None`, wenn der Wert an
+/// dieser Position vollständig in `text_blocks` ausgelagert wurde (nur bei
+/// einem String-Blatt möglich).
+fn split_json_for_block(
+    value: &Value,
+    path: &str,
+    text_blocks: &mut Vec<(String, String)>,
+) -> Option<Value> {
+    match value {
+        Value::Object(object) => {
+            let mut reduced = Map::new();
+            for (key, child) in object {
+                let child_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}.{key}")
+                };
+                if let Some(child_value) = split_json_for_block(child, &child_path, text_blocks) {
+                    reduced.insert(key.clone(), child_value);
+                }
+            }
+            Some(Value::Object(reduced))
+        }
+        Value::Array(items) => {
+            let reduced = items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    let child_path = format!("{path}[{index}]");
+                    // Arrays behalten ihre Indizes; ausgelagerte Einträge
+                    // werden zu `null`, damit die Position erhalten bleibt.
+                    split_json_for_block(item, &child_path, text_blocks).unwrap_or(Value::Null)
+                })
+                .collect();
+            Some(Value::Array(reduced))
+        }
+        Value::String(text) => {
+            if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                Some(parsed)
+            } else if text.contains('\n') {
+                let label = if path.is_empty() { "value".to_owned() } else { path.to_owned() };
+                text_blocks.push((label, text.to_owned()));
+                None
+            } else {
+                Some(Value::String(text.to_owned()))
+            }
+        }
+        other => Some(other.clone()),
+    }
+}
+
+/// Kürzt `text` auf höchstens `max_chars` Unicode-Zeichen und hängt einen
+/// Marker mit der Anzahl entfernter Zeichen an.
+///
+/// # Beschreibung
+/// Schneidet wie [`truncate_markdown`] an einer Zeichen- (nicht Byte-)
+/// Grenze, damit mehrbytige UTF-8-Sequenzen niemals mittendrin getrennt
+/// werden. Anders als [`truncate_markdown`] gilt die Grenze pro Block
+/// (JSON- oder Text-Block eines einzelnen ToolCall-/ToolResult-Eintrags),
+/// nicht für das gesamte Dokument, und der Marker nennt die genaue Anzahl
+/// gekürzter Zeichen.
+///
+/// # Argumente
+/// - `text` (`&str`): der zu kürzende Blockinhalt.
+/// - `max_chars` (`usize`): maximale Anzahl Unicode-Zeichen vor dem Marker.
+///
+/// # Rückgabe
+/// Gekürzter Text mit angehängtem `_[gekürzt: N Zeichen]_`, oder der
+/// unveränderte Text, wenn keine Kürzung nötig war.
+fn truncate_block(text: &str, max_chars: usize) -> String {
+    let total_chars = text.chars().count();
+    if total_chars <= max_chars {
+        return text.to_owned();
+    }
+    let cut_byte = text
+        .char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or(text.len());
+    let removed = total_chars - max_chars;
+    let mut truncated = text[..cut_byte].to_owned();
+    truncated.push_str(&format!("\n\n_[gekürzt: {removed} Zeichen]_\n"));
+    truncated
+}
+
+/// Wendet die Pro-Block-Kappung von [`ExportOptions::max_chars_per_entry`] an.
+fn apply_block_cap(text: &str, max_chars_per_entry: Option<usize>) -> String {
+    match max_chars_per_entry {
+        Some(max_chars) => truncate_block(text, max_chars),
+        None => text.to_owned(),
+    }
+}
+
+/// Rendert einen (bereits redigierten) JSON-Wert lesbar: ein kompakter
+/// ```` ```json ````-Block für die Struktur, gefolgt von je einem eigenen
+/// ```` ```text ````-Block je mehrzeiligem String-Blatt.
+///
+/// # Beschreibung
+/// Ersetzt `display_json` an den Stellen, an denen ToolCall-Argumente und
+/// ToolResult-Ergebnisse gerendert werden. Nutzt [`split_json_for_block`],
+/// um String-Blätter, die selbst JSON sind, verschachtelt einzubetten und
+/// mehrzeilige Freitext-Strings (insbesondere ein Feld `value`) mit echten
+/// Zeilenumbrüchen in einem separaten Block auszugeben, statt sie als eine
+/// einzige escapte JSON-Zeile darzustellen. Jeder Block wird unabhängig über
+/// `max_chars_per_entry` gekappt ([`apply_block_cap`]). Ist die gesamte
+/// Wurzel ein einzelner mehrzeiliger String (kein Objekt/Array), entfällt
+/// der JSON-Block, da er sonst nur `null` zeigen würde.
+///
+/// # Argumente
+/// - `out` (`&mut String`): Ausgabepuffer.
+/// - `value` (`&Value`): bereits redigierter JSON-Wert (siehe [`redact_json_value`]).
+/// - `max_chars_per_entry` (`Option<usize>`): Pro-Block-Obergrenze, siehe
+///   [`ExportOptions::max_chars_per_entry`].
+fn render_json_block(out: &mut String, value: &Value, max_chars_per_entry: Option<usize>) {
+    let mut text_blocks = Vec::new();
+    let reduced = split_json_for_block(value, "", &mut text_blocks);
+
+    if let Some(json_value) = reduced {
+        out.push_str("```json\n");
+        out.push_str(&apply_block_cap(&display_json(&json_value), max_chars_per_entry));
+        out.push_str("\n```\n");
+    }
+
+    for (label, text) in &text_blocks {
+        out.push_str("  - Text (");
+        out.push_str(&sanitize_inline(&redact_text(label)));
+        out.push_str("):\n\n```text\n");
+        out.push_str(&apply_block_cap(&sanitize_display(text), max_chars_per_entry));
+        out.push_str("\n```\n");
+    }
+}
+
+// 8 bzw. 10 Parameter statt eines Parameter-Structs: beide Funktionen werden
+// ausschließlich hier in `render_markdown_with_extensions` aufgerufen, eine
+// Struct-Extraktion für einen einzigen Aufrufer bringt keinen Nutzen —
+// daher gezielt unterdrückt statt umgebaut.
+#[allow(clippy::too_many_arguments)]
 fn render_tool_call_markdown(
     out: &mut String,
     call_id: &str,
@@ -758,21 +1012,18 @@ fn render_tool_call_markdown(
     duration_ms: Option<u64>,
     trust: Option<&str>,
     agent: Option<&ExportAgentRef>,
+    max_chars_per_entry: Option<usize>,
 ) {
     out.push_str("- ⚙ **ToolCall** ");
     out.push_str(&sanitize_inline(&redact_text(tool_name)));
     out.push_str(" (`");
     out.push_str(&sanitize_inline(&redact_text(call_id)));
-    out.push_str("`)\n  - Status: angefordert\n  - Argumente:\n\n```json\n");
-    out.push_str(&display_json(&redact_json_value(arguments)));
-    out.push_str("\n```\n");
+    out.push_str("`)\n  - Status: angefordert\n  - Argumente:\n\n");
+    render_json_block(out, &redact_json_value(arguments), max_chars_per_entry);
     render_tool_metadata_markdown(out, duration_ms, trust, agent);
     out.push('\n');
 }
 
-// 9 Parameter statt eines Parameter-Structs: Aufrufer liegt in app.rs
-// (außerhalb dieses Auftrags), eine Signaturänderung hier würde dort
-// brechen — daher gezielt unterdrückt statt umgebaut.
 #[allow(clippy::too_many_arguments)]
 fn render_tool_result_markdown(
     out: &mut String,
@@ -784,6 +1035,7 @@ fn render_tool_result_markdown(
     duration_ms: Option<u64>,
     trust: Option<&str>,
     agent: Option<&ExportAgentRef>,
+    max_chars_per_entry: Option<usize>,
 ) {
     out.push_str("- ⚙ **ToolResult**");
     if let Some(tool_name) = tool_name {
@@ -792,16 +1044,15 @@ fn render_tool_result_markdown(
     }
     out.push_str(" (`");
     out.push_str(&sanitize_inline(&redact_text(call_id)));
-    out.push_str(")\n  - Status: ");
+    out.push_str("`)\n  - Status: ");
     out.push_str(status.as_str());
     if let Some(error) = error {
         out.push_str(" (");
         out.push_str(&sanitize_inline(&redact_text(error)));
         out.push(')');
     }
-    out.push_str("\n  - Resultat:\n\n```json\n");
-    out.push_str(&display_json(&redact_json_value(result)));
-    out.push_str("\n```\n");
+    out.push_str("\n  - Resultat:\n\n");
+    render_json_block(out, &redact_json_value(result), max_chars_per_entry);
     render_tool_metadata_markdown(out, duration_ms, trust, agent);
     out.push('\n');
 }
@@ -1064,6 +1315,97 @@ fn sensitive_value_range(text: &str, start: usize, marker_len: usize) -> Option<
         .map(|offset| scan_start + offset)
         .unwrap_or(text.len());
     Some((value_start, value_end))
+}
+
+/// Stuft ATX-Überschriften (`#` bis `######`) in `text` um zwei Ebenen
+/// herab, gekappt auf höchstens `######`. Zeilen innerhalb eines
+/// Fenced-Code-Blocks (```` ``` ```` oder `~~~`) bleiben unverändert.
+///
+/// # Beschreibung
+/// Nutzer- und Assistant-Text dürfen eigene Markdown-Überschriften
+/// enthalten (z. B. `# Ergebnis`); ohne Herabstufung würden diese mit den
+/// Export-eigenen Ebenen `#`/`##` kollidieren und die Dokumentgliederung
+/// verfälschen. Jede erkannte ATX-Überschriftszeile außerhalb eines
+/// Fenced-Code-Blocks bekommt zwei zusätzliche `#`; eine bereits auf
+/// `######` stehende Überschrift bleibt unverändert (Ebene 6 ist das
+/// Markdown-Maximum). Ein Fenced-Code-Block wird an seiner öffnenden
+/// Markierung (```` ``` ```` oder `~~~`, führende Leerzeichen erlaubt)
+/// erkannt und endet an der nächsten Zeile mit derselben Markierung;
+/// innerhalb bleibt jede Zeile — auch eine mit `#` beginnende
+/// Shell-Kommentarzeile — unangetastet.
+///
+/// # Argumente
+/// - `text` (`&str`): der zu transformierende Rohtext.
+///
+/// # Rückgabe
+/// Text mit herabgestuften Überschriften; alle sonstigen Zeilen und
+/// Zeilenumbrüche bleiben unverändert.
+fn demote_markdown_headings(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut fence_marker: Option<&'static str> = None;
+    let mut first_line = true;
+
+    for line in text.split('\n') {
+        if !first_line {
+            out.push('\n');
+        }
+        first_line = false;
+
+        let trimmed_start = line.trim_start();
+        let line_fence = if trimmed_start.starts_with("```") {
+            Some("```")
+        } else if trimmed_start.starts_with("~~~") {
+            Some("~~~")
+        } else {
+            None
+        };
+
+        if let Some(marker) = line_fence {
+            match fence_marker {
+                Some(active) if active == marker => fence_marker = None,
+                Some(_) => {}
+                None => fence_marker = Some(marker),
+            }
+            out.push_str(line);
+            continue;
+        }
+
+        if fence_marker.is_some() {
+            out.push_str(line);
+            continue;
+        }
+
+        match demote_heading_line(line) {
+            Some(demoted) => out.push_str(&demoted),
+            None => out.push_str(line),
+        }
+    }
+
+    out
+}
+
+/// Erkennt eine ATX-Überschriftszeile (`^\s*#{1,6}(\s|$)`) und liefert sie
+/// mit zwei zusätzlichen `#` zurück, gekappt auf `######`. Liefert `None`,
+/// wenn `line` keine ATX-Überschrift ist.
+fn demote_heading_line(line: &str) -> Option<String> {
+    let leading_ws_len = line.len() - line.trim_start().len();
+    let (leading_ws, rest) = line.split_at(leading_ws_len);
+    let hashes = rest.chars().take_while(|c| *c == '#').count();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    let after_hashes = &rest[hashes..];
+    // Eine ATX-Überschrift braucht ein Leerzeichen/Tab (oder Zeilenende)
+    // direkt nach den Rauten; sonst ist es z. B. ein `#tag` im Fließtext.
+    if !after_hashes.is_empty() && !after_hashes.starts_with(' ') && !after_hashes.starts_with('\t') {
+        return None;
+    }
+    let new_level = (hashes + 2).min(6);
+    let mut result = String::with_capacity(line.len() + 2);
+    result.push_str(leading_ws);
+    result.push_str(&"#".repeat(new_level));
+    result.push_str(after_hashes);
+    Some(result)
 }
 
 /// Kürzt `text` auf höchstens `max_chars` Unicode-Zeichen und hängt den
@@ -1533,5 +1875,244 @@ mod tests {
 
         let err = write_export(&path, "inhalt\n").expect_err("Traversal muss abgelehnt werden");
         assert!(matches!(err, ExportError::PathRejected(_)));
+    }
+
+    // -----------------------------------------------------------------
+    // A2: schließender Backtick der ToolResult-Zeile
+    // -----------------------------------------------------------------
+
+    /// A2-Regression: Die Call-ID der ToolResult-Zeile ist beidseitig in
+    /// Backticks eingeschlossen, exakt wie bei ToolCall.
+    #[test]
+    fn test_render_tool_result_closes_call_id_backtick() {
+        let entries = vec![ExportEntry::ToolResult {
+            call_id: "call-7".to_owned(),
+            tool_name: Some("demo".to_owned()),
+            result: json!({"ok": true}),
+            status: ExportStatus::Success,
+            error: None,
+            duration_ms: None,
+            trust: None,
+            agent: None,
+        }];
+        let out = render_markdown(&meta_minimal(), &entries, &ExportOptions::default());
+        assert!(out.contains("(`call-7`)\n  - Status: success"));
+    }
+
+    // -----------------------------------------------------------------
+    // A3: render_json_block
+    // -----------------------------------------------------------------
+
+    /// Ein String-Blatt, das selbst gültiges JSON ist, wird verschachtelt
+    /// pretty ausgegeben statt als escapte Zeile.
+    #[test]
+    fn test_render_json_block_parses_json_string_leaf_as_nested_pretty_json() {
+        let entries = vec![ExportEntry::ToolResult {
+            call_id: "call-9".to_owned(),
+            tool_name: Some("demo".to_owned()),
+            result: json!({"value": "{\"inner\":42}"}),
+            status: ExportStatus::Success,
+            error: None,
+            duration_ms: None,
+            trust: None,
+            agent: None,
+        }];
+        let out = render_markdown(&meta_minimal(), &entries, &ExportOptions::default());
+        assert!(out.contains("\"inner\": 42"));
+        assert!(!out.contains("\\\"inner\\\""));
+        assert!(!out.contains("```text"));
+    }
+
+    /// Ein String-Blatt mit echten Zeilenumbrüchen (insb. `value`) landet in
+    /// einem eigenen ```text-Block mit erhaltenen Zeilenumbrüchen; der
+    /// json-Block enthält den großen String nicht mehr.
+    #[test]
+    fn test_render_json_block_extracts_multiline_string_into_text_block() {
+        let entries = vec![ExportEntry::ToolResult {
+            call_id: "call-10".to_owned(),
+            tool_name: Some("demo".to_owned()),
+            result: json!({"status": "ok", "value": "Zeile 1\nZeile 2\nZeile 3"}),
+            status: ExportStatus::Success,
+            error: None,
+            duration_ms: None,
+            trust: None,
+            agent: None,
+        }];
+        let out = render_markdown(&meta_minimal(), &entries, &ExportOptions::default());
+        assert!(out.contains("  - Text (value):\n\n```text\nZeile 1\nZeile 2\nZeile 3"));
+
+        let json_start = out.find("```json\n").expect("json-Block fehlt");
+        let json_end = out[json_start..]
+            .find("\n```\n")
+            .map(|offset| json_start + offset)
+            .expect("json-Block-Ende fehlt");
+        let json_block = &out[json_start..json_end];
+        assert!(!json_block.contains("Zeile 1"));
+        assert!(json_block.contains("\"status\""));
+    }
+
+    /// Jeder Block wird unabhängig über `max_chars_per_entry` gekappt, schneidet
+    /// an einer Zeichen- (nicht Byte-)Grenze und hängt den Marker mit der
+    /// genauen Anzahl gekürzter Zeichen an.
+    #[test]
+    fn test_render_json_block_truncates_per_entry_with_marker_and_multibyte_boundary() {
+        // 20 mehrbytige "ü"-Zeichen (je 2 Bytes UTF-8): ein Byte-Schnitt würde panicen.
+        let long_text = format!("Start\n{}\nEnde", "ü".repeat(20));
+        assert_eq!(long_text.chars().count(), 31);
+
+        let entries = vec![ExportEntry::ToolResult {
+            call_id: "call-11".to_owned(),
+            tool_name: Some("demo".to_owned()),
+            result: json!({"value": long_text}),
+            status: ExportStatus::Success,
+            error: None,
+            duration_ms: None,
+            trust: None,
+            agent: None,
+        }];
+        let opts = ExportOptions {
+            max_chars_per_entry: Some(10),
+            ..ExportOptions::default()
+        };
+        let out = render_markdown(&meta_minimal(), &entries, &opts);
+
+        assert!(out.contains("_[gekürzt: 21 Zeichen]_"));
+        assert!(!out.contains('\u{FFFD}'));
+    }
+
+    /// `ExportOptions::default()` kappt Blöcke standardmäßig bei 4000 Zeichen.
+    #[test]
+    fn test_export_options_default_max_chars_per_entry_is_4000() {
+        assert_eq!(ExportOptions::default().max_chars_per_entry, Some(4000));
+    }
+
+    // -----------------------------------------------------------------
+    // A4: demote_markdown_headings
+    // -----------------------------------------------------------------
+
+    /// ATX-Überschriften in Nutzer-/Assistant-Text werden um zwei Ebenen
+    /// herabgestuft, gekappt auf `######`.
+    #[test]
+    fn test_demote_markdown_headings_shifts_atx_headings_by_two_levels() {
+        let entries = vec![ExportEntry::Assistant(
+            "# Titel\n## Unterabschnitt\n###### Bereits Maximal".to_owned(),
+        )];
+        let out = render_markdown(&meta_minimal(), &entries, &ExportOptions::default());
+        assert!(out.contains("### Titel\n#### Unterabschnitt\n###### Bereits Maximal"));
+    }
+
+    /// Fenced-Code-Blöcke (inkl. `#`-Zeilen darin, z. B. Shell-Kommentare)
+    /// bleiben beim Herabstufen unangetastet.
+    #[test]
+    fn test_demote_markdown_headings_skips_fenced_code_blocks() {
+        let entries = vec![ExportEntry::Assistant(
+            "# Titel\n```bash\n# das ist ein Shell-Kommentar\necho hi\n```\n# Nach dem Block"
+                .to_owned(),
+        )];
+        let out = render_markdown(&meta_minimal(), &entries, &ExportOptions::default());
+        assert!(out.contains("```bash\n# das ist ein Shell-Kommentar\necho hi\n```"));
+        assert!(out.contains("### Titel"));
+        assert!(out.contains("### Nach dem Block"));
+    }
+
+    // -----------------------------------------------------------------
+    // A5: Abschnittszuordnung für ToolCall/ToolResult/Reasoning
+    // -----------------------------------------------------------------
+
+    /// ToolCall und ToolResult nach einer Nutzernachricht schalten auf die
+    /// `## harw`-Überschrift um, statt unter `## Du` zu bleiben.
+    #[test]
+    fn test_tool_entries_after_user_message_switch_to_harw_section() {
+        let entries = vec![
+            ExportEntry::User("Frage".to_owned()),
+            ExportEntry::ToolCall {
+                call_id: "call-1".to_owned(),
+                tool_name: "demo".to_owned(),
+                arguments: json!({}),
+                duration_ms: None,
+                trust: None,
+                agent: None,
+            },
+            ExportEntry::ToolResult {
+                call_id: "call-1".to_owned(),
+                tool_name: Some("demo".to_owned()),
+                result: json!({}),
+                status: ExportStatus::Success,
+                error: None,
+                duration_ms: None,
+                trust: None,
+                agent: None,
+            },
+        ];
+        let out = render_markdown(&meta_minimal(), &entries, &ExportOptions::default());
+
+        let du_pos = out.find("## Du\n\n").expect("Du-Überschrift fehlt");
+        let harw_pos = out.find("## harw\n\n").expect("harw-Überschrift fehlt");
+        let tool_call_pos = out.find("ToolCall").expect("ToolCall fehlt");
+        assert!(du_pos < harw_pos, "Frage muss vor der harw-Überschrift stehen");
+        assert!(harw_pos < tool_call_pos, "ToolCall muss unter harw stehen");
+        // ToolCall und ToolResult teilen sich dieselbe Überschrift.
+        assert_eq!(out.matches("## harw\n\n").count(), 1);
+    }
+
+    /// Ein Reasoning-Eintrag nach einer Nutzernachricht schaltet ebenfalls auf
+    /// `## harw` um.
+    #[test]
+    fn test_reasoning_entry_after_user_message_switches_to_harw_section() {
+        let entries = vec![
+            ExportEntry::User("Frage".to_owned()),
+            ExportEntry::Reasoning("weil X gilt".to_owned()),
+        ];
+        let opts = ExportOptions {
+            include_reasoning: true,
+            ..ExportOptions::default()
+        };
+        let out = render_markdown(&meta_minimal(), &entries, &opts);
+
+        let du_pos = out.find("## Du").expect("Du-Überschrift fehlt");
+        let harw_pos = out.find("## harw").expect("harw-Überschrift fehlt");
+        let reasoning_pos = out.find("weil X gilt").expect("Reasoning-Text fehlt");
+        assert!(du_pos < harw_pos);
+        assert!(harw_pos < reasoning_pos);
+    }
+
+    // -----------------------------------------------------------------
+    // Datum-Helfer
+    // -----------------------------------------------------------------
+
+    /// Ein bekannter Unix-Zeitstempel wird lesbar mit Uhrzeit und Offset
+    /// formatiert, nicht als rohe Sekundenzahl.
+    #[test]
+    fn test_format_export_timestamp_formats_known_unix_seconds() {
+        // 1_700_000_000 = 2023-11-14T22:13:20Z; das Jahr bleibt in jeder
+        // Zeitzone (±14h) unverändert 2023.
+        let formatted = format_export_timestamp(1_700_000_000);
+        assert!(formatted.contains("2023"));
+        assert!(formatted.contains(':'));
+        assert_ne!(formatted, "1700000000");
+    }
+
+    /// Ein Zeitstempel außerhalb des darstellbaren Bereichs fällt auf die
+    /// unveränderte Zahl zurück, statt abzubrechen.
+    #[test]
+    fn test_format_export_timestamp_falls_back_to_number_on_invalid_input() {
+        let formatted = format_export_timestamp(i64::MAX);
+        assert_eq!(formatted, i64::MAX.to_string());
+    }
+
+    /// Ist `meta.started_at` rein numerisch, formatiert der Renderer es über
+    /// [`format_export_timestamp`] lesbar — auch ohne eine `app.rs`-Änderung.
+    #[test]
+    fn test_render_markdown_formats_numeric_started_at_as_readable_date() {
+        let meta = ExportMeta {
+            title: None,
+            session_id: "sess-1".to_owned(),
+            started_at: Some("1700000000".to_owned()),
+            cwd: None,
+            model: None,
+        };
+        let out = render_markdown(&meta, &[], &ExportOptions::default());
+        assert!(!out.contains("- **Datum:** 1700000000"));
+        assert!(out.contains("2023"));
     }
 }

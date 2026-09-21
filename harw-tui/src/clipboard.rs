@@ -16,6 +16,9 @@
 //! - [`osc52_sequence`] — baut die rohe OSC-52-Escape-Sequenz.
 //! - [`copy_or_sequence`] — versucht zuerst [`copy_to_clipboard`], fällt dann
 //!   auf [`osc52_sequence`] zurück.
+//! - [`wrap_osc52_for_tmux`] — hüllt eine OSC-52-Sequenz in ein
+//!   DCS-Passthrough, damit sie tmux hindurch das echte Terminal erreicht
+//!   (A7; der Aufrufer in `app.rs` entscheidet anhand von `TMUX`, ob nötig).
 //!
 //! # Nebenläufigkeit
 //! Jeder Aufruf spawnt höchstens einen Kindprozess synchron über
@@ -285,6 +288,48 @@ pub fn copy_or_sequence(text: &str) -> Result<(ClipboardTarget, Option<String>),
     }
 }
 
+/// Hüllt eine OSC-52-Escape-Sequenz in ein tmux-DCS-Passthrough ein (A7).
+///
+/// # Beschreibung
+/// tmux fängt OSC-Sequenzen seiner Kindprozesse normalerweise ab, statt sie
+/// an das umgebende Terminal weiterzureichen. Das DCS-Passthrough-Protokoll
+/// (`\x1bPtmux;` … `\x1b\\`) weist tmux an, die eingeschlossene Nutzlast
+/// unverändert an das echte Terminal durchzureichen — dafür muss jedes
+/// `\x1b` (ESC) **innerhalb** der Nutzlast verdoppelt werden, da tmux ein
+/// einzelnes ESC sonst als Ende der Passthrough-Sequenz läse. Reine
+/// Funktion ohne I/O; der Aufrufer entscheidet anhand von `TMUX`
+/// ([`resolve_export_choice`] in `app.rs`), ob gehüllt werden muss.
+///
+/// # Argumente
+/// - `sequence` (`&str`): die rohe OSC-52-Sequenz, typischerweise aus
+///   [`osc52_sequence`].
+///
+/// # Rückgabe
+/// `\x1bPtmux;` gefolgt von `sequence` (jedes `\x1b` darin verdoppelt),
+/// abgeschlossen mit `\x1b\\`.
+///
+/// # Beispiele
+/// ```ignore
+/// use harw_tui::clipboard::{osc52_sequence, wrap_osc52_for_tmux};
+/// let seq = osc52_sequence("hi").expect("kurzer Text passt");
+/// let wrapped = wrap_osc52_for_tmux(&seq);
+/// assert!(wrapped.starts_with("\x1bPtmux;"));
+/// assert!(wrapped.ends_with("\x1b\\"));
+/// ```
+#[must_use]
+pub fn wrap_osc52_for_tmux(sequence: &str) -> String {
+    let mut wrapped = String::with_capacity(sequence.len() + "\x1bPtmux;".len() + "\x1b\\".len());
+    wrapped.push_str("\x1bPtmux;");
+    for ch in sequence.chars() {
+        if ch == '\x1b' {
+            wrapped.push('\x1b');
+        }
+        wrapped.push(ch);
+    }
+    wrapped.push_str("\x1b\\");
+    wrapped
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -338,5 +383,41 @@ mod tests {
     fn test_osc52_sequence_size_cap_boundary_accepted() {
         let exact = "a".repeat(OSC52_MAX_BYTES);
         assert!(osc52_sequence(&exact).is_ok());
+    }
+
+    /// A7: die tmux-Hülle beginnt mit dem DCS-Passthrough-Präfix und endet
+    /// mit dem DCS-Terminator.
+    #[test]
+    fn test_wrap_osc52_for_tmux_frames_the_passthrough() {
+        let seq = osc52_sequence("ab").expect("kurzer Text passt");
+        let wrapped = wrap_osc52_for_tmux(&seq);
+        assert!(wrapped.starts_with("\x1bPtmux;"));
+        assert!(wrapped.ends_with("\x1b\\"));
+    }
+
+    /// A7: jedes `\x1b` innerhalb der eingehüllten Sequenz wird verdoppelt —
+    /// die rohe OSC-52-Sequenz enthält genau ein ESC (vor `]52;`), die
+    /// Hülle muss also zwei direkt aufeinanderfolgende ESC an dieser Stelle
+    /// zeigen.
+    #[test]
+    fn test_wrap_osc52_for_tmux_doubles_escape_bytes() {
+        let seq = osc52_sequence("ab").expect("kurzer Text passt");
+        assert_eq!(seq.matches('\x1b').count(), 1);
+
+        let wrapped = wrap_osc52_for_tmux(&seq);
+        // Präfix (`\x1bPtmux;`) + verdoppeltes ESC aus der Nutzlast +
+        // Terminator (`\x1b\\`) ergeben drei ESC-Vorkommen im Präfix/Terminator
+        // plus zwei aus der verdoppelten Nutzlast = vier insgesamt.
+        assert_eq!(wrapped.matches('\x1b').count(), 4);
+        assert!(wrapped.contains("\x1b\x1b]52;c;"));
+    }
+
+    /// Ein leerer Text ergibt trotzdem eine korrekt gerahmte, nicht-leere
+    /// Hülle.
+    #[test]
+    fn test_wrap_osc52_for_tmux_empty_payload() {
+        let seq = osc52_sequence("").expect("leerer Text passt");
+        let wrapped = wrap_osc52_for_tmux(&seq);
+        assert_eq!(wrapped, "\x1bPtmux;\x1b\x1b]52;c;\x07\x1b\\");
     }
 }

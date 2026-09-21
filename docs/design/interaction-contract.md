@@ -312,6 +312,21 @@ Modul-Doc-Kommentar:
   aktuellen Sitzung aus dem `StateStore`-Snapshot.
 - **`/stop`** — bricht einen laufenden Job kontrolliert ab; Command und
   Modell-Tool mit `approval = "always"`.
+- **`/sandbox-lease`** (neu, Nutzerentscheidung 2026-09-21) — Command **und**
+  Modell-Tool für die direkte Host-Freigabe von `shell.exec`. Das Modell-Tool
+  (`harw-ops/src/sandbox_lease.rs`, `model_tool` ohne Zusatz-Approval, denn
+  der Dialog *ist* die Freigabe; Argument `reason`) löst einen
+  `HostPermitPrompt` aus (Vorauswahl `SessionLease`) und wartet bis zu 300 s:
+  `SessionLease` → `mark_session_approved` (TTL-befristet, alle
+  `shell.exec`-Aufrufe der Sitzung laufen danach auf dem Host); `SingleExecution`
+  → `mark_single_use` (nur der nächste Aufruf); Ablehnung/Timeout liefern
+  einen Fehlertext. Der Command `/sandbox-lease [status|revoke]`
+  (`busy = "immediate"`) ist rein lokal: `status` zeigt die aktive Freigabe,
+  `revoke` beendet eine Sitzungsfreigabe sofort über
+  `revoke_session_approval` + `ledger.revoke_session`. `/status`
+  (`harw-ops/src/status.rs`) zeigt zusätzlich die Zeile „Host-Lease: aktiv
+  bis … / Einzelfreigabe / aus". Details zur Host-Ausführung selbst stehen in
+  `mediated-process-execution.md`.
 - **`/permissions`** — Übersicht über Workspace-Identität, Sandbox-Rechte,
   Freigabemodus und Allow-/Deny-Regeln.
 - **`/effort`** — setzt die providerneutrale Reasoning-Stärke für nachfolgende
@@ -408,7 +423,7 @@ gesetzt und `harw-tui`'s `CommandSpec` übernimmt es bereits:
 
 | Sofort während eines Turns | Bis Turn-Ende eingereiht (Auswahl) |
 |---|---|
-| `/status` `/ps` `/usage` `/help` `/diff` `/work` `/review` `/model show`/`list` `/provider show`/`list` (inkl. bare `/provider`) `/approve` `/deny` `/cancel` `/stop` | `/mode` `/effort` `/uia-effort` `/uia-model` `/uia-worker-model` `/uia-provider` `/provider-concurrency` `/permissions` `/plugins` `/skills` `/new` `/compact` `/memory` `/export` `/quit` `/model switch`/bare `/model` `/provider test` |
+| `/status` `/ps` `/usage` `/help` `/diff` `/work` `/review` `/model show`/`list` `/provider show`/`list` (inkl. bare `/provider`) `/approve` `/deny` `/cancel` `/stop` `/sandbox-lease` (`status`/`revoke`) | `/mode` `/effort` `/uia-effort` `/uia-model` `/uia-worker-model` `/uia-provider` `/provider-concurrency` `/permissions` `/plugins` `/skills` `/new` `/compact` `/memory` `/export` `/quit` `/model switch`/bare `/model` `/provider test` |
 
 `/cancel` und `/stop` wirken auf den `JobStore` (Hintergrund-Jobs), **nicht**
 auf den laufenden Turn selbst — dafür bleibt Ctrl+C exklusiv zuständig (siehe
@@ -515,6 +530,39 @@ weiterhin unverändert. `harw-tui/src/app.rs` rendert das Item bereits über
 die vollständig verdrahtete `ReasoningHistoryCell` (gedimmter Text,
 `·`-Präfix). `to_model_messages` (`history.rs`) überspringt
 `TurnItem::Reasoning` beim nächsten Modellaufruf.
+
+### 2.6.7 Export-Lesbarkeit (Ist-Stand 2026-09-21)
+
+`/export` (§2.1 der TUI-Annex) ist um mehrere Lesbarkeits-Korrekturen
+ergänzt, ohne die Grammatik zu ändern:
+
+- Das Startdatum (`ExportMeta.started_at`) wird lesbar formatiert
+  (`jiff::Timestamp`, lokaler Offset, RFC-3339-Stil) statt als rohe
+  Unix-Sekunde ausgegeben; der Dateiname behält weiterhin den
+  Sekunden-Token. Bei fortgesetzter Session (`-r`) stammt das Datum vom
+  Session-Start aus dem Session-Store, nicht vom TUI-Start.
+- Tool-Argumente und -Ergebnisse werden über einen neuen Helfer
+  `render_json_block` dargestellt: ist ein String-Blatt (vor allem `value`)
+  selbst JSON, wird es geparst und als verschachteltes Pretty-JSON
+  ausgegeben; sonst kommt ein eigener ` ```text ` -Block mit echten
+  Zeilenumbrüchen statt einer einzelnen, potenziell zehntausende Zeichen
+  langen Zeile.
+- Jeder Eintrag ist zusätzlich auf `ExportOptions.max_chars_per_entry`
+  (Default 4000 Zeichen) gekappt, mit Marker `_[gekürzt: N Zeichen]_`,
+  zeichengrenzen-sicher wie das bestehende `truncate_markdown`; die globale
+  `--max-chars`-Kappung des gesamten Exports bleibt zusätzlich bestehen.
+- Überschriften (`#…`-Zeilen) in User- und Assistant-Text werden um zwei
+  Ebenen herabgestuft (maximal `######`), Fenced-Code-Blöcke werden dabei
+  übersprungen.
+- Tool-Einträge (ToolCall/ToolResult/Reasoning), die auf eine
+  Nutzernachricht folgen, landen jetzt unter der Überschrift „## harw" statt
+  fälschlich unter „## Du".
+- Scheitert das Kopieren in die Zwischenablage beim reinen `/export` (z. B.
+  weil harw in tmux ohne Zwischenablage läuft), schreibt es stattdessen die
+  Datei über den bestehenden `default_export_path` und meldet den Pfad. Die
+  OSC-52-Ausgabe wird in tmux zusätzlich mit einer
+  DCS-Passthrough-Hülle (`\ePtmux;…\e\\`) umschlossen, wenn `TMUX` gesetzt
+  ist.
 
 ---
 

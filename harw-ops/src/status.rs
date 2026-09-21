@@ -14,6 +14,21 @@
 //! Verdrahtung voll funktionsfähig. Anpassen lässt sich die Grenze über die
 //! separate Operation `/provider-concurrency` (siehe `crate::provider`).
 //!
+//! Zeigt außerdem (Welle 2, Plan `recursive-cooking-lobster.md` Teil B5,
+//! sofern verdrahtet) den Host-Lease-Zustand: „aktiv (noch N min)“,
+//! „Einmalfreigabe“ oder „aus“. Seit der Behebung „volle
+//! Sandbox-Deaktivierung“ (2026-09-21) meldet diese Zeile sowohl eine
+//! sitzungseigene als auch eine prozessweite Freigabe
+//! ([`harw_sandbox::HostPermitSessionRegistry::mark_global_approval`], über
+//! `/sandbox-lease` gesetzt) — `session_approval_remaining`/`has_single_use`
+//! liefern bereits das Maximum aus beiden, ein separater Blick auf
+//! `global_approval_remaining` ist hier deshalb nicht nötig. Die Zeile fehlt
+//! stillschweigend, wenn kein `Arc<harw_tool_shell::HostPermitHandles>` im
+//! `OpContext` registriert ist — `/status` bleibt ohne diese Verdrahtung voll
+//! funktionsfähig, genau wie bei der Provider-Concurrency-Zeile oben.
+//! Freigeben/widerrufen lässt sich der Lease über `/sandbox-lease` (siehe
+//! `crate::sandbox_lease`).
+//!
 //! # Schlüsseltypen
 //! - [`StatusArgs`] — leerer Argument-Container (keine Parameter erforderlich)
 //! - `StatusOperation` — generiert vom `#[operation]`-Makro
@@ -31,9 +46,12 @@
 //! // Die Operation wird über den harw-operations-Registry-Mechanismus aufgerufen.
 //! ```
 
+use std::sync::Arc;
+
 use harw_macros::operation;
 use harw_operations::{OpContext, OpError, OpOutput};
 use harw_operations::session_control::SharedSessionController;
+use harw_tool_shell::HostPermitHandles;
 
 /// Leerer Argument-Container für die `/status`-Operation.
 ///
@@ -147,6 +165,29 @@ async fn status(ctx: &OpContext, _args: StatusArgs) -> Result<OpOutput, OpError>
         ));
     }
 
+    // Welle 2 (Plan Teil B5) — Host-Lease-Zustand, sofern eine
+    // `Arc<HostPermitHandles>` in der ServiceMap registriert ist (siehe
+    // `crate::sandbox_lease`). Fehlt sie, bleibt `/status` unverändert --
+    // dieselbe "fehlt stillschweigend"-Regel wie bei der
+    // Provider-Concurrency-Zeile oben. `session_approval_remaining`/
+    // `has_single_use` liefern seit der "volle Sandbox-Deaktivierung"-
+    // Behebung (2026-09-21) bereits das Maximum aus sitzungseigener und
+    // prozessweiter Freigabe -- kein zusätzlicher Blick auf
+    // `global_approval_remaining` nötig.
+    if let Some(handles) = ctx.service::<Arc<HostPermitHandles>>() {
+        let session_id = ctx.session_id().as_str();
+        let label = if let Some(remaining) =
+            handles.registry.session_approval_remaining(session_id)
+        {
+            format!("aktiv (noch {} min)", remaining.as_secs().div_ceil(60))
+        } else if handles.registry.has_single_use(session_id) {
+            "Einmalfreigabe".to_owned()
+        } else {
+            "aus".to_owned()
+        };
+        lines.push(format!("Host-Lease: {label}"));
+    }
+
     let text = lines.join("\n");
 
     Ok(OpOutput::from(text))
@@ -193,6 +234,7 @@ mod tests {
     fn make_test_ctx(
         active_provider: Option<&str>,
         registry: Option<ProviderLoadRegistry>,
+        host_permit_handles: Option<Arc<harw_tool_shell::HostPermitHandles>>,
     ) -> (OpContext, std::path::PathBuf) {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -230,6 +272,9 @@ mod tests {
         if let Some(registry) = registry {
             services.insert(registry);
         }
+        if let Some(handles) = host_permit_handles {
+            services.insert(handles);
+        }
 
         let ctx = OpContext::new(SessionId::new(), TurnId::new(), sandbox, services);
         (ctx, tmp)
@@ -237,7 +282,7 @@ mod tests {
 
     #[tokio::test]
     async fn status_omits_concurrency_line_without_a_load_registry() {
-        let (ctx, _tmp) = make_test_ctx(Some("openai"), None);
+        let (ctx, _tmp) = make_test_ctx(Some("openai"), None, None);
         let output = status(&ctx, StatusArgs {}).await.expect("status must not fail");
         assert!(
             !output.text.contains("Provider-Concurrency"),
@@ -259,7 +304,7 @@ mod tests {
                 recent_rate_limited: 2,
             })),
         );
-        let (ctx, _tmp) = make_test_ctx(Some("openai"), Some(registry));
+        let (ctx, _tmp) = make_test_ctx(Some("openai"), Some(registry), None);
 
         let output = status(&ctx, StatusArgs {}).await.expect("status must not fail");
         assert!(
@@ -293,12 +338,101 @@ mod tests {
             })),
         );
         // Active provider is "openai", registry only has "anthropic".
-        let (ctx, _tmp) = make_test_ctx(Some("openai"), Some(registry));
+        let (ctx, _tmp) = make_test_ctx(Some("openai"), Some(registry), None);
 
         let output = status(&ctx, StatusArgs {}).await.expect("status must not fail");
         assert!(
             !output.text.contains("Provider-Concurrency"),
             "registry has no entry for the active provider: {}",
+            output.text
+        );
+    }
+
+    // ── Welle 2 (Plan Teil B5) — Host-Lease-Zeile ─────────────────────────────
+
+    /// Frische Handles mit leerem Ledger/Registry, ohne Fragekanal.
+    fn fresh_host_permit_handles() -> Arc<harw_tool_shell::HostPermitHandles> {
+        Arc::new(harw_tool_shell::HostPermitHandles {
+            ledger: Arc::new(harw_sandbox::ProcessPermitLedger::default()),
+            registry: Arc::new(harw_sandbox::HostPermitSessionRegistry::default()),
+            prompts: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn status_omits_host_lease_line_without_handles() {
+        let (ctx, _tmp) = make_test_ctx(None, None, None);
+        let output = status(&ctx, StatusArgs {}).await.expect("status must not fail");
+        assert!(
+            !output.text.contains("Host-Lease"),
+            "no handles registered — must not fabricate a status line: {}",
+            output.text
+        );
+    }
+
+    #[tokio::test]
+    async fn status_shows_host_lease_off_with_handles_but_no_approval() {
+        let handles = fresh_host_permit_handles();
+        let (ctx, _tmp) = make_test_ctx(None, None, Some(handles));
+        let output = status(&ctx, StatusArgs {}).await.expect("status must not fail");
+        assert!(
+            output.text.contains("Host-Lease: aus"),
+            "expected an 'aus' host-lease line: {}",
+            output.text
+        );
+    }
+
+    #[tokio::test]
+    async fn status_shows_host_lease_active_with_remaining_minutes() {
+        let handles = fresh_host_permit_handles();
+        let (ctx, _tmp) = make_test_ctx(None, None, Some(Arc::clone(&handles)));
+        handles
+            .registry
+            .mark_session_approved(ctx.session_id().as_str(), Duration::from_secs(600));
+
+        let output = status(&ctx, StatusArgs {}).await.expect("status must not fail");
+        assert!(
+            output.text.contains("Host-Lease: aktiv"),
+            "expected an active host-lease line: {}",
+            output.text
+        );
+    }
+
+    #[tokio::test]
+    async fn status_shows_host_lease_single_use() {
+        let handles = fresh_host_permit_handles();
+        let (ctx, _tmp) = make_test_ctx(None, None, Some(Arc::clone(&handles)));
+        handles
+            .registry
+            .mark_single_use(ctx.session_id().as_str().to_owned());
+
+        let output = status(&ctx, StatusArgs {}).await.expect("status must not fail");
+        assert!(
+            output.text.contains("Host-Lease: Einmalfreigabe"),
+            "expected a single-use host-lease line: {}",
+            output.text
+        );
+    }
+
+    /// Welle 2 setzte `mark_session_approved` mit der eigenen Session-ID
+    /// voraus; seit der Behebung „volle Sandbox-Deaktivierung“ (2026-09-21,
+    /// `/sandbox-lease`) setzt die Registry ihre Freigabe prozessweit über
+    /// `mark_global_approval`. `/status` muss diese globale Freigabe genauso
+    /// anzeigen wie eine sitzungseigene — auch für eine Session, die selbst
+    /// nie über `mark_session_approved` zugestimmt hat.
+    #[tokio::test]
+    async fn status_shows_host_lease_active_for_a_global_approval_from_a_different_session() {
+        let handles = fresh_host_permit_handles();
+        let (ctx, _tmp) = make_test_ctx(None, None, Some(Arc::clone(&handles)));
+        handles
+            .registry
+            .mark_global_approval(Duration::from_secs(600));
+
+        let output = status(&ctx, StatusArgs {}).await.expect("status must not fail");
+        assert!(
+            output.text.contains("Host-Lease: aktiv"),
+            "a process-wide global approval must show as active even for a session that \
+             never approved itself: {}",
             output.text
         );
     }

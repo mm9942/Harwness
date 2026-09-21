@@ -21,7 +21,8 @@ pub use profile::SandboxProfile;
 
 mod bwrap;
 pub use bwrap::{
-    BwrapCommandPlan, BwrapLauncher, SANDBOX_PROXY_SOCKET_PATH, SANDBOX_RELAY_PATH, SandboxChild,
+    BwrapCommandPlan, BwrapLauncher, HostPathBinding, SANDBOX_PROXY_SOCKET_PATH,
+    SANDBOX_RELAY_PATH, SandboxChild,
 };
 
 pub mod egress;

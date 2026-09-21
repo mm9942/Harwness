@@ -28,6 +28,16 @@ harw-job-runtime = { path = "../harw-job-runtime" }
 harw-extension-api = { path = "../harw-extension-api" }
 harw-tool-shell = { path = "../harw-tool-shell" }
 harw-tools = { path = "../harw-tools" }
+# `sandbox-lease` (Plan `recursive-cooking-lobster.md` Teil B5) wartet mit
+# `tokio::time::timeout` auf die Antwort eines `HostPermitPrompt` (dieselbe
+# Frist wie `harw_tool_shell::HOST_PERMIT_PROMPT_TIMEOUT`). `tokio` stand
+# bislang nur unter `[dev-dependencies]` (für `#[tokio::test]`); das reicht
+# für Produktionscode nicht, weil ein Crate `tokio::...`-Pfade nur benutzen
+# darf, wenn es selbst als Abhängigkeit deklariert ist — auch wenn `tokio`
+# bereits transitiv über harw-tool-shell im Graphen liegt. Nur `time`
+# zusätzlich zur ohnehin vorhandenen dev-dependency-Featureliste, keine neue
+# externe Crate.
+tokio = { version = "1.52.3", features = ["time"] }
 # UIA-Delegationsrouting (`explore`/`research_web`): `AgentRoleId` wird
 # gebraucht, um die aufrufende `organizational_role` gegen `UserInterface`
 # zu prüfen. Vormals nur dev-dependency für Test-Fixtures — jetzt auch in

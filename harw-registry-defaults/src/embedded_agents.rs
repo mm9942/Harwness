@@ -2440,8 +2440,20 @@ mod tests {
             "roles/agent-steward.md: {} Bytes > 1500",
             AGENT_STEWARD_KNOWLEDGE.len()
         );
+        // `uia.md` trägt seit dem Abschnitt "Kommunikationsrhythmus" (erste
+        // Antwort vor Werkzeugaufrufen, Zwischenstände, sofortiger Bericht
+        // nach jedem Kind-Agenten) und seit "Sandbox & Host-Zugriff" (Regel
+        // zum Modell-Tool `sandbox-lease`, siehe `harw-ops/src/sandbox_lease.rs`
+        // und `harw-core/src/mode.rs::SHELL_PROMPT`) ein eigenes, etwas
+        // großzügigeres Budget als die übrigen Rollenregeln — sie bleibt die
+        // einzige Rolle mit dieser Auflage, weil nur sie die direkte
+        // Nutzeroberfläche ist.
+        assert!(
+            UIA_KNOWLEDGE.len() <= 2600,
+            "roles/uia.md: {} Bytes > 2600",
+            UIA_KNOWLEDGE.len()
+        );
         for (name, text) in [
-            ("uia.md", UIA_KNOWLEDGE),
             ("root-orchestrator.md", ROOT_ORCHESTRATOR_KNOWLEDGE),
             ("sub-orchestrator.md", SUB_ORCHESTRATOR_KNOWLEDGE),
         ] {

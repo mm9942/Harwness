@@ -1,6 +1,9 @@
 //! Fragekanal für Host-Profil-Permit-Anfragen zwischen [`crate::exec::ShellExecutor`]
 //! und einer anzeigenden Oberfläche (z. B. `harw-tui`).
 //!
+//! Spec source: `/home/mia/.claude/plans/recursive-cooking-lobster.md`, Teil B5
+//! (`SANDBOX_LEASE_WORKER_DEFINITION`) und Teil B3 (`HostPermitHandles`).
+//!
 //! # Verantwortungsbereich
 //! Dieses Modul besitzt genau den Vertrag, über den [`crate::exec::ShellExecutor`]
 //! (Sendeseite, [`HostPermitPromptSender`]) und ein Renderer (Empfängerseite,
@@ -29,6 +32,10 @@
 //! - [`HostPermitPrompt`] — die Frage, die beim Renderer ankommt.
 //! - [`HostPermitPromptSender`] / [`HostPermitPromptReceiver`] — die beiden
 //!   Enden des `mpsc`-Kanals.
+//! - [`HostPermitHandles`] — gebündelter ServiceMap-Eintrag (Ledger,
+//!   Registry, Fragekanal), siehe Plan Teil B3.
+//! - [`SANDBOX_LEASE_WORKER_DEFINITION`] — Worker-Definition der
+//!   `sandbox-lease`-Operation (Plan Teil B5).
 //!
 //! # Sicherheitsregel: Ablehnung ist der Default
 //! Ein geschlossener Fragekanal, eine fallengelassene Antwort oder ein
@@ -45,8 +52,11 @@
 //! Beantworten **konsumiert**. [`HostPermitPromptSender`] ist `Clone + Send +
 //! Sync` (ein `tokio::sync::mpsc::UnboundedSender`).
 
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use harw_sandbox::{HostPermitSessionRegistry, ProcessPermitLedger};
 use tokio::sync::{mpsc, oneshot};
 
 /// Die zwei Freigabevarianten aus
@@ -107,6 +117,66 @@ pub type HostPermitPromptReceiver = mpsc::UnboundedReceiver<HostPermitPrompt>;
 #[must_use]
 pub fn host_permit_prompt_channel() -> (HostPermitPromptSender, HostPermitPromptReceiver) {
     mpsc::unbounded_channel()
+}
+
+/// Einzige Worker-Definition der `sandbox-lease`-Operation (Plan
+/// `recursive-cooking-lobster.md` Teil B5, `harw-ops/src/sandbox_lease.rs`):
+/// eine über das Modell-Tool direkt angefragte Host-Freigabe trägt diesen
+/// Wert als [`HostPermitPrompt::worker_definition`], statt eines
+/// eingebetteten Host-Profil-Workers wie [`HostPermitPrompt`] es sonst
+/// üblicherweise transportiert — damit kann eine anzeigende Oberfläche den
+/// Dialogtext einer Sitzungsfreigabe-Anfrage von dem eines einzelnen
+/// Host-Profil-Befehls unterscheiden (Plan Teil B6).
+pub const SANDBOX_LEASE_WORKER_DEFINITION: &str = "sandbox-lease";
+
+/// Gebündelte Host-Permit-Handles — ein einzelner ServiceMap-Eintrag
+/// (`Arc<HostPermitHandles>`, Plan Teil B3), statt Ledger, Registry und
+/// Fragekanal einzeln durch jede Verdrahtungsebene zu reichen.
+///
+/// # Description
+/// Trägt genau die drei Teile, die [`ShellToolProvider`] für Host-Profil-
+/// und Sitzungsfreigabe-Ausführung braucht:
+/// [`ShellToolProvider::with_permit_ledger`], [`ShellToolProvider::with_host_permit_registry`]
+/// und [`ShellToolProvider::with_host_permit_prompts`]. `prompts` ist
+/// `Option`, weil manche Verdrahtungsebenen (z. B. eine kopflose Ausführung
+/// ohne UI) bewusst keine Oberfläche anhängen — das bleibt fail-closed, wie
+/// bei [`ShellToolProvider::host_permit_prompts`] dokumentiert.
+///
+/// # Concurrency
+/// `Clone`: `ledger`/`registry` klonen nur den `Arc`-Zeiger
+/// ([`Arc::clone`]), `prompts` klont den `mpsc::UnboundedSender`. `Debug` ist
+/// manuell implementiert, damit `prompts` nie mehr als `"<sender>"` zeigt —
+/// der Sender selbst trägt keine sensiblen Daten, aber sein `Debug`-Format
+/// ist kanalinterner Implementierungsdetail, keine für Logs gedachte
+/// Information.
+///
+/// [`ShellToolProvider`]: crate::exec::ShellToolProvider
+/// [`ShellToolProvider::with_permit_ledger`]: crate::exec::ShellToolProvider::with_permit_ledger
+/// [`ShellToolProvider::with_host_permit_registry`]: crate::exec::ShellToolProvider::with_host_permit_registry
+/// [`ShellToolProvider::with_host_permit_prompts`]: crate::exec::ShellToolProvider::with_host_permit_prompts
+/// [`ShellToolProvider::host_permit_prompts`]: crate::exec::ShellToolProvider::host_permit_prompts
+#[derive(Clone)]
+pub struct HostPermitHandles {
+    /// Der Permit-Ledger für Host-Profil-Ausführung.
+    pub ledger: Arc<ProcessPermitLedger>,
+    /// Die sitzungsseitige Zuordnung von UI-Zustimmungen zu Permits (Session-
+    /// und Einmalfreigaben, siehe [`HostPermitSessionRegistry`]).
+    pub registry: Arc<HostPermitSessionRegistry>,
+    /// Sendeseite des Host-Permit-Fragekanals; `None`, wenn keine
+    /// anzeigende Oberfläche angehängt ist (fail-closed, siehe Moduldoku).
+    pub prompts: Option<HostPermitPromptSender>,
+}
+
+impl fmt::Debug for HostPermitHandles {
+    /// Zeigt `ledger`/`registry` über ihr eigenes `Debug`, aber `prompts`
+    /// nur als `"<sender>"` (bzw. `None`) — nie den internen Kanalzustand.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HostPermitHandles")
+            .field("ledger", &self.ledger)
+            .field("registry", &self.registry)
+            .field("prompts", &self.prompts.as_ref().map(|_sender| "<sender>"))
+            .finish()
+    }
 }
 
 /// Eine einzelne Host-Permit-Frage auf dem Weg zum Renderer.
@@ -306,5 +376,52 @@ mod tests {
         let received = receiver.recv().await.expect("prompt must arrive");
         assert_eq!(received.session(), "s1");
         assert_eq!(received.preselected_variant(), HostPermitVariant::SessionLease);
+    }
+
+    #[test]
+    fn test_sandbox_lease_worker_definition_is_the_documented_literal() {
+        assert_eq!(SANDBOX_LEASE_WORKER_DEFINITION, "sandbox-lease");
+    }
+
+    #[test]
+    fn test_host_permit_handles_clone_shares_the_same_ledger_and_registry() {
+        let handles = HostPermitHandles {
+            ledger: Arc::new(ProcessPermitLedger::default()),
+            registry: Arc::new(HostPermitSessionRegistry::default()),
+            prompts: None,
+        };
+        let cloned = handles.clone();
+        assert!(Arc::ptr_eq(&handles.ledger, &cloned.ledger));
+        assert!(Arc::ptr_eq(&handles.registry, &cloned.registry));
+    }
+
+    #[test]
+    fn test_host_permit_handles_debug_hides_sender_details() {
+        let (sender, _receiver) = host_permit_prompt_channel();
+        let handles = HostPermitHandles {
+            ledger: Arc::new(ProcessPermitLedger::default()),
+            registry: Arc::new(HostPermitSessionRegistry::default()),
+            prompts: Some(sender),
+        };
+        let debugged = format!("{handles:?}");
+        assert!(
+            debugged.contains("\"<sender>\""),
+            "prompts must be redacted to \"<sender>\", got: {debugged}"
+        );
+        assert!(
+            !debugged.to_lowercase().contains("unboundedsender"),
+            "the sender's own Debug internals must not leak, got: {debugged}"
+        );
+    }
+
+    #[test]
+    fn test_host_permit_handles_debug_shows_none_without_a_sender() {
+        let handles = HostPermitHandles {
+            ledger: Arc::new(ProcessPermitLedger::default()),
+            registry: Arc::new(HostPermitSessionRegistry::default()),
+            prompts: None,
+        };
+        let debugged = format!("{handles:?}");
+        assert!(debugged.contains("prompts: None"), "{debugged}");
     }
 }

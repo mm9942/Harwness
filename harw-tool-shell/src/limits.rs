@@ -25,7 +25,7 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
-use harw_sandbox::{BwrapCommandPlan, BwrapLauncher};
+use harw_sandbox::BwrapLauncher;
 
 /// Feste Suchpfade für `prlimit` (util-linux). `PATH` wird nie ausgewertet,
 /// nur diese beiden absoluten Pfade — analog zu `BWRAP_CANDIDATES` in
@@ -209,28 +209,36 @@ pub(crate) struct LaunchCommand {
     pub(crate) args: Vec<OsString>,
 }
 
-/// Baut `prlimit <limits> -- <bwrap> <plan…>` bzw. ohne `prlimit` direkt
-/// `<bwrap> <plan…>`. `bwrap` wird als absoluter Pfad übergeben, damit auch
-/// `prlimit` (execvp) keine `PATH`-Suche durchführt.
+/// Baut `prlimit <limits> -- <program> <args…>` bzw. ohne `prlimit` direkt
+/// `<program> <args…>`. `program` wird als absoluter Pfad übergeben, damit
+/// auch `prlimit` (execvp) keine `PATH`-Suche durchführt.
+///
+/// Nimmt bewusst ein loses `program`/`args`-Paar statt eines
+/// [`harw_sandbox::BwrapCommandPlan`], damit derselbe Mechanismus auch den
+/// Host-Pfad ohne `bwrap` trägt (Plan `recursive-cooking-lobster.md` Teil B1,
+/// `crate::exec::ShellExecutor::run_host_command`): dort gibt es keinen
+/// `BwrapCommandPlan`, nur `/bin/sh -c <command>`. Der `bwrap`-Pfad
+/// (`crate::exec::ShellExecutor::run_command`) übergibt weiterhin
+/// `launcher.executable()` und `plan.args()`.
 pub(crate) fn launch_command(
     prlimit: Option<&Path>,
     limits: &ShellLimits,
-    bwrap: &Path,
-    plan: &BwrapCommandPlan,
+    program: &Path,
+    args: &[OsString],
 ) -> LaunchCommand {
     match prlimit {
         Some(prlimit) => {
-            let mut args = limits.prlimit_args();
-            args.push(bwrap.as_os_str().to_owned());
-            args.extend(plan.args().iter().cloned());
+            let mut prlimit_args = limits.prlimit_args();
+            prlimit_args.push(program.as_os_str().to_owned());
+            prlimit_args.extend(args.iter().cloned());
             LaunchCommand {
                 program: prlimit.to_path_buf(),
-                args,
+                args: prlimit_args,
             }
         }
         None => LaunchCommand {
-            program: bwrap.to_path_buf(),
-            args: plan.args().to_vec(),
+            program: program.to_path_buf(),
+            args: args.to_vec(),
         },
     }
 }
@@ -377,7 +385,7 @@ mod tests {
             Some(Path::new("/usr/bin/prlimit")),
             &limits,
             launcher.executable(),
-            &plan,
+            plan.args(),
         );
 
         assert_eq!(command.program, PathBuf::from("/usr/bin/prlimit"));
@@ -412,12 +420,57 @@ mod tests {
             None,
             &ShellLimits::default(),
             launcher.executable(),
-            &plan,
+            plan.args(),
         );
 
         assert_eq!(command.program, PathBuf::from("/usr/bin/bwrap"));
         assert_eq!(command.args, plan.args());
         assert!(!strings(&command.args).iter().any(|argument| argument.starts_with("--nproc")));
+    }
+
+    #[test]
+    fn launch_command_wraps_a_bare_program_without_a_bwrap_plan() {
+        // Plan Teil B1: `ShellExecutor::run_host_command` hat keinen `BwrapCommandPlan`
+        // (kein `bwrap` läuft dort), sondern nur `/bin/sh -c <command>`. Derselbe
+        // `launch_command`-Mechanismus muss auch dieses lose Programm/Args-Paar mit
+        // `prlimit` umschließen können, ohne eine bwrap-spezifische Plan-Struktur zu
+        // brauchen.
+        let limits = ShellLimits::default();
+        let args = [OsString::from("-c"), OsString::from("echo host_ok")];
+
+        let command = launch_command(
+            Some(Path::new("/usr/bin/prlimit")),
+            &limits,
+            Path::new("/bin/sh"),
+            &args,
+        );
+
+        assert_eq!(command.program, PathBuf::from("/usr/bin/prlimit"));
+        let strung = strings(&command.args);
+        assert_eq!(
+            strung,
+            [
+                "--as=2147483648",
+                "--cpu=60",
+                "--fsize=268435456",
+                "--nofile=256",
+                "--nproc=4096",
+                "--",
+                "/bin/sh",
+                "-c",
+                "echo host_ok",
+            ]
+        );
+    }
+
+    #[test]
+    fn launch_command_wraps_a_bare_program_without_prlimit() {
+        let args = [OsString::from("-c"), OsString::from("echo host_ok")];
+
+        let command = launch_command(None, &ShellLimits::default(), Path::new("/bin/sh"), &args);
+
+        assert_eq!(command.program, PathBuf::from("/bin/sh"));
+        assert_eq!(command.args, args.to_vec());
     }
 
     #[test]

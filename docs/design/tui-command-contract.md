@@ -138,7 +138,7 @@ Legend for **Tier**: `Obs` `Op` `Maint` `Own`.
 | `/fork` | `[--from=turn-id]` | Branch a new session from current or a past turn | Op | Y |
 | `/archive` | `<SessionKey>` | Move a session out of the active list | Op | Y |
 | `/sessions` | `[--all] [--agent=AgentRef]` | List sessions, optionally across agents | Obs | Y |
-| `/export` | `[--format md\|markdown\|json] [--tools\|--no-tools] [--reasoning-summary] [--datei <pfad>] [--max-chars <n>]` | Export a session transcript; `--max-chars <n>` caps the total rendered export length at `n` Unicode characters (whole export, not per entry) — implemented in `harw-ops/src/export.rs` (`ExportArgs::max_chars`) and consumed by `harw_tui::export::ExportOptions::max_chars` | Op | R |
+| `/export` | `[--format md\|markdown\|json] [--tools\|--no-tools] [--reasoning-summary] [--datei <pfad>] [--max-chars <n>]` | Export a session transcript; `--max-chars <n>` caps the total rendered export length at `n` Unicode characters (whole export, not per entry) — implemented in `harw-ops/src/export.rs` (`ExportArgs::max_chars`) and consumed by `harw_tui::export::ExportOptions::max_chars`. **Ist-Stand 2026-09-21:** lesbares Startdatum (`jiff`, RFC-3339-Stil statt Unix-Sekunden); Tool-Argumente/-Ergebnisse als verschachteltes Pretty-JSON bzw. als ` ```text ` -Block statt einer einzelnen Riesenzeile, pro Eintrag gekappt auf `ExportOptions.max_chars_per_entry` (Default 4000 Zeichen, zusätzlich zur globalen `--max-chars`-Kappung); Überschriften in User-/Assistant-Text um zwei Ebenen herabgestuft; Tool-Einträge (ToolCall/ToolResult/Reasoning) gruppiert unter „## harw" statt „## Du"; scheitert das Kopieren in die Zwischenablage, schreibt `/export` stattdessen die Datei (`default_export_path`) und meldet den Pfad, die OSC-52-Ausgabe wird in tmux zusätzlich mit einer DCS-Passthrough-Hülle umschlossen — siehe `interaction-contract.md` §2.6.7 | Op | R |
 
 ### 2.2 Agent & topology
 
@@ -187,6 +187,7 @@ Legend for **Tier**: `Obs` `Op` `Maint` `Own`.
 | `/config` | `<path> [value]` | Read or write a config key on disk | Maint | - |
 | `/policy` | `<PolicyRef> [value]` | Inspect or set a policy value | Maint (read: Op) | - |
 | `/sandbox` | `[--status] [--profile=name]` | Inspect or switch the active sandbox profile | Maint | - |
+| `/sandbox-lease` (neu, Nutzerentscheidung 2026-09-21) | `[status \| revoke]` | Host-Freigabe für `shell.exec`: `status` zeigt die aktive Freigabe (Sitzung/Einzelaufruf/aus), `revoke` beendet eine aktive Sitzungsfreigabe sofort (`busy = "immediate"`); die Freigabe selbst wird nicht über den Command, sondern über das gleichnamige Modell-Tool `sandbox-lease` (Argument `reason`) angefordert und im `HostPermitDialog` bestätigt — siehe `interaction-contract.md` §2.6 und `mediated-process-execution.md` | Maint | - |
 | `/plugins` | `[--list \| --enable=name \| --disable=name]` | Manage extension-api plugins | Maint | - |
 
 ### 2.6 Knowledge surfaces (names reserved here; semantics detailed by another design worker)
@@ -237,7 +238,7 @@ ordinary chat input routed to the active agent.
 | Prefix | Name | Behavior |
 |---|---|---|
 | `/` | **Command** | Structured command per §1–§2. |
-| `!` | **Shell** | Runs the remainder as a host shell command through the sandboxed execution surface; output streams to an Inline or Pager surface depending on length. Requires `Operator` tier and an enabled `commands.shell` capability flag. |
+| `!` | **Shell** | Runs the remainder as a host shell command through the sandboxed execution surface; output streams to an Inline or Pager surface depending on length. Requires `Operator` tier and an enabled `commands.shell` capability flag. **Ist-Stand 2026-09-21:** läuft mit dem beim Programmstart gelesenen zsh-PATH des harw-Prozesses — jedes existierende PATH-Verzeichnis außerhalb von `/usr /bin /lib /lib64` und dem Workspace wird per `--ro-bind-try` in die Sandbox gebunden (ausgenommen `/` und exakt `$HOME`), `~/.cargo/bin` zieht zusätzlich `RUSTUP_HOME`/`CARGO_HOME` nach sich; der Prozess läuft weiterhin in bwrap, nicht auf dem Host, und zwar unabhängig von einem aktiven `sandbox-lease`. Die normale Modell-`shell.exec` in der Projekt-Sandbox bleibt ohne Lease hermetisch mit Minimal-PATH — siehe `mediated-process-execution.md`. |
 | `!!` | **Shell-repeat** | Re-runs the last `!` shell command verbatim. Bare `!!` with no trailing text; any trailing text after `!!` is an error (`CommandError::TrailingTokens`), to avoid ambiguity with `!! <new cmd>` meaning something else. |
 | `#` | **Note** | Appends the remainder as a timestamped entry to `/diary` (§2.6) without invoking the agent. Never sent to the model as a prompt — purely a local annotation. |
 | `@` | **Mention** | Addresses a specific `AgentRef` or file. `@planner <text>` routes `<text>` to the named agent (equivalent to `/mention`). `@./path/to/file` (leading `./`, `../`, or `/`) attaches file content as context instead. Disambiguation rule: a token is an `AgentRef` if it resolves in the topology; otherwise, if it looks path-like, it is a file mention; otherwise it is a literal `@` character passed through as chat text with a warning toast. |

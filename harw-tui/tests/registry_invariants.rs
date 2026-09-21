@@ -414,6 +414,13 @@ fn all_registered_ops_are_reachable_by_name() {
         "review",
         "cancel",
         "retry",
+        // Plan `recursive-cooking-lobster.md` Teil B5
+        // (`harw-ops/src/sandbox_lease.rs`): `/sandbox-lease [status|revoke]`
+        // ist `command(visibility = "tui_only")` und damit Surface::Command,
+        // busy = Immediate (siehe `command_exec::busy_availability_for` --
+        // keine Sonderbehandlung nötig, die generische Immediate-Fallunter-
+        // scheidung greift bereits).
+        "sandbox-lease",
     ];
 
     // Jede Operation muss mindestens eine Fläche tragen. Eine ohne wäre über

@@ -40,6 +40,44 @@
 //! `#[cfg(test)]`, um die vorherigen Test-Erwartungen (feste Service-Bündel)
 //! als Closures nachzubilden.
 //!
+//! # Host-PATH für `!`-Befehle (Plan Teil C2)
+//! [`execute_shell`] baut seinen `ShellToolProvider` über
+//! [`shell_escape_provider`] mit der beim Prozessstart gelesenen
+//! [`harw_sandbox::HostPathBinding::from_env`] (der zsh-`PATH` des Nutzers,
+//! `RUSTUP_HOME`/`CARGO_HOME`). Ohne diese Bindung (`PATH` unset/leer) bleibt
+//! der `bwrap`-Plan byte-identisch zu heute. Die normale Modell-`shell.exec`-
+//! Ausführung in der Projekt-Sandbox bleibt davon unberührt — sie baut ihren
+//! eigenen `ShellToolProvider` in `harw-runtime`, nicht hier.
+//!
+//! # `!`-Modus wie in Claude Code (Plan Teil F)
+//! [`execute_shell`] liefert seit Plan Teil F kein reines `String` mehr,
+//! sondern [`ShellDisplayOutcome`] — Anzeigetext (`display_text`,
+//! byte-identisch zum bisherigen Rückgabewert) plus ein optionales
+//! strukturiertes [`ShellRunOutcome`] (`run`), gesetzt genau dann, wenn der
+//! `shell.exec`-Ausführer tatsächlich lief (`ToolOutput::Json` mit
+//! `exit_code`). [`execute_with_context`] nutzt weiterhin nur
+//! `display_text` und bleibt dadurch für alle bisherigen Aufrufer
+//! (`execute_command_as`, `dispatch_slash_command`, die Busy-Sofort-
+//! Dispatch- und Test-Pfade) unverändert.
+//!
+//! Die neue [`dispatch_command_with_shell_result`] ist der einzige Aufrufer,
+//! der `run` tatsächlich braucht: `app.rs`s `HarwEvent::Command`-Zweig ruft
+//! sie für jede Rohzeile auf, reicht den zuletzt gelaufenen `!`-Befehl der
+//! Sitzung (`ChatApp::last_shell_command`) als `last_shell_command` durch und
+//! startet bei `Some(shell)` sofort einen Folge-Turn mit dem Befehl,
+//! Exit-Code und der (auf 8000 Zeichen gekappten) Ausgabe als
+//! Nutzereingabe. `!!` ([`Invocation::ShellRepeat`]) wird hier — und nur
+//! hier — real aufgelöst: mit `last_shell_command = Some(cmd)` läuft `cmd`
+//! erneut über [`execute_shell`]; ohne Vorgänger liefert es den Text
+//! „Kein vorheriger !-Befehl“, `run: None` (kein Folge-Turn). Die alte,
+//! zustandslose [`execute_with_context`] kennt keinen Sitzungszustand und
+//! bleibt für `!!` bei „Shell-Wiederholung ist noch nicht verfügbar.“ — das
+//! ist folgenlos, weil `!!` als Nicht-`Command`-Invocation in
+//! [`busy_availability_for`] immer `DeferredUntilTurnEnd` ist und deshalb nie
+//! über den Busy-Sofort-Dispatch (`dispatch_slash_command`), sondern
+//! ausschließlich über den Idle-Zweig in `app.rs` (also über
+//! `dispatch_command_with_shell_result`) erreicht wird.
+//!
 //! # Nebenläufigkeit
 //! `execute_command_as` ist `async` und ruft `CommandAdapter::dispatch` (ebenfalls
 //! `async`) auf. Der Aufrufer (`run_loop` in `app.rs`) awaitet die Funktion im
@@ -69,6 +107,7 @@ use harw_operations::operation::BusyAvailability;
 #[cfg(test)]
 use harw_operations::registry::OperationRegistry;
 use harw_operations::{OpContext, PermissionTier, ServiceMap};
+use harw_sandbox::HostPathBinding;
 use harw_tool_shell::ShellToolProvider;
 use harw_tools::spec::ToolName;
 use harw_tools::{ToolCall, ToolExecutionContext, ToolOutput};
@@ -105,12 +144,21 @@ use crate::{
 ///   Turn sichtbar.
 /// - `job_store` (`Option<&Arc<harw_session_store::JobStore>>`): Optionaler
 ///   dauerhafter Job-Store.
+/// - `host_permit_handles` (`Option<&Arc<harw_tool_shell::HostPermitHandles>>`):
+///   Optionales Bündel aus Permit-Ledger, Host-Permit-Session-Registry und
+///   Fragekanal-Sender (Plan Teil B3/C2). In Produktion aus den
+///   `RuntimeAssembly`-Accessoren `host_permit_ledger()`/
+///   `host_permit_session_registry()`/`host_permit_prompt_sender()`
+///   gebaut (gleiche `Arc`-Instanzen, Sender geklont) — hier nur
+///   durchgereicht, damit `/sandbox-lease` und die `/status`-Zeile den
+///   Service in Tests auflösen können.
 #[cfg(test)]
 pub(crate) struct CommandServices<'a> {
     pub(crate) runtime_config: Option<&'a Arc<harw_config::ResolvedConfig>>,
     pub(crate) memory: Option<&'a Arc<dyn harw_memory::Memory>>,
     pub(crate) controller: &'a Arc<TuiSessionController>,
     pub(crate) job_store: Option<&'a Arc<harw_session_store::JobStore>>,
+    pub(crate) host_permit_handles: Option<&'a Arc<harw_tool_shell::HostPermitHandles>>,
 }
 
 /// Führt eine abgeschickte `/command`-Zeile über die Operation-Adapter-Pipeline
@@ -174,6 +222,7 @@ async fn execute_command(
                 services.memory,
                 services.controller,
                 services.job_store,
+                services.host_permit_handles,
             )
         },
     )
@@ -399,16 +448,61 @@ fn tui_dispatch_context(caller_permission: PermissionTier) -> DispatchContext {
     }
 }
 
+/// Klassifiziert eine Rohzeile und admittiert sie über
+/// [`CommandRegistry::dispatch`], ohne sie auszuführen.
+///
+/// # Beschreibung
+/// Aus [`execute_with_context`] herausgelöst (Plan Teil F), damit
+/// [`dispatch_command_with_shell_result`] dieselbe Klassifizierungs- und
+/// Admission-Logik verwendet, ohne sie zu duplizieren. Verhalten
+/// unverändert zum vorherigen Anfang von `execute_with_context`: ein
+/// Klassifizierungsfehler liefert `"Eingabe abgelehnt: {error}"`, ein
+/// Admission-Fehler den Text aus [`render_admission_error`].
+///
+/// # Rückgabe
+/// `Ok((typed, action))` bei erfolgreicher Admission — `typed` ist die vom
+/// Nutzer getippte Form (`/{name}` oder `"!"`) für spätere Fehlermeldungen.
+/// `Err(text)` mit dem fertigen Anzeigetext, wenn Klassifizierung oder
+/// Admission scheitert.
+fn classify_and_admit(
+    adapters: &[CommandAdapter],
+    context: DispatchContext,
+    raw_line: &str,
+) -> Result<(String, CommandAction), String> {
+    let invocation = match crate::classify_input(raw_line) {
+        Ok(invocation) => invocation,
+        Err(error) => return Err(format!("Eingabe abgelehnt: {error}")),
+    };
+    // Die vom Nutzer getippte Form (inkl. Alias) für Fehlermeldungen festhalten,
+    // bevor `dispatch` die Invocation konsumiert.
+    let typed = match &invocation {
+        Invocation::Command { name, .. } => format!("/{name}"),
+        Invocation::Shell(_) | Invocation::ShellRepeat => "!".to_owned(),
+        Invocation::Note(_) | Invocation::Mention { .. } | Invocation::Chat(_) => String::new(),
+    };
+
+    let registry = CommandRegistry::from_command_adapters(adapters);
+    match registry.dispatch(context, invocation) {
+        Ok(action) => Ok((typed, action)),
+        Err(error) => Err(render_admission_error(&typed, &error)),
+    }
+}
+
 /// Klassifiziert, admittiert (über [`CommandRegistry::dispatch`]) und führt aus.
 ///
 /// # Beschreibung
-/// Aus `adapters` wird per [`CommandRegistry::from_command_adapters`] der
-/// Dispatch-Katalog gebaut. Nur `Ok(CommandAction::Command(..))` führt zur
-/// Ausführung: der Adapter mit Pfad `/{spec.name}` wird gesucht, erst danach
-/// wird `services()` aufgerufen (baut die [`ServiceMap`]) und
-/// `CommandAdapter::dispatch` awaitet. Jeder Admission-Fehler wird über
-/// [`render_admission_error`] als Text zurückgegeben, ohne `services()`
-/// aufzurufen oder die Operation anzufassen.
+/// Nutzt [`classify_and_admit`] für Klassifizierung und Admission. Nur
+/// `Ok(CommandAction::Command(..))` führt zur Ausführung: der Adapter mit
+/// Pfad `/{spec.name}` wird gesucht, erst danach wird `services()`
+/// aufgerufen (baut die [`ServiceMap`]) und `CommandAdapter::dispatch`
+/// awaitet. Jeder Admission-Fehler wird unverändert als Text
+/// zurückgegeben, ohne `services()` aufzurufen oder die Operation
+/// anzufassen.
+///
+/// `CommandAction::Shell` liefert nur noch `display_text` aus
+/// [`ShellDisplayOutcome`] (siehe Moduldoc „`!`-Modus wie in Claude Code");
+/// `CommandAction::ShellRepeat` kennt hier — mangels Sitzungszustand — keinen
+/// vorherigen Befehl und bleibt bei der bisherigen Meldung (siehe Moduldoc).
 async fn execute_with_context<F>(
     adapters: &[CommandAdapter],
     sandbox: &SandboxSpec,
@@ -420,22 +514,9 @@ async fn execute_with_context<F>(
 where
     F: FnOnce() -> ServiceMap,
 {
-    let invocation = match crate::classify_input(raw_line) {
-        Ok(invocation) => invocation,
-        Err(error) => return format!("Eingabe abgelehnt: {error}"),
-    };
-    // Die vom Nutzer getippte Form (inkl. Alias) für Fehlermeldungen festhalten,
-    // bevor `dispatch` die Invocation konsumiert.
-    let typed = match &invocation {
-        Invocation::Command { name, .. } => format!("/{name}"),
-        Invocation::Shell(_) | Invocation::ShellRepeat => "!".to_owned(),
-        Invocation::Note(_) | Invocation::Mention { .. } | Invocation::Chat(_) => String::new(),
-    };
-
-    let registry = CommandRegistry::from_command_adapters(adapters);
-    let action = match registry.dispatch(context, invocation) {
-        Ok(action) => action,
-        Err(error) => return render_admission_error(&typed, &error),
+    let (typed, action) = match classify_and_admit(adapters, context, raw_line) {
+        Ok(pair) => pair,
+        Err(text) => return text,
     };
 
     match action {
@@ -459,7 +540,7 @@ where
                 Err(error) => format!("Fehler: {error}"),
             }
         }
-        CommandAction::Shell(command) => execute_shell(sandbox, session_id, command).await,
+        CommandAction::Shell(command) => execute_shell(sandbox, session_id, command).await.display_text,
         CommandAction::ShellRepeat => "Shell-Wiederholung ist noch nicht verfügbar.".to_owned(),
         CommandAction::Note(note) => format!("Notiz: {note}"),
         CommandAction::Mention { target, body } => format!("@{target}: {body}"),
@@ -467,17 +548,206 @@ where
     }
 }
 
+/// Ergebnis eines tatsächlich ausgeführten `!`/`!!`-Laufs (Plan Teil F):
+/// Grundlage für den automatischen Folge-Turn, den `app.rs` nach einem
+/// erfolgreichen `shell.exec`-Aufruf startet.
+///
+/// # Beschreibung
+/// Nur gesetzt, wenn der `shell.exec`-Ausführer wirklich lief und ein
+/// `ToolOutput::Json` mit `exit_code` lieferte (siehe [`execute_shell`]) —
+/// bei Admission-Fehlern (`HARW_DISABLE_SHELL`, fehlende Capability), einem
+/// nicht verfügbaren Ausführer oder einer Ablehnung durch die Sandbox-
+/// Autorität gibt es kein `ShellRunOutcome`, und `app.rs` startet dann
+/// bewusst keinen Folge-Turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShellRunOutcome {
+    /// Der ausgeführte Befehlstext, ohne führendes `!` (bei `!!` der
+    /// aufgelöste letzte Befehl der Sitzung).
+    pub(crate) command: String,
+    /// Exit-Code des Prozesses.
+    pub(crate) exit_code: i64,
+    /// `stdout` und `stderr` zusammengeführt, ungekappt — die Kappung auf
+    /// 8000 Zeichen erfolgt erst beim Bau der Folge-Turn-Nachricht in
+    /// `app.rs` (`build_shell_turn_message`).
+    pub(crate) combined_output: String,
+}
+
+/// Rückgabe von [`execute_shell`]: Anzeigetext für die Verlaufszelle
+/// (unverändert zum bisherigen `String`-Rückgabewert) plus optionales
+/// strukturiertes Ergebnis (Plan Teil F).
+struct ShellDisplayOutcome {
+    /// Anzeigetext für die Verlaufszelle — identisch zum Rückgabewert vor
+    /// Plan Teil F.
+    display_text: String,
+    /// Gesetzt, wenn der Ausführer tatsächlich ein `ToolOutput::Json` mit
+    /// Exit-Code lieferte. Siehe [`ShellRunOutcome`].
+    run: Option<ShellRunOutcome>,
+}
+
+/// Ergebnis von [`dispatch_command_with_shell_result`]: Anzeigetext für die
+/// Verlaufszelle (identisch zu dem, was `execute_command_as` liefern würde)
+/// plus optionales strukturiertes Shell-Ergebnis (Plan Teil F).
+pub(crate) struct CommandDispatchOutcome {
+    /// Anzeigetext für die Verlaufszelle.
+    pub(crate) text: String,
+    /// Gesetzt genau dann, wenn dieser Dispatch tatsächlich einen
+    /// `!`/`!!`-Shell-Befehl ausgeführt hat (nicht bei Admission-Fehlern,
+    /// Nicht-Shell-Commands oder `!!` ohne Vorgänger).
+    pub(crate) shell: Option<ShellRunOutcome>,
+}
+
+/// Klassifiziert, admittiert und führt eine Rohzeile aus — wie
+/// [`execute_command_as`], aber mit echter `!!`-Auflösung und
+/// strukturiertem Shell-Ergebnis (Plan Teil F).
+///
+/// # Beschreibung
+/// Nutzt dieselbe [`classify_and_admit`]-Admission wie
+/// [`execute_with_context`]. `CommandAction::Command`, `Note`, `Mention` und
+/// `Chat` verhalten sich identisch zu [`execute_with_context`] (`shell:
+/// None`). `CommandAction::Shell(command)` läuft über [`execute_shell`] und
+/// gibt dessen `run` unverändert weiter. `CommandAction::ShellRepeat` löst
+/// `last_shell_command` auf: `Some(cmd)` führt `cmd` erneut über
+/// [`execute_shell`] aus; `None` liefert `"Kein vorheriger !-Befehl"` mit
+/// `shell: None` (kein Folge-Turn).
+///
+/// # Argumente
+/// - `last_shell_command` (`Option<&str>`): der zuletzt in dieser Sitzung
+///   gelaufene `!`-Befehl (`ChatApp::last_shell_command`), für `!!`.
+///
+/// # Nebenläufigkeit
+/// `async`; ruft `services()` synchron, bevor `CommandAdapter::dispatch`
+/// bzw. [`execute_shell`] awaitet wird — wie [`execute_command_as`].
+pub(crate) async fn dispatch_command_with_shell_result<F>(
+    adapters: &[CommandAdapter],
+    sandbox: &SandboxSpec,
+    session_id: &SessionId,
+    caller_permission: PermissionTier,
+    raw_line: &str,
+    last_shell_command: Option<&str>,
+    services: F,
+) -> CommandDispatchOutcome
+where
+    F: FnOnce() -> ServiceMap,
+{
+    let context = tui_dispatch_context(caller_permission);
+    let (typed, action) = match classify_and_admit(adapters, context, raw_line) {
+        Ok(pair) => pair,
+        Err(text) => return CommandDispatchOutcome { text, shell: None },
+    };
+
+    match action {
+        CommandAction::Command(spec, raw_args) => {
+            let path = format!("/{}", spec.name.as_str());
+            let Some(adapter) = adapters.iter().find(|adapter| adapter.path() == path) else {
+                return CommandDispatchOutcome {
+                    text: format!("Unbekannter Command: {typed}"),
+                    shell: None,
+                };
+            };
+            let service_map = services();
+            let ctx = OpContext::new(
+                session_id.clone(),
+                TurnId::new(),
+                sandbox.clone(),
+                service_map,
+            );
+            let text = match adapter.dispatch(&ctx, raw_args).await {
+                Ok(output) => output.text,
+                Err(error) => format!("Fehler: {error}"),
+            };
+            CommandDispatchOutcome { text, shell: None }
+        }
+        CommandAction::Shell(command) => {
+            let outcome = execute_shell(sandbox, session_id, command).await;
+            CommandDispatchOutcome {
+                text: outcome.display_text,
+                shell: outcome.run,
+            }
+        }
+        CommandAction::ShellRepeat => match last_shell_command {
+            Some(command) => {
+                let outcome = execute_shell(sandbox, session_id, command.to_owned()).await;
+                CommandDispatchOutcome {
+                    text: outcome.display_text,
+                    shell: outcome.run,
+                }
+            }
+            None => CommandDispatchOutcome {
+                text: "Kein vorheriger !-Befehl".to_owned(),
+                shell: None,
+            },
+        },
+        CommandAction::Note(note) => CommandDispatchOutcome {
+            text: format!("Notiz: {note}"),
+            shell: None,
+        },
+        CommandAction::Mention { target, body } => CommandDispatchOutcome {
+            text: format!("@{target}: {body}"),
+            shell: None,
+        },
+        CommandAction::Chat(text) => CommandDispatchOutcome { text, shell: None },
+    }
+}
+
+/// Baut den `ShellToolProvider` für lokale `!`-Befehle, optional mit der
+/// beim Prozessstart gelesenen Host-PATH-Bindung (Plan
+/// `recursive-cooking-lobster.md` Teil C2).
+///
+/// # Beschreibung
+/// Reine Hilfsfunktion, ausgelagert aus [`execute_shell`], damit die
+/// Übernahme einer [`HostPathBinding`] in den `ShellToolProvider` ohne
+/// `bwrap`-Aufbau testbar ist: `binding = Some(..)` ruft
+/// [`ShellToolProvider::with_host_path`] auf, `binding = None` liefert den
+/// unveränderten `ShellToolProvider::new()`. Wirkt sich nur auf den
+/// `bwrap`-Sandbox-Pfad von `run_command` aus, nicht auf die normale
+/// Modell-`shell.exec`-Ausführung (die baut ihren eigenen
+/// `ShellToolProvider` ohne Host-PATH-Bindung, siehe `harw-runtime`).
+///
+/// # Argumente
+/// - `binding` (`Option<HostPathBinding>`): siehe [`HostPathBinding::from_env`].
+///
+/// # Rückgabe
+/// Ein [`ShellToolProvider`] mit oder ohne Host-PATH-Bindung.
+fn shell_escape_provider(binding: Option<HostPathBinding>) -> ShellToolProvider {
+    let provider = ShellToolProvider::new();
+    match binding {
+        Some(binding) => provider.with_host_path(binding),
+        None => provider,
+    }
+}
+
 /// Führt einen lokalen `!`-Befehl ausschließlich über den normalen,
 /// Bubblewrap-gebundenen `shell.exec`-Ausführer aus. Die übergebene TUI-Sandbox
 /// ist die gesamte Autoritätsquelle; weder Arbeitsverzeichnis noch Rechte kommen
-/// aus dem vom Benutzer getippten Text.
-async fn execute_shell(sandbox: &SandboxSpec, session_id: &SessionId, command: String) -> String {
-    let provider = ShellToolProvider::new();
+/// aus dem vom Benutzer getippten Text. Der beim Start dieses Prozesses
+/// gelesene zsh-PATH ([`HostPathBinding::from_env`]) wird über
+/// [`shell_escape_provider`] an den `ShellToolProvider` gereicht (Plan Teil
+/// C2) — wirkt sich nur auf den `bwrap`-Pfad aus, nicht auf die normale
+/// Modell-`shell.exec`-Ausführung.
+///
+/// Liefert seit Plan Teil F [`ShellDisplayOutcome`] statt eines reinen
+/// `String`: `display_text` ist byte-identisch zum bisherigen
+/// Rückgabewert; `run` ist nur bei einem echten `ToolOutput::Json`-Ergebnis
+/// gesetzt (siehe [`ShellRunOutcome`]).
+async fn execute_shell(
+    sandbox: &SandboxSpec,
+    session_id: &SessionId,
+    command: String,
+) -> ShellDisplayOutcome {
+    let provider = shell_escape_provider(HostPathBinding::from_env());
     let tool_name = ToolName::new("shell.exec");
     let Some(executor) = provider.executor(&tool_name) else {
-        return "Shell-Ausführung fehlgeschlagen: shell.exec ist nicht verfügbar.".to_owned();
+        return ShellDisplayOutcome {
+            display_text: "Shell-Ausführung fehlgeschlagen: shell.exec ist nicht verfügbar."
+                .to_owned(),
+            run: None,
+        };
     };
     let context = ToolExecutionContext::new(session_id.clone(), TurnId::new(), sandbox.clone());
+    // Geklont, weil `command` unten für `ShellRunOutcome::command` gebraucht
+    // wird, nachdem `serde_json::json!` das Original in die Aufrufargumente
+    // verschoben hat.
+    let command_for_result = command.clone();
     let call = ToolCall {
         id: ToolCallId::new(),
         name: tool_name,
@@ -497,16 +767,39 @@ async fn execute_shell(sandbox: &SandboxSpec, session_id: &SessionId, command: S
                 .get("exit_code")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(-1);
-            match (stdout.is_empty(), stderr.is_empty()) {
+            let display_text = match (stdout.is_empty(), stderr.is_empty()) {
                 (true, true) => format!("Shell beendet (Exit-Code {exit_code})."),
                 (false, true) => stdout.to_owned(),
                 (true, false) => format!("stderr:\n{stderr}"),
                 (false, false) => format!("{stdout}\nstderr:\n{stderr}"),
+            };
+            let combined_output = match (stdout.is_empty(), stderr.is_empty()) {
+                (true, true) => String::new(),
+                (false, true) => stdout.to_owned(),
+                (true, false) => stderr.to_owned(),
+                (false, false) => format!("{stdout}\n{stderr}"),
+            };
+            ShellDisplayOutcome {
+                display_text,
+                run: Some(ShellRunOutcome {
+                    command: command_for_result,
+                    exit_code,
+                    combined_output,
+                }),
             }
         }
-        Ok(ToolOutput::Text { content }) => content,
-        Ok(ToolOutput::Error { message }) => format!("Shell-Ausführung abgelehnt: {message}"),
-        Err(error) => format!("Shell-Ausführung fehlgeschlagen: {error}"),
+        Ok(ToolOutput::Text { content }) => ShellDisplayOutcome {
+            display_text: content,
+            run: None,
+        },
+        Ok(ToolOutput::Error { message }) => ShellDisplayOutcome {
+            display_text: format!("Shell-Ausführung abgelehnt: {message}"),
+            run: None,
+        },
+        Err(error) => ShellDisplayOutcome {
+            display_text: format!("Shell-Ausführung fehlgeschlagen: {error}"),
+            run: None,
+        },
     }
 }
 
@@ -567,12 +860,24 @@ fn render_admission_error(typed: &str, error: &CommandError) -> String {
 /// - `controller` (`&Arc<TuiSessionController>`): Langlebiger Controller aus
 ///   `ChatApp`; wird als `SharedSessionController` eingetragen, damit der Zustand
 ///   über mehrere `execute_command`-Aufrufe hinweg erhalten bleibt.
+/// - `job_store` (`Option<&Arc<harw_session_store::JobStore>>`): Optionaler
+///   dauerhafter Job-Store.
+/// - `host_permit_handles` (`Option<&Arc<harw_tool_shell::HostPermitHandles>>`):
+///   Optionales Bündel aus Permit-Ledger, Host-Permit-Session-Registry und
+///   Fragekanal-Sender (Plan Teil B3/C2), z. B. gebaut aus den
+///   `RuntimeAssembly`-Accessoren `host_permit_ledger()`/
+///   `host_permit_session_registry()`/`host_permit_prompt_sender()` (gleiche
+///   `Arc`-Instanzen, Sender geklont). Vorhanden: derselbe `Arc` wird 1:1 in
+///   die `ServiceMap` übernommen, damit `/sandbox-lease` und die
+///   `/status`-Zeile ihn über `ctx.service::<Arc<harw_tool_shell::HostPermitHandles>>()`
+///   finden.
 ///
 /// # Rückgabe
 /// Eine [`ServiceMap`] mit [`OperationRegistry`], [`SharedSessionController`],
 /// je einer leeren `AllowRuleSet` und `ExtraRootsCell` (gleiche Fläche wie
 /// `RuntimeServices::service_map(ServiceSurface::Slash)`) sowie optionalem
-/// `Arc<harw_config::ResolvedConfig>` und `Arc<dyn Memory>`.
+/// `Arc<harw_config::ResolvedConfig>`, `Arc<dyn Memory>` und
+/// `Arc<harw_tool_shell::HostPermitHandles>`.
 ///
 /// # Spec
 /// harw-tui Design §session_controller — build_services long-lived controller.
@@ -586,6 +891,7 @@ pub(crate) fn build_services(
     memory: Option<&Arc<dyn harw_memory::Memory>>,
     controller: &Arc<TuiSessionController>,
     job_store: Option<&Arc<harw_session_store::JobStore>>,
+    host_permit_handles: Option<&Arc<harw_tool_shell::HostPermitHandles>>,
 ) -> ServiceMap {
     let mut registry = OperationRegistry::new();
     let mut seen: HashSet<&str> = HashSet::new();
@@ -606,6 +912,13 @@ pub(crate) fn build_services(
     }
     if let Some(store) = job_store {
         services.insert(Arc::clone(store));
+    }
+    if let Some(handles) = host_permit_handles {
+        // Derselbe `Arc<HostPermitHandles>`-Zeiger wandert unverändert in die
+        // ServiceMap — kein Neubau aus den einzelnen Feldern, damit `/status`
+        // und `/sandbox-lease` exakt denselben Ledger/Registry-Zustand sehen
+        // wie die `RuntimeAssembly`, aus der der Aufrufer sie gebaut hat.
+        services.insert(Arc::clone(handles));
     }
     // Upcast zu Arc<dyn SessionController> VOR dem insert, damit TypeId::of::<SharedSessionController>()
     // mit dem Schlüssel übereinstimmt, den harw-ops-Handler-Code via
@@ -648,7 +961,9 @@ mod tests {
     use crate::CommandRegistry;
     use harw_operations::SessionController;
 
-    use super::{CommandServices, build_services};
+    use super::{
+        CommandServices, build_services, dispatch_command_with_shell_result, shell_escape_provider,
+    };
 
     /// Baut alle 16 `harw-ops`-Adapter über die echte Registrierungsfunktion.
     fn adapters() -> Vec<CommandAdapter> {
@@ -766,6 +1081,7 @@ mod tests {
                 memory: None,
                 controller: &test_controller(),
                 job_store: None,
+                host_permit_handles: None,
             },
         )
         .await;
@@ -799,6 +1115,7 @@ mod tests {
                 memory: None,
                 controller: &test_controller(),
                 job_store: None,
+                host_permit_handles: None,
             },
         )
         .await;
@@ -833,6 +1150,7 @@ mod tests {
                 memory: None,
                 controller: &controller,
                 job_store: None,
+                host_permit_handles: None,
             },
         )
         .await;
@@ -868,6 +1186,7 @@ mod tests {
                 memory: None,
                 controller: &test_controller(),
                 job_store: None,
+                host_permit_handles: None,
             },
         )
         .await;
@@ -896,6 +1215,7 @@ mod tests {
                 memory: None,
                 controller: &test_controller(),
                 job_store: None,
+                host_permit_handles: None,
             },
         )
         .await;
@@ -923,12 +1243,114 @@ mod tests {
                 memory: None,
                 controller: &test_controller(),
                 job_store: None,
+                host_permit_handles: None,
             },
         )
         .await;
         std::fs::remove_dir_all(tmp).ok();
 
         assert_eq!(output, "Shell-Wiederholung ist noch nicht verfügbar.");
+    }
+
+    // -----------------------------------------------------------------------
+    // Plan Teil F: `dispatch_command_with_shell_result` löst `!!` echt auf.
+    // -----------------------------------------------------------------------
+
+    /// Ohne einen vorherigen `!`-Befehl liefert `!!` den dokumentierten
+    /// Hinweistext und kein `ShellRunOutcome` — `app.rs` darf dann keinen
+    /// Folge-Turn starten.
+    #[tokio::test]
+    async fn dispatch_shell_repeat_without_previous_command_reports_hint() {
+        let adapters = adapters();
+        let (sandbox, tmp) = test_sandbox();
+        let session_id = SessionId::new();
+        let controller = test_controller();
+
+        let outcome = dispatch_command_with_shell_result(
+            &adapters,
+            &sandbox,
+            &session_id,
+            harw_operations::PermissionTier::Owner,
+            "!!",
+            None,
+            || build_services(&adapters, None, None, &controller, None, None),
+        )
+        .await;
+        std::fs::remove_dir_all(tmp).ok();
+
+        assert_eq!(outcome.text, "Kein vorheriger !-Befehl");
+        assert!(outcome.shell.is_none());
+    }
+
+    /// Mit einem vorherigen Befehl versucht `!!`, ihn über `execute_shell`
+    /// erneut auszuführen — anders als die zustandslose `execute_with_context`
+    /// (siehe `test_shell_repeat_is_not_implemented`), die diesen Zustand
+    /// nicht kennt. `test_sandbox()` gewährt kein `ExecuteProcess`, daher
+    /// scheitert die Ausführung fail-closed; das beweist trotzdem, dass der
+    /// gespeicherte Befehl tatsächlich (erneut) beim Ausführer ankommt statt
+    /// bei der alten „noch nicht verfügbar"-Meldung stehen zu bleiben.
+    #[tokio::test]
+    async fn dispatch_shell_repeat_with_previous_command_reruns_it() {
+        let adapters = adapters();
+        let (sandbox, tmp) = test_sandbox();
+        let session_id = SessionId::new();
+        let controller = test_controller();
+
+        let outcome = dispatch_command_with_shell_result(
+            &adapters,
+            &sandbox,
+            &session_id,
+            harw_operations::PermissionTier::Owner,
+            "!!",
+            Some("echo hi"),
+            || build_services(&adapters, None, None, &controller, None, None),
+        )
+        .await;
+        std::fs::remove_dir_all(tmp).ok();
+
+        assert_eq!(
+            outcome.text,
+            "Shell-Ausführung abgelehnt: shell.exec denied: ExecuteProcess permission missing"
+        );
+        assert!(
+            outcome.shell.is_none(),
+            "eine von der Sandbox abgelehnte Ausführung darf keinen Folge-Turn auslösen"
+        );
+        assert_ne!(
+            outcome.text, "Shell-Wiederholung ist noch nicht verfügbar.",
+            "dispatch_command_with_shell_result muss !! wirklich auflösen"
+        );
+    }
+
+    /// Ein direkter `!`-Befehl (nicht `!!`) läuft über denselben Pfad wie
+    /// `execute_with_context`s `CommandAction::Shell`-Zweig — `test_sandbox()`
+    /// gewährt kein `ExecuteProcess`, daher `shell: None` und derselbe
+    /// Ablehnungstext wie bei der bestehenden `!`-Deny-Prüfung
+    /// (`test_execute_with_context_admitted_shell_denied_without_execute_permission`).
+    #[tokio::test]
+    async fn dispatch_shell_command_reports_no_structured_result_when_denied() {
+        let adapters: Vec<CommandAdapter> = Vec::new();
+        let (sandbox, tmp) = test_sandbox();
+        let session_id = SessionId::new();
+        let controller = test_controller();
+
+        let outcome = dispatch_command_with_shell_result(
+            &adapters,
+            &sandbox,
+            &session_id,
+            harw_operations::PermissionTier::Owner,
+            "!echo hi",
+            None,
+            || build_services(&adapters, None, None, &controller, None, None),
+        )
+        .await;
+        std::fs::remove_dir_all(tmp).ok();
+
+        assert!(outcome.shell.is_none());
+        assert_eq!(
+            outcome.text,
+            "Shell-Ausführung abgelehnt: shell.exec denied: ExecuteProcess permission missing"
+        );
     }
 
     #[tokio::test]
@@ -947,6 +1369,7 @@ mod tests {
             memory: None,
             controller: &controller,
             job_store: None,
+            host_permit_handles: None,
         };
 
         let shell = super::execute_with_context(
@@ -962,6 +1385,7 @@ mod tests {
                     services.memory,
                     services.controller,
                     services.job_store,
+                    services.host_permit_handles,
                 )
             },
         )
@@ -974,6 +1398,7 @@ mod tests {
                     services.memory,
                     services.controller,
                     services.job_store,
+                    services.host_permit_handles,
                 )
             })
             .await;
@@ -1010,6 +1435,7 @@ mod tests {
                 memory: None,
                 controller: &test_controller(),
                 job_store: None,
+                host_permit_handles: None,
             },
         )
         .await;
@@ -1038,6 +1464,7 @@ mod tests {
                 memory: None,
                 controller: &test_controller(),
                 job_store: None,
+                host_permit_handles: None,
             },
         )
         .await;
@@ -1062,6 +1489,7 @@ mod tests {
                 memory: None,
                 controller: &test_controller(),
                 job_store: None,
+                host_permit_handles: None,
             },
         )
         .await;
@@ -1091,6 +1519,7 @@ mod tests {
                 memory: None,
                 controller: &test_controller(),
                 job_store: None,
+                host_permit_handles: None,
             },
         )
         .await;
@@ -1115,7 +1544,7 @@ mod tests {
             &session_id,
             harw_operations::PermissionTier::Observer,
             "/model list",
-            || build_services(&adapters, None, None, &controller, None),
+            || build_services(&adapters, None, None, &controller, None, None),
         )
         .await;
         std::fs::remove_dir_all(tmp).ok();
@@ -1140,7 +1569,7 @@ mod tests {
             &SessionId::new(),
             PermissionTier::Observer,
             "/guard",
-            || build_services(&adapters, None, None, &controller, None),
+            || build_services(&adapters, None, None, &controller, None, None),
         )
         .await;
         std::fs::remove_dir_all(tmp).ok();
@@ -1175,7 +1604,7 @@ mod tests {
             &session_id,
             PermissionTier::Observer,
             "/protected",
-            || build_services(&adapters, None, None, &controller, None),
+            || build_services(&adapters, None, None, &controller, None, None),
         )
         .await;
         assert_eq!(
@@ -1194,7 +1623,7 @@ mod tests {
             &session_id,
             PermissionTier::Operator,
             "/protected",
-            || build_services(&adapters, None, None, &controller, None),
+            || build_services(&adapters, None, None, &controller, None, None),
         )
         .await;
         std::fs::remove_dir_all(tmp).ok();
@@ -1216,7 +1645,7 @@ mod tests {
             &session_id,
             PermissionTier::Operator,
             "/stauts",
-            || build_services(&adapters, None, None, &controller, None),
+            || build_services(&adapters, None, None, &controller, None, None),
         )
         .await;
         std::fs::remove_dir_all(tmp).ok();
@@ -1256,7 +1685,7 @@ mod tests {
             "/model list",
             || {
                 calls.fetch_add(1, Ordering::Relaxed);
-                build_services(&adapters, None, None, &controller, None)
+                build_services(&adapters, None, None, &controller, None, None)
             },
         )
         .await;
@@ -1279,7 +1708,7 @@ mod tests {
             "/model list",
             || {
                 calls.fetch_add(1, Ordering::Relaxed);
-                build_services(&adapters, None, None, &controller, None)
+                build_services(&adapters, None, None, &controller, None, None)
             },
         )
         .await;
@@ -1315,6 +1744,7 @@ mod tests {
                 memory: None,
                 controller: &test_controller(),
                 job_store: None,
+                host_permit_handles: None,
             },
         )
         .await;
@@ -1352,6 +1782,7 @@ mod tests {
                 memory: None,
                 controller: &controller,
                 job_store: None,
+                host_permit_handles: None,
             },
         )
         .await;
@@ -1365,6 +1796,7 @@ mod tests {
                 memory: None,
                 controller: &controller,
                 job_store: None,
+                host_permit_handles: None,
             },
         )
         .await;
@@ -1431,7 +1863,7 @@ mod tests {
             .expect("set_reasoning_effort must succeed");
 
         // Erster build_services-Aufruf — klont den Controller-Arc in die ServiceMap.
-        let services1 = super::build_services(&adapters, None, None, &controller, None);
+        let services1 = super::build_services(&adapters, None, None, &controller, None, None);
         // Abruf via SharedSessionController-TypeId (Arc<dyn SessionController>).
         let retrieved1 = services1
             .get::<SharedSessionController>()
@@ -1443,7 +1875,7 @@ mod tests {
         );
 
         // Zweiter build_services-Aufruf — derselbe Arc, keine neue Allokation.
-        let services2 = super::build_services(&adapters, None, None, &controller, None);
+        let services2 = super::build_services(&adapters, None, None, &controller, None, None);
         let retrieved2 = services2
             .get::<SharedSessionController>()
             .expect("SharedSessionController must be in ServiceMap after second call");
@@ -1466,7 +1898,7 @@ mod tests {
         let runtime_config = Arc::new(harw_config::ResolvedConfig::default());
 
         let services =
-            super::build_services(&adapters, Some(&runtime_config), None, &controller, None);
+            super::build_services(&adapters, Some(&runtime_config), None, &controller, None, None);
         let retrieved = services
             .get::<Arc<harw_config::ResolvedConfig>>()
             .expect("ResolvedConfig Arc must be present when supplied");
@@ -1484,7 +1916,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = Arc::new(harw_session_store::JobStore::new(temp.path()));
 
-        let services = super::build_services(&adapters, None, None, &controller, Some(&store));
+        let services = super::build_services(&adapters, None, None, &controller, Some(&store), None);
         let resolved = services
             .get::<Arc<harw_session_store::JobStore>>()
             .expect("durable job store must be available to command operations");
@@ -1529,7 +1961,7 @@ mod tests {
             &session_id,
             PermissionTier::Operator,
             "/status",
-            || build_services(&[], None, None, &controller, None),
+            || build_services(&[], None, None, &controller, None, None),
         )
         .await;
         std::fs::remove_dir_all(tmp).ok();
@@ -1646,5 +2078,170 @@ mod tests {
             super::busy_availability_for(&registry, &format!("/{alias}")),
             BusyAvailability::Immediate
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 14. shell_escape_provider (C2): HostPathBinding taken up by the
+    //     ShellToolProvider that backs local `!`-commands.
+    // -----------------------------------------------------------------------
+
+    /// `shell_escape_provider_without_binding_leaves_host_path_none`: with no
+    /// `HostPathBinding` (e.g. `HostPathBinding::from_env()` returned `None`
+    /// because `PATH` was unset), the built provider must be indistinguishable
+    /// from `ShellToolProvider::new()` — no bwrap plan change without a call.
+    #[test]
+    fn shell_escape_provider_without_binding_leaves_host_path_none() {
+        let provider = shell_escape_provider(None);
+        assert!(
+            provider.host_path.is_none(),
+            "shell_escape_provider(None) must not set a host_path binding"
+        );
+    }
+
+    /// `shell_escape_provider_with_binding_sets_host_path`: with a supplied
+    /// `HostPathBinding`, `shell_escape_provider` must thread it through
+    /// `ShellToolProvider::with_host_path` unchanged (Plan Teil C2). Verified
+    /// without ever touching `bwrap` — this is a pure struct-field check.
+    #[test]
+    fn shell_escape_provider_with_binding_sets_host_path() {
+        let binding = harw_sandbox::HostPathBinding {
+            path: "/host/bin:/host/usr/bin".to_owned(),
+            ..harw_sandbox::HostPathBinding::default()
+        };
+
+        let provider = shell_escape_provider(Some(binding.clone()));
+
+        assert_eq!(
+            provider.host_path,
+            Some(binding),
+            "shell_escape_provider(Some(binding)) must carry the exact binding into \
+             ShellToolProvider::host_path via with_host_path"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 15. build_services (W2d/B3-C2): Arc<HostPermitHandles> service entry
+    // -----------------------------------------------------------------------
+
+    /// `build_services_inserts_host_permit_handles_from_assembly_accessors`:
+    /// a caller building `Arc<harw_tool_shell::HostPermitHandles>` from the
+    /// `RuntimeAssembly` accessors (`host_permit_ledger()`,
+    /// `host_permit_session_registry()`, `host_permit_prompt_sender()` —
+    /// stood in here by directly-constructed `ProcessPermitLedger`/
+    /// `HostPermitSessionRegistry` `Arc`s, since building a full
+    /// `RuntimeAssembly` is out of scope for this module) must see the exact
+    /// same `Arc` threaded through `build_services` into the `ServiceMap` —
+    /// no rebuild, no clone-of-contents. This is what makes `/sandbox-lease`
+    /// and the `/status` line resolve the live ledger/registry state.
+    #[test]
+    fn build_services_inserts_host_permit_handles_from_assembly_accessors() {
+        let adapters = adapters();
+        let controller = test_controller();
+        let ledger = Arc::new(harw_sandbox::ProcessPermitLedger::default());
+        let registry = Arc::new(harw_sandbox::HostPermitSessionRegistry::default());
+        let handles = Arc::new(harw_tool_shell::HostPermitHandles {
+            ledger: Arc::clone(&ledger),
+            registry: Arc::clone(&registry),
+            prompts: None,
+        });
+
+        let services = build_services(&adapters, None, None, &controller, None, Some(&handles));
+
+        let retrieved = services
+            .get::<Arc<harw_tool_shell::HostPermitHandles>>()
+            .expect("HostPermitHandles must be present in the ServiceMap when supplied");
+
+        assert!(
+            Arc::ptr_eq(retrieved, &handles),
+            "the exact Arc<HostPermitHandles> supplied by the caller must be threaded through \
+             unchanged, not rebuilt"
+        );
+        assert!(
+            Arc::ptr_eq(&retrieved.ledger, &ledger),
+            "the ledger Arc inside HostPermitHandles must stay ptr-identical to the assembly's \
+             ledger (Arc::clone of the pointer, never a fresh ledger)"
+        );
+        assert!(
+            Arc::ptr_eq(&retrieved.registry, &registry),
+            "the registry Arc inside HostPermitHandles must stay ptr-identical to the \
+             assembly's host permit session registry"
+        );
+    }
+
+    /// `build_services_without_host_permit_handles_leaves_service_absent`:
+    /// `None` must not insert any `Arc<HostPermitHandles>` into the
+    /// `ServiceMap` — composition roots that never wire host permits (e.g. a
+    /// headless run without the accessors available) must not accidentally
+    /// expose a fabricated service.
+    #[test]
+    fn build_services_without_host_permit_handles_leaves_service_absent() {
+        let adapters = adapters();
+        let controller = test_controller();
+
+        let services = build_services(&adapters, None, None, &controller, None, None);
+
+        assert!(
+            services
+                .get::<Arc<harw_tool_shell::HostPermitHandles>>()
+                .is_none(),
+            "without a supplied HostPermitHandles, the ServiceMap must not contain one"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 16. busy_availability_for (Auftrag Punkt 3): the new `sandbox-lease`
+    //     op needs no special-casing — the generic `Immediate` fallthrough
+    //     must already cover it, exactly like `status`/`ps`/`usage`.
+    // -----------------------------------------------------------------------
+
+    /// Test-Doppel für `/sandbox-lease` (Plan B5, registriert von
+    /// `harw-ops/src/sandbox_lease.rs`): eine reine `busy = Immediate`
+    /// `OperationMeta` ohne Modell-Tool-Zusatzlogik, unabhängig davon, ob die
+    /// echte `harw-ops`-Registrierung in dieser Welle bereits gelandet ist.
+    impl CountingOperation {
+        fn sandbox_lease_stub() -> Self {
+            Self {
+                meta: OperationMeta {
+                    name: "sandbox-lease",
+                    summary: "Test-only sandbox-lease stand-in.",
+                    domain: OperationDomain::Misc,
+                    permission: PermissionTier::Operator,
+                    surfaces: vec![Surface::Command {
+                        path: "/sandbox-lease",
+                        visibility: CommandVisibility::TuiOnly,
+                    }],
+                    aliases: &[],
+                    category: OperationCategory::Misc,
+                    args_schema: None,
+                    output_schema: None,
+                    busy: BusyAvailability::Immediate,
+                },
+                meta_reads: AtomicUsize::new(0),
+                dispatches: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    /// `busy_availability_for_sandbox_lease_is_immediate_without_special_casing`:
+    /// bare `/sandbox-lease` and `/sandbox-lease status`/`/sandbox-lease
+    /// revoke` must all classify as `Immediate` via the generic `(_, _) =>
+    /// BusyAvailability::Immediate` fallthrough in
+    /// [`super::busy_availability_for`] — unlike `model`/`provider`, no
+    /// first-argument rule is needed, because every `/sandbox-lease`
+    /// sub-command is safe to dispatch immediately (Contract §Auftrag
+    /// Punkt 3: "sollte nicht" nötig sein).
+    #[test]
+    fn busy_availability_for_sandbox_lease_is_immediate_without_special_casing() {
+        let operation = Arc::new(CountingOperation::sandbox_lease_stub());
+        let adapters = CommandAdapter::from_operation(operation);
+        let registry = CommandRegistry::from_command_adapters(&adapters);
+
+        for raw in ["/sandbox-lease", "/sandbox-lease status", "/sandbox-lease revoke"] {
+            assert_eq!(
+                super::busy_availability_for(&registry, raw),
+                BusyAvailability::Immediate,
+                "'{raw}' must classify as Immediate without any sandbox-lease-specific rule"
+            );
+        }
     }
 }

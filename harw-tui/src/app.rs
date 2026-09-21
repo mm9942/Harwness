@@ -140,12 +140,15 @@ use crate::approval_dialog::{ApprovalChoice, ApprovalDialog, ApprovalDialogReque
 use crate::chat_scroll::{ChatScroll, ScrollAction};
 use crate::choice_dialog::{ChoiceAction, ChoiceDialog};
 use crate::clipboard::{self, ClipboardTarget};
-use crate::command_exec::{busy_availability_for, dispatch_slash_command, execute_command_as};
+use crate::command_exec::{
+    ShellRunOutcome, busy_availability_for, dispatch_command_with_shell_result,
+    dispatch_slash_command, execute_command_as,
+};
 use crate::command_popup::{CommandPopup, PopupAction, TabOutcome};
 use crate::events::{HarwEvent, HarwEventSender};
 use crate::export::{
-    self, ExportAgentEntry, ExportEntry, ExportErrorEntry, ExportMeta, ExportMetaExtensions,
-    ExportOptions, ExportPlanEntry, ExportStatus,
+    self, ExportAgentEntry, ExportEntry, ExportError, ExportErrorEntry, ExportMeta,
+    ExportMetaExtensions, ExportOptions, ExportPlanEntry, ExportStatus,
 };
 use crate::frame_requester::{FrameRequester, MIN_FRAME_INTERVAL};
 use crate::history_cell::{
@@ -692,6 +695,123 @@ pub fn classify_line(line: &str) -> LineAction {
     }
 }
 
+/// Erkennt, ob der aktuell getippte (noch nicht abgeschickte) Composer-Text
+/// im Shell-Modus gerendert werden soll (Plan Teil F: `!`-Modus wie in
+/// Claude Code).
+///
+/// # Beschreibung
+/// Reine Prädikatsfunktion: `true` genau dann, wenn `text` mit `'!'`
+/// beginnt (das schließt `"!"` und `"!!"` selbst ein). Entscheidet
+/// ausschließlich über die Composer-**Darstellung** (Rahmenfarbe, Titel,
+/// Prompt in [`draw_viewport`]); die tatsächliche Ausführungssemantik
+/// (Escape via `\!`, Admission, Capability) bleibt unverändert bei
+/// [`crate::classify_input`] und [`classify_line`].
+///
+/// # Argumente
+/// - `text` (`&str`): der aktuelle, noch nicht abgeschickte Composer-Inhalt.
+///
+/// # Rückgabe
+/// `true`, wenn `text` mit `'!'` beginnt.
+///
+/// # Beispiele
+/// ```ignore
+/// use harw_tui::app::is_shell_mode_input;
+/// assert!(is_shell_mode_input("!ls -la"));
+/// assert!(!is_shell_mode_input("ls -la"));
+/// ```
+#[must_use]
+fn is_shell_mode_input(text: &str) -> bool {
+    text.starts_with('!')
+}
+
+/// Obergrenze der im automatischen Folge-Turn eingebetteten `!`-Ausgabe
+/// (Plan Teil F), in Unicode-Zeichen.
+const SHELL_TURN_OUTPUT_MAX_CHARS: usize = 8000;
+
+/// Kappt `text` zeichengrenzen-sicher (nie mitten in einem UTF-8-Codepunkt)
+/// auf höchstens `max_chars` Zeichen und hängt bei tatsächlicher Kappung den
+/// Hinweis `"\n[gekürzt]"` an (Plan Teil F).
+///
+/// # Argumente
+/// - `text` (`&str`): der zu kappende Text.
+/// - `max_chars` (`usize`): Obergrenze in Unicode-Zeichen (nicht Bytes).
+///
+/// # Rückgabe
+/// `text` unverändert, wenn er höchstens `max_chars` Zeichen hat; sonst die
+/// ersten `max_chars` Zeichen plus `"\n[gekürzt]"`.
+#[must_use]
+fn truncate_chars_with_marker(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+    let mut truncated: String = text.chars().take(max_chars).collect();
+    truncated.push_str("\n[gekürzt]");
+    truncated
+}
+
+/// Baut die Nutzereingabe für den automatischen Folge-Turn nach einem
+/// `!`/`!!`-Befehl (Plan Teil F).
+///
+/// # Beschreibung
+/// Reine Funktion, unabhängig vom Renderer-Zustand testbar. `output` wird
+/// über [`truncate_chars_with_marker`] auf höchstens
+/// [`SHELL_TURN_OUTPUT_MAX_CHARS`] Zeichen gekappt.
+///
+/// # Argumente
+/// - `command` (`&str`): der ausgeführte Befehlstext, ohne führendes `!`.
+/// - `exit_code` (`i64`): Exit-Code des Prozesses.
+/// - `output` (`&str`): `stdout` und `stderr` zusammengeführt.
+///
+/// # Rückgabe
+/// Die vollständige Nutzereingabe-Nachricht für den Folge-Turn, im Format
+/// „Ich habe `!<command>` ausgeführt (Exit <n>):" gefolgt von einem
+/// Markdown-Codeblock (Sprache `text`) mit der (ggf. gekappten) Ausgabe.
+#[must_use]
+fn build_shell_turn_message(command: &str, exit_code: i64, output: &str) -> String {
+    let truncated = truncate_chars_with_marker(output, SHELL_TURN_OUTPUT_MAX_CHARS);
+    format!("Ich habe `!{command}` ausgeführt (Exit {exit_code}):\n```text\n{truncated}\n```")
+}
+
+/// Reiht nach einem tatsächlich gelaufenen `!`/`!!`-Befehl den automatischen
+/// Folge-Turn ein (Plan Teil F).
+///
+/// # Beschreibung
+/// Merkt `shell.command` als [`ChatApp::last_shell_command`] für den
+/// nächsten `!!`-Aufruf, hinterlegt eine kompakte
+/// [`ChatApp::pending_turn_user_cell_override`] (vermeidet doppelte Anzeige
+/// der bereits in der Shell-Ergebniszelle sichtbaren Ausgabe — pragmatische
+/// Entscheidung nach Plan Teil F, siehe Feld-Doku) und reicht die volle,
+/// gekappte Turn-Nachricht ([`build_shell_turn_message`]) über denselben
+/// Pfad weiter wie eine normal abgeschickte Nachricht: frei (`submitted ==
+/// None`) wird sie sofort zum nächsten zu treibenden Turn; belegt
+/// (`submitted.is_some()`) wird sie ans Ende von [`ChatApp::pending_turns`]
+/// gehängt — identisch zu [`HarwEvent::Submit`] in `run_loop`.
+///
+/// # Argumente
+/// - `app` (`&mut ChatApp`): nimmt `last_shell_command` und die
+///   Anzeige-Überschreibung auf.
+/// - `submitted` (`&mut Option<String>`): dieselbe lokale Variable, die
+///   `run_loop` für den nächsten zu treibenden Turn verwendet.
+/// - `shell` ([`ShellRunOutcome`]): das strukturierte Ergebnis des soeben
+///   gelaufenen `!`/`!!`-Befehls.
+fn queue_shell_follow_up_turn(
+    app: &mut ChatApp,
+    submitted: &mut Option<String>,
+    shell: ShellRunOutcome,
+) {
+    app.pending_turn_user_cell_override = Some(format!(
+        "↳ Ausgabe von !{} an den Agenten übergeben",
+        shell.command
+    ));
+    let message = build_shell_turn_message(&shell.command, shell.exit_code, &shell.combined_output);
+    app.last_shell_command = Some(shell.command);
+    if submitted.is_some() {
+        app.pending_turns.push_back(message);
+    } else {
+        *submitted = Some(message);
+    }
+}
+
 /// Zustand des interaktiven Chat-Renderers.
 ///
 /// # Beschreibung
@@ -866,6 +986,15 @@ pub struct ChatApp {
     /// abgeschlossenen Turn (Plan Schritt 7); wird beim ersten Gebrauch über
     /// `take()` konsumiert.
     title_job_context: Option<TitleJobContext>,
+    /// Wurzelverzeichnis des Session-Stores (Transcripts und
+    /// `.meta.json`-Sidecars), sofern der Composition-Root (`runtime_root.rs`)
+    /// sie kennt — anders als [`Self::title_job_context`]s
+    /// `session_store_root` wird dieses Feld **unabhängig** davon gesetzt,
+    /// ob `[session] title_generation` aktiv ist (siehe Aufgabe 2, Plan
+    /// `recursive-cooking-lobster.md` Teil F: Export-Datum bei Resume für
+    /// jede Session). `None`, wenn `/resume` in diesem Lauf gar nicht
+    /// konfiguriert ist. Genutzt von [`apply_session_store_started_at`].
+    session_store_root: Option<std::path::PathBuf>,
     /// Startzeit des aktuellen TUI-/Resume-Laufs für Exportmetadaten.
     export_started_at: Option<String>,
     /// Zuletzt aus `SessionConfigured` bzw. der Laufzeit bekannte Modell-ID.
@@ -893,6 +1022,23 @@ pub struct ChatApp {
     /// `handle_busy_event` selbst keinen Zugriff auf den Ereigniskanal hat
     /// (siehe Plan „Ctrl+C-Hard-Interrupt, UI-Teil", Punkt 6).
     hard_quit_requested: bool,
+    /// Zuletzt in dieser Sitzung tatsächlich gestartete `!`-Befehl (ohne
+    /// führendes `!`), für `!!` (Plan Teil F: `!`-Modus wie in Claude Code).
+    /// `None`, solange noch kein `!`-Befehl gelaufen ist. Wird nach jedem
+    /// `!`/`!!`-Lauf mit einem [`ShellRunOutcome`] neu gesetzt — unabhängig
+    /// vom Exit-Code, denn auch ein fehlgeschlagener Befehl bleibt
+    /// wiederholbar.
+    last_shell_command: Option<String>,
+    /// Kompakte Anzeige-Überschreibung für die NÄCHSTE Nutzerzelle, die
+    /// `run_loop` beim Treiben eines Turns pusht (Plan Teil F). Vermeidet die
+    /// doppelte Anzeige der `!`-Ausgabe: sie steht bereits in der
+    /// Shell-Ergebniszelle direkt darüber, der automatische Folge-Turn
+    /// bräuchte sie sonst ein zweites Mal in seiner Nutzerzelle. `None` lässt
+    /// `run_loop` unverändert den vollen Turn-Text anzeigen (Standardfall für
+    /// jede normal getippte Nachricht); `Some(text)` wird einmalig konsumiert
+    /// (`Option::take`) und ersetzt nur die Anzeige — der Modell-Turn selbst
+    /// bekommt weiterhin den vollen Text.
+    pending_turn_user_cell_override: Option<String>,
 }
 
 /// Handgeschriebene `Debug`-Implementierung, da [`CommandAdapter`] (enthält
@@ -1035,6 +1181,7 @@ impl ChatApp {
             export_entries: Vec::new(),
             session_title: None,
             title_job_context: None,
+            session_store_root: None,
             export_started_at: Some(export_timestamp_now()),
             export_session_model: None,
             export_meta_extensions: ExportMetaExtensions::new(),
@@ -1042,6 +1189,8 @@ impl ChatApp {
             pending_export_format: ExportOutputFormat::Markdown,
             pending_quit: None,
             hard_quit_requested: false,
+            last_shell_command: None,
+            pending_turn_user_cell_override: None,
         }
     }
 
@@ -1186,6 +1335,28 @@ impl ChatApp {
     #[must_use]
     pub(crate) fn with_title_job_context(mut self, ctx: TitleJobContext) -> Self {
         self.title_job_context = Some(ctx);
+        self
+    }
+
+    /// Hinterlegt die Wurzel des Session-Stores für jede Sitzung, bei der sie
+    /// bekannt ist (Aufgabe 2, Plan `recursive-cooking-lobster.md` Teil F:
+    /// Export-Datum bei Resume für jede Session).
+    ///
+    /// # Beschreibung
+    /// Wird von der Composition-Root (`crate::runtime_root::build_root_runtime`)
+    /// **immer** gesetzt, wenn `/resume` in diesem Lauf konfiguriert ist —
+    /// unabhängig davon, ob `[session] title_generation` aktiv ist. Anders
+    /// als [`Self::with_title_job_context`] (nur bei aktiver Titelerzeugung)
+    /// ist dies der zuverlässige Weg, mit dem
+    /// [`apply_session_store_started_at`] für jede fortgesetzte Sitzung das
+    /// tatsächliche Sitzungsstart-Datum statt des TUI-Startzeitpunkts
+    /// auflösen kann.
+    ///
+    /// # Rückgabe
+    /// `Self` für Builder-Verkettung.
+    #[must_use]
+    pub(crate) fn with_session_store_root(mut self, root: std::path::PathBuf) -> Self {
+        self.session_store_root = Some(root);
         self
     }
 
@@ -2315,12 +2486,14 @@ fn hydrate_visible_history(app: &mut ChatApp, history: &ConversationHistory) {
                 };
                 if let Ok(mut guard) = cell.lock() {
                     guard.complete(&result_item.result, result_item.duration_ms);
+                    // A6: die Dauer gehört zum `ExportEntry::ToolResult`
+                    // (unten, `export_tool_result_entry`), nicht zum
+                    // `ToolCall`-Eintrag — kein Backfill von `duration_ms`
+                    // hier mehr.
                     if let Some(index) = tool_export_indices.get(&result_item.call_id)
-                        && let Some(ExportEntry::ToolCall {
-                            duration_ms, trust, ..
-                        }) = app.export_entries.get_mut(*index)
+                        && let Some(ExportEntry::ToolCall { trust, .. }) =
+                            app.export_entries.get_mut(*index)
                     {
-                        *duration_ms = Some(result_item.duration_ms);
                         *trust = Some(export_trust(result_item.trust));
                     }
                     let tool_name = match tool_export_indices
@@ -2449,7 +2622,55 @@ pub(crate) fn install_loaded_history(
     history: ConversationHistory,
 ) {
     hydrate_visible_history(app, &history);
+    apply_session_store_started_at(app);
     *session.history_mut() = history;
+}
+
+/// Ersetzt [`ChatApp::export_started_at`] durch den tatsächlichen
+/// Sitzungsstart aus dem Session-Store-Sidecar, sofern dessen Wurzel
+/// bekannt ist (A1: „bei fortgesetzter Session kommt das Datum vom
+/// Session-Start, nicht vom TUI-Start"; Aufgabe 2: für **jede** Session,
+/// nicht nur bei aktiver Titelerzeugung).
+///
+/// # Beschreibung
+/// Nutzt zuerst [`ChatApp::session_store_root`] — von `runtime_root.rs`
+/// immer gesetzt, wenn `/resume` in diesem Lauf konfiguriert ist,
+/// unabhängig von `[session] title_generation` (siehe
+/// [`ChatApp::with_session_store_root`]). Ist dieses Feld `None` (ältere
+/// Composition-Root-Pfade oder Tests, die nur den Titel-Job-Kontext
+/// setzen), fällt die Funktion auf
+/// [`ChatApp::title_job_context`]s `session_store_root`
+/// (`runtime_root.rs::TitleJobContext`) zurück. Ist auch das unbekannt
+/// (`/resume` in diesem Lauf gar nicht konfiguriert), bleibt
+/// [`ChatApp::export_started_at`] unverändert beim TUI-Startzeitpunkt
+/// (siehe [`export_timestamp_now`]). Ein fehlender oder unlesbarer Sidecar
+/// wird nur geloggt, nie propagiert — dieselbe Best-Effort-Haltung wie
+/// [`harw_session_store::meta::load_or_derive`] selbst, das bei fehlendem
+/// Sidecar aus dem Transcript ableitet statt zu scheitern.
+///
+/// # Argumente
+/// - `app` (`&mut ChatApp`): liefert Session-ID, Session-Store-Wurzel und
+///   Titel-Job-Kontext, nimmt das aufgelöste `started_at` auf.
+fn apply_session_store_started_at(app: &mut ChatApp) {
+    let Some(store_root) = app.session_store_root.clone().or_else(|| {
+        app.title_job_context
+            .as_ref()
+            .map(|ctx| ctx.session_store_root.clone())
+    }) else {
+        return;
+    };
+    match harw_session_store::meta::load_or_derive(&store_root, app.session_id()) {
+        Ok(meta) => {
+            app.export_started_at = Some(meta.created_at.as_second().to_string());
+        }
+        Err(error) => {
+            tracing::warn!(
+                session = %app.session_id(),
+                error = %error,
+                "tui.export.session_store_started_at_failed"
+            );
+        }
+    }
 }
 
 /// Übersetzt einen [`ApprovalDriverError`] in einen [`TuiError`], ohne die
@@ -2788,6 +3009,12 @@ pub(crate) async fn run_loop(
                                 // frühere Not-available-Stub erreichbar. Der gekürzte Verlauf
                                 // wird sofort persistiert, damit ein anschließendes `/resume`
                                 // denselben Kontext erhält.
+                                //
+                                // Plan Teil F: gesetzt, wenn `raw` tatsächlich einen
+                                // `!`/`!!`-Shell-Befehl ausgeführt hat — löst nach dem
+                                // Anzeigen der Ergebniszelle unten den automatischen
+                                // Folge-Turn aus.
+                                let mut shell_result: Option<ShellRunOutcome> = None;
                                 let (output, output_data) = if raw.trim() == "/compact" {
                                     let (session, store, model) = gateway.borrow_turn_ctx();
                                     let context_window_tokens = session
@@ -2848,20 +3075,30 @@ pub(crate) async fn run_loop(
                                             {
                                                 Some(Ok(output)) => (output.text, output.data),
                                                 Some(Err(error)) => (error, None),
-                                                None => (
-                                                    execute_command_as(
+                                                None => {
+                                                    // Plan Teil F: statt der reinen
+                                                    // `execute_command_as`-Textausgabe
+                                                    // liefert dieser Dispatch zusätzlich
+                                                    // ein strukturiertes Shell-Ergebnis,
+                                                    // wenn `raw` ein `!`/`!!`-Befehl war
+                                                    // (`!!` löst hier — anders als in
+                                                    // `execute_command_as` — echt gegen
+                                                    // `app.last_shell_command` auf).
+                                                    let outcome = dispatch_command_with_shell_result(
                                                         app.adapters(),
                                                         app.sandbox(),
                                                         app.session_id(),
                                                         caller_tier,
                                                         &raw,
+                                                        app.last_shell_command.as_deref(),
                                                         || runtime_commands::slash_service_map(
                                                             rt.services(),
                                                         ),
                                                     )
-                                                    .await,
-                                                    None,
-                                                ),
+                                                    .await;
+                                                    shell_result = outcome.shell;
+                                                    (outcome.text, None)
+                                                }
                                             }
                                         }
                                         None => {
@@ -2875,6 +3112,16 @@ pub(crate) async fn run_loop(
                                     .map(|line| Line::from(line.to_owned()))
                                     .collect();
                                 app.push_lines(lines);
+                                // Plan Teil F: nach einem tatsächlich gelaufenen
+                                // `!`/`!!`-Befehl sofort einen Folge-Turn einreihen —
+                                // frei über `submitted` (identischer Pfad wie
+                                // `HarwEvent::Submit`), belegt über
+                                // `app.pending_turns`. Kein `shell_result` (Admission-
+                                // Fehler, `!!` ohne Vorgänger, nicht-Shell-Command) →
+                                // kein Turn.
+                                if let Some(shell) = shell_result {
+                                    queue_shell_follow_up_turn(app, &mut submitted, shell);
+                                }
                                 // AP W5-05: Eine `/command`-Zeile läuft **zwischen**
                                 // Turns. Das ist eine gültige Turn-Grenze, also darf
                                 // ein soeben angefordertes `/mode` sofort wirken —
@@ -2956,8 +3203,17 @@ pub(crate) async fn run_loop(
             continue;
         };
 
-        // Nutzerzelle in die interne History.
-        app.push_line(Role::User, text.clone());
+        // Nutzerzelle in die interne History. Plan Teil F: eine kompakte
+        // Anzeige-Überschreibung (gesetzt von `queue_shell_follow_up_turn`)
+        // ersetzt einmalig nur die ANGEZEIGTE Nutzerzelle — das Modell
+        // bekommt weiterhin `text` in voller Länge (siehe `run_turn_streaming`
+        // unten). Ohne Überschreibung (jede normal getippte Nachricht):
+        // unverändertes Verhalten.
+        let displayed_text = app
+            .pending_turn_user_cell_override
+            .take()
+            .unwrap_or_else(|| text.clone());
+        app.push_line(Role::User, displayed_text);
         // Auto-Correction-Detection (harw-memory M3): reine Textregel,
         // kein LLM-Call. Bei Match: Signal explizit an das Backend geben.
         if let Some(mem) = app.memory() {
@@ -3200,14 +3456,9 @@ fn handle_turn_event(app: &mut ChatApp, state: &mut TurnEventState, event: TurnE
                     .export_tool_calls
                     .insert(call_id.clone(), app.export_entries.len().saturating_sub(1));
             }
-            if let Some(index) = state.export_tool_calls.get(&call_id).copied()
-                && let Some(ExportEntry::ToolCall {
-                    duration_ms: call_duration,
-                    ..
-                }) = app.export_entries.get_mut(index)
-            {
-                *call_duration = Some(duration_ms);
-            }
+            // A6: die Dauer gehört zum `ExportEntry::ToolResult` unten
+            // (`export_tool_result_entry`), nicht zum `ToolCall`-Eintrag —
+            // kein Backfill von `duration_ms` hier mehr.
             let export_entry = match cell.lock() {
                 Ok(mut guard) => {
                     guard.complete(&result, duration_ms);
@@ -3740,12 +3991,18 @@ fn export_request_from_data(data: &serde_json::Value) -> Option<ExportRequest> {
 /// Baut einen dateinamensicheren Zeitstempel aus der Systemzeit.
 ///
 /// # Beschreibung
-/// `time`/`jiff` sind in `harw-tui` bewusst nur Dev-Dependencies (siehe
-/// `Cargo.toml`, Kommentar über `harw-fsutil`) — eine Kalenderdatum-Formatierung
-/// steht in Produktionscode deshalb nicht zur Verfügung. Sekunden seit der
-/// Unix-Epoche (`"1757831400"`) sind für [`export::default_export_path`]
-/// ausreichend eindeutig; Kollisionen fängt ohnehin [`export::write_export`]
-/// über Nummernsuffixe ab.
+/// `time` und `jiff` sind in `harw-tui` **Produktions**-Abhängigkeiten (siehe
+/// `Cargo.toml`); `jiff` formatiert das lesbare Datum in der Export-Kopfzeile
+/// bereits ([`export::format_export_timestamp`]). Diese Funktion liefert
+/// trotzdem bewusst weiterhin Sekunden seit der Unix-Epoche
+/// (`"1757831400"`) als reinen Dezimalstring: das ist das Dateinamens-Token
+/// für [`export::default_export_path`] (zeitzonenunabhängig, sortierbar,
+/// ohne Sonderzeichen); Kollisionen fängt ohnehin [`export::write_export`]
+/// über Nummernsuffixe ab. Dieselbe Zeichenkette dient auch als `started_at`
+/// in [`build_export_meta`] — [`export::format_started_at_for_display`]
+/// erkennt den reinen Zahlenstring und macht daraus über
+/// [`export::format_export_timestamp`] ein lesbares Datum, ohne dass diese
+/// Funktion selbst kalendarisch formatieren müsste.
 fn export_timestamp_now() -> String {
     SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3859,6 +4116,7 @@ fn resolve_export_request(app: &mut ChatApp, request: &ExportRequest) {
         include_tool_calls: request.include_tool_calls,
         include_reasoning: request.include_reasoning_summary,
         max_chars: request.max_chars,
+        ..ExportOptions::default()
     };
     if let Some(path) = request.path.as_deref() {
         app.pending_export_options = None;
@@ -3902,6 +4160,15 @@ fn resolve_export_choice(app: &mut ChatApp, _bus: &HarwEventSender, index: usize
             let content = build_export(app, &opts, format);
             match clipboard::copy_or_sequence(&content) {
                 Ok((ClipboardTarget::Osc52, Some(sequence))) => {
+                    // A7: in tmux fängt der Multiplexer OSC-Sequenzen seiner
+                    // Kindprozesse ab, statt sie an das echte Terminal
+                    // weiterzureichen — die Sequenz muss deshalb in ein
+                    // DCS-Passthrough gehüllt werden.
+                    let sequence = if std::env::var_os("TMUX").is_some() {
+                        clipboard::wrap_osc52_for_tmux(&sequence)
+                    } else {
+                        sequence
+                    };
                     let mut stdout = io::stdout();
                     let written = stdout
                         .write_all(sequence.as_bytes())
@@ -3924,6 +4191,17 @@ fn resolve_export_choice(app: &mut ChatApp, _bus: &HarwEventSender, index: usize
                         format!("Export in die Zwischenablage kopiert ({target:?})."),
                     );
                 }
+                // A7: weder Systemwerkzeug noch OSC-52 verfügbar (z. B. harw
+                // läuft in tmux ohne Zwischenablagen-Weiterleitung und der
+                // Text übersteigt die OSC-52-Nutzlastgrenze) — statt nur den
+                // Fehler zu melden, wird der Export als Datei gespeichert.
+                Err(ExportError::NoClipboard) => {
+                    write_export_to_default_path(
+                        app,
+                        &content,
+                        "Keine Zwischenablage — Export gespeichert unter ",
+                    );
+                }
                 Err(error) => {
                     app.push_line(
                         Role::System,
@@ -3934,20 +4212,36 @@ fn resolve_export_choice(app: &mut ChatApp, _bus: &HarwEventSender, index: usize
         }
         1 => {
             let content = build_export(app, &opts, format);
-            let now = export_timestamp_now();
-            let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-            let path = export::default_export_path(&now, &dir);
-            match export::write_export_path(&path, &content) {
-                Ok(written_path) => app.push_line(
-                    Role::System,
-                    format!("Export gespeichert: {}", written_path.display()),
-                ),
-                Err(error) => {
-                    app.push_line(Role::System, format!("Export fehlgeschlagen: {error}"))
-                }
-            }
+            write_export_to_default_path(app, &content, "Export gespeichert: ");
         }
         _ => {}
+    }
+}
+
+/// Schreibt `content` über [`export::default_export_path`] ins aktuelle
+/// Arbeitsverzeichnis und hängt je nach Ergebnis eine Systemzeile mit
+/// `success_prefix` bzw. dem Fehlschlag an.
+///
+/// # Beschreibung
+/// Gemeinsamer Schreibpfad für die reguläre Datei-Auswahl in
+/// [`resolve_export_choice`] (Index `1`) und deren A7-Fallback, wenn beim
+/// reinen `/export` (Index `0`) weder ein Zwischenablage-Werkzeug noch
+/// OSC-52 verfügbar war.
+///
+/// # Argumente
+/// - `app` (`&mut ChatApp`): nimmt die Ergebniszeile auf.
+/// - `content` (`&str`): der bereits gerenderte Exportinhalt.
+/// - `success_prefix` (`&str`): Text vor dem geschriebenen Pfad bei Erfolg.
+fn write_export_to_default_path(app: &mut ChatApp, content: &str, success_prefix: &str) {
+    let now = export_timestamp_now();
+    let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let path = export::default_export_path(&now, &dir);
+    match export::write_export_path(&path, content) {
+        Ok(written_path) => app.push_line(
+            Role::System,
+            format!("{success_prefix}{}", written_path.display()),
+        ),
+        Err(error) => app.push_line(Role::System, format!("Export fehlgeschlagen: {error}")),
     }
 }
 
@@ -4501,6 +4795,16 @@ fn rate_limit_retry_input() -> TurnInput {
 /// - `turn_event_rx` — Werkzeug-, Kind- und Plan-Zellen erscheinen dadurch
 ///   **während** des Turns statt erst danach.
 ///
+/// B6: bereits das **eigene** `select!` dieser Funktion (die noch nicht in
+/// [`drive_pauses_to_completion`] delegierte Schleife um den `turn`-Future
+/// selbst) pollt zusätzlich `host_permit_prompts` — ein Modell-Tool
+/// (`sandbox-lease`) kann während des laufenden Turns eine Host-Permit-Frage
+/// stellen, ohne dass der Turn dafür in `TurnOutcome::AwaitingApproval`
+/// pausiert; ohne dieses Pollen erschiene der Dialog nie. `tui_rx` routet
+/// Tasten währenddessen (mit demselben Arming-Delay und Ctrl+C-Fail-Safe wie
+/// beim Freigabe-Panel) an [`ChoiceDialog::handle_key`] statt an den
+/// normalen Composer-Pfad.
+///
 /// # Fehler
 /// [`TuiError::Core`], wenn der Turn fehlschlägt (nicht durch Rate-Limit), der
 /// Freigabetreiber scheitert oder keine Antwort vorliegt; [`TuiError::Io`] beim
@@ -4530,6 +4834,13 @@ async fn drive_turn_animated(
     let mut input_open = true;
     let mut pending_input = Some(input);
     let mut attempt: u32 = 0;
+    // B6: Zustand für die Host-Permit-Frage, analog zu
+    // `drive_pauses_to_completion`. Überlebt bewusst Rate-Limit-Retries
+    // (deklariert vor der äußeren `loop`), damit eine während eines
+    // Versuchs geöffnete Frage nicht durch einen erneuten Versuch verloren
+    // geht.
+    let mut host_permit_shown_at: Option<Instant> = None;
+    let mut host_permit_prompts_open = true;
 
     let outcome = loop {
         attempt += 1;
@@ -4544,8 +4855,96 @@ async fn drive_turn_animated(
             loop {
                 tokio::select! {
                     result = &mut turn => break result,
+                    // B6: ein Modell-Tool (`sandbox-lease`) kann während des
+                    // laufenden Turns eine Host-Permit-Frage stellen, ohne
+                    // dass der Turn dafür pausiert (kein `TurnOutcome`-Wechsel
+                    // wie bei `AwaitingApproval`) — deshalb muss dieser Kanal
+                    // schon hier, neben dem laufenden `turn`-Future, gepollt
+                    // werden. Muster aus `drive_pauses_to_completion`s
+                    // `host_permit_prompts.recv()`-Arm.
+                    maybe_host_prompt = host_permit_prompts.recv(), if host_permit_prompts_open => {
+                        match maybe_host_prompt {
+                            Some(prompt) => {
+                                tracing::info!(
+                                    session = prompt.session(),
+                                    worker = prompt.worker_definition(),
+                                    "tui.host_permit.prompt_shown"
+                                );
+                                host_permit_shown_at = Some(open_host_permit_prompt(app, prompt));
+                                draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
+                            }
+                            None => {
+                                tracing::warn!("tui.host_permit.prompt_channel_ended");
+                                host_permit_prompts_open = false;
+                            }
+                        }
+                    }
                     event = tui_rx.recv(), if input_open => {
                         match event {
+                            Some(TuiEvent::Key(key))
+                                if key.modifiers.contains(KeyModifiers::CONTROL)
+                                    && matches!(key.code, KeyCode::Char('c' | 'C'))
+                                    && app.pending_host_permit.is_some() =>
+                            {
+                                // Ctrl+C bleibt fail-safe und lehnt eine offene
+                                // Host-Permit-Frage sofort ab, unabhängig vom
+                                // Arming-Delay des Dialogs — dieselbe
+                                // Sicherheitsinvariante wie in
+                                // `drive_pauses_to_completion`. Der laufende
+                                // Turn selbst wird über `handle_busy_event`
+                                // weiterhin ganz normal kooperativ abgebrochen.
+                                if let Some(prompt) = app.pending_host_permit.take() {
+                                    prompt.deny();
+                                }
+                                app.pending_host_permit_dialog = None;
+                                host_permit_shown_at = None;
+                                match handle_busy_event(app, TuiEvent::Key(key)) {
+                                    BusyKeyOutcome::Redraw => draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?,
+                                    BusyKeyOutcome::Idle => {}
+                                    BusyKeyOutcome::RunImmediate(raw) => {
+                                        run_immediate_busy_command(guard, app, spinner, &raw).await?;
+                                    }
+                                }
+                            }
+                            Some(TuiEvent::Key(key)) if app.pending_host_permit.is_some() => {
+                                // Dasselbe Arming-Delay wie beim Freigabe-Panel
+                                // (`approval_dialog_key_is_armed`), hier auf den
+                                // generischen `ChoiceDialog` angewandt: solange
+                                // nicht scharfgeschaltet, zählt keine Taste.
+                                let since_shown = host_permit_shown_at.map_or(Duration::ZERO, |shown| shown.elapsed());
+                                if !approval_dialog_key_is_armed(key, since_shown) {
+                                    continue;
+                                }
+                                let Some(dialog) = app.pending_host_permit_dialog.as_mut() else {
+                                    continue;
+                                };
+                                match dialog.handle_key(key) {
+                                    ChoiceAction::Stay => match queue_busy_key(app, key) {
+                                        BusyKeyOutcome::Redraw => draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?,
+                                        BusyKeyOutcome::Idle => {}
+                                        BusyKeyOutcome::RunImmediate(raw) => {
+                                            run_immediate_busy_command(guard, app, spinner, &raw).await?;
+                                        }
+                                    },
+                                    ChoiceAction::Cancel => {
+                                        if let Some(prompt) = app.pending_host_permit.take() {
+                                            prompt.deny();
+                                        }
+                                        app.pending_host_permit_dialog = None;
+                                        host_permit_shown_at = None;
+                                        app.push_line(Role::System, "Host-Ausführung abgelehnt.");
+                                        draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
+                                    }
+                                    ChoiceAction::Chosen(index) => {
+                                        if let Some(prompt) = app.pending_host_permit.take() {
+                                            apply_host_permit_decision(app, prompt, index);
+                                        }
+                                        app.pending_host_permit_dialog = None;
+                                        host_permit_shown_at = None;
+                                        draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
+                                    }
+                                }
+                            }
                             Some(event) => match handle_busy_event(app, event) {
                                 BusyKeyOutcome::Redraw => draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?,
                                 BusyKeyOutcome::Idle => {}
@@ -4809,6 +5208,34 @@ fn quote_for_synthetic_command(value: &str) -> String {
     out
 }
 
+/// Öffnet den Host-Permit-Dialog für eine frisch eingetroffene Frage (B6):
+/// dieselbe Zustandsänderung, die auch der `host_permit_prompts.recv()`-Arm
+/// von `drive_pauses_to_completion` inline vornimmt, hier als eigenständige,
+/// aus [`drive_turn_animated`]s `select!` aufgerufene Funktion.
+///
+/// # Beschreibung
+/// Dieselbe K3-Regel wie bei einer normalen Freigabefrage: eine noch offene
+/// ältere Host-Permit-Frage wird nicht still überschrieben, sondern
+/// abgelehnt (Ablehnung ist der Default — [`HostPermitPrompt`]s
+/// Sicherheitsregel).
+///
+/// # Argumente
+/// - `app` (`&mut ChatApp`): nimmt Dialog und Frage auf.
+/// - `prompt` ([`HostPermitPrompt`]): die soeben eingetroffene Frage.
+///
+/// # Rückgabe
+/// Den Zeitpunkt, zu dem der Dialog angezeigt wurde — Grundlage für das
+/// Arming-Delay ([`approval_dialog_key_is_armed`]).
+fn open_host_permit_prompt(app: &mut ChatApp, prompt: HostPermitPrompt) -> Instant {
+    if let Some(stale) = app.pending_host_permit.take() {
+        tracing::warn!("tui.host_permit.stale_prompt_closed");
+        stale.deny();
+    }
+    app.pending_host_permit_dialog = Some(build_host_permit_dialog(&prompt));
+    app.pending_host_permit = Some(prompt);
+    Instant::now()
+}
+
 /// Baut das [`ApprovalDialog`] für eine soeben eingetroffene [`ApprovalPrompt`]
 /// (Plan Schritt 3).
 ///
@@ -4837,6 +5264,14 @@ fn quote_for_synthetic_command(value: &str) -> String {
 /// ändert nur diese Vorauswahl, nie die Optionsliste selbst; der Mensch
 /// bestätigt in jedem Fall explizit (`Enter`).
 ///
+/// Ist `prompt.worker_definition()` die eingebettete Sandbox-Lease-
+/// Worker-Definition ([`harw_tool_shell::SANDBOX_LEASE_WORKER_DEFINITION`]
+/// — das Modell-Tool `sandbox-lease` fragt darüber direkt einen Lease an,
+/// kein tatsächlicher Befehl läuft), zeigen Titel und Hinweistext eine
+/// eigene Formulierung: „Sandbox-Lease angefragt" statt „Host-Ausführung
+/// erlauben?", und `prompt.command()` erscheint als „Grund" statt als
+/// auszuführender Befehl (B6).
+///
 /// # Argumente
 /// - `prompt` (`&HostPermitPrompt`): die anzuzeigende Frage.
 ///
@@ -4852,13 +5287,29 @@ fn build_host_permit_dialog(prompt: &HostPermitPrompt) -> ChoiceDialog {
         HostPermitVariant::SessionLease.label().to_owned(),
         "Nein, ablehnen".to_owned(),
     ];
-    let hint = format!(
-        "Worker {} verlangt Host-Ausführung in Sitzung {}: {}",
-        prompt.worker_definition(),
-        prompt.session(),
-        prompt.command(),
-    );
-    ChoiceDialog::new("Host-Ausführung erlauben?", Some(hint), options).with_selected(selected)
+    let is_sandbox_lease =
+        prompt.worker_definition() == harw_tool_shell::SANDBOX_LEASE_WORKER_DEFINITION;
+    let (title, hint) = if is_sandbox_lease {
+        (
+            "Sandbox-Lease angefragt",
+            format!(
+                "Sitzung {} bittet um eine Sandbox-Lease. Grund: {}",
+                prompt.session(),
+                prompt.command(),
+            ),
+        )
+    } else {
+        (
+            "Host-Ausführung erlauben?",
+            format!(
+                "Worker {} verlangt Host-Ausführung in Sitzung {}: {}",
+                prompt.worker_definition(),
+                prompt.session(),
+                prompt.command(),
+            ),
+        )
+    };
+    ChoiceDialog::new(title, Some(hint), options).with_selected(selected)
 }
 
 /// Setzt eine Entscheidung aus dem Host-Permit-Dialog um (Plan
@@ -5877,20 +6328,49 @@ fn render_viewport(
         return;
     }
 
+    // Plan Teil F: beginnt der getippte Text mit `!`, rendert der Composer
+    // im Shell-Modus (eigene Akzentfarbe für Rahmen und Prompt, eigener
+    // Titel/Hinweis) — `is_shell_mode_input` ist eine reine Prädikatsfunktion
+    // auf dem noch nicht abgeschickten Text, siehe dort.
+    let shell_mode = is_shell_mode_input(app.input.text());
+    let prompt_style = if shell_mode {
+        style::shell_mode_style(theme)
+    } else {
+        Style::default()
+    };
     let mut input_lines: Vec<Line<'static>> = Vec::new();
     for (index, segment) in app.input.visible_lines(input_width).iter().enumerate() {
-        let prefix = if index == 0 { "› " } else { "  " };
-        input_lines.push(Line::from(format!("{prefix}{segment}")));
+        if index == 0 {
+            input_lines.push(Line::from(vec![
+                Span::styled("› ", prompt_style),
+                Span::raw(segment.clone()),
+            ]));
+        } else {
+            input_lines.push(Line::from(format!("  {segment}")));
+        }
     }
     let (cursor_row, cursor_col) = app.input.cursor_position(input_width);
     let input_rows = input_area.height.saturating_sub(2) as usize;
     let input_top = cursor_row.saturating_sub(input_rows.saturating_sub(1));
+    let (title_text, title_style, border_style) = if shell_mode {
+        (
+            " Shell-Modus · Enter führt aus · Esc/Backspace am Anfang verlässt ",
+            style::shell_mode_style(theme),
+            Style::default().fg(style::shell_mode_color(theme)),
+        )
+    } else {
+        (
+            " harw ",
+            style::selected_style(theme),
+            Style::default().fg(style::border_color(theme)),
+        )
+    };
     let input_widget = Paragraph::new(input_lines.into_iter().skip(input_top).collect::<Vec<_>>())
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(Span::styled(" harw ", style::selected_style(theme)))
-                .border_style(Style::default().fg(style::border_color(theme))),
+                .title(Span::styled(title_text, title_style))
+                .border_style(border_style),
         );
     frame.render_widget(input_widget, input_area);
 
@@ -6090,6 +6570,212 @@ mod tests {
         app
     }
 
+    /// Baut einen Session-Store-Sidecar mit festem `created_at`/`last_opened_at`
+    /// unter `root` für `session_id` (Aufgabe 2: Export-Datum bei Resume).
+    fn save_session_meta_with_created_at(
+        root: &std::path::Path,
+        session_id: &SessionId,
+        created_at: jiff::Timestamp,
+    ) {
+        std::fs::create_dir_all(root).expect("temp session store root");
+        let meta = harw_session_store::meta::SessionMeta {
+            version: harw_session_store::meta::SESSION_META_VERSION,
+            session_id: session_id.clone(),
+            title: None,
+            title_source: harw_session_store::meta::TitleSource::None,
+            created_at,
+            last_opened_at: created_at,
+            cwd: None,
+            project_root: None,
+            project_key: None,
+            first_user_message: None,
+            turns: 0,
+            usage_rounds: 0,
+            total_usage: harw_types::TokenUsage::default(),
+            drift_events: std::collections::BTreeMap::new(),
+        };
+        harw_session_store::meta::save(root, &meta).expect("save session meta sidecar");
+    }
+
+    /// Aufgabe 2 (Plan `recursive-cooking-lobster.md` Teil F): eine über
+    /// [`ChatApp::with_session_store_root`] gesetzte Wurzel wird auch OHNE
+    /// jeden Titel-Job-Kontext ausgewertet — anders als vor Aufgabe 2, wo nur
+    /// `title_job_context.session_store_root` (nur bei aktiver
+    /// Titelerzeugung gesetzt) zur Verfügung stand.
+    #[test]
+    fn apply_session_store_started_at_uses_own_field_without_title_job_context() {
+        let mut app = test_chat_app();
+        let root =
+            std::env::temp_dir().join(format!("harw-tui-app-test-started-at-{}", app.session_id()));
+        let created_at = jiff::Timestamp::from_second(1_700_000_000).expect("valid timestamp");
+        save_session_meta_with_created_at(&root, app.session_id(), created_at);
+
+        app = app.with_session_store_root(root.clone());
+        apply_session_store_started_at(&mut app);
+        std::fs::remove_dir_all(&root).ok();
+
+        assert!(app.title_job_context.is_none());
+        assert_eq!(
+            app.export_started_at,
+            Some(created_at.as_second().to_string())
+        );
+    }
+
+    /// Ohne eigenes `session_store_root` fällt [`apply_session_store_started_at`]
+    /// weiterhin auf `title_job_context.session_store_root` zurück (Rückwärts-
+    /// kompatibilität mit dem Verhalten vor Aufgabe 2).
+    #[test]
+    fn apply_session_store_started_at_falls_back_to_title_job_context() {
+        let mut app = test_chat_app();
+        let root = std::env::temp_dir()
+            .join(format!("harw-tui-app-test-started-at-fallback-{}", app.session_id()));
+        let created_at = jiff::Timestamp::from_second(1_650_000_000).expect("valid timestamp");
+        save_session_meta_with_created_at(&root, app.session_id(), created_at);
+
+        app = app.with_title_job_context(TitleJobContext {
+            provider: Arc::new(ScriptedModel::new(Vec::new())),
+            session_store_root: root.clone(),
+            title_model: None,
+            config: Arc::new(harw_config::ResolvedConfig::default()),
+        });
+        assert!(app.session_store_root.is_none());
+        apply_session_store_started_at(&mut app);
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(
+            app.export_started_at,
+            Some(created_at.as_second().to_string())
+        );
+    }
+
+    /// Ist weder das eigene Feld noch der Titel-Job-Kontext bekannt (kein
+    /// `/resume` in diesem Lauf konfiguriert), bleibt `export_started_at`
+    /// unverändert beim TUI-Startzeitpunkt aus `ChatApp::new`.
+    #[test]
+    fn apply_session_store_started_at_leaves_tui_start_when_nothing_known() {
+        let mut app = test_chat_app();
+        let original = app.export_started_at.clone();
+
+        apply_session_store_started_at(&mut app);
+
+        assert_eq!(app.export_started_at, original);
+    }
+
+    // -----------------------------------------------------------------------
+    // Plan Teil F: `!`-Modus wie in Claude Code — Composer-Moduserkennung,
+    // Folge-Turn-Nachricht (inkl. Kappung) und Einreihung.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_shell_mode_input_true_for_bang_prefix() {
+        assert!(is_shell_mode_input("!ls -la"));
+    }
+
+    #[test]
+    fn is_shell_mode_input_true_for_double_bang() {
+        assert!(is_shell_mode_input("!!"));
+    }
+
+    #[test]
+    fn is_shell_mode_input_false_for_plain_text() {
+        assert!(!is_shell_mode_input("ls -la"));
+        assert!(!is_shell_mode_input(""));
+        assert!(!is_shell_mode_input("/status"));
+    }
+
+    #[test]
+    fn truncate_chars_with_marker_leaves_short_text_unchanged() {
+        assert_eq!(truncate_chars_with_marker("hallo", 8000), "hallo");
+        assert_eq!(truncate_chars_with_marker("", 8000), "");
+    }
+
+    /// Kappung ist zeichengrenzen-sicher: ein 8001 Zeichen langer,
+    /// mehrbytiger Text (Umlaute) darf nicht mitten in einem UTF-8-Codepunkt
+    /// getrennt werden — `.chars().take(n)` garantiert das strukturell.
+    #[test]
+    fn truncate_chars_with_marker_caps_long_multibyte_text_with_marker() {
+        let text: String = "ä".repeat(8001);
+        let truncated = truncate_chars_with_marker(&text, 8000);
+        assert!(truncated.ends_with("\n[gekürzt]"));
+        let body = truncated.strip_suffix("\n[gekürzt]").expect("marker suffix");
+        assert_eq!(body.chars().count(), 8000);
+        assert!(body.chars().all(|c| c == 'ä'));
+    }
+
+    #[test]
+    fn build_shell_turn_message_includes_command_and_exit_code() {
+        let message = build_shell_turn_message("ls -la", 0, "total 0\n");
+        assert!(message.starts_with("Ich habe `!ls -la` ausgeführt (Exit 0):"));
+        assert!(message.contains("```text\ntotal 0\n\n```"));
+    }
+
+    #[test]
+    fn build_shell_turn_message_truncates_long_output() {
+        let output: String = "x".repeat(SHELL_TURN_OUTPUT_MAX_CHARS + 500);
+        let message = build_shell_turn_message("yes | head", 0, &output);
+        assert!(message.contains("[gekürzt]"));
+        // Nur die (gekürzte) Ausgabe zählt gegen die Obergrenze, nicht die
+        // umgebende Nachricht (Header + Codeblock-Markierungen).
+        let fence_body = message
+            .split("```text\n")
+            .nth(1)
+            .and_then(|rest| rest.rsplit_once("\n```"))
+            .map(|(body, _)| body)
+            .expect("fenced code block");
+        assert_eq!(
+            fence_body.chars().count(),
+            SHELL_TURN_OUTPUT_MAX_CHARS + "\n[gekürzt]".chars().count()
+        );
+    }
+
+    fn shell_outcome(command: &str, exit_code: i64, combined_output: &str) -> ShellRunOutcome {
+        ShellRunOutcome {
+            command: command.to_owned(),
+            exit_code,
+            combined_output: combined_output.to_owned(),
+        }
+    }
+
+    /// Ist gerade kein Turn unterwegs (`submitted == None`, der Normalfall
+    /// direkt nach einem `!`-Befehl im Idle-Pfad), wird der Folge-Turn sofort
+    /// zum nächsten zu treibenden Turn — derselbe Pfad wie `HarwEvent::Submit`.
+    #[test]
+    fn queue_shell_follow_up_turn_submits_immediately_when_idle() {
+        let mut app = test_chat_app();
+        let mut submitted: Option<String> = None;
+
+        queue_shell_follow_up_turn(&mut app, &mut submitted, shell_outcome("echo hi", 0, "hi\n"));
+
+        let text = submitted.expect("turn queued immediately");
+        assert!(text.starts_with("Ich habe `!echo hi` ausgeführt (Exit 0):"));
+        assert!(app.pending_turns.is_empty());
+        assert_eq!(app.last_shell_command.as_deref(), Some("echo hi"));
+        assert_eq!(
+            app.pending_turn_user_cell_override.as_deref(),
+            Some("↳ Ausgabe von !echo hi an den Agenten übergeben")
+        );
+    }
+
+    /// Läuft bereits ein Turn (`submitted.is_some()`), wird der Folge-Turn
+    /// stattdessen an `app.pending_turns` gehängt statt den belegten Platz zu
+    /// überschreiben.
+    #[test]
+    fn queue_shell_follow_up_turn_queues_when_turn_already_submitted() {
+        let mut app = test_chat_app();
+        let mut submitted: Option<String> = Some("bereits abgeschickte Nachricht".to_owned());
+
+        queue_shell_follow_up_turn(&mut app, &mut submitted, shell_outcome("pwd", 1, "err\n"));
+
+        assert_eq!(submitted.as_deref(), Some("bereits abgeschickte Nachricht"));
+        assert_eq!(app.pending_turns.len(), 1);
+        assert!(
+            app.pending_turns
+                .front()
+                .expect("queued follow-up turn")
+                .starts_with("Ich habe `!pwd` ausgeführt (Exit 1):")
+        );
+    }
+
     #[test]
     fn export_request_marker_reads_format_options_and_path() {
         let request = export_request_from_data(&json!({
@@ -6130,6 +6816,7 @@ mod tests {
             include_tool_calls: request.include_tool_calls,
             include_reasoning: request.include_reasoning_summary,
             max_chars: request.max_chars,
+            ..ExportOptions::default()
         };
         assert_eq!(opts.max_chars, Some(20000));
     }
@@ -6250,6 +6937,51 @@ mod tests {
         ));
         std::fs::remove_file(first).ok();
         std::fs::remove_file(second).ok();
+    }
+
+    /// A7-Fallback-Entscheid: schlägt beim reinen `/export`
+    /// (`resolve_export_choice`-Index `0`, „Zwischenablage") sowohl jedes
+    /// Systemwerkzeug als auch der OSC-52-Fallback fehl, wird stattdessen
+    /// eine Datei über [`export::default_export_path`] geschrieben und ihr
+    /// Pfad gemeldet — statt nur den `NoClipboard`-Fehler anzuzeigen. In der
+    /// Testumgebung ist ohnehin kein Zwischenablage-Werkzeug installiert;
+    /// ein absichtlich übergroßer Inhalt (> `OSC52_MAX_BYTES`) lässt
+    /// zusätzlich den OSC-52-Fallback selbst scheitern, sodass
+    /// `clipboard::copy_or_sequence` deterministisch `NoClipboard` liefert.
+    #[test]
+    fn export_choice_falls_back_to_a_file_when_no_clipboard_is_available() {
+        let mut app = test_chat_app();
+        // Größer als `clipboard::OSC52_MAX_BYTES` (100_000) — macht auch den
+        // OSC-52-Fallback selbst unmöglich, nicht nur die Systemwerkzeuge.
+        app.push_line(Role::User, "x".repeat(150_000));
+        app.pending_export_options = Some(ExportOptions::default());
+        app.pending_export_format = ExportOutputFormat::Markdown;
+        let (bus, _receiver) = harw_event_channel();
+
+        resolve_export_choice(&mut app, &bus, 0);
+
+        let message = app
+            .export_entries
+            .iter()
+            .rev()
+            .find_map(|entry| match entry {
+                ExportEntry::System(text) => Some(text.clone()),
+                _ => None,
+            })
+            .expect("export status message");
+        let expected_prefix = "Keine Zwischenablage — Export gespeichert unter ";
+        assert!(message.starts_with(expected_prefix), "message: {message}");
+
+        let path = std::path::PathBuf::from(
+            message
+                .strip_prefix(expected_prefix)
+                .expect("prefix checked above"),
+        );
+        assert!(
+            path.exists(),
+            "the fallback export file must actually be written: {path:?}"
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     /// Test-lokaler Ersatz für das gelöschte `trusted_tui_spawn_context`
@@ -7620,7 +8352,7 @@ forbidden = [{forbidden}]
             harw_operations::PermissionTier::Operator,
             "/permissions",
             || {
-                let mut services = build_services(&adapters, None, None, &controller, None);
+                let mut services = build_services(&adapters, None, None, &controller, None, None);
                 services.insert(ApprovalModeCell::default());
                 services
             },
@@ -7635,7 +8367,7 @@ forbidden = [{forbidden}]
             &SessionId::new(),
             harw_operations::PermissionTier::Operator,
             "/plugins",
-            || build_services(&adapters, None, None, &controller, None),
+            || build_services(&adapters, None, None, &controller, None, None),
         )
         .await;
 
@@ -7776,6 +8508,127 @@ forbidden = [{forbidden}]
             rendered.contains("fertig"),
             "die Zelle muss den Abschluss zeigen: {rendered:?}"
         );
+    }
+
+    /// A6: eine abgeschlossene Werkzeugausführung schreibt die Dauer nur in
+    /// den `ExportEntry::ToolResult`-Eintrag; der zugehörige
+    /// `ToolCall`-Eintrag bleibt ohne `duration_ms` (kein Backfill mehr).
+    #[test]
+    fn tool_call_completion_leaves_the_call_entry_without_a_duration() {
+        let mut app = test_chat_app();
+        let mut state = TurnEventState::default();
+        let turn_id = TurnId::new();
+        let call_id = ToolCallId::new();
+
+        assert!(handle_turn_event(
+            &mut app,
+            &mut state,
+            TurnEvent::ToolCallRequested {
+                turn_id: turn_id.clone(),
+                call_id: call_id.clone(),
+                tool_name: "fs.read".to_owned(),
+                arguments: json!({ "path": "/tmp/x" }),
+            }
+        ));
+        assert!(handle_turn_event(
+            &mut app,
+            &mut state,
+            TurnEvent::ToolCallCompleted {
+                turn_id,
+                call_id: call_id.clone(),
+                result: ToolCallResult::error("nicht gefunden"),
+                duration_ms: 42,
+            }
+        ));
+
+        let call_duration = app.export_entries.iter().find_map(|entry| match entry {
+            ExportEntry::ToolCall {
+                call_id: id,
+                duration_ms,
+                ..
+            } if *id == call_id.to_string() => Some(*duration_ms),
+            _ => None,
+        });
+        assert_eq!(
+            call_duration,
+            Some(None),
+            "ToolCall-Eintrag muss existieren, aber ohne Dauer"
+        );
+
+        let result_duration = app.export_entries.iter().find_map(|entry| match entry {
+            ExportEntry::ToolResult {
+                call_id: id,
+                duration_ms,
+                ..
+            } if *id == call_id.to_string() => Some(*duration_ms),
+            _ => None,
+        });
+        assert_eq!(
+            result_duration,
+            Some(Some(42)),
+            "ToolResult-Eintrag muss die Dauer tragen"
+        );
+    }
+
+    /// A6 (Hydrate-Pfad): beim Laden einer durablen Historie bekommt der
+    /// `ExportEntry::ToolCall`-Eintrag `trust` nachgetragen, aber keine Dauer
+    /// mehr — die Dauer bleibt exklusiv am `ExportEntry::ToolResult`.
+    #[test]
+    fn hydrated_tool_result_leaves_the_call_entry_without_a_duration() {
+        use harw_protocol::items::{ResultTrust, ToolCallItem, ToolCallResult, ToolResultItem};
+        use harw_types::{ItemId, ToolCallId};
+
+        let call_id = ToolCallId::new();
+        let mut history = ConversationHistory::new();
+        history.push(TurnItem::ToolCall(ToolCallItem {
+            id: ItemId::new(),
+            call_id: call_id.clone(),
+            tool_name: "fs.read".to_owned(),
+            arguments: json!({ "path": "/tmp/x" }),
+        }));
+        history.push(TurnItem::ToolResult(ToolResultItem {
+            id: ItemId::new(),
+            call_id: call_id.clone(),
+            result: ToolCallResult::error("nicht gefunden"),
+            duration_ms: 17,
+            trust: ResultTrust::Runtime,
+        }));
+
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut session = AgentSession::new_with_id(
+            SessionId::from_str("hydrate-duration"),
+            AgentRole::Assistant,
+            None,
+            ExtensionRegistry::builder().build(),
+            event_tx,
+        );
+        let mut app = test_chat_app();
+        install_loaded_history(&mut session, &mut app, history);
+
+        let call_entry = app.export_entries.iter().find_map(|entry| match entry {
+            ExportEntry::ToolCall {
+                call_id: id,
+                duration_ms,
+                trust,
+                ..
+            } if *id == call_id.to_string() => Some((*duration_ms, trust.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            call_entry,
+            Some((None, Some(export_trust(ResultTrust::Runtime)))),
+            "ToolCall-Eintrag: keine Dauer, aber nachgetragenes Vertrauen"
+        );
+
+        let result_duration = app.export_entries.iter().find_map(|entry| match entry {
+            ExportEntry::ToolResult {
+                call_id: id,
+                duration_ms,
+                ..
+            } if *id == call_id.to_string() => Some(*duration_ms),
+            _ => None,
+        });
+        assert_eq!(result_duration, Some(Some(17)));
     }
 
     /// Ein Fortschritt für ein unbekanntes Kind erzeugt **keine** Zelle.
@@ -8093,6 +8946,7 @@ mod approval_arming_tests {
     use super::*;
     use super::tests::test_chat_app;
     use crossterm::event::KeyEventKind;
+    use ratatui::buffer::Buffer;
 
     /// Tastendruck ohne Modifier.
     fn key(code: KeyCode) -> KeyEvent {
@@ -8248,10 +9102,23 @@ mod approval_arming_tests {
     fn build_host_permit_prompt(
         preselected: HostPermitVariant,
     ) -> (HostPermitPrompt, tokio::sync::oneshot::Receiver<Option<HostPermitVariant>>) {
+        build_host_permit_prompt_for("host-process-worker@1", "echo hi", preselected)
+    }
+
+    /// Wie [`build_host_permit_prompt`], aber mit einstellbarer
+    /// `worker_definition`/`command` — für B6-Tests, die zwischen einer
+    /// Sandbox-Lease-Anfrage
+    /// ([`harw_tool_shell::SANDBOX_LEASE_WORKER_DEFINITION`]) und einer
+    /// gewöhnlichen Host-Befehlsanfrage unterscheiden müssen.
+    fn build_host_permit_prompt_for(
+        worker_definition: &str,
+        command: &str,
+        preselected: HostPermitVariant,
+    ) -> (HostPermitPrompt, tokio::sync::oneshot::Receiver<Option<HostPermitVariant>>) {
         HostPermitPrompt::new(
             "s1".to_owned(),
-            "host-process-worker@1".to_owned(),
-            "echo hi".to_owned(),
+            worker_definition.to_owned(),
+            command.to_owned(),
             std::path::PathBuf::from("/workspace"),
             preselected,
         )
@@ -8281,6 +9148,114 @@ mod approval_arming_tests {
         assert_eq!(action, ChoiceAction::Chosen(1));
         assert!(prompt.deny());
         assert_eq!(answer.await.expect("responder must deliver an answer"), None);
+    }
+
+    /// Rendert einen [`ChoiceDialog`] in einen ausreichend breiten Puffer und
+    /// gibt seinen sichtbaren Text als flachen String zurück — dasselbe
+    /// Muster wie `choice_dialog.rs`s eigene `test_render_contains_option_labels`.
+    fn rendered_choice_dialog(dialog: &ChoiceDialog) -> String {
+        let area = Rect::new(0, 0, 90, 10);
+        let mut buf = Buffer::empty(area);
+        dialog.render(area, &mut buf, style::Theme::Dark);
+        buf.content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    /// B6: eine Sandbox-Lease-Anfrage
+    /// ([`harw_tool_shell::SANDBOX_LEASE_WORKER_DEFINITION`]) zeigt einen
+    /// eigenen Titel und rahmt `prompt.command()` als „Grund" statt als
+    /// auszuführenden Befehl.
+    #[test]
+    fn build_host_permit_dialog_uses_sandbox_lease_wording_for_the_lease_worker() {
+        let (prompt, _answer) = build_host_permit_prompt_for(
+            harw_tool_shell::SANDBOX_LEASE_WORKER_DEFINITION,
+            "brauche Host-PATH für cargo",
+            HostPermitVariant::SessionLease,
+        );
+        let dialog = build_host_permit_dialog(&prompt);
+        let rendered = rendered_choice_dialog(&dialog);
+
+        assert!(
+            rendered.contains("Sandbox-Lease angefragt"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("Grund: brauche Host-PATH für cargo"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Host-Ausführung erlauben?"),
+            "rendered: {rendered}"
+        );
+    }
+
+    /// Ein gewöhnlicher Host-Befehl (nicht die Sandbox-Lease-Worker-
+    /// Definition) behält die bisherige Formulierung bei.
+    #[test]
+    fn build_host_permit_dialog_keeps_the_command_wording_for_other_workers() {
+        let (prompt, _answer) = build_host_permit_prompt(HostPermitVariant::SingleExecution);
+        let dialog = build_host_permit_dialog(&prompt);
+        let rendered = rendered_choice_dialog(&dialog);
+
+        assert!(
+            rendered.contains("Host-Ausführung erlauben?"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("host-process-worker@1"),
+            "rendered: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Sandbox-Lease angefragt"),
+            "rendered: {rendered}"
+        );
+    }
+
+    /// B6: `open_host_permit_prompt` — die Funktion, die
+    /// `drive_turn_animated`s neuer `host_permit_prompts.recv()`-Arm bei
+    /// einer während des laufenden Turns eintreffenden Frage aufruft —
+    /// öffnet sofort Dialog und Frage. Ein vollständiger Test des
+    /// `select!`-Loops selbst existiert nicht (kein Test-Terminal/-Gateway
+    /// für `drive_turn_animated` vorhanden); dieser Test deckt die
+    /// tatsächliche Zustandsänderung ab, die den Dialog sichtbar macht.
+    #[test]
+    fn host_permit_prompt_arrival_opens_the_dialog_during_a_running_turn() {
+        let mut app = test_chat_app();
+        assert!(app.pending_host_permit.is_none());
+        assert!(app.pending_host_permit_dialog.is_none());
+
+        let (prompt, _answer) = build_host_permit_prompt(HostPermitVariant::SingleExecution);
+        let shown_at = open_host_permit_prompt(&mut app, prompt);
+
+        assert!(app.pending_host_permit.is_some());
+        assert!(app.pending_host_permit_dialog.is_some());
+        assert!(shown_at.elapsed() < Duration::from_secs(1));
+    }
+
+    /// `open_host_permit_prompt` lehnt eine noch offene ältere Frage ab,
+    /// statt sie still zu überschreiben (dieselbe K3-Regel wie beim
+    /// normalen Freigabe-Panel).
+    #[tokio::test]
+    async fn open_host_permit_prompt_denies_a_stale_open_prompt() {
+        let mut app = test_chat_app();
+        let (stale_prompt, stale_answer) =
+            build_host_permit_prompt(HostPermitVariant::SingleExecution);
+        open_host_permit_prompt(&mut app, stale_prompt);
+        assert!(app.pending_host_permit.is_some());
+
+        let (fresh_prompt, _fresh_answer) =
+            build_host_permit_prompt(HostPermitVariant::SessionLease);
+        open_host_permit_prompt(&mut app, fresh_prompt);
+
+        assert_eq!(
+            stale_answer.await.expect("responder must deliver an answer"),
+            None,
+            "the stale prompt must be denied, not silently dropped"
+        );
+        assert!(app.pending_host_permit.is_some());
     }
 
     /// `apply_host_permit_decision` mit Options-Index 0 genehmigt genau die
