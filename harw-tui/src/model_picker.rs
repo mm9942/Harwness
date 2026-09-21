@@ -48,7 +48,7 @@ impl PickerApp {
                 _ => {}
             },
             Stage::Models => {
-                let Some(provider) = self.providers.get_mut(self.provider_index) else { return None; };
+                let provider = self.providers.get_mut(self.provider_index)?;
                 match key.code {
                     KeyCode::Up => self.model_index = self.model_index.saturating_sub(1),
                     KeyCode::Down => if self.model_index + 1 < provider.models.len() { self.model_index += 1; },

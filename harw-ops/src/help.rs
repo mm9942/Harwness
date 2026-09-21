@@ -243,7 +243,7 @@ fn build_grouped_help<'a>(
     summary = "Listet alle verfügbaren /-Befehle mit Zusammenfassung.",
     domain = "misc",
     permission = "observer",
-    command(path = "/help", visibility = "channel_parity"),
+    command(path = "/help", visibility = "channel_parity", busy = "immediate"),
     // Web-Fläche: reine Auflistung der registrierten Commands, kein
     // Seiteneffekt möglich (die Operation liest nur `ctx.registry()` und
     // formatiert Text) — deshalb `method = "get"`. `approval = "none"`, weil

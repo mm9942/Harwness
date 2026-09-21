@@ -1050,6 +1050,7 @@ fn legacy_provider(name: &str, enabled: bool) -> Option<ProviderToml> {
             rate_limit: None,
             max_concurrency: None,
             originator: None,
+            default_reasoning_effort: None,
         }),
         _ => None,
     }

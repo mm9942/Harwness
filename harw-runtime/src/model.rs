@@ -42,8 +42,8 @@ use harw_config::ResolvedConfig;
 use harw_core::{
     EchoModelProvider, ModelError, ModelFuture, ModelProvider, ModelRequest, PinnedModelProvider,
 };
-use harw_provider_http::SecretResolver;
-use harw_types::ModelId;
+use harw_provider_http::{ProviderLoadRegistry, SecretResolver};
+use harw_types::{ModelId, ProviderId};
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::spec::RuntimeSpec;
@@ -138,9 +138,41 @@ pub fn build_root_model_with_resolver(
     source: ModelSource,
     resolver: Option<&dyn SecretResolver>,
 ) -> RuntimeResult<Arc<dyn ModelProvider>> {
+    build_root_model_with_registry_and_resolver(spec, config, source, resolver)
+        .map(|(model, _registry)| model)
+}
+
+/// Wie [`build_root_model_with_resolver`], liefert zusätzlich die
+/// [`ProviderLoadRegistry`] des gebauten Providers.
+///
+/// # Description
+/// Composition-Root-Baustein für den Auslastungskanal
+/// ([`harw_provider_http::ProviderLoadControl`]): ruft für
+/// [`ModelSource::Configured`]
+/// [`harw_provider_http::build_provider_with_load_registry_and_home`] statt
+/// [`harw_provider_http::build_provider_with_home`] auf und reicht die
+/// Registry unverändert weiter. `Echo`/`Override`/`NoneUsable` liefern eine
+/// leere Registry — keiner dieser Zweige baut einen HTTP-Provider, es gibt
+/// also nichts zu registrieren.
+///
+/// [`build_root_model_with_resolver`] delegiert hierher und verwirft die
+/// Registry — bestehende Aufrufer sind von dieser Erweiterung nicht
+/// betroffen.
+///
+/// # Errors
+/// Wie [`build_root_model_with_resolver`].
+pub fn build_root_model_with_registry_and_resolver(
+    spec: &RuntimeSpec,
+    config: &ResolvedConfig,
+    source: ModelSource,
+    resolver: Option<&dyn SecretResolver>,
+) -> RuntimeResult<(Arc<dyn ModelProvider>, ProviderLoadRegistry)> {
     match source {
-        ModelSource::Override(provider) => Ok(provider),
-        ModelSource::Echo(reply) => Ok(Arc::new(EchoModelProvider::new(reply))),
+        ModelSource::Override(provider) => Ok((provider, ProviderLoadRegistry::new())),
+        ModelSource::Echo(reply) => Ok((
+            Arc::new(EchoModelProvider::new(reply)),
+            ProviderLoadRegistry::new(),
+        )),
         ModelSource::Configured => {
             // Fallback-Speicherplatz: nur belegt, wenn `resolve_default_model`
             // tatsächlich einen abweichenden Vorgabe-Wert wählt (siehe dort).
@@ -170,15 +202,19 @@ pub fn build_root_model_with_resolver(
                          call will fail clearly until an enabled provider is referenced by \
                          default_provider/default_model or a catalog model"
                     );
-                    return Ok(Arc::new(UnusableModelProvider::new(
-                        "no usable model/provider is configured; add an enabled provider under \
-                         providers/ and reference it from default_provider/default_model (or a \
-                         models/ entry) before sending a message"
-                            .to_owned(),
-                    )));
+                    return Ok((
+                        Arc::new(UnusableModelProvider::new(
+                            "no usable model/provider is configured; add an enabled provider \
+                             under providers/ and reference it from \
+                             default_provider/default_model (or a models/ entry) before sending \
+                             a message"
+                                .to_owned(),
+                        )),
+                        ProviderLoadRegistry::new(),
+                    ));
                 }
             };
-            let provider = harw_provider_http::build_provider_with_home(
+            let (provider, registry) = harw_provider_http::build_provider_with_load_registry_and_home(
                 effective_config,
                 spec.home.as_path(),
                 resolver,
@@ -186,7 +222,7 @@ pub fn build_root_model_with_resolver(
             .map_err(|error| RuntimeError::Provider {
                 detail: error.to_string(),
             })?;
-            Ok(Arc::from(provider))
+            Ok((Arc::from(provider), registry))
         }
     }
 }
@@ -277,8 +313,13 @@ enum UiaModelResolution {
     /// unverändert (kein zweiter HTTP-Client).
     UsesDefault,
     /// `uia_provider` bezeichnet einen vorhandenen, aktivierten Provider und
-    /// `uia_model` ist gesetzt — ein eigenständiger HTTP-Client wird dafür
-    /// gebaut.
+    /// `uia_model` ist gesetzt — der bereits gebaute Vorgabe-Router
+    /// (`default_tree_model`, selbst schon ein
+    /// [`harw_provider_http::RoutingModelProvider`] über alle aktivierten
+    /// Provider, siehe `harw-provider-http/src/lib.rs`
+    /// `build_provider_with_optional_resolver`) wird lediglich in einen
+    /// [`UiaDefaultRouteProvider`] gehüllt, der die UIA-Standardroute setzt.
+    /// Es wird **kein** zweiter HTTP-Client gebaut.
     Explicit { provider: String, model: String },
 }
 
@@ -291,6 +332,15 @@ enum UiaModelResolution {
 /// gebaute Vorgabe-Modell des Laufs zurück (`default_provider`/
 /// `default_model`, ggf. bereits selbst per [`resolve_default_model`]
 /// ausgewichen), statt eine eigene Katalog-Suche zu betreiben.
+///
+/// Der Provider selbst muss dafür **nicht** neu gebaut werden: der bereits
+/// gebaute Vorgabe-Router (`default_tree_model`) enthält bereits einen
+/// Backend-Client für jeden aktivierten Provider
+/// (`harw-provider-http/src/lib.rs` `build_provider_with_optional_resolver`,
+/// ~321-368) und routet pro Anfrage nach `request.provider_id`
+/// (`harw-provider-http/src/routing.rs` `RoutingModelProvider::select`,
+/// ~70-89). `Explicit` bestimmt hier nur, welche Provider-/Modell-ID als
+/// Standardroute gilt, wenn eine Anfrage selbst keine wählt.
 ///
 /// `UsesDefault` gilt, wenn `uia_provider` fehlt, keinen vorhandenen,
 /// aktivierten Provider bezeichnet, oder wenn `uia_model` fehlt.
@@ -341,11 +391,15 @@ fn resolve_uia_model(config: &ResolvedConfig) -> UiaModelResolution {
 ///
 /// # Returns
 /// `Arc<dyn ModelProvider>` — entweder `Arc::clone(default_tree_model)` oder
-/// ein eigenständig gebauter HTTP-Client für `uia_provider`/`uia_model`.
+/// derselbe Router, umhüllt von [`UiaDefaultRouteProvider`], die
+/// `uia_provider`/`uia_model` als Standardroute setzt, wenn eine Anfrage
+/// selbst keine `provider_id`/`model_id` mitbringt.
 ///
 /// # Errors
-/// Wie [`build_root_model`]: [`RuntimeError::Provider`], wenn der
-/// konfigurierte UIA-Provider nicht gebaut werden kann.
+/// Kann seit der Vereinheitlichung mit dem Vorgabe-Router nicht mehr
+/// fehlschlagen — es wird kein zweiter HTTP-Client gebaut. Die
+/// `RuntimeResult`-Signatur bleibt aus Kompatibilitätsgründen für
+/// bestehende Aufrufer erhalten.
 pub fn build_uia_model(
     spec: &RuntimeSpec,
     config: &ResolvedConfig,
@@ -364,17 +418,16 @@ pub fn build_uia_model(
 /// öffnen. Der Aufrufer baut den Resolver wie bisher und reicht ihn hier
 /// herein.
 ///
-/// Im `Explicit`-Zweig folgt diese Funktion exakt dem Fallback-Muster aus
-/// [`build_root_model_with_resolver`]: eine Kopie der Konfiguration erhält
-/// `default_provider`/`default_model` auf das UIA-Paar gesetzt und wird
-/// unverändert an [`harw_provider_http::build_provider_with_home`]
-/// weitergereicht — das baut einen zweiten, unabhängigen HTTP-Client, ohne
-/// `harw-provider-http` selbst anzufassen.
+/// Der `Explicit`-Zweig baut seit der Vereinheitlichung mit dem
+/// Vorgabe-Router **keinen** zweiten HTTP-Client mehr (siehe
+/// [`UiaModelResolution::Explicit`], [`UiaDefaultRouteProvider`]) — `spec`
+/// und `resolver` werden hier nicht mehr gebraucht, bleiben aber Teil der
+/// Signatur, damit bestehende Aufrufer unverändert bleiben.
 ///
 /// # Arguments
 /// Wie [`build_uia_model`], zusätzlich:
-/// - `resolver` (`Option<&dyn SecretResolver>`): siehe
-///   [`build_root_model_with_resolver`].
+/// - `resolver` (`Option<&dyn SecretResolver>`): unbenutzt seit der
+///   Vereinheitlichung mit dem Vorgabe-Router; siehe oben.
 ///
 /// # Returns
 /// Wie [`build_uia_model`].
@@ -388,28 +441,145 @@ pub fn build_uia_model_with_resolver(
     default_tree_model: &Arc<dyn ModelProvider>,
     resolver: Option<&dyn SecretResolver>,
 ) -> RuntimeResult<Arc<dyn ModelProvider>> {
+    build_uia_model_with_registry_and_resolver(
+        spec,
+        config,
+        source_is_configured,
+        default_tree_model,
+        resolver,
+    )
+    .map(|(model, _registry)| model)
+}
+
+/// Wie [`build_uia_model_with_resolver`], liefert zusätzlich die
+/// [`ProviderLoadRegistry`] des UIA-Zweigs.
+///
+/// # Description
+/// Seit der Vereinheitlichung mit dem Vorgabe-Router baut **keiner** der
+/// drei Zweige (`!source_is_configured`, [`UiaModelResolution::UsesDefault`],
+/// [`UiaModelResolution::Explicit`]) mehr einen eigenen HTTP-Client: alle
+/// enthaltenen Provider stecken bereits im Vorgabe-Router
+/// `default_tree_model` (`harw-provider-http/src/lib.rs`
+/// `build_provider_with_optional_resolver`, ~321-368), der pro Anfrage nach
+/// `request.provider_id` routet (`harw-provider-http/src/routing.rs`
+/// `RoutingModelProvider::select`, ~70-89). `Explicit` hüllt diesen Router
+/// nur in [`UiaDefaultRouteProvider`], damit Anfragen ohne eigene Wahl auf
+/// `uia_provider`/`uia_model` fallen. Alle drei Zweige liefern deshalb eine
+/// **leere** zusätzliche Registry — der bereits gebaute Root-Registry-Eintrag
+/// deckt jeden Provider schon ab; ein zweiter, identischer Eintrag würde nur
+/// dupliziert (siehe Merge-Logik in [`RuntimeAssemblyBuilder::build`]).
+///
+/// [`build_uia_model_with_resolver`] delegiert hierher und verwirft die
+/// Registry — bestehende Aufrufer sind von dieser Erweiterung nicht
+/// betroffen.
+///
+/// # Errors
+/// Wie [`build_uia_model_with_resolver`]: kann seit der Vereinheitlichung
+/// nicht mehr fehlschlagen (kein zweiter Client-Bau mehr), die
+/// `RuntimeResult`-Signatur bleibt aus Kompatibilitätsgründen erhalten.
+pub fn build_uia_model_with_registry_and_resolver(
+    _spec: &RuntimeSpec,
+    config: &ResolvedConfig,
+    source_is_configured: bool,
+    default_tree_model: &Arc<dyn ModelProvider>,
+    _resolver: Option<&dyn SecretResolver>,
+) -> RuntimeResult<(Arc<dyn ModelProvider>, ProviderLoadRegistry)> {
     if !source_is_configured {
-        // Echo/Override: kein konfigurierter Root-Provider, also auch kein
-        // eigener UIA-Client — `harw-provider-http` bleibt unberührt.
-        return Ok(Arc::clone(default_tree_model));
+        // Echo/Override: kein konfigurierter Root-Provider, also auch keine
+        // eigene UIA-Standardroute — `harw-provider-http` bleibt unberührt.
+        return Ok((Arc::clone(default_tree_model), ProviderLoadRegistry::new()));
     }
 
     match resolve_uia_model(config) {
-        UiaModelResolution::UsesDefault => Ok(Arc::clone(default_tree_model)),
-        UiaModelResolution::Explicit { provider, model } => {
-            let mut effective = config.clone();
-            effective.harness.default_provider = Some(provider);
-            effective.harness.default_model = Some(model);
-            let provider = harw_provider_http::build_provider_with_home(
-                &effective,
-                spec.home.as_path(),
-                resolver,
-            )
-            .map_err(|error| RuntimeError::Provider {
-                detail: error.to_string(),
-            })?;
-            Ok(Arc::from(provider))
+        UiaModelResolution::UsesDefault => {
+            Ok((Arc::clone(default_tree_model), ProviderLoadRegistry::new()))
         }
+        UiaModelResolution::Explicit { provider, model } => {
+            let uia_model: Arc<dyn ModelProvider> = Arc::new(UiaDefaultRouteProvider::new(
+                Arc::clone(default_tree_model),
+                ProviderId::from(provider),
+                ModelId::from(model),
+            ));
+            Ok((uia_model, ProviderLoadRegistry::new()))
+        }
+    }
+}
+
+/// Umhüllt den Vorgabe-Router (`default_tree_model`) so, dass eine Anfrage
+/// ohne eigene `provider_id`/`model_id` auf die UIA-Standardroute fällt,
+/// während eine bereits vom Aufrufer gesetzte Wahl unverändert Vorrang
+/// behält.
+///
+/// # Description
+/// Existiert, weil [`PinnedModelProvider`] (`harw-core/src/pinned_model.rs`
+/// `respond`) `provider_id`/`model_id` **unbedingt** überschreibt, sobald ein
+/// Wert gepinnt ist — unabhängig davon, ob der Request bereits einen eigenen
+/// Wert trägt. Für den `Explicit`-UIA-Zweig ist das falsch: eine Live-Auswahl
+/// über `/uia-model switch`
+/// (`harw-tui/src/session_controller.rs` `apply_to_session`, schreibt
+/// `provider_id`/`model_id` direkt in den Request) muss weiterhin Vorrang
+/// behalten. `UiaDefaultRouteProvider` setzt beide Felder deshalb **nur**,
+/// wenn sie im Request noch `None` sind.
+struct UiaDefaultRouteProvider {
+    /// Der Vorgabe-Router, an den nach dem optionalen Auffüllen delegiert
+    /// wird — enthält bereits einen Backend-Client für jeden aktivierten
+    /// Provider (siehe [`build_uia_model_with_registry_and_resolver`]).
+    inner: Arc<dyn ModelProvider>,
+    /// Provider-ID der UIA-Standardroute (`uia_provider`).
+    default_provider_id: ProviderId,
+    /// Modell-ID der UIA-Standardroute (`uia_model`).
+    default_model_id: ModelId,
+}
+
+impl UiaDefaultRouteProvider {
+    /// Baut den Wrapper um `inner` mit der gegebenen UIA-Standardroute.
+    ///
+    /// # Arguments
+    /// - `inner` (`Arc<dyn ModelProvider>`): der umhüllte Vorgabe-Router.
+    /// - `default_provider_id` (`ProviderId`): Standard-Provider, falls der
+    ///   Request keinen eigenen trägt.
+    /// - `default_model_id` (`ModelId`): Standard-Modell, falls der Request
+    ///   keines trägt.
+    ///
+    /// # Returns
+    /// Einen fertig konfigurierten `UiaDefaultRouteProvider`.
+    fn new(inner: Arc<dyn ModelProvider>, default_provider_id: ProviderId, default_model_id: ModelId) -> Self {
+        Self {
+            inner,
+            default_provider_id,
+            default_model_id,
+        }
+    }
+}
+
+impl ModelProvider for UiaDefaultRouteProvider {
+    /// Füllt `request.provider_id`/`request.model_id` nur, wenn sie noch
+    /// `None` sind, und delegiert dann an `inner`.
+    ///
+    /// # Description
+    /// Im Unterschied zu [`PinnedModelProvider`] wird ein bereits gesetzter
+    /// Wert **nie** überschrieben — die Live-Auswahl des Aufrufers behält
+    /// Vorrang (siehe Struct-Dokumentation).
+    ///
+    /// # Arguments
+    /// - `request` (`ModelRequest`): der Request, dessen fehlende
+    ///   `provider_id`/`model_id` mit der UIA-Standardroute aufgefüllt
+    ///   werden, bevor er an `inner` weitergereicht wird.
+    ///
+    /// # Returns
+    /// Das [`ModelFuture`] des inneren Routers, unverändert durchgereicht.
+    ///
+    /// # Concurrency
+    /// Hält keine Locks; das zurückgegebene Future läuft vollständig im
+    /// inneren Router.
+    fn respond<'a>(&'a self, mut request: ModelRequest) -> ModelFuture<'a> {
+        if request.provider_id.is_none() {
+            request.provider_id = Some(self.default_provider_id.clone());
+        }
+        if request.model_id.is_none() {
+            request.model_id = Some(self.default_model_id.clone());
+        }
+        self.inner.respond(request)
     }
 }
 
@@ -488,9 +658,17 @@ fn resolve_uia_worker_model(config: &ResolvedConfig) -> Option<String> {
 /// # Arguments
 /// - `config` (`&ResolvedConfig`): die bereits validierte Konfiguration
 ///   dieses Laufs.
-/// - `uia_client` (`&Arc<dyn ModelProvider>`): der bereits gebaute
-///   UIA-Client ([`build_uia_model`]), auf dem `uia_worker_model` ggf.
-///   gepinnt wird.
+/// - `uia_client` (`&Arc<dyn ModelProvider>`): das bereits gebaute
+///   UIA-Modell ([`build_uia_model`]) — entweder `default_tree_model`
+///   unverändert oder ein [`UiaDefaultRouteProvider`] darum —, auf dem
+///   `uia_worker_model` ggf. gepinnt wird.
+///
+/// Da [`PinnedModelProvider`] hier nur `model_id` pinnt und `provider_id`
+/// unangetastet lässt, füllt anschließend `uia_client` selbst — sofern es
+/// ein [`UiaDefaultRouteProvider`] ist — eine fehlende `provider_id` mit der
+/// UIA-Standardroute auf: eine uia-worker-Anfrage ohne eigene `provider_id`
+/// landet damit trotzdem beim UIA-Provider, auch ohne dass diese Funktion
+/// selbst die `provider_id` anfasst.
 ///
 /// # Returns
 /// `Arc<dyn ModelProvider>` — entweder ein [`PinnedModelProvider`] um
@@ -547,7 +725,7 @@ mod tests {
     use harw_config::{HarnessConfig, OriginAllowlistToml, ProviderToml};
     use harw_core::{ModelRequest, ModelResponse};
     use harw_extension_api::types::LoadedInstructions;
-    use harw_types::{IngressSurface, PermissionTier, Principal, PrincipalKind, ProviderId};
+    use harw_types::{IngressSurface, PermissionTier, Principal, PrincipalKind};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
@@ -598,6 +776,7 @@ mod tests {
                 rate_limit: None,
                 max_concurrency: None,
                 originator: None,
+                default_reasoning_effort: None,
             },
         );
         config
@@ -622,6 +801,7 @@ mod tests {
                 rate_limit: None,
                 max_concurrency: None,
                 originator: None,
+                default_reasoning_effort: None,
             },
         );
     }
@@ -639,6 +819,7 @@ mod tests {
             reasoning: false,
             input_types: Vec::new(),
             capabilities: harw_config::ModelCapabilitiesToml::default(),
+            default_reasoning_effort: None,
         }
     }
 
@@ -761,6 +942,7 @@ mod tests {
                 reasoning: false,
                 input_types: Vec::new(),
                 capabilities: harw_config::ModelCapabilitiesToml::default(),
+                default_reasoning_effort: None,
             },
         );
 
@@ -902,42 +1084,105 @@ mod tests {
     }
 
     /// Beweistest: `uia_provider` weicht von `default_provider` ab — der
-    /// gebaute UIA-Client ist ein eigenständiger HTTP-Client, dessen
-    /// `respond()` mit `provider_id = "local-b"` nicht am
-    /// `selected_model()`-Provider-Abgleich scheitert (im Unterschied zum
-    /// Verhalten, wenn man `local-b` fälschlich an den `local-a`-Client
-    /// schicken würde).
+    /// `Explicit`-Zweig baut **keinen** zweiten Router mehr, sondern hüllt
+    /// den bereits gebauten Vorgabe-Router in [`UiaDefaultRouteProvider`].
+    /// Beleg: `build_uia_model_with_registry_and_resolver` liefert eine
+    /// leere zusätzliche Registry — es gibt nichts Neues zu registrieren,
+    /// weil kein zweiter HTTP-Client entstanden ist.
     #[test]
-    fn build_uia_model_builds_a_dedicated_client_when_uia_provider_differs_from_default() {
+    fn build_uia_model_explicit_branch_wraps_the_default_router_without_building_a_second_one() {
         let spec = spec_for(Path::new("/nonexistent-home"));
         let mut config = two_provider_config();
         config.harness.uia_provider = Some("local-b".to_owned());
         config.harness.uia_model = Some("local-b-model".to_owned());
-        config
-            .models
-            .insert("local-b-model".to_owned(), model_toml("local-b-model", "local-b"));
+
+        let default_tree_model = build_root_model(&spec, &config, ModelSource::Configured)
+            .expect("default provider (local-a) must build");
+        let (uia_model, uia_registry) = build_uia_model_with_registry_and_resolver(
+            &spec,
+            &config,
+            true,
+            &default_tree_model,
+            None,
+        )
+        .expect("explicit uia branch must not fail — no client is built");
+
+        assert!(
+            !Arc::ptr_eq(&default_tree_model, &uia_model),
+            "the uia model must be a distinct wrapper (UiaDefaultRouteProvider), not the same \
+             Arc as the default tree model"
+        );
+        assert!(
+            uia_registry.is_empty(),
+            "the explicit uia branch must not build a second HTTP client/registry entry — the \
+             default router already registers every enabled provider"
+        );
+    }
+
+    /// Beweistest: eine Anfrage ohne eigene `provider_id`/`model_id` über den
+    /// UIA-Client landet beim UIA-Provider (`local-b`) — `select()` im
+    /// zugrunde liegenden Router (`harw-provider-http/src/routing.rs`) würde
+    /// sonst mit "requested model provider '' is not configured" oder
+    /// ähnlich scheitern; ein `RequestFailed` mit einer Meldung, die auf
+    /// einen fehlenden Provider hindeutet, wäre ein Fehlschlag dieses Tests.
+    #[test]
+    fn build_uia_model_explicit_branch_routes_default_requests_to_the_uia_provider() {
+        let spec = spec_for(Path::new("/nonexistent-home"));
+        let mut config = two_provider_config();
+        config.harness.uia_provider = Some("local-b".to_owned());
+        config.harness.uia_model = Some("local-b-model".to_owned());
 
         let default_tree_model = build_root_model(&spec, &config, ModelSource::Configured)
             .expect("default provider (local-a) must build");
         let uia_model = build_uia_model(&spec, &config, true, &default_tree_model)
-            .expect("uia provider (local-b) must build as a dedicated client");
-
-        assert!(
-            !Arc::ptr_eq(&default_tree_model, &uia_model),
-            "the uia client must be a second, independent provider instance"
-        );
+            .expect("explicit uia branch must not fail");
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("current-thread runtime");
-        let request = empty_request().with_provider_id(Some(ProviderId::from("local-b")));
+        // Kein eigener provider_id/model_id im Request — muss auf die
+        // UIA-Standardroute (local-b) fallen, nicht auf local-a und nicht
+        // auf einen unbekannten Provider.
+        let result = runtime.block_on(uia_model.respond(empty_request()));
+        if let Err(error) = result {
+            let message = error.to_string();
+            assert!(
+                !message.contains("is not configured"),
+                "a request without its own provider_id must route to the uia default provider \
+                 'local-b', which is registered in the default router: {message}"
+            );
+        }
+    }
+
+    /// Beweistest: eine Anfrage mit **eigener** `provider_id` wird respektiert
+    /// — `UiaDefaultRouteProvider` darf eine bereits gesetzte Live-Auswahl
+    /// (`/uia-model switch`, `SessionController::apply_to_session`) nicht
+    /// überschreiben, im Unterschied zu [`PinnedModelProvider`].
+    #[test]
+    fn build_uia_model_explicit_branch_respects_an_already_set_provider_id() {
+        let spec = spec_for(Path::new("/nonexistent-home"));
+        let mut config = two_provider_config();
+        config.harness.uia_provider = Some("local-b".to_owned());
+        config.harness.uia_model = Some("local-b-model".to_owned());
+
+        let default_tree_model = build_root_model(&spec, &config, ModelSource::Configured)
+            .expect("default provider (local-a) must build");
+        let uia_model = build_uia_model(&spec, &config, true, &default_tree_model)
+            .expect("explicit uia branch must not fail");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        // Live-Auswahl auf "local-a" gesetzt — die UIA-Standardroute
+        // ("local-b") darf das nicht überschreiben.
+        let request = empty_request().with_provider_id(Some(ProviderId::from("local-a")));
         let result = runtime.block_on(uia_model.respond(request));
         if let Err(error) = result {
             let message = error.to_string();
             assert!(
-                !message.contains("this HTTP provider is configured for"),
-                "a provider_id matching the dedicated uia client's own provider must not be \
-                 rejected by selected_model(): {message}"
+                !message.contains("is not configured"),
+                "an explicitly chosen provider_id ('local-a') must be respected and routed, not \
+                 overwritten by the uia default route: {message}"
             );
         }
     }

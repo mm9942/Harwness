@@ -14,12 +14,26 @@
 //!   registriert (z. B. via `inventory::submit!` durch Extension-Crate).
 //!
 //! # Op-Set
-//! **Grundausstattung** ([`register_all`], 33 Ops): `help`, `status`, `quit`,
+//! **Grundausstattung** ([`register_all`], 36 Ops): `help`, `status`, `quit`,
 //! `new`, `work`, `ps`, `attach`, `stop`, `diff`, `agent`, `skills`, `plugins`,
 //! `model`, `provider`, `uia-model`, `uia-provider`, `permissions`, `compact`,
 //! `memory`, `effort`, `mode`, `context-proposal`, `approval.pending`,
 //! `approval.resolve`, `add-workdir`, `export`, `usage`, `bug-report`,
-//! `approve`, `deny`, `review`, `cancel`, `retry`.
+//! `approve`, `deny`, `review`, `cancel`, `retry`, `provider-concurrency`,
+//! `uia-worker-model`, `uia-effort`.
+//! `uia-worker-model` (Welle 2, harw-ops/src/model.rs) und `uia-effort`
+//! (harw-ops/src/effort.rs) waren implementiert, aber bis zu diesem Knoten
+//! nicht in `register_all` eingetragen — dadurch existierten `/uia-worker-model`
+//! und `/uia-effort` in der TUI nicht, obwohl der Picker für
+//! `/uia-worker-model` bereits `switch <id>` dagegen sendet. Sie sind
+//! strukturelle Zwillinge von `uia-model`/`uia-provider`: eigene, vom
+//! Session-Default unabhängige Pins (`uia_worker_model`/`uia_effort`), die
+//! erst ab der nächsten UIA-Worker-Sitzung wirken.
+//! `provider-concurrency` (Welle 6b) zeigt/verstellt die harte,
+//! client-seitige Nebenläufigkeitsgrenze eines Providers live und ist —
+//! anders als `provider`, das bewusst kein `model_tool` trägt — auch der UIA
+//! zugänglich, damit sie selbst auf wiederholte HTTP-429-Antworten reagieren
+//! kann (siehe `crate::provider`-Moduldoku).
 //! `bug-report` schreibt einen minimalen, manuell ausgelösten lokalen
 //! Bug-Report nach `<home>/bug-report/` (kein Netzwerk-Versand) — die
 //! automatische Incident-Erkennung ist ein separates, noch ausstehendes
@@ -211,7 +225,7 @@ fn compact_unavailable_output() -> OpOutput {
     OpOutput::from(crate::compact::COMPACT_HINT.to_owned())
 }
 
-/// Registriert alle 33 in dieser Crate definierten Kern-Operationen in der Registry.
+/// Registriert alle 36 in dieser Crate definierten Kern-Operationen in der Registry.
 ///
 /// # Beschreibung
 /// Fügt der übergebenen [`OperationRegistry`] eine `Arc<dyn Operation>`-Instanz
@@ -219,7 +233,8 @@ fn compact_unavailable_output() -> OpOutput {
 /// `help, status, quit, new, work, ps, attach, stop, diff, agent, skills,
 /// plugins, model, provider, uia-model, uia-provider, permissions, compact,
 /// memory, effort, mode, context-proposal, approval.pending, approval.resolve,
-/// add-workdir, export, usage, bug-report, approve, deny, review, cancel, retry`.
+/// add-workdir, export, usage, bug-report, approve, deny, review, cancel, retry,
+/// provider-concurrency, uia-worker-model, uia-effort`.
 ///
 /// Die Reihenfolge steuert nur die `iter()`-Reihenfolge und den Fallback-Namens-
 /// Vorschlag; die eigentliche Auflösung erfolgt über `find_by_name` /
@@ -239,10 +254,12 @@ fn compact_unavailable_output() -> OpOutput {
 ///
 /// let mut registry = OperationRegistry::new();
 /// harw_ops::register_all(&mut registry);
-/// assert_eq!(registry.len(), 33);
+/// assert_eq!(registry.len(), 36);
 /// assert!(registry.find_by_name("help").is_some());
 /// assert!(registry.find_by_command("/uia-provider").is_some());
 /// assert!(registry.find_by_command("/uia-model").is_some());
+/// assert!(registry.find_by_command("/uia-worker-model").is_some());
+/// assert!(registry.find_by_command("/uia-effort").is_some());
 /// assert!(registry.find_by_command("/status").is_some());
 /// assert!(registry.find_by_command("/effort").is_some());
 /// assert!(registry.find_by_command("/mode").is_some());
@@ -260,7 +277,7 @@ fn compact_unavailable_output() -> OpOutput {
 /// assert!(registry.find_by_command("/retry").is_some());
 /// ```
 pub fn register_all(registry: &mut OperationRegistry) {
-    let ops: [Arc<dyn Operation>; 33] = [
+    let ops: [Arc<dyn Operation>; 36] = [
         Arc::new(help::HelpOperation),
         Arc::new(status::StatusOperation),
         Arc::new(quit::QuitOperation),
@@ -322,6 +339,24 @@ pub fn register_all(registry: &mut OperationRegistry) {
         Arc::new(review::ReviewOperation),
         Arc::new(cancel::CancelOperation),
         Arc::new(retry::RetryOperation),
+        // W6b — UIA-Sichtbarkeit auf Provider-Concurrency/Rate-Limit-Zustand +
+        // Live-Anpassung (siehe `crate::provider`-Moduldoku): eigene Operation
+        // statt Unterbefehl von `/provider`, weil `/provider` bewusst KEIN
+        // `model_tool` trägt ("Provider switches are exclusively permitted as
+        // operator commands") — die Concurrency-Anpassung dagegen MUSS auch
+        // der UIA selbst zugänglich sein (Reaktion auf beobachtete 429).
+        Arc::new(provider::ProviderConcurrencyOperation),
+        // Structural twin of `uia-model`/`uia-provider` above: pins
+        // `uia_worker_model` (independent of `default_model`/`uia_model`),
+        // effective from the next UIA-worker session. Was implemented but
+        // never registered until this node, so `/uia-worker-model` —
+        // including the TUI picker's `switch <id>` follow-up — ran into an
+        // unknown command.
+        Arc::new(model::UiaWorkerModelOperation),
+        // Structural twin of `uia-model`/`uia-worker-model` above: pins
+        // `uia_effort`, independent of the session's default reasoning
+        // effort. Same registration gap and fix as `uia-worker-model`.
+        Arc::new(effort::UiaEffortOperation),
     ];
     for op in ops {
         registry.register(op);
@@ -627,10 +662,10 @@ mod tests {
     }
 
     #[test]
-    fn register_all_adds_thirty_three_operations() {
+    fn register_all_adds_thirty_six_operations() {
         let mut reg = OperationRegistry::new();
         register_all(&mut reg);
-        assert_eq!(reg.len(), 33);
+        assert_eq!(reg.len(), 36);
     }
 
     #[test]
@@ -708,6 +743,8 @@ mod tests {
             "/permissions",
             "/compact",
             "/effort",
+            "/uia-worker-model",
+            "/uia-effort",
             "/mode",
             "/context-proposal",
             "/add-workdir",
@@ -785,6 +822,16 @@ mod tests {
             "plugins",
             "model",
             "provider",
+            // `uia-model`/`uia-provider` were previously absent from this
+            // completeness list although they were already registered in
+            // `register_all` — an unexplained gap, not a deliberate
+            // exception like `compact` below. Added here for the same
+            // reason `uia-worker-model`/`uia-effort` triggered this node:
+            // this list is documented as exhaustive over declared op
+            // structs, and there was no recorded rationale for leaving the
+            // other UIA twins out.
+            "uia-model",
+            "uia-provider",
             "permissions",
             "compact",
             "memory",
@@ -802,6 +849,12 @@ mod tests {
             "review",
             "cancel",
             "retry",
+            // W6b, same completeness-list gap as `uia-model`/`uia-provider`
+            // above: already registered, never added here.
+            "provider-concurrency",
+            // This node: implemented, now registered, now listed.
+            "uia-worker-model",
+            "uia-effort",
             "plan",
             "goal",
             "explore",
@@ -850,8 +903,8 @@ mod tests {
         register_all(&mut reg);
         assert_eq!(
             reg.len(),
-            33,
-            "first register_all must produce exactly 33 ops"
+            36,
+            "first register_all must produce exactly 36 ops"
         );
 
         // Attempt to register HelpOperation a second time via the fallible path.
@@ -865,8 +918,8 @@ mod tests {
         // Registry must not have grown — the rejected op was not inserted.
         assert_eq!(
             reg.len(),
-            33,
-            "registry must stay at 33 after a rejected duplicate"
+            36,
+            "registry must stay at 36 after a rejected duplicate"
         );
     }
 }

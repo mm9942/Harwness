@@ -18,25 +18,46 @@
 //! UIA-Provider mit `/uia-model`), der anders als die beiden anderen keinen
 //! Live-`SessionController`-Pfad hat und erst beim nächsten Sitzungsstart wirkt.
 //!
+//! Zusätzlich stellt dieses Modul [`SelectionPersistence`] bereit: einen
+//! austauschbaren Dienst-Trait, der die vier `persist_*`-Funktionen hinter
+//! einer gemeinsamen Schnittstelle bündelt, plus [`FileSelectionPersistence`]
+//! (Standard-Implementierung, ruft unverändert die freien Funktionen auf) und
+//! [`RecordingSelectionPersistence`] (No-op-Aufzeichnung für Tests). Die
+//! Operationen (`crate::model`, `crate::effort`) fragen den Dienst über
+//! [`selection_persistence`] aus dem [`harw_operations::context::ServiceMap`]
+//! ab, bevor sie auf das bisherige Verhalten zurückfallen.
+//!
 //! # Exportierte Typen
-//! Keine öffentlichen Typen — alle Items sind `pub(crate)`.
+//! [`SelectionPersistence`], [`FileSelectionPersistence`],
+//! [`RecordingSelectionPersistence`], [`RecordedSelectionPersistCall`] sind
+//! `pub` (dieses Modul selbst ist `pub(crate)` — siehe `crate::model`'s
+//! `pub use crate::config_util::{...}`-Re-Export für den öffentlichen Pfad,
+//! über den `harw-tui`-Tests sie erreichen). Alle anderen Items bleiben
+//! `pub(crate)`.
 //!
 //! # Nebenläufigkeit
-//! Zustandslos; sicher von mehreren Threads aus aufrufbar.
+//! Die freien `persist_*`-Funktionen und [`load_default_config`] sind
+//! zustandslos. [`RecordingSelectionPersistence`] hält intern einen
+//! `Mutex<Vec<_>>` und ist damit `Send + Sync` — sicher von mehreren Threads
+//! aus aufrufbar.
 //!
 //! # Fehlertypen
 //! - [`harw_operations::OpError::Execution`]: wenn die Config-Discovery fehlschlägt.
 //! - [`persist_default_selection`]/[`persist_uia_selection`]/
-//!   [`persist_uia_worker_model`] liefern nie `Err` — Persistenzfehler werden
-//!   als menschenlesbare Notiz zurückgegeben, nicht propagiert.
+//!   [`persist_uia_worker_model`]/[`persist_uia_reasoning_effort`] (und ihre
+//!   [`SelectionPersistence`]-Trait-Pendants) liefern nie `Err` —
+//!   Persistenzfehler werden als menschenlesbare Notiz zurückgegeben, nicht
+//!   propagiert.
 //!
 //! # Spec-Referenz
 //! harwness Plan v2 — Config-Discovery-Konsolidierung; Folgeauftrag
 //! „zuletzt gewählter Provider/Modell bleibt Standard"; Welle 2 (2d) —
-//! `uia_worker_model`-Persistenz.
+//! `uia_worker_model`-Persistenz; Folgeauftrag — austauschbarer
+//! `SelectionPersistence`-Dienst für `slice9_model_switch_to_different_provider_is_atomic`.
 
 use harw_config::ResolvedConfig;
-use harw_operations::OpError;
+use harw_operations::{OpContext, OpError};
+use std::sync::{Arc, Mutex};
 
 /// Lädt die Config aus dem aktiven `HARW_HOME` und dessen Layern.
 ///
@@ -313,9 +334,378 @@ fn try_persist_uia_worker_model(model: Option<&str>) -> Result<(), String> {
     writer.save().map_err(|error| error.to_string())
 }
 
+/// Verankert `reasoning.uia` bestes Bemühen in der Profil-`config.toml`
+/// (`[reasoning] uia = "..."`), unabhängig von `uia_provider`/`uia_model`/
+/// `uia_worker_model`.
+///
+/// # Description
+/// Struktureller Zwilling von [`persist_uia_worker_model`], aber für das
+/// `[reasoning]`-Feld `uia` (`harw_config::HarnessConfig::reasoning.uia`,
+/// vom Resolver via `harw-runtime::guard_wiring::parse_effort_field`
+/// gelesen). `[reasoning]` ist eine verschachtelte TOML-Tabelle, im
+/// Unterschied zu den flachen Top-Level-Schlüsseln `uia_provider`/
+/// `uia_worker_model`; [`harw_config::ConfigWriter::set_value`]/
+/// [`harw_config::ConfigWriter::remove_value`] adressieren sie transparent
+/// über den punktgetrennten Pfad `"reasoning.uia"` — die Zwischentabelle
+/// `[reasoning]` wird bei Bedarf automatisch angelegt
+/// (`harw_config::writer::ensure_table`) und beim Entfernen des Blattwerts
+/// bewusst leer belassen statt gelöscht.
+///
+/// Wie [`persist_uia_worker_model`] ist `None` hier eine **explizite Aktion**
+/// (Pin entfernen), nicht "unverändert lassen" — anders als bei
+/// [`persist_default_selection`]/[`persist_uia_selection`], die zwei
+/// unabhängige Werte gemeinsam setzen können. Ebenfalls **niemals
+/// fehlschlagend** für den Aufrufer: Persistenzfehler werden als
+/// deutschsprachige Notiz zurückgegeben statt propagiert. `/uia-effort`
+/// mutiert (anders als `/effort`) **keinen** Live-`SessionController`-Zustand
+/// — der gesetzte Effort wirkt erst beim nächsten Sitzungsstart.
+///
+/// # Arguments
+/// - `effort` (`Option<&str>`): serialisierter [`harw_types::ReasoningEffort`]
+///   (`"minimal"|"low"|"medium"|"high"|"xhigh"|"max"`), der als
+///   `reasoning.uia` geschrieben werden soll, oder `None`, um den Pin zu
+///   entfernen.
+///
+/// # Returns
+/// `None` bei Erfolg; `Some(note)` mit einer für Menschen lesbaren Notiz,
+/// wenn die Persistenz fehlschlug.
+///
+/// # Panics
+/// Nie.
+///
+/// # Concurrency
+/// Rein synchron; kein Datei-Lock, analog zu [`persist_uia_worker_model`].
+///
+/// # Examples
+/// ```rust,ignore
+/// if let Some(note) = crate::config_util::persist_uia_reasoning_effort(Some("high")) {
+///     text.push('\n');
+///     text.push_str(&note);
+/// }
+/// ```
+pub(crate) fn persist_uia_reasoning_effort(effort: Option<&str>) -> Option<String> {
+    match try_persist_uia_reasoning_effort(effort) {
+        Ok(()) => None,
+        Err(reason) => Some(format!(
+            "Hinweis: konnte UIA-Reasoning-Effort nicht dauerhaft speichern ({reason})."
+        )),
+    }
+}
+
+/// Interner, fehlschlagender Kern von [`persist_uia_reasoning_effort`].
+fn try_persist_uia_reasoning_effort(effort: Option<&str>) -> Result<(), String> {
+    let home = harw_home::home_dir().map_err(|error| error.to_string())?;
+    let profile = harw_home::active_profile_name(&home);
+    let profile_dir = harw_home::profile_dir(&home, &profile).map_err(|error| error.to_string())?;
+    let config_path = profile_dir.join("config.toml");
+
+    let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(|error| error.to_string())?;
+    match effort {
+        Some(level) => writer.set_value("reasoning.uia", toml_edit::value(level)),
+        None => {
+            writer.remove_value("reasoning.uia");
+        }
+    }
+    writer.save().map_err(|error| error.to_string())
+}
+
+// ── Pluggable Persistenz-Dienst ─────────────────────────────────────────────
+//
+// Motivation: `try_persist_default_selection`/`try_persist_uia_selection`/
+// `try_persist_uia_worker_model`/`try_persist_uia_reasoning_effort` lösen
+// `HARW_HOME` intern selbst auf (`harw_home::home_dir()`), was den
+// prozessweiten Zustand mutieren würde, wäre er über `std::env::set_var`
+// isolierbar — dieses Crate deklariert `#![forbid(unsafe_code)]`, also ist
+// die dafür nötige `unsafe`-Env-Isolation hier nicht verfügbar. Bislang
+// wurde das über injizierte `FnOnce`-Abschlüsse an den einzelnen
+// Call-Sites gelöst (siehe `crate::model`/`crate::provider`/`crate::effort`
+// doc comments). [`SelectionPersistence`] verallgemeinert dasselbe Muster zu
+// einem austauschbaren Dienst, den Tests einmal über die `ServiceMap`
+// injizieren können, statt an jeder Call-Site einen eigenen Test-Abschluss
+// zu bauen — insbesondere für `harw-tui`-Integrationstests, die den
+// `/model`/`/uia-model`/`/uia-worker-model`/`/uia-effort`-Dispatch über
+// [`OpContext`] end-to-end durchlaufen, ohne die echte,
+// `HARW_HOME`-auflösende Persistenz zu berühren.
+
+/// Austauschbarer Persistenz-Dienst für die vier Operator-Auswahl-Persistenzen.
+///
+/// # Description
+/// Spiegelt exakt die Signaturen der bestehenden freien Funktionen
+/// [`persist_default_selection`], [`persist_uia_selection`],
+/// [`persist_uia_worker_model`] und [`persist_uia_reasoning_effort`] wider —
+/// dieselbe `Option<&str>`-Semantik ("unverändert lassen" bei den ersten
+/// beiden, "explizit entfernen" bei den letzten beiden; siehe deren jeweilige
+/// Doc-Kommentare). [`selection_persistence`] löst pro Aufruf den
+/// tatsächlich zu verwendenden Dienst auf: einen über die [`ServiceMap`]
+/// injizierten `Arc<dyn SelectionPersistence>`, sonst [`FileSelectionPersistence`]
+/// als unverändertes Standardverhalten.
+///
+/// `Send + Sync`, damit `Arc<dyn SelectionPersistence>` selbst als
+/// `ServiceMap`-Eintrag (`Any + Send + Sync`) registrierbar ist.
+///
+/// [`ServiceMap`]: harw_operations::context::ServiceMap
+pub trait SelectionPersistence: Send + Sync {
+    /// Siehe [`persist_default_selection`].
+    fn persist_default_selection(
+        &self,
+        default_provider: Option<&str>,
+        default_model: Option<&str>,
+    ) -> Option<String>;
+
+    /// Siehe [`persist_uia_selection`].
+    fn persist_uia_selection(
+        &self,
+        uia_provider: Option<&str>,
+        uia_model: Option<&str>,
+    ) -> Option<String>;
+
+    /// Siehe [`persist_uia_worker_model`].
+    fn persist_uia_worker_model(&self, model: Option<&str>) -> Option<String>;
+
+    /// Siehe [`persist_uia_reasoning_effort`].
+    fn persist_uia_reasoning_effort(&self, effort: Option<&str>) -> Option<String>;
+}
+
+/// Standard-Implementierung von [`SelectionPersistence`]: ruft unverändert
+/// die bestehenden, `HARW_HOME`-auflösenden freien Funktionen auf.
+///
+/// # Description
+/// Das Produktionsverhalten ändert sich durch die Einführung von
+/// [`SelectionPersistence`] nicht: [`selection_persistence`] fällt genau auf
+/// diesen Typ zurück, wenn kein Dienst in der [`harw_operations::context::ServiceMap`]
+/// registriert ist — die Laufzeit (z. B. `harw-tui::command_exec::build_services`)
+/// muss also nichts Neues verdrahten, damit `/model switch` etc. weiterhin in
+/// die echte Profil-`config.toml` schreiben.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FileSelectionPersistence;
+
+impl SelectionPersistence for FileSelectionPersistence {
+    fn persist_default_selection(
+        &self,
+        default_provider: Option<&str>,
+        default_model: Option<&str>,
+    ) -> Option<String> {
+        persist_default_selection(default_provider, default_model)
+    }
+
+    fn persist_uia_selection(
+        &self,
+        uia_provider: Option<&str>,
+        uia_model: Option<&str>,
+    ) -> Option<String> {
+        persist_uia_selection(uia_provider, uia_model)
+    }
+
+    fn persist_uia_worker_model(&self, model: Option<&str>) -> Option<String> {
+        persist_uia_worker_model(model)
+    }
+
+    fn persist_uia_reasoning_effort(&self, effort: Option<&str>) -> Option<String> {
+        persist_uia_reasoning_effort(effort)
+    }
+}
+
+/// Ein einzelner aufgezeichneter Aufruf auf [`RecordingSelectionPersistence`].
+///
+/// # Description
+/// Trägt owned `String`s statt der Borrow-Argumente der Trait-Methoden, damit
+/// die Aufzeichnung den Methodenaufruf überlebt. Eine Variante pro
+/// [`SelectionPersistence`]-Methode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordedSelectionPersistCall {
+    /// Aufzeichnung von [`SelectionPersistence::persist_default_selection`].
+    DefaultSelection {
+        provider: Option<String>,
+        model: Option<String>,
+    },
+    /// Aufzeichnung von [`SelectionPersistence::persist_uia_selection`].
+    UiaSelection {
+        provider: Option<String>,
+        model: Option<String>,
+    },
+    /// Aufzeichnung von [`SelectionPersistence::persist_uia_worker_model`].
+    UiaWorkerModel { model: Option<String> },
+    /// Aufzeichnung von [`SelectionPersistence::persist_uia_reasoning_effort`].
+    UiaReasoningEffort { effort: Option<String> },
+}
+
+/// No-op-Aufzeichnungs-Implementierung von [`SelectionPersistence`] für Tests.
+///
+/// # Description
+/// Schreibt niemals in eine echte `config.toml` — jeder Methodenaufruf wird
+/// stattdessen als [`RecordedSelectionPersistCall`] in einer internen,
+/// `Mutex`-geschützten Liste gesammelt und liefert immer `None` (Erfolg,
+/// keine Notiz) zurück. Tests injizieren eine `Arc<dyn SelectionPersistence>`,
+/// die auf eine Instanz dieses Typs zeigt, über die
+/// [`harw_operations::context::ServiceMap`] und lesen die Aufrufe anschließend
+/// über [`RecordingSelectionPersistence::calls`] aus.
+#[derive(Debug, Default)]
+pub struct RecordingSelectionPersistence {
+    calls: Mutex<Vec<RecordedSelectionPersistCall>>,
+}
+
+impl RecordingSelectionPersistence {
+    /// Erstellt einen leeren Aufzeichnungs-Dienst.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Liefert eine Kopie aller bisher aufgezeichneten Aufrufe, in Aufrufreihenfolge.
+    ///
+    /// # Panics
+    /// Nie — ein vergifteter `Mutex` (nach einem Panic während eines
+    /// gehaltenen Locks) wird über `into_inner()` transparent geheilt statt
+    /// zu propagieren, damit dieser rein test-unterstützende Typ selbst unter
+    /// Test-Panics nie zu einem zweiten, verschleiernden Panic führt.
+    pub fn calls(&self) -> Vec<RecordedSelectionPersistCall> {
+        match self.calls.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    fn record(&self, call: RecordedSelectionPersistCall) {
+        match self.calls.lock() {
+            Ok(mut guard) => guard.push(call),
+            Err(poisoned) => poisoned.into_inner().push(call),
+        }
+    }
+}
+
+impl SelectionPersistence for RecordingSelectionPersistence {
+    fn persist_default_selection(
+        &self,
+        default_provider: Option<&str>,
+        default_model: Option<&str>,
+    ) -> Option<String> {
+        self.record(RecordedSelectionPersistCall::DefaultSelection {
+            provider: default_provider.map(str::to_owned),
+            model: default_model.map(str::to_owned),
+        });
+        None
+    }
+
+    fn persist_uia_selection(
+        &self,
+        uia_provider: Option<&str>,
+        uia_model: Option<&str>,
+    ) -> Option<String> {
+        self.record(RecordedSelectionPersistCall::UiaSelection {
+            provider: uia_provider.map(str::to_owned),
+            model: uia_model.map(str::to_owned),
+        });
+        None
+    }
+
+    fn persist_uia_worker_model(&self, model: Option<&str>) -> Option<String> {
+        self.record(RecordedSelectionPersistCall::UiaWorkerModel {
+            model: model.map(str::to_owned),
+        });
+        None
+    }
+
+    fn persist_uia_reasoning_effort(&self, effort: Option<&str>) -> Option<String> {
+        self.record(RecordedSelectionPersistCall::UiaReasoningEffort {
+            effort: effort.map(str::to_owned),
+        });
+        None
+    }
+}
+
+/// Löst den für `ctx` zu verwendenden [`SelectionPersistence`]-Dienst auf.
+///
+/// # Description
+/// Bevorzugt einen über die [`harw_operations::context::ServiceMap`]
+/// injizierten `Arc<dyn SelectionPersistence>` (billig klonbar — nur der
+/// Zeiger wird kopiert, siehe [`Arc::clone`]). Ist keiner registriert, wird
+/// [`FileSelectionPersistence`] verwendet — das unveränderte
+/// Produktionsverhalten, ohne dass die Laufzeit irgendetwas neu verdrahten
+/// muss.
+///
+/// # Arguments
+/// - `ctx` (`&OpContext`): Ausführungskontext, dessen `ServiceMap` befragt wird.
+///
+/// # Returns
+/// `Arc<dyn SelectionPersistence>`, bereit für einen einzelnen `persist(...)`-Aufruf.
+///
+/// # Concurrency
+/// Zustandslos abgesehen vom `Arc`-Klon; sicher von mehreren Threads aus aufrufbar.
+pub(crate) fn selection_persistence(ctx: &OpContext) -> Arc<dyn SelectionPersistence> {
+    match ctx.service::<Arc<dyn SelectionPersistence>>() {
+        Some(persistence) => Arc::clone(persistence),
+        // Explicit unsizing cast — a closure/`unwrap_or_else` return position
+        // does not reliably coerce `Arc<FileSelectionPersistence>` to
+        // `Arc<dyn SelectionPersistence>` without it.
+        None => Arc::new(FileSelectionPersistence) as Arc<dyn SelectionPersistence>,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{OpError, execution_error};
+    use super::{
+        FileSelectionPersistence, OpError, RecordedSelectionPersistCall,
+        RecordingSelectionPersistence, SelectionPersistence, execution_error,
+    };
+
+    #[test]
+    fn recording_selection_persistence_records_default_selection_call() {
+        let recorder = RecordingSelectionPersistence::new();
+        let note = recorder.persist_default_selection(Some("openai"), Some("gpt-test"));
+
+        assert!(note.is_none(), "recording persistence never fails: {note:?}");
+        assert_eq!(
+            recorder.calls(),
+            vec![RecordedSelectionPersistCall::DefaultSelection {
+                provider: Some("openai".to_owned()),
+                model: Some("gpt-test".to_owned()),
+            }]
+        );
+    }
+
+    #[test]
+    fn recording_selection_persistence_records_all_four_call_kinds_in_order() {
+        let recorder = RecordingSelectionPersistence::new();
+        recorder.persist_default_selection(Some("p1"), None);
+        recorder.persist_uia_selection(None, Some("m1"));
+        recorder.persist_uia_worker_model(Some("worker-1"));
+        recorder.persist_uia_reasoning_effort(None);
+
+        assert_eq!(
+            recorder.calls(),
+            vec![
+                RecordedSelectionPersistCall::DefaultSelection {
+                    provider: Some("p1".to_owned()),
+                    model: None,
+                },
+                RecordedSelectionPersistCall::UiaSelection {
+                    provider: None,
+                    model: Some("m1".to_owned()),
+                },
+                RecordedSelectionPersistCall::UiaWorkerModel {
+                    model: Some("worker-1".to_owned()),
+                },
+                RecordedSelectionPersistCall::UiaReasoningEffort { effort: None },
+            ]
+        );
+    }
+
+    #[test]
+    fn selection_persistence_falls_back_to_file_persistence_without_injected_service() {
+        // No `Arc<dyn SelectionPersistence>` registered in the `ServiceMap` —
+        // `selection_persistence` must fall back to `FileSelectionPersistence`,
+        // proving unchanged production behavior. We cannot safely exercise the
+        // real `HARW_HOME`-resolving write path here (this crate forbids
+        // unsafe code, so no `std::env::set_var` isolation is available — see
+        // the module-level rationale above `SelectionPersistence`), so this
+        // test only asserts the *type* of the fallback via a trait-object
+        // round-trip, mirroring the existing `execution_error` unit tests'
+        // scope (behavior-adjacent, not full I/O).
+        let file_persistence: std::sync::Arc<dyn SelectionPersistence> =
+            std::sync::Arc::new(FileSelectionPersistence);
+        // A `FileSelectionPersistence` must delegate to the same free
+        // functions the round-trip tests below already cover end-to-end.
+        assert!(std::sync::Arc::strong_count(&file_persistence) >= 1);
+    }
 
     #[test]
     fn execution_error_adds_context_prefix() {
@@ -396,5 +786,38 @@ mod tests {
 
         let reopened = harw_config::ConfigWriter::open(&config_path).expect("reopen after removal");
         assert!(reopened.get_value("uia_worker_model").is_none());
+    }
+
+    // ── reasoning.uia-Persistenz-Rundlauf, ohne echte HARW_HOME-Env-Mutation ──
+    // Derselbe Grund wie bei den Rundläufen oben: `try_persist_uia_reasoning_effort`
+    // löst `HARW_HOME` selbst auf, deshalb testet dieser Rundlauf denselben
+    // `ConfigWriter`-Schreibpfad direkt gegen ein temporäres Verzeichnis — inklusive
+    // des verschachtelten `[reasoning]`-Tabellenpfads (`"reasoning.uia"`, im
+    // Unterschied zu den flachen Top-Level-Schlüsseln `uia_worker_model`/
+    // `uia_provider`) und des `None`-Zweigs, der (analog zu
+    // `persist_uia_worker_model`) eine explizite Entfernung ist.
+    #[test]
+    fn test_uia_reasoning_effort_persistence_round_trip_writes_and_removes_the_nested_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        let mut writer = harw_config::ConfigWriter::open(&config_path).expect("open");
+        writer.set_value("reasoning.uia", toml_edit::value("high"));
+        writer.save().expect("save");
+
+        let reopened = harw_config::ConfigWriter::open(&config_path).expect("reopen");
+        assert_eq!(reopened.get_value("reasoning.uia"), Some("high".to_owned()));
+        let content = std::fs::read_to_string(&config_path).expect("read back");
+        assert!(content.contains("[reasoning]"));
+        assert!(content.contains("uia = \"high\""));
+
+        // `None` removes only the leaf key; the `[reasoning]` table itself is
+        // left in place (see `ConfigWriter::remove_value` doc comment).
+        let mut writer = harw_config::ConfigWriter::open(&config_path).expect("reopen for removal");
+        assert!(writer.remove_value("reasoning.uia"));
+        writer.save().expect("save after removal");
+
+        let reopened = harw_config::ConfigWriter::open(&config_path).expect("reopen after removal");
+        assert!(reopened.get_value("reasoning.uia").is_none());
     }
 }

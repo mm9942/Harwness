@@ -770,6 +770,10 @@ fn render_tool_call_markdown(
     out.push('\n');
 }
 
+// 9 Parameter statt eines Parameter-Structs: Aufrufer liegt in app.rs
+// (außerhalb dieses Auftrags), eine Signaturänderung hier würde dort
+// brechen — daher gezielt unterdrückt statt umgebaut.
+#[allow(clippy::too_many_arguments)]
 fn render_tool_result_markdown(
     out: &mut String,
     call_id: &str,
@@ -849,7 +853,7 @@ fn render_error_markdown(out: &mut String, error: &ExportErrorEntry) {
 fn render_plan_markdown(out: &mut String, plan: &ExportPlanEntry) {
     out.push_str("- **Plan**");
     if let Some(plan_id) = &plan.plan_id {
-        out.push_str(" ");
+        out.push(' ');
         out.push_str(&sanitize_inline(&redact_text(plan_id)));
     }
     out.push_str(": ");
@@ -1039,8 +1043,7 @@ fn sensitive_value_range(text: &str, start: usize, marker_len: usize) -> Option<
     if bytes.get(index) == Some(&b'"') || bytes.get(index) == Some(&b'\'') {
         let quote = bytes[index];
         let value_start = index + 1;
-        let value_end = text[value_start..]
-            .as_bytes()
+        let value_end = bytes[value_start..]
             .iter()
             .position(|byte| *byte == quote)
             .map(|offset| value_start + offset)

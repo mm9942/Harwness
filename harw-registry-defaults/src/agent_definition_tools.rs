@@ -583,9 +583,7 @@ fn author_elevation_rejection(delta: &RightsDelta) -> ToolOutput {
 /// `scope = "run"`) wird nicht hier, sondern vom Aufrufer entschieden, weil
 /// er zusätzlich verlangt, dass **beide** Deltas leer sind.
 fn review_level_for(kind: &str, rights_delta_base_role: &RightsDelta) -> &'static str {
-    if kind == "uia" {
-        "user_required"
-    } else if !rights_delta_base_role.is_empty() {
+    if kind == "uia" || !rights_delta_base_role.is_empty() {
         "user_required"
     } else {
         "uia"

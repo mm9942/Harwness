@@ -265,7 +265,6 @@ mod tests {
     use harw_core::auto_compact::CompactDecision;
     use harw_core::compaction::{CompactionObserver, CompactionOutcome};
     use harw_home::project::{ProjectKind, ProjectRoot};
-    use std::future::Future as _;
 
     fn temp_home(tag: &str) -> ProjectHome {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use harw_types::ReasoningEffort;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelToml {
@@ -23,6 +25,17 @@ pub struct ModelToml {
     pub input_types: Vec<String>,
     #[serde(default)]
     pub capabilities: ModelCapabilitiesToml,
+    /// Standard-Reasoning-Effort für Sessions/Kinder, die dieses Modell
+    /// verwenden, sofern nicht durch eine spezifischere Ebene überschrieben
+    /// (Agenten-Definition). `None` = keine Modell-seitige Vorgabe.
+    ///
+    /// Gleicher Typ-Stil wie `ProviderToml::default_reasoning_effort`
+    /// (`Option<ReasoningEffort>` statt `Option<String>`), weil
+    /// `harw_types::ReasoningEffort` bereits serde-fähig ist und
+    /// `harw-config` bereits von `harw-types` abhängt. Die **Rangfolge**
+    /// gegenüber Provider-/Agenten-Ebene ist NICHT Teil dieser Änderung.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// Steuert, wie Prompt-Caching für ein Modell angewendet wird.
@@ -126,5 +139,40 @@ mod tests {
         "#;
         let model: ModelToml = toml::from_str(src).unwrap();
         assert_eq!(model.prompt_caching, None);
+    }
+
+    #[test]
+    fn test_model_without_default_reasoning_effort_is_none() {
+        let src = r#"
+            id = "claude-opus"
+            provider = "anthropic"
+        "#;
+        let model: ModelToml = toml::from_str(src).unwrap();
+        assert!(model.default_reasoning_effort.is_none());
+        assert!(!toml::to_string(&model).unwrap().contains("default_reasoning_effort"));
+    }
+
+    #[test]
+    fn test_model_with_default_reasoning_effort_round_trips() {
+        let src = r#"
+            id = "claude-opus"
+            provider = "anthropic"
+            default_reasoning_effort = "xhigh"
+        "#;
+        let model: ModelToml = toml::from_str(src).unwrap();
+        assert_eq!(
+            model.default_reasoning_effort,
+            Some(harw_types::ReasoningEffort::Xhigh)
+        );
+    }
+
+    #[test]
+    fn test_model_rejects_unknown_default_reasoning_effort_value() {
+        let src = r#"
+            id = "claude-opus"
+            provider = "anthropic"
+            default_reasoning_effort = "ultra"
+        "#;
+        assert!(toml::from_str::<ModelToml>(src).is_err());
     }
 }

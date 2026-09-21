@@ -11,14 +11,22 @@ harw-authority = { path = "../harw-authority" }
 # W0B-04: WHATWG-URL-Parsing für `egress::EgressUrl` — derselbe Parser wie
 # in reqwest, damit geprüfter und verbundener Host nie auseinanderlaufen.
 url = "2.5.8"
+# `SandboxChild::wait_or_cancel` racet nicht-blockierendes `try_wait`-Polling
+# gegen `harw_types::cancel::CancelToken` (Plan „Welle 3 — 3c“, Nachzieh-Task,
+# analog zu shell.exec in harw-tool-shell). Nur `CancelToken` selbst wird
+# gebraucht, nicht dessen Sync-Aufbau, daher weiterhin keine Authority-Typen
+# re-exportiert (siehe `harw-sandbox/src/lib.rs`-Doku).
+harw-types = { path = "../harw-types" }
+# Nur `time` für `tokio::time::sleep` im Poll-Intervall; `tokio::select!` ist
+# featurelos. `process`/`rt` werden hier nicht gebraucht, da `SandboxChild`
+# weiterhin `std::process::Child` (kein `tokio::process::Child`) hält.
+# Version/Feature-Stil wie in harw-tool-shell/Cargo.toml.
+tokio = { version = "1", features = ["time"] }
 
 [dev-dependencies]
-# Testfixtures bauen `WorkspaceRegistration`/`WorkspaceRegistry` (aus
-# harw-authority) direkt und brauchen dafür `TenantId`/`WorkspaceId`.
-# harw-authority re-exportiert diese Typen bewusst nicht (siehe
-# `harw-sandbox/src/lib.rs`-Doku: keine Authority-Typen im Root), und
-# harw-sandbox selbst hat sonst keinen Bezug zu harw-types.
-harw-types = { path = "../harw-types" }
+# `#[tokio::test]` für die neuen `wait_or_cancel`-Tests braucht zusätzlich
+# `rt` + `macros` (identisch zu harw-tool-shell/Cargo.toml).
+tokio = { version = "1", features = ["time", "rt", "macros"] }
 
 [lints]
 workspace = true

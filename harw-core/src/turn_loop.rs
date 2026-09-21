@@ -59,8 +59,17 @@
 //!   Turn mit [`TurnOutcome::Truncated`]. `StopReason::{Refusal,
 //!   ContentFilter}` endet mit [`TurnOutcome::Refused`]. Tool-Calls einer
 //!   solchen Antwort werden nie ausgeführt (Argumente können abgeschnitten
-//!   sein). Opakes Reasoning wird als `TurnItem::Reasoning` gespeichert
-//!   (`raw_content[0]` = JSON des `OpaqueReasoning`, verlustfrei).
+//!   sein). Nur für die UIA-Root-Session (kein Parent, Organisationsrolle
+//!   `UserInterface` — Kriterium wie `is_uia_root_session` in
+//!   `harw-tui/src/session_controller.rs`): trägt `response.reasoning`
+//!   mindestens einen Anthropic-`"thinking"`-Block mit lesbarem Text, wird
+//!   dieser Text als `TurnItem::Reasoning` (VOR der AssistantMessage) in die
+//!   History gepusht und per `TurnEvent::ItemAdded` gemeldet.
+//!   `"redacted_thinking"`- und verschlüsseltes OpenAI-Reasoning liefern
+//!   keinen extrahierbaren Text und bleiben unsichtbar; alle anderen
+//!   Sessions sehen nie ein `TurnItem::Reasoning`. `to_model_messages`
+//!   (`history.rs`) überspringt `Reasoning`-Items beim nächsten
+//!   Provider-Request ohnehin — das Item stört dort also nicht.
 //! - **Resume-Fehler.** Eine abgelehnte Wiederaufnahme (falscher Actor, falsches
 //!   Kind, keine offene Anfrage, bereits aufgelöst) bleibt `Err` und lässt die
 //!   Pause intakt. Scheitert eine *angenommene* Wiederaufnahme (Persistenz,
@@ -298,6 +307,47 @@
 //!   stiller Fehler: sie zu schließen verlangt ein neues, session-persistes
 //!   Feld außerhalb dieses Schreibbereichs, keine weitere Logik hier.
 //!
+//! ## Sechster Nachtrag (dieser Knoten, Welle 3): der Modellaufruf racet
+//! jetzt tatsächlich, und `ToolsError::Cancelled` bricht mitten in der
+//! Ausführung sauber ab
+//!
+//! Der „Fünfter Nachtrag" oben beschrieb bereits **prüfpunktbasierten**
+//! Abbruch (vor dem Modellaufruf, vor der Werkzeugausführung). Zwei Lücken
+//! blieben offen, weil beide vorausgesetzte Bausteine erst in einer früheren
+//! Welle dieses Knotens entstanden: [`ModelRequest::cancel`] (racebar über
+//! [`ModelRequest::with_cancel_token`]) und [`ToolExecutionContext::cancel`]
+//! (racebar über `ToolExecutionContext::with_cancel`). Dieser Knoten
+//! verdrahtet beide:
+//!
+//! - **Modellaufruf.** [`drive_turn`] racet `model.respond(request)` per
+//!   `tokio::select!` (`biased`) gegen `control.cancel_token().cancelled()`
+//!   — der Modellaufruf selbst muss nicht mehr bis zu seiner Antwort
+//!   durchlaufen, um einen bereits erfolgten Abbruch zu bemerken. `request`
+//!   trägt zusätzlich denselben Token über `with_cancel_token`, damit ein
+//!   cancel-fähiger Provider (z. B. `RetryingProvider::race_respond`) auch
+//!   innerhalb eigener Retry-Versuche früher abbricht; das `select!` bleibt
+//!   der Rückfallpfad für jeden anderen Provider. Meldet `respond()` selbst
+//!   [`crate::model::ModelError::Cancelled`] (weil ein cancel-fähiger
+//!   Provider den Token vor dem `select!` sah), mündet das in denselben
+//!   [`cancel_turn`]-Pfad wie ein Treffer am Prüfpunkt — kein neuer
+//!   [`TurnOutcome`], keine neue Fehlervariante.
+//! - **Werkzeugausführung.** [`tool_execution_context`] hängt
+//!   `control.cancel_token()` an jeden gebauten `ToolExecutionContext` — an
+//!   allen drei Aufrufstellen (sequenzieller Dispatch,
+//!   [`try_execute_parallel_calls`], [`resume_after_approval_with_store`]).
+//!   Meldet ein Ausführer daraufhin `ToolsError::Cancelled`, behandeln beide
+//!   Dispatch-Pfade das **nicht** als gewöhnlichen Tool-Fehler (kein
+//!   `ToolCallResult::error(...)` ans Modell): der laufende Call bekommt sein
+//!   Cancel-Ergebnis, alle noch nicht ausgelieferten Calls derselben Antwort
+//!   bekommen ein synthetisches Ergebnis über denselben Mechanismus wie ein
+//!   `tool_checkpoint()`-Treffer ([`cancel_turn_with_pending_calls`]
+//!   sequenziell; der bereits bestehende `ParallelOutcome::Aborted`-Pfad
+//!   parallel — dort stehen alle `tool_call`-Einträge ohnehin schon vor dem
+//!   Start der Jobs im Verlauf, sodass nur noch das `tool_result` fehlt).
+//!   `resume_after_approval_with_store` bekommt den Token seines eigenen
+//!   frischen `TurnControl::new()` (siehe „Fünfter Nachtrag", offene Lücke)
+//!   — plumbing, keine neue Dispatch-Reaktion dort.
+//!
 use crate::cancel::{CancelReason, CancelToken};
 use crate::capture::{ToolOutcome, ToolOutcomeStatus};
 use crate::error::{CoreError, CoreResult};
@@ -311,11 +361,12 @@ use harw_extension_api::{
 };
 use harw_protocol::events::TurnEvent;
 use harw_protocol::items::{
-    AssistantMessageItem, ContentPart, ToolCallResult, TurnItem,
+    AssistantMessageItem, ContentPart, OpaqueReasoning, ReasoningItem, ToolCallResult, TurnItem,
 };
 use harw_session_store::{ApprovalRecord, ApprovalStore};
 use harw_tools::{
-    ToolCall, ToolExecutionContext, ToolName, ToolOutput, ToolSpec, TracedToolExecutor,
+    ToolCall, ToolExecutionContext, ToolName, ToolOutput, ToolSpec, ToolsError,
+    TracedToolExecutor,
 };
 use harw_types::{
     ApprovalActor, Clock, ReviewDecision, SessionId, SystemClock, TokenUsage, ToolCallId,
@@ -330,7 +381,10 @@ use tracing::Instrument as _;
 pub const HANDOFF_PREFIX: &str = "transfer_to_";
 
 /// Ergebnis-Slot für einen parallelen Tool-Call: (ID, Ergebnis, Wandzeit ms).
-type ParallelCallSlot = Option<(ToolCallId, ToolCallResult, u64, String, serde_json::Value)>;
+// Letztes Feld: `true`, wenn dieser Call mit `ToolsError::Cancelled`
+// endete (siehe `try_execute_parallel_calls`s Ergebnis-Auslieferung).
+type ParallelCallSlot =
+    Option<(ToolCallId, ToolCallResult, u64, String, serde_json::Value, bool)>;
 
 /// Grenzwerte eines einzelnen Turns (W4a A-LOOP).
 ///
@@ -835,6 +889,78 @@ fn continuation_fragment(body: &str) -> Option<harw_context::Fragment> {
         digest: harw_types::ContentDigest::of(body.as_bytes()),
         body: body.to_owned(),
     })
+}
+
+/// Entscheidet, ob die laufende Session die UIA-Root-Session ist — das
+/// einzige organisatorische Kriterium, unter dem Reasoning-Text sichtbar
+/// gemacht wird (Welle 3 — 3e).
+///
+/// # Beschreibung
+/// Identisches Kriterium zu `is_uia_root_session` in
+/// `harw-tui/src/session_controller.rs:473-480`: kein Parent UND
+/// Organisationsrolle `UserInterface`. Diese Datei kann jene Funktion nicht
+/// wiederverwenden (anderer Crate, keine gemeinsame Abhängigkeit), daher
+/// dieselbe Prüfung hier dupliziert statt einer neuen crate-übergreifenden
+/// Kopplung. Kind-/Worker-Sessions (jede mit Parent) und Root-Sessions
+/// anderer Rollen (z. B. `RootOrchestrator`) liefern `false`.
+///
+/// # Arguments
+/// - `session` (`&AgentSession`): die laufende Session.
+///
+/// # Returns
+/// `true` genau dann, wenn `session.parent_session_id()` `None` ist und
+/// `session.spawn_context().organizational_role == AgentRoleId::UserInterface`.
+fn is_uia_root_session(session: &AgentSession) -> bool {
+    session.parent_session_id().is_none()
+        && session
+            .spawn_context()
+            .map(|context| context.organizational_role)
+            == Some(harw_agent_dsl::roles::AgentRoleId::UserInterface)
+}
+
+/// Extrahiert lesbaren Denktext aus den `thinking`-Blöcken eines
+/// `OpaqueReasoning` (Welle 3 — 3e).
+///
+/// # Beschreibung
+/// Nur Anthropic-Blöcke vom Typ `"thinking"` tragen ein lesbares
+/// `"thinking"`-Textfeld (Anthropic Messages API). `"redacted_thinking"`
+/// (Anthropic, verschlüsselt) und OpenAI-Reasoning-Blöcke (ebenfalls
+/// verschlüsselt, kein `"thinking"`-Feld) liefern keinen extrahierbaren Text
+/// und werden stillschweigend übersprungen — robust gegen fehlende Felder,
+/// kein Panic, kein Fehler.
+///
+/// Bewusst lokal in `turn_loop.rs` statt in `harw-provider-http` verortet:
+/// letzteres Crate wird parallel von einem anderen Agenten bearbeitet; die
+/// Extraktion gehört logisch dorthin (siehe
+/// `harw_provider_http::anthropic::extract_anthropic_reasoning`), wird hier
+/// aber bewusst dupliziert, um keine Datei außerhalb dieser zu berühren.
+///
+/// # Arguments
+/// - `reasoning` (`&OpaqueReasoning`): die vom Provider gelieferten,
+///   unverändert erhaltenen Denkblöcke.
+///
+/// # Returns
+/// `Some(String)` — alle `"thinking"`-Textfelder in Blockreihenfolge, mit
+/// `\n` verbunden — wenn mindestens ein Block extrahierbaren Text trug;
+/// sonst `None` (z. B. nur `redacted_thinking`-Blöcke oder leere Liste).
+fn extract_thinking_text(reasoning: &OpaqueReasoning) -> Option<String> {
+    let mut joined = String::new();
+    for block in &reasoning.blocks {
+        if block.get("type").and_then(serde_json::Value::as_str) != Some("thinking") {
+            continue;
+        }
+        let Some(text) = block.get("thinking").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if text.is_empty() {
+            continue;
+        }
+        if !joined.is_empty() {
+            joined.push('\n');
+        }
+        joined.push_str(text);
+    }
+    (!joined.is_empty()).then_some(joined)
 }
 
 /// Lädt Instructions von allen `InstructionsProvider` und filtert nach der
@@ -1460,9 +1586,14 @@ fn append_hint(result: &mut ToolCallResult, hint: &str) {
 /// or `ToolCall.arguments`: both of those can originate with untrusted model
 /// or channel input. A session with tools but no resolved sandbox is rejected
 /// instead of falling back to ambient host permissions.
+// `cancel` (W3/C-CANCEL): the turn's `CancelToken`, attached to the built
+// `ToolExecutionContext` so a long-running executor (process, MCP,
+// context-load) can observe cancellation mid-call — see
+// `ToolExecutionContext::with_cancel`'s doc.
 fn tool_execution_context(
     session: &AgentSession,
     ctx: &TurnInputContext,
+    cancel: &CancelToken,
 ) -> CoreResult<ToolExecutionContext> {
     let sandbox = session
         .spawn_context()
@@ -1474,7 +1605,8 @@ fn tool_execution_context(
         ctx.session_id.clone(),
         ctx.turn_id.clone(),
         sandbox,
-    ))
+    )
+    .with_cancel(cancel.clone()))
 }
 
 /// Converts the one recoverable authority-boundary rejection into a result
@@ -1991,8 +2123,11 @@ async fn resume_after_approval_with_store(
                 let result: (ToolCallResult, u64) = async {
                     match find_executor(session, &pending.call.name) {
                         Some(executor) => {
-                            let (result, duration_ms) = match tool_execution_context(session, &ctx)
-                            {
+                            let (result, duration_ms) = match tool_execution_context(
+                                session,
+                                &ctx,
+                                control.cancel_token(),
+                            ) {
                                 Ok(execution_context) => {
                                     let started = std::time::Instant::now();
                                     let output = executor
@@ -2079,8 +2214,12 @@ async fn drive_turn(
     let mut round: u32 = 0;
     // Nutzung der zuletzt abgeschlossenen Modell-Runde — für `maybe_compact`
     // an beiden Call-Sites (innerhalb der Schleife und nach Turn-Ende, wo
-    // `response` bereits außer Scope ist).
-    let mut last_round_usage = harw_types::TokenUsage::default();
+    // `response` bereits außer Scope ist). Kein Default-Vorbelegungswert:
+    // jeder Lesezugriff (Zeile ~2536, nach der Schleife) liegt hinter der
+    // ersten Zuweisung unten (nach dem ersten Modellaufruf dieser Runde);
+    // ein Default hier wäre vor jedem Lesezugriff unbedingt überschrieben
+    // und damit ein toter Store.
+    let mut last_round_usage: harw_types::TokenUsage;
     // Wanduhr-Nullpunkt dieses Aufrufs (siehe Moduldoku „Fünfter Nachtrag").
     // Wiederholte Aufrufe (weiterer Schleifendurchlauf) sind ein No-op — nur
     // der erste zählt.
@@ -2173,7 +2312,8 @@ async fn drive_turn(
         .with_reasoning_effort(session.reasoning_effort())
         .with_model_id(session.active_model().cloned())
         .with_provider_id(session.active_provider().cloned())
-        .with_tool_result_max_bytes(control.limits().tool_result_max_bytes_hint());
+        .with_tool_result_max_bytes(control.limits().tool_result_max_bytes_hint())
+        .with_cancel_token(control.cancel_token().clone());
 
         // Emit model.request event: byte-count proxy via system_prompt +
         // instruction fragments length (ModelRequest is not serde::Serialize).
@@ -2185,7 +2325,45 @@ async fn drive_turn(
                 .sum::<usize>();
         tracing::info!(size_bytes = request_size_bytes, "model.request");
 
-        let response = model.respond(request).await?;
+        // Races the model call itself against `control`'s `CancelToken`
+        // (W4a A-LOOP Moduldoku: "Der Modellaufruf selbst läuft gegen
+        // `CancelToken::cancelled`"). `biased` ensures an already-cancelled
+        // token wins even if the model future also happens to be ready —
+        // matching `model_checkpoint()`'s own cancel-first precedence.
+        // `request.cancel` (`with_cancel_token` above) lets a
+        // cancel-aware provider (e.g. `RetryingProvider::race_respond`)
+        // abort its own retry loop early; this `select!` is the backstop
+        // for every provider, cancel-aware or not.
+        let response = tokio::select! {
+            biased;
+            _ = control.cancel_token().cancelled() => {
+                return cancel_turn(
+                    session,
+                    handle,
+                    total_usage,
+                    control.cancel_token().reason().unwrap_or(CancelReason::User),
+                )
+                .await;
+            }
+            result = model.respond(request) => result,
+        };
+        // `ModelError::Cancelled` can also surface from inside `respond()`
+        // itself (a cancel-aware provider observed the token before this
+        // `select!` did) — routed through the identical `cancel_turn` path
+        // rather than the ordinary `?`-propagated `CoreError::Model(...)`.
+        let response = match response {
+            Ok(response) => response,
+            Err(crate::model::ModelError::Cancelled) => {
+                return cancel_turn(
+                    session,
+                    handle,
+                    total_usage,
+                    control.cancel_token().reason().unwrap_or(CancelReason::User),
+                )
+                .await;
+            }
+            Err(error) => return Err(error.into()),
+        };
         control.record_model_round();
         control.record_usage(&response.usage);
         notify_progress(session);
@@ -2227,6 +2405,36 @@ async fn drive_turn(
         // Fortschritt durch erfolgreiche Tool-Aufrufe mit neuer Signatur wird
         // unten im Tool-Call-Loop gesetzt.
         let mut round_progressed_by_tools = false;
+
+        // Reasoning sichtbar machen (Welle 3 — 3e): nur für die UIA-Root-
+        // Session, und nur, wenn sich lesbarer `"thinking"`-Text extrahieren
+        // ließ (redacted/verschlüsseltes Reasoning bleibt unsichtbar). VOR
+        // der AssistantMessage eingefügt — Denken kommt vor der Antwort.
+        // `to_model_messages` (history.rs) überspringt `TurnItem::Reasoning`
+        // beim nächsten Provider-Request explizit, das Item stört dort also
+        // nicht.
+        if is_uia_root_session(session) {
+            if let Some(text) = response.reasoning.as_ref().and_then(extract_thinking_text) {
+                let reasoning_id = harw_types::ItemId::new();
+                session.history_mut().push(TurnItem::Reasoning(ReasoningItem {
+                    id: reasoning_id.clone(),
+                    summary_text: vec![text.clone()],
+                    raw_content: Vec::new(),
+                }));
+                persist_last(session, store).await?;
+                emit(
+                    session,
+                    TurnEvent::ItemAdded {
+                        turn_id: handle.turn_id.clone(),
+                        item: TurnItem::Reasoning(ReasoningItem {
+                            id: reasoning_id,
+                            summary_text: vec![text],
+                            raw_content: Vec::new(),
+                        }),
+                    },
+                );
+            }
+        }
 
         if let Some(text) = response.message {
             let phase = if response.tool_calls.is_empty() {
@@ -2399,6 +2607,7 @@ async fn drive_turn(
             &mut turn_seen_success_signatures,
             &mut pending_guard_hint,
             &mut round_progressed_by_tools,
+            &control,
         )
         .await?
         {
@@ -2610,41 +2819,94 @@ async fn drive_turn(
                 });
             }
             let tool_span = tracing::info_span!("tool.call", tool_name = %tool_name);
-            let result: (ToolCallResult, u64) = async {
+            // Zweites Feld: `true`, wenn der Ausführer `ToolsError::Cancelled`
+            // meldete (der `ToolExecutionContext` unten trägt `control`s
+            // `CancelToken`, siehe `tool_execution_context`) — ausgewertet
+            // NACH `.instrument(tool_span).await?`, um denselben Weg wie ein
+            // `tool_checkpoint()`-Treffer zu nehmen statt das Ergebnis als
+            // normalen Tool-Fehler ans Modell zurückzuspielen.
+            let (result, was_cancelled): ((ToolCallResult, u64), bool) = async {
                 match find_executor(session, &call.name) {
                     Some(executor) => {
-                        let (result, duration_ms) = match tool_execution_context(session, ctx) {
+                        let (result, duration_ms, cancelled) = match tool_execution_context(
+                            session,
+                            ctx,
+                            control.cancel_token(),
+                        ) {
                             Ok(execution_context) => {
                                 let started = std::time::Instant::now();
                                 let outcome =
                                     executor.traced_execute(&execution_context, &call).await;
                                 let duration_ms = started.elapsed().as_millis() as u64;
+                                let cancelled = matches!(outcome, Err(ToolsError::Cancelled));
                                 let result = match outcome {
                                     Ok(output) => output_to_result(output),
                                     Err(e) => ToolCallResult::error(e.to_string()),
                                 };
-                                (result, duration_ms)
+                                (result, duration_ms, cancelled)
                             }
-                            Err(error) => (missing_tool_execution_context_result(error)?, 0),
+                            Err(error) => (missing_tool_execution_context_result(error)?, 0, false),
                         };
                         tracing::info!(
                             duration_ms = duration_ms,
                             status = if result.is_success() { "ok" } else { "err" },
                             "tool.execute",
                         );
-                        Ok::<_, CoreError>((result, duration_ms))
+                        Ok::<_, CoreError>(((result, duration_ms), cancelled))
                     }
                     None => {
                         tracing::info!(duration_ms = 0u64, status = "err", "tool.execute",);
                         Ok::<_, CoreError>((
-                            ToolCallResult::error(format!("no executor for tool '{}'", call.name)),
-                            0u64,
+                            (
+                                ToolCallResult::error(format!(
+                                    "no executor for tool '{}'",
+                                    call.name
+                                )),
+                                0u64,
+                            ),
+                            false,
                         ))
                     }
                 }
             }
             .instrument(tool_span)
             .await?;
+            if was_cancelled {
+                // Derselbe Weg wie ein Vorab-`tool_checkpoint()`-Treffer
+                // (Moduldoku „W4a A-LOOP"): der laufende Call bekommt sein
+                // eigenes (bereits als Cancel-Fehler geformtes) Ergebnis —
+                // sein `tool_call`-Eintrag steht schon im Verlauf (oben, vor
+                // dieser Runde) — und alle noch nicht gestarteten Calls
+                // derselben Antwort gehen über `cancel_turn_with_pending_calls`
+                // denselben Weg wie die übrigen Prüfpunkt-Treffer dieser
+                // Schleife.
+                let (result_value, result_duration_ms) = result;
+                emit(
+                    session,
+                    TurnEvent::ToolCallCompleted {
+                        turn_id: handle.turn_id.clone(),
+                        call_id: call.id.clone(),
+                        result: result_value.clone(),
+                        duration_ms: result_duration_ms,
+                    },
+                );
+                notify_tool_outcome(session, &tool_name, &call.arguments, &result_value);
+                notify_progress(session);
+                session
+                    .history_mut()
+                    .push_tool_result(call.id, result_value, result_duration_ms);
+                persist_last(session, store).await?;
+                let remaining: Vec<ToolCall> = tool_call_iter.map(|(_, call)| call).collect();
+                return cancel_turn_with_pending_calls(
+                    session,
+                    store,
+                    handle,
+                    total_usage,
+                    control.cancel_token().reason().unwrap_or(CancelReason::User),
+                    remaining,
+                )
+                .await;
+            }
             let (mut result_value, result_duration_ms) = result;
             let abort_reason = apply_tool_guard(
                 session,
@@ -3160,6 +3422,12 @@ async fn cancel_turn_with_pending_calls(
 /// # Arguments
 /// - `prepared` (`&mut PreparedApprovals`): Ausgabekanal für die Entscheidungen
 ///   der Vorprüfung. Wird nur beschrieben, wenn Schritt 4 erreicht wurde.
+/// - `control` (`&TurnControl`): liefert den `CancelToken`, der an den
+///   gemeinsamen `ToolExecutionContext` aller Jobs dieser Antwort angehängt
+///   wird (siehe `tool_execution_context`). Ein Job, der daraufhin
+///   `ToolsError::Cancelled` meldet, geht in der Ergebnis-Auslieferung
+///   denselben `Aborted`-Weg wie ein `TurnGuard`-Abbruch, statt als normaler
+///   Tool-Fehler ans Modell zurückgespielt zu werden.
 ///
 /// # Returns
 /// `true`, wenn die Antwort vollständig parallel ausgeführt und persistiert
@@ -3190,6 +3458,7 @@ async fn try_execute_parallel_calls(
     seen_success_signatures: &mut HashSet<String>,
     pending_hint: &mut Option<String>,
     round_progressed: &mut bool,
+    control: &TurnControl,
 ) -> CoreResult<ParallelOutcome> {
     if calls.len() < 2 || calls.iter().any(|call| handoff_role(&call.name).is_some()) {
         return Ok(ParallelOutcome::NotApplicable);
@@ -3201,7 +3470,7 @@ async fn try_execute_parallel_calls(
         };
         jobs.push((call.clone(), executor));
     }
-    let execution_context = match tool_execution_context(session, ctx) {
+    let execution_context = match tool_execution_context(session, ctx, control.cancel_token()) {
         Ok(context) => context,
         Err(error) => {
             missing_tool_execution_context_result(error)?;
@@ -3241,6 +3510,7 @@ async fn try_execute_parallel_calls(
             async move {
                 let started = std::time::Instant::now();
                 let output = executor.traced_execute(&execution_context, &call).await;
+                let cancelled = matches!(output, Err(ToolsError::Cancelled));
                 let result = output
                     .map(output_to_result)
                     .unwrap_or_else(|error| ToolCallResult::error(error.to_string()));
@@ -3257,6 +3527,7 @@ async fn try_execute_parallel_calls(
                     duration_ms,
                     tool_name_for_capture,
                     arguments_for_capture,
+                    cancelled,
                 )
             }
             .instrument(tool_span),
@@ -3264,9 +3535,9 @@ async fn try_execute_parallel_calls(
     }
     let mut results: Vec<ParallelCallSlot> = vec![None; calls.len()];
     while let Some(joined) = joins.join_next().await {
-        let (position, call_id, result, duration_ms, tool_name, arguments) =
+        let (position, call_id, result, duration_ms, tool_name, arguments, cancelled) =
             joined.map_err(|error| CoreError::ToolFailed(error.to_string()))?;
-        results[position] = Some((call_id, result, duration_ms, tool_name, arguments));
+        results[position] = Some((call_id, result, duration_ms, tool_name, arguments, cancelled));
     }
     // `while let` über den Positions-Iterator statt `for`: bei einem
     // `TurnGuard`-`Abort` mitten in der Auslieferung (Addendum F+G) brauchen
@@ -3276,21 +3547,33 @@ async fn try_execute_parallel_calls(
     let mut results_iter = results.into_iter();
     let mut aborted: Option<CancelReason> = None;
     for result in results_iter.by_ref() {
-        let (call_id, mut value, duration_ms, tool_name, arguments) = result.ok_or_else(|| {
-            CoreError::ToolFailed("parallel tool scheduler lost a completed call".to_owned())
-        })?;
-        let abort_reason = apply_tool_guard(
-            session,
-            store,
-            guard.as_deref_mut(),
-            seen_success_signatures,
-            pending_hint,
-            round_progressed,
-            &tool_name,
-            &arguments,
-            &mut value,
-        )
-        .await;
+        let (call_id, mut value, duration_ms, tool_name, arguments, cancelled) =
+            result.ok_or_else(|| {
+                CoreError::ToolFailed("parallel tool scheduler lost a completed call".to_owned())
+            })?;
+        // `ToolsError::Cancelled` (der `ToolExecutionContext` trägt `control`s
+        // `CancelToken`, siehe der Konstruktion oben) geht denselben Weg wie
+        // ein `TurnGuard`-`Abort`: kein normaler Tool-Fehler ans Modell,
+        // sondern derselbe Prüfpunkt-Treffer-Pfad — die Wächter-Beratung
+        // (`apply_tool_guard`) wird für diesen Call übersprungen, sein bereits
+        // korrekt geformtes Cancel-Ergebnis (`value`) wird unverändert
+        // ausgeliefert.
+        let abort_reason = if cancelled {
+            Some(control.cancel_token().reason().unwrap_or(CancelReason::User))
+        } else {
+            apply_tool_guard(
+                session,
+                store,
+                guard.as_deref_mut(),
+                seen_success_signatures,
+                pending_hint,
+                round_progressed,
+                &tool_name,
+                &arguments,
+                &mut value,
+            )
+            .await
+        };
         emit(
             session,
             TurnEvent::ToolCallCompleted {
@@ -3313,9 +3596,12 @@ async fn try_execute_parallel_calls(
     }
     if let Some(reason) = aborted {
         for result in results_iter {
-            let (call_id, _value, _duration_ms, _tool_name, _arguments) = result.ok_or_else(|| {
-                CoreError::ToolFailed("parallel tool scheduler lost a completed call".to_owned())
-            })?;
+            let (call_id, _value, _duration_ms, _tool_name, _arguments, _cancelled) =
+                result.ok_or_else(|| {
+                    CoreError::ToolFailed(
+                        "parallel tool scheduler lost a completed call".to_owned(),
+                    )
+                })?;
             session.history_mut().push_tool_result(
                 call_id,
                 ToolCallResult::error(format!("turn cancelled before delivery ({reason:?})")),
@@ -5184,6 +5470,335 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Cancel mid-flight (Moduldoku „Sechster Nachtrag"): der Modellaufruf
+    // selbst und eine laufende Werkzeugausführung racen jetzt gegen
+    // `control.cancel_token()` statt nur an den Prüfpunkten davor/danach.
+    // ------------------------------------------------------------------
+
+    /// Modell, dessen `respond()` erst nach `delay` antwortet — lang genug,
+    /// dass ein Test ohne funktionierende Racing-Verdrahtung an seinem
+    /// `tokio::time::timeout` scheitert statt fälschlich grün zu werden.
+    /// `started` feuert, sobald `respond()` betreten wurde, damit der Test
+    /// genau dann abbrechen kann, wenn der Aufruf wirklich in Flight ist.
+    struct DelayedModelProvider {
+        delay: Duration,
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    impl ModelProvider for DelayedModelProvider {
+        fn respond<'a>(&'a self, _request: ModelRequest) -> crate::model::ModelFuture<'a> {
+            self.started.notify_one();
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok(crate::model::ModelResponse::text("too late — cancellation should have won"))
+            })
+        }
+    }
+
+    /// Ausführer, der erst zurückkehrt, wenn sein
+    /// [`ToolExecutionContext::cancel`]-Token feuert — dann mit
+    /// `ToolsError::Cancelled`, genau wie ein wohlerzogener, cancel-bewusster
+    /// Ausführer (W3/C-CANCEL) reagieren muss. Fehlt die Cancel-Verdrahtung
+    /// (`ctx.cancel()` liefert `None`), schläft er stattdessen lange genug,
+    /// dass der Test am `tokio::time::timeout` scheitert statt zu hängen.
+    /// `started` feuert bei jedem Aufruf, damit ein Test exakt weiß, wann
+    /// mindestens ein Aufruf tatsächlich läuft.
+    struct CancelAwareExecutor {
+        executions: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    impl ToolExecutor for CancelAwareExecutor {
+        fn execute<'a>(
+            &'a self,
+            ctx: &'a ToolExecutionContext,
+            _call: &'a ToolCall,
+        ) -> ToolExecutorFuture<'a> {
+            self.executions.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            Box::pin(async move {
+                match ctx.cancel() {
+                    Some(token) => {
+                        token.cancelled().await;
+                        Err(ToolsError::Cancelled)
+                    }
+                    None => {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        Ok(ToolOutput::Text {
+                            content: "unreachable without cancel wiring".to_owned(),
+                        })
+                    }
+                }
+            })
+        }
+    }
+
+    /// Einzelnes, **nicht** `parallel_safe` markiertes Werkzeug `"block"` —
+    /// erzwingt den sequenziellen Dispatch-Pfad.
+    struct CancelAwareToolProvider {
+        executions: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    impl ToolProvider for CancelAwareToolProvider {
+        fn tools(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec::Function(FunctionToolSpec {
+                name: ToolName::new("block"),
+                description: "blocks until its cancel token fires".to_owned(),
+                parameters: JsonSchema::default(),
+                strict: false,
+            })]
+        }
+
+        fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
+            (name.as_str() == "block").then(|| {
+                Arc::new(CancelAwareExecutor {
+                    executions: Arc::clone(&self.executions),
+                    started: Arc::clone(&self.started),
+                }) as Arc<dyn ToolExecutor>
+            })
+        }
+    }
+
+    /// Wie [`CancelAwareToolProvider`], aber `"block"` ist `parallel_safe` —
+    /// erzwingt den `JoinSet`-Pfad ([`try_execute_parallel_calls`]).
+    struct CancelAwareParallelProvider {
+        executions: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    impl ToolProvider for CancelAwareParallelProvider {
+        fn tools(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec::Function(FunctionToolSpec {
+                name: ToolName::new("block"),
+                description: "blocks until its cancel token fires".to_owned(),
+                parameters: JsonSchema::default(),
+                strict: false,
+            })]
+        }
+
+        fn executor(&self, name: &ToolName) -> Option<Arc<dyn ToolExecutor>> {
+            (name.as_str() == "block").then(|| {
+                Arc::new(CancelAwareExecutor {
+                    executions: Arc::clone(&self.executions),
+                    started: Arc::clone(&self.started),
+                }) as Arc<dyn ToolExecutor>
+            })
+        }
+
+        fn parallel_safe(&self, name: &ToolName) -> bool {
+            name.as_str() == "block"
+        }
+    }
+
+    #[tokio::test]
+    async fn model_call_cancelled_mid_flight_ends_the_turn_quickly() {
+        let provider = StubToolProvider::with_names(&[]);
+        let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
+        let store = crate::state_store::InMemoryStateStore::new();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let model = DelayedModelProvider {
+            delay: Duration::from_secs(30),
+            started: Arc::clone(&started),
+        };
+        let control = TurnControl::new();
+        let cancel_token = control.cancel_token().clone();
+        let input = TurnInput::user("hello").with_control(control);
+
+        let run = run_turn(&mut session, &model, &store, input);
+        let canceller = async {
+            started.notified().await;
+            cancel_token.cancel(CancelReason::User);
+        };
+
+        let (outcome, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(run, canceller)
+        })
+        .await
+        .expect(
+            "cancellation must win long before the provider's 30s delay elapses — \
+             the model call is not actually racing the cancel token",
+        );
+        let outcome = outcome.expect("a cancelled model call ends the turn cleanly, not as Err");
+
+        assert!(
+            matches!(
+                outcome,
+                TurnOutcome::Cancelled {
+                    reason: CancelReason::User
+                }
+            ),
+            "expected Cancelled{{reason: User}}, got {outcome:?}"
+        );
+        assert!(
+            matches!(session.state(), crate::session::SessionState::Idle),
+            "a cancelled turn returns the session to Idle, exactly like Completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_cancelled_mid_flight_aborts_pending_calls_sequential_path() {
+        let first = ToolCallId::new();
+        let second = ToolCallId::new();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let provider = Arc::new(CancelAwareToolProvider {
+            executions: Arc::clone(&executions),
+            started: Arc::clone(&started),
+        });
+        let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full))
+            .with_spawn_context(test_spawn_context());
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![response_with(vec![
+            call(&first, "block"),
+            call(&second, "block"),
+        ])]);
+        let control = TurnControl::new();
+        let cancel_token = control.cancel_token().clone();
+        let input = TurnInput::user("go").with_control(control);
+
+        let run = run_turn(&mut session, &model, &store, input);
+        let canceller = async {
+            started.notified().await;
+            cancel_token.cancel(CancelReason::User);
+        };
+
+        let (outcome, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(run, canceller)
+        })
+        .await
+        .expect("cancellation must resolve the blocked sequential call quickly");
+        let outcome =
+            outcome.expect("a cancelled sequential tool call ends the turn cleanly, not as Err");
+
+        assert!(
+            matches!(
+                outcome,
+                TurnOutcome::Cancelled {
+                    reason: CancelReason::User
+                }
+            ),
+            "expected Cancelled{{reason: User}}, got {outcome:?}"
+        );
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            1,
+            "the second call must never start — it was still pending in `tool_call_iter` \
+             when cancellation hit, exactly like a `tool_checkpoint()` pre-emptive hit"
+        );
+        let items = session.history().items();
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| matches!(item, TurnItem::ToolCall(_)))
+                .count(),
+            2,
+            "both calls must have a tool_call entry (the second one synthesized by \
+             cancel_turn_with_pending_calls)"
+        );
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| matches!(item, TurnItem::ToolResult(_)))
+                .count(),
+            2,
+            "every tool_call must be paired with a tool_result, or the history is not \
+             provider-valid for the next model call"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_cancelled_mid_flight_aborts_pending_calls_parallel_path() {
+        let first = ToolCallId::new();
+        let second = ToolCallId::new();
+        let executions = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let handler = Arc::new(CountingApproval::allow_everything());
+        let provider = Arc::new(CancelAwareParallelProvider {
+            executions: Arc::clone(&executions),
+            started: Arc::clone(&started),
+        });
+        let mut session = guarded_session(provider, Arc::clone(&handler));
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![response_with(vec![
+            call(&first, "block"),
+            call(&second, "block"),
+        ])]);
+        let control = TurnControl::new();
+        let cancel_token = control.cancel_token().clone();
+        let input = TurnInput::user("go").with_control(control);
+
+        let run = run_turn(&mut session, &model, &store, input);
+        let canceller = async {
+            started.notified().await;
+            cancel_token.cancel(CancelReason::User);
+        };
+
+        let (outcome, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(run, canceller)
+        })
+        .await
+        .expect("cancellation must resolve the blocked parallel calls quickly");
+        let outcome =
+            outcome.expect("a cancelled parallel tool call ends the turn cleanly, not as Err");
+
+        assert!(
+            matches!(
+                outcome,
+                TurnOutcome::Cancelled {
+                    reason: CancelReason::User
+                }
+            ),
+            "expected Cancelled{{reason: User}}, got {outcome:?}"
+        );
+        let items = session.history().items();
+        assert_eq!(
+            items
+                .iter()
+                .filter(|item| matches!(item, TurnItem::ToolCall(_)))
+                .count(),
+            2,
+            "the JoinSet path pushes both tool_call entries up front, before spawning"
+        );
+        let results: Vec<ToolCallResult> = items
+            .iter()
+            .filter_map(|item| match item {
+                TurnItem::ToolResult(result) => Some(result.result.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results.len(),
+            2,
+            "every tool_call must be paired with a tool_result, or the history is not \
+             provider-valid for the next model call"
+        );
+        let delivered_cancelled = results.iter().any(|result| {
+            matches!(
+                result,
+                ToolCallResult::Error { message } if message == "tool execution was cancelled"
+            )
+        });
+        let synthesized_pending = results.iter().any(|result| {
+            matches!(
+                result,
+                ToolCallResult::Error { message } if message.contains("cancelled before delivery")
+            )
+        });
+        assert!(
+            delivered_cancelled,
+            "the call whose own result was delivered must carry ToolsError::Cancelled's \
+             message, not a generic tool error — got {results:?}"
+        );
+        assert!(
+            synthesized_pending,
+            "the call that was not yet delivered when the abort hit must get the same \
+             synthetic message a TurnGuard abort produces — got {results:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
     // maybe_compact tests
     // ------------------------------------------------------------------
 
@@ -5384,5 +5999,273 @@ mod tests {
             .clone()
             .expect("history far above the tiny target ⇒ compact_session must run");
         assert_eq!(outcome.reason, Some(crate::auto_compact::CompactDecision::TurnStart));
+    }
+
+    // ------------------------------------------------------------------
+    // last_round_usage → maybe_compact wiring (Teil 1)
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_last_round_usage_from_response_drives_auto_compaction() {
+        // `last_round_usage` wird in `drive_turn` bei jeder Modellrunde aus
+        // `response.usage` gesetzt und an `maybe_compact` weitergereicht
+        // (Turn-Ende-Aufruf). Mit `TokenUsage::default()` (der ungenutzte
+        // Anfangswert) könnte `decide()` bei einer 70-Token-Schwelle nie
+        // `BudgetExceeded` liefern — nur die tatsächliche Antwort-Nutzung
+        // (80 Tokens) kann das. Der Test beweist also konkret, dass der
+        // reale Wert ankommt, nicht der Default.
+        let policy = crate::auto_compact::AutoCompactPolicy::for_context_window(100);
+        let provider = StubToolProvider::with_names(&[]);
+        let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full))
+            .with_auto_compact(Some(policy));
+        let observer = RecordingCompactionObserver::new();
+        session = session.with_compaction_observer(Some(observer.clone()));
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![crate::model::ModelResponse {
+            usage: harw_types::TokenUsage {
+                input_tokens: 80,
+                output_tokens: 5,
+                reasoning_tokens: None,
+                cached_tokens: None,
+                cache_write_tokens: None,
+            },
+            ..crate::model::ModelResponse::text("fertig")
+        }]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("hi"))
+            .await
+            .expect("der Turn läuft durch");
+        assert!(matches!(outcome, TurnOutcome::Completed));
+
+        let compaction_outcome = observer
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .expect(
+                "die tatsächliche Antwort-Nutzung (80 > 70er-Schwelle) muss den \
+                 Turn-Ende-Compact auslösen — geschieht das nicht, wurde \
+                 `last_round_usage` nicht an `maybe_compact` durchgereicht",
+            );
+        assert_eq!(
+            compaction_outcome.reason,
+            Some(crate::auto_compact::CompactDecision::BudgetExceeded)
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Reasoning-Sichtbarkeit für die UIA-Root-Session (Teil 2 / Welle 3 — 3e)
+    // ------------------------------------------------------------------
+
+    /// UIA-Root-Fixture: kein Parent, `organizational_role` =
+    /// `AgentRoleId::UserInterface` — identisches Kriterium zu
+    /// `is_uia_root_session` in `harw-tui/src/session_controller.rs`.
+    fn uia_root_session(provider: Arc<dyn ToolProvider>) -> AgentSession {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let registry = ExtensionRegistryBuilder::default()
+            .tool_provider(provider)
+            .build();
+        AgentSession::new(AgentRole::Assistant, None, registry, tx).with_spawn_context(
+            SpawnContext {
+                organizational_role: harw_agent_dsl::roles::AgentRoleId::UserInterface,
+                ..test_spawn_context()
+            },
+        )
+    }
+
+    fn anthropic_reasoning(blocks: Vec<serde_json::Value>) -> OpaqueReasoning {
+        OpaqueReasoning {
+            provider: "anthropic".to_owned(),
+            model: "claude-test".to_owned(),
+            blocks,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_thinking_block_emits_reasoning_item_for_uia_root_session() {
+        let provider = StubToolProvider::with_names(&[]);
+        let mut session = uia_root_session(provider);
+        let (turn_tx, mut turn_rx) = mpsc::unbounded_channel();
+        session = session.with_turn_event_sink(turn_tx);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![crate::model::ModelResponse {
+            reasoning: Some(anthropic_reasoning(vec![serde_json::json!({
+                "type": "thinking",
+                "thinking": "Der Nutzer fragt nach X, also prüfe ich zuerst Y.",
+            })])),
+            ..crate::model::ModelResponse::text("Antwort")
+        }]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("frage"))
+            .await
+            .expect("der Turn läuft durch");
+        assert!(matches!(outcome, TurnOutcome::Completed));
+
+        // History: Reasoning-Item kommt vor der AssistantMessage.
+        let items = session.history().items();
+        let reasoning_pos = items
+            .iter()
+            .position(|item| matches!(item, TurnItem::Reasoning(_)))
+            .expect("ein Reasoning-Item muss in der History stehen");
+        let assistant_pos = items
+            .iter()
+            .position(|item| matches!(item, TurnItem::AssistantMessage(_)))
+            .expect("die AssistantMessage muss in der History stehen");
+        assert!(
+            reasoning_pos < assistant_pos,
+            "Reasoning muss vor der AssistantMessage stehen (Denken vor Antwort)"
+        );
+        match &items[reasoning_pos] {
+            TurnItem::Reasoning(item) => {
+                assert_eq!(
+                    item.summary_text,
+                    vec!["Der Nutzer fragt nach X, also prüfe ich zuerst Y.".to_owned()]
+                );
+                assert!(item.raw_content.is_empty());
+            }
+            other => panic!("erwartete TurnItem::Reasoning, war {other:?}"),
+        }
+
+        // Event: TurnEvent::ItemAdded mit TurnItem::Reasoning wurde emittiert.
+        let events = drain_turn_events(&mut turn_rx);
+        let reasoning_event = events.iter().find(|event| {
+            matches!(
+                event,
+                TurnEvent::ItemAdded {
+                    item: TurnItem::Reasoning(_),
+                    ..
+                }
+            )
+        });
+        assert!(
+            reasoning_event.is_some(),
+            "ein TurnEvent::ItemAdded für das Reasoning-Item muss emittiert werden"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_thinking_block_emits_no_reasoning_item_for_non_uia_session() {
+        // Identische Antwort wie im UIA-Test, aber eine Session mit
+        // Standard-Rolle (`test_spawn_context()` ⇒ `RootOrchestrator`) —
+        // das UIA-Filter-Kriterium darf hier nicht greifen.
+        let provider = StubToolProvider::with_names(&[]);
+        let mut session = make_session(provider, SessionActivation::new(ToolProfile::Full));
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![crate::model::ModelResponse {
+            reasoning: Some(anthropic_reasoning(vec![serde_json::json!({
+                "type": "thinking",
+                "thinking": "unsichtbarer Denkprozess",
+            })])),
+            ..crate::model::ModelResponse::text("Antwort")
+        }]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("frage"))
+            .await
+            .expect("der Turn läuft durch");
+        assert!(matches!(outcome, TurnOutcome::Completed));
+
+        assert!(
+            !session
+                .history()
+                .items()
+                .iter()
+                .any(|item| matches!(item, TurnItem::Reasoning(_))),
+            "eine Nicht-UIA-Session darf kein Reasoning-Item bekommen"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_redacted_thinking_emits_no_reasoning_item_and_does_not_error() {
+        // `redacted_thinking`-Blöcke tragen keinen lesbaren Text — die
+        // Extraktion muss robust `None` liefern statt zu paniken, auch für
+        // eine UIA-Root-Session.
+        let provider = StubToolProvider::with_names(&[]);
+        let mut session = uia_root_session(provider);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![crate::model::ModelResponse {
+            reasoning: Some(anthropic_reasoning(vec![serde_json::json!({
+                "type": "redacted_thinking",
+                "data": "verschlüsselter-blob",
+            })])),
+            ..crate::model::ModelResponse::text("Antwort")
+        }]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("frage"))
+            .await
+            .expect("ein redacted_thinking-Block darf den Turn nicht scheitern lassen");
+        assert!(matches!(outcome, TurnOutcome::Completed));
+
+        assert!(
+            !session
+                .history()
+                .items()
+                .iter()
+                .any(|item| matches!(item, TurnItem::Reasoning(_))),
+            "redacted_thinking liefert keinen extrahierbaren Text ⇒ kein Reasoning-Item"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_reasoning_data_leaves_behavior_unchanged() {
+        // `response.reasoning == None` (kein Extended Thinking) — auch für
+        // eine UIA-Root-Session darf sich am bisherigen Verhalten nichts
+        // ändern: nur die AssistantMessage landet in der History.
+        let provider = StubToolProvider::with_names(&[]);
+        let mut session = uia_root_session(provider);
+        let store = crate::state_store::InMemoryStateStore::new();
+        let model = ScriptedModel::new(vec![crate::model::ModelResponse::text("Antwort ohne Denken")]);
+
+        let outcome = run_turn(&mut session, &model, &store, TurnInput::user("frage"))
+            .await
+            .expect("der Turn läuft durch");
+        assert!(matches!(outcome, TurnOutcome::Completed));
+
+        let items = session.history().items();
+        assert!(
+            !items.iter().any(|item| matches!(item, TurnItem::Reasoning(_))),
+            "ohne Reasoning-Daten darf kein Reasoning-Item entstehen"
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item, TurnItem::AssistantMessage(_))),
+            "die AssistantMessage muss weiterhin in der History stehen"
+        );
+    }
+
+    #[test]
+    fn test_extract_thinking_text_joins_multiple_thinking_blocks() {
+        let reasoning = anthropic_reasoning(vec![
+            serde_json::json!({"type": "thinking", "thinking": "erster Gedanke"}),
+            serde_json::json!({"type": "thinking", "thinking": "zweiter Gedanke"}),
+        ]);
+        assert_eq!(
+            extract_thinking_text(&reasoning),
+            Some("erster Gedanke\nzweiter Gedanke".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_extract_thinking_text_skips_redacted_blocks() {
+        let reasoning = anthropic_reasoning(vec![serde_json::json!({
+            "type": "redacted_thinking",
+            "data": "opak",
+        })]);
+        assert_eq!(extract_thinking_text(&reasoning), None);
+    }
+
+    #[test]
+    fn test_extract_thinking_text_handles_missing_field_without_panicking() {
+        // Ein `thinking`-Block ohne das `thinking`-Textfeld (z. B. ein
+        // zukünftiges Provider-Format) darf nicht paniken — nur ausgelassen
+        // werden.
+        let reasoning = anthropic_reasoning(vec![serde_json::json!({"type": "thinking"})]);
+        assert_eq!(extract_thinking_text(&reasoning), None);
+    }
+
+    #[test]
+    fn test_extract_thinking_text_none_for_empty_blocks() {
+        let reasoning = anthropic_reasoning(vec![]);
+        assert_eq!(extract_thinking_text(&reasoning), None);
     }
 }

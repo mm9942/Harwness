@@ -389,10 +389,14 @@ fn test_merge_layer_into_composite_member_rule_toml_uses_full_struct_equality() 
 // zu übernehmen (kein Merge-Effekt, im Unterschied zu `ProfileReplaces`).
 #[test]
 fn test_merge_layer_into_per_file_validated_config_version_is_never_inherited() {
-    let mut trusted = HarnessConfig::default();
-    trusted.config_version = 3;
-    let mut incoming = HarnessConfig::default();
-    incoming.default_provider = Some("anthropic".to_owned());
+    let mut trusted = HarnessConfig {
+        config_version: 3,
+        ..Default::default()
+    };
+    let incoming = HarnessConfig {
+        default_provider: Some("anthropic".to_owned()),
+        ..Default::default()
+    };
     let raw = raw_from(r#"default_provider = "anthropic""#);
 
     let diagnostics =

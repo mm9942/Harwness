@@ -123,11 +123,13 @@ use harw_extension_api::approval_mode::ApprovalMode;
 use harw_extension_api::registry::ContextProviderRegistrationError;
 use harw_extension_api::{ToolCall, ToolName};
 use harw_operations::adapter::CommandAdapter;
+use harw_operations::operation::BusyAvailability;
 use harw_operations::{OpOutput, SessionController};
 use harw_plan::PlanStore;
 use harw_plan::goal::{GoalStore, evaluate_goal};
 use harw_protocol::events::{SessionEvent, TurnEvent};
 use harw_protocol::items::{ContentPart, ResultTrust, ToolCallResult, TurnItem};
+use harw_types::ReasoningEffort;
 use harw_types::SessionId;
 use harw_types::TokenUsage;
 
@@ -138,7 +140,7 @@ use crate::approval_dialog::{ApprovalChoice, ApprovalDialog, ApprovalDialogReque
 use crate::chat_scroll::{ChatScroll, ScrollAction};
 use crate::choice_dialog::{ChoiceAction, ChoiceDialog};
 use crate::clipboard::{self, ClipboardTarget};
-use crate::command_exec::execute_command_as;
+use crate::command_exec::{busy_availability_for, dispatch_slash_command, execute_command_as};
 use crate::command_popup::{CommandPopup, PopupAction, TabOutcome};
 use crate::events::{HarwEvent, HarwEventSender};
 use crate::export::{
@@ -152,6 +154,9 @@ use crate::history_cell::{
     ToolState, ToolVerbosity, UserHistoryCell,
 };
 use crate::host_permit_dialog::{HostPermitPrompt, HostPermitPromptReceiver, HostPermitVariant};
+use crate::model_switch_picker::{
+    ModelEntry, ModelSwitchPicker, PickerAction as ModelSwitchAction, PickerTarget, ProviderEntry,
+};
 // Hinweis: die drei obigen Typen sind Re-Exporte aus
 // `harw_tool_shell::host_permit_prompt` (siehe `crate::host_permit_dialog`-
 // Moduldoku) — der Fragevertrag und die Ausstellungslogik leben dort bzw. in
@@ -190,6 +195,17 @@ const REASON_OPERATOR_REJECTED: &str = "operator rejected the tool call in the t
 
 /// Begründung, die eine per Abbruch (Esc/Ctrl+C) abgelehnte Freigabe trägt.
 const REASON_OPERATOR_CANCELLED: &str = "operator cancelled the approval prompt in the terminal UI";
+
+/// Alle sechs [`ReasoningEffort`]-Stufen, aufsteigend — Optionsliste für
+/// [`ChatApp::open_effort_choice`] (Welle 7b).
+const EFFORT_LEVELS: [ReasoningEffort; 6] = [
+    ReasoningEffort::Minimal,
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::Xhigh,
+    ReasoningEffort::Max,
+];
 
 // ── Geteilte, nachträglich veränderbare Verlaufszellen ───────────────────────
 
@@ -448,46 +464,26 @@ enum ExportOutputFormat {
     Json,
 }
 
+/// Ziel eines [`Overlay::EffortChoice`]-Dialogs (Welle 7b).
+///
+/// Steuert, welche Befehlszeile eine getroffene Wahl synthetisiert
+/// (`/effort ...` vs. `/uia-effort ...`) und welcher Konfigurations-/
+/// Laufzeitwert die Vorauswahl liefert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EffortTarget {
+    /// Der aktive Reasoning-Effort der laufenden Session (Controller-Snapshot,
+    /// live wirksam über `/effort`).
+    Session,
+    /// Der persistierte UIA-Reasoning-Effort (`config.harness.reasoning.uia`,
+    /// wirksam ab der nächsten Sitzung über `/uia-effort`).
+    Uia,
+}
+
 /// Vollflächiges Overlay, das den normalen Eingabe-/Popup-Pfad ersetzt.
 ///
 /// # Beschreibung
 /// Analog zum `/command`-Popup, aber exklusiv: solange ein Overlay offen ist,
 /// gehen Tasten ausschließlich an das Overlay (siehe `handle_overlay_key`).
-/// Geteilter Zustand für "Provider-förmige" Auswahl-Overlays
-/// ([`Overlay::ProviderChoice`], [`Overlay::UiaProviderChoice`]).
-///
-/// `ids[i]` ist die kanonische Provider-ID der `i`-ten Zeile in `dialog` —
-/// getrennt vom Anzeigetext gehalten, statt aus dem Label zurückgeparst zu
-/// werden.
-#[derive(Debug)]
-struct ProviderChoiceState {
-    /// Kanonische Provider-IDs in derselben Reihenfolge wie die Optionen
-    /// des Dialogs.
-    ids: Vec<String>,
-    /// Der eigentliche Auswahldialog (Titel, Optionen, Markierung).
-    dialog: ChoiceDialog,
-}
-
-/// Geteilter Zustand für "Modell-förmige" Auswahl-Overlays
-/// ([`Overlay::ModelChoice`], [`Overlay::UiaModelChoice`]).
-#[derive(Debug)]
-struct ModelChoiceState {
-    /// Kanonische Provider-ID, auf die der Katalog gefiltert wurde.
-    provider: String,
-    /// Kanonische Modell-IDs in derselben Reihenfolge wie die Optionen
-    /// des Dialogs.
-    ids: Vec<String>,
-    /// Der eigentliche Auswahldialog.
-    dialog: ChoiceDialog,
-    /// `true`, wenn diese Auswahl die zweite Stufe von `/provider` ist
-    /// (Enter emittiert `/provider switch <provider> <model>`); `false`
-    /// für die direkte `/model`-Auswahl (Enter emittiert
-    /// `/model switch <model>`) und immer `false` für
-    /// [`Overlay::UiaModelChoice`] (die UIA-Pin-Auswahl kennt keinen
-    /// kombinierten Zwischenschritt).
-    combined: bool,
-}
-
 #[derive(Debug)]
 enum Overlay {
     /// `/resume` ohne Argument öffnet eine filterbare Liste vergangener
@@ -496,21 +492,23 @@ enum Overlay {
     /// `/export` ohne `--datei` öffnet die Auswahl Zwischenablage/Datei/Abbrechen
     /// (Contract „Nachträgliche Entscheidungen", Slice E1).
     ExportChoice(ChoiceDialog),
-    /// `/provider` ohne Argument öffnet die interaktive Provider-Auswahl.
-    ProviderChoice(ProviderChoiceState),
-    /// `/model` ohne Argument (oder die zweite Stufe nach einer
-    /// Providerwahl, deren aktives Modell nicht kompatibel ist) öffnet die
-    /// Modell-Auswahl, gefiltert auf `provider`.
-    ModelChoice(ModelChoiceState),
-    /// `/uia-provider` ohne Argument öffnet die interaktive Auswahl des
-    /// UIA-Pin-Providers (`config.harness.uia_provider`). Anders als
-    /// [`Overlay::ProviderChoice`] gibt es keine kombinierte Modell-Stufe:
-    /// die Kompatibilitätsprüfung bleibt ops-seitig.
-    UiaProviderChoice(ProviderChoiceState),
-    /// `/uia-model` ohne Argument öffnet die interaktive Auswahl des
-    /// UIA-Pin-Modells, gefiltert auf den aktuell gepinnten oder aktiven
-    /// Provider. `combined` ist hier immer `false`.
-    UiaModelChoice(ModelChoiceState),
+    /// `/model`, `/uia-model` bzw. `/uia-worker-model` ohne Argument (oder
+    /// als argloses `switch`) öffnen den konsolidierten zweistufigen
+    /// Provider/Modell-Picker (Welle 4a). `/provider`/`/uia-provider` ohne
+    /// Argument öffnen seit dieser Konsolidierung **keinen** Picker mehr
+    /// (kein Alias) — sie laufen unverändert auf `show`.
+    ///
+    /// Geboxt, da [`ModelSwitchPicker`] deutlich größer ist als die übrigen
+    /// Varianten (clippy::large_enum_variant).
+    ModelSwitch(Box<ModelSwitchPicker>),
+    /// `/effort`/`/uia-effort` ohne Argument (oder als argloses `switch`)
+    /// öffnen die einstufige Effort-Auswahl (Welle 7b).
+    EffortChoice {
+        /// Session oder UIA — bestimmt die synthetisierte Befehlszeile.
+        target: EffortTarget,
+        /// Der eigentliche Auswahldialog.
+        dialog: ChoiceDialog,
+    },
 }
 
 /// Plan- und Ziel-Dienste, die der Renderer für [`PlanGraphCell`] und
@@ -853,8 +851,9 @@ pub struct ChatApp {
     /// Interaktionsmodus, zu dem der Zyklus nach Verlassen der `Plan`-Stufe
     /// zurückkehrt (Plan Schritt 5).
     mode_before_plan: Option<InteractionMode>,
-    /// Vollflächiges Overlay (Session-Picker, `/export`-Auswahl), das den
-    /// normalen Eingabe-/Popup-Pfad ersetzt (Plan Schritt 6/7).
+    /// Vollflächiges Overlay (Session-Picker, `/export`-, Modell/Provider-,
+    /// Effort-Auswahl), das den normalen Eingabe-/Popup-Pfad ersetzt (Plan
+    /// Schritt 6/7, Welle 4a/7b).
     overlay: Option<Overlay>,
     /// Gesprächsverlauf als quellcode-unabhängige Einträge für `/export`
     /// (Contract „Nachträgliche Entscheidungen", Slice E1); parallel zu
@@ -877,6 +876,23 @@ pub struct ChatApp {
     /// geöffnet ist.
     pending_export_options: Option<ExportOptions>,
     pending_export_format: ExportOutputFormat,
+    /// „Scharfgestellter" Beenden-Hinweis (4c): ein erster Ctrl+C/Ctrl+D setzt
+    /// dieses Feld; ein zweiter Druck derselben Taste innerhalb von
+    /// [`QUIT_HINT_WINDOW`] beendet die Sitzung. Vormals eine lokale Variable
+    /// in [`run_loop`] — jetzt ein `ChatApp`-Feld, damit auch der Busy-Pfad
+    /// ([`handle_busy_event`]) dieselbe Scharfstellung lesen und setzen kann
+    /// (Ctrl+C während eines laufenden Turns bricht zusätzlich ab, statt nur
+    /// zu beenden).
+    pending_quit: Option<QuitArm>,
+    /// Welle 4c: gesetzt von [`handle_busy_event`], wenn ein zweiter
+    /// Ctrl+C-Druck während eines laufenden Turns innerhalb von
+    /// [`QUIT_HINT_WINDOW`] eintrifft. [`run_loop`] prüft dieses Feld direkt
+    /// nach jedem `run_turn_streaming(...)`-Rückkehrpunkt und beendet dann
+    /// sofort — derselbe Ausgang wie [`HarwEvent::Quit`] im Idle-Pfad. Ein
+    /// eigenes `bool`-Feld statt eines durchgereichten `harw_tx`, weil
+    /// `handle_busy_event` selbst keinen Zugriff auf den Ereigniskanal hat
+    /// (siehe Plan „Ctrl+C-Hard-Interrupt, UI-Teil", Punkt 6).
+    hard_quit_requested: bool,
 }
 
 /// Handgeschriebene `Debug`-Implementierung, da [`CommandAdapter`] (enthält
@@ -917,6 +933,8 @@ impl std::fmt::Debug for ChatApp {
             .field("export_entries_len", &self.export_entries.len())
             .field("session_title", &self.session_title)
             .field("has_title_job_context", &self.title_job_context.is_some())
+            .field("pending_quit_armed", &self.pending_quit.is_some())
+            .field("hard_quit_requested", &self.hard_quit_requested)
             .finish()
     }
 }
@@ -1022,6 +1040,8 @@ impl ChatApp {
             export_meta_extensions: ExportMetaExtensions::new(),
             pending_export_options: None,
             pending_export_format: ExportOutputFormat::Markdown,
+            pending_quit: None,
+            hard_quit_requested: false,
         }
     }
 
@@ -1270,9 +1290,9 @@ impl ChatApp {
     ///
     /// # Beschreibung
     /// Dieselbe Präzedenz wie `harw_ops::provider::handle_show`: Laufzeit vor
-    /// Konfiguration. Wird sowohl von [`Self::open_provider_choice`] (zur
-    /// Vorauswahl) als auch von der bare-`/model`-Auswahl (zur Filterung)
-    /// verwendet.
+    /// Konfiguration. Wird sowohl von [`Self::open_model_switch_picker`] (zur
+    /// Vorauswahl) als auch vom `/uia-worker-model`-Trigger (zur Auflösung
+    /// des effektiven UIA-Providers) verwendet.
     #[must_use]
     fn active_or_default_provider(&self, config: &harw_config::ResolvedConfig) -> Option<String> {
         self.session_controller
@@ -1282,314 +1302,178 @@ impl ChatApp {
             .or_else(|| config.harness.default_provider.clone())
     }
 
-    /// Öffnet die interaktive Provider-Auswahl (`/provider` ohne Argument).
+    /// Öffnet den konsolidierten Provider/Modell-Umschalt-Picker (Welle 4a).
     ///
     /// # Beschreibung
-    /// Listet alle konfigurierten Provider alphabetisch mit Statusmarker
-    /// (aktiv / Auth fehlt / deaktiviert) und markiert den aktiven Provider
-    /// vorausgewählt (Snapshot des Controllers, sonst Config-Default). Ohne
-    /// Konfiguration oder ohne konfigurierte Provider wird stattdessen eine
-    /// klare Systemzeile angehängt — nie ein leerer Dialog.
-    pub(crate) fn open_provider_choice(&mut self) {
+    /// Ersetzt die vier vormaligen Öffner (`open_provider_choice`,
+    /// `open_uia_provider_choice`, `open_model_choice`,
+    /// `open_uia_model_choice`). Baut `providers` (nur aktivierte Provider,
+    /// alphabetisch) und `models_by_provider` (alle konfigurierten Modelle,
+    /// nach kanonischem Provider gruppiert) aus der aufgelösten Config; ohne
+    /// Konfiguration oder ohne aktivierte Provider wird stattdessen eine
+    /// klare Systemzeile angehängt — nie ein leerer Dialog (dieselbe
+    /// Zurückhaltung wie die vormaligen Öffner).
+    ///
+    /// Die Vorauswahl unterscheidet sich je `target`:
+    /// - Für [`PickerTarget::Orchestrator`]: Controller-Snapshot
+    ///   (`active_provider`/`active_model`), sonst `default_provider`/
+    ///   `default_model`.
+    /// - Für [`PickerTarget::Uia`]: `config.harness.uia_provider`/`uia_model`,
+    ///   sonst derselbe Fallback wie beim Orchestrator (aktiver/Standard-
+    ///   Provider bzw. Controller-Snapshot-Modell).
+    /// - [`PickerTarget::UiaWorker`]: `fixed_provider` ist bereits der
+    ///   effektive UIA-Provider (vom Aufrufer aufgelöst); aktives Modell ist
+    ///   `config.harness.uia_worker_model`.
+    ///
+    /// # Argumente
+    /// - `target` (`PickerTarget`): Umschalt-Kontext (siehe oben).
+    pub(crate) fn open_model_switch_picker(&mut self, target: PickerTarget) {
+        let context_label = match &target {
+            PickerTarget::Orchestrator => "Modell-Auswahl",
+            PickerTarget::Uia => "UIA-Modell-Auswahl",
+            PickerTarget::UiaWorker { .. } => "UIA-Worker-Modell-Auswahl",
+        };
+
         let Some(config) = self.resolved_config() else {
             self.push_line(
                 Role::System,
-                "Provider-Auswahl nicht verfügbar: keine Konfiguration geladen.",
+                format!("{context_label} nicht verfügbar: keine Konfiguration geladen."),
             );
             return;
         };
-        if config.providers.is_empty() {
-            self.push_line(
-                Role::System,
-                "Provider-Auswahl nicht verfügbar: keine Provider konfiguriert.",
-            );
-            return;
-        }
 
-        let active = self.active_or_default_provider(&config);
-
-        let mut providers: Vec<&harw_config::ProviderToml> = config.providers.values().collect();
+        let mut providers: Vec<&harw_config::ProviderToml> = config
+            .providers
+            .values()
+            .filter(|provider| provider.enabled)
+            .collect();
         providers.sort_by(|left, right| left.name.cmp(&right.name));
 
-        let mut ids = Vec::with_capacity(providers.len());
-        let mut options = Vec::with_capacity(providers.len());
-        let mut selected = 0usize;
-        for (index, provider) in providers.iter().enumerate() {
-            let is_active = active.as_deref() == Some(provider.name.as_str());
-            if is_active {
-                selected = index;
-            }
-            let marker = if is_active {
-                "aktiv"
-            } else if !provider.enabled {
-                "deaktiviert"
-            } else if provider.auth.is_none() && !provider.has_plaintext_secret() {
-                "Auth fehlt"
-            } else {
-                "bereit"
-            };
-            options.push(format!("{} [{marker}]", provider.name));
-            ids.push(provider.name.clone());
-        }
-
-        let dialog = ChoiceDialog::new("Provider wählen", None, options).with_selected(selected);
-        self.overlay = Some(Overlay::ProviderChoice(ProviderChoiceState { ids, dialog }));
-    }
-
-    /// Öffnet die interaktive Auswahl des UIA-Pin-Providers (`/uia-provider`
-    /// ohne Argument).
-    ///
-    /// # Beschreibung
-    /// Spiegelt [`Self::open_provider_choice`], markiert die aktive Zeile
-    /// aber bevorzugt anhand von `config.harness.uia_provider` (dem
-    /// bestehenden UIA-Pin aus `harw-config`), statt anhand des
-    /// `/provider switch`-Snapshots — der reflektiert nur die reguläre
-    /// Session, nicht den UIA-Pin. Ist `uia_provider` `None`, fällt die
-    /// Markierung auf dieselbe Live-Snapshot-Logik zurück wie
-    /// [`Self::open_provider_choice`]. Eine getroffene Wahl emittiert direkt
-    /// `/uia-provider switch <id>` — ohne die Provider/Modell-Kompatibilitäts-
-    /// Atomarität von [`Self::resolve_provider_choice`], da diese Prüfung
-    /// beim UIA-Pin ops-seitig erfolgt.
-    pub(crate) fn open_uia_provider_choice(&mut self) {
-        let Some(config) = self.resolved_config() else {
-            self.push_line(
-                Role::System,
-                "UIA-Provider-Auswahl nicht verfügbar: keine Konfiguration geladen.",
-            );
-            return;
-        };
-        if config.providers.is_empty() {
-            self.push_line(
-                Role::System,
-                "UIA-Provider-Auswahl nicht verfügbar: keine Provider konfiguriert.",
-            );
-            return;
-        }
-
-        let active = config
-            .harness
-            .uia_provider
-            .clone()
-            .or_else(|| self.active_or_default_provider(&config));
-
-        let mut providers: Vec<&harw_config::ProviderToml> = config.providers.values().collect();
-        providers.sort_by(|left, right| left.name.cmp(&right.name));
-
-        let mut ids = Vec::with_capacity(providers.len());
-        let mut options = Vec::with_capacity(providers.len());
-        let mut selected = 0usize;
-        for (index, provider) in providers.iter().enumerate() {
-            let is_active = active.as_deref() == Some(provider.name.as_str());
-            if is_active {
-                selected = index;
-            }
-            let marker = if is_active {
-                "aktiv"
-            } else if !provider.enabled {
-                "deaktiviert"
-            } else if provider.auth.is_none() && !provider.has_plaintext_secret() {
-                "Auth fehlt"
-            } else {
-                "bereit"
-            };
-            options.push(format!("{} [{marker}]", provider.name));
-            ids.push(provider.name.clone());
-        }
-
-        let dialog =
-            ChoiceDialog::new("UIA-Provider wählen", None, options).with_selected(selected);
-        self.overlay = Some(Overlay::UiaProviderChoice(ProviderChoiceState {
-            ids,
-            dialog,
-        }));
-    }
-
-    /// Löst eine getroffene Providerwahl auf (zweite Stufe von
-    /// [`Self::open_provider_choice`]).
-    ///
-    /// # Beschreibung
-    /// Ohne aktives Modell oder mit einem Modell, das bereits zum gewählten
-    /// Provider passt, wird sofort `/provider switch <provider>` emittiert.
-    /// Ist das aktive Modell einem anderen Provider zugeordnet, öffnet sich
-    /// stattdessen die Modell-Auswahl gefiltert auf `provider`
-    /// (`combined = true`): die dort getroffene Wahl emittiert
-    /// `/provider switch <provider> <model>` in einem Schritt, damit die
-    /// Sitzung nie durch einen inkompatiblen Zwischenschritt läuft — dieselbe
-    /// Atomarität, die `harw_ops::provider::handle_switch` serverseitig
-    /// erzwingt. Ein unbekanntes aktives Modell gilt (wie dort) als
-    /// kompatibel — die Ablehnung bleibt allein Sache des Laufzeit-Executors.
-    ///
-    /// # Argumente
-    /// - `bus` (`&HarwEventSender`): Kanal für die synthetisierte
-    ///   `/provider switch`-Befehlszeile.
-    /// - `provider` (`String`): die kanonische Provider-ID der getroffenen Wahl.
-    fn resolve_provider_choice(&mut self, bus: &HarwEventSender, provider: String) {
-        let Some(config) = self.resolved_config() else {
-            bus.send(HarwEvent::Command(format!("/provider switch {provider}")));
-            return;
-        };
-        let active_model = self.session_controller.snapshot().active_model;
-        let compatible = match &active_model {
-            None => true,
-            Some(active_model) => config
-                .models
-                .values()
-                .find(|model| {
-                    model.id == *active_model
-                        || model.aliases.iter().any(|alias| alias == active_model)
-                })
-                .map(|model| {
-                    Self::canonical_provider_name(&config, &model.provider)
-                        == Some(provider.as_str())
-                })
-                .unwrap_or(true),
-        };
-        if compatible {
-            bus.send(HarwEvent::Command(format!("/provider switch {provider}")));
-        } else {
-            self.open_model_choice(provider, true);
-        }
-    }
-
-    /// Öffnet die interaktive Modell-Auswahl, gefiltert auf `provider`.
-    ///
-    /// # Beschreibung
-    /// Listet nur Modelle, deren (kanonisierter) Provider `provider`
-    /// entspricht, alphabetisch nach ID; markiert das aktive Modell (falls
-    /// eines gesetzt und in dieser Liste vorhanden ist) vorausgewählt. Ist
-    /// die gefilterte Liste leer, wird stattdessen eine klare Systemzeile
-    /// angehängt.
-    ///
-    /// # Argumente
-    /// - `provider` (`String`): kanonische Provider-ID, auf die gefiltert wird.
-    /// - `combined` (`bool`): `true`, wenn dies die zweite Stufe von
-    ///   `/provider` ist (Enter emittiert `/provider switch <provider> <model>`);
-    ///   `false` für die direkte `/model`-Auswahl (Enter emittiert
-    ///   `/model switch <model>`).
-    fn open_model_choice(&mut self, provider: String, combined: bool) {
-        let Some(config) = self.resolved_config() else {
-            self.push_line(
-                Role::System,
-                "Modell-Auswahl nicht verfügbar: keine Konfiguration geladen.",
-            );
-            return;
-        };
-
-        let snap = self.session_controller.snapshot();
-        let active_model = snap.active_model.clone();
-
-        let mut models: Vec<&harw_config::ModelToml> = config
-            .models
-            .values()
-            .filter(|model| {
-                Self::canonical_provider_name(&config, &model.provider) == Some(provider.as_str())
-            })
-            .collect();
-        models.sort_by(|left, right| left.id.cmp(&right.id));
-
-        if models.is_empty() {
-            self.push_line(
-                Role::System,
-                format!("Modell-Auswahl nicht verfügbar: keine Modelle für Provider '{provider}' konfiguriert."),
-            );
-            return;
-        }
-
-        let mut ids = Vec::with_capacity(models.len());
-        let mut options = Vec::with_capacity(models.len());
-        let mut selected = 0usize;
-        for (index, model) in models.iter().enumerate() {
-            let is_active = active_model.as_deref() == Some(model.id.as_str());
-            if is_active {
-                selected = index;
-            }
-            let marker = if is_active { " [aktiv]" } else { "" };
-            let label = model.name.as_deref().unwrap_or(model.id.as_str());
-            options.push(format!("{label} ({}){marker}", model.id));
-            ids.push(model.id.clone());
-        }
-
-        let dialog = ChoiceDialog::new(format!("Modell wählen ({provider})"), None, options)
-            .with_selected(selected);
-        self.overlay = Some(Overlay::ModelChoice(ModelChoiceState {
-            provider,
-            ids,
-            dialog,
-            combined,
-        }));
-    }
-
-    /// Öffnet die interaktive Auswahl des UIA-Pin-Modells, gefiltert auf
-    /// `provider` (`/uia-model` ohne Argument).
-    ///
-    /// # Beschreibung
-    /// Spiegelt [`Self::open_model_choice`] (`combined` ist hier immer
-    /// `false` — die UIA-Pin-Auswahl kennt keinen kombinierten
-    /// Provider+Modell-Zwischenschritt), markiert die aktive Zeile aber
-    /// bevorzugt anhand von `config.harness.uia_model`, statt anhand des
-    /// Laufzeit-Snapshots. Ist `uia_model` `None`, fällt die Markierung auf
-    /// dieselbe Live-Snapshot-Logik zurück wie [`Self::open_model_choice`].
-    /// Eine getroffene Wahl emittiert `/uia-model switch <model>`.
-    ///
-    /// # Argumente
-    /// - `provider` (`String`): kanonische Provider-ID, auf die gefiltert wird
-    ///   (der aktuell gepinnte oder aktive Provider — vom Aufrufer bestimmt).
-    pub(crate) fn open_uia_model_choice(&mut self, provider: String) {
-        let Some(config) = self.resolved_config() else {
-            self.push_line(
-                Role::System,
-                "UIA-Modell-Auswahl nicht verfügbar: keine Konfiguration geladen.",
-            );
-            return;
-        };
-
-        let active_model = config
-            .harness
-            .uia_model
-            .clone()
-            .or_else(|| self.session_controller.snapshot().active_model);
-
-        let mut models: Vec<&harw_config::ModelToml> = config
-            .models
-            .values()
-            .filter(|model| {
-                Self::canonical_provider_name(&config, &model.provider) == Some(provider.as_str())
-            })
-            .collect();
-        models.sort_by(|left, right| left.id.cmp(&right.id));
-
-        if models.is_empty() {
+        if providers.is_empty() {
             self.push_line(
                 Role::System,
                 format!(
-                    "UIA-Modell-Auswahl nicht verfügbar: keine Modelle für Provider '{provider}' konfiguriert."
+                    "{context_label} nicht verfügbar: keine aktivierten Provider konfiguriert."
                 ),
             );
             return;
         }
 
-        let mut ids = Vec::with_capacity(models.len());
-        let mut options = Vec::with_capacity(models.len());
-        let mut selected = 0usize;
-        for (index, model) in models.iter().enumerate() {
-            let is_active = active_model.as_deref() == Some(model.id.as_str());
-            if is_active {
-                selected = index;
-            }
-            let marker = if is_active { " [aktiv]" } else { "" };
+        let provider_entries: Vec<ProviderEntry> = providers
+            .iter()
+            .map(|provider| ProviderEntry {
+                id: provider.name.clone(),
+                label: provider.name.clone(),
+            })
+            .collect();
+
+        let mut models: Vec<&harw_config::ModelToml> = config.models.values().collect();
+        models.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let mut models_by_provider: Vec<(String, Vec<ModelEntry>)> = Vec::new();
+        for model in models {
+            let Some(canonical) = Self::canonical_provider_name(&config, &model.provider) else {
+                continue;
+            };
             let label = model.name.as_deref().unwrap_or(model.id.as_str());
-            options.push(format!("{label} ({}){marker}", model.id));
-            ids.push(model.id.clone());
+            let entry = ModelEntry {
+                id: model.id.clone(),
+                label: format!("{label} ({})", model.id),
+            };
+            match models_by_provider
+                .iter_mut()
+                .find(|(id, _)| id.as_str() == canonical)
+            {
+                Some((_, list)) => list.push(entry),
+                None => models_by_provider.push((canonical.to_owned(), vec![entry])),
+            }
         }
 
-        let dialog = ChoiceDialog::new(format!("UIA-Modell wählen ({provider})"), None, options)
-            .with_selected(selected);
-        self.overlay = Some(Overlay::UiaModelChoice(ModelChoiceState {
-            provider,
-            ids,
-            dialog,
-            combined: false,
-        }));
+        let snap = self.session_controller.snapshot();
+        let (active_provider, active_model): (Option<String>, Option<String>) = match &target {
+            PickerTarget::Orchestrator => (
+                snap.active_provider
+                    .clone()
+                    .or_else(|| config.harness.default_provider.clone()),
+                snap.active_model
+                    .clone()
+                    .or_else(|| config.harness.default_model.clone()),
+            ),
+            PickerTarget::Uia => (
+                config
+                    .harness
+                    .uia_provider
+                    .clone()
+                    .or_else(|| self.active_or_default_provider(&config)),
+                config
+                    .harness
+                    .uia_model
+                    .clone()
+                    .or_else(|| snap.active_model.clone()),
+            ),
+            PickerTarget::UiaWorker { fixed_provider } => (
+                Some(fixed_provider.clone()),
+                config.harness.uia_worker_model.clone(),
+            ),
+        };
+
+        let Some(picker) = ModelSwitchPicker::new(
+            target,
+            provider_entries,
+            models_by_provider,
+            active_provider.as_deref(),
+            active_model.as_deref(),
+        ) else {
+            self.push_line(
+                Role::System,
+                format!(
+                    "{context_label} nicht verfügbar: keine aktivierten Provider konfiguriert."
+                ),
+            );
+            return;
+        };
+        self.overlay = Some(Overlay::ModelSwitch(Box::new(picker)));
+    }
+
+    /// Öffnet die einstufige Effort-Auswahl (Welle 7b).
+    ///
+    /// # Beschreibung
+    /// Listet alle sechs [`ReasoningEffort`]-Stufen (aufsteigend) plus einen
+    /// abschließenden Eintrag „Provider-Default (zurücksetzen)" (emittiert
+    /// `clear`). Die Vorauswahl unterscheidet sich je `target`:
+    /// [`EffortTarget::Session`] liest den Controller-Snapshot
+    /// (`reasoning_effort`), [`EffortTarget::Uia`] den persistierten
+    /// `config.harness.reasoning.uia`-Wert (geparst über
+    /// [`ReasoningEffort::from_str`]; ein unbekannter oder fehlender Wert
+    /// fällt auf keine Vorauswahl zurück).
+    ///
+    /// # Argumente
+    /// - `target` (`EffortTarget`): Session oder UIA.
+    pub(crate) fn open_effort_choice(&mut self, target: EffortTarget) {
+        let active: Option<ReasoningEffort> = match target {
+            EffortTarget::Session => self.session_controller.snapshot().reasoning_effort,
+            EffortTarget::Uia => self
+                .resolved_config()
+                .and_then(|config| config.harness.reasoning.uia.clone())
+                .and_then(|value| value.parse::<ReasoningEffort>().ok()),
+        };
+
+        let mut options: Vec<String> = EFFORT_LEVELS
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        options.push("Provider-Default (zurücksetzen)".to_owned());
+
+        let selected = active
+            .and_then(|active| EFFORT_LEVELS.iter().position(|level| *level == active))
+            .unwrap_or(0);
+
+        let title = match target {
+            EffortTarget::Session => "Reasoning-Effort wählen",
+            EffortTarget::Uia => "UIA-Reasoning-Effort wählen",
+        };
+        let dialog = ChoiceDialog::new(title, None, options).with_selected(selected);
+        self.overlay = Some(Overlay::EffortChoice { target, dialog });
     }
 
     /// Gibt `true` zurück, wenn gerade ein Vollflächen-Overlay geöffnet ist.
@@ -2251,24 +2135,24 @@ fn resume_request(raw: &str) -> Option<TuiRunOutcome> {
     }
 }
 
-/// Erkennt genau `command` ohne weitere Tokens (beliebiger Umgebungs-Whitespace).
+/// Erkennt die bare Form eines Befehls **oder** dessen argloses `switch`
+/// (Welle 4a/7b: `/model`, `/model switch`, `/uia-effort switch`, …).
 ///
 /// # Beschreibung
-/// Genau wie [`resume_request`]s Präfix-Erkennung, aber ohne
-/// `TuiRunOutcome`-Nutzlast: `/provider list` oder `/model switch x` bleiben
-/// unberührt (der reguläre `/command`-Dispatch behandelt sie unverändert) —
-/// nur die bare Form öffnet die interaktive Auswahl.
+/// `raw.trim() == command` oder `raw.trim() == format!("{command} switch")`
+/// — jeweils exakt, kein zusätzliches Argument. `/model switch <id>` bleibt
+/// unberührt (bleibt Text-Dispatch); nur die beiden argumentlosen Formen
+/// öffnen den jeweiligen Picker.
 ///
 /// # Argumente
 /// - `raw` (`&str`): die unveränderte Befehlszeile.
-/// - `command` (`&str`): der zu erkennende Befehl, z. B. `"/provider"`.
+/// - `command` (`&str`): der zu erkennende Befehl, z. B. `"/model"`.
 ///
 /// # Rückgabe
-/// `true` für genau `command` (mit beliebigem Whitespace drumherum), sonst
-/// `false`.
-fn is_bare_command(raw: &str, command: &str) -> bool {
-    let mut words = raw.split_whitespace();
-    words.next() == Some(command) && words.next().is_none()
+/// `true` für die bare Form oder das arglose `switch`, sonst `false`.
+fn is_bare_or_argless_switch(raw: &str, command: &str) -> bool {
+    let trimmed = raw.trim();
+    trimmed == command || trimmed == format!("{command} switch")
 }
 
 fn visible_message_text(content: &[ContentPart]) -> String {
@@ -2607,7 +2491,7 @@ const POPUP_MAX_ROWS: u16 = 8;
 /// Ein zweiter Druck derselben Taste innerhalb von [`QUIT_HINT_WINDOW`] beendet;
 /// jede andere Taste (und der Timeout) macht die Scharfstellung rückgängig.
 #[derive(Clone, Copy)]
-struct QuitArm {
+pub(crate) struct QuitArm {
     /// Anzeige-Label der Taste (`"Ctrl+C"` / `"Ctrl+D"`).
     label: &'static str,
     /// Zeitpunkt des ersten Drucks.
@@ -2691,7 +2575,6 @@ pub(crate) async fn run_loop(
     // die eine Verlaufszelle je Kind-Session.
     let mut turn_state = TurnEventState::default();
 
-    let mut pending_quit: Option<QuitArm> = None;
     let mut spinner = Spinner::new();
     let mut provider_error_streak = 0_u32;
 
@@ -2706,18 +2589,18 @@ pub(crate) async fn run_loop(
                     let Some(tev) = maybe_tev else { return Ok(TuiRunOutcome::Quit) };
 
                     // Abgelaufenen Beenden-Hinweis verwerfen.
-                    if let Some(arm) = pending_quit {
+                    if let Some(arm) = app.pending_quit {
                         if arm.at.elapsed() > QUIT_HINT_WINDOW {
-                            pending_quit = None;
+                            app.pending_quit = None;
                         }
                     }
 
                     match tev {
                         TuiEvent::Draw => {
-                            draw_viewport(guard, app, &spinner, pending_quit.map(|arm| arm.label))?;
+                            draw_viewport(guard, app, &spinner, app.pending_quit.map(|arm| arm.label))?;
                         }
                         TuiEvent::Key(key) => {
-                            if handle_key(app, key, &mut pending_quit, harw_tx) {
+                            if handle_key(app, key, harw_tx) {
                                 frame_req.schedule_frame();
                             }
                         }
@@ -2771,53 +2654,33 @@ pub(crate) async fn run_loop(
                             if let Some(request) = resume_request(&raw) {
                                 return Ok(request);
                             }
-                            // `/provider`/`/model` ohne Argument öffnen die
-                            // interaktive Auswahl statt der Text-Ausgabe (`show`)
-                            // — vor dem regulären `/command`-Dispatch
-                            // abgefangen, damit `show` nicht zusätzlich läuft.
-                            // `/provider list`, `/model switch x` u. ä. bleiben
-                            // unberührt und laufen unverändert weiter unten.
-                            if is_bare_command(&raw, "/provider") {
-                                app.open_provider_choice();
+                            // `/model`/`/uia-model`/`/uia-worker-model` ohne
+                            // Argument (oder als argloses `switch`) öffnen den
+                            // konsolidierten Provider/Modell-Picker statt der
+                            // Text-Ausgabe (`show`) — vor dem regulären
+                            // `/command`-Dispatch abgefangen, damit `show`
+                            // nicht zusätzlich läuft. `/model switch <id>` mit
+                            // Argument bleibt unberührt und läuft unverändert
+                            // weiter unten. Bare `/provider`/`/uia-provider`
+                            // öffnen seit der Picker-Konsolidierung (Welle 4a)
+                            // **keinen** Picker mehr — sie laufen unverändert
+                            // auf `show` durch den regulären Dispatch.
+                            if is_bare_or_argless_switch(&raw, "/model") {
+                                app.open_model_switch_picker(PickerTarget::Orchestrator);
                                 frame_req.schedule_frame();
                                 continue;
                             }
-                            if is_bare_command(&raw, "/model") {
+                            if is_bare_or_argless_switch(&raw, "/uia-model") {
+                                app.open_model_switch_picker(PickerTarget::Uia);
+                                frame_req.schedule_frame();
+                                continue;
+                            }
+                            if is_bare_or_argless_switch(&raw, "/uia-worker-model") {
                                 match app.resolved_config() {
-                                    Some(config) => match app.active_or_default_provider(&config) {
-                                        Some(provider) => app.open_model_choice(provider, false),
-                                        None => app.push_line(
-                                            Role::System,
-                                            "Modell-Auswahl nicht verfügbar: kein aktiver oder \
-                                             Standard-Provider bekannt.",
-                                        ),
-                                    },
-                                    None => app.push_line(
-                                        Role::System,
-                                        "Modell-Auswahl nicht verfügbar: keine Konfiguration geladen.",
-                                    ),
-                                }
-                                frame_req.schedule_frame();
-                                continue;
-                            }
-                            // `/uia-provider`/`/uia-model` ohne Argument öffnen
-                            // dieselbe interaktive Auswahl wie `/provider`/
-                            // `/model`, pinnen aber den UIA-Worker statt der
-                            // aktiven Session (Ops-Handler dafür werden parallel
-                            // in `harw-ops` ergänzt; bis dahin ist die
-                            // emittierte `/uia-provider switch`/`/uia-model
-                            // switch`-Zeile ein erwarteter "unbekannter Befehl").
-                            if is_bare_command(&raw, "/uia-provider") {
-                                app.open_uia_provider_choice();
-                                frame_req.schedule_frame();
-                                continue;
-                            }
-                            if is_bare_command(&raw, "/uia-model") {
-                                match app.resolved_config() {
-                                    // Der UIA-Pin-Provider hat Vorrang vor dem
-                                    // regulären aktiven/Standard-Provider, damit
-                                    // die Modell-Liste zum tatsächlich gepinnten
-                                    // Provider passt.
+                                    // Der Worker ist zwingend an den effektiven
+                                    // UIA-Provider gebunden (UIA-Pin, sonst der
+                                    // aktive/Standard-Provider) — keine eigene
+                                    // `uia_worker_provider`-Konzeption.
                                     Some(config) => {
                                         let provider = config
                                             .harness
@@ -2825,19 +2688,37 @@ pub(crate) async fn run_loop(
                                             .clone()
                                             .or_else(|| app.active_or_default_provider(&config));
                                         match provider {
-                                            Some(provider) => app.open_uia_model_choice(provider),
+                                            Some(fixed_provider) => app.open_model_switch_picker(
+                                                PickerTarget::UiaWorker { fixed_provider },
+                                            ),
                                             None => app.push_line(
                                                 Role::System,
-                                                "UIA-Modell-Auswahl nicht verfügbar: kein UIA-Pin-, \
-                                                 aktiver oder Standard-Provider bekannt.",
+                                                "UIA-Worker-Modell-Auswahl nicht verfügbar: kein \
+                                                 UIA-Pin-, aktiver oder Standard-Provider bekannt.",
                                             ),
                                         }
                                     }
                                     None => app.push_line(
                                         Role::System,
-                                        "UIA-Modell-Auswahl nicht verfügbar: keine Konfiguration geladen.",
+                                        "UIA-Worker-Modell-Auswahl nicht verfügbar: keine \
+                                         Konfiguration geladen.",
                                     ),
                                 }
+                                frame_req.schedule_frame();
+                                continue;
+                            }
+                            // `/effort`/`/uia-effort` ohne Argument (oder als
+                            // argloses `switch`) öffnen die einstufige
+                            // Effort-Auswahl (Welle 7b) — dieselbe
+                            // Abfang-Reihenfolge wie beim Modell-Picker.
+                            // `/effort <level>` mit Argument bleibt unberührt.
+                            if is_bare_or_argless_switch(&raw, "/effort") {
+                                app.open_effort_choice(EffortTarget::Session);
+                                frame_req.schedule_frame();
+                                continue;
+                            }
+                            if is_bare_or_argless_switch(&raw, "/uia-effort") {
+                                app.open_effort_choice(EffortTarget::Uia);
                                 frame_req.schedule_frame();
                                 continue;
                             }
@@ -3096,7 +2977,7 @@ pub(crate) async fn run_loop(
         // Chat offen und der Fehler wird als System-Zeile angezeigt.
         // `TuiError::Io` bleibt fatal und propagiert weiterhin nach
         // oben, da er einen nicht behebbaren Terminalfehler anzeigt.
-        if let Err(error) = run_turn_streaming(
+        let turn_result = run_turn_streaming(
             guard,
             app,
             &mut spinner,
@@ -3109,8 +2990,18 @@ pub(crate) async fn run_loop(
             turn_event_rx,
             &mut turn_state,
         )
-        .await
-        {
+        .await;
+
+        // Welle 4c: ein zweiter Ctrl+C während des soeben beendeten Turns hat
+        // `app.hard_quit_requested` gesetzt (siehe `handle_busy_event`) — der
+        // Loop beendet direkt hier, unabhängig davon, ob der Turn selbst
+        // erfolgreich war oder mit einem Fehler zurückkam (derselbe Ausgang
+        // wie `HarwEvent::Quit` im Idle-Pfad oben).
+        if app.hard_quit_requested {
+            return Ok(TuiRunOutcome::Quit);
+        }
+
+        if let Err(error) = turn_result {
             let provider_error = matches!(
                 &error,
                 TuiError::Core(message)
@@ -3637,6 +3528,10 @@ struct ExportRequest {
     /// `--datei <pfad>`: `Some(pfad)` überspringt die Auswahl und schreibt
     /// direkt dorthin; `None` öffnet [`Overlay::ExportChoice`].
     path: Option<String>,
+    /// `--max-chars <n>`: harte Obergrenze der Gesamtlänge des gerenderten
+    /// Exports in Unicode-Zeichen (nicht je Eintrag). Fehlt der Schlüssel im
+    /// Marker, bleibt es `None` — keine Begrenzung.
+    max_chars: Option<usize>,
 }
 
 /// Führt den strukturierten `/export`-Command bis zum `OpOutput` aus.
@@ -3750,6 +3645,7 @@ fn export_request_for_command(raw: &str) -> Option<ExportRequest> {
                         include_tool_calls,
                         include_reasoning_summary,
                         path: None,
+                        max_chars: None,
                     });
                 };
                 path = Some(value.clone());
@@ -3786,6 +3682,10 @@ fn export_request_for_command(raw: &str) -> Option<ExportRequest> {
         include_tool_calls,
         include_reasoning_summary,
         path,
+        // `--max-chars` ist Sache des strukturierten `export.request`-Markers
+        // (`export_request_from_data`) — der Legacy-Raw-Fallback hier kennt
+        // dieses Flag bewusst nicht (siehe `ExportRequest::max_chars`-Doku).
+        max_chars: None,
     })
 }
 
@@ -3820,11 +3720,20 @@ fn export_request_from_data(data: &serde_json::Value) -> Option<ExportRequest> {
         None | Some(serde_json::Value::Null) => None,
         Some(value) => Some(value.as_str()?.to_owned()),
     };
+    // `max_chars` fehlt im Marker komplett, wenn `--max-chars` nicht
+    // angegeben wurde (kein `null` — siehe `harw_ops::export`s Marker-Bau);
+    // nur ein positiver Wert wird übernommen.
+    let max_chars = object
+        .get("max_chars")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|value| *value > 0)
+        .map(|value| value as usize);
     Some(ExportRequest {
         format,
         include_tool_calls,
         include_reasoning_summary,
         path,
+        max_chars,
     })
 }
 
@@ -3844,20 +3753,16 @@ fn export_timestamp_now() -> String {
         .unwrap_or_else(|_| "0".to_owned())
 }
 
-/// Baut das Markdown-Dokument für `/export` aus dem parallel mitgeführten
-/// [`ExportEntry`]-Verlauf ([`ChatApp::export_entries`]).
-///
-/// # Beschreibung
-/// Werkzeugaufrufe und Denkschritte bleiben standardmäßig ausgeblendet
-/// ([`ExportOptions::default`]) — dieselbe Zurückhaltung wie im Freigabe-Panel:
-/// beide können interne Details offenlegen, die nicht jeder Export teilen
-/// soll. `started_at` bleibt `None` (siehe [`export_timestamp_now`] für den
-/// Grund); Titel, Verzeichnis und Session-ID kommen aus der laufenden Sitzung.
+/// Baut die [`ExportMeta`]-Kopfzeile für `/export` (Titel, Session-ID,
+/// Verzeichnis, Modell) — gemeinsam für [`build_export_markdown`] und den
+/// JSON-Zweig von [`build_export`], damit beide Formate dieselbe
+/// Session-Auflösung verwenden. `started_at` bleibt `None` (siehe
+/// [`export_timestamp_now`] für den Grund); Titel, Verzeichnis und
+/// Session-ID kommen aus der laufenden Sitzung.
 ///
 /// # Argumente
 /// - `app` (`&ChatApp`): liefert Titel, Projekt-Root, Session-ID und Verlauf.
-/// - `opts` (`&ExportOptions`): Inhaltsauswahl (siehe [`export_request_for_command`]).
-fn build_export(app: &ChatApp, opts: &ExportOptions, format: ExportOutputFormat) -> String {
+fn build_export_meta(app: &ChatApp) -> ExportMeta {
     let controller = SessionController::snapshot(app.session_controller.as_ref());
     let config = app.resolved_config();
     let provider = controller.active_provider.or_else(|| {
@@ -3879,7 +3784,7 @@ fn build_export(app: &ChatApp, opts: &ExportOptions, format: ExportOutputFormat)
         (Some(provider), None) => Some(provider),
         (None, None) => None,
     };
-    let meta = ExportMeta {
+    ExportMeta {
         title: app.session_title().map(str::to_owned),
         session_id: app.session_id().to_string(),
         started_at: app.export_started_at.clone(),
@@ -3889,25 +3794,59 @@ fn build_export(app: &ChatApp, opts: &ExportOptions, format: ExportOutputFormat)
             Some(app.project_root().to_owned())
         },
         model,
-    };
-    match format {
-        ExportOutputFormat::Markdown => export::render_markdown_with_extensions(
-            &meta,
-            &app.export_entries,
-            opts,
-            &app.export_meta_extensions,
-        ),
-        ExportOutputFormat::Json => export::render_json_with_extensions(
-            &meta,
-            &app.export_entries,
-            opts,
-            &app.export_meta_extensions,
-        ),
     }
 }
 
+/// Rendert den Export ausschließlich als Markdown.
+///
+/// # Beschreibung
+/// Eigenständiger Markdown-Zweig von [`build_export`]: baut dieselben
+/// [`ExportMeta`] über [`build_export_meta`] und rendert sie über
+/// [`export::render_markdown_with_extensions`]. [`build_export`] ruft diese
+/// Funktion für [`ExportOutputFormat::Markdown`] auf statt die Logik zu
+/// duplizieren — so bleibt genau eine Stelle maßgeblich für das
+/// Markdown-Rendering.
+///
+/// # Argumente
+/// - `app` (`&ChatApp`): liefert Titel, Projekt-Root, Session-ID und Verlauf.
+/// - `opts` (`&ExportOptions`): Inhaltsauswahl (siehe [`export_request_for_command`]).
+///
+/// # Rückgabe
+/// Das fertige Markdown-Dokument.
 fn build_export_markdown(app: &ChatApp, opts: &ExportOptions) -> String {
-    build_export(app, opts, ExportOutputFormat::Markdown)
+    let meta = build_export_meta(app);
+    export::render_markdown_with_extensions(&meta, &app.export_entries, opts, &app.export_meta_extensions)
+}
+
+/// Baut das Exportdokument aus dem parallel mitgeführten [`ExportEntry`]-Verlauf
+/// ([`ChatApp::export_entries`]) im angeforderten Format.
+///
+/// # Beschreibung
+/// Werkzeugaufrufe und Denkschritte bleiben standardmäßig ausgeblendet
+/// ([`ExportOptions::default`]) — dieselbe Zurückhaltung wie im Freigabe-Panel:
+/// beide können interne Details offenlegen, die nicht jeder Export teilen
+/// soll. `started_at` bleibt `None` (siehe [`export_timestamp_now`] für den
+/// Grund); Titel, Verzeichnis und Session-ID kommen aus der laufenden Sitzung.
+/// Delegiert für Markdown an [`build_export_markdown`]; für JSON rendert sie
+/// direkt über [`export::render_json_with_extensions`].
+///
+/// # Argumente
+/// - `app` (`&ChatApp`): liefert Titel, Projekt-Root, Session-ID und Verlauf.
+/// - `opts` (`&ExportOptions`): Inhaltsauswahl (siehe [`export_request_for_command`]).
+/// - `format` (`ExportOutputFormat`): Markdown oder JSON.
+fn build_export(app: &ChatApp, opts: &ExportOptions, format: ExportOutputFormat) -> String {
+    match format {
+        ExportOutputFormat::Markdown => build_export_markdown(app, opts),
+        ExportOutputFormat::Json => {
+            let meta = build_export_meta(app);
+            export::render_json_with_extensions(
+                &meta,
+                &app.export_entries,
+                opts,
+                &app.export_meta_extensions,
+            )
+        }
+    }
 }
 
 /// Führt eine erkannte Exportanfrage mit genau deren Format und Optionen aus.
@@ -3919,7 +3858,7 @@ fn resolve_export_request(app: &mut ChatApp, request: &ExportRequest) {
     let opts = ExportOptions {
         include_tool_calls: request.include_tool_calls,
         include_reasoning: request.include_reasoning_summary,
-        ..ExportOptions::default()
+        max_chars: request.max_chars,
     };
     if let Some(path) = request.path.as_deref() {
         app.pending_export_options = None;
@@ -3956,10 +3895,7 @@ fn resolve_export_request(app: &mut ChatApp, request: &ExportRequest) {
 ///   [`handle_overlay_key`], falls ein künftiger Export-Pfad asynchron wird.
 /// - `index` (`usize`): der von [`ChoiceDialog`] gemeldete Auswahlindex.
 fn resolve_export_choice(app: &mut ChatApp, _bus: &HarwEventSender, index: usize) {
-    let opts = app
-        .pending_export_options
-        .take()
-        .unwrap_or_else(ExportOptions::default);
+    let opts = app.pending_export_options.take().unwrap_or_default();
     let format = app.pending_export_format;
     match index {
         0 => {
@@ -4045,83 +3981,35 @@ pub(crate) async fn frame_scheduler(
 }
 
 /// Verarbeitet einen Tastendruck, während ein Vollflächen-Overlay
-/// (Session-Picker, `/export`-, `/provider`-, `/model`-Auswahl) den normalen
-/// Eingabepfad ersetzt.
+/// (Session-Picker, `/export`-, Modell/Provider-, Effort-Auswahl) den
+/// normalen Eingabepfad ersetzt.
 ///
 /// # Beschreibung
 /// - [`Overlay::SessionPicker`]: delegiert an [`SessionPicker::handle_key`].
-///   `PickerAction::Open(id)` schließt das Overlay und synthetisiert eine
-///   `/resume <id>`-Befehlszeile über den bestehenden [`HarwEvent::Command`]-
-///   Pfad (`resume_request` in `run_loop` erkennt sie und beendet den Loop
-///   mit `TuiRunOutcome::Resume { selector: Some(id) }`, genau wie bei einer
-///   getippten Zeile) — kein neuer Ereignistyp nötig.
+///   `PickerAction::Open(id)` (`session_picker`) schließt das Overlay und
+///   synthetisiert eine `/resume <id>`-Befehlszeile über den bestehenden
+///   [`HarwEvent::Command`]-Pfad (`resume_request` in `run_loop` erkennt sie
+///   und beendet den Loop mit `TuiRunOutcome::Resume { selector: Some(id) }`,
+///   genau wie bei einer getippten Zeile) — kein neuer Ereignistyp nötig.
 /// - [`Overlay::ExportChoice`]: delegiert an [`ChoiceDialog::handle_key`].
 ///   Eine getroffene Wahl schließt das Overlay und wird über
 ///   [`resolve_export_choice`] eingelöst.
-/// - [`Overlay::ProviderChoice`]: delegiert an [`ChoiceDialog::handle_key`].
-///   Eine getroffene Wahl schließt das Overlay und wird über
-///   [`ChatApp::resolve_provider_choice`] eingelöst — entweder ein direktes
-///   `/provider switch <id>`, oder das Öffnen der zweiten Stufe
-///   ([`Overlay::ModelChoice`] mit `combined = true`).
-/// - [`Overlay::ModelChoice`]: delegiert an [`ChoiceDialog::handle_key`].
+/// - [`Overlay::ModelSwitch`]: delegiert an [`ModelSwitchPicker::on_key`].
+///   `ModelSwitchAction::Accept { provider, model }` schließt das Overlay und
+///   synthetisiert je nach [`ModelSwitchPicker::target`] `/model switch
+///   <model>`, `/uia-model switch <model>` bzw. `/uia-worker-model switch
+///   <model>` über [`HarwEvent::Command`] (`provider` bleibt implizit — der
+///   Ziel-Op wechselt Provider+Modell atomar).
+/// - [`Overlay::EffortChoice`]: delegiert an [`ChoiceDialog::handle_key`].
 ///   Eine getroffene Wahl schließt das Overlay und synthetisiert je nach
-///   `combined` entweder `/provider switch <provider> <model>` oder
-///   `/model switch <model>` über [`HarwEvent::Command`].
-/// - [`Overlay::UiaProviderChoice`] / [`Overlay::UiaModelChoice`]: dieselbe
-///   Ablaufsteuerung wie ihre nicht-UIA-Pendants (via den lokalen Makros
-///   `handle_provider_choice_overlay!`/`handle_model_choice_overlay!`),
-///   emittieren aber direkt `/uia-provider switch <id>` bzw.
-///   `/uia-model switch <id>` — ohne kombinierte Zwischenstufe.
+///   `target` `/effort <level>`/`/effort clear` bzw. `/uia-effort
+///   <level>`/`/uia-effort clear` (letzter Eintrag „Provider-Default
+///   (zurücksetzen)" → `clear`).
 ///
 /// # Rückgabe
 /// `true` (jede Taste verändert entweder den Overlay-Zustand oder schließt
 /// ihn — in beiden Fällen ist ein Redraw nötig).
 fn handle_overlay_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -> bool {
-    // Gemeinsame Ablaufsteuerung für "provider-förmige" Auswahl-Overlays
-    // ([`Overlay::ProviderChoice`], [`Overlay::UiaProviderChoice`]):
-    // delegiert an [`ChoiceDialog::handle_key`], löst bei `Chosen` die
-    // kanonische ID auf und schließt das Overlay, bevor `$action` läuft —
-    // dieselbe Borrow-Reihenfolge wie im vormaligen Handcode, damit
-    // `$action` (das oft `app`/`bus` erneut borgt) erst nach dem letzten
-    // Zugriff auf `$state` läuft.
-    macro_rules! handle_provider_choice_overlay {
-        ($state:expr, $id:ident => $action:expr) => {
-            match $state.dialog.handle_key(key) {
-                ChoiceAction::Stay => {}
-                ChoiceAction::Cancel => app.overlay = None,
-                ChoiceAction::Chosen(index) => {
-                    let $id = $state.ids.get(index).cloned();
-                    app.overlay = None;
-                    if let Some($id) = $id {
-                        $action
-                    }
-                }
-            }
-        };
-    }
-
-    // Gegenstück für "modell-förmige" Auswahl-Overlays ([`Overlay::ModelChoice`],
-    // [`Overlay::UiaModelChoice`]) — zusätzlich zur gewählten Modell-ID
-    // stehen `$provider` (`state.provider.clone()`) und `$combined`
-    // (`state.combined`) für `$action` zur Verfügung.
-    macro_rules! handle_model_choice_overlay {
-        ($state:expr, $model:ident, $provider:ident, $combined:ident => $action:expr) => {
-            match $state.dialog.handle_key(key) {
-                ChoiceAction::Stay => {}
-                ChoiceAction::Cancel => app.overlay = None,
-                ChoiceAction::Chosen(index) => {
-                    let $model = $state.ids.get(index).cloned();
-                    let $provider = $state.provider.clone();
-                    let $combined = $state.combined;
-                    app.overlay = None;
-                    if let Some($model) = $model {
-                        $action
-                    }
-                }
-            }
-        };
-    }
-
     match app.overlay.as_mut() {
         Some(Overlay::SessionPicker(picker)) => match picker.handle_key(key) {
             PickerAction::Stay => {}
@@ -4142,30 +4030,38 @@ fn handle_overlay_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -
                 resolve_export_choice(app, bus, index);
             }
         },
-        Some(Overlay::ProviderChoice(state)) => {
-            handle_provider_choice_overlay!(state, provider => {
-                app.resolve_provider_choice(bus, provider);
-            });
-        }
-        Some(Overlay::UiaProviderChoice(state)) => {
-            handle_provider_choice_overlay!(state, provider => {
-                bus.send(HarwEvent::Command(format!("/uia-provider switch {provider}")));
-            });
-        }
-        Some(Overlay::ModelChoice(state)) => {
-            handle_model_choice_overlay!(state, model, provider, combined => {
-                let command = if combined {
-                    format!("/provider switch {provider} {model}")
-                } else {
-                    format!("/model switch {model}")
+        Some(Overlay::ModelSwitch(picker)) => match picker.on_key(key) {
+            ModelSwitchAction::Stay => {}
+            ModelSwitchAction::Cancel => app.overlay = None,
+            ModelSwitchAction::Accept { model, .. } => {
+                let target = picker.target().clone();
+                app.overlay = None;
+                let command = match target {
+                    PickerTarget::Orchestrator => format!("/model switch {model}"),
+                    PickerTarget::Uia => format!("/uia-model switch {model}"),
+                    PickerTarget::UiaWorker { .. } => {
+                        format!("/uia-worker-model switch {model}")
+                    }
                 };
                 bus.send(HarwEvent::Command(command));
-            });
-        }
-        Some(Overlay::UiaModelChoice(state)) => {
-            handle_model_choice_overlay!(state, model, _provider, _combined => {
-                bus.send(HarwEvent::Command(format!("/uia-model switch {model}")));
-            });
+            }
+        },
+        Some(Overlay::EffortChoice { target, dialog }) => {
+            let target = *target;
+            match dialog.handle_key(key) {
+                ChoiceAction::Stay => {}
+                ChoiceAction::Cancel => app.overlay = None,
+                ChoiceAction::Chosen(index) => {
+                    app.overlay = None;
+                    let level = EFFORT_LEVELS.get(index).map(std::string::ToString::to_string);
+                    let level = level.unwrap_or_else(|| "clear".to_owned());
+                    let command = match target {
+                        EffortTarget::Session => format!("/effort {level}"),
+                        EffortTarget::Uia => format!("/uia-effort {level}"),
+                    };
+                    bus.send(HarwEvent::Command(command));
+                }
+            }
         }
         None => {}
     }
@@ -4187,19 +4083,16 @@ fn handle_overlay_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -
 /// - Bei offenem Popup: Pfeiltasten/Enter/Esc/Ziffern navigieren das Popup.
 ///
 /// # Argumente
-/// - `app` (`&mut ChatApp`): Zustand, der mutiert wird.
+/// - `app` (`&mut ChatApp`): Zustand, der mutiert wird — inklusive
+///   [`ChatApp::pending_quit`] (Welle 4c: vormals ein separater Parameter,
+///   jetzt ein Feld, damit auch [`handle_busy_event`] dieselbe Scharfstellung
+///   lesen/setzen kann).
 /// - `key` (`KeyEvent`): der bereits auf Press/Repeat gefilterte Tastendruck.
-/// - `pending_quit` (`&mut Option<QuitArm>`): Scharfstellung des Beenden-Hinweises.
 /// - `bus` (`&HarwEventSender`): Kanal, über den [`HarwEvent`]s emittiert werden.
 ///
 /// # Rückgabe
 /// `true` wenn ein Redraw angefordert werden soll, sonst `false`.
-fn handle_key(
-    app: &mut ChatApp,
-    key: KeyEvent,
-    pending_quit: &mut Option<QuitArm>,
-    bus: &HarwEventSender,
-) -> bool {
+fn handle_key(app: &mut ChatApp, key: KeyEvent, bus: &HarwEventSender) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
     // ── Globale Steuer-Keys (unabhängig von Popup/Editor-Zustand) ────────
@@ -4207,7 +4100,7 @@ fn handle_key(
     // Ctrl+C — Doppeldruck beendet (unabhängig vom Eingabeinhalt).
     if ctrl && matches!(key.code, KeyCode::Char('c' | 'C')) {
         if matches!(
-            *pending_quit,
+            app.pending_quit,
             Some(QuitArm {
                 label: "Ctrl+C",
                 ..
@@ -4216,7 +4109,7 @@ fn handle_key(
             bus.send(HarwEvent::Quit);
             return false;
         }
-        *pending_quit = Some(QuitArm {
+        app.pending_quit = Some(QuitArm {
             label: "Ctrl+C",
             at: Instant::now(),
         });
@@ -4228,7 +4121,7 @@ fn handle_key(
     // Notausstieg auch bei offenem Dialog oder nicht leerer Eingabe funktioniert.
     if ctrl && matches!(key.code, KeyCode::Char('d' | 'D')) {
         if matches!(
-            *pending_quit,
+            app.pending_quit,
             Some(QuitArm {
                 label: "Ctrl+D",
                 ..
@@ -4237,7 +4130,7 @@ fn handle_key(
             bus.send(HarwEvent::Quit);
             return false;
         }
-        *pending_quit = Some(QuitArm {
+        app.pending_quit = Some(QuitArm {
             label: "Ctrl+D",
             at: Instant::now(),
         });
@@ -4245,12 +4138,13 @@ fn handle_key(
     }
 
     // Jede andere Taste macht eine Scharfstellung rückgängig.
-    *pending_quit = None;
+    app.pending_quit = None;
     if !matches!(key.code, KeyCode::Esc) {
         app.escape_armed = false;
     }
 
-    // ── Vollflächige Overlays (Session-Picker, `/export`-Auswahl) ────────
+    // ── Vollflächige Overlays (Session-Picker, `/export`-, Modell/Provider-,
+    // Effort-Auswahl) ─────────────────────────────────────────────────────
     // Exklusiv: solange eines offen ist, geht keine Taste an Popup, Editor
     // oder ChatScroll (Plan Schritt 6/7).
     if app.has_overlay() {
@@ -4497,6 +4391,22 @@ async fn run_turn_streaming(
     // angefordert …"-Hinweis aus einem vorherigen, jetzt abgeschlossenen Turn
     // gehört nicht mehr zum aktuellen Zustand.
     app.cancel_requested_at = None;
+    // Welle 4c, Punkt 8: denselben `ManagedAgentSpawner`, den die Wurzelsitzung
+    // beim Admittieren von Kindern befragt ([`ChatApp::managed_spawner`] ist
+    // exakt `RuntimeAssembly::spawner()` — siehe deren Montage in
+    // `runtime_root.rs`, `with_managed_spawner(assembly.spawner().cloned())`,
+    // und `assembly.rs`, wo dieselbe `Arc<ManagedAgentSpawner>`-Instanz sowohl
+    // in den Registry-Builder als auch ins `RuntimeAssembly`-Feld wandert),
+    // mit dem Eltern-Cancel-Token dieses Turns registrieren. Danach admittierte
+    // Kinder erben `cancel.child()`; ein harter Ctrl+C-Abbruch bricht sie
+    // dadurch mit ab. Ein Fehler (z. B. weil diese Session selbst ein
+    // admittiertes Kind ist) ist nicht fatal für den Turn — nur geloggt.
+    if let Some(spawner) = app.managed_spawner() {
+        if let Err(error) = spawner.register_parent_cancel_token(app.session_id(), cancel.clone())
+        {
+            tracing::warn!(error = %error, "tui.turn.register_parent_cancel_token_failed");
+        }
+    }
     spinner.start();
     let reply = drive_turn_animated(
         guard,
@@ -4610,7 +4520,7 @@ async fn drive_turn_animated(
     turn_state: &mut TurnEventState,
 ) -> Result<String, TuiError> {
     // Einmal zeichnen, damit der Spinner sofort erscheint.
-    draw_viewport(guard, app, spinner, None)?;
+    draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
 
     // Rate-Limit-Retry-Schleife: Erstversuch plus bis zu
     // RATE_LIMIT_MAX_ATTEMPTS-1 Wiederholungen. Jeder Versuch läuft durch
@@ -4636,11 +4546,13 @@ async fn drive_turn_animated(
                     result = &mut turn => break result,
                     event = tui_rx.recv(), if input_open => {
                         match event {
-                            Some(event) => {
-                                if handle_busy_event(app, event) {
-                                    draw_viewport(guard, app, spinner, None)?;
+                            Some(event) => match handle_busy_event(app, event) {
+                                BusyKeyOutcome::Redraw => draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?,
+                                BusyKeyOutcome::Idle => {}
+                                BusyKeyOutcome::RunImmediate(raw) => {
+                                    run_immediate_busy_command(guard, app, spinner, &raw).await?;
                                 }
-                            }
+                            },
                             None => input_open = false,
                         }
                     }
@@ -4649,13 +4561,13 @@ async fn drive_turn_animated(
                     maybe_turn_event = turn_event_rx.recv() => {
                         if let Some(event) = maybe_turn_event {
                             if handle_turn_event(app, turn_state, event) {
-                                draw_viewport(guard, app, spinner, None)?;
+                                draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                             }
                         }
                     }
                     _ = tokio::time::sleep(SPINNER_INTERVAL) => {
                         spinner.tick();
-                        draw_viewport(guard, app, spinner, None)?;
+                        draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                     }
                 }
             }
@@ -4679,7 +4591,7 @@ async fn drive_turn_animated(
                 while tokio::time::Instant::now() < deadline {
                     tokio::time::sleep(SPINNER_INTERVAL).await;
                     spinner.tick();
-                    draw_viewport(guard, app, spinner, None)?;
+                    draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                 }
                 // Nächster Schleifendurchlauf: leerer Retry-Input.
             }
@@ -5248,13 +5160,13 @@ async fn drive_pauses_to_completion(
                     // tatsächlich `Some` ist (siehe unten); ein verwaister
                     // `Some`-Wert würde also nie fälschlich als „schon lange
                     // offen" gelesen.
-                    draw_viewport(guard, app, spinner, None)?;
+                    draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                 }
                 // Dieselbe Regel für eine noch offene Host-Permit-Frage.
                 if let Some(prompt) = app.pending_host_permit.take() {
                     prompt.deny();
                     app.pending_host_permit_dialog = None;
-                    draw_viewport(guard, app, spinner, None)?;
+                    draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                 }
                 return Ok(());
             }
@@ -5288,7 +5200,7 @@ async fn drive_pauses_to_completion(
                         app.pending_approval_dialog = Some(build_approval_dialog(&prompt, app, timeout));
                         dialog_shown_at = Some(Instant::now());
                         pending = Some(PendingApprovalPrompt { prompt, tool_cell });
-                        draw_viewport(guard, app, spinner, None)?;
+                        draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                     }
                     None => {
                         tracing::warn!("tui.approval.prompt_channel_ended");
@@ -5314,7 +5226,7 @@ async fn drive_pauses_to_completion(
                         app.pending_host_permit_dialog = Some(build_host_permit_dialog(&prompt));
                         app.pending_host_permit = Some(prompt);
                         host_permit_shown_at = Some(Instant::now());
-                        draw_viewport(guard, app, spinner, None)?;
+                        draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                     }
                     None => {
                         tracing::warn!("tui.host_permit.prompt_channel_ended");
@@ -5325,14 +5237,18 @@ async fn drive_pauses_to_completion(
             maybe_event = tui_rx.recv(), if input_open => {
                 match maybe_event {
                     Some(event) if pending.is_none() && app.pending_host_permit.is_none() => {
-                        if handle_busy_event(app, event) {
-                            draw_viewport(guard, app, spinner, None)?;
+                        match handle_busy_event(app, event) {
+                            BusyKeyOutcome::Redraw => draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?,
+                            BusyKeyOutcome::Idle => {}
+                            BusyKeyOutcome::RunImmediate(raw) => {
+                                run_immediate_busy_command(guard, app, spinner, &raw).await?;
+                            }
                         }
                     }
                     Some(TuiEvent::Key(key)) => {
                         if app.scroll.handle_key(key, app.last_history_total_lines() as usize,
                             app.last_history_visible_rows() as usize) == ScrollAction::Redraw {
-                            draw_viewport(guard, app, spinner, None)?;
+                            draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                             continue;
                         }
                         // Ctrl+C bleibt fail-safe und lehnt sofort ab,
@@ -5357,7 +5273,7 @@ async fn drive_pauses_to_completion(
                             }
                             app.pending_host_permit_dialog = None;
                             host_permit_shown_at = None;
-                            draw_viewport(guard, app, spinner, None)?;
+                            draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                             continue;
                         }
                         if pending.is_some() {
@@ -5367,13 +5283,15 @@ async fn drive_pauses_to_completion(
                                 continue;
                             };
                             match dialog.handle_key(key, armed) {
-                                DialogAction::Stay => {
-                                    if queue_busy_key(app, key) {
-                                        draw_viewport(guard, app, spinner, None)?;
+                                DialogAction::Stay => match queue_busy_key(app, key) {
+                                    BusyKeyOutcome::Redraw => draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?,
+                                    BusyKeyOutcome::Idle => {}
+                                    BusyKeyOutcome::RunImmediate(raw) => {
+                                        run_immediate_busy_command(guard, app, spinner, &raw).await?;
                                     }
-                                }
+                                },
                                 DialogAction::ToggleDetails => {
-                                    draw_viewport(guard, app, spinner, None)?;
+                                    draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                                 }
                                 DialogAction::Decided(choice) => {
                                     if let Some(open) = pending.take() {
@@ -5381,7 +5299,7 @@ async fn drive_pauses_to_completion(
                                     }
                                     app.pending_approval_dialog = None;
                                     dialog_shown_at = None;
-                                    draw_viewport(guard, app, spinner, None)?;
+                                    draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                                 }
                             }
                         } else if app.pending_host_permit.is_some() {
@@ -5397,11 +5315,13 @@ async fn drive_pauses_to_completion(
                                 continue;
                             };
                             match dialog.handle_key(key) {
-                                ChoiceAction::Stay => {
-                                    if queue_busy_key(app, key) {
-                                        draw_viewport(guard, app, spinner, None)?;
+                                ChoiceAction::Stay => match queue_busy_key(app, key) {
+                                    BusyKeyOutcome::Redraw => draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?,
+                                    BusyKeyOutcome::Idle => {}
+                                    BusyKeyOutcome::RunImmediate(raw) => {
+                                        run_immediate_busy_command(guard, app, spinner, &raw).await?;
                                     }
-                                }
+                                },
                                 ChoiceAction::Cancel => {
                                     if let Some(prompt) = app.pending_host_permit.take() {
                                         prompt.deny();
@@ -5409,7 +5329,7 @@ async fn drive_pauses_to_completion(
                                     app.pending_host_permit_dialog = None;
                                     host_permit_shown_at = None;
                                     app.push_line(Role::System, "Host-Ausführung abgelehnt.");
-                                    draw_viewport(guard, app, spinner, None)?;
+                                    draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                                 }
                                 ChoiceAction::Chosen(index) => {
                                     if let Some(prompt) = app.pending_host_permit.take() {
@@ -5417,17 +5337,26 @@ async fn drive_pauses_to_completion(
                                     }
                                     app.pending_host_permit_dialog = None;
                                     host_permit_shown_at = None;
-                                    draw_viewport(guard, app, spinner, None)?;
+                                    draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                                 }
                             }
                         }
                     }
                     Some(TuiEvent::Draw) | Some(TuiEvent::Resize(_, _)) => {
-                        draw_viewport(guard, app, spinner, None)?;
+                        draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                     }
                     Some(TuiEvent::Mouse(mouse)) => {
-                        if handle_busy_event(app, TuiEvent::Mouse(mouse)) {
-                            draw_viewport(guard, app, spinner, None)?;
+                        // Ein Maus-Ereignis kann `handle_busy_event` niemals in
+                        // `BusyKeyOutcome::RunImmediate` überführen (nur ein
+                        // fertig abgeschicktes Slash-Kommando kann das) — der
+                        // volle Match bleibt trotzdem, damit ein künftiger
+                        // Enum-Zweig hier nicht stillschweigend ignoriert wird.
+                        match handle_busy_event(app, TuiEvent::Mouse(mouse)) {
+                            BusyKeyOutcome::Redraw => draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?,
+                            BusyKeyOutcome::Idle => {}
+                            BusyKeyOutcome::RunImmediate(raw) => {
+                                run_immediate_busy_command(guard, app, spinner, &raw).await?;
+                            }
                         }
                     }
                     // Pasted text never answers an approval prompt.
@@ -5457,30 +5386,104 @@ async fn drive_pauses_to_completion(
             maybe_turn_event = turn_event_rx.recv() => {
                 if let Some(event) = maybe_turn_event {
                     if handle_turn_event(app, turn_state, event) {
-                        draw_viewport(guard, app, spinner, None)?;
+                        draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
                     }
                 }
             }
             _ = tokio::time::sleep(SPINNER_INTERVAL) => {
                 spinner.tick();
-                draw_viewport(guard, app, spinner, None)?;
+                draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))?;
             }
         }
     }
 }
 
+/// Ergebnis eines Tastendrucks/Ereignisses während eines laufenden Turns
+/// (Welle 4b, `queue_busy_key`/`handle_busy_event`).
+///
+/// # Beschreibung
+/// Ersetzt das frühere `bool` (`true` → Redraw, `false` → Idle): ein fertig
+/// abgeschickter Slash-Befehl mit `BusyAvailability::Immediate`
+/// ([`busy_availability_for`]) läuft nicht mehr über `deferred_input`, sondern
+/// wird von den beiden `select!`-Schleifen (`drive_turn_animated`,
+/// `drive_pauses_to_completion`) sofort über [`dispatch_slash_command`]
+/// ausgeführt — der laufende Turn, der Composer, `pending_turns` und
+/// `deferred_input` bleiben dabei unberührt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BusyKeyOutcome {
+    /// Kein sichtbarer Zustand geändert — kein Redraw nötig.
+    Idle,
+    /// Sichtbarer Zustand geändert — Redraw nötig.
+    Redraw,
+    /// Eine fertig abgeschickte `/command`-Zeile mit
+    /// `BusyAvailability::Immediate`; der Aufrufer dispatcht sie sofort über
+    /// [`dispatch_slash_command`] und zeigt die Ausgabe wie im Idle-Pfad.
+    RunImmediate(String),
+}
+
+/// Führt einen während eines laufenden Turns als
+/// [`BusyKeyOutcome::RunImmediate`] gemeldeten Slash-Befehl sofort aus und
+/// zeigt die Ausgabe wie im Idle-Pfad (Welle 4b).
+///
+/// # Beschreibung
+/// Derselbe Anzeigepfad wie der `HarwEvent::Command`-Zweig im Idle-Teil von
+/// [`run_loop`] (mehrzeilige Ausgabe an `\n` aufgeteilt, `app.push_lines`),
+/// gebaut über den wiederverwendbaren Helfer [`dispatch_slash_command`]. Der
+/// laufende Turn, der Composer, `pending_turns` und `deferred_input` bleiben
+/// dabei unberührt — nur die Ausgabe landet im Verlauf, gefolgt von einem
+/// Redraw.
+///
+/// # Argumente
+/// - `guard` (`&mut TerminalGuard`): Terminal-Guard zum Zeichnen des Frames.
+/// - `app` (`&mut ChatApp`): liefert Runtime/Adapter/Sandbox/Session-ID und
+///   nimmt die Ausgabezeilen auf.
+/// - `spinner` (`&Spinner`): aktueller Spinner-Frame für den Redraw.
+/// - `raw` (`&str`): die abgeschickte `/command`-Zeile.
+///
+/// # Fehler
+/// [`TuiError::Io`] beim Zeichnen.
+async fn run_immediate_busy_command(
+    guard: &mut TerminalGuard,
+    app: &mut ChatApp,
+    spinner: &Spinner,
+    raw: &str,
+) -> Result<(), TuiError> {
+    let output = dispatch_slash_command(
+        app.runtime(),
+        app.adapters(),
+        app.sandbox(),
+        app.session_id(),
+        raw,
+    )
+    .await;
+    let lines: Vec<Line<'static>> = output
+        .split('\n')
+        .map(|line| Line::from(line.to_owned()))
+        .collect();
+    app.push_lines(lines);
+    draw_viewport(guard, app, spinner, app.pending_quit.map(|arm| arm.label))
+}
+
 /// Bearbeitet den Composer während eines laufenden Turns. Chat-Zeilen gehen
-/// direkt in die FIFO. Slash-Kommandos werden als Paste-plus-Enter in die
-/// nachgelagerte Eingabe-Queue gelegt: Nach dem Turn laufen sie dadurch über
-/// denselben autorisierten Command-Kanal wie interaktiv eingegebene Befehle,
-/// statt im Composer stecken zu bleiben oder still verloren zu gehen.
-fn queue_busy_key(app: &mut ChatApp, key: KeyEvent) -> bool {
+/// direkt in die FIFO. Ein fertig abgeschickter Slash-Befehl mit
+/// `BusyAvailability::Immediate` ([`busy_availability_for`]) wird als
+/// [`BusyKeyOutcome::RunImmediate`] gemeldet, statt in `deferred_input`
+/// eingereiht zu werden; jeder andere Slash-Befehl bleibt wie bisher als
+/// Paste-plus-Enter in der nachgelagerten Eingabe-Queue: nach dem Turn läuft
+/// er dadurch über denselben autorisierten Command-Kanal wie interaktiv
+/// eingegebene Befehle, statt im Composer stecken zu bleiben oder still
+/// verloren zu gehen.
+fn queue_busy_key(app: &mut ChatApp, key: KeyEvent) -> BusyKeyOutcome {
     match app.input.handle_key(key) {
         InputAction::Submit(text) => {
             app.remember_input(&text);
             match classify_line(&text) {
                 LineAction::Chat(text) => app.pending_turns.push_back(text),
                 LineAction::Command(raw) => {
+                    if busy_availability_for(&app.command_registry, &raw) == BusyAvailability::Immediate
+                    {
+                        return BusyKeyOutcome::RunImmediate(raw);
+                    }
                     app.deferred_input.push_back(TuiEvent::Paste(raw));
                     app.deferred_input.push_back(TuiEvent::Key(KeyEvent::new(
                         KeyCode::Enter,
@@ -5489,18 +5492,36 @@ fn queue_busy_key(app: &mut ChatApp, key: KeyEvent) -> bool {
                 }
                 LineAction::Quit | LineAction::Ignore | LineAction::System(_) => {}
             }
-            true
+            BusyKeyOutcome::Redraw
         }
         InputAction::Redraw => {
             app.sync_popup();
-            true
+            BusyKeyOutcome::Redraw
         }
-        InputAction::Passthrough => false,
+        InputAction::Passthrough => BusyKeyOutcome::Idle,
     }
 }
 
 /// Processes navigation immediately while preserving typing for the next prompt.
-fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> bool {
+///
+/// # Ctrl+C-Hard-Interrupt (Welle 4c, Punkt 5/6)
+/// Ein abgelaufener Beenden-Hinweis wird zuerst verworfen — dasselbe
+/// Äquivalent zur Ablaufprüfung im Idle-Pfad von [`run_loop`], nur hier für
+/// den Busy-Pfad. Ein erster Ctrl+C-Druck bricht den laufenden Turn
+/// kooperativ ab (`active_cancel.cancel`) und scharft zusätzlich
+/// [`ChatApp::pending_quit`]; ein zweiter Druck derselben Taste innerhalb von
+/// [`QUIT_HINT_WINDOW`] setzt [`ChatApp::hard_quit_requested`], das
+/// [`run_loop`] direkt nach dem laufenden `run_turn_streaming(...)`-Aufruf
+/// prüft und dann sofort beendet — derselbe Ausgang wie [`HarwEvent::Quit`]
+/// im Idle-Pfad.
+fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> BusyKeyOutcome {
+    // Abgelaufenen Beenden-Hinweis verwerfen — Pendant zur Ablaufprüfung im
+    // Idle-Pfad von `run_loop`, hier für den Busy-Pfad (Welle 4c, Punkt 5).
+    if let Some(arm) = app.pending_quit {
+        if arm.at.elapsed() > QUIT_HINT_WINDOW {
+            app.pending_quit = None;
+        }
+    }
     let total = app.last_history_total_lines() as usize;
     let rows = app.last_history_visible_rows() as usize;
     match event {
@@ -5508,6 +5529,12 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> bool {
             if key.modifiers.contains(KeyModifiers::CONTROL)
                 && matches!(key.code, KeyCode::Char('c' | 'C')) =>
         {
+            // Zweiter Druck innerhalb des Fensters: harter Abbruch statt
+            // eines weiteren kooperativen Cancels.
+            if matches!(app.pending_quit, Some(QuitArm { label: "Ctrl+C", .. })) {
+                app.hard_quit_requested = true;
+                return BusyKeyOutcome::Redraw;
+            }
             if let Some(cancel) = &app.active_cancel {
                 cancel.cancel(CancelReason::User);
                 // Nur ein transienter Statuszeilen-Hinweis (siehe
@@ -5515,28 +5542,36 @@ fn handle_busy_event(app: &mut ChatApp, event: TuiEvent) -> bool {
                 // dieser Hinweis mit dem Turn-Ende oder einem neuen Turn
                 // automatisch wieder verschwinden muss.
                 app.cancel_requested_at = Some(Instant::now());
-                return true;
+                app.pending_quit = Some(QuitArm {
+                    label: "Ctrl+C",
+                    at: Instant::now(),
+                });
+                return BusyKeyOutcome::Redraw;
             }
-            false
+            BusyKeyOutcome::Idle
         }
         TuiEvent::Mouse(mouse) => {
-            app.scroll.handle_mouse(mouse, total, rows) == ScrollAction::Redraw
+            if app.scroll.handle_mouse(mouse, total, rows) == ScrollAction::Redraw {
+                BusyKeyOutcome::Redraw
+            } else {
+                BusyKeyOutcome::Idle
+            }
         }
         TuiEvent::Key(key) if app.scroll.handle_key(key, total, rows) == ScrollAction::Redraw => {
-            true
+            BusyKeyOutcome::Redraw
         }
         // Shift+Tab gilt sofort und wird nicht in `deferred_input` eingereiht,
         // damit der Zyklus nach Turn-Ende nicht ein zweites Mal läuft.
         TuiEvent::Key(key) if matches!(key.code, KeyCode::BackTab) => {
             app.cycle_permission_stage(false);
-            true
+            BusyKeyOutcome::Redraw
         }
-        TuiEvent::Draw | TuiEvent::Resize(_, _) => true,
+        TuiEvent::Draw | TuiEvent::Resize(_, _) => BusyKeyOutcome::Redraw,
         TuiEvent::Paste(text) => {
             app.input
                 .insert_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
             app.sync_popup();
-            true
+            BusyKeyOutcome::Redraw
         }
         TuiEvent::Key(key) => queue_busy_key(app, key),
     }
@@ -5605,8 +5640,8 @@ fn render_viewport(
     let theme = app.theme;
     let area = frame.area();
 
-    // Vollflächige Overlays (Session-Picker, `/export`-, `/provider`-,
-    // `/model`-Auswahl) ersetzen die gesamte Viewport (Plan Schritt 6/7) —
+    // Vollflächige Overlays (Session-Picker, `/export`-, Modell/Provider-,
+    // Effort-Auswahl) ersetzen die gesamte Viewport (Plan Schritt 6/7) —
     // `Clear` erst, sonst bliebe Chat-Text unter dem Overlay stehen
     // (dasselbe Muster wie beim `/command`-Popup weiter unten).
     match &app.overlay {
@@ -5615,11 +5650,12 @@ fn render_viewport(
             picker.render(area, frame.buffer_mut(), &theme);
             return;
         }
-        Some(Overlay::ExportChoice(dialog))
-        | Some(Overlay::ProviderChoice(ProviderChoiceState { dialog, .. }))
-        | Some(Overlay::UiaProviderChoice(ProviderChoiceState { dialog, .. }))
-        | Some(Overlay::ModelChoice(ModelChoiceState { dialog, .. }))
-        | Some(Overlay::UiaModelChoice(ModelChoiceState { dialog, .. })) => {
+        Some(Overlay::ModelSwitch(picker)) => {
+            frame.render_widget(Clear, area);
+            picker.render(area, frame.buffer_mut(), theme);
+            return;
+        }
+        Some(Overlay::ExportChoice(dialog)) | Some(Overlay::EffortChoice { dialog, .. }) => {
             frame.render_widget(Clear, area);
             dialog.render(area, frame.buffer_mut(), theme);
             return;
@@ -6072,6 +6108,69 @@ mod tests {
             request.path.as_deref(),
             Some("exports/session with spaces.json")
         );
+        // Kein `max_chars`-Schlüssel im Marker → `None`, keine Begrenzung.
+        assert_eq!(request.max_chars, None);
+    }
+
+    /// `max_chars` im Marker (`--max-chars <n>` am `/export`-Command, siehe
+    /// `harw_ops::export`) wird als positive Zahl übernommen und landet
+    /// unverändert in `ExportOptions.max_chars`.
+    #[test]
+    fn export_request_marker_reads_max_chars() {
+        let request = export_request_from_data(&json!({
+            "kind": "export.request",
+            "format": "markdown",
+            "max_chars": 20000,
+        }))
+        .expect("valid export marker");
+
+        assert_eq!(request.max_chars, Some(20000));
+
+        let opts = ExportOptions {
+            include_tool_calls: request.include_tool_calls,
+            include_reasoning: request.include_reasoning_summary,
+            max_chars: request.max_chars,
+        };
+        assert_eq!(opts.max_chars, Some(20000));
+    }
+
+    #[test]
+    fn build_export_markdown_reflects_reasoning_and_tool_options() {
+        let mut app = test_chat_app();
+        app.push_line(Role::User, "Frage");
+        app.export_entries
+            .push(ExportEntry::Reasoning("sichere Zusammenfassung".to_owned()));
+        app.export_entries.push(ExportEntry::Tool {
+            label: "shell.exec".to_owned(),
+            summary: Some("Ergebnis".to_owned()),
+        });
+
+        // Standard: Reasoning ausgeblendet, Werkzeuge eingeblendet.
+        let default_markdown = build_export_markdown(&app, &ExportOptions::default());
+        assert!(!default_markdown.contains("sichere Zusammenfassung"));
+        assert!(default_markdown.contains("shell.exec"));
+
+        // `--reasoning-summary` muss im Markdown tatsächlich wirken.
+        let with_reasoning = build_export_markdown(
+            &app,
+            &ExportOptions {
+                include_reasoning: true,
+                ..ExportOptions::default()
+            },
+        );
+        assert!(with_reasoning.contains("sichere Zusammenfassung"));
+
+        // `build_export` mit `ExportOutputFormat::Markdown` muss identisch zu
+        // `build_export_markdown` sein — beide teilen sich denselben Zweig.
+        let via_build_export = build_export(
+            &app,
+            &ExportOptions {
+                include_reasoning: true,
+                ..ExportOptions::default()
+            },
+            ExportOutputFormat::Markdown,
+        );
+        assert_eq!(with_reasoning, via_build_export);
     }
 
     #[test]
@@ -6116,7 +6215,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "harw-tui-export-suffix-{}-{}.md",
             std::process::id(),
-            SessionId::new().to_string()
+            SessionId::new()
         ));
         let first = export::write_export_path(&path, "first\n").expect("create first export");
 
@@ -6127,6 +6226,7 @@ mod tests {
                 include_tool_calls: true,
                 include_reasoning_summary: false,
                 path: Some(path.to_string_lossy().into_owned()),
+                max_chars: None,
             },
         );
 
@@ -6184,40 +6284,70 @@ mod tests {
         // `deferred_input` zwischengelagert, sondern live in `app.input`
         // editiert — der Composer bleibt beim Tippen sichtbar aktuell.
         // Fertige Chat-Zeilen landen direkt in `pending_turns`; nur ein
-        // fertiges Slash-Kommando wird für die autorisierte Nach-Turn-
-        // Ausführung als Paste+Enter in `deferred_input` gelegt. Diese
-        // Assertions prüfen jetzt genau das, statt die alte Roh-Event-
-        // Warteschlange: Scrollen wirkt weiterhin sofort, und Tippen +
-        // Einfügen bleiben in der Reihenfolge im Composer erhalten.
+        // fertiges Slash-Kommando ohne `BusyAvailability::Immediate` wird für
+        // die autorisierte Nach-Turn-Ausführung als Paste+Enter in
+        // `deferred_input` gelegt (Welle 4b: ein `Immediate`-Kommando meldet
+        // stattdessen `BusyKeyOutcome::RunImmediate`, siehe die eigenen Tests
+        // dafür unten). Diese Assertions prüfen jetzt genau das, statt die
+        // alte Roh-Event-Warteschlange: Scrollen wirkt weiterhin sofort, und
+        // Tippen + Einfügen bleiben in der Reihenfolge im Composer erhalten.
         let mut app = test_chat_app();
         app.last_history_total_lines.set(100);
         app.last_history_visible_rows.set(10);
         let typed = TuiEvent::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
         let pasted = TuiEvent::Paste("next prompt".to_owned());
-        assert!(handle_busy_event(&mut app, typed.clone()));
-        assert!(handle_busy_event(
-            &mut app,
-            TuiEvent::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
-        ));
+        assert_eq!(
+            handle_busy_event(&mut app, typed.clone()),
+            BusyKeyOutcome::Redraw
+        );
+        assert_eq!(
+            handle_busy_event(
+                &mut app,
+                TuiEvent::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE))
+            ),
+            BusyKeyOutcome::Redraw
+        );
         assert!(app.scroll.offset() > 0);
-        assert!(handle_busy_event(&mut app, pasted.clone()));
+        assert_eq!(
+            handle_busy_event(&mut app, pasted.clone()),
+            BusyKeyOutcome::Redraw
+        );
         assert_eq!(app.input.text(), "xnext prompt");
         assert!(app.deferred_input.is_empty());
     }
 
+    /// Welle 4b: `/status` trägt `BusyAvailability::Immediate` und nur seine
+    /// Anzeige läuft — `queue_busy_key` meldet `RunImmediate` statt den
+    /// Befehl in `deferred_input` einzureihen; Composer und `deferred_input`
+    /// bleiben unberührt (die eigentliche Ausführung obliegt dem Aufrufer,
+    /// siehe `run_immediate_busy_command`).
     #[test]
-    fn busy_turn_queues_submitted_command_for_authorized_dispatch_after_turn() {
+    fn busy_turn_immediate_command_reports_run_immediate_without_touching_deferred_input() {
         let mut app = test_chat_app();
         app.input.insert_str("/status");
 
-        assert!(queue_busy_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        ));
+        let outcome = queue_busy_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(outcome, BusyKeyOutcome::RunImmediate("/status".to_owned()));
+        assert!(app.input.is_empty());
+        assert!(app.deferred_input.is_empty());
+    }
+
+    /// `/mode plan` bleibt `DeferredUntilTurnEnd` (kein `Immediate`-Befehl aus
+    /// Welle 2d/3d/4a) — unverändertes Verhalten: Paste+Enter in
+    /// `deferred_input`, für die autorisierte Ausführung nach Turn-Ende.
+    #[test]
+    fn busy_turn_queues_submitted_command_for_authorized_dispatch_after_turn() {
+        let mut app = test_chat_app();
+        app.input.insert_str("/mode plan");
+
+        assert_eq!(
+            queue_busy_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            BusyKeyOutcome::Redraw
+        );
         assert!(app.input.is_empty());
         assert_eq!(
             app.deferred_input.pop_front(),
-            Some(TuiEvent::Paste("/status".to_owned()))
+            Some(TuiEvent::Paste("/mode plan".to_owned()))
         );
         assert_eq!(
             app.deferred_input.pop_front(),
@@ -6227,6 +6357,132 @@ mod tests {
             )))
         );
         assert!(app.deferred_input.is_empty());
+    }
+
+    /// `/model switch x` bleibt eingereiht (Welle 4b-Sonderfall: `model` ist
+    /// `Immediate` markiert, aber nur `show`/`list` dürfen sofort laufen).
+    #[test]
+    fn busy_turn_model_switch_with_argument_stays_deferred() {
+        let mut app = test_chat_app();
+        app.input.insert_str("/model switch x");
+
+        assert_eq!(
+            queue_busy_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            BusyKeyOutcome::Redraw
+        );
+        assert_eq!(
+            app.deferred_input.pop_front(),
+            Some(TuiEvent::Paste("/model switch x".to_owned()))
+        );
+        assert_eq!(
+            app.deferred_input.pop_front(),
+            Some(TuiEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+        );
+        assert!(app.deferred_input.is_empty());
+    }
+
+    /// Ein unbekannter Befehl bleibt sicher eingereiht — `busy_availability_for`
+    /// liefert dafür `DeferredUntilTurnEnd`, der eigentliche „unbekannter
+    /// Befehl"-Fehler entsteht erst im späteren Dispatch.
+    #[test]
+    fn busy_turn_unknown_command_stays_deferred() {
+        let mut app = test_chat_app();
+        app.input.insert_str("/no-such-command");
+
+        assert_eq!(
+            queue_busy_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            BusyKeyOutcome::Redraw
+        );
+        assert_eq!(
+            app.deferred_input.pop_front(),
+            Some(TuiEvent::Paste("/no-such-command".to_owned()))
+        );
+        assert_eq!(
+            app.deferred_input.pop_front(),
+            Some(TuiEvent::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+        );
+        assert!(app.deferred_input.is_empty());
+    }
+
+    /// Chattext (kein Slash-Befehl) landet weiterhin direkt in `pending_turns`,
+    /// unabhängig von `busy_availability_for`.
+    #[test]
+    fn busy_turn_chat_text_still_goes_to_pending_turns() {
+        let mut app = test_chat_app();
+        app.input.insert_str("hallo welt");
+
+        assert_eq!(
+            queue_busy_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            BusyKeyOutcome::Redraw
+        );
+        assert_eq!(app.pending_turns.pop_front(), Some("hallo welt".to_owned()));
+        assert!(app.deferred_input.is_empty());
+    }
+
+    /// Welle 4c: ein erster Ctrl+C während eines laufenden Turns bricht ihn
+    /// weiterhin kooperativ ab und scharft zusätzlich `app.pending_quit`; ein
+    /// zweiter Druck derselben Taste innerhalb von `QUIT_HINT_WINDOW` setzt
+    /// `app.hard_quit_requested` — derselbe Doppeldruck-Vertrag wie im
+    /// Idle-Pfad (`handle_key`/`double_ctrl_d_quits_regardless_of_...`), nur
+    /// mit zusätzlichem Cancel des laufenden Turns statt eines sofortigen
+    /// `HarwEvent::Quit`.
+    #[test]
+    fn double_ctrl_c_during_busy_quits_like_idle() {
+        let mut app = test_chat_app();
+        let cancel = CancelToken::new();
+        app.active_cancel = Some(cancel.clone());
+        let ctrl_c = || TuiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert_eq!(handle_busy_event(&mut app, ctrl_c()), BusyKeyOutcome::Redraw);
+        assert!(cancel.is_cancelled(), "erster Ctrl+C muss den Turn kooperativ abbrechen");
+        assert!(matches!(
+            app.pending_quit,
+            Some(QuitArm {
+                label: "Ctrl+C",
+                ..
+            })
+        ));
+        assert!(!app.hard_quit_requested);
+
+        assert_eq!(handle_busy_event(&mut app, ctrl_c()), BusyKeyOutcome::Redraw);
+        assert!(
+            app.hard_quit_requested,
+            "zweiter Ctrl+C-Druck binnen des Fensters muss hart beenden"
+        );
+    }
+
+    /// Nach Ablauf von `QUIT_HINT_WINDOW` beendet ein erneuter Ctrl+C-Druck
+    /// nicht hart — die Scharfstellung ist verfallen und wird stattdessen neu
+    /// gesetzt, exakt wie die Ablaufprüfung im Idle-Pfad von `run_loop`
+    /// (Welle 4c, Punkt 5).
+    #[test]
+    fn ctrl_c_during_busy_after_window_expiry_does_not_hard_quit() {
+        let mut app = test_chat_app();
+        app.active_cancel = Some(CancelToken::new());
+        app.pending_quit = Some(QuitArm {
+            label: "Ctrl+C",
+            at: Instant::now() - QUIT_HINT_WINDOW - Duration::from_millis(1),
+        });
+        let ctrl_c = TuiEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert_eq!(handle_busy_event(&mut app, ctrl_c), BusyKeyOutcome::Redraw);
+        assert!(
+            !app.hard_quit_requested,
+            "ein abgelaufener Hinweis darf keinen harten Abbruch auslösen"
+        );
+        assert!(matches!(
+            app.pending_quit,
+            Some(QuitArm {
+                label: "Ctrl+C",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -6303,6 +6559,7 @@ forbidden = [{forbidden}]
             authority: harw_agent_dsl::authority::AuthorityCeiling::default(),
             trace: harw_agent_dsl::resolved::ResolutionTrace { steps: Vec::new() },
             config: raw.tables,
+            reasoning_effort: raw.reasoning_effort,
         };
 
         harw_agent_dsl::lower(&resolved).expect("lower test executable policy")
@@ -6541,12 +6798,11 @@ forbidden = [{forbidden}]
         assert!(app.command_popup.is_some(), "Vorbedingung: Popup ist offen");
 
         let (bus, mut receiver) = harw_event_channel();
-        let mut pending_quit = None;
         let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
 
-        assert!(handle_key(&mut app, ctrl_d, &mut pending_quit, &bus));
+        assert!(handle_key(&mut app, ctrl_d, &bus));
         assert!(matches!(
-            pending_quit,
+            app.pending_quit,
             Some(QuitArm {
                 label: "Ctrl+D",
                 ..
@@ -6557,7 +6813,7 @@ forbidden = [{forbidden}]
             Err(tokio::sync::mpsc::error::TryRecvError::Empty)
         ));
 
-        assert!(!handle_key(&mut app, ctrl_d, &mut pending_quit, &bus));
+        assert!(!handle_key(&mut app, ctrl_d, &bus));
         assert!(matches!(receiver.try_recv(), Ok(HarwEvent::Quit)));
     }
 
@@ -6578,11 +6834,9 @@ forbidden = [{forbidden}]
         );
 
         let (bus, mut receiver) = harw_event_channel();
-        let mut pending_quit: Option<QuitArm> = None;
         let redraw = handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-            &mut pending_quit,
             &bus,
         );
 
@@ -6602,15 +6856,15 @@ forbidden = [{forbidden}]
     fn busy_submit_is_queued_in_fifo_order() {
         let mut app = test_chat_app();
         app.input.insert_str("erste Nachricht");
-        assert!(queue_busy_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        ));
+        assert_eq!(
+            queue_busy_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            BusyKeyOutcome::Redraw
+        );
         app.input.insert_str("zweite Nachricht");
-        assert!(queue_busy_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        ));
+        assert_eq!(
+            queue_busy_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            BusyKeyOutcome::Redraw
+        );
 
         assert_eq!(
             app.pending_turns.pop_front().as_deref(),
@@ -6630,14 +6884,13 @@ forbidden = [{forbidden}]
         let mut app = test_chat_app();
         app.input.insert_str("nicht verlieren beim ersten Escape");
         let (bus, _receiver) = harw_event_channel();
-        let mut pending_quit = None;
         let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
 
-        assert!(handle_key(&mut app, escape, &mut pending_quit, &bus));
+        assert!(handle_key(&mut app, escape, &bus));
         assert_eq!(app.input(), "nicht verlieren beim ersten Escape");
         assert!(app.escape_armed);
 
-        assert!(handle_key(&mut app, escape, &mut pending_quit, &bus));
+        assert!(handle_key(&mut app, escape, &bus));
         assert!(app.input().is_empty());
         assert!(!app.escape_armed);
     }
@@ -6661,10 +6914,9 @@ forbidden = [{forbidden}]
         }
 
         let (bus, mut receiver) = harw_event_channel();
-        let mut pending_quit: Option<QuitArm> = None;
         let key = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
 
-        let redraw = handle_key(&mut app, key, &mut pending_quit, &bus);
+        let redraw = handle_key(&mut app, key, &bus);
 
         assert!(redraw, "Tab muss einen Redraw anfordern");
         assert_eq!(
@@ -6697,10 +6949,9 @@ forbidden = [{forbidden}]
         app.sync_popup();
 
         let (bus, mut receiver) = harw_event_channel();
-        let mut pending_quit: Option<QuitArm> = None;
         let key = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
 
-        let redraw = handle_key(&mut app, key, &mut pending_quit, &bus);
+        let redraw = handle_key(&mut app, key, &bus);
 
         assert!(redraw, "Tab muss einen Redraw anfordern");
         assert_eq!(
@@ -6772,11 +7023,10 @@ forbidden = [{forbidden}]
     fn test_handle_key_types_digits_in_argument_not_swallowed() {
         let mut app = test_chat_app();
         let (bus, mut receiver) = harw_event_channel();
-        let mut pending_quit: Option<QuitArm> = None;
 
         for character in "/stop job-42".chars() {
             let key = KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
-            handle_key(&mut app, key, &mut pending_quit, &bus);
+            handle_key(&mut app, key, &bus);
         }
 
         assert_eq!(
@@ -7614,6 +7864,225 @@ forbidden = [{forbidden}]
         let app = test_chat_app();
 
         assert!(goal_cell_for_command(&app, "/goal check").is_none());
+    }
+
+    // ── Welle 4a/7b: Picker-Konsolidierung (`/model`, `/uia-model`,
+    // `/uia-worker-model`, `/effort`, `/uia-effort`) ──────────────────────
+
+    /// Bare Form und argloses `switch` öffnen den Picker; `switch <id>` mit
+    /// Argument bleibt Text-Dispatch (kein Picker).
+    #[test]
+    fn is_bare_or_argless_switch_matches_bare_and_argless_switch_only() {
+        assert!(is_bare_or_argless_switch("/model", "/model"));
+        assert!(is_bare_or_argless_switch("  /model  ", "/model"));
+        assert!(is_bare_or_argless_switch("/model switch", "/model"));
+        assert!(is_bare_or_argless_switch("/uia-effort switch", "/uia-effort"));
+
+        assert!(!is_bare_or_argless_switch("/model switch x", "/model"));
+        assert!(!is_bare_or_argless_switch("/model list", "/model"));
+        assert!(!is_bare_or_argless_switch("/provider", "/model"));
+        // Bare `/provider` selbst öffnet seit der Konsolidierung (Welle 4a)
+        // keinen Picker mehr — es gibt schlicht keinen `is_bare_or_argless_switch`-
+        // Aufruf mehr für `/provider`/`/uia-provider` im Trigger-Zweig
+        // (siehe `run_loop`s `HarwEvent::Command`-Arm); diese Zeile hält nur
+        // fest, dass der Prädikat selbst `/provider` nicht fälschlich matcht,
+        // falls er versehentlich doch wieder verdrahtet würde.
+        assert!(!is_bare_or_argless_switch("/provider switch", "/model"));
+    }
+
+    /// Ohne Konfiguration (Test-`ChatApp` ohne Runtime-Montage) wird kein
+    /// leerer Dialog geöffnet, sondern eine klare Systemzeile angehängt —
+    /// für jedes der drei `PickerTarget`-Ziele.
+    #[test]
+    fn open_model_switch_picker_without_config_pushes_system_line_not_overlay() {
+        for target in [
+            PickerTarget::Orchestrator,
+            PickerTarget::Uia,
+            PickerTarget::UiaWorker {
+                fixed_provider: "anthropic".to_owned(),
+            },
+        ] {
+            let mut app = test_chat_app();
+            app.open_model_switch_picker(target);
+            assert!(app.overlay.is_none());
+        }
+    }
+
+    /// `Accept` auf [`Overlay::ModelSwitch`] synthetisiert je nach `target`
+    /// die richtige Befehlszeile — `/model switch`, `/uia-model switch` bzw.
+    /// `/uia-worker-model switch` — und schließt das Overlay.
+    #[test]
+    fn model_switch_accept_emits_the_command_line_for_each_target() {
+        let providers = vec![ProviderEntry {
+            id: "anthropic".to_owned(),
+            label: "Anthropic".to_owned(),
+        }];
+        let models = vec![(
+            "anthropic".to_owned(),
+            vec![ModelEntry {
+                id: "claude-sonnet".to_owned(),
+                label: "Claude Sonnet".to_owned(),
+            }],
+        )];
+
+        let cases = [
+            (PickerTarget::Orchestrator, "/model switch claude-sonnet"),
+            (PickerTarget::Uia, "/uia-model switch claude-sonnet"),
+            (
+                PickerTarget::UiaWorker {
+                    fixed_provider: "anthropic".to_owned(),
+                },
+                "/uia-worker-model switch claude-sonnet",
+            ),
+        ];
+
+        for (target, expected) in cases {
+            let mut app = test_chat_app();
+            let picker = ModelSwitchPicker::new(target, providers.clone(), models.clone(), None, None)
+                .expect("providers fixture ist nicht leer");
+            app.overlay = Some(Overlay::ModelSwitch(Box::new(picker)));
+
+            let (bus, mut receiver) = harw_event_channel();
+            // Erster Enter wählt (bzw. bestätigt) den einzigen Provider und
+            // wechselt in die Modell-Stufe (bei `UiaWorker` ist die
+            // Provider-Stufe bereits übersprungen, ein Enter genügt dort
+            // direkt für das Modell).
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                &bus,
+            );
+            if app.overlay.is_some() {
+                handle_key(
+                    &mut app,
+                    KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    &bus,
+                );
+            }
+
+            assert!(app.overlay.is_none(), "Overlay muss nach Accept geschlossen sein");
+            match receiver.try_recv() {
+                Ok(HarwEvent::Command(command)) => assert_eq!(command, expected),
+                other => panic!("erwartete HarwEvent::Command({expected:?}), bekam {other:?}"),
+            }
+        }
+    }
+
+    /// `Cancel` (Esc) auf [`Overlay::ModelSwitch`] schließt das Overlay ohne
+    /// eine Befehlszeile zu emittieren.
+    #[test]
+    fn model_switch_cancel_closes_overlay_without_emitting_a_command() {
+        let providers = vec![ProviderEntry {
+            id: "anthropic".to_owned(),
+            label: "Anthropic".to_owned(),
+        }];
+        let models = vec![(
+            "anthropic".to_owned(),
+            vec![ModelEntry {
+                id: "claude-sonnet".to_owned(),
+                label: "Claude Sonnet".to_owned(),
+            }],
+        )];
+        let picker = ModelSwitchPicker::new(PickerTarget::Orchestrator, providers, models, None, None)
+            .expect("providers fixture ist nicht leer");
+
+        let mut app = test_chat_app();
+        app.overlay = Some(Overlay::ModelSwitch(Box::new(picker)));
+        let (bus, mut receiver) = harw_event_channel();
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &bus,
+        );
+
+        assert!(app.overlay.is_none());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    /// Bare `/effort`/`/uia-effort` öffnet [`Overlay::EffortChoice`] mit
+    /// allen sechs Stufen plus dem Reset-Eintrag; die Vorauswahl folgt dem
+    /// Controller-Snapshot (`Session`) bzw. bleibt ohne Konfiguration auf
+    /// Index 0 (`Uia`, kein persistierter Wert im Test-`ChatApp`).
+    #[test]
+    fn open_effort_choice_lists_all_levels_with_reset_entry() {
+        let mut app = test_chat_app();
+        app.session_controller
+            .set_reasoning_effort(Some(ReasoningEffort::High))
+            .expect("set_reasoning_effort muss gelingen");
+
+        app.open_effort_choice(EffortTarget::Session);
+        match &app.overlay {
+            Some(Overlay::EffortChoice { target, .. }) => {
+                assert_eq!(*target, EffortTarget::Session);
+            }
+            other => panic!("erwartete Overlay::EffortChoice, bekam {other:?}"),
+        }
+
+        app.open_effort_choice(EffortTarget::Uia);
+        assert!(matches!(
+            app.overlay,
+            Some(Overlay::EffortChoice {
+                target: EffortTarget::Uia,
+                ..
+            })
+        ));
+    }
+
+    /// Eine getroffene Effort-Wahl sendet `/effort <level>` bzw.
+    /// `/uia-effort <level>`; der letzte Eintrag („Provider-Default
+    /// (zurücksetzen)") sendet `clear` statt einer Stufe.
+    #[test]
+    fn effort_choice_accept_emits_level_or_clear_per_target() {
+        // Session: dritte Stufe (Index 2 = "medium") direkt bestätigen.
+        let mut app = test_chat_app();
+        app.open_effort_choice(EffortTarget::Session);
+        let (bus, mut receiver) = harw_event_channel();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &bus,
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+            &bus,
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &bus,
+        );
+        assert!(app.overlay.is_none());
+        match receiver.try_recv() {
+            Ok(HarwEvent::Command(command)) => assert_eq!(command, "/effort medium"),
+            other => panic!("erwartete HarwEvent::Command(\"/effort medium\"), bekam {other:?}"),
+        }
+
+        // Uia: letzten Eintrag (Reset) wählen → `clear`.
+        let mut app = test_chat_app();
+        app.open_effort_choice(EffortTarget::Uia);
+        let (bus, mut receiver) = harw_event_channel();
+        for _ in 0..EFFORT_LEVELS.len() {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                &bus,
+            );
+        }
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &bus,
+        );
+        assert!(app.overlay.is_none());
+        match receiver.try_recv() {
+            Ok(HarwEvent::Command(command)) => assert_eq!(command, "/uia-effort clear"),
+            other => panic!("erwartete HarwEvent::Command(\"/uia-effort clear\"), bekam {other:?}"),
+        }
     }
 }
 

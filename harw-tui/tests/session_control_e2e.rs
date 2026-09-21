@@ -11,15 +11,19 @@
 //!   `ModelRequest::{reasoning_effort,model_id,provider_id}` (mirroring turn_loop.rs ~815-822)
 //!
 //! Handler invocation (via `Operation::run`) is used in tests 5
-//! (`slice9_model_switch_to_different_provider_is_atomic`, `#[ignore]`d — see
-//! its doc comment for why) and 5b
+//! (`slice9_model_switch_to_different_provider_is_atomic`) and 5b
 //! (`slice9b_model_switch_to_disabled_target_provider_is_atomic_on_failure`)
 //! only, where the atomic provider+model switch logic lives exclusively
 //! inside the `/model switch` handler and cannot be reached through the
 //! controller setters. `/provider switch <id>` no longer exists as a text
 //! sub-command; `/model switch <id>` is now the sole atomic switch entry
 //! point, even when the target model belongs to a different provider than
-//! the one currently active.
+//! the one currently active. `build_slice9_fixture` injects a
+//! `harw_ops::model::RecordingSelectionPersistence` (via
+//! `harw_ops::model::SelectionPersistence` — see that crate's
+//! `config_util` module doc), so test 5, previously `#[ignore]`d because a
+//! successful switch used to reach the real `HARW_HOME`-resolving
+//! `config.toml` write, now runs unignored.
 
 use std::sync::Arc;
 
@@ -271,21 +275,34 @@ fn slice8_provider_switch_influences_next_turn() {
 /// serves both the atomic-success case and the atomic-failure/atomicity-
 /// preserved case).
 ///
+/// Also injects a [`harw_ops::model::RecordingSelectionPersistence`] into the
+/// `ServiceMap` as `Arc<dyn harw_ops::model::SelectionPersistence>` — the
+/// austauschbare Persistenz-Dienst introduced alongside this fixture change
+/// so that `slice9_model_switch_to_different_provider_is_atomic` (see below)
+/// no longer needs `#[ignore]`: a successful `/model switch` now records into
+/// this in-memory recorder instead of reaching the real,
+/// `HARW_HOME`-resolving `persist_default_selection` filesystem write. The
+/// caller reads the recorded calls back off the returned `Arc` to assert
+/// persistence happened exactly once, with the expected provider/model.
+///
 /// # Returns
-/// `(OpContext, tmp_dir, controller)`. The caller is responsible for
-/// removing `tmp_dir` (best effort) once done, and for snapshotting
-/// `controller` directly (the context only holds a type-erased clone of it).
+/// `(OpContext, tmp_dir, controller, recording_persistence)`. The caller is
+/// responsible for removing `tmp_dir` (best effort) once done, and for
+/// snapshotting `controller`/`recording_persistence` directly (the context
+/// only holds type-erased clones of them).
 fn build_slice9_fixture(
     openai_enabled: bool,
 ) -> (
     harw_operations::OpContext,
     std::path::PathBuf,
     Arc<TuiSessionController>,
+    Arc<harw_ops::model::RecordingSelectionPersistence>,
 ) {
     use harw_config::{ModelToml, ProviderToml, ResolvedConfig, SecretRef};
     use harw_operations::{SharedSessionController, context::ServiceMap};
     use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
+    use harw_ops::model::{RecordingSelectionPersistence, SelectionPersistence};
 
     // ── Build a minimal OpContext with a real SandboxSpec ─────────────────────
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -336,6 +353,7 @@ fn build_slice9_fixture(
             rate_limit: None,
             max_concurrency: None,
             originator: None,
+            default_reasoning_effort: None,
         },
     );
     config.providers.insert(
@@ -354,6 +372,7 @@ fn build_slice9_fixture(
             rate_limit: None,
             max_concurrency: None,
             originator: None,
+            default_reasoning_effort: None,
         },
     );
     config.models.insert(
@@ -369,6 +388,7 @@ fn build_slice9_fixture(
             input_types: Vec::new(),
             capabilities: Default::default(),
             prompt_caching: None,
+            default_reasoning_effort: None,
         },
     );
     config.models.insert(
@@ -384,6 +404,7 @@ fn build_slice9_fixture(
             input_types: Vec::new(),
             capabilities: Default::default(),
             prompt_caching: None,
+            default_reasoning_effort: None,
         },
     );
 
@@ -394,14 +415,20 @@ fn build_slice9_fixture(
     ctrl.set_active_model("claude-opus-4-8".to_owned())
         .expect("set_active_model must succeed");
 
+    // ── Inject a recording persistence service, so `/model switch` never
+    // reaches the real filesystem `HARW_HOME` config write ────────────────────
+    let recorder = Arc::new(RecordingSelectionPersistence::new());
+    let persistence: Arc<dyn SelectionPersistence> = Arc::clone(&recorder) as Arc<dyn SelectionPersistence>;
+
     // ── Build OpContext with the controller ───────────────────────────────────
     let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
     let mut services = ServiceMap::new();
     services.insert(shared);
     services.insert(Arc::new(config));
+    services.insert(persistence);
     let ctx = harw_operations::OpContext::new(SessionId::new(), TurnId::new(), sandbox, services);
 
-    (ctx, tmp, ctrl)
+    (ctx, tmp, ctrl, recorder)
 }
 
 /// Proves the atomic-switch success path: `/model switch <id>`, invoked via
@@ -414,48 +441,29 @@ fn build_slice9_fixture(
 /// Precondition: active_provider = "anthropic", active_model = "claude-opus-4-8"
 /// Action:       /model switch gpt-test-slice9   (target provider "openai" enabled)
 /// Assert:       Ok(...) AND snapshot_after.active_provider == "openai" AND
-///               snapshot_after.active_model == "gpt-test-slice9"
+///               snapshot_after.active_model == "gpt-test-slice9" AND the
+///               injected `RecordingSelectionPersistence` recorded exactly one
+///               `persist_default_selection` call with
+///               `(Some("openai"), Some("gpt-test-slice9"))`.
 ///
-/// # Ignored — real, non-injectable filesystem I/O
-/// A successful switch through `ModelOperation::run()` always reaches
-/// `harw-ops::provider::handle_switch_core`'s Step 5, which calls
-/// `harw-ops::config_util::persist_default_selection` — hardcoded at the
-/// `/model switch` call site in `harw-ops/src/model.rs`, with no
-/// test-injectable seam through the public `Operation` surface (unlike
-/// `resolved_config`, which *does* prefer a context-scoped config — see
-/// `build_slice9_fixture` above). `persist_default_selection` resolves
-/// `$HARW_HOME` (default `~/.harw`) via `harw_home::home_dir()` and, on a
-/// successful switch, always writes `default_provider`/`default_model` into
-/// the *active profile's real* `config.toml` — even on failure to persist it
-/// swallows the error into a text note rather than an `Err`, so this is not
-/// observable as a test failure, only as a live side effect.
-///
-/// In-crate unit tests avoid this by calling the private
-/// `handle_switch_core`/`handle_uia_switch_core` core functions directly
-/// with a no-op `persist` closure (see
-/// `harw-ops/src/model.rs::tests::model_switch_to_different_provider_switches_both_atomically`);
-/// that seam is `pub(crate)`/private and unreachable from this external
-/// `harw-tui` integration-test crate. Redirecting `$HARW_HOME` into this
-/// test's own tmp dir via `std::env::set_var` is also unavailable: this
-/// workspace declares `[workspace.lints.rust] unsafe_code = "forbid"`
-/// (root `Cargo.toml`), inherited by `harw-tui` via `[lints] workspace =
-/// true`, and `std::env::set_var`/`remove_var` require an `unsafe` block on
-/// current Rust.
-///
-/// Run unignored, this test would silently overwrite `default_provider`/
-/// `default_model` in the developer's real, active harwness profile on every
-/// local `cargo test` — a live-filesystem side effect this project's own
-/// Rust testing rules forbid outside `#[ignore]` ("Tests must not rely on
-/// ... the filesystem unless marked `#[ignore]` with a comment explaining
-/// the requirement"). Run explicitly via `cargo test -- --ignored` only with
-/// `HARW_HOME` pointed at a throwaway directory.
+/// # No longer `#[ignore]`d — injected `SelectionPersistence` service
+/// A successful switch through `ModelOperation::run()` reaches
+/// `harw-ops::provider::handle_switch_core`'s Step 5, which now resolves the
+/// persistence service via `harw-ops::config_util::selection_persistence(ctx)`
+/// instead of calling `persist_default_selection` directly — see
+/// `harw-ops/src/model.rs`'s `/model switch` call site. `build_slice9_fixture`
+/// injects a `harw_ops::model::RecordingSelectionPersistence` as
+/// `Arc<dyn harw_ops::model::SelectionPersistence>` into the `ServiceMap`, so
+/// this test never touches the real, `HARW_HOME`-resolving `config.toml`
+/// write — the previous version of this test was `#[ignore]`d for exactly
+/// that reason (see git history), which no longer applies now that the
+/// persistence call site is test-injectable through the public `Operation`
+/// surface, the same way `resolved_config` already was.
 #[tokio::test]
-#[ignore = "reaches the real, non-injectable persist_default_selection and would \
-            overwrite the developer's live ~/.harw profile config.toml; see doc comment"]
 async fn slice9_model_switch_to_different_provider_is_atomic() {
     use harw_operations::{OpInput, Operation};
 
-    let (ctx, tmp, ctrl) = build_slice9_fixture(true);
+    let (ctx, tmp, ctrl, recorder) = build_slice9_fixture(true);
 
     // ── Invoke ModelOperation::run() with ["switch", "gpt-test-slice9"] ───────
     let op = harw_ops::model::ModelOperation;
@@ -485,6 +493,19 @@ async fn slice9_model_switch_to_different_provider_is_atomic() {
         "active_model must be the requested target"
     );
 
+    // PERSISTENCE: the injected recording service must have been called
+    // exactly once, with the resulting provider+model pair — proving the
+    // switch went through `selection_persistence(ctx)` instead of the real
+    // filesystem persistence, and that it was not skipped or double-called.
+    assert_eq!(
+        recorder.calls(),
+        vec![harw_ops::model::RecordedSelectionPersistCall::DefaultSelection {
+            provider: Some("openai".to_owned()),
+            model: Some("gpt-test-slice9".to_owned()),
+        }],
+        "persist_default_selection must be called exactly once with (openai, gpt-test-slice9)"
+    );
+
     // Cleanup tmp dir (best effort).
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -504,7 +525,7 @@ async fn slice9_model_switch_to_different_provider_is_atomic() {
 async fn slice9b_model_switch_to_disabled_target_provider_is_atomic_on_failure() {
     use harw_operations::{OpInput, Operation};
 
-    let (ctx, tmp, ctrl) = build_slice9_fixture(false);
+    let (ctx, tmp, ctrl, recorder) = build_slice9_fixture(false);
     let snapshot_before = ctrl.snapshot();
 
     // ── Invoke ModelOperation::run() with ["switch", "gpt-test-slice9"] ───────
@@ -536,6 +557,14 @@ async fn slice9b_model_switch_to_disabled_target_provider_is_atomic_on_failure()
     assert_eq!(
         snapshot_after.active_model, snapshot_before.active_model,
         "active_model must not change after a rejected switch"
+    );
+
+    // ATOMICITY ON FAILURE: persistence (Step 5) must never have been
+    // reached — the rejection in Step 2 happens well before it.
+    assert!(
+        recorder.calls().is_empty(),
+        "a rejected switch must never call persist_default_selection: {:?}",
+        recorder.calls()
     );
 
     // Cleanup tmp dir (best effort).

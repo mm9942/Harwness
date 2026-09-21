@@ -57,7 +57,7 @@ pub struct CancelArgs {
     summary = "Bricht einen laufenden Job (WorkId) kontrolliert ab — Genehmigungs-Befehlsgruppe (siehe Moduldoku, Verhältnis zu /stop).",
     domain = "execution",
     permission = "operator",
-    command(path = "/cancel", visibility = "channel_parity"),
+    command(path = "/cancel", visibility = "channel_parity", busy = "immediate"),
     model_tool(approval = "always")
 )]
 async fn cancel(ctx: &OpContext, args: CancelArgs) -> Result<OpOutput, OpError> {

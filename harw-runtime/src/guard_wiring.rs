@@ -261,6 +261,83 @@ fn parse_effort_field(label: Option<&str>, default: ReasoningEffort, field: &str
     }
 }
 
+/// Löst den Standard-Reasoning-Effort eines Kindes nach der
+/// Nutzerentscheidung-Rangfolge **Provider > Modell > Agent > Rolle** auf
+/// (Welle 8, `recursive-cooking-lobster.md`).
+///
+/// # Beschreibung
+/// Prüft die vier Ebenen in genau dieser Reihenfolge und liefert den ersten
+/// `Some`-Wert:
+///
+/// 1. `provider_default` — `ProviderToml.default_reasoning_effort`
+///    (`harw-config`), bereits typisiert.
+/// 2. `model_default` — `ModelToml.default_reasoning_effort`
+///    (`harw-config`), bereits typisiert.
+/// 3. `agent_default` — `ExecutableAgentIr::reasoning_effort()`
+///    (`harw-agent-dsl`), ein undurchsichtiges Label. Wird hier per
+///    `str::parse::<ReasoningEffort>` typisiert; ein unbekanntes Label ist
+///    **kein Abbruch** — es wird `tracing::warn!`-gemeldet und diese Ebene
+///    übersprungen (fällt zur Rollen-Ebene durch), analog zu
+///    [`parse_effort_field`] für `[reasoning]`.
+/// 4. `role_default` — der Rollen-Standard aus
+///    [`role_effort_weights_from_config`] (`RoleEffortWeights`), der Boden
+///    dieser Rangfolge.
+///
+/// Eine explizite Live-Einstellung (`/effort` in der Sitzung) ist **nicht**
+/// Teil dieser Funktion — sie steht laut Nutzerentscheidung über allen vier
+/// Ebenen und muss vom Aufrufer bereits vor dem Aufruf dieser Funktion
+/// abgefangen werden (diese Funktion liefert nur den *Standard*, keinen
+/// Live-Override).
+///
+/// # Argumente
+/// - `provider_default` (`Option<ReasoningEffort>`): der Provider-Standard
+///   des tatsächlich für diese Rolle aufgelösten Providers.
+/// - `model_default` (`Option<ReasoningEffort>`): der Modell-Standard des
+///   tatsächlich für diese Rolle aufgelösten Modells.
+/// - `agent_default` (`Option<&str>`): `ExecutableAgentIr::reasoning_effort()`
+///   des spawnenden Kindes — ein undurchsichtiges DSL-Label, hier typisiert.
+/// - `role_default` (`Option<ReasoningEffort>`): der Rollen-Standard (z. B.
+///   aus `RoleEffortWeights`); üblicherweise `Some`, da
+///   [`role_effort_weights_from_config`] bereits auf `RoleEffortWeights::default`
+///   zurückfällt — als `Option` geführt, damit ein Aufrufer ohne aufgelöste
+///   Rolle (kein Rollen-Kontext) `None` übergeben kann.
+///
+/// # Rückgabe
+/// `Some(ReasoningEffort)` mit der ersten Ebene, die eine gültige Aussage
+/// trifft (in der Rangfolge Provider → Modell → Agent → Rolle); `None`, wenn
+/// keine der vier Ebenen eine (gültige) Aussage trifft.
+///
+/// # Nebenläufigkeit
+/// Rein; von jedem Thread aus sicher.
+#[must_use]
+pub fn resolve_default_reasoning_effort(
+    provider_default: Option<ReasoningEffort>,
+    model_default: Option<ReasoningEffort>,
+    agent_default: Option<&str>,
+    role_default: Option<ReasoningEffort>,
+) -> Option<ReasoningEffort> {
+    if let Some(effort) = provider_default {
+        return Some(effort);
+    }
+    if let Some(effort) = model_default {
+        return Some(effort);
+    }
+    if let Some(label) = agent_default {
+        match label.parse::<ReasoningEffort>() {
+            Ok(effort) => return Some(effort),
+            Err(error) => {
+                tracing::warn!(
+                    label,
+                    error = %error,
+                    "runtime.reasoning_default.invalid_agent_label"
+                );
+                // Fällt bewusst zur Rollen-Ebene durch, statt abzubrechen.
+            }
+        }
+    }
+    role_default
+}
+
 /// Baut den periodischen Kind-Reaper (Addendum F+G, "Zombies").
 ///
 /// # Beschreibung
@@ -332,4 +409,79 @@ pub fn spawn_child_reaper(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod resolve_default_reasoning_effort_tests {
+    //! Tests für [`resolve_default_reasoning_effort`] — je Rangfolge-Ebene
+    //! (Provider > Modell > Agent > Rolle, Welle 8) ein Test, plus die
+    //! Fail-Open-Behandlung eines ungültigen Agenten-Labels.
+    use super::resolve_default_reasoning_effort;
+    use harw_types::ReasoningEffort;
+
+    #[test]
+    fn test_role_only_uses_role_default() {
+        let result = resolve_default_reasoning_effort(None, None, None, Some(ReasoningEffort::Low));
+        assert_eq!(result, Some(ReasoningEffort::Low));
+    }
+
+    #[test]
+    fn test_agent_overrides_role() {
+        let result = resolve_default_reasoning_effort(
+            None,
+            None,
+            Some("high"),
+            Some(ReasoningEffort::Low),
+        );
+        assert_eq!(result, Some(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn test_model_overrides_agent_and_role() {
+        let result = resolve_default_reasoning_effort(
+            None,
+            Some(ReasoningEffort::Medium),
+            Some("high"),
+            Some(ReasoningEffort::Low),
+        );
+        assert_eq!(result, Some(ReasoningEffort::Medium));
+    }
+
+    #[test]
+    fn test_provider_overrides_model_agent_and_role_even_when_all_conflict() {
+        let result = resolve_default_reasoning_effort(
+            Some(ReasoningEffort::Max),
+            Some(ReasoningEffort::Medium),
+            Some("high"),
+            Some(ReasoningEffort::Low),
+        );
+        assert_eq!(result, Some(ReasoningEffort::Max));
+    }
+
+    #[test]
+    fn test_invalid_agent_label_skips_to_role_default() {
+        let result = resolve_default_reasoning_effort(
+            None,
+            None,
+            Some("not-a-real-effort-level"),
+            Some(ReasoningEffort::Low),
+        );
+        assert_eq!(
+            result,
+            Some(ReasoningEffort::Low),
+            "an unparsable agent label must warn and fall through to the role default, not abort"
+        );
+    }
+
+    #[test]
+    fn test_invalid_agent_label_with_no_role_default_yields_none() {
+        let result = resolve_default_reasoning_effort(None, None, Some("bogus"), None);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_all_none_yields_none() {
+        let result = resolve_default_reasoning_effort(None, None, None, None);
+        assert_eq!(result, None);
+    }
 }

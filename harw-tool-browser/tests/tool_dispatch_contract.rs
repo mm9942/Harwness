@@ -7,7 +7,7 @@ use std::future::Future;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll, Waker};
 
 use async_trait::async_trait;
 use harw_browser::action::{ActionOutcome, ActionRequest, BrowserAction};
@@ -559,16 +559,9 @@ impl BrowserRuntime for FakeRuntime {
     }
 }
 
-struct NoopWake;
-
-impl Wake for NoopWake {
-    fn wake(self: Arc<Self>) {}
-}
-
 // Fake futures resolve without real I/O; polling to completion is enough.
 fn block_on<F: Future>(future: F) -> F::Output {
-    let waker = Waker::from(Arc::new(NoopWake));
-    let mut context = Context::from_waker(&waker);
+    let mut context = Context::from_waker(Waker::noop());
     let mut future = std::pin::pin!(future);
     loop {
         match future.as_mut().poll(&mut context) {

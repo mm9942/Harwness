@@ -460,6 +460,16 @@ pub(crate) mod testing {
     }
 
     // Verbraucht eine Einheit eines Injektionszählers, falls vorhanden.
+    //
+    // `fetch_update` wurde zugunsten von `try_update` (gleiche Semantik)
+    // umbenannt/deprecated. Das Workspace-`Cargo.toml` legt
+    // `rust-version = "1.85"` als Mindestversion fest; `try_update` ist erst
+    // in einer neueren Rust-Version stabil, konnte aber hier nicht ohne
+    // Netzwerk-/Registry-Zugriff exakt verifiziert werden (nicht
+    // verifizierbar in dieser Aufgabe). Um die deklarierte MSRV nicht zu
+    // brechen, bleibt `fetch_update` bestehen und die Deprecation-Warnung
+    // wird bewusst unterdrückt statt die API umzustellen.
+    #[allow(deprecated)]
     fn take_one(counter: &AtomicUsize) -> bool {
         counter
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))

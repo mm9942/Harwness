@@ -60,7 +60,7 @@ pub struct DenyArgs {
     summary = "Lehnt einen Job (WorkId) endgültig ab — bricht ihn ab, sofern er nicht bereits Blocked ist (siehe Moduldoku).",
     domain = "execution",
     permission = "operator",
-    command(path = "/deny", visibility = "channel_parity")
+    command(path = "/deny", visibility = "channel_parity", busy = "immediate")
 )]
 async fn deny(ctx: &OpContext, args: DenyArgs) -> Result<OpOutput, OpError> {
     let Some(work_id) = args.work_id.as_deref() else {

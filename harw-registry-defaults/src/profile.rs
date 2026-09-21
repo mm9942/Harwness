@@ -2085,6 +2085,14 @@ pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile(
 /// # Ok(())
 /// # }
 /// ```
+// clippy::too_many_arguments: jeder Parameter ist ein eigenständiger,
+// unabhängig optionaler Konstruktionsbaustein (Profil, Projektkontext,
+// Identität, Freigabe-Zustand, Rechte, Definitionszugriff, Sandbox-Profil,
+// Host-Permit-Verdrahtung); ein Bündel-Struct würde die aussagekräftigen
+// Parameternamen an den bestehenden Aufrufstellen (`harw-runtime/src/
+// assembly.rs`, `harw-cli/src/sandbox_cmd.rs`) verschleiern, ohne die
+// Kopplung zu verringern.
+#[allow(clippy::too_many_arguments)]
 pub fn assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits(
     profile: RegistryProfile,
     project: &ProjectContext,

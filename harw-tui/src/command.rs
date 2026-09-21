@@ -55,6 +55,15 @@ pub enum CommandScope {
 /// silently-diverging truths.
 pub use harw_operations::operation::PermissionTier;
 
+/// Verfügbarkeit eines Befehls während eines laufenden ("busy") Turns.
+///
+/// Re-exported from `harw_operations` — mirrors [`OperationMeta::busy`] so that
+/// [`CommandSpec`] carries the same busy-availability truth as the operation it
+/// was derived from, instead of a second, silently-diverging copy.
+///
+/// [`OperationMeta::busy`]: harw_operations::operation::OperationMeta::busy
+pub use harw_operations::operation::BusyAvailability;
+
 /// Surface on which a future renderer presents a command result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutputSurface {
@@ -86,10 +95,16 @@ pub struct CommandSpec {
     pub permission: PermissionTier,
     pub output: OutputSurface,
     pub domain: CommandDomain,
+    pub busy: harw_operations::operation::BusyAvailability,
 }
 
 impl CommandSpec {
     /// Creates a command spec after validating its canonical name and aliases.
+    ///
+    /// `busy` defaults to [`BusyAvailability::DeferredUntilTurnEnd`] (the same
+    /// default as [`harw_operations::operation::OperationMeta::busy`]); callers
+    /// that need to construct a spec with an explicit busy-availability set the
+    /// field directly on the returned value.
     pub fn new(
         name: impl Into<String>,
         aliases: impl IntoIterator<Item = impl Into<String>>,
@@ -112,13 +127,16 @@ impl CommandSpec {
             permission,
             output,
             domain,
+            busy: BusyAvailability::default(),
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandDomain, CommandName, CommandScope, CommandSpec, OutputSurface};
+    use super::{
+        BusyAvailability, CommandDomain, CommandName, CommandScope, CommandSpec, OutputSurface,
+    };
     use crate::{CommandError, PermissionTier};
 
     #[test]
@@ -151,5 +169,41 @@ mod tests {
                 input: "not_an_alias".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn command_spec_new_defaults_busy_to_deferred_until_turn_end() {
+        let spec = CommandSpec::new(
+            "status",
+            Vec::<String>::new(),
+            CommandScope::TuiOnly,
+            PermissionTier::Observer,
+            OutputSurface::Inline,
+            CommandDomain::SessionLifecycle,
+        )
+        .expect("valid spec must construct");
+
+        assert_eq!(
+            spec.busy,
+            BusyAvailability::DeferredUntilTurnEnd,
+            "CommandSpec::new must default busy to DeferredUntilTurnEnd, matching \
+             OperationMeta::busy's default"
+        );
+    }
+
+    #[test]
+    fn command_spec_busy_field_can_be_set_to_immediate() {
+        let mut spec = CommandSpec::new(
+            "status",
+            Vec::<String>::new(),
+            CommandScope::TuiOnly,
+            PermissionTier::Observer,
+            OutputSurface::Inline,
+            CommandDomain::SessionLifecycle,
+        )
+        .expect("valid spec must construct");
+        spec.busy = BusyAvailability::Immediate;
+
+        assert_eq!(spec.busy, BusyAvailability::Immediate);
     }
 }

@@ -176,7 +176,7 @@ fn format_usage(snapshot: &SessionStateSnapshot, meta: Option<&SessionMeta>) -> 
     summary = "Zeigt die aufgezeichnete Token-Nutzung der aktuellen Sitzung.",
     domain = "session",
     permission = "observer",
-    command(path = "/usage", visibility = "channel_parity")
+    command(path = "/usage", visibility = "channel_parity", busy = "immediate")
 )]
 async fn usage(ctx: &OpContext, _args: UsageArgs) -> Result<OpOutput, OpError> {
     let Some(store) = ctx.state_store() else {

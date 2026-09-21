@@ -50,6 +50,13 @@ fn main() -> ExitCode {
     let RelayConfig { proxy_socket, command, .. } = config;
 
     let Some(command) = command else {
+        // `run_relay` ist als `-> Infallible` deklariert (endlose Schleife,
+        // kehrt nie zurück). Ein leerer `match` ist der kanonische Weg, einen
+        // unbewohnten Rückgabetyp in die von `let-else` geforderte
+        // Divergenz (`!`) zu heben; rustc markiert den Aufruf dabei als
+        // unreachable, weil `Infallible` keine Werte hat — kein echter Bug,
+        // Verhalten bleibt unverändert.
+        #[allow(unreachable_code)]
         match run_relay(listener, &proxy_socket, DEFAULT_RELAY_MAX_CONNECTIONS, report) {}
     };
 

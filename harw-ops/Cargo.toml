@@ -13,6 +13,13 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 harw-config = { path = "../harw-config" }
 harw-home = { path = "../harw-home" }
+# Auslastungskanal (`ProviderLoadStatus`/`ProviderLoadControl`/
+# `ProviderLoadRegistry`) für `/provider show`, `/status` und
+# `/provider-concurrency`. Kein Zyklus: harw-provider-http hängt nur von
+# harw-config/harw-core/harw-oauth/harw-fsutil/harw-protocol/harw-provider/
+# harw-sandbox/harw-tools/harw-types ab, keiner davon zurück auf harw-ops
+# (geprüft, siehe Cargo.toml-Audit dieser Zeile).
+harw-provider-http = { path = "../harw-provider-http" }
 harw-memory = { path = "../harw-memory" }
 harw-model-catalog = { path = "../harw-model-catalog" }
 harw-provider = { path = "../harw-provider" }

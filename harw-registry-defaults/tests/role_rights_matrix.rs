@@ -188,7 +188,7 @@ fn test_profile_by_permission_matrix_never_registers_ungranted_tools() {
                     "{profile:?}: {tool} ohne Grant"
                 );
             }
-            let has = |name: &str| tools.iter().any(|tool| *tool == name);
+            let has = |name: &str| tools.contains(&name);
             // `fs.write` gehört zu `Full`, `MemoryStewardship` und
             // `UiaWriter` (schreibende Erkundungsspezialisierung der UIA,
             // siehe `agents/uia-writer.toml` und die Begründung bei

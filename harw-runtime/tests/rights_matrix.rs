@@ -1103,3 +1103,200 @@ async fn uia_root_session_is_admitted_its_uia_explorer_and_uia_writer_specializa
             });
     }
 }
+
+// ── Welle 3a, Teil A: die uia-worker-Rollenfamilie bekommt die UIA nicht die
+//    Vorgabe-Provider (`harw-runtime/src/{children,assembly}.rs`) ──────────
+
+/// Konfiguration mit zwei baubaren, netzlosen Loopback-Providern
+/// (`"local-a"` als Vorgabe, `"local-b"` als abweichender UIA-Provider) —
+/// dasselbe Muster wie `harw_runtime::model`s private Testfixtur, hier
+/// dupliziert statt importiert (jene ist privat zu diesem Modul).
+fn two_provider_config() -> harw_config::ResolvedConfig {
+    fn loopback_provider(name: &str) -> harw_config::ProviderToml {
+        harw_config::ProviderToml {
+            name: name.to_owned(),
+            api: "openai-chat".to_owned(),
+            base_url: "http://127.0.0.1:11434/v1".to_owned(),
+            auth: None,
+            auth_header: Some("none".to_owned()),
+            api_key: None,
+            headers: std::collections::HashMap::new(),
+            models: Vec::new(),
+            enabled: true,
+            origin_allowlist: harw_config::OriginAllowlistToml::default(),
+            rate_limit: None,
+            max_concurrency: None,
+            originator: None,
+            default_reasoning_effort: None,
+        }
+    }
+
+    let mut config = harw_config::ResolvedConfig {
+        harness: harw_config::HarnessConfig {
+            default_provider: Some("local-a".to_owned()),
+            default_model: Some("local-a-model".to_owned()),
+            ..harw_config::HarnessConfig::default()
+        },
+        ..harw_config::ResolvedConfig::default()
+    };
+    config
+        .providers
+        .insert("local-a".to_owned(), loopback_provider("local-a"));
+    config
+        .providers
+        .insert("local-b".to_owned(), loopback_provider("local-b"));
+    config
+}
+
+/// Ende-zu-Ende-Beleg für Welle 3a, Teil A: die gesamte
+/// `uia-worker`-Rollenfamilie (`uia-worker`, `uia-explorer`, `uia-writer`,
+/// `uia-shell-worker`) muss das über `uia_provider`/`uia_model` konfigurierte
+/// UIA-Modell benutzen, **nicht** `default_provider`/`default_model`, sobald
+/// beide voneinander abweichen.
+///
+/// # Aufbau
+/// `harw_core::ManagedAgentSpawner` selbst hat keine öffentliche Methode, um
+/// das je Rolle registrierte Modell nachträglich zu inspizieren (es wird erst
+/// bei einem tatsächlichen Kind-Turn über `ChildRegistryFactory::model_for_task`
+/// gezogen, `harw-core/src/child_controller.rs::run_child_with_approvals`).
+/// Dieser Test geht deshalb über [`RuntimeChildRegistryFactory`] direkt — **derselbe**
+/// Fabriktyp, den `harw-runtime/src/assembly.rs::build_spawner` als
+/// `uia_worker_factory` für genau diese vier Rollen registriert (Welle 3a,
+/// Teil A, Schritt 5) — und über dieselben Produktionsfunktionen
+/// (`harw_runtime::model::{build_root_model, build_uia_model, build_uia_worker_model}`),
+/// die `RuntimeAssemblyBuilder::build` (`split_root_and_uia_worker_models`)
+/// beim Bau des echten Laufs aufruft.
+///
+/// Drei Beweisschritte:
+/// 1. **Spawn gelingt**: `factory.build_registry(role, ...)` — genau das, was
+///    ein Spawn bei der Registry-Montage jeder Rolle verlangt
+///    (`ChildRegistryFactory::build_registry`).
+/// 2. **Routing**: `factory.model_for(role)` liefert exakt das aus
+///    `uia_provider`/`uia_model` abgeleitete `uia_worker_model` — nicht das
+///    `default_tree_model` (`local-a`). Das ist die direkte Wirkung von
+///    Welle 3a, Teil A, Schritt 1: `internal_point_for_role` mappt die
+///    gesamte Familie nicht mehr, `model_for` reicht also unverändert
+///    `self.model` durch, und `self.model` ist bei dieser Fabrik bereits das
+///    UIA-abgeleitete Modell.
+/// 3. **Provider-Identität**: ein Request ohne eigene `provider_id` landet
+///    trotzdem beim UIA-Provider (`local-b`) — die uia-worker-Rollenfamilie
+///    setzt selbst keine `provider_id` (siehe
+///    `harw_runtime::model::build_uia_worker_model`: pinnt nur `model_id`),
+///    also muss die UIA-Standardroute (`UiaDefaultRouteProvider` in
+///    `harw-runtime/src/model.rs`) sie auffüllen. Ein Request mit explizit
+///    gesetzter `provider_id = "local-b"` darf ebenfalls nicht scheitern —
+///    dasselbe Beweismuster wie `harw_runtime::model`s eigene Tests
+///    `build_uia_model_explicit_branch_routes_default_requests_to_the_uia_provider`
+///    und `build_uia_model_explicit_branch_respects_an_already_set_provider_id`.
+///    Seit der Vereinheitlichung mit dem Vorgabe-Router (siehe
+///    `harw-runtime/src/model.rs` `UiaModelResolution::Explicit`) gibt es
+///    dafür keinen zweiten, unabhängigen HTTP-Client mehr — `local-b` ist
+///    bereits im Vorgabe-Router registriert, der Loopback-Provider ohne
+///    Netzzugriff bleibt (keine echte Verbindung nötig, siehe unten).
+#[tokio::test]
+async fn uia_worker_and_its_siblings_use_the_uia_provider_not_the_default_provider_when_they_differ()
+{
+
+    let fixture = fixture();
+    let assembled = assemble(EntryKind::Tui, &fixture).expect("montiert");
+
+    let mut config = two_provider_config();
+    config.harness.uia_provider = Some("local-b".to_owned());
+    config.harness.uia_model = Some("local-b-model".to_owned());
+
+    let spec = spec_for(EntryKind::Tui, &fixture);
+    let default_tree_model: Arc<dyn harw_core::ModelProvider> =
+        harw_runtime::model::build_root_model(&spec, &config, ModelSource::Configured)
+            .expect("default provider (local-a) must build");
+    let uia_client = harw_runtime::model::build_uia_model(&spec, &config, true, &default_tree_model)
+        .expect("uia provider (local-b) must resolve to a UiaDefaultRouteProvider wrapping the \
+                 default router — no second HTTP client is built");
+    let uia_worker_model = harw_runtime::model::build_uia_worker_model(&config, &uia_client);
+
+    assert!(
+        !Arc::ptr_eq(&default_tree_model, &uia_worker_model),
+        "the uia-worker family must not resolve to the same Arc as the default provider's \
+         client — it must go through the UiaDefaultRouteProvider/PinnedModelProvider wrapping"
+    );
+
+    let factory = RuntimeChildRegistryFactory::new(
+        assembled.assembly.project().clone(),
+        Arc::clone(&uia_worker_model),
+        ApprovalChain::for_root(
+            &config,
+            AskResolution::Interactive,
+            ApprovalModeCell::default(),
+            None,
+            AllowRuleSet::new(),
+        ),
+    )
+    .expect("Fabrik");
+
+    for role in [
+        role_names::UIA_WORKER,
+        role_names::UIA_EXPLORER,
+        role_names::UIA_WRITER,
+        role_names::UIA_SHELL_WORKER,
+    ] {
+        // Beweisschritt 1: die Rolle spawnt tatsächlich.
+        factory
+            .build_registry(role, &spawn_input(), None)
+            .unwrap_or_else(|error| panic!("role '{role}' must build a registry: {error:?}"));
+
+        // Beweisschritt 2: exakt das uia-abgeleitete Modell, nicht das
+        // Vorgabe-Modell.
+        let model = factory
+            .model_for(role)
+            .unwrap_or_else(|error| panic!("role '{role}' must resolve a model: {error:?}"));
+        assert!(
+            Arc::ptr_eq(&model, &uia_worker_model),
+            "role '{role}' must receive exactly the uia-derived model, not the default \
+             provider's client"
+        );
+    }
+
+    // Beweisschritt 3a: eine uia-worker-Anfrage OHNE eigene `provider_id`
+    // (wie `build_uia_worker_model` sie tatsächlich stellt — es pinnt nur
+    // `model_id`) muss trotzdem beim UIA-Provider ('local-b') landen, nicht
+    // beim Vorgabe-Provider ('local-a') und nicht bei einem unbekannten
+    // Provider. Keine echte Netzwerkverbindung nötig — der Router
+    // (`harw-provider-http/src/routing.rs` `RoutingModelProvider::select`)
+    // entscheidet vor jedem tatsächlichen Aufruf. Direkt `.await`en (kein
+    // zweiter, verschachtelter Tokio-Runtime-Bau): diese Testfunktion läuft
+    // bereits unter `#[tokio::test]` — `Builder::new_current_thread().block_on(...)`
+    // hier würde mit "Cannot start a runtime from within a runtime" abstürzen.
+    let request_without_provider_id = harw_core::ModelRequest::new(
+        harw_extension_api::types::LoadedInstructions::default(),
+        Vec::new(),
+        harw_core::ConversationHistory::new(),
+        Vec::new(),
+    );
+    let result = uia_worker_model.respond(request_without_provider_id).await;
+    if let Err(error) = result {
+        let message = error.to_string();
+        assert!(
+            !message.contains("is not configured"),
+            "a uia-worker request without its own provider_id must fall back to the uia default \
+             route ('local-b'), which is registered in the default router: {message}"
+        );
+    }
+
+    // Beweisschritt 3b: ein Request mit explizit gesetzter `provider_id =
+    // "local-b"` darf ebenfalls nicht scheitern.
+    let request_with_provider_id = harw_core::ModelRequest::new(
+        harw_extension_api::types::LoadedInstructions::default(),
+        Vec::new(),
+        harw_core::ConversationHistory::new(),
+        Vec::new(),
+    )
+    .with_provider_id(Some(harw_types::ProviderId::from("local-b")));
+    let result = uia_worker_model.respond(request_with_provider_id).await;
+    if let Err(error) = result {
+        let message = error.to_string();
+        assert!(
+            !message.contains("is not configured"),
+            "the uia-worker model must accept an explicit 'local-b' request too — 'local-b' is \
+             registered in the default router: {message}"
+        );
+    }
+}

@@ -380,6 +380,21 @@ fn all_registered_ops_are_reachable_by_name() {
         // `command(visibility = "tui_only")` und damit Surface::Command.
         "uia-model",
         "uia-provider",
+        // `uia-worker-model` (harw-ops/src/model.rs) und `uia-effort`
+        // (harw-ops/src/effort.rs) waren implementiert, aber bis zu diesem
+        // Knoten nicht in `harw_ops::register_all` eingetragen -- `/uia-
+        // worker-model` und `/uia-effort` existierten deshalb in der TUI
+        // nicht, obwohl der Picker für `/uia-worker-model` bereits `switch
+        // <id>` dagegen sendet. Beide sind `command(visibility =
+        // "tui_only")` und damit Surface::Command, genau wie `uia-model`/
+        // `uia-provider` oben.
+        "uia-worker-model",
+        "uia-effort",
+        // W6b: `provider-concurrency` (harw-ops/src/provider.rs) ist
+        // `command(visibility = "tui_only")` und Surface::Command, ebenfalls
+        // bereits in `register_all`, aber zuvor nicht in dieser
+        // erschöpfenden Liste geführt.
+        "provider-concurrency",
         // Manueller lokaler Bug-Report-Fallback (`harw-ops/src/bug_report.rs`),
         // `command(visibility = "tui_only")` -- reine Session-/Diagnose-Fläche
         // wie `usage` oben.

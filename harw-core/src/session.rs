@@ -1824,6 +1824,7 @@ forbidden = [{forbidden}]
             authority: AuthorityCeiling::default(),
             trace: ResolutionTrace { steps: Vec::new() },
             config: raw.tables,
+            reasoning_effort: raw.reasoning_effort.clone(),
         };
 
         lower(&resolved).expect("test agent definition must lower")

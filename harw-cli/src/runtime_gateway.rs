@@ -442,6 +442,7 @@ mod tests {
                 reasoning: false,
                 input_types: Vec::new(),
                 capabilities: harw_config::ModelCapabilitiesToml::default(),
+                default_reasoning_effort: None,
             },
         );
 
@@ -469,6 +470,7 @@ mod tests {
             rate_limit: None,
             max_concurrency: None,
             originator: None,
+            default_reasoning_effort: None,
         }
     }
 }

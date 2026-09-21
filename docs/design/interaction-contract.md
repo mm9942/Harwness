@@ -315,7 +315,206 @@ Modul-Doc-Kommentar:
 - **`/permissions`** — Übersicht über Workspace-Identität, Sandbox-Rechte,
   Freigabemodus und Allow-/Deny-Regeln.
 - **`/effort`** — setzt die providerneutrale Reasoning-Stärke für nachfolgende
-  Turns; operator-only, TUI-only, kein Modell-Tool.
+  Turns, live, für die laufende Sitzung; operator-only, TUI-only, kein
+  Modell-Tool. Grammatik: `show | clear | minimal | low | medium | high |
+  xhigh | max` (Alias `/reasoning`) — hat einen strukturellen Zwilling,
+  `/uia-effort` (siehe §2.6.1).
+
+### 2.6.1 Modell-/Provider-/Effort-Befehle (Ist-Stand 2026-09, Welle 1–2)
+
+Vollständiges Befehlsinventar für die Modell-, Provider- und
+Reasoning-Effort-Achse, wie in `harw-ops/src/model.rs`, `provider.rs` und
+`effort.rs` implementiert. `/provider switch` und `/uia-provider switch`
+**existieren nicht mehr** — ein Provider+Modell-Wechsel läuft ausschließlich
+atomar über `/model switch <id>` bzw. `/uia-model switch <id>`, die den
+konfigurierten Provider des Ziel-Modells auflösen und an
+`provider::handle_switch_core`/`handle_uia_switch_core` delegieren, auch wenn
+das Ziel-Modell zu einem anderen Provider gehört als der aktuell aktive.
+
+| Befehl | Grammatik | Wirkung | Sichtbarkeit | Permission |
+|---|---|---|---|---|
+| `/model` (Alias `/m`) | `show \| list \| switch <id>` | `switch` wechselt Provider+Modell **atomar**, live, über den `SessionController` | `tui_only` | `operator` |
+| `/uia-model` | `show \| list \| switch <id>` | wie `/model`, aber für die gepinnte UIA-Auswahl (`uia_provider`/`uia_model`); `switch` ist live | `tui_only` | `operator` |
+| `/uia-worker-model` (neu) | `show \| list \| switch <id>` | `switch` validiert die Modell-ID gegen den *effektiven* UIA-Provider und persistiert nur `uia_worker_model` in der Profil-`config.toml` — **kein** Live-Wechsel, kein eigenes `uia_worker_provider`-Konzept (der Worker teilt sich den Provider mit der UIA); wirkt ab der nächsten Sitzung | `tui_only` | `operator` |
+| `/effort` (Alias `/reasoning`) | `show \| clear \| minimal \| low \| medium \| high \| xhigh \| max` | Live-Sitzungseinstellung über den `SessionController`, wirkt sofort auf nachfolgende Turns | `tui_only` | `operator` |
+| `/uia-effort` (neu) | dieselbe Grammatik wie `/effort` | persistiert `reasoning.uia` in der Profil-`config.toml`, **kein** Live-Override (bewusster Unterschied zu `/effort`), wirkt ab der nächsten Sitzung | `tui_only` | `operator` |
+| `/provider` (Alias `/p`) | `show \| list \| test` | rein lesend; `switch` fällt in den Unbekannt-Unterbefehl-Zweig und verweist auf `/model` | `tui_only` | `operator` |
+| `/uia-provider` | `show \| list \| test` | wie `/provider`, für die UIA-Pin-Auswahl; `switch` verweist auf `/uia-model` | `tui_only` | `operator` |
+| `/provider-concurrency` | `<ProviderRef> <n \| unlimited>` | verstellt `max_concurrency` eines Providers **live** über den `DynamicConcurrencyLimiter`: Erhöhen gibt Permits sofort frei, Senken ist lazy (laufende Requests werden nie abgebrochen, nur die Wiederauffüllung gedrosselt, bis das Ziel erreicht ist); Empfehlung bei wiederholten HTTP-429-Antworten: senken, nicht erhöhen | `tui_only` **und** `model_tool` (die UIA kann sich selbst drosseln) | `operator` (Command); `approval = "always"` für den Tool-Aufruf (die Macro unterstützt nur eine statische Freigabestufe je `model_tool`, daher gilt sie auch fürs Senken) |
+
+**Sichtbarkeit der Concurrency-Grenze:** `/provider show` (über die geteilte
+`format_load_status`-Hilfsfunktion, `harw-ops/src/provider.rs`) und `/status`
+(`harw-ops/src/status.rs`) zeigen beide dieselben vier Werte aus
+`harw_provider_http::ProviderLoadStatus`: die Concurrency-Grenze (`unlimited`,
+falls kein Limiter installiert), die Anzahl freier Permits, die aktuelle
+Rate-Limit-Wartezeit und die Anzahl seit Start beobachteter HTTP-429-Antworten
+(inkl. Hinweis, bei wiederholten 429ern zu senken statt zu erhöhen). Der
+`DynamicConcurrencyLimiter` ist für den OpenAI-kompatiblen **und** den
+Anthropic-Pfad derselbe Mechanismus — `AnthropicMessagesProvider::
+configure_concurrency` installiert denselben Limiter-Typ wie der
+OpenAI-kompatible Provider (`harw-provider-http/src/anthropic.rs`).
+
+**Anmerkung zur Granularität:** `OperationMeta.busy` ist eine Eigenschaft der
+gesamten Operation, nicht des Unterbefehls — `/model` und `/provider` sind
+auf dieser Ebene als Ganzes `busy = "immediate"`. Die TUI verfeinert das
+jedoch zur Laufzeit über `busy_availability_for`
+(`harw-tui/src/command_exec.rs`): nur `show`/`list` (und das bare
+`/provider`, das äquivalent zu `show` ist) lösen tatsächlich sofortigen
+Dispatch während eines laufenden Turns aus; `/model switch <id>`, bare
+`/model` (öffnet den Picker) und `/provider test` werden trotz
+`OperationMeta.busy = "immediate"` bis Turn-Ende eingereiht. Das entspricht
+der ursprünglich engeren Nutzerentscheidung 4 ("nur `show`") — nicht jeder
+Unterbefehl dieser beiden Operationen ist sofort verfügbar, siehe §2.6.3.
+
+### 2.6.2 Trennung UIA / Orchestrator (Provider-Ebene)
+
+- Korrektur (war zuvor als "zwei unabhängige Provider-Clients" beschrieben):
+  Es gibt **einen** Router über alle aktivierten Provider
+  (`RoutingModelProvider`, gebaut einmal in
+  `harw-provider-http/src/lib.rs::build_provider_with_load_registry`, mit
+  genau einem HTTP-Client je aktiviertem Provider). Die UIA bekommt darüber
+  **keinen** eigenen Client mehr, sondern nur eine eigene Standardroute:
+  `build_uia_model`/`build_uia_worker_model`
+  (`harw-runtime/src/model.rs`) umhüllen den gemeinsamen Router mit
+  `UiaDefaultRouteProvider`, der `provider_id`/`model_id` eines Requests
+  **nur dann** mit `uia_provider`/`uia_model` auffüllt, wenn der Request sie
+  noch nicht selbst trägt — eine Live-Wahl über `/uia-model switch`
+  (die den Request explizit mit ihrer eigenen `provider_id`/`model_id`
+  versieht) hat also stets Vorrang vor der Standardroute. Der
+  `build_uia_model`-Doc-Kommentar hält fest: "seit der Vereinheitlichung mit
+  dem Vorgabe-Router kann [der Aufbau] nicht mehr fehlschlagen — es wird kein
+  zweiter HTTP-Client gebaut." Weicht `uia_provider` vom `default_provider`
+  ab, scheitern UIA-Anfragen dadurch nicht mehr zur Laufzeit. Die
+  Concurrency-Grenze (`DynamicConcurrencyLimiter`, §2.6.1) ist **eine**
+  Grenze je Provider, nicht je Route — eine UIA-Anfrage über die
+  Standardroute und eine Orchestrator-Anfrage an denselben Provider teilen
+  sich dasselbe Kontingent.
+- `uia_worker_model` pinnt ausschließlich die `model_id` über einen
+  `PinnedModelProvider`, **nie** die `provider_id` — der Provider bleibt
+  zwingend derselbe wie der effektive `uia_provider`.
+- Die gesamte `uia-worker`-Rollenfamilie läuft **immer als genau eine
+  Instanz, nie parallel**: `harw-core/src/child_controller.rs` und
+  `harw-core-bridge/src/agent_tool.rs` deckeln `slots`/`max_parallel` für
+  diese Rollen intern auf `1`, unabhängig vom Aufrufer-Parameter (ein
+  `analyze(max_parallel: 4)` darf das nicht umgehen). Die UIA-Root-Session
+  selbst kann heute ohnehin nicht als Kind-Session ein zweites Mal
+  gleichzeitig entstehen (kein passender Spawn-Codepfad).
+
+### 2.6.3 Busy-Verfügbarkeit während eines laufenden Turns
+
+Grammatik-Metadatum `OperationMeta.busy` (`BusyAvailability::Immediate` vs.
+`DeferredUntilTurnEnd`, Default) ist auf allen 13 vorgesehenen Operationen
+gesetzt und `harw-tui`'s `CommandSpec` übernimmt es bereits:
+
+| Sofort während eines Turns | Bis Turn-Ende eingereiht (Auswahl) |
+|---|---|
+| `/status` `/ps` `/usage` `/help` `/diff` `/work` `/review` `/model show`/`list` `/provider show`/`list` (inkl. bare `/provider`) `/approve` `/deny` `/cancel` `/stop` | `/mode` `/effort` `/uia-effort` `/uia-model` `/uia-worker-model` `/uia-provider` `/provider-concurrency` `/permissions` `/plugins` `/skills` `/new` `/compact` `/memory` `/export` `/quit` `/model switch`/bare `/model` `/provider test` |
+
+`/cancel` und `/stop` wirken auf den `JobStore` (Hintergrund-Jobs), **nicht**
+auf den laufenden Turn selbst — dafür bleibt Ctrl+C exklusiv zuständig (siehe
+§2.6.4).
+
+**Fertig:** Die Metadaten-Verdrahtung (`harw-ops`,
+`harw-tui/src/command.rs`/`registry.rs`) sowie der eigentliche Sofort-Dispatch
+in der TUI (`queue_busy_key` in `harw-tui/src/app.rs`, delegiert an
+`busy_availability_for`/`dispatch_slash_command` in
+`harw-tui/src/command_exec.rs`) sind vollständig verdrahtet. `queue_busy_key`
+verzweigt bei jedem abgeschickten Slash-Befehl auf `busy_availability_for`:
+`BusyAvailability::Immediate` läuft sofort über `dispatch_slash_command`,
+alles andere landet weiterhin in `deferred_input`. `busy_availability_for`
+verfeinert `/model` und `/provider` zusätzlich unterhalb der
+`OperationMeta`-Ebene (§2.6.1, Anmerkung zur Granularität): nur `show`/`list`
+sind tatsächlich sofort, `switch` und `test` bleiben eingereiht.
+
+### 2.6.4 Ctrl+C — harter Interrupt
+
+Nutzerauftrag: Ctrl+C soll ein echter harter Interrupt sein (Modellaufruf,
+Shell-/Sandbox-Prozesse, Kind-Agenten), nicht nur ein kooperativ geprüftes
+Signal.
+
+- **Modellaufruf:** `harw-core/src/turn_loop.rs` racet den Modellaufruf
+  gegen `CancelToken::cancelled()` (`tokio::select!`, `biased`); ein Treffer
+  **und** ein `Err(ModelError::Cancelled)` aus dem Provider (racet dort
+  ebenfalls gegen den `CancelToken` aus `ModelRequest`) münden beide in
+  denselben `cancel_turn(...)`-Pfad. **Fertig.**
+- **Shell-/Subprozesse:** `harw-tool-shell/src/exec.rs` racet beide
+  `timeout_at`-Wartepunkte zusätzlich gegen `cancel.cancelled()`; ein Treffer
+  löst SIGKILL über die bestehende `terminate()`-Funktion aus und liefert
+  `Err(ToolsError::Cancelled)`. **Fertig.**
+- **Kind-Agenten:** `ManagedAgentSpawner::register_parent_cancel_token` (in
+  `harw-core/src/child_controller.rs`) ist verdrahtet — `harw-tui/src/app.rs`
+  ruft es beim Start jedes Turns auf (kurz vor `drive_turn_animated`, mit
+  demselben `CancelToken`, der auch `TurnControl::with_cancel` mitgegeben
+  wird), sodass danach admittierte Kinder `cancel.child()` erben. Ein
+  Registrierungsfehler (z. B. weil die Session selbst ein admittiertes Kind
+  ist) ist nicht fatal für den Turn, sondern wird nur geloggt
+  (`tui.turn.register_parent_cancel_token_failed`). **Fertig.**
+- **Doppel-Tap Idle/Busy:** `ChatApp::pending_quit`/`hard_quit_requested`
+  (`harw-tui/src/app.rs`) vereinheitlichen den `QuitArm`/
+  `QUIT_HINT_WINDOW`-Mechanismus (2 Sekunden Fenster) über Idle- und
+  Busy-Pfad: `handle_busy_event` cancelt beim ersten Ctrl+C-Druck den
+  laufenden Turn kooperativ (`active_cancel.cancel(...)`) und armt
+  `pending_quit`; ein zweiter Druck derselben Taste binnen des Fensters setzt
+  `hard_quit_requested`, das `run_loop` direkt nach dem laufenden
+  `run_turn_streaming(...)`-Aufruf prüft und dann sofort beendet — derselbe
+  Ausgang wie `HarwEvent::Quit` im Idle-Pfad. **Fertig.**
+
+### 2.6.5 Reasoning-Effort-Standards (Rangfolge)
+
+Nutzerentscheidung: Standard-Reasoning-Effort ist zusätzlich pro Provider,
+pro Modell und pro Agenten-Definition konfigurierbar; bei Konflikt gilt die
+Rangfolge **Provider > Modell > Agenten-Definition > Rolle** (`reasoning.*`
+bleibt der Boden-Fallback).
+
+- **Fertig:** die Config-Felder — `ProviderToml.default_reasoning_effort`
+  (`harw-config/src/provider_toml.rs`) und
+  `ModelToml.default_reasoning_effort` (`harw-config/src/model_toml.rs`)
+  existieren mit rundtrip-getesteter TOML-Serialisierung.
+- **Fertig:** die vierstufige Auflösungsfunktion, die die Rangfolge zur
+  Spawn-Zeit anwendet, existiert in zwei bewusst identischen Ausprägungen
+  (Schichtungsregel: `harw-core` darf nicht von `harw-runtime` abhängen):
+  `harw_runtime::guard_wiring::resolve_default_reasoning_effort`
+  (`harw-runtime/src/guard_wiring.rs`) für die UIA-Root-Session (aufgerufen
+  aus `harw-runtime/src/assembly.rs`, nur wenn
+  `organizational_role == AgentRoleId::UserInterface` und `spec.reasoning_effort`
+  keine explizite Live-Einstellung trägt) und eine gespiegelte Fassung in
+  `harw-core/src/child_controller.rs`
+  (`resolve_child_default_reasoning_effort`) für Kind-Agenten, die über
+  `ChildRegistryFactory::reasoning_effort_defaults_for_role(_task)` bedient
+  werden — `harw-runtime/src/children.rs`s `RuntimeChildRegistryFactory`
+  überschreibt diese Methode mit den tatsächlich für die aufgelöste
+  Provider-/Modell-ID hinterlegten `default_reasoning_effort`-Werten.
+  `role_effort_weights_from_config` bleibt weiterhin nur die unterste Ebene
+  (Rolle) und dient beiden Auflösungsfunktionen als Boden-Fallback.
+  **Bestehende Einschränkung (kein Bug, dokumentiert):** Ein Kind ohne eigene
+  interne Modellstelle (`internal_point_for_role` liefert `None`, d. h. kein
+  passender `internal_models`-Eintrag) läuft auf dem geerbten
+  Eltern-Hauptmodell; dessen Provider-/Modell-ID ist der
+  `RuntimeChildRegistryFactory` nicht bekannt, daher liefert
+  `reasoning_effort_defaults_for_role(_task)` für ein solches Kind `(None,
+  None)` und die Rangfolge fällt direkt auf die Rollen-Ebene durch — Provider-
+  und Modell-Standard greifen nur für Kinder mit einer aufgelösten internen
+  Modellstelle.
+
+### 2.6.6 Reasoning-Sichtbarkeit (UIA)
+
+Nutzerauftrag: Denkinhalt der UIA soll sichtbar werden, vor allem in der
+UIA-Sitzung.
+
+**Fertig, Ende-zu-Ende verdrahtet:** `harw-core/src/turn_loop.rs` liest
+`response.reasoning: Option<OpaqueReasoning>` nach jedem Modellaufruf aus.
+Für Anthropic-Blöcke extrahiert `extract_thinking_text` das lesbare
+`"thinking"`-Textfeld; `"redacted_thinking"`-Blöcke und verschlüsseltes
+OpenAI-Reasoning liefern keinen Text und erzeugen bewusst **kein**
+`TurnItem::Reasoning` (kein Fehler). Der extrahierte Text wird als
+`ReasoningItem` in `session.history_mut()` gepusht und als
+`TurnEvent::ItemAdded { item: TurnItem::Reasoning(...) }` emittiert — **nur**
+für Sessions mit `organizational_role == AgentRoleId::UserInterface` (dasselbe
+Kriterium wie `is_uia_root_session`); Nicht-UIA-Sessions verwerfen Reasoning
+weiterhin unverändert. `harw-tui/src/app.rs` rendert das Item bereits über
+die vollständig verdrahtete `ReasoningHistoryCell` (gedimmter Text,
+`·`-Präfix). `to_model_messages` (`history.rs`) überspringt
+`TurnItem::Reasoning` beim nächsten Modellaufruf.
 
 ---
 

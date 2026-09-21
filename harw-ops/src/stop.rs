@@ -75,7 +75,7 @@ pub struct StopArgs {
     summary = "Bricht einen laufenden Job kontrolliert ab.",
     domain = "execution",
     permission = "operator",
-    command(path = "/stop", visibility = "channel_parity"),
+    command(path = "/stop", visibility = "channel_parity", busy = "immediate"),
     model_tool(approval = "always"),
     // Web-Fläche übernimmt exakt dieselbe Achse wie das ModelTool:
     // `method = "post"` (Abbruch ist ein Seiteneffekt), `approval = "always"` —

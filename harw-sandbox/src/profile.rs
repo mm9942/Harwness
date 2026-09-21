@@ -14,9 +14,10 @@ use crate::{CargoSandboxProfile, TmuxSandboxProfile};
 ///
 /// Jede Variante aktiviert genau die Bindungen, die für ihr Profil nötig sind.
 /// Der Standard ist [`SandboxProfile::Strict`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum SandboxProfile {
     /// Strikte Bubblewrap-Sandbox: kein Cargo, kein tmux, kein Host.
+    #[default]
     Strict,
     /// Isolierte Bubblewrap-Sandbox mit aktiviertem Cargo-Modul.
     Cargo(CargoSandboxProfile),
@@ -24,12 +25,6 @@ pub enum SandboxProfile {
     Tmux(TmuxSandboxProfile),
     /// Lokale Host-Ausführung; nur nach UI-Approval möglich.
     Host,
-}
-
-impl Default for SandboxProfile {
-    fn default() -> Self {
-        Self::Strict
-    }
 }
 
 impl SandboxProfile {

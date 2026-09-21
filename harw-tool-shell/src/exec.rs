@@ -44,6 +44,7 @@ use harw_tools::{
     spec::{FunctionToolSpec, ToolName, ToolSpec},
     ToolCall, ToolExecutionContext, ToolExecutor, ToolExecutorFuture, ToolOutput, ToolsError,
 };
+use harw_types::cancel::CancelToken;
 use serde::Deserialize;
 use serde_json::json;
 use std::{
@@ -507,14 +508,24 @@ impl ShellExecutor {
     /// Strict/Cargo/Tmux profiles are unaffected because the sandbox itself is
     /// their enforcement boundary, not a permit.
     ///
+    /// If `cancel` is `Some`, both waits below (draining stdout/stderr, and waiting
+    /// for the exit status after EOF) additionally race the token's
+    /// [`CancelToken::cancelled`] future. A cancellation hit kills the process tree
+    /// via the existing [`terminate`] function (the same SIGKILL path timeout and
+    /// output-limit overflow already use) and returns [`ToolsError::Cancelled`]
+    /// instead of a timeout `ToolOutput`. With `cancel = None` both waits behave
+    /// exactly as before (plain `timeout_at`, no race).
+    ///
     /// # Errors
     /// Returns `Ok(ToolOutput::error(...))` for denied-permission, missing sandbox binaries,
     /// timeout, or spawn failure — callers are not expected to match on `Err` for these cases.
-    /// Returns `Err(ToolsError)` only for argument parsing failures.
+    /// Returns `Err(ToolsError::Cancelled)` when `cancel` fires before the command
+    /// completes. Returns `Err(ToolsError)` otherwise only for argument parsing failures.
     ///
     /// # Concurrency
-    /// Safe to call from any async context. Timeout and output overflow kill and reap the
-    /// child explicitly; `kill_on_drop(true)` still covers a dropped future.
+    /// Safe to call from any async context. Timeout, cancellation, and output overflow
+    /// all kill and reap the child explicitly via [`terminate`]; `kill_on_drop(true)`
+    /// still covers a dropped future.
     ///
     /// # Panics
     /// None in production paths.
@@ -523,6 +534,7 @@ impl ShellExecutor {
         args: &ShellExecArgs,
         sandbox: &SandboxSpec,
         session_id: &str,
+        cancel: Option<&CancelToken>,
     ) -> Result<ToolOutput, ToolsError> {
         let effective_timeout = self.effective_timeout(args)?;
 
@@ -613,8 +625,19 @@ impl ShellExecutor {
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(effective_timeout);
         let mut capture = BoundedCapture::new(self.max_output_bytes);
-        let drained =
-            tokio::time::timeout_at(deadline, capture.drain(&mut stdout, &mut stderr)).await;
+        let drained = match cancel {
+            Some(cancel) => {
+                tokio::select! {
+                    result = tokio::time::timeout_at(deadline, capture.drain(&mut stdout, &mut stderr)) => result,
+                    () = cancel.cancelled() => {
+                        terminate(&mut child).await;
+                        info!(session_id, "shell.exec cancelled while draining output");
+                        return Err(ToolsError::Cancelled);
+                    }
+                }
+            }
+            None => tokio::time::timeout_at(deadline, capture.drain(&mut stdout, &mut stderr)).await,
+        };
 
         let status = match drained {
             Err(_elapsed) => {
@@ -640,7 +663,20 @@ impl ShellExecutor {
                 return Ok(self.completed_output(status, &capture, true));
             }
             Ok(Ok(DrainEnd::Eof)) => {
-                match tokio::time::timeout_at(deadline, child.wait()).await {
+                let waited = match cancel {
+                    Some(cancel) => {
+                        tokio::select! {
+                            result = tokio::time::timeout_at(deadline, child.wait()) => result,
+                            () = cancel.cancelled() => {
+                                terminate(&mut child).await;
+                                info!(session_id, "shell.exec cancelled while waiting for exit");
+                                return Err(ToolsError::Cancelled);
+                            }
+                        }
+                    }
+                    None => tokio::time::timeout_at(deadline, child.wait()).await,
+                };
+                match waited {
                     Ok(Ok(status)) => status,
                     Ok(Err(err)) => {
                         terminate(&mut child).await;
@@ -756,20 +792,27 @@ impl ToolExecutor for ShellExecutor {
     /// 2. Rejects blank commands and caller-provided zero timeouts.
     /// 3. Checks that [`Permission::ExecuteProcess`] is granted in `context.sandbox()`.
     /// 4. Builds a Bubblewrap plan from `context.sandbox()`.
-    /// 5. Executes `/bin/sh -c <command>` inside that plan with the effective timeout.
+    /// 5. Executes `/bin/sh -c <command>` inside that plan with the effective timeout,
+    ///    racing `context.cancel()` (if attached) against both output-drain and
+    ///    post-EOF exit waits.
     /// 6. Returns a JSON `ToolOutput` with `exit_code`, `stdout`, `stderr`, and `truncated`.
     ///
     /// # Arguments
-    /// - `context` (`&ToolExecutionContext`): harness-established sandbox authority.
+    /// - `context` (`&ToolExecutionContext`): harness-established sandbox authority;
+    ///   its optional [`harw_types::cancel::CancelToken`] (via `context.cancel()`) is
+    ///   passed through to [`Self::run_command`].
     /// - `call` (`&ToolCall`): untrusted invocation; `arguments` must match [`ShellExecArgs`].
     ///
     /// # Returns
     /// `Ok(ToolOutput::json(...))` on success, `Ok(ToolOutput::error(...))` on permission
     /// denial or runtime failure, `Err(ToolsError::InvalidArguments)` if arguments cannot
-    /// be parsed.
+    /// be parsed, `Err(ToolsError::Cancelled)` if `context.cancel()` fires before the
+    /// command completes.
     ///
     /// # Errors
     /// - [`ToolsError::InvalidArguments`]: arguments JSON does not conform to the tool schema.
+    /// - [`ToolsError::Cancelled`]: the attached cancel token fired before completion;
+    ///   the process tree is killed via [`terminate`] before this is returned.
     ///
     /// # Concurrency
     /// `Send + Sync`. The returned future is `Send`.
@@ -823,8 +866,13 @@ impl ToolExecutor for ShellExecutor {
             //    Grenze, nicht der Permit).
 
             // 5 + 6. Build an isolated launch plan, spawn, and collect.
-            self.run_command(&args, context.sandbox(), context.session_id().as_str())
-                .await
+            self.run_command(
+                &args,
+                context.sandbox(),
+                context.session_id().as_str(),
+                context.cancel(),
+            )
+            .await
         })
     }
 }
@@ -1492,7 +1540,7 @@ mod tests {
             timeout_secs: None,
         };
 
-        match executor.run_command(&args, &sandbox, "test-session").await.expect("run") {
+        match executor.run_command(&args, &sandbox, "test-session", None).await.expect("run") {
             ToolOutput::Error { message } => {
                 assert!(message.contains("resource limits"), "{message}");
                 assert!(message.contains("nofile"), "{message}");
@@ -1862,6 +1910,99 @@ mod tests {
         test_exec_rlimits_and_tmpfs_size_apply,
         test_exec_rlimits_and_tmpfs_size_apply_required,
         rlimits_and_tmpfs_size_apply_inside_sandbox
+    );
+
+    // ── Cancel-Tests (run_command: cancel: Option<&CancelToken>) ──────────
+
+    fn plain_executor(timeout_secs: u64) -> ShellExecutor {
+        ShellExecutor {
+            timeout_secs,
+            max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            limits: ShellLimits::default(),
+            sandbox_profile: SandboxProfile::Strict,
+            permit_ledger: None,
+            host_permit_registry: None,
+            host_permit_prompts: None,
+            preselected_permit_variant: HostPermitVariant::SingleExecution,
+            host_permit_timeout: HOST_PERMIT_PROMPT_TIMEOUT,
+        }
+    }
+
+    async fn cancel_during_run_kills_process_and_returns_cancelled() {
+        use harw_types::cancel::CancelReason;
+
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        // Long timeout so the timeout path can never win the race against cancel.
+        let executor = plain_executor(30);
+        let args = ShellExecArgs {
+            command: "sleep 30".to_owned(),
+            timeout_secs: None,
+        };
+        let cancel = CancelToken::new();
+        let canceller_cancel = cancel.clone();
+        let canceller = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            canceller_cancel.cancel(CancelReason::User);
+        });
+
+        let started = std::time::Instant::now();
+        let result = executor
+            .run_command(&args, &sandbox, "cancel-session", Some(&cancel))
+            .await;
+        canceller.await.expect("canceller task must not panic");
+
+        assert!(
+            started.elapsed() < KILL_REAP_TIMEOUT + Duration::from_secs(5),
+            "cancel must kill the process tree (SIGKILL) well within the kill-reap \
+             timeout, instead of waiting out `sleep 30`, took: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            matches!(result, Err(ToolsError::Cancelled)),
+            "a cancelled run_command must return Err(ToolsError::Cancelled) instead of \
+             a timeout ToolOutput, got: {result:?}"
+        );
+    }
+    sandbox_test!(
+        test_exec_cancel_kills_process_and_returns_cancelled,
+        test_exec_cancel_kills_process_and_returns_cancelled_required,
+        cancel_during_run_kills_process_and_returns_cancelled
+    );
+
+    async fn cancel_none_behaves_exactly_as_before() {
+        // Regression guard: `cancel: None` must leave today's plain
+        // `timeout_at`-only behavior untouched — no race, no `Cancelled` path.
+        let tmp = make_temp_workspace();
+        let sandbox = make_sandbox(&tmp, vec![Permission::ExecuteProcess]);
+        let executor = plain_executor(DEFAULT_TIMEOUT_SECS);
+        let args = ShellExecArgs {
+            command: "echo cancel_none_ok".to_owned(),
+            timeout_secs: None,
+        };
+
+        match executor
+            .run_command(&args, &sandbox, "no-cancel-session", None)
+            .await
+            .expect("run_command must not return Err for a plain, uncancelled command")
+        {
+            ToolOutput::Json { content } => {
+                assert_eq!(content["exit_code"], 0, "echo must exit with 0");
+                let stdout = content["stdout"].as_str().unwrap_or("");
+                assert!(
+                    stdout.contains("cancel_none_ok"),
+                    "stdout must contain echoed string, got: {stdout:?}"
+                );
+            }
+            other => panic!(
+                "expected Json output for cancel=None, got: {other:?}"
+            ),
+        }
+    }
+    sandbox_test!(
+        test_exec_cancel_none_behaves_as_before,
+        test_exec_cancel_none_behaves_as_before_required,
+        cancel_none_behaves_exactly_as_before
     );
 
     // ── Permit-/Profil-Tests ───────────────────────────────────────────────

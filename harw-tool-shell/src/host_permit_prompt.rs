@@ -46,7 +46,6 @@
 //! Sync` (ein `tokio::sync::mpsc::UnboundedSender`).
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 

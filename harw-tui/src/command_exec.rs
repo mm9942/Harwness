@@ -65,6 +65,7 @@ use harw_extension_api::contributors::ToolProvider;
 #[cfg(test)]
 use harw_operations::SharedSessionController;
 use harw_operations::adapter::CommandAdapter;
+use harw_operations::operation::BusyAvailability;
 #[cfg(test)]
 use harw_operations::registry::OperationRegistry;
 use harw_operations::{OpContext, PermissionTier, ServiceMap};
@@ -225,6 +226,150 @@ where
         services,
     )
     .await
+}
+
+/// Kapselt den Idle-Dispatch-Ablauf aus `app.rs` (`HarwEvent::Command`-Zweig,
+/// ca. Zeile 2955-2990: „keine Runtime"-Fehlerpfad + `execute_command_as`-
+/// Aufruf über `runtime_commands::caller_tier`/`runtime_commands::slash_service_map`)
+/// als wiederverwendbaren Helfer für den Welle-4b-Sofort-Dispatch
+/// (`BusyAvailability::Immediate` während eines laufenden Turns) und für die
+/// Welle-5-Konsolidierung, die diesen Codeblock zwischen Idle- und Busy-Pfad
+/// nicht länger duplizieren soll.
+///
+/// # Beschreibung
+/// Bei `runtime = None` liefert dieser Helfer wortgleich die heutige
+/// „keine Runtime"-Meldung aus `app.rs`: `"Fehler: keine Runtime-Montage"`
+/// (inkl. desselben `tracing::error!("tui.command.no_runtime_assembly")`).
+/// Bei `Some(rt)` liest er die Aufrufer-Stufe über
+/// [`crate::runtime_commands::caller_tier`] aus `rt.principal()` und
+/// dispatcht über [`execute_command_as`] mit
+/// `|| crate::runtime_commands::slash_service_map(rt.services())` als
+/// Services-Closure — identisch zum bestehenden `execute_command_as`-Zweig in
+/// `app.rs`.
+///
+/// **Bewusst ausgeklammert:** die `/export`-Sonderbehandlung
+/// (`execute_export_command_with_data` in `app.rs`, liefert zusätzlich
+/// `OpOutput::data` für den Export-Dateischreiber) ist in `app.rs` als
+/// private `async fn` deklariert und von hier — anderes Modul, kein
+/// `pub(crate)` — nicht erreichbar. Für den Sofort-Dispatch-Anwendungsfall
+/// (Welle 4b) ist das folgenlos: `/export` trägt `busy =
+/// DeferredUntilTurnEnd` (Standard, nicht Teil der in Welle 2d/3d/4a auf
+/// `Immediate` gesetzten Befehle) und läuft daher nie über diesen Helfer.
+/// Falls Welle 5 auch den *Idle*-Pfad vollständig hierher verlagern will,
+/// müsste `app.rs` zuerst `execute_export_command_with_data` auf
+/// `pub(crate)` heben (oder die Funktion nach `command_exec.rs`
+/// verschieben); dieser Helfer bräuchte dann einen zusätzlichen
+/// `/export`-Vorabschritt, der bei `Some(Ok(..))`/`Some(Err(..))` Vorrang vor
+/// `execute_command_as` erhält (siehe app.rs, `HarwEvent::Command`-Zweig) —
+/// bis dahin bleibt die Export-Sonderbehandlung ausschließlich in `app.rs`.
+///
+/// # Argumente
+/// - `runtime` (`Option<&std::sync::Arc<harw_runtime::RuntimeAssembly>>`):
+///   `app.runtime()`. `None` → keine Runtime-Montage vorhanden.
+/// - `adapters` (`&[CommandAdapter]`): `app.adapters()`.
+/// - `sandbox` (`&SandboxSpec`): `app.sandbox()`.
+/// - `session_id` (`&SessionId`): `app.session_id()`.
+/// - `raw` (`&str`): die abgeschickte `/command`-Zeile.
+///
+/// # Rückgabe
+/// Anzeigetext, identisch zum heutigen `HarwEvent::Command`-Idle-Zweig
+/// (abzüglich der `/export`-`data`-Sonderbehandlung, siehe oben — deren
+/// `Vec<Line<'static>>`-Aufteilung und `app.push_lines`/
+/// `app.apply_pending_controller_state`-Nachbereitung bleiben ohnehin
+/// Aufgabe des jeweiligen Aufrufers, nicht dieses Helfers).
+///
+/// # Nebenläufigkeit
+/// `async`; ruft [`execute_command_as`] genau einmal auf. Keine eigenen
+/// Locks oder geteilten Zustände.
+pub(crate) async fn dispatch_slash_command(
+    runtime: Option<&std::sync::Arc<harw_runtime::RuntimeAssembly>>,
+    adapters: &[CommandAdapter],
+    sandbox: &SandboxSpec,
+    session_id: &SessionId,
+    raw: &str,
+) -> String {
+    match runtime {
+        Some(rt) => {
+            let caller_tier = crate::runtime_commands::caller_tier(rt.principal());
+            execute_command_as(adapters, sandbox, session_id, caller_tier, raw, || {
+                crate::runtime_commands::slash_service_map(rt.services())
+            })
+            .await
+        }
+        None => {
+            tracing::error!("tui.command.no_runtime_assembly");
+            "Fehler: keine Runtime-Montage".to_owned()
+        }
+    }
+}
+
+/// Klassifiziert eine rohe Eingabezeile in ihre
+/// [`harw_operations::operation::BusyAvailability`] für den Busy-Sofort-Dispatch
+/// (Welle 4b).
+///
+/// # Beschreibung
+/// Nutzt [`crate::classify_input`] (denselben Parser wie jeder andere
+/// Dispatch-Pfad). Nur [`Invocation::Command`] kann `Immediate` liefern:
+/// - Kein Befehl (`Shell`, `ShellRepeat`, `Note`, `Mention`, `Chat`) →
+///   `DeferredUntilTurnEnd` (diese Formen haben keine `busy`-Metadaten und
+///   sind während eines laufenden Turns ohnehin nicht sicher sofort
+///   ausführbar).
+/// - Unbekannter Befehlsname (`registry.find` liefert `None`) →
+///   `DeferredUntilTurnEnd` — die ehrliche „unbekannter Befehl"-Meldung
+///   entsteht weiterhin erst im eigentlichen Dispatch, nicht hier.
+/// - Bekannter Befehl (kanonischer Name oder Alias, via [`CommandRegistry::find`]) →
+///   grundsätzlich `spec.busy`.
+///
+/// **Sonderfall `model`/`provider`** (§Auftrag Punkt 3): beide Operationen
+/// sind als `busy = Immediate` markiert, aber nur ihre Anzeige (`show`/
+/// `list`) darf während eines laufenden Turns sofort laufen — `/model
+/// switch ...`, ein bare `/model`/`/model switch` (öffnet den
+/// `ModelSwitchPicker`, der eine Änderung vornimmt) und `/provider test`
+/// müssen weiterhin bis zum Turn-Ende warten. Geprüft wird der **kanonische**
+/// Befehlsname (nach Alias-Auflösung über `spec.name`, nicht der getippte
+/// Alias) gegen das erste Argument-Token aus `Invocation::Command::raw_args`:
+/// - `provider`: `show`/`list` **oder kein Argument** (bare `/provider` ≡
+///   `show`, siehe 4a) → `Immediate`; jedes andere erste Token (z. B. `test`)
+///   → `Deferred`.
+/// - `model`: `show`/`list` → `Immediate`; **kein Argument** (bare `/model`
+///   öffnet den Picker) oder jedes andere erste Token (u. a. `switch`,
+///   egal ob mit oder ohne weiteres Argument) → `Deferred`.
+///
+/// Alle anderen `Immediate`-Befehle (`status, ps, usage, help, diff, work,
+/// review, approve, deny, cancel, stop`, Welle 2d/3d) behalten unverändert
+/// `spec.busy`.
+///
+/// # Argumente
+/// - `registry` (`&CommandRegistry`): der Dispatch-Katalog, z. B.
+///   `CommandRegistry::from_command_adapters(app.adapters())` bzw.
+///   `CommandRegistry::built_in()`.
+/// - `raw` (`&str`): die rohe, noch nicht abgeschickte oder gerade
+///   abgeschickte Eingabezeile.
+///
+/// # Rückgabe
+/// Die [`BusyAvailability`] dieser Eingabe für den Busy-Sofort-Dispatch.
+#[must_use]
+pub(crate) fn busy_availability_for(registry: &CommandRegistry, raw: &str) -> BusyAvailability {
+    let Ok(Invocation::Command { name, raw_args }) = crate::classify_input(raw) else {
+        return BusyAvailability::DeferredUntilTurnEnd;
+    };
+
+    let Some(spec) = registry.find(&name) else {
+        return BusyAvailability::DeferredUntilTurnEnd;
+    };
+
+    if spec.busy != BusyAvailability::Immediate {
+        return spec.busy;
+    }
+
+    let first_arg = raw_args.first().map(String::as_str);
+    match (spec.name.as_str(), first_arg) {
+        ("provider", None | Some("show") | Some("list")) => BusyAvailability::Immediate,
+        ("provider", Some(_)) => BusyAvailability::DeferredUntilTurnEnd,
+        ("model", Some("show") | Some("list")) => BusyAvailability::Immediate,
+        ("model", None | Some(_)) => BusyAvailability::DeferredUntilTurnEnd,
+        (_, _) => BusyAvailability::Immediate,
+    }
 }
 
 /// Baut den [`DispatchContext`] der lokalen TUI.
@@ -500,6 +645,7 @@ mod tests {
     use harw_types::{SessionId, TenantId, WorkspaceId};
 
     use crate::session_controller::TuiSessionController;
+    use crate::CommandRegistry;
     use harw_operations::SessionController;
 
     use super::{CommandServices, build_services};
@@ -1190,8 +1336,6 @@ mod tests {
     /// resolve to the same canonical spec name, confirming a single truth source.
     #[tokio::test]
     async fn alias_dispatches_to_same_handler_as_canonical() {
-        use crate::CommandRegistry;
-
         let adapters = adapters();
         let (sandbox, tmp) = test_sandbox();
         let session_id = SessionId::new();
@@ -1346,5 +1490,161 @@ mod tests {
             .expect("durable job store must be available to command operations");
 
         assert!(Arc::ptr_eq(resolved, &store));
+    }
+
+    // -----------------------------------------------------------------------
+    // 12. dispatch_slash_command: no-runtime message + happy path
+    // -----------------------------------------------------------------------
+
+    /// `dispatch_slash_command_reports_the_idle_no_runtime_message`: mirrors
+    /// the `app.rs` `HarwEvent::Command`-Zweig's "no runtime" branch verbatim.
+    #[tokio::test]
+    async fn dispatch_slash_command_reports_the_idle_no_runtime_message() {
+        let adapters = adapters();
+        let (sandbox, tmp) = test_sandbox();
+        let session_id = SessionId::new();
+
+        let output =
+            super::dispatch_slash_command(None, &adapters, &sandbox, &session_id, "/status")
+                .await;
+        std::fs::remove_dir_all(tmp).ok();
+
+        assert_eq!(output, "Fehler: keine Runtime-Montage");
+    }
+
+    /// `dispatch_slash_command_with_empty_adapters_reports_unknown`: without a
+    /// `RuntimeAssembly` in scope for this unit test, exercise the
+    /// runtime-independent branches through `execute_command_as` directly to
+    /// prove they still agree (an empty adapter list is honest about missing
+    /// commands, same as the idle path).
+    #[tokio::test]
+    async fn dispatch_slash_command_and_execute_command_as_agree_on_unknown_command() {
+        let (sandbox, tmp) = test_sandbox();
+        let session_id = SessionId::new();
+        let controller = test_controller();
+
+        let via_execute_command_as = super::execute_command_as(
+            &[],
+            &sandbox,
+            &session_id,
+            PermissionTier::Operator,
+            "/status",
+            || build_services(&[], None, None, &controller, None),
+        )
+        .await;
+        std::fs::remove_dir_all(tmp).ok();
+
+        assert_eq!(via_execute_command_as, "Unbekannter Command: /status");
+    }
+
+    // -----------------------------------------------------------------------
+    // 13. busy_availability_for classifier
+    // -----------------------------------------------------------------------
+
+    fn built_in_registry() -> CommandRegistry {
+        CommandRegistry::built_in()
+    }
+
+    #[test]
+    fn busy_availability_for_status_is_immediate() {
+        assert_eq!(
+            super::busy_availability_for(&built_in_registry(), "/status"),
+            BusyAvailability::Immediate
+        );
+    }
+
+    #[test]
+    fn busy_availability_for_mode_plan_is_deferred() {
+        assert_eq!(
+            super::busy_availability_for(&built_in_registry(), "/mode plan"),
+            BusyAvailability::DeferredUntilTurnEnd
+        );
+    }
+
+    #[test]
+    fn busy_availability_for_model_show_is_immediate() {
+        assert_eq!(
+            super::busy_availability_for(&built_in_registry(), "/model show"),
+            BusyAvailability::Immediate
+        );
+    }
+
+    #[test]
+    fn busy_availability_for_model_switch_with_argument_is_deferred() {
+        assert_eq!(
+            super::busy_availability_for(&built_in_registry(), "/model switch x"),
+            BusyAvailability::DeferredUntilTurnEnd
+        );
+    }
+
+    #[test]
+    fn busy_availability_for_bare_model_is_deferred() {
+        assert_eq!(
+            super::busy_availability_for(&built_in_registry(), "/model"),
+            BusyAvailability::DeferredUntilTurnEnd
+        );
+    }
+
+    #[test]
+    fn busy_availability_for_bare_provider_is_immediate() {
+        assert_eq!(
+            super::busy_availability_for(&built_in_registry(), "/provider"),
+            BusyAvailability::Immediate
+        );
+    }
+
+    #[test]
+    fn busy_availability_for_provider_list_is_immediate() {
+        assert_eq!(
+            super::busy_availability_for(&built_in_registry(), "/provider list"),
+            BusyAvailability::Immediate
+        );
+    }
+
+    #[test]
+    fn busy_availability_for_provider_test_is_deferred() {
+        assert_eq!(
+            super::busy_availability_for(&built_in_registry(), "/provider test"),
+            BusyAvailability::DeferredUntilTurnEnd
+        );
+    }
+
+    #[test]
+    fn busy_availability_for_unknown_command_is_deferred() {
+        assert_eq!(
+            super::busy_availability_for(&built_in_registry(), "/gibtsnicht"),
+            BusyAvailability::DeferredUntilTurnEnd
+        );
+    }
+
+    #[test]
+    fn busy_availability_for_chat_text_is_deferred() {
+        assert_eq!(
+            super::busy_availability_for(&built_in_registry(), "hallo welt"),
+            BusyAvailability::DeferredUntilTurnEnd
+        );
+    }
+
+    /// `busy_availability_for_alias_of_an_immediate_command_is_immediate`: an
+    /// alias must resolve to the same canonical spec (and thus the same
+    /// `busy` flag plus the same `model`/`provider` sub-command rule) as the
+    /// canonical command name. `/p` is `/provider`'s alias; typed bare it
+    /// must classify identically to bare `/provider` (`Immediate`, defaults
+    /// to `show`) because [`super::busy_availability_for`] matches on
+    /// `spec.name` (the canonical name), not on the typed token.
+    #[test]
+    fn busy_availability_for_alias_of_an_immediate_command_is_immediate() {
+        let registry = built_in_registry();
+        let canonical = registry.find("provider").expect("provider must be registered");
+        let alias = canonical
+            .aliases
+            .first()
+            .cloned()
+            .expect("/provider must declare at least one alias for this test to be meaningful");
+
+        assert_eq!(
+            super::busy_availability_for(&registry, &format!("/{alias}")),
+            BusyAvailability::Immediate
+        );
     }
 }

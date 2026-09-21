@@ -1901,8 +1901,18 @@ const QUESTION_ID_EXCERPT_CHARS: usize = 64;
 ///   zum Ergebnisvektor.
 /// - `authority_reducer` (`&str`): Kennung der Sandbox-Reduktion.
 /// - `budget` ([`AgentBudget`]): Deckel je Kind, vor der Verschneidung mit der IR.
-/// - `max_parallel` (`usize`): gleichzeitig admittierte und laufende Kinder
-///   dieser Welle (`0` wird zu `1`).
+/// - `max_parallel` (`usize`): gewünschte gleichzeitig admittierte und
+///   laufende Kinder dieser Welle (`0` wird zu `1`). **Kann nicht** die
+///   `uia-worker`-Rollenfamilie über eine Instanz hinaus parallelisieren:
+///   [`ManagedAgentSpawner::max_concurrent_instances_for_role`] deckelt
+///   `role` unten auf `1`, sobald ihre Organisationsrolle
+///   `harw_agent_dsl::roles::AgentRoleId::UiaWorker` ist — unabhängig davon,
+///   welchen Wert der Aufrufer (z. B. `analyze(max_parallel: 4)`) übergibt.
+///   Da diese Funktion nur **eine einzige** Rolle je Welle fährt (siehe
+///   oben), ist hier — anders als bei
+///   [`harw_core::child_controller::ManagedAgentSpawner::run_children`],
+///   das gemischte Rollen je Anfrage zulässt — keine Minimumsbildung über
+///   mehrere Rollen nötig.
 /// - `join` ([`JoinSemantics`]): Klammerung der Welle.
 /// - `contract` ([`ChildReturnContract`]): wie die Antworten ausgewertet werden.
 ///
@@ -1978,7 +1988,24 @@ pub async fn fanout_children(
     let child_sandbox = reducer(ctx.sandbox());
 
     let total = questions.len();
-    let slots = max_parallel.max(1);
+    let requested_slots = max_parallel.max(1);
+    // Sicherheitsnetz gegen `analyze(max_parallel: N)` & Co.: eine
+    // `uia-worker`-Rollenfamilie darf nie mit mehr als einer gleichzeitig
+    // laufenden Instanz gefanoutet werden, unabhängig vom Aufrufer-Wunsch.
+    // `max_concurrent_instances_for_role` kapselt die Organisationsrollen-
+    // Fallunterscheidung vollständig in `harw-core`, weil diese Crate
+    // `harw-agent-dsl` nur als `[dev-dependencies]` führt (siehe die
+    // Argument-Doku oben) und den Rollen-Enum-Typ im produktiven Build gar
+    // nicht benennen kann.
+    let slots = requested_slots.min(spawner.max_concurrent_instances_for_role(role));
+    if slots < requested_slots {
+        tracing::info!(
+            role,
+            requested_max_parallel = requested_slots,
+            effective_max_parallel = slots,
+            "agent_fanout.uia_worker_capped",
+        );
+    }
     let winner = AtomicBool::new(false);
     // Je Position die Session-ID, sobald das Kind admittiert ist — nur damit
     // der Scheduler laufende Geschwister kooperativ abbrechen kann.
@@ -2525,6 +2552,7 @@ contract = "{contract}"
             authority: AuthorityCeiling::default(),
             trace: ResolutionTrace { steps: Vec::new() },
             config: raw.tables,
+            reasoning_effort: raw.reasoning_effort.clone(),
         };
         lower(&resolved).expect("Test-Agent-Definition muss lowern")
     }
@@ -3561,6 +3589,65 @@ contract = "{contract}"
             );
             assert_eq!(active, 0, "abgelehnter Aufruf darf kein Kind admittieren");
         }
+    }
+
+    // ── UiaWorker-Fan-out-Deckelung ───────────────────────────────────────────
+
+    /// `fanout_children` (siehe oben, `agent_tool.rs`) deckelt `max_parallel` für
+    /// eine `uia-worker`-Rolle über
+    /// [`ManagedAgentSpawner::max_concurrent_instances_for_role`] statt über einen
+    /// direkten `harw_agent_dsl::roles::AgentRoleId`-Vergleich in dieser Datei:
+    /// `harw-core-bridge` führt `harw-agent-dsl` nur als `[dev-dependencies]`
+    /// (`harw-core-bridge/Cargo.toml`), der Rollen-Enum-Typ ist im produktiven
+    /// Build dieser Crate also gar nicht benennbar. Dieser Test belegt, dass die
+    /// Deckelungsmethode selbst — von genau hier aus, derselben Crate, aus der
+    /// `fanout_children` sie aufruft — für eine registrierte `uia-worker`-Rolle
+    /// `1` liefert und für eine andere Rolle unbeschränkt bleibt. Der volle
+    /// asynchrone Scheduler-Beweis (echte Nebenläufigkeitsmessung über mehrere
+    /// tatsächlich laufende Kind-Turns) lebt in
+    /// `harw-core/src/child_controller.rs`
+    /// (`run_children_caps_uia_worker_wave_to_one_regardless_of_max_parallel`),
+    /// weil `ManagedAgentSpawner`s `active`/`cancellations`-Felder, die diese
+    /// Testinfrastruktur braucht, `harw-core`-privat sind und von hier aus nicht
+    /// erreichbar sind.
+    #[test]
+    fn fanout_children_uia_worker_cap_is_reachable_from_this_crate() {
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let spawner = ManagedAgentSpawner::new(
+            Arc::new(Mutex::new(SessionManager::new(event_tx))),
+            ChildLimits::conservative(),
+        )
+        .with_role(
+            "uia-worker",
+            harw_types::AgentRole::Agent {
+                name: "uia-worker".to_owned(),
+            },
+            harw_agent_dsl::roles::AgentRoleId::UiaWorker,
+            Arc::new(IrRegistryFactory {
+                ir: ir_with_contract("harwness.return.coding-task@1"),
+            }),
+        )
+        .with_role(
+            "worker",
+            harw_types::AgentRole::Agent {
+                name: "worker".to_owned(),
+            },
+            harw_agent_dsl::roles::AgentRoleId::Worker,
+            Arc::new(IrRegistryFactory {
+                ir: ir_with_contract("harwness.return.coding-task@1"),
+            }),
+        );
+
+        assert_eq!(
+            spawner.max_concurrent_instances_for_role("uia-worker"),
+            1,
+            "a uia-worker role must cap fanout_children's slots to 1"
+        );
+        assert_eq!(
+            spawner.max_concurrent_instances_for_role("worker"),
+            usize::MAX,
+            "a non-uia-worker role must stay unbounded"
+        );
     }
 
     // ── Send + Sync compile-time check ────────────────────────────────────────

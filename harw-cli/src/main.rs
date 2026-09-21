@@ -682,7 +682,13 @@ fn serve_mcp(
     // ist das Arbeitsverzeichnis des Dienstes — dagegen löst der Worker die
     // Pfade des Mutationsvertrags auf.
     let plan_node_services = match home.as_deref() {
-        Some(home_path) => {
+        // Nur das Vorhandensein eines HARW-Home entscheidet (`plans/` gibt es
+        // nur unter Home). Der Home-Pfad selbst fließt hier nicht ein: der
+        // Projekt-Root von `build_plan_node_services` ist laut Kommentar
+        // oben bewusst das Arbeitsverzeichnis des Dienstes
+        // (`std::env::current_dir()`), nicht `home_path` — `runtime_root`
+        // unten ist die Stelle, die `home_path` tatsächlich verwendet.
+        Some(_) => {
             let plan_config = plan_tool_config_from_section(&config.harness.tools.plan)?;
             let project_root = std::env::current_dir().map_err(|error| error.to_string())?;
             build_plan_node_services(&plan_config, &project_root)?
@@ -1107,6 +1113,7 @@ fn open_serve_secret_resolver(
                 origin_allowlist: OriginAllowlistToml::default(),
                 rate_limit: None,
                 max_concurrency: None,
+                default_reasoning_effort: None,
             },
         );
         needs_resolver = true;
@@ -2813,6 +2820,7 @@ mod tests {
             origin_allowlist: OriginAllowlistToml::default(),
             rate_limit: None,
             max_concurrency: None,
+            default_reasoning_effort: None,
         };
         let mut config = ResolvedConfig::default();
         config.harness.default_provider = Some("gateway".to_owned());

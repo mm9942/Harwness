@@ -117,6 +117,7 @@ pub fn resolve_definition(
         steps: Vec::new(),
         config: toml::Table::new(),
         authority: AuthorityCeiling::default(),
+        reasoning_effort: None,
     };
     // 4–5. Ziel-Layer aufsteigend komponieren. Höhere Layer sind Overlays.
     for (layer_index, definition) in target_layers.iter().enumerate() {
@@ -139,6 +140,7 @@ pub fn resolve_definition(
         name: target.name.clone(),
         description: target.description.clone(),
         authority: ctx.authority,
+        reasoning_effort: ctx.reasoning_effort,
         trace: ResolutionTrace { steps: ctx.steps },
         config: ctx.config,
     })
@@ -166,6 +168,24 @@ struct ResolveCtx<'a> {
     config: toml::Table,
     /// Aktuell gültige Authority-Obergrenze.
     authority: AuthorityCeiling,
+    /// Aktuell gültiger Standard-Reasoning-Effort. Wird von jeder Ebene
+    /// (Basis vor Mixin vor eigenem Inhalt, ältere Vorfahren vor jüngeren,
+    /// niedrigere Schicht vor höherer) überschrieben, sofern diese Ebene
+    /// `reasoning_effort` selbst setzt (`Some`); eine Ebene ohne Aussage
+    /// (`None`) lässt den zuvor akkumulierten Wert unverändert. So gewinnt
+    /// stets die spezifischste Definition, die tatsächlich eine Aussage
+    /// trifft — analog zur Vererbungsregel von `BudgetSpec::effort_cap`.
+    reasoning_effort: Option<String>,
+}
+
+/// Wendet die "spezifischere Definition überschreibt"-Regel für
+/// `reasoning_effort` an: setzt `ctx.reasoning_effort` nur, wenn `definition`
+/// selbst eine Aussage trifft (`Some`); lässt den akkumulierten Wert bei
+/// `None` unverändert, statt ihn zu löschen.
+fn apply_reasoning_effort_override(ctx: &mut ResolveCtx<'_>, definition: &RawAgentDefinition) {
+    if let Some(effort) = &definition.reasoning_effort {
+        ctx.reasoning_effort = Some(effort.clone());
+    }
 }
 
 /// Resolves every ancestor of `definition`, from its root base to its direct base.
@@ -239,6 +259,7 @@ fn apply_mixins(
             });
         }
         merge_tables(&mut ctx.config, &mixin.tables);
+        apply_reasoning_effort_override(ctx, mixin);
         ctx.steps.push(ResolutionStep {
             source: mixin_ref.id.to_string(),
             kind: "mixin".to_owned(),
@@ -286,6 +307,11 @@ fn apply_definition_content(
     } else {
         merge_tables(&mut ctx.config, &definition.tables);
     }
+
+    // Zuletzt anwenden: die eigene Aussage dieser Definition ist innerhalb
+    // ihrer Ebene die spezifischste und überschreibt, was Basis/Mixins zuvor
+    // gesetzt haben (siehe [`apply_reasoning_effort_override`]).
+    apply_reasoning_effort_override(ctx, definition);
 
     ctx.steps.push(ResolutionStep {
         source: definition.id.to_string(),
@@ -1304,5 +1330,241 @@ capabilities = ["filesystem.read", "filesystem.write"]
             location.field_path.as_deref(),
             Some("authority.capabilities")
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // reasoning_effort: Vererbung über extends/mixins/Schichten
+    // (Rollen-Konflikt-Rangfolge: Provider > Modell > Agent > Rolle — dieser
+    // Knoten liefert nur die Agent-Ebene; siehe guard_wiring::resolve_default_reasoning_effort)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_reasoning_effort_absent_everywhere_resolves_to_none() {
+        let raw = parse_toml(MINIMAL_WORKER).unwrap();
+        let id = DefinitionId::parse("harwness.agent.worker@1").unwrap();
+        let layers = vec![(DefinitionLayer::BuiltIn, raw)];
+        let resolved = resolve_definition(&id, &layers, now()).unwrap();
+        assert!(resolved.reasoning_effort.is_none());
+    }
+
+    #[test]
+    fn test_reasoning_effort_set_only_on_target_is_used() {
+        let src = r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.effort-target@1"
+version = "1.0.0"
+role = "worker"
+specialization = "effort-target"
+reasoning_effort = "high"
+"#;
+        let raw = parse_toml(src).unwrap();
+        let id = DefinitionId::parse("harwness.agent.effort-target@1").unwrap();
+        let layers = vec![(DefinitionLayer::BuiltIn, raw)];
+        let resolved = resolve_definition(&id, &layers, now()).unwrap();
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn test_reasoning_effort_inherited_from_extends_base_when_target_silent() {
+        // Basis setzt reasoning_effort; das Ziel selbst schweigt dazu -> die
+        // Basisaussage wird übernommen (spezifischste vorhandene Aussage gewinnt,
+        // eine schweigende Ebene löscht nichts).
+        let base = parse_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.effort-base@1"
+version = "1.0.0"
+role = "worker"
+specialization = "base"
+reasoning_effort = "low"
+"#,
+        )
+        .unwrap();
+        let target = parse_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.effort-child@1"
+version = "1.0.0"
+role = "worker"
+specialization = "child"
+extends = { id = "harwness.agent.effort-base@1" }
+"#,
+        )
+        .unwrap();
+        let id = DefinitionId::parse("harwness.agent.effort-child@1").unwrap();
+        let layers = vec![
+            (DefinitionLayer::BuiltIn, base),
+            (DefinitionLayer::BuiltIn, target),
+        ];
+        let resolved = resolve_definition(&id, &layers, now()).unwrap();
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn test_reasoning_effort_target_overrides_extends_base() {
+        // Spezifischere Definition (Ziel) überschreibt die Aussage der Basis —
+        // identisch zur Vererbungsregel von BudgetSpec::effort_cap.
+        let base = parse_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.effort-base2@1"
+version = "1.0.0"
+role = "worker"
+specialization = "base"
+reasoning_effort = "low"
+"#,
+        )
+        .unwrap();
+        let target = parse_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.effort-child2@1"
+version = "1.0.0"
+role = "worker"
+specialization = "child"
+extends = { id = "harwness.agent.effort-base2@1" }
+reasoning_effort = "high"
+"#,
+        )
+        .unwrap();
+        let id = DefinitionId::parse("harwness.agent.effort-child2@1").unwrap();
+        let layers = vec![
+            (DefinitionLayer::BuiltIn, base),
+            (DefinitionLayer::BuiltIn, target),
+        ];
+        let resolved = resolve_definition(&id, &layers, now()).unwrap();
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn test_reasoning_effort_inherited_from_mixin_when_target_silent() {
+        let mixin = parse_toml(
+            r#"
+schema = "harwness.mixin/v1"
+id = "harwness.mixin.effort-mixin@1"
+version = "1.0.0"
+role = "worker"
+specialization = "mixin"
+reasoning_effort = "medium"
+"#,
+        )
+        .unwrap();
+        let target = parse_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.effort-mixin-user@1"
+version = "1.0.0"
+role = "worker"
+specialization = "target"
+mixins = [{ id = "harwness.mixin.effort-mixin@1" }]
+"#,
+        )
+        .unwrap();
+        let id = DefinitionId::parse("harwness.agent.effort-mixin-user@1").unwrap();
+        let layers = vec![
+            (DefinitionLayer::BuiltIn, mixin),
+            (DefinitionLayer::BuiltIn, target),
+        ];
+        let resolved = resolve_definition(&id, &layers, now()).unwrap();
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn test_reasoning_effort_target_overrides_mixin() {
+        let mixin = parse_toml(
+            r#"
+schema = "harwness.mixin/v1"
+id = "harwness.mixin.effort-mixin2@1"
+version = "1.0.0"
+role = "worker"
+specialization = "mixin"
+reasoning_effort = "medium"
+"#,
+        )
+        .unwrap();
+        let target = parse_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.effort-mixin-user2@1"
+version = "1.0.0"
+role = "worker"
+specialization = "target"
+mixins = [{ id = "harwness.mixin.effort-mixin2@1" }]
+reasoning_effort = "high"
+"#,
+        )
+        .unwrap();
+        let id = DefinitionId::parse("harwness.agent.effort-mixin-user2@1").unwrap();
+        let layers = vec![
+            (DefinitionLayer::BuiltIn, mixin),
+            (DefinitionLayer::BuiltIn, target),
+        ];
+        let resolved = resolve_definition(&id, &layers, now()).unwrap();
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn test_reasoning_effort_higher_layer_overrides_lower_layer() {
+        let builtin = parse_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.effort-layered@1"
+version = "1.0.0"
+role = "worker"
+specialization = "builtin"
+reasoning_effort = "low"
+"#,
+        )
+        .unwrap();
+        let project = parse_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.effort-layered@1"
+version = "1.1.0"
+role = "worker"
+specialization = "project"
+reasoning_effort = "high"
+"#,
+        )
+        .unwrap();
+        let id = DefinitionId::parse("harwness.agent.effort-layered@1").unwrap();
+        let layers = vec![
+            (DefinitionLayer::BuiltIn, builtin),
+            (DefinitionLayer::Project, project),
+        ];
+        let resolved = resolve_definition(&id, &layers, now()).unwrap();
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn test_reasoning_effort_higher_layer_silent_keeps_lower_layer_value() {
+        let builtin = parse_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.effort-layered2@1"
+version = "1.0.0"
+role = "worker"
+specialization = "builtin"
+reasoning_effort = "low"
+"#,
+        )
+        .unwrap();
+        let project = parse_toml(
+            r#"
+schema = "harwness.agent/v1"
+id = "harwness.agent.effort-layered2@1"
+version = "1.1.0"
+role = "worker"
+specialization = "project"
+"#,
+        )
+        .unwrap();
+        let id = DefinitionId::parse("harwness.agent.effort-layered2@1").unwrap();
+        let layers = vec![
+            (DefinitionLayer::BuiltIn, builtin),
+            (DefinitionLayer::Project, project),
+        ];
+        let resolved = resolve_definition(&id, &layers, now()).unwrap();
+        assert_eq!(resolved.reasoning_effort.as_deref(), Some("low"));
     }
 }

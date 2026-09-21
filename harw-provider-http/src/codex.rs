@@ -52,7 +52,7 @@ impl CodexRoute {
         let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
             return Ok(None);
         };
-        if PathBuf::from(path) != PathBuf::from(home).join(".codex/auth.json")
+        if Path::new(path) != PathBuf::from(home).join(".codex/auth.json")
             || pointer != ACCESS_POINTER
         {
             return Ok(None);
@@ -373,6 +373,7 @@ mod tests {
             rate_limit: None,
             max_concurrency: None,
             originator: None,
+            default_reasoning_effort: None,
         }
     }
 

@@ -123,8 +123,8 @@ pub(crate) struct CommandPopup {
     query: String,
     /// Indizes in `items`, sortiert nach Rang: exakter Treffer > Präfix-Treffer
     /// > Teilstring-Treffer; innerhalb eines Rangs nach Namenslänge, dann
-    /// alphabetisch (stabil, deterministisch — Registrierungsreihenfolge
-    /// entscheidet nie über die Anzeigereihenfolge).
+    /// > alphabetisch (stabil, deterministisch — Registrierungsreihenfolge
+    /// > entscheidet nie über die Anzeigereihenfolge).
     filtered: Vec<usize>,
     /// Anzahl der führenden Einträge in `filtered`, die exakte oder
     /// Präfix-Treffer sind (Rang 0/1). Da `filtered` nach Rang sortiert ist,

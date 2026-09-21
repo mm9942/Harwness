@@ -30,8 +30,8 @@
 //!
 //! # Validierung
 //! Nach jedem Schreiben lädt [`print_validation_result`] die betroffene
-//! Config-Kette neu (`harw_home::config_layers` + `harw_config::discover_config`
-//! + `ResolvedConfig::validate`) und druckt ein knappes Ergebnis — im Stil
+//! Config-Kette neu (`harw_home::config_layers` +
+//! `harw_config::discover_config` + `ResolvedConfig::validate`) und druckt ein knappes Ergebnis — im Stil
 //! von `harw doctor` (`crate::doctor`), aber nicht fehlschlagend: die Datei
 //! ist zu diesem Zeitpunkt bereits geschrieben.
 //!
@@ -435,6 +435,7 @@ fn add_provider(
         origin_allowlist: harw_config::OriginAllowlistToml::default(),
         rate_limit: None,
         max_concurrency: None,
+        default_reasoning_effort: None,
     };
     write_provider(home, &provider)
 }

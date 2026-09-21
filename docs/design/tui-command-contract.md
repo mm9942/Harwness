@@ -138,7 +138,7 @@ Legend for **Tier**: `Obs` `Op` `Maint` `Own`.
 | `/fork` | `[--from=turn-id]` | Branch a new session from current or a past turn | Op | Y |
 | `/archive` | `<SessionKey>` | Move a session out of the active list | Op | Y |
 | `/sessions` | `[--all] [--agent=AgentRef]` | List sessions, optionally across agents | Obs | Y |
-| `/export` | `<SessionKey?> [--format=md\|json]` | Export a session transcript | Op | R |
+| `/export` | `[--format md\|markdown\|json] [--tools\|--no-tools] [--reasoning-summary] [--datei <pfad>] [--max-chars <n>]` | Export a session transcript; `--max-chars <n>` caps the total rendered export length at `n` Unicode characters (whole export, not per entry) — implemented in `harw-ops/src/export.rs` (`ExportArgs::max_chars`) and consumed by `harw_tui::export::ExportOptions::max_chars` | Op | R |
 
 ### 2.2 Agent & topology
 
@@ -179,8 +179,8 @@ Legend for **Tier**: `Obs` `Op` `Maint` `Own`.
 | Command | Args | Description | Tier | Parity |
 |---|---|---|---|---|
 | `/doctor` | `[--fix] [--section=catalog\|config\|provider\|mcp\|sandbox\|policy]` | Health check across catalog/config/provider/MCP/sandbox/policy | Obs (plain), Maint (`--fix`) | Y |
-| `/model` | `[ProviderRef/model \| --status]` | Select or inspect the active model/provider | Op | Y |
-| `/provider` | `[ProviderRef] [--auth] [--status]` | Inspect or switch provider, manage credentials | Maint (`--auth`), Op (else) | R |
+| `/model` | `show \| list \| switch <id>` | Inspect the active model, or atomically switch provider+model together (implemented grammar; see `interaction-contract.md` §2.6.1 for the full Ist-Stand table, including the new `/uia-model`, `/uia-worker-model`, `/effort`, `/uia-effort`, `/provider-concurrency` siblings) | Op | Y |
+| `/provider` | `show \| list \| test` | Inspect provider status and credentials only — **`/provider switch` no longer exists**; a provider (and model) switch is exclusively driven by `/model switch <id>` (atomic, works even across providers) | Op | R |
 | `/skills` | `[SkillRef] [--search=text] [--install]` | Browse, search, or install skills | Op (browse), Maint (`--install`) | R |
 | `/tools` | `[ToolRef] [--enable \| --disable]` | Show or toggle tool availability for the session | Op | R |
 | `/mcp` | `[McpServerRef] [--add \| --remove \| --status]` | Inspect or manage MCP server bindings | Maint | - |
@@ -280,7 +280,7 @@ optional two-key chords, entirely configurable via TOML in `harw-config`.
 
 | Key | Action |
 |---|---|
-| `Ctrl+C` (×2 within 1s) | Quit (double-tap guard against accidental exit) |
+| `Ctrl+C` (×2 within 2s) | Idle: quit (double-tap guard against accidental exit). Busy (during a running turn): **hard interrupt** — first press cancels the running model call, shell/sandbox subprocesses (SIGKILL), and child agents, and arms the same double-tap state as idle; a second press within the window quits. Model-call and subprocess cancellation (`harw-core/src/turn_loop.rs`, `harw-tool-shell/src/exec.rs`), child-agent cancellation wiring (`register_parent_cancel_token` called from `run_turn_streaming` in `harw-tui/src/app.rs`), and the unified idle/busy double-tap state (`pending_quit`/`hard_quit_requested`, `QuitArm`/`QUIT_HINT_WINDOW`) are all implemented — see `interaction-contract.md` §2.6.4. |
 | `Ctrl+K` | Open command palette (fuzzy `/` command search) |
 | `Ctrl+L` | Clear visible transcript pane |
 | `F1` | Toggle help overlay (keybinding + command cheat sheet) |
@@ -336,7 +336,7 @@ lists all registered chords.
 # ~/.config/harwness/keybindings.toml
 
 [global]
-quit = { keys = ["ctrl+c", "ctrl+c"], within_ms = 1000 }
+quit = { keys = ["ctrl+c", "ctrl+c"], within_ms = 2000 }
 command-palette = { keys = ["ctrl+k"] }
 clear-transcript = { keys = ["ctrl+l"] }
 help-overlay = { keys = ["f1"] }
@@ -676,6 +676,43 @@ terminal, presentation-facing type rather than a propagation type.
 
 **Parity summary**: of 56 inventoried commands, 25 are full `ChannelParity`,
 17 are `ChannelReduced`, 14 are `TuiOnly`.
+
+### 6.1 Busy availability (immediate vs. deferred dispatch)
+
+Independent of channel parity, every `CommandSpec` also carries a
+`busy: BusyAvailability` (`Immediate` vs. `DeferredUntilTurnEnd`, the
+default), set from the underlying `OperationMeta.busy` in `harw-ops`. Today
+`/status`, `/ps`, `/usage`, `/help`, `/diff`, `/work`, `/review`, `/model`,
+`/provider`, `/approve`, `/deny`, `/cancel`, `/stop` are `Immediate` at the
+`OperationMeta` level; every other command is deferred until the running turn
+ends. `/cancel`/`/stop` act on the `JobStore` (background jobs), not the
+running turn itself — Ctrl+C (§4.1) remains the only way to interrupt a turn
+in progress. The TUI's busy-key dispatch loop (`queue_busy_key` in
+`harw-tui/src/app.rs`, delegating to `busy_availability_for` in
+`harw-tui/src/command_exec.rs`) is now wired and further narrows `/model`
+and `/provider`: only `show`/`list` (and bare `/provider`, which is `show`)
+dispatch immediately during a running turn; `/model switch`, bare `/model`
+(opens the picker), and `/provider test` are queued to `deferred_input` and
+run after the turn ends like any other deferred command. Every other listed
+`Immediate` command keeps `spec.busy` unchanged. See
+`interaction-contract.md` §2.6.3 for the full table and status.
+
+### 6.2 Model/provider picker consolidation
+
+The former four separate dialog variants (`ProviderChoice`/`ModelChoice`/
+`UiaProviderChoice`/`UiaModelChoice`) are gone. `harw-tui/src/app.rs`'s
+`Overlay` enum now has a single `Overlay::ModelSwitch(ModelSwitchPicker)`
+variant, backed by the consolidated `ModelSwitchPicker` widget
+(`harw-tui/src/model_switch_picker.rs`: provider stage → model stage, `Left`
+to go back, `Esc` cancels). Bare `/model`, `/uia-model` and
+`/uia-worker-model` (and their argless `switch`) open the picker; for
+`/uia-worker-model` the picker skips the provider stage entirely
+(`PickerTarget::UiaWorker { fixed_provider }`) since the worker is bound to
+the UIA's own provider. `/model switch <id>` with an explicit argument stays
+a plain text dispatch. Bare `/provider`/`/uia-provider` no longer open any
+picker — they run `show`. A parallel single-stage `Overlay::EffortChoice`
+opens for bare `/effort`/`/uia-effort`, listing all six reasoning-effort
+levels plus a "Provider-Default (zurücksetzen)" entry that emits `clear`.
 
 ---
 

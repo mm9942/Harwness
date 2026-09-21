@@ -720,8 +720,13 @@ impl FilePlanStore {
     /// Siegel. Der erste Zustand ist immer ein Checkpoint; danach gilt ein
     /// Intervall von zehn Revisionen oder ein terminaler Übergang.
     fn checkpoint_required(candidate: &Plan, events: &[PlanEvent]) -> bool {
+        // `u64::is_multiple_of` was stabilized in Rust 1.87; this workspace's
+        // `rust-version` is 1.85 (see root Cargo.toml), so the manual `% == 0`
+        // form is kept intentionally instead of upgrading the MSRV.
+        #[allow(clippy::manual_is_multiple_of)]
+        let is_checkpoint_interval = candidate.revision.value() % CHECKPOINT_INTERVAL == 0;
         candidate.revision.value() == 1
-            || candidate.revision.value() % CHECKPOINT_INTERVAL == 0
+            || is_checkpoint_interval
             || events.iter().any(|event| matches!(
                 &event.action,
                 PlanAction::SetStatus {

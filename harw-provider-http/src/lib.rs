@@ -96,6 +96,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
@@ -241,7 +242,7 @@ const EXTERNAL_CLI_CREDENTIALS: &[(&str, &[&str], &[&str])] = &[
 pub fn build_provider(
     config: &harw_config::ResolvedConfig,
 ) -> HttpProviderResult<Box<dyn ModelProvider>> {
-    build_provider_with_optional_resolver(config, None, None)
+    build_provider_with_optional_resolver(config, None, None).map(|(provider, _)| provider)
 }
 
 /// Builds configured providers with an injected synchronous `secrets:` resolver.
@@ -251,7 +252,45 @@ pub fn build_provider_with_resolver(
     config: &harw_config::ResolvedConfig,
     resolver: &dyn SecretResolver,
 ) -> HttpProviderResult<Box<dyn ModelProvider>> {
+    build_provider_with_optional_resolver(config, Some(resolver), None).map(|(provider, _)| provider)
+}
+
+/// Wie [`build_provider`], liefert zusätzlich eine [`ProviderLoadRegistry`]
+/// mit den [`ProviderLoadControl`]-Handles aller Provider, die diese
+/// Fähigkeit unterstützen (aktuell: alle OpenAI-kompatiblen Backends, siehe
+/// [`ProviderLoadRegistry`]-Doku).
+///
+/// # Composition-Root-Hinweis
+/// Gedacht für den Wiring-Punkt, der `harw_operations::context::ServiceMap`
+/// zusammenbaut (siehe `harw-runtime/src/assembly.rs` bzw. `services.rs`):
+/// `services.insert(registry)` macht die Handles für `harw-ops` erreichbar
+/// (siehe `harw-ops::provider`/`harw-ops::status`, die `ctx.service::<
+/// ProviderLoadRegistry>()` abfragen). `build_provider`/
+/// `build_provider_with_resolver`/`build_provider_with_home` bleiben
+/// unverändert (verwerfen die Registry) — bestehende Aufrufer sind von
+/// dieser Erweiterung nicht betroffen.
+pub fn build_provider_with_load_registry(
+    config: &harw_config::ResolvedConfig,
+) -> HttpProviderResult<(Box<dyn ModelProvider>, ProviderLoadRegistry)> {
+    build_provider_with_optional_resolver(config, None, None)
+}
+
+/// Wie [`build_provider_with_load_registry`] mit injiziertem `secrets:`-Resolver.
+pub fn build_provider_with_load_registry_and_resolver(
+    config: &harw_config::ResolvedConfig,
+    resolver: &dyn SecretResolver,
+) -> HttpProviderResult<(Box<dyn ModelProvider>, ProviderLoadRegistry)> {
     build_provider_with_optional_resolver(config, Some(resolver), None)
+}
+
+/// Wie [`build_provider_with_load_registry`] mit bekanntem harw-Home (siehe
+/// [`build_provider_with_home`] für die `file:`/`file-json:`-Auflösung).
+pub fn build_provider_with_load_registry_and_home(
+    config: &harw_config::ResolvedConfig,
+    home: &Path,
+    resolver: Option<&dyn SecretResolver>,
+) -> HttpProviderResult<(Box<dyn ModelProvider>, ProviderLoadRegistry)> {
+    build_provider_with_optional_resolver(config, resolver, Some(home))
 }
 
 /// Baut die konfigurierten Provider mit bekanntem harw-Home.
@@ -276,14 +315,14 @@ pub fn build_provider_with_home(
     home: &Path,
     resolver: Option<&dyn SecretResolver>,
 ) -> HttpProviderResult<Box<dyn ModelProvider>> {
-    build_provider_with_optional_resolver(config, resolver, Some(home))
+    build_provider_with_optional_resolver(config, resolver, Some(home)).map(|(provider, _)| provider)
 }
 
 fn build_provider_with_optional_resolver(
     config: &harw_config::ResolvedConfig,
     resolver: Option<&dyn SecretResolver>,
     home: Option<&Path>,
-) -> HttpProviderResult<Box<dyn ModelProvider>> {
+) -> HttpProviderResult<(Box<dyn ModelProvider>, ProviderLoadRegistry)> {
     let sources = SecretSources {
         env_layer: &config.env_layer,
         resolver,
@@ -302,6 +341,7 @@ fn build_provider_with_optional_resolver(
     })?;
 
     let mut providers = BTreeMap::new();
+    let mut load_controls: ProviderLoadRegistry = BTreeMap::new();
     for (name, provider) in config
         .providers
         .iter()
@@ -309,17 +349,22 @@ fn build_provider_with_optional_resolver(
         .collect::<BTreeMap<_, _>>()
     {
         let backend = match build_named_provider(name, provider, config, model, sources) {
-            Ok(backend) => backend,
+            Ok((backend, load_control)) => {
+                if let Some(load_control) = load_control {
+                    load_controls.insert(name.to_owned(), load_control);
+                }
+                backend
+            }
             Err(error) if name != provider_name => Box::new(UnavailableProvider(error.to_string())),
             Err(error) => return Err(error),
         };
         providers.insert(name.to_owned(), backend);
     }
 
-    Ok(Box::new(RoutingModelProvider::new(
-        providers,
-        provider_name,
-    )?))
+    Ok((
+        Box::new(RoutingModelProvider::new(providers, provider_name)?),
+        load_controls,
+    ))
 }
 
 struct UnavailableProvider(String);
@@ -360,13 +405,29 @@ fn network_retry_policy() -> RetryPolicy {
     }
 }
 
+/// Rückgabe von [`build_named_provider`]: der gebaute Provider-Backend plus
+/// dessen optionales [`ProviderLoadControl`]-Handle.
+type NamedProviderBuild = (Box<dyn ModelProvider>, Option<std::sync::Arc<dyn ProviderLoadControl>>);
+
+/// Builds one named provider backend, plus its [`ProviderLoadControl`] handle
+/// when the backend supports it.
+///
+/// # Returns
+/// `Some` load-control handle for both HTTP-backed branches: the
+/// OpenAI-compatible branch (the concrete [`OpenAiResponsesProvider`] always
+/// builds a [`DynamicConcurrencyLimiter`], see
+/// [`OpenAiResponsesProvider::from_named_config`]-Doku) and the
+/// `anthropic-messages` branch, where [`AnthropicMessagesProvider::configure_concurrency`]
+/// installs the same [`DynamicConcurrencyLimiter`] type before the backend is
+/// moved into [`retry::RetryingProvider`] (Anthropic-Parität for W6b's
+/// rate-limit-visibility slice, previously OpenAI-only).
 fn build_named_provider(
     provider_name: &str,
     provider: &harw_config::ProviderToml,
     config: &harw_config::ResolvedConfig,
     default_model: &str,
     sources: SecretSources<'_>,
-) -> HttpProviderResult<Box<dyn ModelProvider>> {
+) -> HttpProviderResult<NamedProviderBuild> {
     validate_endpoint(&provider.base_url)?;
     let sources = SecretSources {
         endpoint: Some(&provider.base_url),
@@ -476,16 +537,36 @@ fn build_named_provider(
         );
         backend.configure_rate_limit(provider.rate_limit.clone());
         backend.configure_credential_pool(pool);
-        return Ok(Box::new(RetryingProvider::new(
-            backend,
-            network_retry_policy(),
-        )));
+        backend.configure_concurrency(provider.max_concurrency);
+        // Beide `Arc`s werden geklont, *bevor* `backend` unten per Wert in
+        // `RetryingProvider::new` verschoben wird — siehe
+        // [`ProviderLoadHandle`]-Doku (identisches Muster zum
+        // OpenAI-kompatiblen Zweig unten).
+        let load_control: std::sync::Arc<dyn ProviderLoadControl> =
+            std::sync::Arc::new(ProviderLoadHandle {
+                provider_id: provider_name.to_owned(),
+                concurrency_limiter: backend.concurrency_limiter(),
+                rate_limiter: backend.rate_limiter_handle(),
+            });
+        return Ok((
+            Box::new(RetryingProvider::new(backend, network_retry_policy())),
+            Some(load_control),
+        ));
     }
 
-    Ok(Box::new(RetryingProvider::new(
-        OpenAiResponsesProvider::from_named_config(provider_name, provider, config, model, sources)?,
-        network_retry_policy(),
-    )))
+    let http_provider =
+        OpenAiResponsesProvider::from_named_config(provider_name, provider, config, model, sources)?;
+    // Beide `Arc`s werden geklont, *bevor* `http_provider` unten per Wert in
+    // `RetryingProvider::new` verschoben wird — siehe [`ProviderLoadHandle`]-Doku.
+    let load_control: std::sync::Arc<dyn ProviderLoadControl> = std::sync::Arc::new(ProviderLoadHandle {
+        provider_id: provider_name.to_owned(),
+        concurrency_limiter: http_provider.concurrency_limiter(),
+        rate_limiter: http_provider.rate_limiter_handle(),
+    });
+    Ok((
+        Box::new(RetryingProvider::new(http_provider, network_retry_policy())),
+        Some(load_control),
+    ))
 }
 
 /// Löst Base-URL + Credential für den nativen Anthropic-Weg auf.
@@ -743,6 +824,449 @@ pub enum Transport {
     Chat,
 }
 
+/// Sentinel-Permit-Zahl, die [`DynamicConcurrencyLimiter`] für „unbegrenzt"
+/// verwendet — der von `tokio::sync::Semaphore` selbst erzwungene
+/// Höchstwert (`usize::MAX >> 3`). `Option<usize>::None` wird intern immer
+/// auf diesen Wert abgebildet, damit Wachstums-/Schrumpf-Vergleiche in
+/// [`DynamicConcurrencyLimiter::set_target`] und
+/// [`DynamicConcurrencyLimiterState::release`] ohne `Option`-Sonderfälle als
+/// reiner `usize`-Vergleich auskommen.
+const UNLIMITED_PERMITS: usize = tokio::sync::Semaphore::MAX_PERMITS;
+
+/// Geteilter, interner Zustand von [`DynamicConcurrencyLimiter`].
+///
+/// Getrennt vom öffentlichen Typ und selbst hinter einem `Arc`, damit
+/// [`ConcurrencyPermit`] ihn beim Erwerb per günstigem `Arc::clone`
+/// referenzieren kann, ohne dass [`DynamicConcurrencyLimiter::acquire`]
+/// einen `self: Arc<Self>`-Empfänger bräuchte (das läge außerhalb der auf
+/// stable Rust unterstützten Empfänger-Typen) — `DynamicConcurrencyLimiter`
+/// bleibt dadurch ein gewöhnlicher `&self`-Typ, den Aufrufer optional selbst
+/// in ein `Arc` packen (wie es [`OpenAiResponsesProvider::concurrency_limiter`]
+/// tut).
+struct DynamicConcurrencyLimiterState {
+    semaphore: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Permits, die aktuell insgesamt im Semaphore stecken (frei + im
+    /// Umlauf). Wächst sofort in [`DynamicConcurrencyLimiter::set_target`].
+    /// Schrumpft zweistufig: sofort für aktuell freie Permits (ebenfalls in
+    /// [`DynamicConcurrencyLimiter::set_target`], per
+    /// `Semaphore::forget_permits`), der Rest (Permits, die gerade in
+    /// Benutzung waren) erst lazy bei Rückgabe in [`Self::release`].
+    total_permits: AtomicUsize,
+    /// Gewünschte Permit-Zahl. Kann während eines laufenden Schrumpfens
+    /// kleiner sein als `total_permits`.
+    target: AtomicUsize,
+}
+
+impl DynamicConcurrencyLimiterState {
+    // Wird von `ConcurrencyPermit::drop` aufgerufen, wenn ein Permit
+    // zurückgegeben wird. Schrumpft lazy in Richtung `target`, indem das
+    // Permit statt zurückgegeben verworfen wird (`forget`), solange
+    // `total_permits > target` gilt — nie mehr als ein Permit pro Aufruf,
+    // laufende (bereits erworbene) Permits sind davon nie betroffen.
+    fn release(&self, permit: tokio::sync::OwnedSemaphorePermit) {
+        loop {
+            let target = self.target.load(Ordering::SeqCst);
+            let current_total = self.total_permits.load(Ordering::SeqCst);
+            if current_total <= target {
+                drop(permit);
+                return;
+            }
+            if self
+                .total_permits
+                .compare_exchange(
+                    current_total,
+                    current_total - 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                permit.forget();
+                return;
+            }
+            // Eine gleichzeitige Rückgabe/`set_target` hat `total_permits`
+            // inzwischen verändert; mit dem neuen Stand erneut versuchen.
+        }
+    }
+}
+
+/// Elastischer Nebenläufigkeits-Limiter für [`OpenAiResponsesProvider`]
+/// (siehe `provider.max_concurrency`, [`harw_config::ProviderToml::max_concurrency`]).
+///
+/// # Description
+/// Kapselt ein `tokio::sync::Semaphore`, dessen effektive Permit-Zahl sich
+/// zur Laufzeit ändern lässt, ohne laufende Requests jemals abzubrechen:
+///
+/// - **Vergrößern** ([`Self::set_target`] auf einen höheren Wert) wirkt
+///   sofort: die zusätzlichen Permits werden direkt via
+///   `Semaphore::add_permits` freigegeben, ein wartender Aufrufer bekommt
+///   sein Permit ohne auf laufende Requests zu warten.
+/// - **Verkleinern** wirkt zweistufig: `target` wird sofort auf den neuen,
+///   kleineren Wert gesetzt, und [`Self::set_target`] zieht im selben
+///   Aufruf sofort so viele aktuell *freie* Permits wie möglich direkt aus
+///   dem Semaphore ab (`Semaphore::forget_permits`) — bei einem
+///   unbegrenzten oder gerade wenig ausgelasteten Limiter greift die neue
+///   Grenze dadurch sofort, nicht erst beim nächsten `acquire`/`release`.
+///   Nur der Teil, der gerade tatsächlich in Benutzung ist, kann nicht
+///   sofort entzogen werden und schrumpft weiterhin lazy: sobald so ein
+///   Permit zurückgegeben wird, ruft [`ConcurrencyPermit::drop`]
+///   [`DynamicConcurrencyLimiterState::release`] auf, das prüft, ob
+///   `total_permits > target` gilt, und in diesem Fall das zurückgegebene
+///   Permit per `OwnedSemaphorePermit::forget` verwirft (statt es ans
+///   Semaphore zurückzugeben) — ein Permit weniger pro Rückgabe, bis
+///   `total_permits == target` erreicht ist. Laufende Requests behalten ihr
+///   eigenes Permit bis zum Ende und werden nie unterbrochen.
+///
+/// `None`/unbegrenzt wird als [`UNLIMITED_PERMITS`] (der von tokio selbst
+/// erzwungene Höchstwert) modelliert statt als echter `enum`-Sonderfall —
+/// das hält Wachstums-/Schrumpf-Vergleiche einheitlich (immer ein simpler
+/// `usize`-Vergleich) und vermeidet doppelte Verzweigungen in
+/// `acquire`/`set_target`/`release`.
+///
+/// # Concurrency
+/// `Send + Sync`. `acquire` ist die einzige `await`-Stelle; `set_target` und
+/// die Permit-Rückgabe (`release`) sind beide lock-frei über
+/// `AtomicUsize`-CAS-Schleifen implementiert, kein `Mutex` auf dem Hot-Path.
+/// Mehrere gleichzeitige `set_target`-Aufrufe sind sicher (CAS verhindert
+/// doppeltes Zählen); mehrere gleichzeitige Permit-Rückgaben während eines
+/// Schrumpfens sind ebenfalls sicher (jede Rückgabe schrumpft höchstens um
+/// genau ein Permit).
+pub struct DynamicConcurrencyLimiter {
+    state: std::sync::Arc<DynamicConcurrencyLimiterState>,
+}
+
+impl std::fmt::Debug for DynamicConcurrencyLimiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynamicConcurrencyLimiter")
+            .field("target", &self.target())
+            .field("available", &self.available())
+            .finish()
+    }
+}
+
+impl DynamicConcurrencyLimiter {
+    /// Baut einen neuen Limiter.
+    ///
+    /// # Arguments
+    /// - `initial` (`Option<usize>`): Anfangs-Ziel (siehe
+    ///   [`harw_config::ProviderToml::max_concurrency`]); `None` heißt
+    ///   praktisch unbegrenzt (siehe [`UNLIMITED_PERMITS`]).
+    ///
+    /// # Returns
+    /// Einen Limiter mit `total_permits == target == initial` (bzw.
+    /// [`UNLIMITED_PERMITS`] für `None`).
+    #[must_use]
+    pub fn new(initial: Option<usize>) -> Self {
+        let permits = initial.unwrap_or(UNLIMITED_PERMITS).min(UNLIMITED_PERMITS);
+        Self {
+            state: std::sync::Arc::new(DynamicConcurrencyLimiterState {
+                semaphore: std::sync::Arc::new(tokio::sync::Semaphore::new(permits)),
+                total_permits: AtomicUsize::new(permits),
+                target: AtomicUsize::new(permits),
+            }),
+        }
+    }
+
+    /// Erwirbt ein Permit; wartet, bis eines frei wird.
+    ///
+    /// # Returns
+    /// Ein [`ConcurrencyPermit`]-Guard, der das Permit hält, bis er gedroppt
+    /// wird (siehe [`DynamicConcurrencyLimiterState::release`] für das
+    /// Verhalten beim Drop während eines laufenden Schrumpfens).
+    ///
+    /// # Errors
+    /// - [`tokio::sync::AcquireError`]: das interne Semaphore wurde
+    ///   geschlossen. `DynamicConcurrencyLimiter` schließt es selbst nie —
+    ///   tritt praktisch nicht auf.
+    ///
+    /// # Concurrency
+    /// Sicher von mehreren Tasks gleichzeitig aufrufbar; wartet kooperativ
+    /// (kein Busy-Loop) über `tokio::sync::Semaphore`.
+    pub async fn acquire(&self) -> Result<ConcurrencyPermit, tokio::sync::AcquireError> {
+        let permit = std::sync::Arc::clone(&self.state.semaphore)
+            .acquire_owned()
+            .await?;
+        Ok(ConcurrencyPermit {
+            permit: Some(permit),
+            state: std::sync::Arc::clone(&self.state),
+        })
+    }
+
+    /// Setzt das Ziel neu. Wachsen wirkt sofort, Schrumpfen lazy (siehe
+    /// Typ-Dokumentation).
+    ///
+    /// # Arguments
+    /// - `new_target` (`Option<usize>`): neues Ziel; `None` heißt unbegrenzt.
+    ///
+    /// # Concurrency
+    /// Lock-frei (CAS-Schleife über `total_permits`); sicher, wenn mehrere
+    /// Aufrufer gleichzeitig `set_target` aufrufen.
+    pub fn set_target(&self, new_target: Option<usize>) {
+        let new_target = new_target.unwrap_or(UNLIMITED_PERMITS).min(UNLIMITED_PERMITS);
+        self.state.target.store(new_target, Ordering::SeqCst);
+        loop {
+            let current_total = self.state.total_permits.load(Ordering::SeqCst);
+            if new_target == current_total {
+                // Bereits auf Ziel — weder wachsen noch sofort schrumpfen
+                // nötig.
+                break;
+            }
+            if new_target > current_total {
+                // Wachsen: sofort per `add_permits`, siehe Typ-Doku. CAS
+                // gegen `total_permits`, damit ein gleichzeitiger
+                // `set_target`/`release`-Aufruf nicht überschrieben wird.
+                let delta = new_target - current_total;
+                if self
+                    .state
+                    .total_permits
+                    .compare_exchange(current_total, new_target, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    self.state.semaphore.add_permits(delta);
+                    break;
+                }
+                // Ein gleichzeitiger Aufruf hat `total_permits` inzwischen
+                // verändert; mit dem neuen Stand erneut versuchen.
+            } else {
+                // Schrumpfen, Stufe 1 (sofort): so viele FREIE Permits wie
+                // möglich direkt aus dem Semaphore einziehen
+                // (`Semaphore::forget_permits`, tokio 1.53 — entfernt bis zu
+                // `excess` aktuell verfügbare Permits sofort und liefert die
+                // tatsächlich entfernte Anzahl `forgotten <= excess`, ohne
+                // auf laufende/erworbene Permits zu warten oder sie
+                // anzutasten). Der Rest, falls `forgotten < excess` weil
+                // gerade zu viele Permits in Benutzung waren, wird lazy bei
+                // Rückgabe verworfen (siehe
+                // [`DynamicConcurrencyLimiterState::release`]).
+                //
+                // Invariante: `total_permits` wird hier ausschließlich per
+                // `fetch_sub(forgotten)` nachgeführt (kein CAS gegen den
+                // zuvor gelesenen `current_total`), weil `forget_permits`
+                // bereits unwiderruflich und atomar gegen den tatsächlichen
+                // freien Bestand des Semaphores wirkt — die zurückgegebene
+                // Anzahl ist unabhängig davon korrekt, ob `total_permits`
+                // zwischenzeitlich durch ein gleichzeitiges `set_target`
+                // (Wachsen) oder `release` (lazy Schrumpfen) verändert
+                // wurde. Ein `fetch_sub` ist dafür ausreichend und race-frei,
+                // da es die tatsächlich vergessenen Permits abzieht, egal
+                // welchen Wert `total_permits` gerade hat; `total_permits`
+                // fällt dadurch nie unter `target`, weil `forgotten` niemals
+                // mehr als `excess = current_total - new_target` sein kann.
+                let excess = current_total - new_target;
+                let forgotten = self.state.semaphore.forget_permits(excess);
+                if forgotten > 0 {
+                    self.state
+                        .total_permits
+                        .fetch_sub(forgotten, Ordering::SeqCst);
+                }
+                break;
+            }
+        }
+    }
+
+    /// Aktuelles Ziel, oder `None` für unbegrenzt.
+    #[must_use]
+    pub fn target(&self) -> Option<usize> {
+        let target = self.state.target.load(Ordering::SeqCst);
+        (target != UNLIMITED_PERMITS).then_some(target)
+    }
+
+    /// Aktuell verfügbare (nicht im Umlauf befindliche) Permits.
+    ///
+    /// # Returns
+    /// Für einen unbegrenzten Limiter ein sehr großer Wert (nahe
+    /// [`UNLIMITED_PERMITS`]) statt `usize::MAX` — kein Sonderfall nötig,
+    /// da praktisch nie erreicht.
+    #[must_use]
+    pub fn available(&self) -> usize {
+        self.state.semaphore.available_permits()
+    }
+}
+
+/// RAII-Guard für ein von [`DynamicConcurrencyLimiter::acquire`] erworbenes
+/// Permit.
+///
+/// # Description
+/// Hält intern ein `tokio::sync::OwnedSemaphorePermit`. Beim Drop
+/// entscheidet [`DynamicConcurrencyLimiterState::release`], ob das Permit
+/// normal ans Semaphore zurückgegeben wird, oder — falls der Limiter
+/// inzwischen lazy schrumpft und noch mehr Permits im Umlauf sind als das
+/// aktuelle Ziel erlaubt — verworfen wird, um die Kapazität dauerhaft (bis
+/// zum nächsten Wachsen) zu reduzieren.
+pub struct ConcurrencyPermit {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    state: std::sync::Arc<DynamicConcurrencyLimiterState>,
+}
+
+impl Drop for ConcurrencyPermit {
+    fn drop(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            self.state.release(permit);
+        }
+    }
+}
+
+/// Provider-neutraler Zustandsbericht über Nebenläufigkeit und Rate-Limit-Pacing
+/// eines HTTP-Providers (W6b — UIA-Sichtbarkeit auf Provider-Concurrency/
+/// Rate-Limit-Zustand).
+///
+/// # Description
+/// Aggregiert die zwei unabhängigen Laufzeit-Schutzmechanismen eines Providers
+/// in einer einzigen, textformatierbaren Momentaufnahme: das harte,
+/// client-seitige Nebenläufigkeits-Limit ([`DynamicConcurrencyLimiter`]) und
+/// das reaktive Header-Pacing ([`rate_limiter::ProviderRateLimiter`]). Gedacht
+/// für `/status`/`/provider show` (Mensch) und als `ModelResponse`-Datenquelle
+/// für ein `provider-concurrency`-Modell-Tool (UIA) — siehe
+/// [`ProviderLoadControl`].
+#[derive(Debug, Clone)]
+pub struct ProviderLoadStatus {
+    /// Kanonischer Provider-Name (Schlüssel in `harw_config::ResolvedConfig::providers`).
+    pub provider: String,
+    /// Aktuell konfiguriertes Nebenläufigkeits-Ziel, oder `None` für unbegrenzt
+    /// (siehe [`DynamicConcurrencyLimiter::target`]).
+    pub max_concurrency: Option<usize>,
+    /// Aktuell freie (nicht im Umlauf befindliche) Permits (siehe
+    /// [`DynamicConcurrencyLimiter::available`]). `usize::MAX`, wenn dieser
+    /// Provider ohne installierten Limiter gebaut wurde (siehe
+    /// [`OpenAiResponsesProvider::concurrency_limiter`]-Doku).
+    pub available_permits: usize,
+    /// Aktuell fällige Pacing-Wartezeit aus beobachteten Rate-Limit-Headern
+    /// (siehe [`rate_limiter::ProviderRateLimiter::pending_wait`]); `None`,
+    /// wenn kein Kontingent knapp ist oder der Pacer deaktiviert ist.
+    pub rate_limit_wait: Option<Duration>,
+    /// Gesamtzahl seit Provider-Konstruktion beobachteter HTTP-429-Antworten
+    /// (siehe [`rate_limiter::ProviderRateLimiter::rate_limited_count`]).
+    /// Wiederholte 429 sind das primäre Signal, die Concurrency für diesen
+    /// Provider zu **senken** — nicht zu erhöhen.
+    pub recent_rate_limited: u64,
+}
+
+/// Provider-neutrale Steuer- und Beobachtungsfläche für Nebenläufigkeit und
+/// Rate-Limit-Zustand — die Schnittstelle, über die ein Ops-Layer (z. B.
+/// `harw-ops`) einen konkreten HTTP-Provider beobachten und live anpassen
+/// kann, ohne dessen konkreten Rust-Typ zu kennen.
+///
+/// # Description
+/// `harw-ops` sieht Provider normalerweise nur als `Arc<dyn
+/// harw_core::ModelProvider>` — ein reines Anfrage-Interface ohne
+/// Introspektion. `ProviderLoadControl` ist der separate, additive Kanal
+/// dafür: ein Registrierungs-Layer (Composition Root) legt für jeden
+/// HTTP-Provider, der diese Fähigkeit unterstützt, einen
+/// `Arc<dyn ProviderLoadControl>` in die `ServiceMap` (typischerweise unter
+/// dem Typ [`ProviderLoadRegistry`]).
+///
+/// # Concurrency
+/// Implementierungen müssen `Send + Sync` sein und dürfen intern beliebig oft
+/// gleichzeitig aufgerufen werden (siehe [`OpenAiResponsesProvider`] und
+/// [`ProviderLoadHandle`] — beide delegieren an lock-freie `Arc`-Zustände).
+pub trait ProviderLoadControl: Send + Sync {
+    /// Liefert eine Momentaufnahme des aktuellen Nebenläufigkeits-/
+    /// Rate-Limit-Zustands.
+    #[must_use]
+    fn provider_status(&self) -> ProviderLoadStatus;
+
+    /// Setzt das Nebenläufigkeits-Ziel neu (siehe
+    /// [`DynamicConcurrencyLimiter::set_target`]: Wachsen wirkt sofort,
+    /// Schrumpfen lazy, kein laufender Request wird abgebrochen).
+    ///
+    /// # Arguments
+    /// - `target` (`Option<usize>`): neues Ziel; `None` heißt unbegrenzt.
+    ///
+    /// # Returns
+    /// `true`, wenn ein Limiter installiert ist und die Änderung angewendet
+    /// wurde; `false`, wenn dieser Provider ohne
+    /// [`DynamicConcurrencyLimiter`] gebaut wurde (praktisch nur bei
+    /// [`OpenAiResponsesProvider::new`]/[`OpenAiResponsesProvider::with_transport`]
+    /// statt über die Konfiguration) — dann bleibt die Anfrage wirkungslos.
+    fn set_max_concurrency(&self, target: Option<usize>) -> bool;
+}
+
+/// Registrierte [`ProviderLoadControl`]-Handles je Provider-Name.
+///
+/// # Description
+/// Schlüssel ist derselbe kanonische Provider-Name, unter dem
+/// `harw_config::ResolvedConfig::providers` und die interne
+/// `RoutingModelProvider`-Provider-Map (siehe [`build_provider`]) den
+/// Provider führen. Sowohl OpenAI-kompatible Backends
+/// ([`OpenAiResponsesProvider`]) als auch der native Anthropic-Backend
+/// ([`AnthropicMessagesProvider`]) füllen diese Registry (siehe
+/// `build_named_provider`-Kommentar).
+///
+/// # Concurrency
+/// `Send + Sync` (jeder Wert ist ein `Arc<dyn ProviderLoadControl>`, dessen
+/// Trait `Send + Sync` als Supertrait fordert).
+pub type ProviderLoadRegistry = BTreeMap<String, std::sync::Arc<dyn ProviderLoadControl>>;
+
+/// Baut eine [`ProviderLoadStatus`] aus den drei Rohgrößen, die sowohl
+/// [`OpenAiResponsesProvider`] als auch [`ProviderLoadHandle`] halten — hält
+/// beide Implementierungen von [`ProviderLoadControl::provider_status`]
+/// deckungsgleich, ohne Code zu duplizieren.
+///
+/// `pub(crate)`, weil [`crate::anthropic::AnthropicMessagesProvider`] sie
+/// ebenfalls für [`crate::anthropic::AnthropicMessagesProvider::load_status`]
+/// nutzt (siehe dort).
+pub(crate) fn provider_load_status(
+    provider_id: &str,
+    concurrency_limiter: Option<&DynamicConcurrencyLimiter>,
+    rate_limiter: &rate_limiter::ProviderRateLimiter,
+) -> ProviderLoadStatus {
+    ProviderLoadStatus {
+        provider: provider_id.to_owned(),
+        max_concurrency: concurrency_limiter.and_then(DynamicConcurrencyLimiter::target),
+        available_permits: concurrency_limiter
+            .map(DynamicConcurrencyLimiter::available)
+            .unwrap_or(usize::MAX),
+        rate_limit_wait: rate_limiter.pending_wait(),
+        recent_rate_limited: rate_limiter.rate_limited_count(),
+    }
+}
+
+/// Eigenständiger [`ProviderLoadControl`]-Handle, der nur die beiden bereits
+/// unabhängig `Arc`-gehaltenen Zustände eines Providers referenziert
+/// (`concurrency_limiter`, `rate_limiter`), statt den ganzen Provider zu
+/// besitzen.
+///
+/// # Description
+/// Nötig, weil [`build_named_provider`] den konkreten
+/// [`OpenAiResponsesProvider`] am Ende in einen [`retry::RetryingProvider`]
+/// verschiebt (`RetryingProvider::new(inner: P, ..)` nimmt `P` per Wert
+/// entgegen) und ihn danach als `Box<dyn harw_core::ModelProvider>`
+/// zurückgibt — der konkrete Typ ist für den Aufrufer damit nicht mehr
+/// erreichbar. Beide vom Provider gehaltenen `Arc`s
+/// ([`OpenAiResponsesProvider::concurrency_limiter`],
+/// [`OpenAiResponsesProvider::rate_limiter_handle`]) werden deshalb **vor**
+/// dieser Verschiebung geklont und hier separat gehalten.
+///
+/// # Concurrency
+/// `Send + Sync` (beide Felder sind `Arc`s über bereits `Send + Sync`
+/// gestaltete, lock-freie bzw. kurzzeitig gesperrte Zustände).
+#[derive(Debug, Clone)]
+struct ProviderLoadHandle {
+    provider_id: String,
+    concurrency_limiter: Option<std::sync::Arc<DynamicConcurrencyLimiter>>,
+    rate_limiter: std::sync::Arc<rate_limiter::ProviderRateLimiter>,
+}
+
+impl ProviderLoadControl for ProviderLoadHandle {
+    fn provider_status(&self) -> ProviderLoadStatus {
+        provider_load_status(
+            &self.provider_id,
+            self.concurrency_limiter.as_deref(),
+            &self.rate_limiter,
+        )
+    }
+
+    fn set_max_concurrency(&self, target: Option<usize>) -> bool {
+        match &self.concurrency_limiter {
+            Some(limiter) => {
+                limiter.set_target(target);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 /// HTTP-Provider gegen die OpenAI-kompatible Responses-API.
 ///
 /// # Description
@@ -773,8 +1297,14 @@ pub struct OpenAiResponsesProvider {
     /// Client-seitiger Rate-Limiter (siehe [`rate_limiter::ProviderRateLimiter`]);
     /// standardmäßig deaktiviert (`ProviderRateLimiter::new(None)`).
     rate_limiter: std::sync::Arc<rate_limiter::ProviderRateLimiter>,
-    /// Harte Nebenläufigkeitsgrenze für diesen Provider (siehe
-    /// [`harw_config::ProviderToml::max_concurrency`]); `None` = unbegrenzt.
+    /// Harte, zur Laufzeit elastisch verstellbare Nebenläufigkeitsgrenze für
+    /// diesen Provider (siehe [`harw_config::ProviderToml::max_concurrency`]
+    /// und [`DynamicConcurrencyLimiter`]); `None` heißt: kein Limiter
+    /// installiert (nur bei [`Self::new`]/[`Self::with_transport`] — nie bei
+    /// [`Self::from_named_config`], das immer einen Limiter baut, auch für
+    /// `max_concurrency: None`, damit ein späterer Ops-Layer per
+    /// [`DynamicConcurrencyLimiter::set_target`] auch ursprünglich
+    /// unbegrenzte Provider nachträglich deckeln kann).
     ///
     /// Anders als [`Self::rate_limiter`] (reaktives Header-Pacing, wirkt auf
     /// den *nächsten* Request) blockiert dies zusätzliche Requests rein
@@ -784,7 +1314,7 @@ pub struct OpenAiResponsesProvider {
     /// (z. B. einen Cloudflare Worker vor Workers AI), die bei zu vielen
     /// gleichzeitigen Chat-Turn-Requests (etwa durch Tool-Use-Fanout einer
     /// einzigen User-Runde) ins Stocken geraten.
-    concurrency_limiter: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    concurrency_limiter: Option<std::sync::Arc<DynamicConcurrencyLimiter>>,
     /// `auth.credential_pool[provider_id]`, falls nicht-leer konfiguriert
     /// (siehe Modul-Doku „Credential-Pool" und [`credential_pool`]).
     /// `None` heißt: dieser Provider nutzt ausschließlich `api_key`/`base_url`
@@ -982,10 +1512,13 @@ impl OpenAiResponsesProvider {
     /// (jedes Modell dieses Providers mit gesetztem `prompt_caching`, unter
     /// seiner `id` **und** all seinen `aliases`) sowie `provider.rate_limit`
     /// zum Bau des [`rate_limiter::ProviderRateLimiter`]. `provider.max_concurrency`
-    /// (siehe [`harw_config::ProviderToml::max_concurrency`]) wird, falls
-    /// `Some(n)`, in [`Self::concurrency_limiter`] als frischen
-    /// `Arc<Semaphore>` mit `n` Permits übersetzt; `None` lässt das Feld
-    /// unverändert `None` (unbegrenzt). `provider.auth` bleibt immer das
+    /// (siehe [`harw_config::ProviderToml::max_concurrency`]) baut
+    /// [`Self::concurrency_limiter`] immer als frischen
+    /// `Arc<`[`DynamicConcurrencyLimiter`]`>` über
+    /// `DynamicConcurrencyLimiter::new(provider.max_concurrency)` — auch für
+    /// `None` (praktisch unbegrenzt), damit ein späterer Ops-Layer über
+    /// [`DynamicConcurrencyLimiter::set_target`] jederzeit eine Grenze
+    /// setzen kann. `provider.auth` bleibt immer das
     /// primäre Credential; ist `config.auth.credential_pool` für
     /// `provider_name` nicht-leer, liefert er nur Failover-Kandidaten
     /// dahinter (siehe Modul-Doku „Credential-Pool"); Codex-Routen bleiben
@@ -1044,7 +1577,7 @@ impl OpenAiResponsesProvider {
                     &config.auth,
                     provider_name,
                     sources,
-                    |secret| Ok(secret),
+                    Ok,
                 )?;
                 if let Some(pool) = &pool {
                     for index in 0..pool.len() {
@@ -1132,10 +1665,75 @@ impl OpenAiResponsesProvider {
         http_provider.rate_limiter = std::sync::Arc::new(rate_limiter::ProviderRateLimiter::new(
             provider.rate_limit.clone(),
         ));
-        http_provider.concurrency_limiter = provider
-            .max_concurrency
-            .map(|limit| std::sync::Arc::new(tokio::sync::Semaphore::new(limit)));
+        http_provider.concurrency_limiter = Some(std::sync::Arc::new(
+            DynamicConcurrencyLimiter::new(provider.max_concurrency),
+        ));
         Ok(http_provider)
+    }
+
+    /// Liefert einen geteilten Zugriff auf den [`DynamicConcurrencyLimiter`]
+    /// dieses Providers, falls einer installiert ist.
+    ///
+    /// # Description
+    /// Schnittstelle für einen späteren Ops-Layer (z. B. `harw-ops`), der
+    /// `target()`/`available()` beobachten und `set_target(...)` aufrufen
+    /// will, um die Nebenläufigkeitsgrenze zur Laufzeit zu verändern (siehe
+    /// [`DynamicConcurrencyLimiter`]-Typ-Doku: Wachsen sofort, Schrumpfen
+    /// lazy, kein Abbruch laufender Requests). `None` nur bei Providern, die
+    /// über [`Self::new`]/[`Self::with_transport`] statt
+    /// [`Self::from_named_config`] gebaut wurden.
+    ///
+    /// # Returns
+    /// `Some(&Arc<DynamicConcurrencyLimiter>)`, geklont über `Arc::clone`
+    /// für den Aufrufer, oder `None`.
+    ///
+    /// # Concurrency
+    /// Der zurückgegebene `Arc` ist `Send + Sync` und sicher von mehreren
+    /// Threads/Tasks gleichzeitig nutzbar (siehe [`DynamicConcurrencyLimiter`]).
+    #[must_use]
+    pub fn concurrency_limiter(&self) -> Option<std::sync::Arc<DynamicConcurrencyLimiter>> {
+        self.concurrency_limiter
+            .as_ref()
+            .map(std::sync::Arc::clone)
+    }
+
+    /// Liefert einen geteilten Zugriff auf den [`rate_limiter::ProviderRateLimiter`]
+    /// dieses Providers.
+    ///
+    /// # Description
+    /// Schnittstelle für [`ProviderLoadHandle`] (und damit für einen späteren
+    /// Ops-Layer): erlaubt das Ablesen von `pending_wait()`/`rate_limited_count()`,
+    /// ohne dass der Aufrufer den ganzen Provider besitzen muss — insbesondere,
+    /// wenn der Provider selbst bereits in einen `RetryingProvider` verpackt und
+    /// dadurch als konkreter Typ nicht mehr erreichbar ist (siehe
+    /// `build_named_provider`).
+    ///
+    /// # Returns
+    /// Ein geklonter `Arc<ProviderRateLimiter>` (immer vorhanden — anders als
+    /// [`Self::concurrency_limiter`] gibt es keinen `None`-Fall, jeder Provider
+    /// hat einen Rate-Limiter, ggf. nur deaktiviert).
+    ///
+    /// # Concurrency
+    /// Der zurückgegebene `Arc` ist `Send + Sync` und sicher von mehreren
+    /// Threads/Tasks gleichzeitig nutzbar.
+    #[must_use]
+    pub fn rate_limiter_handle(&self) -> std::sync::Arc<rate_limiter::ProviderRateLimiter> {
+        std::sync::Arc::clone(&self.rate_limiter)
+    }
+
+    /// Momentaufnahme von Nebenläufigkeits-/Rate-Limit-Zustand dieses Providers.
+    ///
+    /// # Returns
+    /// Siehe [`ProviderLoadStatus`]. Identisch zu
+    /// `<Self as ProviderLoadControl>::provider_status`; als eigene Methode
+    /// nutzbar, ohne den Trait zu importieren.
+    #[must_use]
+    pub fn load_status(&self) -> ProviderLoadStatus {
+        provider_load_status(
+            &self.provider_id,
+            self.concurrency_limiter.as_deref(),
+            &self.rate_limiter,
+        )
     }
 
     /// Resolves the model for one request after checking its provider affinity.
@@ -2614,17 +3212,11 @@ impl OpenAiResponsesProvider {
         // die Grenze wirklich in Flug befindliche Requests zählt, nicht
         // nur abgesetzte.
         let _concurrency_permit = match &self.concurrency_limiter {
-            Some(semaphore) => Some(
-                std::sync::Arc::clone(semaphore)
-                    .acquire_owned()
-                    .await
-                    .map_err(|_| {
-                        ModelError::RequestFailed(
-                            "internal error: provider concurrency semaphore was closed"
-                                .to_owned(),
-                        )
-                    })?,
-            ),
+            Some(limiter) => Some(limiter.acquire().await.map_err(|_| {
+                ModelError::RequestFailed(
+                    "internal error: provider concurrency semaphore was closed".to_owned(),
+                )
+            })?),
             None => None,
         };
         self.rate_limiter.wait_for_slot().await;
@@ -2668,6 +3260,14 @@ impl OpenAiResponsesProvider {
                 .map_err(|error| model_error_for_transport(error, true))?;
 
             if !status.is_success() {
+                if status.as_u16() == 429 {
+                    // W6b — UIA-Sichtbarkeit: zählt jede beobachtete 429-Antwort
+                    // dieses Providers, unabhängig davon, ob sie unten als
+                    // `QuotaExceeded` oder `Transient{status: Some(429)}`
+                    // übersetzt wird (siehe `rate_limiter::ProviderRateLimiter::
+                    // record_rate_limited`).
+                    self.rate_limiter.record_rate_limited();
+                }
                 let hint =
                     retry_after_hint(retry_after.as_deref(), retry_after_ms.as_deref(), &body);
                 let error =
@@ -2697,6 +3297,22 @@ impl OpenAiResponsesProvider {
             call.name = ToolName::new(names.decode(call.name.as_str()));
         }
         Ok(response)
+    }
+}
+
+impl ProviderLoadControl for OpenAiResponsesProvider {
+    fn provider_status(&self) -> ProviderLoadStatus {
+        self.load_status()
+    }
+
+    fn set_max_concurrency(&self, target: Option<usize>) -> bool {
+        match &self.concurrency_limiter {
+            Some(limiter) => {
+                limiter.set_target(target);
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -2976,6 +3592,282 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dynamic_limiter_set_target_grows_immediately_without_waiting_for_existing_permits() {
+        let limiter = std::sync::Arc::new(DynamicConcurrencyLimiter::new(Some(2)));
+        let permit1 = limiter.acquire().await.expect("permit 1 acquires immediately");
+        let permit2 = limiter.acquire().await.expect("permit 2 acquires immediately");
+        assert_eq!(limiter.available(), 0);
+        assert_eq!(limiter.target(), Some(2));
+
+        // Grow while both original permits are still held.
+        limiter.set_target(Some(4));
+        assert_eq!(limiter.target(), Some(4));
+
+        // The two new permits must be grantable right away — growth never
+        // waits for the pre-existing in-flight permits to be released.
+        let permit3 = tokio::time::timeout(Duration::from_millis(200), limiter.acquire())
+            .await
+            .expect("permit 3 must be available immediately after growing, without waiting")
+            .expect("acquire succeeds");
+        let permit4 = tokio::time::timeout(Duration::from_millis(200), limiter.acquire())
+            .await
+            .expect("permit 4 must be available immediately after growing, without waiting")
+            .expect("acquire succeeds");
+
+        assert_eq!(limiter.available(), 0);
+        drop(permit1);
+        drop(permit2);
+        drop(permit3);
+        drop(permit4);
+        assert_eq!(
+            limiter.available(),
+            4,
+            "all four permits must be free again after every guard dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_limiter_set_target_shrink_from_unbounded_shrinks_free_permits_immediately() {
+        // The most important real-world case: a provider that started with
+        // no configured max_concurrency (`None` -> `UNLIMITED_PERMITS`) gets
+        // its target lowered live (e.g. UIA reacting to a 429). Since
+        // nothing is in flight yet, every "excess" permit is free, so
+        // `forget_permits` must remove it right away instead of only lazily
+        // on the next release.
+        let limiter = std::sync::Arc::new(DynamicConcurrencyLimiter::new(None));
+        assert_eq!(limiter.target(), None);
+
+        limiter.set_target(Some(2));
+        assert_eq!(limiter.target(), Some(2));
+        assert_eq!(
+            limiter.available(),
+            2,
+            "shrinking an unbounded, idle limiter must apply immediately, not lazily"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_limiter_set_target_shrink_with_some_free_permits_forgets_only_the_free_ones() {
+        // 1 of 4 permits busy, 3 free. Shrinking to 2 must immediately
+        // forget exactly one of the three free permits (3 free - 1 needed
+        // headroom for the still-busy permit = 2 to forget down to target),
+        // leaving `available() == 1` right away; the remaining shrink (the
+        // busy permit itself) only happens lazily once it is released.
+        let limiter = std::sync::Arc::new(DynamicConcurrencyLimiter::new(Some(4)));
+        let permit1 = limiter.acquire().await.expect("permit 1 acquires immediately");
+        assert_eq!(limiter.available(), 3);
+
+        limiter.set_target(Some(2));
+        assert_eq!(limiter.target(), Some(2));
+        assert_eq!(
+            limiter.available(),
+            1,
+            "the two truly free excess permits must be forgotten immediately"
+        );
+
+        drop(permit1);
+        assert_eq!(
+            limiter.available(),
+            2,
+            "releasing the last busy permit completes the lazy part of the shrink"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_limiter_set_target_repeated_shrink_and_grow_stays_consistent() {
+        let limiter = std::sync::Arc::new(DynamicConcurrencyLimiter::new(Some(8)));
+        assert_eq!(limiter.available(), 8);
+
+        limiter.set_target(Some(3));
+        assert_eq!(limiter.available(), 3, "idle limiter shrinks immediately");
+
+        limiter.set_target(Some(6));
+        assert_eq!(limiter.available(), 6, "growing always applies immediately");
+
+        limiter.set_target(Some(1));
+        assert_eq!(limiter.available(), 1, "shrinking again from an idle state is immediate");
+
+        limiter.set_target(None);
+        assert_eq!(
+            limiter.available(),
+            UNLIMITED_PERMITS,
+            "growing to unbounded restores the full sentinel capacity"
+        );
+        assert_eq!(limiter.target(), None);
+    }
+
+    #[tokio::test]
+    async fn dynamic_limiter_set_target_shrink_waits_until_enough_permits_forgotten() {
+        let limiter = std::sync::Arc::new(DynamicConcurrencyLimiter::new(Some(4)));
+        let permit1 = limiter.acquire().await.expect("permit 1 acquires immediately");
+        let permit2 = limiter.acquire().await.expect("permit 2 acquires immediately");
+        let permit3 = limiter.acquire().await.expect("permit 3 acquires immediately");
+        let permit4 = limiter.acquire().await.expect("permit 4 acquires immediately");
+        assert_eq!(limiter.available(), 0);
+
+        limiter.set_target(Some(2));
+        assert_eq!(
+            limiter.target(),
+            Some(2),
+            "target changes immediately even though capacity has not shrunk yet"
+        );
+        assert_eq!(
+            limiter.available(),
+            0,
+            "shrinking must never revoke or wait on the four already in-flight permits"
+        );
+
+        let waiter_limiter = std::sync::Arc::clone(&limiter);
+        let waiter = tokio::spawn(async move { waiter_limiter.acquire().await });
+
+        // Let the waiter task run far enough to register as pending on the
+        // semaphore before any permit is released.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !waiter.is_finished(),
+            "waiter must still be blocked before any of the four in-flight requests finished"
+        );
+
+        // All four original requests "finish" (return their permit) — none
+        // of them was ever aborted. The first two returns are only enough to
+        // shrink total capacity from 4 down to the new target of 2; they are
+        // forgotten rather than handed to the waiter.
+        drop(permit1);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !waiter.is_finished(),
+            "waiter must still be blocked after only one permit was lazily forgotten"
+        );
+        drop(permit2);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !waiter.is_finished(),
+            "waiter must still be blocked after only two permits were lazily forgotten \
+             (capacity has now reached the shrunk target, but is still fully held)"
+        );
+
+        // The third return is a real release: capacity is already at target,
+        // so this permit goes straight to the waiting acquirer.
+        drop(permit3);
+        let waiter_permit = tokio::time::timeout(Duration::from_millis(200), waiter)
+            .await
+            .expect("waiter must resolve once capacity has shrunk to the target")
+            .expect("waiter task completes without panicking")
+            .expect("waiter acquires a permit");
+
+        // The fourth return is also a real release now.
+        drop(permit4);
+        assert!(
+            limiter.available() <= 2,
+            "available() must never exceed the shrunk target of 2"
+        );
+        assert_eq!(limiter.available(), 1, "one free permit plus one held by the waiter");
+        drop(waiter_permit);
+        assert_eq!(
+            limiter.available(),
+            2,
+            "capacity has fully settled at the shrunk target once everything is released"
+        );
+    }
+
+    #[tokio::test]
+    async fn respond_hard_cap_never_overshoots_while_shrinking_target() {
+        const INITIAL_MAX_CONCURRENCY: usize = 4;
+        const SHRUNK_TARGET: usize = 2;
+        const REQUEST_COUNT: usize = 6;
+
+        let (base_url, peak, server) = mock_concurrency_probe_server(REQUEST_COUNT);
+        let mut provider = configured_provider(
+            "elastic",
+            base_url,
+            vec!["gpt-test"],
+            "ELASTIC_PROVIDER_KEY",
+        );
+        provider.max_concurrency = Some(INITIAL_MAX_CONCURRENCY);
+        provider.validate().expect("max_concurrency = 4 is valid");
+
+        let env_layer = BTreeMap::from([(
+            "ELASTIC_PROVIDER_KEY".to_owned(),
+            "sk-secret".to_owned(),
+        )]);
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.default_provider = Some("elastic".to_owned());
+        config.harness.default_model = Some("gpt-test".to_owned());
+        config
+            .providers
+            .insert("elastic".to_owned(), provider.clone());
+
+        let http_provider = std::sync::Arc::new(
+            OpenAiResponsesProvider::from_named_config(
+                "elastic",
+                &provider,
+                &config,
+                "gpt-test",
+                test_sources(&env_layer, None, None),
+            )
+            .expect("provider builds with max_concurrency configured"),
+        );
+        let limiter = http_provider
+            .concurrency_limiter()
+            .expect("from_named_config always installs a limiter, even for a finite max_concurrency");
+        assert_eq!(limiter.target(), Some(INITIAL_MAX_CONCURRENCY));
+
+        let mut handles = Vec::with_capacity(REQUEST_COUNT);
+        for _ in 0..REQUEST_COUNT {
+            let http_provider = std::sync::Arc::clone(&http_provider);
+            handles.push(tokio::spawn(async move {
+                http_provider
+                    .respond(request_with_ids(None, None))
+                    .await
+                    .expect("mock chat response parses")
+            }));
+        }
+
+        // Shrink the target while the first wave of (up to) four requests is
+        // still in flight. Shrinking must never let the number of
+        // concurrently held permits exceed the original hard cap — it only
+        // ever withholds *future* grants, it never revokes an already
+        // in-flight request's permit.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        limiter.set_target(Some(SHRUNK_TARGET));
+
+        for handle in handles {
+            handle.await.expect("respond task completes");
+        }
+        server.join().expect("mock server completes");
+
+        assert!(
+            peak.load(std::sync::atomic::Ordering::SeqCst) <= INITIAL_MAX_CONCURRENCY,
+            "observed more than {INITIAL_MAX_CONCURRENCY} requests in flight simultaneously, \
+             even while the target was shrinking"
+        );
+        assert_eq!(
+            limiter.available(),
+            SHRUNK_TARGET,
+            "capacity must have fully settled to the shrunk target once every request returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_limiter_unbounded_never_waits() {
+        let limiter = std::sync::Arc::new(DynamicConcurrencyLimiter::new(None));
+        assert_eq!(limiter.target(), None, "None must mean unbounded, not a numeric cap");
+
+        // Acquiring far more permits than any realistic max_concurrency
+        // would allow must never block, proving `None` behaves exactly as
+        // before this feature existed (no client-side cap at all).
+        let mut permits = Vec::with_capacity(1000);
+        for _ in 0..1000 {
+            let permit = tokio::time::timeout(Duration::from_millis(50), limiter.acquire())
+                .await
+                .expect("unbounded limiter must never block on acquire")
+                .expect("acquire succeeds");
+            permits.push(permit);
+        }
+        drop(permits);
+    }
+
+    #[tokio::test]
     async fn test_with_transport_never_installs_concurrency_limiter() {
         let provider = OpenAiResponsesProvider::with_transport(
             "http://127.0.0.1:0",
@@ -3033,7 +3925,8 @@ mod tests {
             SecretString::new("sk-secret".into()),
             Transport::Chat,
         );
-        provider.concurrency_limiter = Some(std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
+        provider.concurrency_limiter =
+            Some(std::sync::Arc::new(DynamicConcurrencyLimiter::new(Some(1))));
 
         const FAILED_REQUESTS: usize = 3;
         for attempt in 0..FAILED_REQUESTS {
@@ -3112,6 +4005,7 @@ mod tests {
             rate_limit: None,
             max_concurrency: None,
             originator: None,
+            default_reasoning_effort: None,
         }
     }
 
@@ -3411,6 +4305,130 @@ mod tests {
             .expect("secondary mock server completes");
     }
 
+    #[test]
+    fn build_provider_with_load_registry_exposes_a_handle_per_openai_provider() {
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.default_provider = Some("primary".to_owned());
+        config.harness.default_model = Some("a-model".to_owned());
+        config.providers.insert(
+            "primary".to_owned(),
+            configured_provider(
+                "primary",
+                "https://primary.example.com".to_owned(),
+                vec!["a-model"],
+                "PRIMARY_KEY",
+            ),
+        );
+        config
+            .env_layer
+            .insert("PRIMARY_KEY".to_owned(), "primary-secret".to_owned());
+
+        let (_provider, registry) =
+            build_provider_with_load_registry(&config).expect("construct configured provider");
+
+        let handle = registry
+            .get("primary")
+            .expect("openai-compatible provider must expose a ProviderLoadControl handle");
+        let status = handle.provider_status();
+        assert_eq!(status.provider, "primary");
+        assert_eq!(
+            status.max_concurrency, None,
+            "unconfigured max_concurrency stays unlimited"
+        );
+        assert_eq!(
+            status.recent_rate_limited, 0,
+            "no 429 observed yet"
+        );
+    }
+
+    #[test]
+    fn provider_load_control_set_max_concurrency_applies_immediately() {
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.default_provider = Some("primary".to_owned());
+        config.harness.default_model = Some("a-model".to_owned());
+        config.providers.insert(
+            "primary".to_owned(),
+            configured_provider(
+                "primary",
+                "https://primary.example.com".to_owned(),
+                vec!["a-model"],
+                "PRIMARY_KEY",
+            ),
+        );
+        config
+            .env_layer
+            .insert("PRIMARY_KEY".to_owned(), "primary-secret".to_owned());
+
+        let (_provider, registry) =
+            build_provider_with_load_registry(&config).expect("construct configured provider");
+        let handle = registry.get("primary").expect("handle registered");
+
+        let applied = handle.set_max_concurrency(Some(2));
+        assert!(applied, "OpenAI-compatible provider always has a limiter");
+        let status = handle.provider_status();
+        assert_eq!(status.max_concurrency, Some(2));
+        assert_eq!(status.available_permits, 2);
+    }
+
+    #[test]
+    fn provider_load_registry_has_entry_for_anthropic_messages_provider() {
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.default_provider = Some("claude".to_owned());
+        config.harness.default_model = Some("claude-model".to_owned());
+        let mut provider = configured_provider(
+            "claude",
+            "https://api.anthropic.com".to_owned(),
+            vec!["claude-model"],
+            "CLAUDE_KEY",
+        );
+        provider.api = "anthropic-messages".to_owned();
+        config.providers.insert("claude".to_owned(), provider);
+        config
+            .env_layer
+            .insert("CLAUDE_KEY".to_owned(), "claude-secret".to_owned());
+
+        let (_provider, registry) =
+            build_provider_with_load_registry(&config).expect("construct configured provider");
+        let handle = registry
+            .get("claude")
+            .expect("anthropic-messages provider now exposes a ProviderLoadControl handle");
+        let status = handle.provider_status();
+        assert_eq!(status.provider, "claude");
+        assert_eq!(
+            status.max_concurrency, None,
+            "unconfigured max_concurrency stays unlimited"
+        );
+        assert_eq!(status.recent_rate_limited, 0, "no 429 observed yet");
+    }
+
+    #[test]
+    fn anthropic_provider_load_control_set_max_concurrency_applies_immediately() {
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.default_provider = Some("claude".to_owned());
+        config.harness.default_model = Some("claude-model".to_owned());
+        let mut provider = configured_provider(
+            "claude",
+            "https://api.anthropic.com".to_owned(),
+            vec!["claude-model"],
+            "CLAUDE_KEY",
+        );
+        provider.api = "anthropic-messages".to_owned();
+        config.providers.insert("claude".to_owned(), provider);
+        config
+            .env_layer
+            .insert("CLAUDE_KEY".to_owned(), "claude-secret".to_owned());
+
+        let (_provider, registry) =
+            build_provider_with_load_registry(&config).expect("construct configured provider");
+        let handle = registry.get("claude").expect("handle registered");
+
+        let applied = handle.set_max_concurrency(Some(2));
+        assert!(applied, "Anthropic-Provider always has a limiter");
+        let status = handle.provider_status();
+        assert_eq!(status.max_concurrency, Some(2));
+        assert_eq!(status.available_permits, 2);
+    }
+
     fn request_with_ids(model_id: Option<&str>, provider_id: Option<&str>) -> ModelRequest {
         ModelRequest {
             system_prompt: String::new(),
@@ -3483,6 +4501,35 @@ mod tests {
         assert_eq!(provider.model, "gpt-test");
         assert_eq!(provider.api_key.expose_secret(), "sk-secret");
         assert_eq!(provider.request_timeout, DEFAULT_REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn provider_load_status_reflects_recorded_rate_limits_without_a_concurrency_limiter() {
+        // `OpenAiResponsesProvider::new` (unlike `from_named_config`) never
+        // installs a `DynamicConcurrencyLimiter` — `load_status`/
+        // `ProviderLoadControl::set_max_concurrency` must degrade cleanly:
+        // `available_permits == usize::MAX`, `set_max_concurrency` returns
+        // `false`, but the 429 counter still works (it lives on the
+        // always-present `ProviderRateLimiter`, not on the limiter).
+        let provider = OpenAiResponsesProvider::new(
+            "https://example.test/v1",
+            "gpt-test",
+            SecretString::new("sk-secret".into()),
+        );
+        let status = provider.load_status();
+        assert_eq!(status.max_concurrency, None);
+        assert_eq!(status.available_permits, usize::MAX);
+        assert_eq!(status.recent_rate_limited, 0);
+
+        provider.rate_limiter_handle().record_rate_limited();
+        provider.rate_limiter_handle().record_rate_limited();
+        let status = ProviderLoadControl::provider_status(&provider);
+        assert_eq!(status.recent_rate_limited, 2);
+
+        assert!(
+            !ProviderLoadControl::set_max_concurrency(&provider, Some(1)),
+            "no limiter installed via ::new — must not silently succeed"
+        );
     }
 
     #[test]
@@ -4945,6 +5992,7 @@ mod tests {
             rate_limit: None,
             max_concurrency: None,
             originator: None,
+            default_reasoning_effort: None,
         }
     }
 

@@ -17,7 +17,7 @@ pub fn load_system_prompt(agent_dir: &Path, system_file: Option<&str>) -> Config
 /// selten. Das unterscheidet sie von `Personality.md` (Ton/Antwortverhalten)
 /// und von `USER.md` (Kontext über den Nutzer). Analog zu
 /// [`load_system_prompt`]: reiner Volltext-Read über [`configured_file_path`]
-/// + [`read_optional_file`], keine Zeilen-Interpretation (im Gegensatz zu
+/// und [`read_optional_file`], keine Zeilen-Interpretation (im Gegensatz zu
 /// [`load_uia_user_name`]), weil `identity.md` freie Prosa ist.
 ///
 /// # Arguments

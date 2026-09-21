@@ -53,17 +53,24 @@ use crate::error::{RuntimeError, RuntimeResult};
 /// `researcher-web`, `researcher-deps` und `analyst` (sie teilen sich den
 /// Recherche-Befund-Vertrag) → [`InternalModelPoint::Research`];
 /// `memory-steward` → [`InternalModelPoint::MemoryConsolidation`];
-/// `uia-worker` (Addendum J, exklusiver Schnellhelfer der UIA, eigene
-/// Organisationsrolle `AgentRoleId::UiaWorker`) →
-/// [`InternalModelPoint::WorkerSimple`], die einfache Worker-Modellstufe —
-/// er ist für kleine Schnelleingriffe gedacht, nicht für tiefe Recherche
-/// oder Konsolidierung. `agent-steward` (Addendum K, eigene
-/// Organisationsrolle `AgentRoleId::AgentSteward`) →
-/// [`InternalModelPoint::WorkerComplex`]: Validieren, Rechte-Delta und
-/// Vorschlagsentscheidung verlangen eigenes Urteilsvermögen, auch wenn der
-/// Auftrag klein aussieht. Jede andere Rolle (inklusive `planner`,
-/// `executor`, `security-*` und unbekannter/repo-lokaler Rollen) bleibt
-/// unverändert beim Eltern-Modell — `None`.
+/// `agent-steward` (Addendum K, eigene Organisationsrolle
+/// `AgentRoleId::AgentSteward`) → [`InternalModelPoint::WorkerComplex`]:
+/// Validieren, Rechte-Delta und Vorschlagsentscheidung verlangen eigenes
+/// Urteilsvermögen, auch wenn der Auftrag klein aussieht.
+///
+/// Die gesamte `uia-worker`-Rollenfamilie (`AgentRoleId::UiaWorker`:
+/// [`role_names::UIA_WORKER`], [`role_names::UIA_EXPLORER`],
+/// [`role_names::UIA_WRITER`], [`role_names::UIA_SHELL_WORKER`]) fällt
+/// **absichtlich** auf `None` durch (Welle 3a) — sie hängt seither nicht mehr
+/// an einer über [`resolve_internal_models_for_children`] aufgelösten
+/// internen Modellstelle des Eltern-Modells, sondern bekommt ihr eigenes,
+/// von der UIA-Sitzung abgeleitetes Modell direkt über die eigene
+/// Kind-Registry-Fabrik der Rolle (`RuntimeAssemblyBuilder::build`,
+/// `build_spawner`s `uia_worker_factory`; das Modell selbst entsteht über
+/// [`crate::model::build_uia_model_with_resolver`] +
+/// [`crate::model::build_uia_worker_model`]). Jede andere Rolle (inklusive
+/// `planner`, `executor`, `security-*` und unbekannter/repo-lokaler Rollen)
+/// bleibt unverändert beim Eltern-Modell — `None`.
 ///
 /// # Returns
 /// `Some(point)` für eine der oben genannten Rollen, sonst `None`.
@@ -77,9 +84,62 @@ pub fn internal_point_for_role(role: &str) -> Option<InternalModelPoint> {
             Some(InternalModelPoint::Research)
         }
         r if r == role_names::MEMORY_STEWARD => Some(InternalModelPoint::MemoryConsolidation),
-        r if r == role_names::UIA_WORKER => Some(InternalModelPoint::WorkerSimple),
         r if r == role_names::AGENT_STEWARD => Some(InternalModelPoint::WorkerComplex),
         _ => None,
+    }
+}
+
+/// Deckelt die höchstens gleichzeitig laufende Anzahl Instanzen einer Rolle
+/// (Welle 6a, Singleton-Erzwingung).
+///
+/// # Description
+/// Der Nutzer verlangt, dass UIA und die gesamte `uia-worker`-Rollenfamilie
+/// (`AgentRoleId::UiaWorker`: [`role_names::UIA_WORKER`],
+/// [`role_names::UIA_EXPLORER`], [`role_names::UIA_WRITER`],
+/// [`role_names::UIA_SHELL_WORKER`]) **nie** mit mehr als einer gleichzeitig
+/// laufenden Instanz gefanoutet werden dürfen — unabhängig vom
+/// Aufrufer-`max_parallel`-Wert (`analyze(max_parallel: N)`, `explore`,
+/// `delegate_task` o. ä.). Diese Funktion selbst deckelt **nichts**: sie ist
+/// die reine, getestete Zuordnungsregel, die ein späterer Aufrufer außerhalb
+/// dieses Crates (`harw-core/src/child_controller.rs::run_children`,
+/// `harw-core-bridge/src/agent_tool.rs::fanout_children` — beide liegen
+/// außerhalb dieser Welle) auslesen und seinen `max_parallel`-Parameter
+/// darauf klemmen kann, z. B.
+/// `let effective = max_parallel.min(max_concurrent_instances_for_role(role, &definitions));`.
+///
+/// Die Organisationsrolle wird genau wie an jeder anderen Stelle dieser
+/// Datei ermittelt ([`ChildRegistryFactory::build_registry`],
+/// `assembly.rs::build_spawner`s Registrierungsschleife): über die
+/// eingebaute, gesenkte [`ExecutableAgentIr`] der Rolle, fail-closed auf
+/// [`AgentRoleId::Worker`] für eine unbekannte/nicht eingebaute Rolle. Das
+/// trifft automatisch alle vier UIA-Spezialisierungen, ohne eine Namensliste
+/// zu pflegen.
+///
+/// # Arguments
+/// - `role` (`&str`): der registrierte Rollenname.
+/// - `definitions` (`&HashMap<String, ExecutableAgentIr>`): die gesenkten
+///   eingebauten Rollen — dieselbe Quelle, die
+///   [`RuntimeChildRegistryFactory::build_registry`] und
+///   `assembly.rs::build_spawner` für die Organisationsrolle einer Rolle
+///   lesen (`RuntimeChildRegistryFactory::builtin_definitions` bzw.
+///   `SpawnerInputs::definitions`).
+///
+/// # Returns
+/// `1`, wenn die Organisationsrolle von `role` laut `definitions`
+/// [`AgentRoleId::UiaWorker`] ist; sonst `usize::MAX` — keine zusätzliche
+/// Deckelung für jede andere Rolle, inklusive unbekannter Rollen.
+#[must_use]
+pub fn max_concurrent_instances_for_role(
+    role: &str,
+    definitions: &HashMap<String, ExecutableAgentIr>,
+) -> usize {
+    let organizational_role = definitions
+        .get(role)
+        .map_or(harw_agent_dsl::roles::AgentRoleId::Worker, ExecutableAgentIr::role);
+    if organizational_role == harw_agent_dsl::roles::AgentRoleId::UiaWorker {
+        1
+    } else {
+        usize::MAX
     }
 }
 
@@ -103,7 +163,6 @@ pub fn internal_point_for_role(role: &str) -> Option<InternalModelPoint> {
 /// [`harw_registry_defaults::profile::AgentDefinitionAccess`] eines
 /// `agent-steward`-Kindes zu bestimmen.
 ///
-
 /// # Arguments
 /// - `parent_role` (`Option<harw_agent_dsl::roles::AgentRoleId>`): die
 ///   Organisationsrolle des unmittelbaren Elternteils, sofern bekannt.
@@ -201,6 +260,16 @@ pub struct RuntimeChildRegistryFactory {
     /// obwohl die Kind-Registry gebaut wird, bevor der Spawner selbst in der
     /// Assembly vollständig konstruiert ist.
     spawner_slot: Arc<OnceLock<Weak<ManagedAgentSpawner>>>,
+    /// Die aufgelöste Config des Elternlaufs, nur für
+    /// [`ChildRegistryFactory::reasoning_effort_defaults_for_role_task`]
+    /// (Welle 8: Rangfolge Provider > Modell > Agent > Rolle) — liefert die
+    /// `providers`-/`models`-Tabellen, in denen `default_reasoning_effort`
+    /// je Provider-/Modell-ID hinterlegt ist. `None`, solange
+    /// [`Self::with_reasoning_effort_config`] nicht aufgerufen wurde; die
+    /// Trait-Methode fällt dann für jede Rolle auf `(None, None)` zurück
+    /// (Kompatibilitäts-Default, § dort) — dieselbe fail-open-Bedeutung wie
+    /// bei [`Self::internal_models`].
+    reasoning_effort_config: Option<Arc<harw_config::ResolvedConfig>>,
 }
 
 impl std::fmt::Debug for RuntimeChildRegistryFactory {
@@ -278,6 +347,7 @@ impl RuntimeChildRegistryFactory {
             profile_agents_dir: None,
             browser: harw_config::BrowserSection::default(),
             spawner_slot: Arc::new(OnceLock::new()),
+            reasoning_effort_config: None,
         }
     }
 
@@ -341,6 +411,66 @@ impl RuntimeChildRegistryFactory {
     ) -> Self {
         self.spawner_slot = spawner_slot;
         self
+    }
+
+    /// Ergänzt die aufgelöste Config für Provider-/Modell-Reasoning-Effort-
+    /// Defaults (Welle 8).
+    ///
+    /// # Description
+    /// Reiner Erbauer-Schritt, analog [`Self::with_internal_models`]:
+    /// [`Self::new`]/[`Self::with_definitions`] bleiben unverändert. Ohne
+    /// Aufruf bleibt [`Self::reasoning_effort_config`] `None` und
+    /// [`ChildRegistryFactory::reasoning_effort_defaults_for_role_task`]
+    /// liefert für jede Rolle `(None, None)` — bit-identisch zum
+    /// Kompatibilitäts-Default der Trait-Methode.
+    ///
+    /// # Arguments
+    /// - `config` (`Arc<harw_config::ResolvedConfig>`): dieselbe aufgelöste
+    ///   Konfiguration, aus der auch [`resolve_internal_models_for_children`]
+    ///   gespeist wird.
+    #[must_use]
+    pub fn with_reasoning_effort_config(mut self, config: Arc<harw_config::ResolvedConfig>) -> Self {
+        self.reasoning_effort_config = Some(config);
+        self
+    }
+
+    /// Liefert Provider-/Modell-Reasoning-Effort-Defaults für eine bereits
+    /// aufgelöste interne Modellstelle.
+    ///
+    /// # Description
+    /// `(None, None)`, wenn [`Self::with_reasoning_effort_config`] nie
+    /// aufgerufen wurde, `point` in [`Self::internal_models`] nicht aufgelöst
+    /// ist, oder die aufgelöste Stelle das Hauptmodell trägt
+    /// ([`ResolvedInternalModel::is_main_model`] — die tatsächliche
+    /// Provider-/Modell-ID des aktiven Hauptmodells kennt diese Fabrik nicht,
+    /// siehe [`ChildRegistryFactory::reasoning_effort_defaults_for_role_task`]
+    /// unten). Sonst: die `default_reasoning_effort`-Felder der in
+    /// `config.providers`/`config.models` unter der aufgelösten ID
+    /// hinterlegten Einträge, je `None` bei fehlendem Eintrag.
+    fn reasoning_effort_defaults_for_point(
+        &self,
+        point: InternalModelPoint,
+    ) -> (Option<harw_types::ReasoningEffort>, Option<harw_types::ReasoningEffort>) {
+        let Some(config) = self.reasoning_effort_config.as_deref() else {
+            return (None, None);
+        };
+        let Some(resolved) = self.internal_models.get(&point) else {
+            return (None, None);
+        };
+        if resolved.is_main_model() {
+            return (None, None);
+        }
+        let provider_default = resolved
+            .provider
+            .as_deref()
+            .and_then(|id| config.providers.get(id))
+            .and_then(|provider| provider.default_reasoning_effort);
+        let model_default = resolved
+            .model
+            .as_deref()
+            .and_then(|id| config.models.get(id))
+            .and_then(|model| model.default_reasoning_effort);
+        (provider_default, model_default)
     }
 
     /// Löst `point` gegen [`Self::internal_models`] auf und liefert entweder
@@ -530,6 +660,61 @@ impl ChildRegistryFactory for RuntimeChildRegistryFactory {
     /// geschnitten (`harw-core/src/child_controller.rs`, W2A-02).
     fn executable_agent_ir(&self, role: &str) -> Option<&ExecutableAgentIr> {
         self.builtin_definitions.get(role)
+    }
+
+    /// Liefert Provider-/Modell-Reasoning-Effort-Defaults für eine Kind-Rolle
+    /// ohne Aufgabenkomplexität (Welle 8).
+    ///
+    /// # Beschreibung
+    /// Wie [`Self::model_for`]: hat `role` eine eigene interne Modellstelle
+    /// ([`internal_point_for_role`]), gelten deren Defaults
+    /// ([`Self::reasoning_effort_defaults_for_point`]). Sonst — auch für eine
+    /// Worker-Rolle ohne bekannte Komplexität — `(None, None)`, weil ohne
+    /// Komplexität nicht zwischen `WorkerSimple`/`WorkerComplex`
+    /// unterschieden werden kann; [`Self::reasoning_effort_defaults_for_role_task`]
+    /// ist die vollständige Fassung.
+    fn reasoning_effort_defaults_for_role(
+        &self,
+        role: &str,
+    ) -> (Option<harw_types::ReasoningEffort>, Option<harw_types::ReasoningEffort>) {
+        let Some(point) = internal_point_for_role(role) else {
+            return (None, None);
+        };
+        self.reasoning_effort_defaults_for_point(point)
+    }
+
+    /// Wie [`Self::reasoning_effort_defaults_for_role`], zusätzlich mit der
+    /// Aufgabenkomplexität (Addendum D+E) — spiegelt exakt die Auswahllogik
+    /// von [`Self::model_for_task`]: eine bekannte interne Modellstelle hat
+    /// Vorrang; sonst wird bei einer laut eingebauter [`ExecutableAgentIr`]
+    /// registrierten Worker-Rolle [`InternalModelPoint::WorkerSimple`] bzw.
+    /// [`InternalModelPoint::WorkerComplex`] verwendet; jede andere Rolle
+    /// (auch eine, die auf das Eltern-Hauptmodell zurückfällt) liefert
+    /// `(None, None)` — die Provider-/Modell-ID des aktiven Hauptmodells ist
+    /// dieser Fabrik nicht bekannt (siehe Feld-Doku
+    /// [`Self::reasoning_effort_config`]); für die UIA-Wurzelsitzung selbst
+    /// löst `crate::assembly` diese Ebene direkt gegen die Config auf, nicht
+    /// über diese Fabrik.
+    fn reasoning_effort_defaults_for_role_task(
+        &self,
+        role: &str,
+        complexity: Option<harw_core::TaskComplexity>,
+    ) -> (Option<harw_types::ReasoningEffort>, Option<harw_types::ReasoningEffort>) {
+        if let Some(point) = internal_point_for_role(role) {
+            return self.reasoning_effort_defaults_for_point(point);
+        }
+        let is_worker = self
+            .builtin_definitions
+            .get(role)
+            .is_some_and(|ir| ir.role() == harw_agent_dsl::roles::AgentRoleId::Worker);
+        if !is_worker {
+            return (None, None);
+        }
+        let point = match complexity {
+            Some(harw_core::TaskComplexity::Simple) => InternalModelPoint::WorkerSimple,
+            Some(harw_core::TaskComplexity::Complex) | None => InternalModelPoint::WorkerComplex,
+        };
+        self.reasoning_effort_defaults_for_point(point)
     }
 
     /// Baut die Registry eines Kindes unter Kenntnis der effektiven Rechte
@@ -744,11 +929,20 @@ mod tests {
     }
 
     #[test]
-    fn internal_point_for_role_maps_uia_worker_to_worker_simple() {
-        assert_eq!(
-            internal_point_for_role(role_names::UIA_WORKER),
-            Some(InternalModelPoint::WorkerSimple)
-        );
+    fn internal_point_for_role_leaves_the_entire_uia_worker_family_unmapped() {
+        for role in [
+            role_names::UIA_WORKER,
+            role_names::UIA_EXPLORER,
+            role_names::UIA_WRITER,
+            role_names::UIA_SHELL_WORKER,
+        ] {
+            assert_eq!(
+                internal_point_for_role(role),
+                None,
+                "role {role} must stay unmapped — it gets its own uia-derived model \
+                 via `build_spawner`'s `uia_worker_factory`, not an internal model point"
+            );
+        }
     }
 
     #[test]
@@ -798,5 +992,231 @@ mod tests {
                 "role {role} should stay on the parent model"
             );
         }
+    }
+
+    /// Die gesenkten eingebauten Rollen einer leeren Konfiguration — dieselbe
+    /// Quelle, die `assembly.rs::build_spawner` für `definitions` benutzt.
+    fn builtin_definitions() -> HashMap<String, ExecutableAgentIr> {
+        builtin_agent_definitions(&HashMap::new()).expect("eingebaute Rollen senken")
+    }
+
+    #[test]
+    fn max_concurrent_instances_for_role_caps_the_entire_uia_worker_family_at_one() {
+        let definitions = builtin_definitions();
+        for role in [
+            role_names::UIA_WORKER,
+            role_names::UIA_EXPLORER,
+            role_names::UIA_WRITER,
+            role_names::UIA_SHELL_WORKER,
+        ] {
+            assert_eq!(
+                max_concurrent_instances_for_role(role, &definitions),
+                1,
+                "role {role} (AgentRoleId::UiaWorker) must never fan out beyond one instance"
+            );
+        }
+    }
+
+    #[test]
+    fn max_concurrent_instances_for_role_leaves_other_roles_unbounded() {
+        let definitions = builtin_definitions();
+        for role in [
+            role_names::EXPLORER,
+            role_names::PLANNER,
+            role_names::EXECUTOR,
+            role_names::AGENT_STEWARD,
+            "some-repo-local-role",
+        ] {
+            assert_eq!(
+                max_concurrent_instances_for_role(role, &definitions),
+                usize::MAX,
+                "role {role} must not be capped by the uia-worker singleton rule"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // reasoning_effort_defaults_for_role(_task) — Welle 8, Provider-/
+    // Modell-Ebene der Rangfolge Provider > Modell > Agent > Rolle.
+    // -------------------------------------------------------------------
+
+    /// Ein Projektkontext ohne echte Diskovery — nur die Felder, die
+    /// [`RuntimeChildRegistryFactory`] tatsächlich liest.
+    fn test_project() -> ProjectContext {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        ProjectContext {
+            cwd: root.clone(),
+            project_root: root,
+            docs: Vec::new(),
+        }
+    }
+
+    fn test_chain(config: &harw_config::ResolvedConfig) -> crate::approval::ApprovalChain {
+        crate::approval::ApprovalChain::for_root(
+            config,
+            crate::spec::AskResolution::Interactive,
+            harw_extension_api::approval_mode::ApprovalModeCell::default(),
+            None,
+            harw_extension_api::allow_rules::AllowRuleSet::new(),
+        )
+    }
+
+    fn test_provider_toml(default_reasoning_effort: Option<&str>) -> harw_config::ProviderToml {
+        harw_config::ProviderToml {
+            name: "acme".to_owned(),
+            api: "openai-chat".to_owned(),
+            base_url: "https://example.invalid/v1".to_owned(),
+            auth: None,
+            auth_header: None,
+            api_key: None,
+            headers: HashMap::new(),
+            models: Vec::new(),
+            enabled: true,
+            origin_allowlist: Default::default(),
+            rate_limit: None,
+            max_concurrency: None,
+            originator: None,
+            default_reasoning_effort: default_reasoning_effort.map(|label| {
+                label
+                    .parse()
+                    .expect("test fixture uses a valid ReasoningEffort label")
+            }),
+        }
+    }
+
+    fn test_model_toml(default_reasoning_effort: Option<&str>) -> harw_config::ModelToml {
+        harw_config::ModelToml {
+            id: "acme-model".to_owned(),
+            name: None,
+            provider: "acme".to_owned(),
+            aliases: Vec::new(),
+            context_window: None,
+            max_tokens: None,
+            prompt_caching: None,
+            reasoning: false,
+            input_types: Vec::new(),
+            capabilities: Default::default(),
+            default_reasoning_effort: default_reasoning_effort.map(|label| {
+                label
+                    .parse()
+                    .expect("test fixture uses a valid ReasoningEffort label")
+            }),
+        }
+    }
+
+    /// Baut eine Fabrik mit genau einer aufgelösten internen Modellstelle
+    /// (`WorkerComplex`) und der zugehörigen Provider-/Modell-Config, in der
+    /// `default_reasoning_effort` gesetzt ist.
+    fn factory_with_worker_complex_effort_defaults(
+        provider_effort: Option<&str>,
+        model_effort: Option<&str>,
+    ) -> RuntimeChildRegistryFactory {
+        let mut config = harw_config::ResolvedConfig::default();
+        config
+            .providers
+            .insert("acme".to_owned(), test_provider_toml(provider_effort));
+        config
+            .models
+            .insert("acme-model".to_owned(), test_model_toml(model_effort));
+
+        let chain = test_chain(&config);
+        let mut internal_models = HashMap::new();
+        internal_models.insert(
+            InternalModelPoint::WorkerComplex,
+            harw_config::ResolvedInternalModel {
+                point: InternalModelPoint::WorkerComplex,
+                provider: Some("acme".to_owned()),
+                model: Some("acme-model".to_owned()),
+                source: harw_config::InternalModelSource::Explicit,
+            },
+        );
+
+        RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            chain,
+        )
+        .expect("factory builds")
+        .with_internal_models(internal_models)
+        .with_reasoning_effort_config(Arc::new(config))
+    }
+
+    #[test]
+    fn reasoning_effort_defaults_for_role_task_uses_worker_complex_point_for_agent_steward() {
+        // `agent-steward` maps directly to `InternalModelPoint::WorkerComplex`
+        // (see `internal_point_for_role_maps_agent_steward_to_worker_complex`),
+        // so it exercises the point-lookup path without needing to guess a
+        // `TaskComplexity`.
+        let factory = factory_with_worker_complex_effort_defaults(Some("high"), Some("low"));
+        let (provider_default, model_default) =
+            factory.reasoning_effort_defaults_for_role_task(role_names::AGENT_STEWARD, None);
+        assert_eq!(provider_default, Some(harw_types::ReasoningEffort::High));
+        assert_eq!(model_default, Some(harw_types::ReasoningEffort::Low));
+    }
+
+    #[test]
+    fn reasoning_effort_defaults_for_role_task_selects_worker_complex_for_complex_worker() {
+        let factory = factory_with_worker_complex_effort_defaults(Some("xhigh"), None);
+        let (provider_default, model_default) = factory.reasoning_effort_defaults_for_role_task(
+            role_names::EXECUTOR,
+            Some(harw_core::TaskComplexity::Complex),
+        );
+        assert_eq!(provider_default, Some(harw_types::ReasoningEffort::Xhigh));
+        assert_eq!(model_default, None);
+    }
+
+    #[test]
+    fn reasoning_effort_defaults_for_role_task_yields_none_for_worker_simple_when_only_complex_is_configured() {
+        // Only `WorkerComplex` was given a resolved model in the fixture —
+        // `WorkerSimple` stays unresolved, so a simple-complexity worker must
+        // fall through to (None, None), not accidentally inherit the
+        // complex-tier defaults.
+        let factory = factory_with_worker_complex_effort_defaults(Some("xhigh"), Some("xhigh"));
+        let (provider_default, model_default) = factory.reasoning_effort_defaults_for_role_task(
+            role_names::EXECUTOR,
+            Some(harw_core::TaskComplexity::Simple),
+        );
+        assert_eq!(provider_default, None);
+        assert_eq!(model_default, None);
+    }
+
+    #[test]
+    fn reasoning_effort_defaults_for_role_task_yields_none_without_reasoning_effort_config() {
+        let chain = test_chain(&harw_config::ResolvedConfig::default());
+        let mut internal_models = HashMap::new();
+        internal_models.insert(
+            InternalModelPoint::WorkerComplex,
+            harw_config::ResolvedInternalModel {
+                point: InternalModelPoint::WorkerComplex,
+                provider: Some("acme".to_owned()),
+                model: Some("acme-model".to_owned()),
+                source: harw_config::InternalModelSource::Explicit,
+            },
+        );
+        let factory = RuntimeChildRegistryFactory::new(
+            test_project(),
+            Arc::new(harw_core::EchoModelProvider::new("echo")),
+            chain,
+        )
+        .expect("factory builds")
+        .with_internal_models(internal_models);
+        // `with_reasoning_effort_config` was never called.
+        let (provider_default, model_default) =
+            factory.reasoning_effort_defaults_for_role_task(role_names::AGENT_STEWARD, None);
+        assert_eq!(provider_default, None);
+        assert_eq!(model_default, None);
+    }
+
+    #[test]
+    fn reasoning_effort_defaults_for_role_task_yields_none_for_main_model_fallback() {
+        // A role with no builtin `TaskComplexity`-mapped point and no
+        // internal-model-point override falls back to the parent's main
+        // model — whose provider/model id this factory does not track (see
+        // field doc on `reasoning_effort_config`).
+        let factory = factory_with_worker_complex_effort_defaults(Some("high"), Some("high"));
+        let (provider_default, model_default) =
+            factory.reasoning_effort_defaults_for_role_task(role_names::PLANNER, None);
+        assert_eq!(provider_default, None);
+        assert_eq!(model_default, None);
     }
 }

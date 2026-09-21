@@ -33,6 +33,7 @@
 
 use std::fmt;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use reqwest::header::HeaderMap;
@@ -76,6 +77,16 @@ pub struct ProviderRateLimiter {
     enabled: bool,
     safety_margin_pct: u8,
     state: Mutex<State>,
+    /// Zähler beobachteter HTTP-429-Antworten dieses Providers (W6b —
+    /// UIA-Sichtbarkeit auf Provider-Concurrency/Rate-Limit-Zustand). Läuft
+    /// unabhängig von `enabled`/`safety_margin_pct`: auch ein deaktivierter
+    /// Pacer soll melden können, dass der Provider tatsächlich 429
+    /// zurückgegeben hat. Der Aufrufer (siehe `lib.rs::respond_once`) ruft
+    /// [`Self::record_rate_limited`] genau dort auf, wo Status 429 erkannt
+    /// wird — unabhängig davon, in welche [`harw_core::ModelError`]-Variante
+    /// (`QuotaExceeded` oder `Transient{status: Some(429)}`) der Fehler
+    /// anschließend übersetzt wird.
+    rate_limited_count: AtomicU64,
 }
 
 impl fmt::Debug for ProviderRateLimiter {
@@ -86,6 +97,7 @@ impl fmt::Debug for ProviderRateLimiter {
         f.debug_struct("ProviderRateLimiter")
             .field("enabled", &self.enabled)
             .field("safety_margin_pct", &self.safety_margin_pct)
+            .field("rate_limited_count", &self.rate_limited_count())
             .finish_non_exhaustive()
     }
 }
@@ -114,6 +126,7 @@ impl ProviderRateLimiter {
             enabled,
             safety_margin_pct,
             state: Mutex::new(State::default()),
+            rate_limited_count: AtomicU64::new(0),
         }
     }
 
@@ -123,6 +136,38 @@ impl ProviderRateLimiter {
     /// `true`, wenn `observe_headers`/`wait_for_slot` tatsächlich wirken.
     pub fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Zählt eine vom Aufrufer beobachtete HTTP-429-Antwort dieses Providers.
+    ///
+    /// # Description
+    /// Reiner Beobachtungszähler (kein Pacing-Effekt) — läuft unabhängig von
+    /// [`Self::is_enabled`], damit auch ein Provider ohne konfigurierten
+    /// Rate-Limit-Pacer meldet, dass er tatsächlich 429 zurückgegeben hat.
+    /// Der Aufrufer ruft dies genau dort auf, wo Status 429 aus einer
+    /// HTTP-Antwort gelesen wird, unabhängig davon, in welche
+    /// `harw_core::ModelError`-Variante der Fehler danach übersetzt wird.
+    ///
+    /// # Concurrency
+    /// Lock-frei (`AtomicU64::fetch_add`); sicher von mehreren Threads/Tasks
+    /// gleichzeitig aufrufbar.
+    pub fn record_rate_limited(&self) {
+        self.rate_limited_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Liefert die Gesamtzahl der seit Konstruktion beobachteten
+    /// HTTP-429-Antworten dieses Providers.
+    ///
+    /// # Returns
+    /// Monoton wachsender Zähler; setzt sich nie selbst zurück (im
+    /// Unterschied zum internen Pacing-Zustand, den [`Self::wait_for_slot`]
+    /// je Dimension zurücksetzt).
+    ///
+    /// # Concurrency
+    /// Lock-frei; sicher von mehreren Threads/Tasks gleichzeitig aufrufbar.
+    #[must_use]
+    pub fn rate_limited_count(&self) -> u64 {
+        self.rate_limited_count.load(Ordering::Relaxed)
     }
 
     /// Wertet Rate-Limit-Header einer HTTP-Antwort aus und aktualisiert den
@@ -674,5 +719,31 @@ mod tests {
         let limiter = ProviderRateLimiter::new(None);
         // Darf nicht blockieren; da deaktiviert, gibt es sofort zurueck.
         limiter.wait_for_slot().await;
+    }
+
+    #[test]
+    fn test_rate_limited_count_starts_at_zero() {
+        let limiter = ProviderRateLimiter::new(None);
+        assert_eq!(limiter.rate_limited_count(), 0);
+    }
+
+    #[test]
+    fn test_record_rate_limited_increments_count() {
+        let limiter = ProviderRateLimiter::new(None);
+        limiter.record_rate_limited();
+        limiter.record_rate_limited();
+        limiter.record_rate_limited();
+        assert_eq!(limiter.rate_limited_count(), 3);
+    }
+
+    #[test]
+    fn test_record_rate_limited_counts_even_when_pacer_disabled() {
+        // Der 429-Zähler ist ein reiner Beobachtungszähler, unabhängig vom
+        // Pacing-Zustand (`enabled == false` heißt nur: kein proaktives
+        // Warten, nicht "keine Beobachtung").
+        let limiter = ProviderRateLimiter::new(None);
+        assert!(!limiter.is_enabled());
+        limiter.record_rate_limited();
+        assert_eq!(limiter.rate_limited_count(), 1);
     }
 }

@@ -10,6 +10,13 @@
 //! change its own provider — neither directly nor indirectly. The `permission = "operator"`
 //! declaration enforces this at harness level. No `model_tool` attribute is set.
 //!
+//! This module also defines the sibling operation [`provider_concurrency`]
+//! (`/provider-concurrency`, Welle 6b), which **does** carry a `model_tool`
+//! surface (`approval = "always"`) — it adjusts an already-selected
+//! provider's client-side concurrency cap, never which provider is active,
+//! so it does not fall under the rule above. See its own doc for the
+//! approval-policy rationale.
+//!
 //! # Sub-Commands
 //! - `show` (default): reports the *runtime-active* provider from the controller snapshot;
 //!   falls back to `harness.default_provider` from config if no switch has occurred.
@@ -28,11 +35,17 @@
 //!
 //! # Exported Types
 //! - [`ProviderArgs`] — argument struct for the `/provider` command.
+//! - [`ProviderConcurrencyArgs`] — argument struct for
+//!   `/provider-concurrency` (Welle 6b).
 //!
 //! # Error Types
 //! - [`harw_operations::OpError::Execution`]: controller not available in context.
 //! - [`harw_operations::OpError::InvalidArguments`]: unknown subcommand, unknown
-//!   provider ID, missing credentials, or incompatible active model.
+//!   provider ID, missing credentials, incompatible active model, or (for
+//!   `/provider-concurrency`) a malformed `<n|unlimited>` value.
+//! - [`harw_operations::OpError::NotAvailable`]: (`/provider-concurrency`
+//!   only) no `ProviderLoadRegistry` service registered, or the resolved
+//!   provider has no registered load-control handle.
 //!
 //! # Concurrency
 //! The function is `async` but performs only synchronous reads except for the
@@ -44,9 +57,7 @@
 //! Welle 2 (2d) — `/model switch` becomes the sole atomic provider+model switch.
 
 use harw_macros::operation;
-use harw_operations::{
-    OpContext, OpError, OpOutput, SessionController, SharedSessionController,
-};
+use harw_operations::{OpContext, OpError, OpOutput, SharedSessionController};
 use harw_operations::session_control::UiaSelection;
 use std::sync::Arc;
 
@@ -162,7 +173,7 @@ pub(crate) fn resolved_config(ctx: &OpContext) -> Result<Arc<harw_config::Resolv
 /// [`OpOutput`] with compact, multi-line text.
 ///
 /// # Errors
-/// - [`OpError::Execution`]: when the [`SessionController`] is not registered in context.
+/// - [`OpError::Execution`]: when the [`SharedSessionController`] is not registered in context.
 /// - [`OpError::InvalidArguments`]: unknown sub-command; unknown provider ID;
 ///   missing credentials; incompatible active model.
 ///
@@ -248,12 +259,13 @@ fn handle_show(ctx: &OpContext) -> Result<OpOutput, OpError> {
         match configured_provider(&config, &active_id) {
             Some((canonical_id, provider)) => {
                 let auth = configured_auth_status_label(provider);
-                let text = format!(
+                let mut text = format!(
                     "Active provider : {canonical_id}  (runtime, explicitly switched)\n\
                      Name            : {display_name}\n\
                      Credentials     : {auth}",
                     display_name = provider.name,
                 );
+                append_load_status(ctx, canonical_id, &mut text);
                 Ok(OpOutput::from(text))
             }
             None => {
@@ -270,10 +282,12 @@ fn handle_show(ctx: &OpContext) -> Result<OpOutput, OpError> {
             Some(name) if configured_provider(&config, name).is_some() => {
                 let (canonical_id, _) = configured_provider(&config, name)
                     .expect("configured provider was checked in the match guard");
-                format!(
+                let mut text = format!(
                     "Active provider : {canonical_id}  (default from config, not yet switched)\n\
                  Use `/provider switch <id>` to change the active provider."
-                )
+                );
+                append_load_status(ctx, canonical_id, &mut text);
+                text
             }
             Some(name) => format!(
                 "Default provider '{name}' is not present in the configured provider catalog. \
@@ -282,6 +296,75 @@ fn handle_show(ctx: &OpContext) -> Result<OpOutput, OpError> {
             None => "No default provider configured. Use `harw onboard` to set one up.".to_owned(),
         };
         Ok(OpOutput::from(text))
+    }
+}
+
+/// Appends a concurrency/rate-limit status block to `text`, if a
+/// [`harw_provider_http::ProviderLoadRegistry`] is registered in the
+/// [`OpContext`] **and** it has a
+/// [`harw_provider_http::ProviderLoadControl`] handle for `canonical_id`.
+///
+/// # Description
+/// Silently a no-op when either is missing — most commonly because the
+/// composition root has not (yet) wired a [`harw_provider_http::ProviderLoadRegistry`]
+/// into the [`harw_operations::context::ServiceMap`] (see
+/// `harw_provider_http::build_provider_with_load_registry`), or because
+/// `canonical_id` names an `anthropic-messages` provider, which currently has
+/// no `ProviderLoadControl` implementation. `/provider show` must keep
+/// working (with only the base info) either way — this is purely additive.
+///
+/// # Arguments
+/// - `ctx` (`&OpContext`): execution context, queried for the registry service.
+/// - `canonical_id` (`&str`): the provider's canonical name/registry key.
+/// - `text` (`&mut String`): appended to in place.
+fn append_load_status(ctx: &OpContext, canonical_id: &str, text: &mut String) {
+    let Some(registry) = ctx.service::<harw_provider_http::ProviderLoadRegistry>() else {
+        return;
+    };
+    let Some(control) = registry.get(canonical_id) else {
+        return;
+    };
+    text.push('\n');
+    text.push_str(&format_load_status(&control.provider_status()));
+}
+
+/// Formats a [`harw_provider_http::ProviderLoadStatus`] as a compact,
+/// human-readable multi-line block (shared by `/provider show` and
+/// `/provider-concurrency`).
+fn format_load_status(status: &harw_provider_http::ProviderLoadStatus) -> String {
+    let concurrency = match status.max_concurrency {
+        Some(n) => n.to_string(),
+        None => "unlimited".to_owned(),
+    };
+    let wait = match status.rate_limit_wait {
+        Some(duration) => format!("{:.1}s", duration.as_secs_f64()),
+        None => "none".to_owned(),
+    };
+    format!(
+        "Concurrency     : {concurrency}  (available: {available})\n\
+         Rate limit wait : {wait}\n\
+         Rate limited    : {count}x observed since start\
+         {advice}",
+        available = display_permits(status.available_permits),
+        count = status.recent_rate_limited,
+        advice = if status.recent_rate_limited > 0 {
+            "\nHint: repeated HTTP 429 is a signal to lower concurrency, not raise it \
+             (`/provider-concurrency <provider> <n>`)."
+        } else {
+            ""
+        },
+    )
+}
+
+/// Renders `available_permits` for display — `usize::MAX` means "no
+/// [`harw_provider_http::DynamicConcurrencyLimiter`] installed" (see
+/// [`harw_provider_http::ProviderLoadStatus::available_permits`] doc), shown
+/// as `n/a` instead of a meaningless huge number.
+fn display_permits(available_permits: usize) -> String {
+    if available_permits == usize::MAX {
+        "n/a".to_owned()
+    } else {
+        available_permits.to_string()
     }
 }
 
@@ -711,6 +794,180 @@ fn handle_test(ctx: &OpContext) -> Result<OpOutput, OpError> {
     )))
 }
 
+/// Argument struct for the `/provider-concurrency` command/model-tool.
+///
+/// # Fields
+/// - `provider` (`Option<String>`): the canonical provider ID/name (first
+///   token). Required — [`provider_concurrency`] rejects a missing value.
+/// - `value` (`Option<String>`): either an unsigned integer (new hard
+///   nebenläufigkeits cap) or the literal `"unlimited"` (second token).
+///   Required — [`provider_concurrency`] rejects a missing or malformed
+///   value.
+///
+/// # Spec Reference
+/// Plan v2, Welle 6b — UIA-Sichtbarkeit auf Provider-Concurrency/
+/// Rate-Limit-Zustand + Live-Anpassung.
+#[derive(Default, serde::Deserialize)]
+pub struct ProviderConcurrencyArgs {
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub value: Option<String>,
+}
+
+impl harw_operations::FromRawArgs for ProviderConcurrencyArgs {
+    /// Assigns the first token to `provider`, the second to `value` —
+    /// mirrors [`crate::model::ModelArgs::from_raw_args`], so
+    /// `/provider-concurrency <id> <n|unlimited>` needs no join trick.
+    fn from_raw_args(tokens: &[String]) -> Result<Self, harw_operations::OpError> {
+        Ok(Self {
+            provider: tokens.first().cloned(),
+            value: tokens.get(1).cloned(),
+        })
+    }
+}
+
+/// Parses the `<n|unlimited>` token into a concurrency target.
+///
+/// # Returns
+/// `Ok(None)` for `"unlimited"` (case-insensitive), `Ok(Some(n))` for a
+/// positive integer.
+///
+/// # Errors
+/// - [`OpError::InvalidArguments`]: empty/missing value, `0`, a negative
+///   number, or anything that does not parse as `usize`.
+fn parse_concurrency_value(raw: &str) -> Result<Option<usize>, OpError> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("unlimited") {
+        return Ok(None);
+    }
+    match trimmed.parse::<usize>() {
+        Ok(0) => Err(OpError::InvalidArguments(
+            "concurrency must be a positive integer (use `unlimited` to remove the cap, not 0)"
+                .to_owned(),
+        )),
+        Ok(n) => Ok(Some(n)),
+        Err(_) => Err(OpError::InvalidArguments(format!(
+            "'{trimmed}' is not a valid concurrency value — expected a positive integer or \
+             `unlimited`"
+        ))),
+    }
+}
+
+/// Implements `/provider-concurrency` — live-adjusts a provider's hard,
+/// client-side concurrency cap and reports its resulting load status.
+///
+/// # Description
+/// Resolves `args.provider` against the configured provider catalog (same
+/// [`configured_provider`] lookup as `/provider show`/`switch`), then looks
+/// the canonical ID up in the [`harw_provider_http::ProviderLoadRegistry`]
+/// registered in the [`OpContext`] (see [`ServiceMap`][sm]). Calling
+/// [`harw_provider_http::ProviderLoadControl::set_max_concurrency`] takes
+/// effect immediately: raising the cap frees permits right away, lowering it
+/// only stops new permits from being handed out once in-flight requests
+/// return theirs (see `harw_provider_http::DynamicConcurrencyLimiter` doc —
+/// no in-flight request is ever aborted).
+///
+/// # Dual surface & approval
+/// Exposed both as an operator command (`/provider-concurrency`) and as a
+/// `model_tool`, so the UIA can lower its own provider's concurrency in
+/// response to repeated HTTP 429 without operator round-trip. The
+/// `#[operation(...)]` macro only supports a single static `approval` for
+/// the whole `model_tool` surface (no per-argument distinction), so this
+/// operation is declared `approval = "always"`: **raising** concurrency can
+/// increase cost and the chance of hitting the provider's own rate limit
+/// harder, which must not happen unattended; the macro cannot exempt
+/// lowering from that gate, so lowering pays the same (harmless) approval
+/// cost as a deliberate, conservative default. See module doc for the
+/// broader `/provider` "no unattended provider changes" rule, which this
+/// mirrors.
+///
+/// [sm]: harw_operations::context::ServiceMap
+///
+/// # Arguments
+/// - `ctx` (`&OpContext`): execution context, used for `resolved_config` and
+///   the `ProviderLoadRegistry` service lookup.
+/// - `args` (`ProviderConcurrencyArgs`): provider ID + `<n|unlimited>`.
+///
+/// # Returns
+/// [`OpOutput`] confirming the new target with the resulting load status
+/// (see [`format_load_status`]).
+///
+/// # Errors
+/// - [`OpError::InvalidArguments`]: missing provider/value, unknown provider,
+///   or a malformed value (see [`parse_concurrency_value`]).
+/// - [`OpError::NotAvailable`]: no [`harw_provider_http::ProviderLoadRegistry`]
+///   is registered in the [`OpContext`] (composition root has not wired it
+///   in yet), or the resolved provider has no registered handle (currently:
+///   any `anthropic-messages` provider — see
+///   `harw_provider_http::build_named_provider` doc).
+///
+/// # Spec Reference
+/// Plan v2, Welle 6b — "Live-Anpassung".
+#[operation(
+    name = "provider-concurrency",
+    summary = "Zeigt/verstellt die harte Nebenläufigkeitsgrenze eines Providers live. Bei wiederholten HTTP-429-Antworten die Concurrency senken, nicht erhöhen.",
+    domain = "catalog_config",
+    permission = "operator",
+    category = "model",
+    command(path = "/provider-concurrency", visibility = "tui_only", busy = "immediate"),
+    model_tool(approval = "always")
+)]
+async fn provider_concurrency(
+    ctx: &OpContext,
+    args: ProviderConcurrencyArgs,
+) -> Result<OpOutput, OpError> {
+    let provider_arg = args.provider.as_deref().filter(|s| !s.trim().is_empty()).ok_or_else(|| {
+        OpError::InvalidArguments(
+            "usage: /provider-concurrency <provider> <n|unlimited>".to_owned(),
+        )
+    })?;
+    let value_arg = args.value.as_deref().filter(|s| !s.trim().is_empty()).ok_or_else(|| {
+        OpError::InvalidArguments(
+            "usage: /provider-concurrency <provider> <n|unlimited>".to_owned(),
+        )
+    })?;
+    let target = parse_concurrency_value(value_arg)?;
+
+    let config = resolved_config(ctx)?;
+    let (canonical_id, _provider) = configured_provider(&config, provider_arg)
+        .ok_or_else(|| OpError::InvalidArguments(format!("unknown provider: {provider_arg}")))?;
+
+    let registry = ctx
+        .service::<harw_provider_http::ProviderLoadRegistry>()
+        .ok_or_else(|| {
+            OpError::NotAvailable(
+                "provider load-control registry is not available in this runtime \
+                 (the composition root has not wired a ProviderLoadRegistry into the \
+                 ServiceMap yet)"
+                    .to_owned(),
+            )
+        })?;
+    let control = registry.get(canonical_id).ok_or_else(|| {
+        OpError::NotAvailable(format!(
+            "provider '{canonical_id}' has no live load-control handle \
+             (only OpenAI-compatible backends currently expose this)"
+        ))
+    })?;
+
+    let applied = control.set_max_concurrency(target);
+    if !applied {
+        return Err(OpError::Execution(format!(
+            "provider '{canonical_id}' has no concurrency limiter installed; the request had no effect"
+        )));
+    }
+
+    let target_label = match target {
+        Some(n) => n.to_string(),
+        None => "unlimited".to_owned(),
+    };
+    let text = format!(
+        "provider '{canonical_id}': concurrency target set to {target_label}\n{status}",
+        status = format_load_status(&control.provider_status()),
+    );
+    Ok(OpOutput::from(text))
+}
+
 /// Implements `/uia-provider` — shows, lists and tests the UIA's
 /// own pinned provider selection (`harness.uia_provider`), independent of
 /// `default_provider`.
@@ -1035,6 +1292,7 @@ mod tests {
                 rate_limit: None,
                 max_concurrency: None,
                 originator: None,
+                default_reasoning_effort: None,
             },
         );
 
@@ -1142,5 +1400,123 @@ mod tests {
             }
             other => panic!("Expected OpError::InvalidArguments, got: {other:?}"),
         }
+    }
+
+    // ── `/provider-concurrency` (Welle 6b) ─────────────────────────────────────
+
+    fn openai_provider_config(name: &str) -> harw_config::ResolvedConfig {
+        let mut config = harw_config::ResolvedConfig::default();
+        config.providers.insert(
+            name.to_owned(),
+            harw_config::ProviderToml {
+                name: name.to_owned(),
+                api: "openai-chat".to_owned(),
+                base_url: "https://api.example.test/v1".to_owned(),
+                auth: None,
+                auth_header: None,
+                api_key: None,
+                headers: Default::default(),
+                models: Vec::new(),
+                enabled: true,
+                origin_allowlist: Default::default(),
+                rate_limit: None,
+                max_concurrency: None,
+                originator: None,
+                default_reasoning_effort: None,
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn parse_concurrency_value_accepts_unlimited_case_insensitively() {
+        assert_eq!(super::parse_concurrency_value("unlimited"), Ok(None));
+        assert_eq!(super::parse_concurrency_value("UNLIMITED"), Ok(None));
+        assert_eq!(super::parse_concurrency_value("  Unlimited  "), Ok(None));
+    }
+
+    #[test]
+    fn parse_concurrency_value_accepts_positive_integers() {
+        assert_eq!(super::parse_concurrency_value("1"), Ok(Some(1)));
+        assert_eq!(super::parse_concurrency_value("42"), Ok(Some(42)));
+    }
+
+    #[test]
+    fn parse_concurrency_value_rejects_zero() {
+        assert!(matches!(
+            super::parse_concurrency_value("0"),
+            Err(OpError::InvalidArguments(_))
+        ));
+    }
+
+    #[test]
+    fn parse_concurrency_value_rejects_negative_and_non_numeric() {
+        assert!(matches!(
+            super::parse_concurrency_value("-1"),
+            Err(OpError::InvalidArguments(_))
+        ));
+        assert!(matches!(
+            super::parse_concurrency_value("not-a-number"),
+            Err(OpError::InvalidArguments(_))
+        ));
+        assert!(matches!(
+            super::parse_concurrency_value(""),
+            Err(OpError::InvalidArguments(_))
+        ));
+    }
+
+    #[test]
+    fn provider_concurrency_args_from_raw_args_assigns_provider_and_value() {
+        let args = super::ProviderConcurrencyArgs::from_raw_args(&toks(&["openai", "3"]))
+            .expect("from_raw_args must not fail");
+        assert_eq!(args.provider.as_deref(), Some("openai"));
+        assert_eq!(args.value.as_deref(), Some("3"));
+    }
+
+    #[tokio::test]
+    async fn provider_concurrency_rejects_missing_provider_argument() {
+        let config = Arc::new(openai_provider_config("openai"));
+        let (ctx, _tmp) = make_test_ctx(None, Some(config));
+
+        let args = super::ProviderConcurrencyArgs {
+            provider: None,
+            value: Some("2".to_owned()),
+        };
+        let result = super::provider_concurrency(&ctx, args).await;
+        assert!(matches!(result, Err(OpError::InvalidArguments(_))));
+    }
+
+    #[tokio::test]
+    async fn provider_concurrency_rejects_unknown_provider() {
+        let config = Arc::new(openai_provider_config("openai"));
+        let (ctx, _tmp) = make_test_ctx(None, Some(config));
+
+        let args = super::ProviderConcurrencyArgs {
+            provider: Some("does-not-exist".to_owned()),
+            value: Some("2".to_owned()),
+        };
+        let result = super::provider_concurrency(&ctx, args).await;
+        match result {
+            Err(OpError::InvalidArguments(msg)) => {
+                assert!(msg.contains("unknown provider"), "message was: {msg}");
+            }
+            other => panic!("Expected OpError::InvalidArguments, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_concurrency_without_registered_load_registry_is_not_available() {
+        // No `ProviderLoadRegistry` service inserted — simulates a runtime
+        // whose composition root has not wired one into the `ServiceMap` yet
+        // (see `harw_provider_http::build_provider_with_load_registry` doc).
+        let config = Arc::new(openai_provider_config("openai"));
+        let (ctx, _tmp) = make_test_ctx(None, Some(config));
+
+        let args = super::ProviderConcurrencyArgs {
+            provider: Some("openai".to_owned()),
+            value: Some("2".to_owned()),
+        };
+        let result = super::provider_concurrency(&ctx, args).await;
+        assert!(matches!(result, Err(OpError::NotAvailable(_))));
     }
 }

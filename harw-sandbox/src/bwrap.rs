@@ -34,8 +34,10 @@ use std::num::NonZeroU64;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::time::Duration;
 
 use harw_authority::{Permission, SandboxSpec};
+use harw_types::cancel::CancelToken;
 
 use crate::{
     CargoExecutionMode, CargoSandboxProfile, NetworkMode, RelaySpec, SANDBOX_TMUX_SOCKET_PATH,
@@ -58,6 +60,11 @@ const SANDBOX_RUN_DIR: &str = "/run/harw";
 pub const SANDBOX_CARGO_PATH: &str = "/opt/harw/toolchain/bin/cargo";
 pub const SANDBOX_RUSTUP_HOME: &str = "/opt/harw/rustup";
 pub const SANDBOX_CARGO_HOME: &str = "/var/cache/harw/cargo";
+
+/// Poll-Intervall für [`SandboxChild::wait_or_cancel`]: `std::process::Child`
+/// kennt kein async-natives Warten, daher wird `try_wait` in dieser
+/// Schrittweite wiederholt, geracet gegen `CancelToken::cancelled`.
+const WAIT_OR_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// A fully determined Bubblewrap invocation. Keeping it inspectable makes
 /// policy tests possible without launching a process on the host.
@@ -579,6 +586,89 @@ impl SandboxChild {
         })?;
         self.reaped = true;
         Ok(status)
+    }
+
+    /// Wartet nicht-blockierend auf das Prozessende, geracet gegen `cancel`
+    /// (Plan „Welle 3 — 3c", Nachzieh-Task: `SandboxChild` konsistent
+    /// abbrechbar wie `shell.exec` in harw-tool-shell).
+    ///
+    /// # Description
+    /// `std::process::Child` kennt kein async-natives Warten; die Methode
+    /// pollt daher `Child::try_wait` alle [`WAIT_OR_CANCEL_POLL_INTERVAL`]
+    /// (20 ms) und racet die Wartezeit dazwischen per `tokio::select!` gegen
+    /// [`CancelToken::cancelled`]. Beendet sich der Prozess von selbst zuerst,
+    /// liefert die Methode dessen Status. Feuert `cancel` zuerst, wird der
+    /// Prozess per `SIGKILL` beendet (`Child::kill`) und blockierend
+    /// eingesammelt (`Child::wait`), damit kein Zombie zurückbleibt. In
+    /// beiden Fällen markiert die Methode den Prozess als eingesammelt, sodass
+    /// `Drop` ihn danach nicht erneut tötet.
+    ///
+    /// # Arguments
+    /// - `cancel` (`&CancelToken`): Token, gegen das die Wartezeit geracet
+    ///   wird; `cancel.is_cancelled()` kann beim Aufruf bereits `true` sein,
+    ///   dann kehrt der erste `select!`-Durchlauf sofort in den
+    ///   Abbruchzweig ein.
+    ///
+    /// # Returns
+    /// `Ok(Some(status))` bei normalem Prozessende (`ExitStatus` des
+    /// `bwrap`-Prozesses). `Ok(None)`, wenn `cancel` zuerst gefeuert hat und
+    /// der Prozess deswegen getötet wurde — bewusst kein eigener
+    /// Abbruch-Fehlervariant, da `Ok(None)` den Abbruch bereits eindeutig vom
+    /// Erfolgsfall unterscheidet und Kill/Reap dabei planmäßig ablaufen (kein
+    /// Fehlerfall).
+    ///
+    /// # Errors
+    /// [`SandboxError::Io`] mit dem Executable-Pfad, wenn `try_wait`, `kill`
+    /// oder das abschließende `wait` scheitert (echte E/A-Fehler bleiben
+    /// [`SandboxError::Io`], konsistent mit [`wait`](Self::wait)).
+    ///
+    /// # Concurrency
+    /// Blockiert den aufrufenden Task höchstens für ein Poll-Intervall
+    /// zwischen zwei Prüfungen; sicher gegenüber einem `cancel`, das
+    /// gleichzeitig auf einem anderen Task ausgelöst wird.
+    ///
+    /// # Examples
+    /// ```rust,no_run
+    /// # async fn demo(
+    /// #     launcher: &harw_sandbox::BwrapLauncher,
+    /// #     plan: &harw_sandbox::BwrapCommandPlan,
+    /// #     cancel: &harw_types::cancel::CancelToken,
+    /// # ) -> Result<(), harw_sandbox::SandboxError> {
+    /// let mut child = launcher.spawn(plan)?;
+    /// match child.wait_or_cancel(cancel).await? {
+    ///     Some(status) => println!("sandbox exited: {status}"),
+    ///     None => println!("sandbox cancelled"),
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub async fn wait_or_cancel(
+        &mut self,
+        cancel: &CancelToken,
+    ) -> SandboxResult<Option<ExitStatus>> {
+        loop {
+            if let Some(status) = self.child.try_wait().map_err(|error| SandboxError::Io {
+                path: self.executable.to_path_buf(),
+                reason: format!("polling sandbox process failed: {error}"),
+            })? {
+                self.reaped = true;
+                return Ok(Some(status));
+            }
+            tokio::select! {
+                () = tokio::time::sleep(WAIT_OR_CANCEL_POLL_INTERVAL) => {}
+                () = cancel.cancelled() => {
+                    self.child.kill().map_err(|error| SandboxError::Io {
+                        path: self.executable.to_path_buf(),
+                        reason: format!("killing sandbox process on cancel failed: {error}"),
+                    })?;
+                    self.child.wait().map_err(|error| SandboxError::Io {
+                        path: self.executable.to_path_buf(),
+                        reason: format!("reaping sandbox process after cancel failed: {error}"),
+                    })?;
+                    self.reaped = true;
+                    return Ok(None);
+                }
+            }
+        }
     }
 }
 
@@ -1128,6 +1218,63 @@ mod tests {
         assert!(child.wait().unwrap().success());
         // Wiederholtes Warten liefert denselben Status; Drop tötet nicht mehr.
         assert!(child.wait().unwrap().success());
+    }
+
+    #[tokio::test]
+    #[ignore = "startet /bin/sleep als Host-Prozess; Laufzeit-Erkennung im Test"]
+    async fn wait_or_cancel_kills_and_reaps_long_running_process_on_cancel() {
+        use harw_types::cancel::{CancelReason, CancelToken};
+
+        let sleep = Path::new("/bin/sleep");
+        if !sleep.is_file() {
+            eprintln!("übersprungen: /bin/sleep fehlt");
+            return;
+        }
+        let child = Command::new(sleep)
+            .arg("300")
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut guard = SandboxChild::new(child, sleep);
+        let proc_entry = PathBuf::from(format!("/proc/{}", guard.id()));
+        assert!(proc_entry.exists());
+
+        let cancel = CancelToken::new();
+        let canceller = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            canceller.cancel(CancelReason::User);
+        });
+
+        let started = std::time::Instant::now();
+        let result = guard.wait_or_cancel(&cancel).await.unwrap();
+        assert!(result.is_none(), "cancel must yield None, got {result:?}");
+        // Nach Kill + Wait ist der Prozess eingesammelt: kein /proc-Eintrag mehr.
+        assert!(!proc_entry.exists());
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // `Drop` darf den bereits eingesammelten Prozess nicht erneut töten.
+        drop(guard);
+    }
+
+    #[tokio::test]
+    #[ignore = "startet /bin/true als Host-Prozess; Laufzeit-Erkennung im Test"]
+    async fn wait_or_cancel_returns_exit_status_without_cancel() {
+        use harw_types::cancel::CancelToken;
+
+        let true_bin = Path::new("/bin/true");
+        if !true_bin.is_file() {
+            eprintln!("übersprungen: /bin/true fehlt");
+            return;
+        }
+        let child = Command::new(true_bin).stdin(Stdio::null()).spawn().unwrap();
+        let mut guard = SandboxChild::new(child, true_bin);
+        let cancel = CancelToken::new();
+
+        let status = guard.wait_or_cancel(&cancel).await.unwrap();
+        assert!(
+            status.is_some_and(|status| status.success()),
+            "expected Some(success), got {status:?}"
+        );
     }
 
     #[test]

@@ -493,6 +493,9 @@ mod tests {
     use std::io::{Read, Write};
     use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
 
+    // Signatur der beiden Beneath-Öffner, die die Tests gleich behandeln.
+    type Opener = fn(BorrowedFd<'_>, &Path, OpenMode) -> io::Result<File>;
+
     fn is_errno(err: &io::Error, candidates: &[Errno]) -> bool {
         candidates
             .iter()
@@ -717,7 +720,7 @@ mod tests {
         let wo = within_timeout(move || outcome(open_nofollow(&path, write)));
         assert!(wo.is_some(), "Schreib-Öffnen eines FIFOs muss scheitern");
 
-        let openers: [fn(BorrowedFd<'_>, &Path, OpenMode) -> io::Result<File>; 2] =
+        let openers: [Opener; 2] =
             [open_beneath, open_beneath_componentwise];
         for open in openers {
             let root_path = tmp.path().to_path_buf();
@@ -758,7 +761,7 @@ mod tests {
         assert!(!status.contains(OFlags::NONBLOCK));
 
         let root = open_dir_nofollow(tmp.path()).expect("root");
-        let openers: [fn(BorrowedFd<'_>, &Path, OpenMode) -> io::Result<File>; 2] =
+        let openers: [Opener; 2] =
             [open_beneath, open_beneath_componentwise];
         for open in openers {
             let file = open(root.as_fd(), Path::new("dir/inner.txt"), OpenMode::read_only())

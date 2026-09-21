@@ -464,6 +464,14 @@ fn merge_optional_or_bool(
 // Verhalten zurueck (Risiko R1, Abschnitt 8): jede Abweichung vom
 // aktuellen `trusted`-Wert wird abgelehnt + diagnostiziert, ohne einen
 // Vergleichsversuch zu unternehmen.
+// 8 Parameter, weil `ordering` zu den 7 Parametern hinzukommt, die alle
+// generischen Merge-Regel-Helfer in diesem Modul teilen (vgl. `or_bool`,
+// `merge_optional_or_bool`: role/field/layer_path/out als gemeinsamer
+// "Merge-Kontext"). Ein eigener Kontext-Struct nur fuer diese Funktion
+// wuerde von den Schwesterfunktionen abweichen, ohne echte Komplexitaet zu
+// reduzieren (nur 2 Aufrufstellen), und dieser Auftrag ist ausdruecklich
+// auf reine Clippy-Fixes ohne Verhaltensaenderung beschraenkt.
+#[allow(clippy::too_many_arguments)]
 fn stricter_of(
     trusted: &mut String,
     incoming: String,
@@ -517,6 +525,9 @@ fn stricter_of(
 
 // Wie `stricter_of`, aber fuer `Option<String>` (`permissions.default_mode`)
 // — s. `merge_optional_min_bound`.
+// Gleiche Begruendung wie bei `stricter_of` oben: `ordering` kommt zu den
+// 7 gemeinsamen Merge-Kontext-Parametern hinzu, nur eine Aufrufstelle.
+#[allow(clippy::too_many_arguments)]
 fn merge_optional_stricter_of(
     trusted: &mut Option<String>,
     incoming: Option<String>,
@@ -1353,10 +1364,14 @@ mod tests {
     // vertrautes Profil setzt einen neuen Wert und ersetzt den Home-Wert.
     #[test]
     fn test_uia_worker_model_profile_replaces_overrides_trusted_value() {
-        let mut trusted = HarnessConfig::default();
-        trusted.uia_worker_model = Some("claude-old".to_owned());
-        let mut incoming = HarnessConfig::default();
-        incoming.uia_worker_model = Some("claude-new".to_owned());
+        let mut trusted = HarnessConfig {
+            uia_worker_model: Some("claude-old".to_owned()),
+            ..Default::default()
+        };
+        let incoming = HarnessConfig {
+            uia_worker_model: Some("claude-new".to_owned()),
+            ..Default::default()
+        };
         let raw = raw_from("uia_worker_model = \"claude-new\"");
         let diagnostics = merge_layer_into(
             &mut trusted,
@@ -1375,10 +1390,14 @@ mod tests {
     // rohen TOML traegt.
     #[test]
     fn test_uia_worker_model_untrusted_project_layer_cannot_set_it() {
-        let mut trusted = HarnessConfig::default();
-        trusted.uia_worker_model = Some("claude-trusted".to_owned());
-        let mut incoming = HarnessConfig::default();
-        incoming.uia_worker_model = Some("claude-evil".to_owned());
+        let mut trusted = HarnessConfig {
+            uia_worker_model: Some("claude-trusted".to_owned()),
+            ..Default::default()
+        };
+        let incoming = HarnessConfig {
+            uia_worker_model: Some("claude-evil".to_owned()),
+            ..Default::default()
+        };
         let raw = raw_from("uia_worker_model = \"claude-evil\"");
         let diagnostics = merge_layer_into(
             &mut trusted,

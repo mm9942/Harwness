@@ -17,6 +17,16 @@
 //! ## Nebenläufigkeit
 //! [`AnthropicMessagesProvider`] ist `Send + Sync` (`reqwest::Client` teilt
 //! sich intern und klont günstig). `respond` liefert ein `Box::pin`-Future.
+//! `build_named_provider` (in `lib.rs`) installiert über
+//! [`AnthropicMessagesProvider::configure_concurrency`] denselben
+//! [`crate::DynamicConcurrencyLimiter`] wie der OpenAI-kompatible Pfad —
+//! ein Permit pro Request, gehalten bis der Response-Body vollständig
+//! gelesen ist — sowie über [`AnthropicMessagesProvider::configure_rate_limit`]
+//! denselben [`crate::rate_limiter::ProviderRateLimiter`] (Header-Pacing plus
+//! HTTP-429-Zähler via `record_rate_limited`). Beide sind über
+//! `impl `[`crate::ProviderLoadControl`]` for AnthropicMessagesProvider`
+//! beobacht- und live verstellbar (Anthropic-Parität zu
+//! [`crate::OpenAiResponsesProvider`], W6b).
 //!
 //! ## Sicherheit
 //! Das Credential liegt in `secrecy::SecretString` und wird ausschließlich beim
@@ -124,6 +134,18 @@ pub struct AnthropicMessagesProvider {
     /// deaktiviert (`ProviderRateLimiter::new(None)`) — dieser Konstruktionsweg
     /// hat keinen Zugriff auf `harw_config::ProviderToml::rate_limit`.
     rate_limiter: std::sync::Arc<crate::rate_limiter::ProviderRateLimiter>,
+    /// Harte, zur Laufzeit elastisch verstellbare Nebenläufigkeitsgrenze
+    /// (siehe [`harw_config::ProviderToml::max_concurrency`] und
+    /// [`crate::DynamicConcurrencyLimiter`]); `None` nur bei [`Self::new`]/
+    /// [`Self::from_base`] (kein Limiter installiert). `build_named_provider`
+    /// installiert über [`Self::configure_concurrency`] immer einen Limiter
+    /// — auch für `max_concurrency: None` (unbegrenzt) — damit ein späterer
+    /// Ops-Layer per [`crate::DynamicConcurrencyLimiter::set_target`] auch
+    /// ursprünglich unbegrenzte Provider nachträglich deckeln kann. Anders
+    /// als `rate_limiter` (reaktives Header-Pacing) blockiert dies
+    /// zusätzliche Requests rein client-seitig, bevor sie überhaupt gesendet
+    /// werden.
+    concurrency_limiter: Option<Arc<crate::DynamicConcurrencyLimiter>>,
     /// `auth.credential_pool[provider_id]`, falls nicht-leer konfiguriert
     /// (siehe `crate::credential_pool`-Moduldoku „Credential-Pool"). `None`
     /// heißt: dieser Provider nutzt ausschließlich `credential`/`messages_url`
@@ -158,6 +180,7 @@ impl AnthropicMessagesProvider {
             request_timeout: super::DEFAULT_REQUEST_TIMEOUT,
             configured_headers: None,
             rate_limiter: std::sync::Arc::new(crate::rate_limiter::ProviderRateLimiter::new(None)),
+            concurrency_limiter: None,
             credential_pool: None,
         }
     }
@@ -200,6 +223,56 @@ impl AnthropicMessagesProvider {
     pub(crate) fn configure_rate_limit(&mut self, rate_limit: Option<harw_config::RateLimitToml>) {
         self.rate_limiter =
             std::sync::Arc::new(crate::rate_limiter::ProviderRateLimiter::new(rate_limit));
+    }
+
+    /// Installiert einen [`crate::DynamicConcurrencyLimiter`] aus
+    /// `harw_config::ProviderToml::max_concurrency`; aufgerufen von
+    /// `build_named_provider` im Anthropic-Zweig — analog zu
+    /// `OpenAiResponsesProvider::from_named_config`, das ebenfalls immer
+    /// einen Limiter installiert, auch für `max_concurrency: None`
+    /// (unbegrenzt), damit ein späterer Ops-Layer die Grenze nachträglich
+    /// per [`crate::DynamicConcurrencyLimiter::set_target`] setzen kann.
+    pub(crate) fn configure_concurrency(&mut self, max_concurrency: Option<usize>) {
+        self.concurrency_limiter = Some(Arc::new(crate::DynamicConcurrencyLimiter::new(
+            max_concurrency,
+        )));
+    }
+
+    /// Liefert einen geteilten Zugriff auf den installierten
+    /// [`crate::DynamicConcurrencyLimiter`], falls einer via
+    /// [`Self::configure_concurrency`] gesetzt wurde.
+    ///
+    /// # Returns
+    /// `Some(&Arc<DynamicConcurrencyLimiter>)`, geklont über `Arc::clone` für
+    /// den Aufrufer, oder `None`, wenn dieser Provider über [`Self::new`]/
+    /// [`Self::from_base`] statt `build_named_provider` gebaut wurde.
+    #[must_use]
+    pub fn concurrency_limiter(&self) -> Option<Arc<crate::DynamicConcurrencyLimiter>> {
+        self.concurrency_limiter.as_ref().map(Arc::clone)
+    }
+
+    /// Liefert einen geteilten Zugriff auf den
+    /// [`crate::rate_limiter::ProviderRateLimiter`] dieses Providers.
+    ///
+    /// # Returns
+    /// Ein geklonter `Arc<ProviderRateLimiter>` (immer vorhanden — jeder
+    /// Provider hat einen Rate-Limiter, ggf. nur deaktiviert).
+    #[must_use]
+    pub fn rate_limiter_handle(&self) -> Arc<crate::rate_limiter::ProviderRateLimiter> {
+        Arc::clone(&self.rate_limiter)
+    }
+
+    /// Momentaufnahme von Nebenläufigkeits-/Rate-Limit-Zustand dieses
+    /// Providers. Siehe [`crate::ProviderLoadStatus`]. Identisch zu
+    /// `<Self as crate::ProviderLoadControl>::provider_status`; als eigene
+    /// Methode nutzbar, ohne den Trait zu importieren.
+    #[must_use]
+    pub fn load_status(&self) -> crate::ProviderLoadStatus {
+        crate::provider_load_status(
+            &self.provider_id,
+            self.concurrency_limiter.as_deref(),
+            &self.rate_limiter,
+        )
     }
 
     /// Resolves the model for one request after checking its provider affinity.
@@ -807,6 +880,20 @@ impl AnthropicMessagesProvider {
             }
         }
 
+        // Hartes Nebenläufigkeits-Limit (siehe [`Self::concurrency_limiter`]):
+        // blockiert, bis ein Slot frei wird, statt fehlzuschlagen. Der Guard
+        // bleibt bis zum Ende dieser Funktion (also bis der Response-Body
+        // vollständig gelesen ist) im Scope, damit die Grenze wirklich in
+        // Flug befindliche Requests zählt — gleiches Muster wie
+        // `OpenAiResponsesProvider::respond_once`.
+        let _concurrency_permit = match &self.concurrency_limiter {
+            Some(limiter) => Some(limiter.acquire().await.map_err(|_| {
+                ModelError::RequestFailed(
+                    "internal error: provider concurrency semaphore was closed".to_owned(),
+                )
+            })?),
+            None => None,
+        };
         self.rate_limiter.wait_for_slot().await;
         let response = builder
             .json(&wire)
@@ -830,6 +917,10 @@ impl AnthropicMessagesProvider {
         })?;
 
         if status.as_u16() == 429 {
+            // W6b — UIA-Sichtbarkeit: zählt jede beobachtete 429-Antwort
+            // dieses Providers (siehe
+            // `rate_limiter::ProviderRateLimiter::record_rate_limited`).
+            self.rate_limiter.record_rate_limited();
             let retry_after = super::parse_retry_after(retry_after_header.as_deref(), &body);
             return Err(ModelError::RateLimited {
                 retry_after_secs: retry_after.as_secs(),
@@ -937,6 +1028,26 @@ impl ModelProvider for AnthropicMessagesProvider {
                 }
             }
         })
+    }
+}
+
+impl crate::ProviderLoadControl for AnthropicMessagesProvider {
+    /// Siehe [`Self::load_status`].
+    fn provider_status(&self) -> crate::ProviderLoadStatus {
+        self.load_status()
+    }
+
+    /// Siehe [`crate::DynamicConcurrencyLimiter::set_target`]: wirkt sofort
+    /// beim Wachsen, lazy beim Schrumpfen. `false`, wenn dieser Provider
+    /// ohne [`Self::configure_concurrency`] gebaut wurde.
+    fn set_max_concurrency(&self, target: Option<usize>) -> bool {
+        match &self.concurrency_limiter {
+            Some(limiter) => {
+                limiter.set_target(target);
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -2034,4 +2145,170 @@ mod tests {
             Some(ANTHROPIC_API_HOST)
         );
     }
+
+    // ── Nebenläufigkeit & Rate-Limit-Sichtbarkeit (W6b-Parität für Anthropic) ──
+
+    #[test]
+    fn set_max_concurrency_applies_immediately_to_available_permits() {
+        let mut provider = test_provider();
+        provider.configure_concurrency(None);
+
+        assert!(
+            crate::ProviderLoadControl::set_max_concurrency(&provider, Some(2)),
+            "provider built with configure_concurrency always has a limiter"
+        );
+        let status = crate::ProviderLoadControl::provider_status(&provider);
+        assert_eq!(status.max_concurrency, Some(2));
+        assert_eq!(status.available_permits, 2);
+    }
+
+    #[test]
+    fn provider_load_control_reports_false_without_configured_limiter() {
+        let provider = test_provider();
+        assert!(!crate::ProviderLoadControl::set_max_concurrency(
+            &provider,
+            Some(2)
+        ));
+    }
+
+    /// Startet einen Mock-HTTP-Server, der pro Verbindung einen eigenen
+    /// Thread spawnt, die aktuell gleichzeitig offenen Verbindungen zählt,
+    /// den beobachteten Höchststand (`peak`) trackt, künstlich verzögert und
+    /// dann eine minimale, gültige Anthropic-Messages-Antwort zurückgibt.
+    /// Gleiches Muster wie `lib.rs::tests::mock_concurrency_probe_server`,
+    /// hier lokal dupliziert, weil dieses Modul keinen Zugriff auf das
+    /// private Test-Fixture von `lib.rs` hat.
+    fn mock_anthropic_concurrency_probe_server(
+        request_count: usize,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::thread::JoinHandle<()>,
+    ) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let base_url = format!(
+            "http://{}/v1/messages",
+            listener.local_addr().expect("mock address")
+        );
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let peak_for_thread = Arc::clone(&peak);
+        let handle = thread::spawn(move || {
+            let mut connection_handles = Vec::with_capacity(request_count);
+            for _ in 0..request_count {
+                let (mut stream, _) = listener.accept().expect("accept mock request");
+                let in_flight = Arc::clone(&in_flight);
+                let peak = Arc::clone(&peak_for_thread);
+                connection_handles.push(thread::spawn(move || {
+                    let mut request_buffer = [0_u8; 4096];
+                    let _read = stream.read(&mut request_buffer).expect("read mock request");
+                    let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(current, Ordering::SeqCst);
+                    // Künstliche Latenz, damit gleichzeitig eingehende
+                    // Requests sich zeitlich überlappen können, sofern der
+                    // Client sie überhaupt gleichzeitig absetzt.
+                    thread::sleep(Duration::from_millis(80));
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    let body = br#"{"content":[{"type":"text","text":"mock"}]}"#;
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream
+                        .write_all(headers.as_bytes())
+                        .expect("write mock response headers");
+                    stream.write_all(body).expect("write mock response body");
+                }));
+            }
+            for handle in connection_handles {
+                handle.join().expect("mock connection handler completes");
+            }
+        });
+        (base_url, peak, handle)
+    }
+
+    #[tokio::test]
+    async fn respond_honors_max_concurrency_hard_cap() {
+        const MAX_CONCURRENCY: usize = 2;
+        const REQUEST_COUNT: usize = 5;
+
+        let (base_url, peak, server) = mock_anthropic_concurrency_probe_server(REQUEST_COUNT);
+
+        let mut provider = AnthropicMessagesProvider::new(
+            base_url,
+            "configured-model",
+            AnthropicCredential::ApiKey(SecretString::new("sk-secret".into())),
+        );
+        provider.configure_concurrency(Some(MAX_CONCURRENCY));
+        let provider = Arc::new(provider);
+
+        let mut handles = Vec::with_capacity(REQUEST_COUNT);
+        for _ in 0..REQUEST_COUNT {
+            let provider = Arc::clone(&provider);
+            handles.push(tokio::spawn(async move {
+                provider
+                    .respond(request_with_ids(None, None))
+                    .await
+                    .expect("mock anthropic response parses")
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("respond task completes");
+        }
+        server.join().expect("mock server completes");
+
+        assert!(
+            peak.load(std::sync::atomic::Ordering::SeqCst) <= MAX_CONCURRENCY,
+            "observed more than {MAX_CONCURRENCY} requests in flight simultaneously"
+        );
+    }
+
+    #[tokio::test]
+    async fn respond_records_rate_limited_count_on_429() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let base_url = format!(
+            "http://{}/v1/messages",
+            listener.local_addr().expect("mock address")
+        );
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept mock request");
+            let mut request_buffer = [0_u8; 4096];
+            let _read = stream.read(&mut request_buffer).expect("read mock request");
+            let body = br#"{"type":"error","error":{"type":"rate_limit_error","message":"rate limited"}}"#;
+            let headers = format!(
+                "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\nretry-after: 1\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .expect("write mock response headers");
+            stream.write_all(body).expect("write mock response body");
+        });
+
+        let provider = AnthropicMessagesProvider::new(
+            base_url,
+            "configured-model",
+            AnthropicCredential::ApiKey(SecretString::new("sk-secret".into())),
+        );
+
+        assert_eq!(provider.rate_limiter_handle().rate_limited_count(), 0);
+        let error = provider
+            .respond(request_with_ids(None, None))
+            .await
+            .expect_err("429 must surface as an error");
+        assert!(matches!(error, ModelError::RateLimited { .. }));
+        assert_eq!(provider.rate_limiter_handle().rate_limited_count(), 1);
+
+        server.join().expect("mock server completes");
+    }
+
 }

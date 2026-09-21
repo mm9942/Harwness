@@ -48,8 +48,18 @@
 //! ```
 
 use harw_macros::operation;
-use harw_operations::{OpContext, OpError, OpOutput, SessionController};
+use harw_operations::{OpContext, OpError, OpOutput};
 use harw_operations::session_control::UiaSelection;
+
+// Öffentlicher Re-Export: `crate::config_util` ist `pub(crate)`, deshalb ist
+// dieser `pub use` der öffentliche Pfad, über den `harw-tui`-Tests (und
+// jeder andere Downstream-Crate) `SelectionPersistence` und
+// `RecordingSelectionPersistence` erreichen — ohne `harw-ops/src/lib.rs`
+// ändern zu müssen. Siehe `crate::config_util`-Moduldoc für den Trait selbst.
+pub use crate::config_util::{
+    FileSelectionPersistence, RecordedSelectionPersistCall, RecordingSelectionPersistence,
+    SelectionPersistence,
+};
 
 /// Argumente für die `/model`-Operation.
 ///
@@ -384,7 +394,10 @@ async fn model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError> {
             }
         };
 
-        return handle_switch_core(ctx, target, crate::config_util::persist_default_selection);
+        let persistence = crate::config_util::selection_persistence(ctx);
+        return handle_switch_core(ctx, target, move |provider, model| {
+            persistence.persist_default_selection(provider, model)
+        });
     }
 
     // ── TASK A/B: show + list read live state then fall back to config ────────
@@ -516,13 +529,17 @@ fn handle_uia_model_switch(ctx: &OpContext, target: String) -> Result<OpOutput, 
     // Delegate fully to the UIA provider switch core: validates the resolved
     // provider and mutates provider+model together, atomically. `persist` is
     // passed explicitly (rather than hardcoded inside `handle_uia_switch_core`)
-    // purely so tests can inject a no-op closure — production behavior is
-    // unchanged, this is always `persist_uia_selection` here.
+    // so tests can inject a `RecordingSelectionPersistence` via the
+    // `ServiceMap` (see `crate::config_util::selection_persistence`) instead
+    // of a bespoke no-op closure — production behavior is unchanged, this
+    // resolves to `persist_uia_selection` (via `FileSelectionPersistence`)
+    // whenever no service is injected.
+    let persistence = crate::config_util::selection_persistence(ctx);
     crate::provider::handle_uia_switch_core(
         ctx,
         configured.provider.clone(),
         Some(configured.id.clone()),
-        crate::config_util::persist_uia_selection,
+        move |provider, model| persistence.persist_uia_selection(provider, model),
     )
 }
 
@@ -916,11 +933,10 @@ async fn uia_worker_model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, 
             }
         };
 
-        return handle_uia_worker_model_switch(
-            ctx,
-            target,
-            crate::config_util::persist_uia_worker_model,
-        );
+        let persistence = crate::config_util::selection_persistence(ctx);
+        return handle_uia_worker_model_switch(ctx, target, move |model| {
+            persistence.persist_uia_worker_model(model)
+        });
     }
 
     let controller = ctx.service::<harw_operations::SharedSessionController>();
@@ -970,6 +986,7 @@ mod tests {
                 input_types: Vec::new(),
                 capabilities: harw_config::ModelCapabilitiesToml::default(),
                 prompt_caching: None,
+                default_reasoning_effort: None,
             },
         );
 
@@ -1062,6 +1079,7 @@ mod tests {
                 rate_limit: None,
                 max_concurrency: None,
                 originator: None,
+                default_reasoning_effort: None,
             }
         }
         fn model(model_id: &str, provider_name: &str) -> harw_config::ModelToml {
@@ -1076,6 +1094,7 @@ mod tests {
                 input_types: Vec::new(),
                 capabilities: harw_config::ModelCapabilitiesToml::default(),
                 prompt_caching: None,
+                default_reasoning_effort: None,
             }
         }
 
@@ -1244,6 +1263,7 @@ mod tests {
                     input_types: Vec::new(),
                     capabilities: harw_config::ModelCapabilitiesToml::default(),
                     prompt_caching: None,
+                    default_reasoning_effort: None,
                 },
             );
         }

@@ -320,6 +320,15 @@ pub struct ExecutableAgentIr {
     /// Authority ceiling after resolution (§7, §12).
     authority: AuthorityCeiling,
 
+    /// Standard-Reasoning-Effort dieses Agenten nach der DSL-Vererbungsregel
+    /// (`extends`/Mixins/Schichten: spezifischere Definition überschreibt).
+    /// Undurchsichtiger `String` — analog zu `BudgetSpec::effort_cap` — weil
+    /// diese Crate nicht von `harw_types::ReasoningEffort` abhängen darf.
+    /// `None` bedeutet: keine Ebene der DSL-Auflösung hat eine Aussage
+    /// getroffen; die Rangfolge gegenüber Provider-/Modell-/Rollen-Ebene ist
+    /// Aufgabe des Konsumenten (`harw-runtime::guard_wiring::resolve_default_reasoning_effort`).
+    reasoning_effort: Option<String>,
+
     /// SpawnContract — the immutable snapshot passed at session construction.
     spawn_contract: SpawnContract,
     /// JobTemplate — the shape of the work unit this agent runs.
@@ -585,7 +594,7 @@ pub struct ReturnPipeline {
 /// mit einem `v3`-Digest; beide Räume sind durch den Domain-String getrennt).
 /// Golden-Snapshots aus `v2` sind ab diesem Knoten bewusst ungültig — kein
 /// stillschweigend verschobener Hash, siehe Abschlussbericht des Knotens.
-const SNAPSHOT_HASH_DOMAIN: &str = "harwness.executable-ir.snapshot/v4";
+const SNAPSHOT_HASH_DOMAIN: &str = "harwness.executable-ir.snapshot/v5";
 
 /// Berechnet einen stabilen BLAKE3-Digest über die Inhaltsfelder einer [`ExecutableAgentIr`].
 ///
@@ -720,6 +729,8 @@ fn compute_snapshot_id(ir: &ExecutableAgentIr) -> SnapshotId {
     hash_str(&mut hasher, &format!("{:?}", ir.role));
     // specialization
     hash_str(&mut hasher, &ir.specialization);
+    // reasoning_effort — neu in v5: undurchsichtiges Label, Präsenz-Byte + Wert
+    hash_opt_str(&mut hasher, ir.reasoning_effort.as_deref());
     // authority.capabilities (sorted for determinism)
     let mut sorted_caps = ir.authority.capabilities.clone();
     sorted_caps.sort();
@@ -799,6 +810,22 @@ impl ExecutableAgentIr {
     /// Returns the resolved authority ceiling.
     pub fn authority(&self) -> &AuthorityCeiling {
         &self.authority
+    }
+
+    /// Returns the agent-level default reasoning effort, if any DSL layer
+    /// (target, mixin, or `extends` ancestor) set one.
+    ///
+    /// # Description
+    /// Undurchsichtiges Label (nicht `harw_types::ReasoningEffort`, siehe
+    /// Feld-Doku). Der Konsument entscheidet die Rangfolge gegenüber
+    /// Provider-/Modell-/Rollen-Default und muss ein unbekanntes Label
+    /// fail-closed behandeln (nicht raten).
+    ///
+    /// # Returns
+    /// `Some(&str)` mit dem aufgelösten Label, `None` wenn keine Ebene eine
+    /// Aussage getroffen hat.
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        self.reasoning_effort.as_deref()
     }
 
     /// Returns the immutable spawn contract snapshot.
@@ -1324,6 +1351,7 @@ pub fn lower(resolved: &ResolvedAgentDefinition) -> Result<ExecutableAgentIr, Ds
         role: resolved.role,
         specialization: resolved.specialization.clone(),
         authority: resolved.authority.clone(),
+        reasoning_effort: resolved.reasoning_effort.clone(),
         spawn_contract,
         job_template,
         context_program,
@@ -1467,11 +1495,25 @@ mod tests {
             specialization: specialization.to_owned(),
             name: None,
             description: None,
+            reasoning_effort: None,
             authority: AuthorityCeiling {
                 capabilities: vec!["filesystem.read".to_owned()],
             },
             trace: ResolutionTrace { steps: vec![] },
             config: toml::Table::new(),
+        }
+    }
+
+    /// Wie [`base_resolved`], aber mit gesetztem `reasoning_effort` — für
+    /// Tests des Durchreichens von `ResolvedAgentDefinition::reasoning_effort`
+    /// bis in [`ExecutableAgentIr::reasoning_effort`].
+    fn base_resolved_with_reasoning_effort(
+        specialization: &str,
+        reasoning_effort: Option<&str>,
+    ) -> ResolvedAgentDefinition {
+        ResolvedAgentDefinition {
+            reasoning_effort: reasoning_effort.map(str::to_owned),
+            ..base_resolved(specialization)
         }
     }
 
@@ -2473,6 +2515,38 @@ mod tests {
         assert_eq!(
             snap1, snap2,
             "identical section_detail content must produce an identical SnapshotId across repeated lowering"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // reasoning_effort: Durchreichen von ResolvedAgentDefinition in
+    // ExecutableAgentIr (Vererbungsregel selbst ist Sache von `resolve.rs`).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_lower_passes_through_absent_reasoning_effort() {
+        let resolved = base_resolved_with_reasoning_effort("worker", None);
+        let ir = lower(&resolved).expect("lower should succeed");
+        assert_eq!(ir.reasoning_effort(), None);
+    }
+
+    #[test]
+    fn test_lower_passes_through_set_reasoning_effort() {
+        let resolved = base_resolved_with_reasoning_effort("worker", Some("high"));
+        let ir = lower(&resolved).expect("lower should succeed");
+        assert_eq!(ir.reasoning_effort(), Some("high"));
+    }
+
+    #[test]
+    fn test_snapshot_id_differs_when_reasoning_effort_differs() {
+        let ir1 = lower(&base_resolved_with_reasoning_effort("worker", Some("low")))
+            .expect("lower should succeed");
+        let ir2 = lower(&base_resolved_with_reasoning_effort("worker", Some("high")))
+            .expect("lower should succeed");
+        assert_ne!(
+            ir1.snapshot_id(),
+            ir2.snapshot_id(),
+            "reasoning_effort participates in the content hash (v5)"
         );
     }
 }

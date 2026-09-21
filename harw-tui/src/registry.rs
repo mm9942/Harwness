@@ -192,6 +192,9 @@ impl CommandRegistry {
     /// - `output`: defaults to [`OutputSurface::Inline`].
     /// - `aliases`: pulled from [`harw_operations::operation::OperationMeta::aliases`] so that
     ///   short aliases like `"m"`, `"p"`, and `"reasoning"` are wired into the TUI catalog.
+    /// - `busy`: copied from [`harw_operations::operation::OperationMeta::busy`] so that
+    ///   [`CommandSpec::busy`] reflects whether the command may run immediately during a
+    ///   busy turn or must wait for turn end (the default).
     ///
     /// # Collision detection
     /// Returns `Err(TuiRegistryError)` when:
@@ -316,7 +319,7 @@ impl CommandRegistry {
                     let domain = map_domain(meta.domain);
                     let output = OutputSurface::Inline;
 
-                    if let Ok(cmd_spec) = CommandSpec::new(
+                    if let Ok(mut cmd_spec) = CommandSpec::new(
                         cmd_name.as_str(),
                         meta.aliases.iter().copied(),
                         scope,
@@ -324,6 +327,7 @@ impl CommandRegistry {
                         output,
                         domain,
                     ) {
+                        cmd_spec.busy = meta.busy;
                         // Record in indexes after successful spec construction.
                         path_index.push((raw_path.clone(), op_name.clone()));
                         name_index.push((canonical.clone(), op_name.clone()));
@@ -415,8 +419,9 @@ impl CommandRegistry {
     /// - `permission`: [`harw_operations::adapter::CommandAdapter::permission`], i.e. the
     ///   tier copied from the operation when the adapter was registered.
     /// - `scope`: mapped from [`harw_operations::adapter::CommandAdapter::visibility`].
-    /// - `aliases` / `domain`: read from the operation metadata exactly once per adapter;
-    ///   aliases that are not valid command names are dropped (they were unreachable).
+    /// - `aliases` / `domain` / `busy`: read from the operation metadata exactly once per
+    ///   adapter; aliases that are not valid command names are dropped (they were
+    ///   unreachable).
     ///
     /// Unlike [`Self::from_operation_registry`], this constructor does not reject
     /// collisions: the first adapter claiming a canonical name wins, mirroring the
@@ -479,6 +484,7 @@ impl CommandRegistry {
                 permission: adapter.permission(),
                 output: OutputSurface::Inline,
                 domain: map_domain(meta.domain),
+                busy: meta.busy,
             });
         }
         Self::new(specs)
@@ -1005,6 +1011,58 @@ mod tests {
             r_spec.unwrap().name.as_str(),
             "effort",
             "alias 'reasoning' must map to the canonical 'effort' command"
+        );
+    }
+
+    /// Test 8: `from_operation_registry` copies `OperationMeta::busy` into
+    /// `CommandSpec::busy` — both for an operation that opts into `Immediate`
+    /// (`/model`) and one that keeps the `DeferredUntilTurnEnd` default (`/new`).
+    #[test]
+    fn test_from_operation_registry_maps_busy_availability() {
+        let ops = ops_registry();
+        let registry = CommandRegistry::from_operation_registry(&ops)
+            .expect("built-in ops must produce a collision-free registry");
+
+        let model_spec = registry.find("model").expect("'model' spec must exist");
+        assert_eq!(
+            model_spec.busy,
+            harw_operations::operation::BusyAvailability::Immediate,
+            "'/model' declares busy=\"immediate\"; spec must carry Immediate"
+        );
+
+        let new_spec = registry.find("new").expect("'new' spec must exist");
+        assert_eq!(
+            new_spec.busy,
+            harw_operations::operation::BusyAvailability::DeferredUntilTurnEnd,
+            "'/new' does not declare busy; spec must carry the DeferredUntilTurnEnd default"
+        );
+    }
+
+    /// Test 9: `from_command_adapters` copies `OperationMeta::busy` into
+    /// `CommandSpec::busy` — mirrors the `from_operation_registry` coverage above
+    /// for the adapter-driven constructor used by `command_exec`.
+    #[test]
+    fn test_from_command_adapters_maps_busy_availability() {
+        let ops = ops_registry();
+        let adapters: Vec<CommandAdapter> = ops
+            .iter()
+            .flat_map(|op| CommandAdapter::from_operation(std::sync::Arc::clone(op)))
+            .collect();
+        let registry = CommandRegistry::from_command_adapters(&adapters);
+
+        let model_spec = registry.find("model").expect("'model' spec must exist");
+        assert_eq!(
+            model_spec.busy,
+            harw_operations::operation::BusyAvailability::Immediate,
+            "'/model' declares busy=\"immediate\"; adapter-derived spec must carry Immediate"
+        );
+
+        let new_spec = registry.find("new").expect("'new' spec must exist");
+        assert_eq!(
+            new_spec.busy,
+            harw_operations::operation::BusyAvailability::DeferredUntilTurnEnd,
+            "'/new' does not declare busy; adapter-derived spec must carry the \
+             DeferredUntilTurnEnd default"
         );
     }
 }

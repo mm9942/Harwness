@@ -41,7 +41,7 @@ pub struct ReviewArgs {
     summary = "Zeigt den vollständigen Zustand eines Governance-Jobs (WorkId) — Freigabekontext, Budget, Lease, Abschluss.",
     domain = "execution",
     permission = "observer",
-    command(path = "/review", visibility = "channel_parity")
+    command(path = "/review", visibility = "channel_parity", busy = "immediate")
 )]
 async fn review(ctx: &OpContext, args: ReviewArgs) -> Result<OpOutput, OpError> {
     let Some(work_id) = args.work_id.as_deref() else {
@@ -115,7 +115,7 @@ fn render_review(record: &StoredJob) -> String {
 mod tests {
     use super::{ReviewArgs, review};
     use crate::testutil::toks;
-    use harw_job_runtime::{Budget, Job, JobKind, JobScope, JobState, RetryPolicy, StoredJob};
+    use harw_job_runtime::{Budget, Job, JobKind, JobScope, RetryPolicy, StoredJob};
     use harw_operations::{FromRawArgs, OpContext, OpError, context::ServiceMap};
     use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_session_store::JobStore;

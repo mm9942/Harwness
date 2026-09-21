@@ -214,11 +214,11 @@ pub fn resolve_provider_api_key(
 ///   Auth-Header (z. B. lokales Ollama).
 ///
 /// # Errors
-/// - [`DiscoveryError::Auth`]: HTTP 401/403.
-/// - [`DiscoveryError::Api`]: andere Nicht-Erfolgsstatus.
-/// - [`DiscoveryError::Network`]: Verbindungs-/Timeout-Fehler.
-/// - [`DiscoveryError::Decode`]: Antwort ist kein gültiges JSON.
-/// - [`DiscoveryError::Unsupported`]: `provider.api` ohne Discovery-Pfad.
+/// - [`DiscoveryError::Auth`] — HTTP 401/403.
+/// - [`DiscoveryError::Api`] — andere Nicht-Erfolgsstatus.
+/// - [`DiscoveryError::Network`] — Verbindungs-/Timeout-Fehler.
+/// - [`DiscoveryError::Decode`] — Antwort ist kein gültiges JSON.
+/// - [`DiscoveryError::Unsupported`] — `provider.api` ohne Discovery-Pfad.
 ///
 /// # Concurrency
 /// Reine `async fn`; sicher aus mehreren Tasks parallel aufrufbar.

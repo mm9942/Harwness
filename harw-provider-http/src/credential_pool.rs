@@ -267,7 +267,7 @@ impl<T> CredentialPool<T> {
             if Some(index) == exclude {
                 continue;
             }
-            let cooled_down = until.map_or(true, |until| until <= now);
+            let cooled_down = until.is_none_or(|until| until <= now);
             if cooled_down {
                 return Some(index);
             }
@@ -366,7 +366,7 @@ mod tests {
                 entry("env:OPENAI_A", 0, Some("first")),
             ],
         );
-        let pool = CredentialPool::from_auth_config(&auth, "openai", sources(&env_layer), |secret| Ok(secret))
+        let pool = CredentialPool::from_auth_config(&auth, "openai", sources(&env_layer), Ok)
             .expect("resolves")
             .expect("pool present");
         assert_eq!(pool.len(), 2);
@@ -379,7 +379,7 @@ mod tests {
         let mut env_layer = BTreeMap::new();
         env_layer.insert("OPENAI_A".to_owned(), "value-a".to_owned());
         let auth = auth_with_pool("openai", vec![entry("env:OPENAI_A", 0, None)]);
-        let pool = CredentialPool::from_auth_config(&auth, "openai", sources(&env_layer), |secret| Ok(secret))
+        let pool = CredentialPool::from_auth_config(&auth, "openai", sources(&env_layer), Ok)
             .expect("resolves")
             .expect("pool present");
         assert_eq!(pool.entry(0).label, "openai#0");

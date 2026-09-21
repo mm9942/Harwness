@@ -221,6 +221,7 @@ Weiteres das Hauptmodell; änderbar mit `harw models internal`."
         rate_limit: None,
         max_concurrency: None,
         originator: None,
+        default_reasoning_effort: None,
     };
     let providers_dir = profile.join("providers");
     create_dir_all(&providers_dir)?;
@@ -352,6 +353,7 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
         rate_limit: None,
         max_concurrency: None,
         originator: None,
+        default_reasoning_effort: None,
     };
     let providers_dir = profile.join("providers");
     create_dir_all(&providers_dir)?;
@@ -373,6 +375,7 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
         input_types: Vec::new(),
         capabilities: harw_config::ModelCapabilitiesToml::default(),
         prompt_caching: None,
+        default_reasoning_effort: None,
     };
     let models_dir = profile.join("models");
     create_dir_all(&models_dir)?;
@@ -401,6 +404,7 @@ fn persist_outcome(home: &Path, outcome: &harw_tui::SetupOutcome) -> Result<(), 
             input_types: Vec::new(),
             capabilities: harw_config::ModelCapabilitiesToml::default(),
             prompt_caching: None,
+            default_reasoning_effort: None,
         };
         write_file(
             &extra_path,

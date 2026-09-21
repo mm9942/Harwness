@@ -85,7 +85,7 @@ pub struct PsArgs {
     summary = "Listet alle laufenden Jobs und Kindprozesse.",
     domain = "execution",
     permission = "observer",
-    command(path = "/ps", visibility = "channel_reduced"),
+    command(path = "/ps", visibility = "channel_reduced", busy = "immediate"),
     model_tool(readonly, approval = "none"),
     // Web-Fläche übernimmt dieselbe Achse wie das ModelTool: reines
     // Auflisten laufender Jobs, keine Mutation, keine Bestätigung nötig.

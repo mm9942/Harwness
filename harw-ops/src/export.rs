@@ -11,7 +11,8 @@
 //! oder `app.rs`-Typen — die spätere Verdrahtung übersetzt den Verlauf in
 //! `ExportEntry`-Werte"). Diese Operation parst nur
 //! `/export [--format md|markdown|json] [--tools|--no-tools]
-//! [--reasoning-summary] [--datei <pfad>]` und liefert einen maschinenlesbaren
+//! [--reasoning-summary] [--datei <pfad>] [--max-chars <n>]` und liefert einen
+//! maschinenlesbaren
 //! Marker über [`OpOutput::data`], den die künftige `app.rs`-Verdrahtung
 //! abfängt, um den Auswahl-Dialog zu öffnen bzw. direkt in die genannte
 //! Datei zu schreiben.
@@ -25,9 +26,19 @@
 //!   "format": "markdown",
 //!   "include_tool_calls": true,
 //!   "include_reasoning_summary": false,
-//!   "path": null
+//!   "path": null,
+//!   "max_chars": 20000
 //! }
 //! ```
+//!
+//! Der Schlüssel `max_chars` erscheint nur, wenn `--max-chars <n>` angegeben
+//! wurde; ohne die Option fehlt der Schlüssel im Marker vollständig (kein
+//! `null`-Eintrag). Der Wert wird 1:1 als
+//! `harw_tui::export::ExportOptions::max_chars` übernommen und begrenzt die
+//! Gesamtlänge des **gesamten gerenderten Exports** (nicht je Eintrag) auf
+//! höchstens `n` Unicode-Zeichen (siehe `ExportOptions::max_chars`-Dokumentation
+//! in `harw-tui/src/export.rs`: harte Obergrenze der Ausgabelänge, an der
+//! nötigenfalls mit einem Abschneide-Marker gekürzt wird).
 //!
 //! - `kind` ist der stabile Diskriminator, den `app.rs` abfragt. Das ist die
 //!   strukturierte Variante desselben Musters, das `app.rs` heute für
@@ -54,6 +65,10 @@
 //!   zeigt die TUI den Auswahl-Dialog „in die Zwischenablage kopieren" /
 //!   „als Datei speichern" / „abbrechen"; ist `path` gesetzt, überspringt sie
 //!   den Dialog und schreibt direkt dorthin.
+//! - `max_chars`: `Some(n)` bei `--max-chars <n>` mit `n` als positive
+//!   Ganzzahl, sonst fehlt der Schlüssel im Marker. Begrenzt die Gesamtlänge
+//!   des kompletten gerenderten Exports (nicht je Eintrag) auf `n`
+//!   Unicode-Zeichen.
 //!
 //! `--reasoning-summary` ist bewusst enger als eine generische
 //! `--reasoning`-Option: Die spätere TUI-Verdrahtung darf dafür ausschließlich
@@ -64,20 +79,15 @@ use harw_macros::operation;
 use harw_operations::{FromRawArgs, OpContext, OpError, OpOutput};
 
 /// Ausgabeformat des angeforderten Exports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 pub enum ExportFormat {
     /// Menschenlesbares Markdown; `md` und `markdown` sind Eingabe-Aliase.
     #[serde(rename = "markdown", alias = "md")]
+    #[default]
     Markdown,
     /// Strukturiertes JSON.
     #[serde(rename = "json")]
     Json,
-}
-
-impl Default for ExportFormat {
-    fn default() -> Self {
-        Self::Markdown
-    }
 }
 
 impl ExportFormat {
@@ -120,6 +130,11 @@ pub struct ExportArgs {
     /// die TUI den Auswahl-Dialog zeigen soll.
     #[serde(default)]
     pub path: Option<String>,
+    /// `--max-chars <n>`: harte Obergrenze der Gesamtlänge des gerenderten
+    /// Exports in Unicode-Zeichen (nicht je Eintrag). `None` bedeutet keine
+    /// Begrenzung.
+    #[serde(default)]
+    pub max_chars: Option<u32>,
 }
 
 impl Default for ExportArgs {
@@ -129,6 +144,7 @@ impl Default for ExportArgs {
             include_tool_calls: true,
             include_reasoning_summary: false,
             path: None,
+            max_chars: None,
         }
     }
 }
@@ -144,6 +160,7 @@ impl FromRawArgs for ExportArgs {
         let mut include_tool_calls = true;
         let mut include_reasoning_summary = false;
         let mut path = None;
+        let mut max_chars = None;
         let mut index = 0;
         while index < tokens.len() {
             match tokens[index].as_str() {
@@ -181,9 +198,28 @@ impl FromRawArgs for ExportArgs {
                     path = Some(value.clone());
                     index += 2;
                 }
+                "--max-chars" => {
+                    let value = tokens.get(index + 1).ok_or_else(|| {
+                        OpError::InvalidArguments(
+                            "/export --max-chars <n> braucht eine positive Ganzzahl".to_owned(),
+                        )
+                    })?;
+                    let parsed: u32 = value.parse().map_err(|_| {
+                        OpError::InvalidArguments(format!(
+                            "/export: ungültiger Wert '{value}' für --max-chars (erwartet eine positive Ganzzahl)"
+                        ))
+                    })?;
+                    if parsed == 0 {
+                        return Err(OpError::InvalidArguments(
+                            "/export: --max-chars muss größer als 0 sein".to_owned(),
+                        ));
+                    }
+                    max_chars = Some(parsed);
+                    index += 2;
+                }
                 other => {
                     return Err(OpError::InvalidArguments(format!(
-                        "/export: unbekanntes Argument '{other}' (Usage: /export [--format md|markdown|json] [--tools|--no-tools] [--reasoning-summary] [--datei <pfad>])"
+                        "/export: unbekanntes Argument '{other}' (Usage: /export [--format md|markdown|json] [--tools|--no-tools] [--reasoning-summary] [--datei <pfad>] [--max-chars <n>])"
                     )));
                 }
             }
@@ -193,6 +229,7 @@ impl FromRawArgs for ExportArgs {
             include_tool_calls,
             include_reasoning_summary,
             path,
+            max_chars,
         })
     }
 }
@@ -220,28 +257,35 @@ impl FromRawArgs for ExportArgs {
 /// [`OpError::InvalidArguments`] bei ungültigen Tokens.
 #[operation(
     name = "export",
-    summary = "Fordert einen Export des Sitzungsverlaufs an; die TUI führt Dialog und Schreiben aus.",
+    summary = "Fordert einen Export des Sitzungsverlaufs an (Format, Werkzeugaufrufe, Reasoning-Summary, Zielpfad, optionale Gesamtlängen-Obergrenze via --max-chars); die TUI führt Dialog und Schreiben aus.",
     domain = "session",
     permission = "operator",
     command(path = "/export", visibility = "tui_only")
 )]
 async fn export(_ctx: &OpContext, args: ExportArgs) -> Result<OpOutput, OpError> {
-    let data = serde_json::json!({
+    let mut data = serde_json::json!({
         "kind": "export.request",
         "format": args.format.marker_name(),
         "include_tool_calls": args.include_tool_calls,
         "include_reasoning_summary": args.include_reasoning_summary,
         "path": args.path,
     });
+    if let Some(max_chars) = args.max_chars {
+        data["max_chars"] = serde_json::json!(max_chars);
+    }
+    let max_chars_suffix = match args.max_chars {
+        Some(max_chars) => format!(", max. {max_chars} Zeichen gesamt"),
+        None => String::new(),
+    };
     let text = match &args.path {
         Some(path) => format!(
-            "Export angefordert: Datei {path} (Format: {}, Werkzeugaufrufe: {}, Reasoning-Summary: {}).",
+            "Export angefordert: Datei {path} (Format: {}, Werkzeugaufrufe: {}, Reasoning-Summary: {}{max_chars_suffix}).",
             args.format.marker_name(),
             if args.include_tool_calls { "ja" } else { "nein" },
             if args.include_reasoning_summary { "ja" } else { "nein" },
         ),
         None => format!(
-            "Export angefordert: Zielauswahl folgt (Format: {}, Zwischenablage/Datei/abbrechen).",
+            "Export angefordert: Zielauswahl folgt (Format: {}, Zwischenablage/Datei/abbrechen{max_chars_suffix}).",
             args.format.marker_name()
         ),
     };
@@ -359,6 +403,51 @@ mod tests {
     }
 
     #[test]
+    fn test_export_args_from_raw_args_defaults_max_chars_to_none() {
+        let args = ExportArgs::from_raw_args(&toks(&[])).expect("parse");
+        assert_eq!(args.max_chars, None);
+    }
+
+    #[test]
+    fn test_export_args_from_raw_args_parses_valid_max_chars() {
+        let args = ExportArgs::from_raw_args(&toks(&["--max-chars", "20000"])).expect("parse");
+        assert_eq!(args.max_chars, Some(20000));
+    }
+
+    #[test]
+    fn test_export_args_from_raw_args_rejects_zero_max_chars() {
+        let result = ExportArgs::from_raw_args(&toks(&["--max-chars", "0"]));
+        match result {
+            Err(OpError::InvalidArguments(message)) => assert!(message.contains("--max-chars")),
+            other => panic!("expected invalid arguments, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_export_args_from_raw_args_rejects_negative_max_chars() {
+        let result = ExportArgs::from_raw_args(&toks(&["--max-chars", "-5"]));
+        assert!(matches!(result, Err(OpError::InvalidArguments(_))));
+    }
+
+    #[test]
+    fn test_export_args_from_raw_args_rejects_non_numeric_max_chars() {
+        let result = ExportArgs::from_raw_args(&toks(&["--max-chars", "abc"]));
+        match result {
+            Err(OpError::InvalidArguments(message)) => assert!(message.contains("--max-chars")),
+            other => panic!("expected invalid arguments, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_export_args_from_raw_args_max_chars_without_value_is_invalid() {
+        let result = ExportArgs::from_raw_args(&toks(&["--max-chars"]));
+        match result {
+            Err(OpError::InvalidArguments(message)) => assert!(message.contains("--max-chars")),
+            other => panic!("expected invalid arguments, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_export_args_from_raw_args_accepts_both_flags_in_either_order() {
         let args = ExportArgs::from_raw_args(&toks(&["--datei", "/tmp/x.md", "--tools"])).expect("parse");
         assert!(args.include_tool_calls);
@@ -418,8 +507,22 @@ mod tests {
         assert_eq!(data["include_tool_calls"], serde_json::json!(true));
         assert_eq!(data["include_reasoning_summary"], serde_json::json!(false));
         assert_eq!(data["path"], serde_json::Value::Null);
+        assert!(data.get("max_chars").is_none());
         assert!(output.text.contains("Zielauswahl"));
         assert!(output.text.contains("markdown"));
+    }
+
+    #[tokio::test]
+    async fn export_with_max_chars_returns_marker_with_max_chars_key() {
+        let ctx = test_context();
+        let args = ExportArgs {
+            max_chars: Some(20_000),
+            ..ExportArgs::default()
+        };
+        let output = export(&ctx, args).await.expect("export");
+        let data = output.data.expect("data marker must be present");
+        assert_eq!(data["max_chars"], serde_json::json!(20_000));
+        assert!(output.text.contains("20000"));
     }
 
     #[tokio::test]
@@ -430,6 +533,7 @@ mod tests {
             include_tool_calls: true,
             include_reasoning_summary: true,
             path: Some("/tmp/export.md".to_owned()),
+            max_chars: None,
         };
         let output = export(&ctx, args).await.expect("export");
         let data = output.data.expect("data marker must be present");

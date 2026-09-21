@@ -279,7 +279,7 @@ fn render_shell_output(content: Value) -> Result<String, OpError> {
     summary = "Zeigt den aktuellen git-Diff des Workspaces.",
     domain = "knowledge",
     permission = "observer",
-    command(path = "/diff", visibility = "channel_parity"),
+    command(path = "/diff", visibility = "channel_parity", busy = "immediate"),
     // `diff` starts a real process (git, via shell.exec) under the caller's
     // sandbox. Auto-approval let repo-controlled git config/attributes run
     // code without a prompt (F-022/F-191/G-027); every model-initiated call

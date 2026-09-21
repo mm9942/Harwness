@@ -47,7 +47,7 @@ use harw_types::{ReviewDecision, RiskLevel};
 use crate::error::{KnowledgeError, KnowledgeResult};
 use crate::visibility::AgentId;
 
-use super::board::{BlockKind, Card, CardId, CardState, LaneId};
+use super::board::{BlockKind, Card, CardState};
 
 pub use harw_job_runtime::WorkId;
 
@@ -301,6 +301,11 @@ pub fn archive(card: &mut Card, unresolved_children: usize) -> KnowledgeResult<(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `CardId`/`LaneId` sind nur in Tests nötig (`card()`-Fixture unten); die
+    // acht öffentlichen Übergänge dieses Moduls adressieren Karten
+    // ausschließlich über `&mut Card` (siehe Moduldoc), deshalb kein
+    // Top-Level-Import.
+    use crate::kanban::board::{CardId, LaneId};
     use crate::visibility::VisibilityScope;
 
     fn card(state: CardState) -> Card {

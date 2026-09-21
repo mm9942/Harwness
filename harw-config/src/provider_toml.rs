@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use harw_types::ReasoningEffort;
+
 use crate::auth_toml::SecretRef;
 use crate::error::{ConfigError, ConfigResult};
 
@@ -56,6 +58,21 @@ pub struct ProviderToml {
     /// bestimmte Wahl, validiert den Wert aber (siehe [`Self::validate`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub originator: Option<String>,
+    /// Standard-Reasoning-Effort für Sessions/Kinder, die über diesen
+    /// Provider laufen, sofern nicht durch eine spezifischere Ebene
+    /// überschrieben (Modell, Agenten-Definition). `None` = keine
+    /// Provider-seitige Vorgabe.
+    ///
+    /// `ReasoningEffort` ist selbst serde-fähig (`FromStr`/`Display`/
+    /// `Serialize`/`Deserialize`, `rename_all = "snake_case"`, siehe
+    /// `harw-types/src/reasoning.rs`), daher wird hier direkt der Enum-Typ
+    /// verwendet statt eines undurchsichtigen `String`: ein unbekanntes
+    /// Label (z. B. `"medum"`) scheitert bereits beim Deserialisieren der
+    /// TOML-Datei, nicht erst bei einer späteren Auflösung. Die **Rangfolge**
+    /// gegenüber Modell-/Agenten-Ebene ist NICHT Teil dieser Änderung — das
+    /// ist Aufgabe einer späteren Welle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// Höchstlänge des `originator`-Felds (siehe [`ProviderToml::validate`]).
@@ -455,6 +472,45 @@ mod tests {
         provider
             .validate()
             .expect("originator at exactly the length cap is valid");
+    }
+
+    #[test]
+    fn test_provider_without_default_reasoning_effort_is_none() {
+        let src = r#"
+            name = "openai"
+            api = "openai-chat"
+            base_url = "https://api.openai.com/v1"
+        "#;
+        let provider: ProviderToml = toml::from_str(src).unwrap();
+        assert!(provider.default_reasoning_effort.is_none());
+        assert!(!toml::to_string(&provider).unwrap().contains("default_reasoning_effort"));
+    }
+
+    #[test]
+    fn test_provider_with_default_reasoning_effort_round_trips() {
+        let src = r#"
+            name = "openai"
+            api = "openai-chat"
+            base_url = "https://api.openai.com/v1"
+            default_reasoning_effort = "high"
+        "#;
+        let provider: ProviderToml = toml::from_str(src).unwrap();
+        assert_eq!(
+            provider.default_reasoning_effort,
+            Some(harw_types::ReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn test_provider_rejects_unknown_default_reasoning_effort_value() {
+        let src = r#"
+            name = "openai"
+            api = "openai-chat"
+            base_url = "https://api.openai.com/v1"
+            default_reasoning_effort = "extreme"
+        "#;
+        let error = toml::from_str::<ProviderToml>(src).unwrap_err();
+        assert!(error.to_string().contains("extreme") || error.to_string().contains("unknown variant"));
     }
 
     #[test]

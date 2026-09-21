@@ -358,6 +358,7 @@ mod tests {
             rate_limit: None,
             max_concurrency: None,
             originator: None,
+            default_reasoning_effort: None,
         }
     }
 

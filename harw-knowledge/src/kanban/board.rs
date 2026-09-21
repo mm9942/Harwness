@@ -134,7 +134,7 @@ struct BoardRecord {
 /// # Fehler
 /// - [`KnowledgeError::TomlEncode`]: `board`/`lanes` ließen sich nicht als
 ///   TOML kodieren.
-/// - [`KnowledgeError::Io`]: Schreib-/Rename-Fehler.
+/// - [`KnowledgeError::Io`]\: Schreib-/Rename-Fehler.
 ///
 /// # Nebenläufigkeit
 /// Kein eigenes Locking; parallele `save_board`-Aufrufe für dieselbe
@@ -300,7 +300,7 @@ const RETRY_COUNT_KEY: &str = "retry_count";
 /// Das vollständige, geschriebene [`KnowledgeArtifact`].
 ///
 /// # Fehler
-/// - [`KnowledgeError::Io`]: Lese-/Schreib-/Rename-Fehler.
+/// - [`KnowledgeError::Io`]\: Lese-/Schreib-/Rename-Fehler.
 /// - [`KnowledgeError::Frontmatter`]/[`KnowledgeError::MalformedFrontmatter`]:
 ///   eine bestehende Kartendatei ließ sich nicht parsen.
 /// - [`KnowledgeError::Json`]: `card.state` ließ sich nicht als JSON kodieren
@@ -339,7 +339,7 @@ pub fn save_card(
     );
     frontmatter
         .extra
-        .insert(STATE_KEY.to_owned(), serde_json::to_value(&card.state)?);
+        .insert(STATE_KEY.to_owned(), serde_json::to_value(card.state)?);
     frontmatter.extra.insert(
         WORK_ID_KEY.to_owned(),
         card.work_id.as_ref().map_or(serde_json::Value::Null, |work_id| {

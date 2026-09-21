@@ -899,6 +899,7 @@ fn write_discovered_model_file(
             vision: false,
             json_mode: false,
         },
+        default_reasoning_effort: None,
     };
     let rendered = toml::to_string_pretty(&toml_model).map_err(|error| ModelsError::Toml {
         path: path.to_path_buf(),
@@ -1231,6 +1232,7 @@ mod tests {
             reasoning: false,
             input_types: Vec::new(),
             capabilities: harw_config::ModelCapabilitiesToml::default(),
+            default_reasoning_effort: None,
         };
         let cache_path = models.join(model_filename(&live.id));
         std::fs::write(
@@ -1301,6 +1303,7 @@ mod tests {
             reasoning: false,
             input_types: Vec::new(),
             capabilities: harw_config::ModelCapabilitiesToml::default(),
+            default_reasoning_effort: None,
         };
         let other = harw_config::ModelToml {
             provider: "other".to_owned(),
@@ -1401,6 +1404,7 @@ mod tests {
             reasoning: false,
             input_types: Vec::new(),
             capabilities: harw_config::ModelCapabilitiesToml::default(),
+            default_reasoning_effort: None,
         };
         let default_model = harw_config::ModelToml {
             id: "gpt-5.6-terra".to_owned(),
@@ -1610,6 +1614,7 @@ mod tests {
             origin_allowlist: harw_config::OriginAllowlistToml::default(),
             rate_limit: None,
             max_concurrency: None,
+            default_reasoning_effort: None,
         }
     }
 

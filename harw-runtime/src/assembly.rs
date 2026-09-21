@@ -31,7 +31,7 @@
 //!    Spawner: Wurzel-Turn und Kinder hängen an derselben `trace_id`.
 //! 6. [`ApprovalChain::for_root`] — Config-Politik ohne Nebenschalter, plus
 //!    die [`crate::spec::AskResolution`] des Einstiegs.
-//! 7. [`assemble_registry_for_project`] → [`ApprovalChain::install_over_default`];
+//! 7. [`assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits`](harw_registry_defaults::profile::assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits) → [`ApprovalChain::install_over_default`];
 //!    der Projektkontext der Registry folgt [`EntryProfile::project_context`]
 //!    (ohne ihn: keine Doku, Platzhalter statt Host-Pfaden) und bei
 //!    [`RuntimeNarrowing::workspace_root`] nur Doku unterhalb des gebundenen Roots.
@@ -96,11 +96,10 @@ use harw_plan::{InMemoryGoalStore, InMemoryPlanStore, PlanNodeKind, PlanToolConf
 use harw_plan_bridge::FindingStore;
 use harw_project_discovery::{DiscoveryConfig, ProjectContext, discover_project};
 use harw_protocol::events::{SessionEvent, TurnEvent};
-use harw_provider_http::SecretResolver;
+use harw_provider_http::{ProviderLoadRegistry, SecretResolver};
 use harw_registry_defaults::embedded_agents::builtin_agent_definitions;
 use harw_registry_defaults::profile::{
-    HostPermitWiring, IdentityOverrides, RegistryProfile, assemble_registry_for_project,
-    role_names,
+    HostPermitWiring, IdentityOverrides, RegistryProfile, role_names,
 };
 use harw_sandbox::{ExtraRootsCell, HostPermitSessionRegistry, ProcessPermitLedger};
 use harw_tool_shell::host_permit_prompt::{
@@ -120,7 +119,7 @@ use crate::children::RuntimeChildRegistryFactory;
 use crate::config::{ConfigTrustReport, load_config};
 use crate::contributors::{AssemblyContributor, AssemblyInputs, AssemblyParts};
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::model::{ModelSource, build_root_model_with_resolver};
+use crate::model::{ModelSource, build_root_model_with_registry_and_resolver};
 use crate::sandbox::root_sandbox;
 use crate::services::{PlanServices, RuntimeServices, RuntimeServicesParts, ServiceSurface};
 use crate::spec::{
@@ -843,7 +842,7 @@ const PROJECT_CONTEXT_PLACEHOLDER: &str = "<workspace>";
 /// Der Projektkontext, den die Wurzel-Registry dem Modell zeigt.
 ///
 /// # Beschreibung
-/// Die Registry ([`assemble_registry_for_project`]) reicht den Kontext an
+/// Die Registry ([`assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits`](harw_registry_defaults::profile::assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits)) reicht den Kontext an
 /// zwei Stellen in den Modellkontext: `ProjectContextProvider` (Fragmente
 /// `project.root` mit `project_root=`/`cwd=` und je Doku-Datei
 /// `project.doc:<name>`) und die Baseline-Identität (Systemprompt mit
@@ -1557,7 +1556,7 @@ impl RuntimeAssemblyBuilder {
         // selbst an.
         let project_facts = project_facts.or_else(|| {
             match harw_memory::FactStore::open(
-                &home_project.memories_dir(),
+                home_project.memories_dir(),
                 harw_memory::FactScope::Project,
             ) {
                 Ok(store) => Some(Arc::new(store)),
@@ -1654,6 +1653,12 @@ impl RuntimeAssemblyBuilder {
             resolve_active_agent(spec.active_agent.as_deref(), &config, &agent_definitions)?
         };
         let activation = root_activation(uia_ir.as_ref().or(agent_ir.as_ref()));
+        // Welle 8: Provider-/Modell-/Agenten-Reasoning-Effort-Vorgaben der
+        // Wurzel-UIA, einmalig hier bestimmt (nicht in
+        // [`Self::new_root_session`], das keinen Zugriff auf `uia_ir` selbst
+        // hat — nur auf die daraus geklonten Werte).
+        let root_uia_reasoning_effort_defaults =
+            resolve_root_uia_reasoning_effort_defaults(&config, uia_ir.as_ref());
 
         // 5. Ein Trace, ein Spawn-Kontext.
         let trace = new_root_trace(spec.entry);
@@ -1844,7 +1849,7 @@ impl RuntimeAssemblyBuilder {
         .map_err(|error| RuntimeError::Registry {
             detail: format!("could not assemble the root registry: {error}"),
         })?;
-        // `install_over_default`: `assemble_registry_for_project` hat die
+        // `install_over_default`: `assemble_registry_for_sandbox_with_definition_access_and_sandbox_profile_and_permits` hat die
         // `DefaultApprovalPolicy` über `chain.mode()` gerade selbst registriert
         // (harw-registry-defaults/src/profile.rs:921-922) — eine zweite wäre
         // eine Dublette (Befund Z2c-06).
@@ -1886,12 +1891,49 @@ impl RuntimeAssemblyBuilder {
         //    die Auto-Traits ab, dieselbe `SecretResolver`-Vtable bleibt
         //    gültig, deshalb reicht eine gewöhnliche Unsize-Coercion ohne
         //    Trait-Upcasting-Feature.
-        let model = build_root_model_with_resolver(
+        //
+        //    Welle 3a: `source_is_configured` wird **vor** dem Verbrauch von
+        //    `model_source` ermittelt ([`ModelSource`] wird by-value
+        //    konsumiert) — [`split_root_and_uia_worker_models`] braucht ihn,
+        //    um zu entscheiden, ob die UIA-Sitzung überhaupt einen eigenen
+        //    HTTP-Client bauen darf (siehe dessen Doku und
+        //    [`crate::model::build_uia_model_with_resolver`]).
+        let source_is_configured = matches!(&model_source, ModelSource::Configured);
+        let (default_tree_model, root_load_registry) = build_root_model_with_registry_and_resolver(
             &spec,
             &config,
             model_source,
             secret_resolver.as_deref().map(|r| r as &dyn SecretResolver),
         )?;
+        // Welle 3a: bei aktiver UIA bekommt sie ihr eigenes Provider-Modell
+        // (`uia_client`), aus dem sich zusätzlich das Modell der gesamten
+        // `uia-worker`-Rollenfamilie ableitet (`uia_worker_model`) — beide
+        // unabhängig vom `default_tree_model`, das weiterhin jede andere
+        // Kind-Rolle bedient. Ohne aktive UIA sind beide Rückgabewerte
+        // unverändert `Arc::clone(&default_tree_model)` (bit-identisch zum
+        // bisherigen Verhalten).
+        //
+        // `uia_load_registry` trägt zusätzlich zur [`ProviderLoadControl`]-
+        // Registry des Wurzel-Baums nur die Handles, die ein **eigenständiger**
+        // UIA-Client gebaut hat (leer, solange die UIA denselben
+        // `default_tree_model` weiterverwendet — siehe
+        // [`crate::model::build_uia_model_with_registry_and_resolver`]).
+        let (model, uia_worker_model, uia_load_registry) = split_root_and_uia_worker_models(
+            &spec,
+            &config,
+            source_is_configured,
+            &default_tree_model,
+            uia_ir.as_ref(),
+            secret_resolver.as_deref().map(|r| r as &dyn SecretResolver),
+        )?;
+        // Merge: derselbe Provider-Name in beiden Registries → der
+        // Wurzel-Baum-Eintrag gewinnt (er bedient die meisten Kind-Rollen und
+        // ist damit der repräsentative Handle für `/status`/`/provider`; ein
+        // zweiter, gleichnamiger Handle aus der UIA-Registry wäre für dieselbe
+        // HTTP-Verbindung ohnehin redundant, siehe
+        // `crate::model::build_uia_model_with_registry_and_resolver`-Doku).
+        let mut provider_load_registry: ProviderLoadRegistry = uia_load_registry;
+        provider_load_registry.extend(root_load_registry);
         let root_session_id = root_session_id.unwrap_or_else(SessionId::new);
         let (spawner, spawner_roles) = build_spawner(
             profile.spawner,
@@ -1899,7 +1941,8 @@ impl RuntimeAssemblyBuilder {
                 config: &config,
                 project: &project,
                 chain: &chain,
-                model: &model,
+                model: &default_tree_model,
+                uia_worker_model: &uia_worker_model,
                 root_session_id: &root_session_id,
                 spawn_context: &spawn_context,
                 reasoning_effort: spec.reasoning_effort,
@@ -1908,6 +1951,13 @@ impl RuntimeAssemblyBuilder {
                 guard_policy,
                 pitfall_advisor: pitfall_advisor.clone(),
                 profile_agents_dir: profile_agents_dir.clone(),
+                // Welle 8: dieselbe aufgelöste Config, aus der auch
+                // `resolve_internal_models_for_children` gespeist wird — ohne
+                // diesen Aufruf liefern beide Kind-Fabriken für jede Rolle
+                // `(None, None)` an `reasoning_effort_defaults_for_role_task`
+                // (Kompatibilitäts-Default, siehe
+                // `RuntimeChildRegistryFactory::with_reasoning_effort_config`).
+                reasoning_effort_config: Arc::clone(&config),
             },
             session_events,
         )?;
@@ -2002,6 +2052,7 @@ impl RuntimeAssemblyBuilder {
             extra_roots: extra_roots.clone(),
             principal: spec.principal.clone(),
             session_controller,
+            provider_load_registry: provider_load_registry.clone(),
         }));
 
         // 12. Modell-Tool-Fläche der Operationen — **nur** für
@@ -2109,6 +2160,7 @@ impl RuntimeAssemblyBuilder {
             memory_capture,
             guard_policy,
             role_effort_weights,
+            root_uia_reasoning_effort_defaults,
             pitfall_advisor,
             registry: Mutex::new(Some(registry)),
             responder: Mutex::new(None),
@@ -2169,6 +2221,149 @@ fn resolve_active_uia(
         });
     }
     Ok(Some(ir))
+}
+
+/// Löst Provider-/Modell-/Agenten-Reasoning-Effort-Vorgaben der Wurzel-UIA
+/// auf (Welle 8: Rangfolge Provider > Modell > Agent > Rolle).
+///
+/// # Description
+/// Spiegelt [`crate::model::resolve_uia_model`] (dort privat, deshalb hier
+/// dupliziert statt importiert): `uia_provider`/`uia_model`, falls beide
+/// gesetzt sind und `uia_provider` einen vorhandenen, aktivierten Provider
+/// bezeichnet, sonst `default_provider`/`default_model`. Aus der so
+/// bestimmten Provider-/Modell-ID werden anschließend
+/// `ProviderToml::default_reasoning_effort`/`ModelToml::default_reasoning_effort`
+/// gelesen (`None` bei fehlendem Eintrag oder fehlender ID). Das dritte
+/// Ergebnisfeld ist [`ExecutableAgentIr::reasoning_effort`] der übergebenen
+/// UIA-Definition, als eigenständiger `String` geklont, damit
+/// [`RuntimeAssembly`] ihn unabhängig von der Lebensdauer der IR selbst
+/// halten kann.
+///
+/// # Arguments
+/// - `config` (`&ResolvedConfig`): die aufgelöste Konfiguration des Laufs.
+/// - `uia_ir` (`Option<&ExecutableAgentIr>`): die über
+///   [`resolve_active_uia`] aufgelöste UIA-Definition, falls dieser Einstieg
+///   eine hat.
+///
+/// # Returns
+/// `(provider_default, model_default, agent_default)`, zum Aufruf von
+/// [`crate::guard_wiring::resolve_default_reasoning_effort`] gedacht;
+/// `(None, None, None)`, solange `uia_ir` `None` ist.
+fn resolve_root_uia_reasoning_effort_defaults(
+    config: &ResolvedConfig,
+    uia_ir: Option<&ExecutableAgentIr>,
+) -> (
+    Option<harw_types::ReasoningEffort>,
+    Option<harw_types::ReasoningEffort>,
+    Option<String>,
+) {
+    let Some(uia_ir) = uia_ir else {
+        return (None, None, None);
+    };
+    let uia_provider_usable = config
+        .harness
+        .uia_provider
+        .as_deref()
+        .is_some_and(|provider_id| {
+            config
+                .providers
+                .get(provider_id)
+                .is_some_and(|provider| provider.enabled)
+        });
+    let (provider_id, model_id) = if uia_provider_usable && config.harness.uia_model.is_some() {
+        (
+            config.harness.uia_provider.as_deref(),
+            config.harness.uia_model.as_deref(),
+        )
+    } else {
+        (
+            config.harness.default_provider.as_deref(),
+            config.harness.default_model.as_deref(),
+        )
+    };
+    let provider_default = provider_id
+        .and_then(|id| config.providers.get(id))
+        .and_then(|provider| provider.default_reasoning_effort);
+    let model_default = model_id
+        .and_then(|id| config.models.get(id))
+        .and_then(|model| model.default_reasoning_effort);
+    let agent_default = uia_ir.reasoning_effort().map(str::to_owned);
+    (provider_default, model_default, agent_default)
+}
+
+/// Baut das Root-Modell und das (ggf. abweichende) Modell der
+/// `uia-worker`-Rollenfamilie eines Laufs (Welle 3a, Teil A).
+///
+/// # Description
+/// Reiner, direkt getesteter Baustein von [`RuntimeAssemblyBuilder::build`]
+/// (Schritt 9): ohne aktive UIA (`uia_ir` ist `None`) bleibt alles
+/// bit-identisch zum bisherigen Verhalten — beide Rückgabewerte sind
+/// `Arc::clone(default_tree_model)`. Mit aktiver UIA baut diese Funktion
+/// zuerst über [`crate::model::build_uia_model_with_resolver`] das
+/// eigenständige Modell der UIA-Sitzung selbst (`uia_client`, verwendet den
+/// `default_tree_model` unverändert, solange `source_is_configured` `false`
+/// ist oder kein abweichender `uia_provider`/`uia_model` konfiguriert ist),
+/// und leitet daraus über [`crate::model::build_uia_worker_model`] das
+/// Modell der gesamten `uia-worker`-Rollenfamilie ab (`uia-worker`,
+/// `uia-explorer`, `uia-writer`, `uia-shell-worker`) — dieselbe Ableitung,
+/// die `build_spawner`s `uia_worker_factory` (Teil A, Schritt 4) anschließend
+/// registriert.
+///
+/// # Arguments
+/// - `spec` / `config` / `resolver`: wie
+///   [`crate::model::build_uia_model_with_resolver`].
+/// - `source_is_configured` (`bool`): vom Aufrufer **vor** dem Verbrauch des
+///   [`ModelSource`] ermittelt (`matches!(&model_source, ModelSource::Configured)`).
+/// - `default_tree_model` (`&Arc<dyn ModelProvider>`): das bereits gebaute
+///   Vorgabe-Modell des Laufs; Rückgabewert für beide Positionen, solange
+///   `uia_ir` `None` ist.
+/// - `uia_ir` (`Option<&ExecutableAgentIr>`): das Ergebnis von
+///   [`resolve_active_uia`]; nur `Some`/`None` ist relevant, der Inhalt der
+///   IR selbst wird hier nicht gelesen.
+///
+/// # Returns
+/// `(model, uia_worker_model, uia_load_registry)` — `model` ist der Wert, der
+/// den Root-Turn dieses Laufs treibt (bei aktiver UIA der UIA-Client, sonst
+/// unverändert `default_tree_model`); `uia_worker_model` ist das Modell, das
+/// `build_spawner` an die `uia_worker_factory` reicht; `uia_load_registry`
+/// ist die [`ProviderLoadRegistry`] des eigenständig gebauten UIA-Clients
+/// (leer ohne aktive UIA oder solange die UIA `default_tree_model`
+/// weiterverwendet — siehe
+/// [`crate::model::build_uia_model_with_registry_and_resolver`]).
+///
+/// # Errors
+/// Wie [`crate::model::build_uia_model_with_resolver`]:
+/// [`RuntimeError::Provider`], wenn der konfigurierte UIA-Provider nicht
+/// gebaut werden kann.
+/// Rückgabe von [`split_root_and_uia_worker_models`]: `(model,
+/// uia_worker_model, uia_load_registry)`, siehe dortige `# Returns`-Sektion.
+type SplitRootAndUiaWorkerModels =
+    (Arc<dyn ModelProvider>, Arc<dyn ModelProvider>, ProviderLoadRegistry);
+
+fn split_root_and_uia_worker_models(
+    spec: &RuntimeSpec,
+    config: &ResolvedConfig,
+    source_is_configured: bool,
+    default_tree_model: &Arc<dyn ModelProvider>,
+    uia_ir: Option<&ExecutableAgentIr>,
+    resolver: Option<&dyn SecretResolver>,
+) -> RuntimeResult<SplitRootAndUiaWorkerModels> {
+    if uia_ir.is_none() {
+        return Ok((
+            Arc::clone(default_tree_model),
+            Arc::clone(default_tree_model),
+            ProviderLoadRegistry::new(),
+        ));
+    }
+    let (uia_client, uia_load_registry) = crate::model::build_uia_model_with_registry_and_resolver(
+        spec,
+        config,
+        source_is_configured,
+        default_tree_model,
+        resolver,
+    )?;
+    let uia_worker_model = crate::model::build_uia_worker_model(config, &uia_client);
+    Ok((uia_client, uia_worker_model, uia_load_registry))
 }
 
 /// Löst den benannten Wurzel-Agenten zu seiner gesenkten IR auf.
@@ -2761,8 +2956,9 @@ fn resolve_context_window(config: &ResolvedConfig) -> u64 {
 /// Die Leihgaben, aus denen [`build_spawner`] den Spawner baut.
 ///
 /// # Beschreibung
-/// Die neun Werte stammen aus verschiedenen, voneinander unabhängigen
-/// Montageschritten (Konfiguration, Projekt, Freigabekette, Modell,
+/// Die zehn Werte (seit Welle 3a: zwei Modelle statt eines) stammen aus
+/// verschiedenen, voneinander unabhängigen Montageschritten (Konfiguration,
+/// Projekt, Freigabekette, Wurzel-Baum-Modell, UIA-Worker-Modell,
 /// Wurzelidentität, Spawn-Kontext, Effort, Aktivierung, gesenkte Rollen). Sie
 /// stehen hier in **einem** Typ, weil elf Positionsparameter an der einen
 /// Aufrufstelle nicht mehr lesbar wären — und weil ein unterdrückter
@@ -2779,8 +2975,17 @@ struct SpawnerInputs<'a> {
     project: &'a ProjectContext,
     /// Die Wurzelkette; jedes Kind leitet daraus [`ApprovalChain::for_child`] ab.
     chain: &'a ApprovalChain,
-    /// Der Modellanbieter des Wurzel-Turns; jedes Kind benutzt denselben.
+    /// Der Modellanbieter des Wurzel-**Baums** (`default_tree_model`); jede
+    /// "normale" Kind-Rolle benutzt ihn — **unabhängig** davon, ob der
+    /// laufende Einstieg gerade eine UIA ist ([`Self::uia_worker_model`]
+    /// trägt deren ggf. abweichendes Modell separat).
     model: &'a Arc<dyn ModelProvider>,
+    /// Das Modell der `uia-worker`-Rollenfamilie (Welle 3a, Teil A):
+    /// `uia-worker`, `uia-explorer`, `uia-writer`, `uia-shell-worker`. Ohne
+    /// aktive UIA identisch zu [`Self::model`] (`Arc::clone`); mit aktiver
+    /// UIA das über [`crate::model::build_uia_worker_model`] abgeleitete
+    /// Modell (siehe [`split_root_and_uia_worker_models`]).
+    uia_worker_model: &'a Arc<dyn ModelProvider>,
     /// Die Kennung der Wurzelsitzung, unter der der Spawner sie registriert.
     root_session_id: &'a SessionId,
     /// Der eine Spawn-Kontext des Laufs (Sandbox, Trace, Decke).
@@ -2804,6 +3009,13 @@ struct SpawnerInputs<'a> {
     /// Welle FANIN-K/FANIN-RT, Fan-in-Zusatzpunkt "`profile_agents_dir` …
     /// im Runtime-Pfad setzen"). `None`, wenn kein Profil ermittelbar war.
     profile_agents_dir: Option<PathBuf>,
+    /// Die aufgelöste Config des Laufs, für
+    /// [`RuntimeChildRegistryFactory::with_reasoning_effort_config`] (Welle
+    /// 8: Rangfolge Provider > Modell > Agent > Rolle). Jede über diesen
+    /// Spawner gebaute Kind-Fabrik (`factory` **und** `uia_worker_factory`)
+    /// bekommt sie — ohne diesen Aufruf lieferten die neuen Kind-Effort-
+    /// Vorgaben unverändert `(None, None)`.
+    reasoning_effort_config: Arc<ResolvedConfig>,
 }
 
 /// Montiert den Spawner eines Laufs nach seiner [`SpawnerPolicy`].
@@ -2830,6 +3042,7 @@ fn build_spawner(
         project,
         chain,
         model,
+        uia_worker_model,
         root_session_id,
         spawn_context,
         reasoning_effort,
@@ -2838,6 +3051,7 @@ fn build_spawner(
         guard_policy,
         pitfall_advisor,
         profile_agents_dir,
+        reasoning_effort_config,
     } = inputs;
 
     let events = session_events.ok_or_else(|| RuntimeError::Spawner {
@@ -2857,9 +3071,30 @@ fn build_spawner(
         .with_internal_models(crate::children::resolve_internal_models_for_children(
             config,
         ))
+        .with_profile_agents_dir(profile_agents_dir.clone())
+        .with_browser_config(config.browser.clone())
+        .with_spawner_slot(Arc::clone(&spawner_slot))
+        .with_reasoning_effort_config(Arc::clone(&reasoning_effort_config)),
+    );
+    // Welle 3a, Teil A: eine zweite Fabrik-Instanz, ausschließlich für die
+    // `uia-worker`-Rollenfamilie (`AgentRoleId::UiaWorker`). Gleiches Projekt,
+    // gleiche Kette, gleiche gesenkten Definitionen wie `factory` — der
+    // einzige Unterschied ist `model`: hier bereits exakt das
+    // UIA-Worker-Modell (`uia_worker_model`), deshalb **ohne**
+    // `.with_internal_models(...)` — `internal_point_for_role` liefert für
+    // diese vier Rollen ohnehin `None` (Welle 3a, Teil A, Schritt 1), eine
+    // interne Modellstelle könnte hier nichts mehr überschreiben.
+    let uia_worker_factory: Arc<dyn ChildRegistryFactory> = Arc::new(
+        RuntimeChildRegistryFactory::with_definitions(
+            project.clone(),
+            Arc::clone(uia_worker_model),
+            chain.clone(),
+            definitions.clone(),
+        )
         .with_profile_agents_dir(profile_agents_dir)
         .with_browser_config(config.browser.clone())
-        .with_spawner_slot(Arc::clone(&spawner_slot)),
+        .with_spawner_slot(Arc::clone(&spawner_slot))
+        .with_reasoning_effort_config(Arc::clone(&reasoning_effort_config)),
     );
 
     let model_id = config.harness.default_model.as_deref().unwrap_or_default();
@@ -2882,6 +3117,18 @@ fn build_spawner(
         .with_pitfall_advisor(pitfall_advisor.clone());
     let mut roles: Vec<String> = Vec::with_capacity(role_names::ALL.len());
     for role in role_names::ALL {
+        // Welle 3a, Teil A, Schritt 5: dieselbe Organisationsrolle, die
+        // `RuntimeChildRegistryFactory::build_registry` für `role` gleich
+        // noch einmal liest — trifft automatisch alle vier
+        // UIA-Spezialisierungen, ohne eine Namensliste zu pflegen.
+        let organizational_role = definitions
+            .get(*role)
+            .map_or(AgentRoleId::Worker, ExecutableAgentIr::role);
+        let role_factory = if organizational_role == AgentRoleId::UiaWorker {
+            Arc::clone(&uia_worker_factory)
+        } else {
+            Arc::clone(&factory)
+        };
         spawner = spawner.with_role(
             (*role).to_owned(),
             AgentRole::Agent {
@@ -2890,10 +3137,8 @@ fn build_spawner(
             // The registered target's sealed role comes from its frozen
             // definition. Unknown/missing definitions fail closed as workers,
             // which cannot spawn further agents.
-            definitions
-                .get(*role)
-                .map_or(AgentRoleId::Worker, ExecutableAgentIr::role),
-            Arc::clone(&factory),
+            organizational_role,
+            role_factory,
         );
         roles.push((*role).to_owned());
     }
@@ -2985,6 +3230,18 @@ pub struct RuntimeAssembly {
     /// [`Self::new_root_session`] nutzt `weights.uia`, falls die Wurzel eine
     /// UIA ist und [`RuntimeSpec::reasoning_effort`] `None` bleibt.
     role_effort_weights: RoleEffortWeights,
+    /// Provider-/Modell-/Agenten-Reasoning-Effort-Vorgaben der Wurzel-UIA
+    /// (Welle 8: Rangfolge Provider > Modell > Agent > Rolle), aus
+    /// [`resolve_root_uia_reasoning_effort_defaults`]. `(None, None, None)`,
+    /// solange der Einstieg keine UIA-Wurzel ist.
+    /// [`Self::new_root_session`] reicht sie, zusammen mit
+    /// `role_effort_weights.uia` als unterster Ebene, an
+    /// [`crate::guard_wiring::resolve_default_reasoning_effort`] weiter.
+    root_uia_reasoning_effort_defaults: (
+        Option<harw_types::ReasoningEffort>,
+        Option<harw_types::ReasoningEffort>,
+        Option<String>,
+    ),
     /// Pitfall-Berater über die Projekt-Fakten-Wurzel (Addendum F+G,
     /// `PitfallMatch`), `None` ohne geöffnete Projekt-Fakten-Wurzel.
     /// [`Self::new_root_session`] hängt ihn, falls gesetzt, über
@@ -3501,16 +3758,27 @@ impl RuntimeAssembly {
         // Vertrags. Der Handoff-Beobachter schreibt bei jeder Verdichtung
         // `<project>/.harw/handoff.json` (Contract §"harw-runtime/src/handoff.rs").
         let context_window = resolve_context_window(&self.config);
-        // Addendum F+G: eine UIA-Wurzel ohne expliziten Effort erbt
-        // `role_effort_weights.uia`, statt unverändert `None` zu bleiben (was
-        // `AgentSession` seinerseits auf den Modell-Vorgabewert abbildet).
-        // Jeder andere Einstieg (auch ein `active_agent`-Root ohne UIA) bleibt
-        // unverändert bei `spec.reasoning_effort`.
+        // Addendum F+G / Welle 8: eine UIA-Wurzel ohne expliziten Effort
+        // (`spec.reasoning_effort`, die einzige Live-Einstellung, die über
+        // dieser gesamten Rangfolge steht) erbt nicht mehr unverändert
+        // `role_effort_weights.uia`, sondern die volle Rangfolge
+        // Provider > Modell > Agent > Rolle
+        // ([`crate::guard_wiring::resolve_default_reasoning_effort`]), mit
+        // `role_effort_weights.uia` als Boden. Jeder andere Einstieg (auch
+        // ein `active_agent`-Root ohne UIA) bleibt unverändert bei
+        // `spec.reasoning_effort`.
         let reasoning_effort =
             if self.spawn_context.organizational_role == AgentRoleId::UserInterface {
-                self.spec
-                    .reasoning_effort
-                    .or(Some(self.role_effort_weights.uia))
+                let (provider_default, model_default, agent_default) =
+                    &self.root_uia_reasoning_effort_defaults;
+                self.spec.reasoning_effort.or_else(|| {
+                    crate::guard_wiring::resolve_default_reasoning_effort(
+                        *provider_default,
+                        *model_default,
+                        agent_default.as_deref(),
+                        Some(self.role_effort_weights.uia),
+                    )
+                })
             } else {
                 self.spec.reasoning_effort
             };
@@ -3747,6 +4015,207 @@ mod tests {
         );
     }
 
+    // ── split_root_and_uia_worker_models (Welle 3a, Teil A) ─────────────
+
+    /// Ein minimaler [`RuntimeSpec`], nur für den Modell-Bau relevant — kein
+    /// echtes Home/Cwd wird je gelesen, solange `ModelSource::Configured`
+    /// nicht mit einem tatsächlich konfigurierten Provider zusammentrifft.
+    fn model_spec() -> RuntimeSpec {
+        RuntimeSpec {
+            entry: EntryKind::OneShot,
+            home: std::path::PathBuf::from("/nonexistent-home"),
+            cwd: std::path::PathBuf::from("/nonexistent-cwd"),
+            principal: harw_types::Principal::trusted_ingress(
+                harw_types::PrincipalKind::Human,
+                "test",
+                harw_types::IngressSurface::Tui,
+                harw_types::PermissionTier::Owner,
+            ),
+            mode_override: None,
+            active_agent: None,
+            reasoning_effort: None,
+        }
+    }
+
+    /// Konfiguration mit zwei baubaren, netzlosen Loopback-Providern
+    /// (`"local-a"` als Vorgabe, `"local-b"` als abweichender UIA-Provider) —
+    /// dasselbe Muster wie `model::tests::two_provider_config`, hier
+    /// dupliziert statt importiert (jenes ist privat zu `model.rs`).
+    fn two_provider_config() -> ResolvedConfig {
+        fn loopback_provider(name: &str) -> harw_config::ProviderToml {
+            harw_config::ProviderToml {
+                name: name.to_owned(),
+                api: "openai-chat".to_owned(),
+                base_url: "http://127.0.0.1:11434/v1".to_owned(),
+                auth: None,
+                auth_header: Some("none".to_owned()),
+                api_key: None,
+                headers: HashMap::new(),
+                models: Vec::new(),
+                enabled: true,
+                origin_allowlist: harw_config::OriginAllowlistToml::default(),
+                rate_limit: None,
+                max_concurrency: None,
+                originator: None,
+                default_reasoning_effort: None,
+            }
+        }
+
+        let mut config = ResolvedConfig {
+            harness: harw_config::HarnessConfig {
+                default_provider: Some("local-a".to_owned()),
+                default_model: Some("local-a-model".to_owned()),
+                ..harw_config::HarnessConfig::default()
+            },
+            ..ResolvedConfig::default()
+        };
+        config.providers.insert("local-a".to_owned(), loopback_provider("local-a"));
+        config.providers.insert("local-b".to_owned(), loopback_provider("local-b"));
+        config
+    }
+
+    // ── resolve_root_uia_reasoning_effort_defaults (Welle 8) ────────────
+
+    #[test]
+    fn resolve_root_uia_reasoning_effort_defaults_is_none_triple_without_a_uia() {
+        let config = two_provider_config();
+        assert_eq!(
+            resolve_root_uia_reasoning_effort_defaults(&config, None),
+            (None, None, None),
+            "ohne UIA gibt es keine Wurzel-UIA-Effort-Vorgabe aufzulösen"
+        );
+    }
+
+    #[test]
+    fn resolve_root_uia_reasoning_effort_defaults_prefers_uia_pair_when_usable() {
+        let mut config = two_provider_config();
+        // `local-a` (der Vorgabe-Provider) trägt einen anderen Effort als
+        // `local-b` (der abweichende UIA-Provider) — nur `local-b` darf
+        // gewinnen, wenn `uia_provider`/`uia_model` beide gesetzt und
+        // `uia_provider` nutzbar ist.
+        config.providers.get_mut("local-a").expect("local-a").default_reasoning_effort =
+            Some(harw_types::ReasoningEffort::Low);
+        config.providers.get_mut("local-b").expect("local-b").default_reasoning_effort =
+            Some(harw_types::ReasoningEffort::Xhigh);
+        config.harness.uia_provider = Some("local-b".to_owned());
+        config.harness.uia_model = Some("local-b-model".to_owned());
+
+        let (_config_for_definitions, definitions) = builtin();
+        let uia_ir = definitions
+            .get(role_names::EXPLORER)
+            .expect("builtin explorer definition");
+
+        let (provider_default, model_default, _agent_default) =
+            resolve_root_uia_reasoning_effort_defaults(&config, Some(uia_ir));
+        assert_eq!(provider_default, Some(harw_types::ReasoningEffort::Xhigh));
+        assert_eq!(model_default, None, "local-b-model ist nicht katalogisiert");
+    }
+
+    #[test]
+    fn resolve_root_uia_reasoning_effort_defaults_falls_back_to_default_pair_without_a_usable_uia_pair() {
+        let mut config = two_provider_config();
+        config.providers.get_mut("local-a").expect("local-a").default_reasoning_effort =
+            Some(harw_types::ReasoningEffort::High);
+        // Kein `uia_provider`/`uia_model` gesetzt: die Auflösung muss auf
+        // `default_provider` (`local-a`) zurückfallen.
+        let (_config_for_definitions, definitions) = builtin();
+        let uia_ir = definitions
+            .get(role_names::EXPLORER)
+            .expect("builtin explorer definition");
+
+        let (provider_default, _model_default, _agent_default) =
+            resolve_root_uia_reasoning_effort_defaults(&config, Some(uia_ir));
+        assert_eq!(provider_default, Some(harw_types::ReasoningEffort::High));
+    }
+
+    #[test]
+    fn resolve_root_uia_reasoning_effort_defaults_carries_the_agent_label() {
+        let config = two_provider_config();
+        let (_config_for_definitions, definitions) = builtin();
+        let uia_ir = definitions
+            .get(role_names::EXPLORER)
+            .expect("builtin explorer definition");
+        let (_provider_default, _model_default, agent_default) =
+            resolve_root_uia_reasoning_effort_defaults(&config, Some(uia_ir));
+        assert_eq!(
+            agent_default.as_deref(),
+            uia_ir.reasoning_effort(),
+            "das dritte Feld ist ExecutableAgentIr::reasoning_effort() der UIA, als \
+             eigenständiger String geklont"
+        );
+    }
+
+    #[test]
+    fn builder_splits_model_and_uia_worker_model_only_when_a_uia_is_active() {
+        let spec = model_spec();
+        let config = ResolvedConfig::default();
+        let default_tree_model: Arc<dyn ModelProvider> =
+            Arc::new(harw_core::EchoModelProvider::new("echo: root"));
+
+        let (model, uia_worker_model, uia_load_registry) = split_root_and_uia_worker_models(
+            &spec,
+            &config,
+            false,
+            &default_tree_model,
+            None,
+            None,
+        )
+        .expect("without an active uia the split never fails");
+        assert!(
+            uia_load_registry.is_empty(),
+            "without an active uia there is no dedicated client, so no dedicated registry"
+        );
+
+        assert!(
+            Arc::ptr_eq(&model, &default_tree_model),
+            "without an active uia, the root model must stay the default tree model"
+        );
+        assert!(
+            Arc::ptr_eq(&uia_worker_model, &default_tree_model),
+            "without an active uia, the uia-worker family must also fall back to the \
+             default tree model"
+        );
+    }
+
+    #[test]
+    fn builder_gives_the_uia_session_its_own_provider_client_when_configured() {
+        let spec = model_spec();
+        let mut config = two_provider_config();
+        config.harness.uia_provider = Some("local-b".to_owned());
+        config.harness.uia_model = Some("local-b-model".to_owned());
+        let default_tree_model: Arc<dyn ModelProvider> =
+            crate::model::build_root_model(&spec, &config, ModelSource::Configured)
+                .expect("default provider (local-a) must build");
+
+        // Any `Some` is enough to flip the branch — the split function only
+        // checks presence, never the IR's own content.
+        let (_config_for_definitions, definitions) = builtin();
+        let uia_ir = definitions
+            .get(role_names::EXPLORER)
+            .expect("builtin explorer definition");
+
+        let (model, uia_worker_model, _uia_load_registry) = split_root_and_uia_worker_models(
+            &spec,
+            &config,
+            true,
+            &default_tree_model,
+            Some(uia_ir),
+            None,
+        )
+        .expect("uia provider (local-b) must build as a dedicated client");
+
+        assert!(
+            !Arc::ptr_eq(&model, &default_tree_model),
+            "an active uia with its own configured provider must get a dedicated client, \
+             not the default tree model"
+        );
+        assert!(
+            !Arc::ptr_eq(&uia_worker_model, &default_tree_model),
+            "the uia-worker family must be derived from the uia client, not the default \
+             tree model, once the uia provider differs"
+        );
+    }
+
     #[test]
     fn an_unknown_agent_name_fails_closed() {
         let (config, definitions) = builtin();
@@ -3964,6 +4433,23 @@ mod tests {
         }
     }
 
+    /// Wie [`build_fixture`], mit [`write_fixture_uia_with_default_provider_effort`]
+    /// statt [`write_fixture_uia`].
+    fn build_fixture_with_default_provider_effort(provider_effort: &str) -> BuildFixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path().join("home");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::create_dir_all(&project).expect("project");
+        std::fs::write(project.join("Cargo.toml"), "[workspace]\n").expect("marker");
+        write_fixture_uia_with_default_provider_effort(&home, provider_effort);
+        BuildFixture {
+            _dir: dir,
+            home,
+            project,
+        }
+    }
+
     /// Legt eine minimale, gültige UIA (`role = "user-interface"`) im
     /// Standardprofil des Test-`home` an und aktiviert sie über
     /// `harness.active_uia_definition`.
@@ -3995,6 +4481,54 @@ mod tests {
             "active_uia_definition = \"harwness.agent.fixture-uia@1\"\n",
         )
         .expect("fixture profile config");
+    }
+
+    /// Wie [`write_fixture_uia`], zusätzlich mit einem `default_provider`/
+    /// `default_model`-Paar, dessen Provider-Datei einen
+    /// `default_reasoning_effort` trägt (Welle 8: Rangfolge Provider &gt;
+    /// Modell &gt; Agent &gt; Rolle) — für Tests von
+    /// [`resolve_root_uia_reasoning_effort_defaults`] über den vollen
+    /// [`RuntimeAssembly::new_root_session`]-Pfad, nicht nur die reine
+    /// Funktion.
+    fn write_fixture_uia_with_default_provider_effort(
+        home: &std::path::Path,
+        provider_effort: &str,
+    ) {
+        let profile_dir = home.join("profiles").join("default");
+        let agent_dir = profile_dir.join("agents").join("fixture-uia");
+        std::fs::create_dir_all(&agent_dir).expect("fixture uia dir");
+        std::fs::write(
+            agent_dir.join("definition.toml"),
+            "schema = \"harwness.agent/v1\"\nid = \"harwness.agent.fixture-uia@1\"\nversion = \"1.0.0\"\nrole = \"user-interface\"\nspecialization = \"terminal-ui\"\n",
+        )
+        .expect("fixture uia definition");
+        std::fs::write(
+            profile_dir.join("config.toml"),
+            "active_uia_definition = \"harwness.agent.fixture-uia@1\"\n\
+             default_provider = \"fixture-provider\"\n\
+             default_model = \"fixture-model\"\n",
+        )
+        .expect("fixture profile config");
+        let providers_dir = profile_dir.join("providers");
+        std::fs::create_dir_all(&providers_dir).expect("providers dir");
+        std::fs::write(
+            providers_dir.join("fixture-provider.toml"),
+            format!(
+                "name = \"fixture-provider\"\n\
+                 api = \"openai-chat\"\n\
+                 base_url = \"http://127.0.0.1:11434/v1\"\n\
+                 auth_header = \"none\"\n\
+                 default_reasoning_effort = \"{provider_effort}\"\n"
+            ),
+        )
+        .expect("fixture provider toml");
+        let models_dir = profile_dir.join("models");
+        std::fs::create_dir_all(&models_dir).expect("models dir");
+        std::fs::write(
+            models_dir.join("fixture-model.toml"),
+            "id = \"fixture-model\"\nprovider = \"fixture-provider\"\n",
+        )
+        .expect("fixture model toml");
     }
 
     /// Ein Builder mit Echo-Modell und In-Memory-Verlauf. Nur für Einstiege
@@ -4102,6 +4636,102 @@ mod tests {
             root.session.tool_outcome_observer().is_some(),
             "eine erfolgreich geöffnete Erfassungsfläche muss die Wurzelsitzung \
              mit einem ToolOutcomeObserver verdrahten"
+        );
+    }
+
+    /// Welle 8: eine UIA-Wurzel ohne explizites `spec.reasoning_effort`
+    /// übernimmt `default_provider`s `default_reasoning_effort`, statt
+    /// unverändert `role_effort_weights.uia` (`High`) zu bleiben — die
+    /// Provider-Ebene steht in der Rangfolge Provider > Modell > Agent > Rolle
+    /// über der Rollen-Ebene.
+    #[test]
+    fn test_root_uia_session_reasoning_effort_prefers_provider_default_over_role_weight() {
+        let fixture = build_fixture_with_default_provider_effort("xhigh");
+        let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+        let assembly = fixture_builder(EntryKind::Tui, &fixture)
+            .session_events(events)
+            .build()
+            .expect("Tui montiert");
+
+        let (session_events, _session_rx) =
+            tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+        let (turn_events, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
+        let root = assembly
+            .new_root_session(
+                assembly.root_session_id().clone(),
+                session_events,
+                turn_events,
+                None,
+            )
+            .expect("UIA-Wurzelsitzung entsteht");
+
+        assert_eq!(
+            root.session.reasoning_effort(),
+            Some(harw_types::ReasoningEffort::Xhigh),
+            "der `default_provider`-Vorgabewert (\"xhigh\") muss vor \
+             `role_effort_weights.uia` (High) gewinnen"
+        );
+    }
+
+    /// Regressionstest: ohne konfigurierten Provider-/Modell-/Agenten-
+    /// Standard bleibt die UIA-Wurzel unverändert bei `role_effort_weights.uia`
+    /// (Addendum F+G, bisheriges Verhalten).
+    #[test]
+    fn test_root_uia_session_reasoning_effort_falls_back_to_role_weight_without_any_default() {
+        let fixture = build_fixture();
+        let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+        let assembly = fixture_builder(EntryKind::Tui, &fixture)
+            .session_events(events)
+            .build()
+            .expect("Tui montiert");
+
+        let (session_events, _session_rx) =
+            tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+        let (turn_events, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
+        let root = assembly
+            .new_root_session(
+                assembly.root_session_id().clone(),
+                session_events,
+                turn_events,
+                None,
+            )
+            .expect("UIA-Wurzelsitzung entsteht");
+
+        assert_eq!(
+            root.session.reasoning_effort(),
+            Some(RoleEffortWeights::default().uia),
+            "ohne jede konfigurierte Ebene bleibt die UIA-Wurzel beim Rollengewicht"
+        );
+    }
+
+    /// Eine explizite Live-Einstellung (`RuntimeSpec::reasoning_effort`)
+    /// steht laut Nutzerentscheidung über der gesamten Rangfolge Provider >
+    /// Modell > Agent > Rolle — auch über einem konfigurierten
+    /// `default_provider`.
+    #[test]
+    fn test_root_uia_session_reasoning_effort_explicit_spec_wins_over_provider_default() {
+        let fixture = build_fixture_with_default_provider_effort("xhigh");
+        let (events, _event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+        let mut builder = fixture_builder(EntryKind::Tui, &fixture).session_events(events);
+        builder.spec.reasoning_effort = Some(harw_types::ReasoningEffort::Low);
+        let assembly = builder.build().expect("Tui montiert");
+
+        let (session_events, _session_rx) =
+            tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+        let (turn_events, _turn_rx) = tokio::sync::mpsc::unbounded_channel::<TurnEvent>();
+        let root = assembly
+            .new_root_session(
+                assembly.root_session_id().clone(),
+                session_events,
+                turn_events,
+                None,
+            )
+            .expect("UIA-Wurzelsitzung entsteht");
+
+        assert_eq!(
+            root.session.reasoning_effort(),
+            Some(harw_types::ReasoningEffort::Low),
+            "eine explizite Live-Einstellung steht über der gesamten Rangfolge"
         );
     }
 
@@ -4446,7 +5076,6 @@ mod tests {
     /// Kontextfragment als `label\ncontent`. Nimmt die Registry aus der
     /// Montage (danach ist sie für `new_root_session` verbraucht).
     fn registry_model_context(assembly: &RuntimeAssembly) -> Vec<String> {
-        use harw_extension_api::{ContextProvider as _, InstructionsProvider as _};
         let registry = assembly
             .registry
             .lock()
@@ -4524,7 +5153,7 @@ mod tests {
             let expected_root =
                 format!("project.root\nproject_root={placeholder}\ncwd={placeholder}");
             assert!(
-                context.iter().any(|text| *text == expected_root),
+                context.contains(&expected_root),
                 "{entry:?}: neutraler Platzhalter statt Host-Pfad: {context:?}"
             );
         }
@@ -4562,7 +5191,7 @@ mod tests {
             canonical_project.display()
         );
         assert!(
-            context.iter().any(|text| *text == expected_root),
+            context.contains(&expected_root),
             "Tui zeigt den erkannten Projekt-Root: {context:?}"
         );
     }
@@ -4613,7 +5242,7 @@ mod tests {
             canonical_workspace.display()
         );
         assert!(
-            context.iter().any(|text| *text == expected_root),
+            context.contains(&expected_root),
             "project_root im Kontext ist der gebundene Root: {context:?}"
         );
 
@@ -4796,8 +5425,10 @@ mod tests {
         std::fs::create_dir_all(&valid).expect("valid");
         let missing = primary.join("does-not-exist");
 
-        let mut global = PermissionsSection::default();
-        global.extra_roots = vec![valid, missing];
+        let global = PermissionsSection {
+            extra_roots: vec![valid, missing],
+            ..PermissionsSection::default()
+        };
 
         let cell = seed_extra_roots(&global, &PermissionsSection::default(), &primary, None);
         let snapshot = cell.snapshot();
@@ -4850,8 +5481,10 @@ mod tests {
             discover_home_project(&fixture.project, &[]).expect("Projekt-Home erkannt");
         let project_home = ProjectHome::at(&home_project_root);
 
-        let mut section = PlanSection::default();
-        section.enabled = false;
+        let section = PlanSection {
+            enabled: false,
+            ..PlanSection::default()
+        };
         assert!(!plan_section_is_untouched(&section));
 
         assert!(
@@ -4871,10 +5504,12 @@ mod tests {
     /// übersetzt (Knotenlimits, Exploration-Vorgaben).
     #[test]
     fn test_plan_tool_config_from_section_translates_fields() {
-        let mut section = PlanSection::default();
-        section.enabled = true;
-        section.max_nodes = 12;
-        section.require_exploration_for = vec!["coding".to_owned()];
+        let section = PlanSection {
+            enabled: true,
+            max_nodes: 12,
+            require_exploration_for: vec!["coding".to_owned()],
+            ..PlanSection::default()
+        };
 
         let config = plan_tool_config_from_section(&section).expect("gültige Sektion übersetzt");
         assert!(config.enabled);
@@ -4886,9 +5521,11 @@ mod tests {
     /// Prüfung, die [`resolve_plan_services`] fail-soft in `None` auflöst.
     #[test]
     fn test_plan_tool_config_from_section_rejects_zero_max_nodes() {
-        let mut section = PlanSection::default();
-        section.enabled = true;
-        section.max_nodes = 0;
+        let section = PlanSection {
+            enabled: true,
+            max_nodes: 0,
+            ..PlanSection::default()
+        };
         assert!(plan_tool_config_from_section(&section).is_err());
 
         let fixture = build_fixture();

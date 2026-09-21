@@ -54,17 +54,10 @@ mod tests {
 
     #[test]
     fn ohne_runtime_wird_direkt_ausgefuehrt() {
-        use std::sync::Arc;
-        use std::task::{Context, Poll, Wake, Waker};
-
-        struct Noop;
-        impl Wake for Noop {
-            fn wake(self: Arc<Self>) {}
-        }
+        use std::task::{Context, Poll, Waker};
 
         assert!(tokio::runtime::Handle::try_current().is_err());
-        let waker = Waker::from(Arc::new(Noop));
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(Waker::noop());
         let job = || Ok(ToolOutput::text("ok"));
         let mut future = std::pin::pin!(run_blocking("fs.test", job));
         match future.as_mut().poll(&mut cx) {

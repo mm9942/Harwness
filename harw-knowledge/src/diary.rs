@@ -130,7 +130,7 @@ fn entry_count(frontmatter: &Frontmatter) -> u64 {
 /// Tagesdatei.
 ///
 /// # Fehler
-/// - [`crate::error::KnowledgeError::Io`]: Lese-/Schreib-/Rename-Fehler.
+/// - [`crate::error::KnowledgeError::Io`]\: Lese-/Schreib-/Rename-Fehler.
 /// - [`crate::error::KnowledgeError::MalformedFrontmatter`] /
 ///   [`crate::error::KnowledgeError::Frontmatter`]: eine bestehende
 ///   Tagesdatei ließ sich nicht als gültiges Frontmatter-Dokument parsen.
@@ -283,7 +283,7 @@ pub struct DiaryGcReport {
 /// # Fehler
 /// - [`crate::error::KnowledgeError::Time`]: die Cutoff-Berechnung hat den
 ///   von `jiff` darstellbaren Zeitbereich überschritten.
-/// - [`crate::error::KnowledgeError::Io`]: Lese-/Schreib-/Löschfehler.
+/// - [`crate::error::KnowledgeError::Io`]\: Lese-/Schreib-/Löschfehler.
 /// - [`crate::error::KnowledgeError::MalformedFrontmatter`] /
 ///   [`crate::error::KnowledgeError::Frontmatter`]: eine Tages- oder
 ///   Rollup-Datei ließ sich nicht parsen.

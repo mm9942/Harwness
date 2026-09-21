@@ -46,7 +46,7 @@ pub struct WorkArgs {}
     summary = "Zeigt dauerhafte Job-Zusammenfassung; Approval- und Diff-Daten lokal nicht verfügbar.",
     domain = "execution",
     permission = "observer",
-    command(path = "/work", visibility = "channel_parity"),
+    command(path = "/work", visibility = "channel_parity", busy = "immediate"),
     // Web-Fläche: laut Moduldoku "schreibgeschützte Übersicht" — liest nur
     // den `JobStore`, keine Mutation. `method = "get"`, `approval = "none"`.
     web(path = "/api/work", method = "get", approval = "none")

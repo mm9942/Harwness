@@ -116,6 +116,7 @@ pub(crate) struct ModelEntry {
 /// die Modell-Stufe die ursprünglich aktive Modellauswahl vorausgewählt
 /// werden kann, sofern der neu gewählte Provider mit dem ursprünglich
 /// aktiven Provider übereinstimmt.
+#[derive(Debug)]
 pub(crate) struct ModelSwitchPicker {
     /// Umschalt-Kontext (steuert, ob die Provider-Stufe existiert).
     target: PickerTarget,

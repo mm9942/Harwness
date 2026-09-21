@@ -62,6 +62,7 @@ use harw_operations::registry::OperationRegistry;
 use harw_operations::{ServiceMap, SharedSessionController};
 use harw_plan::{GoalStore, PlanStore, PlanToolConfig};
 use harw_plan_bridge::{FindingStore, register_plan_services};
+use harw_provider_http::ProviderLoadRegistry;
 use harw_sandbox::ExtraRootsCell;
 use harw_session_store::JobStore;
 use harw_types::Principal;
@@ -268,6 +269,20 @@ pub struct RuntimeServicesParts {
     pub principal: Principal,
     /// Sitzungs-Controller einer laufenden interaktiven Sitzung; `None` außerhalb.
     pub session_controller: Option<SharedSessionController>,
+    /// [`ProviderLoadControl`](harw_provider_http::ProviderLoadControl)-Handles
+    /// je Provider-Name (Auslastungskanal, additiv zu allem oben). Kein
+    /// `Option`, aus demselben Grund wie [`Self::allow_rules`]: `/status` und
+    /// `/provider` müssen die Registry über
+    /// `ctx.service::<ProviderLoadRegistry>()` unabhängig davon finden, ob
+    /// dieser Lauf überhaupt einen Provider mit Auslastungs-Handle gebaut hat
+    /// — eine leere [`ProviderLoadRegistry`] ist ein gültiger Zustand
+    /// (`ModelSource::Echo`, Loopback-Provider ohne
+    /// [`harw_provider_http::ProviderLoadControl`]-Impl), keine Abwesenheit
+    /// des Dienstes. Gebaut von
+    /// [`crate::model::build_root_model_with_registry_and_resolver`] und
+    /// [`crate::model::build_uia_model_with_registry_and_resolver`],
+    /// zusammengeführt in `RuntimeAssemblyBuilder::build`.
+    pub provider_load_registry: ProviderLoadRegistry,
 }
 
 // ── RuntimeServices ───────────────────────────────────────────────────────────
@@ -417,6 +432,7 @@ impl RuntimeServices {
     /// | [`AllowRuleSet`] | ✓ | ✓ | ✓ | ✓ |
     /// | [`ExtraRootsCell`] | ✓ | ✓ | ✓ | ✓ |
     /// | [`Principal`] | ✓ | ✓ | ✓ | ✓ |
+    /// | [`ProviderLoadRegistry`] | ✓ | ✓ | ✓ | ✓ |
     /// | `Arc<dyn Memory>` (falls vorhanden) | ✓ | ✓ | ✓ | ✓ |
     /// | `Arc<JobStore>` (falls vorhanden) | ✓ | ✓ | ✓ | ✓ |
     /// | Plan-Dienste (falls vorhanden) | ✓ | ✓ | ✓ | ✓ |
@@ -509,6 +525,11 @@ impl RuntimeServices {
         insert_service(&mut map, &mut names, self.parts.allow_rules.clone());
         insert_service(&mut map, &mut names, self.parts.extra_roots.clone());
         insert_service(&mut map, &mut names, self.parts.principal.clone());
+        insert_service(
+            &mut map,
+            &mut names,
+            self.parts.provider_load_registry.clone(),
+        );
 
         if let Some(memory) = &self.parts.memory {
             insert_service(&mut map, &mut names, Arc::clone(memory));
@@ -569,6 +590,7 @@ mod tests {
     use harw_operations::session_control::NullSessionController;
     use harw_operations::{ServiceMap, SharedSessionController};
     use harw_plan::{GoalStore, InMemoryGoalStore, InMemoryPlanStore, PlanStore, PlanToolConfig};
+    use harw_provider_http::ProviderLoadRegistry;
     use harw_plan_bridge::FindingStore;
     use harw_sandbox::ExtraRootsCell;
     use harw_session_store::JobStore;
@@ -645,6 +667,7 @@ mod tests {
             extra_roots: ExtraRootsCell::new(),
             principal: test_principal(),
             session_controller: Some(Arc::new(NullSessionController::new())),
+            provider_load_registry: ProviderLoadRegistry::new(),
         }
     }
 
@@ -663,10 +686,11 @@ mod tests {
             extra_roots: ExtraRootsCell::new(),
             principal: test_principal(),
             session_controller: None,
+            provider_load_registry: ProviderLoadRegistry::new(),
         }
     }
 
-    /// Die Namen der sieben immer vorhandenen Dienste.
+    /// Die Namen der acht immer vorhandenen Dienste.
     fn always_present() -> Vec<&'static str> {
         vec![
             type_name::<OperationRegistry>(),
@@ -676,6 +700,7 @@ mod tests {
             type_name::<AllowRuleSet>(),
             type_name::<ExtraRootsCell>(),
             type_name::<Principal>(),
+            type_name::<ProviderLoadRegistry>(),
         ]
     }
 
@@ -933,7 +958,7 @@ mod tests {
     }
 
     #[test]
-    fn minimal_parts_register_only_the_mandatory_seven() {
+    fn minimal_parts_register_only_the_mandatory_eight() {
         let services = RuntimeServices::new(minimal_parts());
         for surface in ServiceSurface::ALL {
             assert_eq!(
@@ -942,6 +967,26 @@ mod tests {
                 "Fläche {} ohne optionale Dienste",
                 surface.as_str()
             );
+        }
+    }
+
+    /// [`ProviderLoadRegistry`] muss wie [`AllowRuleSet`]/[`ExtraRootsCell`]
+    /// bedingungslos auf jeder Fläche liegen — auch leer (`minimal_parts`
+    /// setzt sie nie), damit `ctx.service::<ProviderLoadRegistry>()` in
+    /// `harw-ops` nie an einem fehlenden Dienst scheitert (siehe
+    /// `harw-ops/src/status.rs`, `harw-ops/src/provider.rs`).
+    #[test]
+    fn provider_load_registry_is_present_on_every_surface_even_when_empty() {
+        for parts in [full_parts(), minimal_parts()] {
+            let services = RuntimeServices::new(parts);
+            for surface in ServiceSurface::ALL {
+                let map = services.service_map(surface);
+                assert!(
+                    map.get::<ProviderLoadRegistry>().is_some(),
+                    "ProviderLoadRegistry fehlt auf {}",
+                    surface.as_str()
+                );
+            }
         }
     }
 

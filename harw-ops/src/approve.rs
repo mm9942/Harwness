@@ -60,7 +60,7 @@ pub struct ApproveArgs {
     summary = "Genehmigt einen wegen einer Freigabe blockierten Job (WorkId) — führt ihn zurück nach Ready.",
     domain = "execution",
     permission = "operator",
-    command(path = "/approve", visibility = "channel_parity")
+    command(path = "/approve", visibility = "channel_parity", busy = "immediate")
 )]
 async fn approve(ctx: &OpContext, args: ApproveArgs) -> Result<OpOutput, OpError> {
     let Some(work_id) = args.work_id.as_deref() else {

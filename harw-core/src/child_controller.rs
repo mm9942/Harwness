@@ -124,6 +124,72 @@ const CANCELLED_BY_SIBLING: &str = "cancelled: sibling completed first";
 /// Ordnung `Minimal < Low < Medium < High < Xhigh < Max`.
 const DEFAULT_CHILD_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Medium;
 
+/// Löst den Kind-Default-Reasoning-Effort nach der Nutzerentscheidung-Rangfolge
+/// **Provider > Modell > Agent > Rolle** auf (Welle 8,
+/// `recursive-cooking-lobster.md`).
+///
+/// # Beschreibung
+/// Spiegelt absichtlich dieselbe Rangfolgen-Logik wie
+/// `harw_runtime::guard_wiring::resolve_default_reasoning_effort` — dieses
+/// Crate (`harw-core`) darf nicht von `harw-runtime` abhängen (Schichtung:
+/// `harw-runtime` hängt von `harw-core` ab, nie umgekehrt), deshalb lebt hier
+/// eine zweite, bewusst identische Implementierung statt eines Imports.
+/// **Wer die Rangfolge ändert, muss beide Stellen nachziehen.**
+///
+/// Anders als die `harw-runtime`-Fassung nimmt `role_default` hier keinen
+/// `Option`, weil [`RoleEffortWeights::for_child`] immer einen konkreten
+/// Wert liefert — der Boden dieser Rangfolge ist an dieser Anwendungsstelle
+/// nie unbestimmt.
+///
+/// # Arguments
+/// - `provider_default` (`Option<ReasoningEffort>`): Provider-Standard des
+///   für diese Rolle tatsächlich aufgelösten Providers, aus
+///   [`ChildRegistryFactory::reasoning_effort_defaults_for_role`].
+/// - `model_default` (`Option<ReasoningEffort>`): Modell-Standard desselben
+///   aufgelösten Modells, aus derselben Quelle.
+/// - `agent_default` (`Option<&str>`): [`harw_agent_dsl::executable::ExecutableAgentIr::reasoning_effort`]
+///   der Rolle — ein undurchsichtiges DSL-Label. Ein Label, das nicht als
+///   [`ReasoningEffort`] geparst werden kann, wird `tracing::warn!`-gemeldet
+///   und übersprungen (fällt zur Rollen-Ebene durch), statt die Admission
+///   abzubrechen.
+/// - `role_default` (`ReasoningEffort`): das Rollengewicht aus
+///   [`RoleEffortWeights::for_child`] — der Boden dieser Rangfolge.
+///
+/// # Returns
+/// Das nach der Rangfolge gewinnende [`ReasoningEffort`]-Level, **vor** der
+/// Klammerung gegen das geerbte Eltern-Level (die bleibt Sache des Aufrufers,
+/// siehe [`ManagedAgentSpawner::admit`]).
+///
+/// # Concurrency
+/// Rein; von jedem Thread aus sicher.
+fn resolve_child_default_reasoning_effort(
+    provider_default: Option<ReasoningEffort>,
+    model_default: Option<ReasoningEffort>,
+    agent_default: Option<&str>,
+    role_default: ReasoningEffort,
+) -> ReasoningEffort {
+    if let Some(effort) = provider_default {
+        return effort;
+    }
+    if let Some(effort) = model_default {
+        return effort;
+    }
+    if let Some(label) = agent_default {
+        match label.parse::<ReasoningEffort>() {
+            Ok(effort) => return effort,
+            Err(error) => {
+                tracing::warn!(
+                    label,
+                    error = %error,
+                    "core.child_admit.reasoning_default.invalid_agent_label"
+                );
+                // Fällt bewusst zur Rollen-Ebene durch, statt abzubrechen.
+            }
+        }
+    }
+    role_default
+}
+
 /// Obergrenze (in Bytes) für den Text, den [`ManagedAgentSpawner::child_final_assistant_text`]
 /// an den Elternteil zurückgibt.
 ///
@@ -1103,6 +1169,58 @@ pub trait ChildRegistryFactory: Send + Sync {
         self.model_for(role)
     }
 
+    /// Liefert Provider- und Modell-Standard-Reasoning-Effort für die
+    /// Provider-/Modell-Zuordnung, die diese Factory für `role` tatsächlich
+    /// auflöst (Welle 8: Rangfolge Provider > Modell > Agent > Rolle).
+    ///
+    /// # Beschreibung
+    /// Der Kompatibilitäts-Default liefert `(None, None)`: eine Factory ohne
+    /// Config-Zugriff (z. B. die Test-Mocks in diesem Modul) trifft damit auf
+    /// diesen beiden Ebenen keine Aussage, und
+    /// `resolve_child_default_reasoning_effort` fällt zur Agenten-/Rollen-Ebene
+    /// durch. `harw-runtime`s `RuntimeChildRegistryFactory` (hat Zugriff auf
+    /// `harw_config::ResolvedConfig`) überschreibt diese Methode mit den
+    /// tatsächlich für die aufgelöste Provider-/Modell-ID hinterlegten
+    /// `default_reasoning_effort`-Werten.
+    ///
+    /// # Arguments
+    /// - `role` (`&str`): exakter registrierter Rollenname.
+    ///
+    /// # Returns
+    /// `(provider_default, model_default)` — je `None`, wenn diese Ebene
+    /// keine Aussage trifft (fehlende Config-Sektion, fehlendes Feld, oder
+    /// kein Config-Zugriff).
+    fn reasoning_effort_defaults_for_role(
+        &self,
+        role: &str,
+    ) -> (Option<ReasoningEffort>, Option<ReasoningEffort>) {
+        let _ = role;
+        (None, None)
+    }
+
+    /// Wie [`Self::reasoning_effort_defaults_for_role`], zusätzlich mit der
+    /// Aufgabenkomplexität (Addendum D) — erlaubt Factories, zwischen den
+    /// Worker-Modellstufen `WorkerSimple`/`WorkerComplex` zu unterscheiden,
+    /// genau wie [`Self::model_for_task`] gegenüber [`Self::model_for`]. Der
+    /// Default ignoriert `complexity` und delegiert an
+    /// [`Self::reasoning_effort_defaults_for_role`].
+    ///
+    /// # Arguments
+    /// - `role` (`&str`): exakter registrierter Rollenname.
+    /// - `complexity` (`Option<TaskComplexity>`): aus
+    ///   [`TaskComplexity::from_spawn_context`] gelesene Einstufung.
+    ///
+    /// # Returns
+    /// Wie [`Self::reasoning_effort_defaults_for_role`].
+    fn reasoning_effort_defaults_for_role_task(
+        &self,
+        role: &str,
+        complexity: Option<TaskComplexity>,
+    ) -> (Option<ReasoningEffort>, Option<ReasoningEffort>) {
+        let _ = complexity;
+        self.reasoning_effort_defaults_for_role(role)
+    }
+
     /// Die aufgelöste Agent-IR dieser Rolle, falls vorhanden. Der Controller
     /// wendet daraus Tool-Aktivierung, Budget und Pause-Sperre an.
     ///
@@ -2047,6 +2165,59 @@ impl ManagedAgentSpawner {
             .and_then(|active| active.get(child.as_str()).cloned())
     }
 
+    /// Deckelt die zulässige Fan-out-Parallelität für einen **registrierten
+    /// Rollennamen** — unabhängig vom aufrufer-seitigen `max_parallel`.
+    ///
+    /// # Beschreibung
+    /// Lokales Äquivalent zu
+    /// `harw_runtime::children::max_concurrent_instances_for_role`, hier aber
+    /// **nicht** durch Aufruf jener Funktion implementiert: `harw-runtime`
+    /// hängt von `harw-core` ab (siehe `harw-runtime/Cargo.toml`,
+    /// `harw-core = { path = "../harw-core" }`), nie umgekehrt — ein Aufruf
+    /// von hier aus wäre eine zirkuläre Crate-Abhängigkeit und würde nicht
+    /// kompilieren. Diese Methode zieht dieselbe Schlussfolgerung
+    /// (Organisationsrolle [`harw_agent_dsl::roles::AgentRoleId::UiaWorker`]
+    /// ⇒ höchstens eine gleichzeitige Instanz) unabhängig, aus der lokal
+    /// bereits vorhandenen Quelle: [`Self::roles`]
+    /// (`ChildRoleDefinition::organizational_role`), derselben Zuordnung, die
+    /// [`Self::run_child_with_approvals`] wenige Zeilen weiter unten für den
+    /// Modell-Lookup liest und die [`Self::with_role`] beim Registrieren
+    /// jeder Rolle bindet.
+    ///
+    /// Aufrufer außerhalb dieser Crate (z. B.
+    /// `harw-core-bridge::agent_tool::fanout_children`) erhalten hier absichtlich
+    /// nur ein `usize` zurück statt der
+    /// [`harw_agent_dsl::roles::AgentRoleId`] selbst: `harw-core-bridge` führt
+    /// `harw-agent-dsl` nur als `[dev-dependencies]`
+    /// (`harw-core-bridge/Cargo.toml:24-28`), nicht als produktive
+    /// Abhängigkeit — der Rollen-Enum-Typ ist dort im produktiven Build gar
+    /// nicht benennbar. Diese Methode kapselt die Fallunterscheidung deshalb
+    /// vollständig in `harw-core`.
+    ///
+    /// # Arguments
+    /// - `role` (`&str`): der exakte registrierte Rollenname (`self.roles`-Schlüssel).
+    ///
+    /// # Returns
+    /// `1`, wenn `role` registriert ist und ihre Organisationsrolle
+    /// [`harw_agent_dsl::roles::AgentRoleId::UiaWorker`] ist; sonst
+    /// `usize::MAX` — das schließt eine **unbekannte** Rolle ein (fail-open
+    /// für die Deckelung selbst: eine nicht registrierte Rolle scheitert
+    /// ohnehin kurz danach an der eigentlichen Admission/Ausführung mit einem
+    /// eigenen Fehler, siehe [`Self::run_child_with_approvals`]).
+    ///
+    /// # Concurrency
+    /// Nimmt keinen Lock: `self.roles` ist ein einfaches `BTreeMap`, nicht
+    /// hinter einem `Mutex`, und nach der Konstruktion unveränderlich (nur
+    /// [`Self::with_role`] schreibt, als Builder-Methode vor jeder
+    /// Nebenläufigkeit). Sicher aus jedem Thread aufrufbar.
+    #[must_use]
+    pub fn max_concurrent_instances_for_role(&self, role: &str) -> usize {
+        match self.roles.get(role).map(|definition| definition.organizational_role) {
+            Some(harw_agent_dsl::roles::AgentRoleId::UiaWorker) => 1,
+            _ => usize::MAX,
+        }
+    }
+
     /// Liefert die organisatorische Rolle (§3 DSL-Spawn-Matrix) der Session,
     /// die `child` delegiert hat.
     ///
@@ -2627,6 +2798,54 @@ impl ManagedAgentSpawner {
         Ok(outcome)
     }
 
+    /// Deckelt einen bereits auf `max(1)` angehobenen Slot-Wunsch auf die
+    /// strengste Rollen-Grenze, die in `requests` vorkommt.
+    ///
+    /// # Beschreibung
+    /// Löst für jede Anfrage die Organisationsrolle ihres bereits
+    /// admittierten Kindes auf ([`Self::child_record`] → `role`-Name →
+    /// [`Self::max_concurrent_instances_for_role`], dieselbe Quelle, die
+    /// [`Self::run_child_with_approvals`] für den Modell-Lookup liest) und
+    /// bildet das **Minimum** über alle Anfragen. Mischt eine Welle mehrere
+    /// verschiedene Rollen (nicht nur eine einzige `uia-worker`-Rolle), gibt
+    /// es dafür keine Pro-Rolle-Slotzahl — [`Self::run_children`]s Scheduler
+    /// kennt nur einen einzigen globalen `slots`-Wert für die ganze Welle
+    /// (siehe die `VecDeque<(usize, FanoutRequest)>`/`running: Vec<...>`-Struktur
+    /// dort). Deshalb gilt hier bewusst die strengste Deckelung über alle in
+    /// der Welle vorkommenden Rollen: eine Welle, die auch nur eine
+    /// `UiaWorker`-Anfrage enthält, wird als Ganzes auf `1` gedeckelt, selbst
+    /// wenn andere Rollen derselben Welle für sich unbeschränkt wären. Das
+    /// ist strenger als für die Nicht-`UiaWorker`-Geschwister nötig, aber
+    /// sicherer als eine Welle mit zwei UiaWorker-Instanzen gleichzeitig
+    /// laufen zu lassen.
+    ///
+    /// Ein Kind, dessen [`Self::child_record`] nicht (mehr) auflösbar ist
+    /// (z. B. bereits entfernt), trägt fail-**offen** keine zusätzliche
+    /// Deckelung bei — seine eigentliche Ausführung scheitert ohnehin kurz
+    /// danach in [`Self::run_child_with_approvals`] mit einem eigenen,
+    /// aussagekräftigen Fehler.
+    ///
+    /// # Arguments
+    /// - `requests` (`&[FanoutRequest]`): die Welle, vor dem Verbrauch in die
+    ///   Scheduler-Queue.
+    /// - `requested_slots` (`usize`): der bereits auf `max(1)` angehobene
+    ///   Aufrufer-Wunsch.
+    ///
+    /// # Returns
+    /// `requested_slots`, oder eine kleinere Zahl, wenn mindestens eine
+    /// Anfrage einer Rolle mit einer strengeren
+    /// [`Self::max_concurrent_instances_for_role`]-Grenze zugeordnet ist.
+    fn effective_fanout_slots(&self, requests: &[FanoutRequest], requested_slots: usize) -> usize {
+        requests.iter().fold(requested_slots, |slots, request| {
+            let role_cap = self
+                .child_record(&request.child)
+                .map_or(usize::MAX, |record| {
+                    self.max_concurrent_instances_for_role(&record.role)
+                });
+            slots.min(role_cap)
+        })
+    }
+
     /// Führt mehrere bereits admittierte Kinder nebenläufig aus.
     ///
     /// # Beschreibung
@@ -2689,7 +2908,16 @@ impl ManagedAgentSpawner {
     /// - `requests` (`Vec<FanoutRequest>`): die Welle; jedes Kind muss bereits
     ///   admittiert sein.
     /// - `store` (`&dyn StateStore`): gemeinsame Transkript-Persistenz.
-    /// - `max_parallel` (`usize`): Deckel gleichzeitig laufender Kinder.
+    /// - `max_parallel` (`usize`): vom Aufrufer gewünschter Deckel gleichzeitig
+    ///   laufender Kinder. **Kann nicht** eine `uia-worker`-Rollenfamilie
+    ///   (Organisationsrolle
+    ///   [`harw_agent_dsl::roles::AgentRoleId::UiaWorker`]) über eine
+    ///   Instanz hinaus parallelisieren — siehe
+    ///   [`Self::effective_fanout_slots`]: sobald mindestens eine Anfrage
+    ///   dieser Welle einer solchen Rolle zugeordnet ist, wird die
+    ///   **gesamte** Welle auf `1` gedeckelt, auch wenn andere Rollen
+    ///   derselben Welle für sich unbeschränkt wären (`slots` ist heute ein
+    ///   einziger globaler Wert für die ganze Welle, kein Wert je Rolle).
     /// - `join` (`JoinSemantics`): Klammerung der Welle.
     ///
     /// # Returns
@@ -2716,7 +2944,15 @@ impl ManagedAgentSpawner {
         if total == 0 {
             return Vec::new();
         }
-        let slots = if max_parallel == 0 { 1 } else { max_parallel };
+        let requested_slots = if max_parallel == 0 { 1 } else { max_parallel };
+        let slots = self.effective_fanout_slots(&requests, requested_slots);
+        if slots < requested_slots {
+            tracing::info!(
+                requested_max_parallel = requested_slots,
+                effective_max_parallel = slots,
+                "child_fanout.uia_worker_capped",
+            );
+        }
         let mut results: Vec<Option<Result<ChildRunResult, AgentSpawnError>>> =
             (0..total).map(|_| None).collect();
         let mut queue: VecDeque<(usize, FanoutRequest)> =
@@ -3756,18 +3992,29 @@ impl ManagedAgentSpawner {
                 ))
             })?;
         }
-        // Monotone Vererbung + Rollengewicht (Addendum F+G): das Kind startet
-        // mit dem Effort-Level des Parents, geklammert auf das Rollengewicht
-        // seiner eigenen organisatorischen Rolle — nie höher als eines von
-        // beiden.
+        // Monotone Vererbung + Standard-Rangfolge (Welle 8: Provider > Modell
+        // > Agent > Rolle; Addendum F+G): das Kind startet mit dem
+        // Effort-Level des Parents, geklammert auf den nach dieser Rangfolge
+        // aufgelösten Standard — nie höher als eines von beiden. Die Rollen-
+        // Ebene bleibt der Boden der Rangfolge, wie vor Welle 8.
         {
             let role_weight = self.role_effort_weights.for_child(
                 definition.organizational_role,
                 !child_allowed_child_orchestrators.is_empty(),
                 task_complexity,
             );
+            let (provider_default, model_default) = definition
+                .registry_factory
+                .reasoning_effort_defaults_for_role_task(role_name, task_complexity);
+            let agent_default = executable_ir.and_then(harw_agent_dsl::executable::ExecutableAgentIr::reasoning_effort);
+            let resolved_default = resolve_child_default_reasoning_effort(
+                provider_default,
+                model_default,
+                agent_default,
+                role_weight,
+            );
             let inherited = parent_reasoning_effort.unwrap_or(DEFAULT_CHILD_REASONING_EFFORT);
-            let effective = inherited.min(role_weight);
+            let effective = inherited.min(resolved_default);
             if let Ok(child_session) = manager.get_mut(&child) {
                 child_session.set_reasoning_effort(Some(effective));
             }
@@ -4130,6 +4377,36 @@ mod tests {
         }
     }
 
+    /// Registry-Factory, die einen festen Provider-/Modell-Reasoning-Effort-
+    /// Standard liefert — für Tests der Welle-8-Rangfolge (Provider > Modell
+    /// > Agent > Rolle) beim Kind-Spawn.
+    struct FixedReasoningEffortDefaultsRegistry {
+        provider_default: Option<ReasoningEffort>,
+        model_default: Option<ReasoningEffort>,
+    }
+
+    impl ChildRegistryFactory for FixedReasoningEffortDefaultsRegistry {
+        fn build_registry(
+            &self,
+            _role: &str,
+            _input: &SpawnInput,
+            _suggestions: Option<&AgentSuggestions>,
+        ) -> Result<ExtensionRegistry, AgentSpawnError> {
+            Ok(ExtensionRegistryBuilder::default().build())
+        }
+
+        fn model_for(&self, _role: &str) -> Result<Arc<dyn ModelProvider>, AgentSpawnError> {
+            Ok(Arc::new(EchoModelProvider::new("fixed defaults child")))
+        }
+
+        fn reasoning_effort_defaults_for_role(
+            &self,
+            _role: &str,
+        ) -> (Option<ReasoningEffort>, Option<ReasoningEffort>) {
+            (self.provider_default, self.model_default)
+        }
+    }
+
     /// Lowert eine Test-Agent-IR aus einem TOML-Fragment (Sektionen `[spawn]`,
     /// `[spawn.budget]`, `[lifecycle]`, `[tools]`).
     fn test_agent_ir(sections: &str) -> ExecutableAgentIr {
@@ -4151,6 +4428,7 @@ specialization = "child-controller-test"
             specialization: raw.specialization,
             name: raw.name,
             description: raw.description,
+            reasoning_effort: raw.reasoning_effort,
             authority: AuthorityCeiling::default(),
             trace: ResolutionTrace { steps: Vec::new() },
             config: raw.tables,
@@ -4608,6 +4886,94 @@ specialization = "child-controller-test"
         (spawner, ids)
     }
 
+    /// Wie [`runnable_children`], aber mit **einer Rolle je Kind** statt
+    /// einer einzigen gemeinsamen `"worker"`-Rolle für alle — Testinfrastruktur
+    /// für die UiaWorker-Fan-out-Deckelung
+    /// ([`ManagedAgentSpawner::max_concurrent_instances_for_role`],
+    /// [`ManagedAgentSpawner::effective_fanout_slots`]), die eine **gemischte**
+    /// Welle beweisen muss. `roles` trägt für jedes zu erzeugende Kind ein
+    /// `(Rollenname, Organisationsrolle)`-Paar; die Reihenfolge der
+    /// zurückgegebenen `SessionId`s entspricht der Reihenfolge von `roles`.
+    fn runnable_children_with_roles(
+        factory: Arc<dyn ChildRegistryFactory>,
+        allow_pause: bool,
+        roles: &[(&str, harw_agent_dsl::roles::AgentRoleId)],
+        mut registry: impl FnMut() -> ExtensionRegistry,
+    ) -> (ManagedAgentSpawner, Vec<SessionId>) {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events.clone())));
+        let mut spawner =
+            ManagedAgentSpawner::new(Arc::clone(&manager), ChildLimits::conservative());
+        let mut registered_role_names: Vec<&str> = Vec::new();
+        for (role_name, organizational_role) in roles {
+            if registered_role_names.contains(role_name) {
+                continue;
+            }
+            registered_role_names.push(role_name);
+            spawner = spawner.with_role(
+                *role_name,
+                AgentRole::Agent {
+                    name: (*role_name).to_owned(),
+                },
+                *organizational_role,
+                Arc::clone(&factory),
+            );
+        }
+        let parent = SessionId::new();
+        let admitted_at = Timestamp::now();
+        let lease_expires_at = admitted_at
+            .checked_add(SignedDuration::from_secs(300))
+            .expect("test lease does not overflow");
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let mut ids = Vec::with_capacity(roles.len());
+        for (role_name, organizational_role) in roles {
+            let session = AgentSession::new(
+                AgentRole::Agent {
+                    name: (*role_name).to_owned(),
+                },
+                Some(parent.clone()),
+                registry(),
+                events.clone(),
+            )
+            .with_spawn_context(external_root_context(sandbox.clone(), *organizational_role));
+            let child = session.id().clone();
+            manager
+                .lock()
+                .expect("test session manager lock")
+                .restore(session)
+                .expect("test child session restores");
+            spawner
+                .active
+                .lock()
+                .expect("test child registry lock")
+                .insert(
+                    child.as_str().to_owned(),
+                    ChildRecord {
+                        child: child.clone(),
+                        parent: parent.clone(),
+                        handoff_call_id: ToolCallId::new(),
+                        role: (*role_name).to_owned(),
+                        depth: 1,
+                        admitted_at,
+                        lease_expires_at,
+                        budget: AgentBudget::default(),
+                        allow_pause,
+                        depth_ceiling: ChildLimits::conservative().max_depth,
+                        trace: None,
+                        status: ChildStatus::Admitted,
+                        task_complexity: None,
+                    },
+                );
+            spawner
+                .cancellations
+                .lock()
+                .expect("test cancellation registry lock")
+                .insert(child.as_str().to_owned(), CancelToken::new());
+            ids.push(child);
+        }
+        (spawner, ids)
+    }
+
     fn empty_registry() -> ExtensionRegistry {
         ExtensionRegistryBuilder::default().build()
     }
@@ -4746,6 +5112,60 @@ specialization = "child-controller-test"
             .collect()
     }
 
+    #[test]
+    fn max_concurrent_instances_for_role_caps_uia_worker_family_to_one() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative()).with_role(
+            "uia-worker",
+            AgentRole::Agent {
+                name: "uia-worker".to_owned(),
+            },
+            harw_agent_dsl::roles::AgentRoleId::UiaWorker,
+            Arc::new(EmptyChildRegistry),
+        );
+
+        assert_eq!(spawner.max_concurrent_instances_for_role("uia-worker"), 1);
+    }
+
+    #[test]
+    fn max_concurrent_instances_for_role_leaves_other_roles_unbounded() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative())
+            .with_role(
+                "worker",
+                AgentRole::Agent {
+                    name: "worker".to_owned(),
+                },
+                harw_agent_dsl::roles::AgentRoleId::Worker,
+                Arc::new(EmptyChildRegistry),
+            )
+            .with_role(
+                "agent-steward",
+                AgentRole::Agent {
+                    name: "agent-steward".to_owned(),
+                },
+                harw_agent_dsl::roles::AgentRoleId::AgentSteward,
+                Arc::new(EmptyChildRegistry),
+            );
+
+        assert_eq!(
+            spawner.max_concurrent_instances_for_role("worker"),
+            usize::MAX
+        );
+        assert_eq!(
+            spawner.max_concurrent_instances_for_role("agent-steward"),
+            usize::MAX
+        );
+        assert_eq!(
+            spawner.max_concurrent_instances_for_role("unregistered-role"),
+            usize::MAX,
+            "an unregistered role must fail open here — admission/execution \
+             rejects it separately with its own error"
+        );
+    }
+
     #[tokio::test]
     async fn run_children_returns_results_in_request_order() {
         let (spawner, children) = runnable_children(
@@ -4807,6 +5227,91 @@ specialization = "child-controller-test"
             peak.load(Ordering::SeqCst),
             1,
             "max_parallel = 1 must never have two child turns in flight"
+        );
+    }
+
+    /// Beweist die UiaWorker-Fan-out-Deckelung (Nutzerauftrag: `analyze(max_parallel:
+    /// 4)` darf eine `uia-worker`-Rollenfamilie nicht umgehen können). Die Welle
+    /// mischt eine einzige `uia-worker`-Anfrage unter zwei `worker`-Anfragen —
+    /// [`ManagedAgentSpawner::effective_fanout_slots`] muss die **gesamte** Welle
+    /// trotzdem auf `1` deckeln, obwohl `max_parallel = 4` angefordert wird und
+    /// zwei der drei Anfragen für sich unbeschränkt wären.
+    #[tokio::test]
+    async fn run_children_caps_uia_worker_wave_to_one_regardless_of_max_parallel() {
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (spawner, children) = runnable_children_with_roles(
+            Arc::new(ConcurrencyProbeRegistry {
+                inflight: Arc::clone(&inflight),
+                peak: Arc::clone(&peak),
+            }),
+            true,
+            &[
+                ("worker", harw_agent_dsl::roles::AgentRoleId::Worker),
+                ("uia-worker", harw_agent_dsl::roles::AgentRoleId::UiaWorker),
+                ("worker", harw_agent_dsl::roles::AgentRoleId::Worker),
+            ],
+            empty_registry,
+        );
+        let store = InMemoryStateStore::new();
+
+        let results = spawner
+            .run_children(
+                fanout_requests(&children),
+                &store,
+                4,
+                JoinSemantics::AllTerminal,
+            )
+            .await;
+
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(Result::is_ok));
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "a wave containing a uia-worker request must serialise, \
+             even though max_parallel = 4 and the sibling roles are unbounded"
+        );
+    }
+
+    /// Regressionsschutz für die UiaWorker-Deckelung: eine Welle **ohne** jede
+    /// `uia-worker`-Anfrage darf weiterhin bis `max_parallel` überlappen —
+    /// [`ManagedAgentSpawner::effective_fanout_slots`] darf Nicht-UiaWorker-Wellen
+    /// nicht fälschlich auf `1` klemmen.
+    #[tokio::test]
+    async fn run_children_without_uia_worker_role_stays_unbounded_at_max_parallel() {
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (spawner, children) = runnable_children_with_roles(
+            Arc::new(ConcurrencyProbeRegistry {
+                inflight: Arc::clone(&inflight),
+                peak: Arc::clone(&peak),
+            }),
+            true,
+            &[
+                ("worker", harw_agent_dsl::roles::AgentRoleId::Worker),
+                ("agent-steward", harw_agent_dsl::roles::AgentRoleId::AgentSteward),
+                ("worker", harw_agent_dsl::roles::AgentRoleId::Worker),
+                ("agent-steward", harw_agent_dsl::roles::AgentRoleId::AgentSteward),
+            ],
+            empty_registry,
+        );
+        let store = InMemoryStateStore::new();
+
+        let results = spawner
+            .run_children(
+                fanout_requests(&children),
+                &store,
+                4,
+                JoinSemantics::Collect,
+            )
+            .await;
+
+        assert_eq!(results.len(), 4);
+        assert!(
+            peak.load(Ordering::SeqCst) >= 2,
+            "a wave without any uia-worker request must not be serialised by the \
+             uia-worker cap"
         );
     }
 
@@ -6366,6 +6871,109 @@ admitted = ["fs.read", "shell.exec"]
                 .expect("known child clamps cleanly"),
             Some(DEFAULT_CHILD_REASONING_EFFORT),
             "ohne Deckel und ohne Basis gilt der Default, nicht der Provider-Default"
+        );
+    }
+
+    #[test]
+    fn admit_uses_provider_default_reasoning_effort_over_role_weight() {
+        // Welle 8: Provider > Modell > Agent > Rolle. Der Rollen-Standard für
+        // `Worker` ohne bekannte Komplexität ist `Medium`
+        // ([`RoleEffortWeights::default`]); ein Provider-Default `Xhigh`
+        // (höher, aber die geerbte Eltern-Basis unten deckelt trotzdem nicht,
+        // da sie selbst `Xhigh` führt) muss ihn bei der Admission
+        // überschreiben.
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let parent = SessionId::new();
+        let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative())
+            .with_role(
+                "worker",
+                AgentRole::Agent {
+                    name: "worker".to_owned(),
+                },
+                harw_agent_dsl::roles::AgentRoleId::Worker,
+                Arc::new(FixedReasoningEffortDefaultsRegistry {
+                    provider_default: Some(ReasoningEffort::Xhigh),
+                    model_default: None,
+                }),
+            )
+            .with_external_root_parent(
+                parent.clone(),
+                external_root_context(
+                    sandbox.clone(),
+                    harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+                ),
+                Some(ReasoningEffort::Xhigh),
+                SessionActivation::default(),
+            )
+            .expect("trusted external root registers during construction");
+
+        let child = spawner
+            .admit("worker", spawn_input(parent), sandbox, None)
+            .expect("child is admitted");
+
+        assert_eq!(
+            spawner
+                .manager
+                .lock()
+                .expect("test session manager lock")
+                .get(&child)
+                .expect("child is manager-owned")
+                .reasoning_effort(),
+            Some(ReasoningEffort::Xhigh),
+            "provider default (Xhigh) must win over the Worker role weight (Medium)"
+        );
+    }
+
+    #[test]
+    fn admit_falls_back_to_role_weight_when_provider_and_model_are_silent() {
+        let (events, _receiver) = mpsc::unbounded_channel();
+        let manager = Arc::new(Mutex::new(SessionManager::new(events)));
+        let sandbox = test_sandbox(PermissionSet::from_policy([Permission::ReadWorkspace]));
+        let parent = SessionId::new();
+        let spawner = ManagedAgentSpawner::new(manager, ChildLimits::conservative())
+            .with_role(
+                "worker",
+                AgentRole::Agent {
+                    name: "worker".to_owned(),
+                },
+                harw_agent_dsl::roles::AgentRoleId::Worker,
+                Arc::new(FixedReasoningEffortDefaultsRegistry {
+                    provider_default: None,
+                    model_default: None,
+                }),
+            )
+            .with_external_root_parent(
+                parent.clone(),
+                external_root_context(
+                    sandbox.clone(),
+                    harw_agent_dsl::roles::AgentRoleId::RootOrchestrator,
+                ),
+                Some(ReasoningEffort::Xhigh),
+                SessionActivation::default(),
+            )
+            .expect("trusted external root registers during construction");
+
+        let child = spawner
+            .admit("worker", spawn_input(parent), sandbox, None)
+            .expect("child is admitted");
+
+        let expected_role_weight = RoleEffortWeights::default().for_child(
+            harw_agent_dsl::roles::AgentRoleId::Worker,
+            false,
+            None,
+        );
+        assert_eq!(
+            spawner
+                .manager
+                .lock()
+                .expect("test session manager lock")
+                .get(&child)
+                .expect("child is manager-owned")
+                .reasoning_effort(),
+            Some(expected_role_weight),
+            "without a provider/model default, the role weight remains the floor"
         );
     }
 

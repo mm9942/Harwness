@@ -68,6 +68,13 @@ pub struct ResolvedAgentDefinition {
     /// Optionale Beschreibung.
     pub description: Option<String>,
 
+    /// Standard-Reasoning-Effort nach Anwendung der Vererbungsregel über
+    /// `extends`/Mixins/Schichten (spezifischere Definition überschreibt,
+    /// analog zu `BudgetSpec::effort_cap`; siehe
+    /// [`RawAgentDefinition::reasoning_effort`](crate::raw::RawAgentDefinition::reasoning_effort)).
+    /// `None` = keine Ebene dieser Auflösung hat eine Aussage getroffen.
+    pub reasoning_effort: Option<String>,
+
     /// Authority-Ceiling nach Anwendung aller Patches und Intersects (§7, §12).
     pub authority: AuthorityCeiling,
 

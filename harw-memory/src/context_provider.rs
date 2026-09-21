@@ -60,9 +60,10 @@
 //!    Dateizugriff auf die Store-Wurzel besitzt.
 //! 2. Immer: alle [`crate::facts::FactType::Preference`]-Fakten, Projekt vor
 //!    Global.
-//! 2b. Immer (Addendum B): alle [`crate::facts::FactType::Pitfall`]-Fakten,
-//!    Projekt vor Global, höchstens [`PITFALL_MAX_FACTS`] insgesamt, als ein
-//!    Fragment unter der Überschrift „Bekannte Fallstricke".
+//!    2b, ebenfalls immer (Addendum B): alle
+//!    [`crate::facts::FactType::Pitfall`]-Fakten, Projekt vor Global,
+//!    höchstens [`PITFALL_MAX_FACTS`] insgesamt, als ein Fragment unter der
+//!    Überschrift „Bekannte Fallstricke".
 //! 3. Nach Bedarf: Stichworttreffer aus [`crate::facts::FactStore::search`]
 //!    gegen den jüngsten `user`-Eintrag im STM (`TurnInputContext` selbst
 //!    trägt keinen Freitext-Nutzertext — nur `session_id`/`turn_id`/
