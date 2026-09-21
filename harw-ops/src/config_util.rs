@@ -11,6 +11,12 @@
 //! `/model switch` den zuletzt gewählten Provider/Modell als Standard für
 //! künftige Sitzungen in der Profil-`config.toml` verankern — bestes Bemühen,
 //! niemals ein Fehler für den Aufrufer (der In-Session-Wechsel steht bereits).
+//! [`persist_uia_selection`] ist der strukturelle Zwilling für `uia_provider`/
+//! `uia_model`; [`persist_uia_worker_model`] verankert zusätzlich
+//! `uia_worker_model` — ein einzelner Wert ohne eigenes
+//! `uia_worker_provider`-Pendant (der Worker teilt sich den effektiven
+//! UIA-Provider mit `/uia-model`), der anders als die beiden anderen keinen
+//! Live-`SessionController`-Pfad hat und erst beim nächsten Sitzungsstart wirkt.
 //!
 //! # Exportierte Typen
 //! Keine öffentlichen Typen — alle Items sind `pub(crate)`.
@@ -20,12 +26,14 @@
 //!
 //! # Fehlertypen
 //! - [`harw_operations::OpError::Execution`]: wenn die Config-Discovery fehlschlägt.
-//! - [`persist_default_selection`] liefert nie `Err` — Persistenzfehler werden
+//! - [`persist_default_selection`]/[`persist_uia_selection`]/
+//!   [`persist_uia_worker_model`] liefern nie `Err` — Persistenzfehler werden
 //!   als menschenlesbare Notiz zurückgegeben, nicht propagiert.
 //!
 //! # Spec-Referenz
 //! harwness Plan v2 — Config-Discovery-Konsolidierung; Folgeauftrag
-//! „zuletzt gewählter Provider/Modell bleibt Standard".
+//! „zuletzt gewählter Provider/Modell bleibt Standard"; Welle 2 (2d) —
+//! `uia_worker_model`-Persistenz.
 
 use harw_config::ResolvedConfig;
 use harw_operations::OpError;
@@ -238,6 +246,73 @@ fn try_persist_uia_selection(
     writer.save().map_err(|error| error.to_string())
 }
 
+/// Verankert `uia_worker_model` bestes Bemühen in der Profil-`config.toml`,
+/// unabhängig von `uia_provider`/`uia_model`/`default_provider`/`default_model`.
+///
+/// # Description
+/// Struktureller Zwilling von [`persist_uia_selection`], aber für **einen
+/// einzigen** Wert: es gibt bewusst kein `uia_worker_provider`-Pendant — der
+/// UIA-Worker teilt sich den effektiven UIA-Provider mit `/uia-model`
+/// (`harness.uia_provider`, aufgelöst über
+/// [`crate::model::effective_uia_selection`]), nicht einen eigenen. Im
+/// Gegensatz zu [`persist_default_selection`]/[`persist_uia_selection`], bei
+/// denen `None` „diesen Schlüssel unverändert lassen" bedeutet (weil dort
+/// zwei Werte unabhängig voneinander gesetzt werden können), ist `None` hier
+/// eine explizite Aktion: den Pin entfernen. Ebenfalls **niemals
+/// fehlschlagend** für den Aufrufer — Persistenzfehler werden als
+/// deutschsprachige Notiz zurückgegeben statt propagiert. Anders als
+/// `/uia-model switch` hat der UIA-Worker-Modell-Wechsel keinen
+/// Live-`SessionController`-Pfad: `uia_worker_model` wirkt erst beim
+/// nächsten Sitzungsstart, wie andere `internal_models.*`-Punkte.
+///
+/// # Arguments
+/// - `model` (`Option<&str>`): kanonische Modell-ID für den UIA-Worker, die
+///   als `uia_worker_model` geschrieben werden soll, oder `None`, um den Pin
+///   zu entfernen.
+///
+/// # Returns
+/// `None` bei Erfolg; `Some(note)` mit einer für Menschen lesbaren Notiz,
+/// wenn die Persistenz fehlschlug.
+///
+/// # Panics
+/// Nie.
+///
+/// # Concurrency
+/// Rein synchron; kein Datei-Lock, analog zu [`persist_uia_selection`].
+///
+/// # Examples
+/// ```rust,ignore
+/// if let Some(note) = crate::config_util::persist_uia_worker_model(Some("claude-worker-x")) {
+///     text.push('\n');
+///     text.push_str(&note);
+/// }
+/// ```
+pub(crate) fn persist_uia_worker_model(model: Option<&str>) -> Option<String> {
+    match try_persist_uia_worker_model(model) {
+        Ok(()) => None,
+        Err(reason) => Some(format!(
+            "Hinweis: konnte UIA-Worker-Modell nicht dauerhaft speichern ({reason})."
+        )),
+    }
+}
+
+/// Interner, fehlschlagender Kern von [`persist_uia_worker_model`].
+fn try_persist_uia_worker_model(model: Option<&str>) -> Result<(), String> {
+    let home = harw_home::home_dir().map_err(|error| error.to_string())?;
+    let profile = harw_home::active_profile_name(&home);
+    let profile_dir = harw_home::profile_dir(&home, &profile).map_err(|error| error.to_string())?;
+    let config_path = profile_dir.join("config.toml");
+
+    let mut writer = harw_config::ConfigWriter::open(&config_path).map_err(|error| error.to_string())?;
+    match model {
+        Some(model) => writer.set_value("uia_worker_model", toml_edit::value(model)),
+        None => {
+            writer.remove_value("uia_worker_model");
+        }
+    }
+    writer.save().map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{OpError, execution_error};
@@ -288,5 +363,38 @@ mod tests {
         let content = std::fs::read_to_string(&config_path).expect("read back");
         assert!(content.contains("uia_provider"));
         assert!(content.contains("uia_model"));
+    }
+
+    // ── uia_worker_model-Persistenz-Rundlauf, ohne echte HARW_HOME-Env-Mutation ──
+    // Derselbe Grund wie beim UIA-Auswahl-Rundlauf oben: `try_persist_uia_worker_model`
+    // löst `HARW_HOME` selbst auf, deshalb testet dieser Rundlauf denselben
+    // `ConfigWriter`-Schreibpfad direkt gegen ein temporäres Verzeichnis — inklusive
+    // des `None`-Zweigs, der (anders als bei `persist_default_selection`/
+    // `persist_uia_selection`) eine explizite Entfernung ist, kein "unverändert lassen".
+    #[test]
+    fn test_uia_worker_model_persistence_round_trip_writes_and_removes_the_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+
+        let mut writer = harw_config::ConfigWriter::open(&config_path).expect("open");
+        writer.set_value("uia_worker_model", toml_edit::value("claude-worker-x"));
+        writer.save().expect("save");
+
+        let reopened = harw_config::ConfigWriter::open(&config_path).expect("reopen");
+        assert_eq!(
+            reopened.get_value("uia_worker_model"),
+            Some("claude-worker-x".to_owned())
+        );
+        let content = std::fs::read_to_string(&config_path).expect("read back");
+        assert!(content.contains("uia_worker_model"));
+
+        // `None` removes the key (an explicit action, unlike the "leave
+        // unchanged" semantics of `persist_default_selection`/`persist_uia_selection`).
+        let mut writer = harw_config::ConfigWriter::open(&config_path).expect("reopen for removal");
+        assert!(writer.remove_value("uia_worker_model"));
+        writer.save().expect("save after removal");
+
+        let reopened = harw_config::ConfigWriter::open(&config_path).expect("reopen after removal");
+        assert!(reopened.get_value("uia_worker_model").is_none());
     }
 }

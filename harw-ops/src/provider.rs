@@ -16,24 +16,32 @@
 //!   Also reports credential status (variant type, not value) for the active provider.
 //! - `list`: enumerates every provider in the live resolved configuration and marks each as `[active]`,
 //!   `[auth-ok]`, or `[auth-missing]`.
-//! - `switch <provider-id>`: validates configured existence, enabled/auth state,
-//!   and model compatibility before atomically updating the controller.
 //! - `test`: shows the auth-ref type for the config-default provider (no secret value).
+//!
+//! `switch` is **no longer** a `/provider` sub-command (Welle 2, 2d). An atomic
+//! provider(+model) switch is exclusively driven by `/model switch <id>` (and,
+//! on the UIA axis, `/uia-model switch <id>`), which resolve the target
+//! model's configured provider and delegate to [`handle_switch_core`]
+//! (respectively [`handle_uia_switch_core`]) here — both are `pub(crate)` for
+//! exactly this. `/provider switch ...` now falls into the unknown-sub-command
+//! catchall, whose message points the operator to `/model`.
 //!
 //! # Exported Types
 //! - [`ProviderArgs`] — argument struct for the `/provider` command.
 //!
 //! # Error Types
 //! - [`harw_operations::OpError::Execution`]: controller not available in context.
-//! - [`harw_operations::OpError::InvalidArguments`]: unknown subcommand, `switch` without
-//!   ID, unknown provider ID, missing credentials, or incompatible active model.
+//! - [`harw_operations::OpError::InvalidArguments`]: unknown subcommand, unknown
+//!   provider ID, missing credentials, or incompatible active model.
 //!
 //! # Concurrency
-//! The function is `async` but performs only synchronous reads except for the `switch`
-//! mutation path. Thread-safe — the controller uses interior mutability.
+//! The function is `async` but performs only synchronous reads except for the
+//! [`handle_switch_core`]/[`handle_uia_switch_core`] mutation path invoked from
+//! `harw-ops::model`. Thread-safe — the controller uses interior mutability.
 //!
 //! # Spec Reference
-//! harwness Plan v2 — `/provider` meta-definition + Wave 5 runtime-truthful ops.
+//! harwness Plan v2 — `/provider` meta-definition + Wave 5 runtime-truthful ops;
+//! Welle 2 (2d) — `/model switch` becomes the sole atomic provider+model switch.
 
 use harw_macros::operation;
 use harw_operations::{
@@ -49,18 +57,19 @@ use std::sync::Arc;
 ///   - `"show"` (default) — shows the runtime-active provider.
 ///   - `"list"` — enumerates all configured providers (no secret values).
 ///   - `"test"` — shows auth-ref type of the default provider (no secret value).
-///   - `"switch <provider-id>"` — switches the active provider via [`SessionController`].
+///
+///   Any other value (including a bare `"switch ..."`, no longer supported
+///   here — see `/model switch`) is rejected with [`harw_operations::OpError::InvalidArguments`].
 ///
 /// # Note
-/// Empty or absent `cmd` falls back to `"show"`. Multiple tokens (e.g. `["switch",
-/// "anthropic"]`) are joined into a single space-separated string so that
-/// `strip_prefix("switch ")` works correctly.
+/// Empty or absent `cmd` falls back to `"show"`. Multiple tokens are joined
+/// into a single space-separated string.
 ///
 /// # Spec Reference
-/// harwness Plan v2 — `/provider` sub-command table.
+/// harwness Plan v2 — `/provider` sub-command table; Welle 2 (2d) — `switch` retired.
 #[derive(Default, serde::Deserialize)]
 pub struct ProviderArgs {
-    /// Sub-command: `"show"` (default), `"list"`, `"test"`, `"switch <id>"`.
+    /// Sub-command: `"show"` (default), `"list"`, `"test"`.
     #[serde(default)]
     pub cmd: Option<String>,
 }
@@ -112,7 +121,16 @@ fn configured_auth_status_label(provider: &harw_config::ProviderToml) -> &'stati
 /// The context-scoped configuration is authoritative when present, which makes
 /// provider operations composable with callers that already resolved their
 /// configuration. Standalone operation execution retains the discovery fallback.
-fn resolved_config(ctx: &OpContext) -> Result<Arc<harw_config::ResolvedConfig>, OpError> {
+///
+/// `pub(crate)` so [`crate::model::handle_switch_core`],
+/// [`crate::model::handle_uia_model_switch`] and
+/// [`crate::model::handle_uia_worker_model_switch`] resolve the target
+/// model's configured provider through the same context-scoped-first
+/// authority that this function's own `handle_switch_core`/
+/// `handle_uia_switch_core` already use — the runtime (`harw-tui`'s
+/// `command_exec::build_services`) injects `Arc<harw_config::ResolvedConfig>`
+/// into the `ServiceMap` specifically for `/model`- and `/provider`-ops.
+pub(crate) fn resolved_config(ctx: &OpContext) -> Result<Arc<harw_config::ResolvedConfig>, OpError> {
     if let Some(config) = ctx.service::<Arc<harw_config::ResolvedConfig>>() {
         return Ok(Arc::clone(config));
     }
@@ -120,7 +138,7 @@ fn resolved_config(ctx: &OpContext) -> Result<Arc<harw_config::ResolvedConfig>, 
     crate::config_util::load_default_config("Config-Discovery fehlgeschlagen").map(Arc::new)
 }
 
-/// Shows, lists, tests and switches configured providers, using live runtime state.
+/// Shows, lists and tests configured providers, using live runtime state.
 ///
 /// # Description
 /// Reads live session state from [`SharedSessionController`] and dispatches on
@@ -131,13 +149,12 @@ fn resolved_config(ctx: &OpContext) -> Result<Arc<harw_config::ResolvedConfig>, 
 ///   the credential variant type for the active provider (no secret value).
 /// - **`list`**: enumerates every provider in the resolved configuration; marks each as active,
 ///   `auth-ok`, or `auth-missing`.
-/// - **`switch <id>`**: validates provider existence, credentials, and active-model
-///   compatibility before atomically switching via the controller.
 /// - **`test`**: shows the auth-ref type for the config-default provider.
-/// - **anything else**: returns [`OpError::InvalidArguments`].
+/// - **anything else** (including `switch ...`, retired here — see `/model
+///   switch`): returns [`OpError::InvalidArguments`] pointing to `/model`.
 ///
 /// # Arguments
-/// - `ctx` (`&OpContext`): execution context — required for `switch` and `show`
+/// - `ctx` (`&OpContext`): execution context — required for `show` and `list`
 ///   to access the [`SharedSessionController`] from the [`ServiceMap`].
 /// - `args` (`ProviderArgs`): contains the optional sub-command.
 ///
@@ -146,15 +163,16 @@ fn resolved_config(ctx: &OpContext) -> Result<Arc<harw_config::ResolvedConfig>, 
 ///
 /// # Errors
 /// - [`OpError::Execution`]: when the [`SessionController`] is not registered in context.
-/// - [`OpError::InvalidArguments`]: unknown sub-command; `switch` without ID;
-///   unknown provider ID; missing credentials; incompatible active model.
+/// - [`OpError::InvalidArguments`]: unknown sub-command; unknown provider ID;
+///   missing credentials; incompatible active model.
 ///
 /// # Panics
 /// None.
 ///
 /// # Concurrency
-/// Stateless on read paths; the `switch` path calls `controller.set_active_provider`
-/// which uses interior mutability. Thread-safe.
+/// Stateless — read paths only. The atomic mutation path lives in
+/// [`handle_switch_core`], reached exclusively via `/model switch` in
+/// `harw-ops::model`, not through this function's own dispatch.
 ///
 /// # Examples
 /// ```rust,no_run
@@ -162,52 +180,33 @@ fn resolved_config(ctx: &OpContext) -> Result<Arc<harw_config::ResolvedConfig>, 
 /// // /provider            → shows runtime-active provider
 /// // /provider list       → lists all configured providers
 /// // /provider test       → shows auth-ref type of config-default provider
-/// // /provider switch foo → switches active provider to "foo"
+/// // /model switch <id>   → atomically switches provider+model (see harw-ops::model)
 /// ```
 #[operation(
     name = "provider",
-    summary = "Zeigt aktiven Provider; listet/testet/wechselt konfigurierte Provider.",
+    summary = "Zeigt aktiven Provider; listet/testet konfigurierte Provider.",
     domain = "catalog_config",
     permission = "operator",
     aliases = ["p"],
     category = "model",
-    command(path = "/provider", visibility = "tui_only"),
+    command(path = "/provider", visibility = "tui_only", busy = "immediate"),
 )]
 async fn provider(ctx: &OpContext, args: ProviderArgs) -> Result<OpOutput, OpError> {
     let sub = args.cmd.as_deref().unwrap_or("show");
 
-    // ── `switch <id> [<model-id>]` — atomic validation + mutation via
-    // SessionController. An optional second token pins the model in the
-    // same call, so a provider+model pair never passes through a moment of
-    // provider/model incompatibility.
-    if let Some(target) = sub.strip_prefix("switch ") {
-        let target = target.trim();
-        if target.is_empty() {
-            return Err(OpError::InvalidArguments(
-                "switch requires a provider ID: /provider switch <id> [<model-id>]".into(),
-            ));
-        }
-        let mut tokens = target.split_whitespace();
-        // `target` is non-empty (checked above), so the first token always exists.
-        let provider_target = tokens.next().unwrap_or_default().to_owned();
-        let model_target = tokens.next().map(str::to_owned);
-        if tokens.next().is_some() {
-            return Err(OpError::InvalidArguments(
-                "switch accepts at most a provider ID and a model ID: \
-                 /provider switch <id> [<model-id>]"
-                    .into(),
-            ));
-        }
-        return handle_switch(ctx, provider_target, model_target);
-    }
-
+    // `switch` is no longer a `/provider` sub-command: an atomic
+    // provider+model switch is now exclusively driven by `/model switch`
+    // (which delegates to `handle_switch_core` below), so that a target
+    // model belonging to a different provider is always accepted, not just
+    // rejected with a hint. `switch ...` therefore falls into the catchall
+    // arm below like any other unknown sub-command.
     match sub {
         "show" => handle_show(ctx),
         "list" => handle_list(ctx),
         "test" => handle_test(ctx),
         other => Err(OpError::InvalidArguments(format!(
             "Unknown /provider sub-command: '{other}'. \
-             Supported: show, list, switch <id> [<model-id>], test."
+             Supported: show, list, test. Use `/model` to change the active provider and model together."
         ))),
     }
 }
@@ -342,8 +341,7 @@ fn handle_list(ctx: &OpContext) -> Result<OpOutput, OpError> {
     Ok(OpOutput::from(lines.join("\n")))
 }
 
-/// Implements `/provider switch <id> [<model-id>]` — atomic, validated
-/// provider (and optional model) switch.
+/// Shared core of the atomic, validated provider (and optional model) switch.
 ///
 /// # Description
 /// Performs every validation step before mutating the controller, so a
@@ -372,40 +370,13 @@ fn handle_list(ctx: &OpContext) -> Result<OpOutput, OpError> {
 ///    start with the same selection. A persistence failure never fails the
 ///    operation — it is appended to the success text as a clear note instead.
 ///
-/// # Arguments
-/// - `ctx` (`&OpContext`): used to obtain the controller.
-/// - `target` (`String`): the provider ID to switch to (already trimmed).
-/// - `model` (`Option<String>`): an optional model ID/alias to switch to in
-///   the same call.
-///
-/// # Returns
-/// [`OpOutput`] confirming the switch, with a trailing persistence note.
-///
-/// # Errors
-/// - [`OpError::Execution`]: controller not in context, or controller mutation failed.
-/// - [`OpError::InvalidArguments`]: unknown provider, missing credentials, unknown
-///   model, or provider/model incompatibility.
-///
-/// # Spec Reference
-/// harwness Plan v2 — Task C: `/provider switch` becomes atomic + compatibility-checked.
-/// Folgeauftrag — `/provider switch <id> <model-id>` und persistenter Default.
-fn handle_switch(
-    ctx: &OpContext,
-    target: String,
-    model: Option<String>,
-) -> Result<OpOutput, OpError> {
-    handle_switch_core(ctx, target, model, crate::config_util::persist_default_selection)
-}
-
-/// Shared core of the atomic, validated provider (and optional model) switch.
-///
-/// # Description
-/// Identical validation/mutation sequence as documented on [`handle_switch`],
-/// factored out so both `/provider switch` and `/uia-provider switch` share
-/// it — the two differ only in which config key the resulting selection is
-/// persisted under. `/provider switch` passes
-/// [`crate::config_util::persist_default_selection`]; `/uia-provider switch`
-/// passes [`crate::config_util::persist_uia_selection`].
+/// `pub(crate)` because this is now the sole atomic provider(+model) switch
+/// path: `/provider switch`/`/uia-provider switch` were retired as
+/// sub-commands (an operator now always goes through `/model switch` or
+/// `/uia-model switch`, which resolve the target model's configured provider
+/// and delegate here so a provider+model pair never passes through a moment
+/// of incompatibility). [`crate::model::handle_switch_core`] calls this
+/// directly with `persist = `[`crate::config_util::persist_default_selection`].
 ///
 /// # Arguments
 /// - `ctx` (`&OpContext`): used to obtain the controller.
@@ -427,8 +398,10 @@ fn handle_switch(
 ///   model, or provider/model incompatibility.
 ///
 /// # Spec Reference
-/// harwness Plan v2 — Task C; `/uia-provider` follow-up (UIA-specific pinned selection).
-fn handle_switch_core(
+/// harwness Plan v2 — Task C; `/uia-provider` follow-up (UIA-specific pinned selection);
+/// Welle 2 (2d) — `/model switch`/`/uia-model switch` become the sole atomic
+/// provider+model switch entry points.
+pub(crate) fn handle_switch_core(
     ctx: &OpContext,
     target: String,
     model: Option<String>,
@@ -547,10 +520,27 @@ fn handle_switch_core(
 ///
 /// Das aktuelle UIA-Modell stammt aus der Live-Auswahl oder aus
 /// `harness.uia_model`; generische `active_*`-Werte werden nie übernommen.
-fn handle_uia_switch_core(
+///
+/// `pub(crate)`, weil dies inzwischen der einzige atomare UIA-Provider(+Modell)-
+/// Wechselpfad ist: `/uia-provider switch` wurde als Unterbefehl entfernt —
+/// [`crate::model::handle_uia_model_switch`] löst stattdessen den konfigurierten
+/// Provider des Ziel-Modells auf und delegiert direkt hierher.
+///
+/// `persist` ist — wie bei [`handle_switch_core`] — ein injizierter Abschluss
+/// statt eines hartcodierten Aufrufs von
+/// [`crate::config_util::persist_uia_selection`]. Der einzige Produktions-
+/// Aufrufer ([`crate::model::handle_uia_model_switch`]) übergibt weiterhin
+/// genau diese Funktion, sodass sich am Laufzeitverhalten nichts ändert;
+/// die Injektion existiert, damit Tests einen No-op-Abschluss einsetzen
+/// können und **niemals** die echte, `HARW_HOME`-auflösende Persistenz
+/// berühren — diese Crate deklariert `#![forbid(unsafe_code)]`, sodass eine
+/// testweise `HARW_HOME`-Env-Isolation (die `unsafe fn
+/// std::env::set_var`/`remove_var` bräuchte) hier nicht zur Verfügung steht.
+pub(crate) fn handle_uia_switch_core(
     ctx: &OpContext,
     target: String,
     model: Option<String>,
+    persist: impl FnOnce(Option<&str>, Option<&str>) -> Option<String>,
 ) -> Result<OpOutput, OpError> {
     let config = resolved_config(ctx)?;
     if config.providers.is_empty() {
@@ -639,10 +629,7 @@ fn handle_uia_switch_core(
             ),
         },
     };
-    match crate::config_util::persist_uia_selection(
-        selection.provider.as_deref(),
-        selection.model.as_deref(),
-    ) {
+    match persist(selection.provider.as_deref(), selection.model.as_deref()) {
         Some(note) => {
             text.push('\n');
             text.push_str(&note);
@@ -724,22 +711,22 @@ fn handle_test(ctx: &OpContext) -> Result<OpOutput, OpError> {
     )))
 }
 
-/// Implements `/uia-provider` — shows, lists, tests and switches the UIA's
+/// Implements `/uia-provider` — shows, lists and tests the UIA's
 /// own pinned provider selection (`harness.uia_provider`), independent of
 /// `default_provider`.
 ///
 /// # Description
-/// Reuses [`ProviderArgs`] and the same `switch <id> [<model-id>]` parsing as
-/// `/provider`, since the sub-command grammar is unchanged:
+/// Reuses [`ProviderArgs`], since the sub-command grammar is otherwise
+/// unchanged:
 ///
 /// - **`show`** (default): reports the effective UIA provider/model from the
 ///   live UIA selection, otherwise `uia_provider`/`uia_model` config.
 /// - **`list`**: lists the provider catalog and marks the effective UIA provider.
-/// - **`switch <id> [<model-id>]`**: delegates to [`handle_switch_core`] with
-///   [`crate::config_util::persist_uia_selection`], so the runtime switch is
-///   identical to `/provider switch` but the persisted default is
-///   `uia_provider`/`uia_model` instead of `default_provider`/`default_model`.
 /// - **`test`**: tests the effective UIA provider's configured auth variant.
+/// - **anything else** (including `switch ...`, retired here — see
+///   `/uia-model switch`, which resolves the target model's configured
+///   provider and delegates to [`handle_uia_switch_core`]): returns
+///   [`OpError::InvalidArguments`] pointing to `/uia-model`.
 ///
 /// # Arguments
 /// - `ctx` (`&OpContext`): execution context.
@@ -750,14 +737,16 @@ fn handle_test(ctx: &OpContext) -> Result<OpOutput, OpError> {
 ///
 /// # Errors
 /// - [`OpError::Execution`]: controller not in context, or config discovery failed.
-/// - [`OpError::InvalidArguments`]: unknown sub-command; `switch` without ID;
-///   unknown provider ID; missing credentials; incompatible active model.
+/// - [`OpError::InvalidArguments`]: unknown sub-command; unknown provider ID;
+///   missing credentials; incompatible active model.
 ///
 /// # Panics
 /// None.
 ///
 /// # Concurrency
-/// Same as `/provider` — stateless reads, interior-mutable switch path.
+/// Stateless — read paths only. The atomic mutation path lives in
+/// [`handle_uia_switch_core`], reached exclusively via `/uia-model switch` in
+/// `harw-ops::model`.
 ///
 /// # Spec Reference
 /// harwness Plan v2 — UIA-specific pinned provider/model selection.
@@ -772,33 +761,17 @@ fn handle_test(ctx: &OpContext) -> Result<OpOutput, OpError> {
 async fn uia_provider(ctx: &OpContext, args: ProviderArgs) -> Result<OpOutput, OpError> {
     let sub = args.cmd.as_deref().unwrap_or("show");
 
-    if let Some(target) = sub.strip_prefix("switch ") {
-        let target = target.trim();
-        if target.is_empty() {
-            return Err(OpError::InvalidArguments(
-                "switch requires a provider ID: /uia-provider switch <id> [<model-id>]".into(),
-            ));
-        }
-        let mut tokens = target.split_whitespace();
-        let provider_target = tokens.next().unwrap_or_default().to_owned();
-        let model_target = tokens.next().map(str::to_owned);
-        if tokens.next().is_some() {
-            return Err(OpError::InvalidArguments(
-                "switch accepts at most a provider ID and a model ID: \
-                 /uia-provider switch <id> [<model-id>]"
-                    .into(),
-            ));
-        }
-        return handle_uia_switch_core(ctx, provider_target, model_target);
-    }
-
+    // `switch` is no longer a `/uia-provider` sub-command — see the
+    // analogous comment on `provider()` above. The atomic UIA provider+model
+    // switch now lives exclusively behind `/uia-model switch`, which
+    // delegates to `handle_uia_switch_core` below.
     match sub {
         "show" => handle_uia_show(ctx),
         "list" => handle_uia_list(ctx),
         "test" => handle_uia_test(ctx),
         other => Err(OpError::InvalidArguments(format!(
             "Unknown /uia-provider sub-command: '{other}'. \
-             Supported: show, list, switch <id> [<model-id>], test."
+             Supported: show, list, test. Use `/uia-model` to change the active provider and model together."
         ))),
     }
 }
@@ -1103,13 +1076,71 @@ mod tests {
                     "Error must contain the unrecognised command: {msg}"
                 );
                 assert!(
-                    msg.contains("show") && msg.contains("list") && msg.contains("switch"),
+                    msg.contains("show") && msg.contains("list") && msg.contains("test"),
                     "Error must list the supported sub-commands: {msg}"
                 );
             }
             other => {
                 panic!("Expected OpError::InvalidArguments for unknown sub-command, got: {other:?}")
             }
+        }
+    }
+
+    // ── Welle 2 (2d), Teil 1: `switch` retired as a `/provider` sub-command ───
+
+    /// `/provider switch ...` must no longer be recognised as its own
+    /// sub-command: it falls into the unknown-sub-command catchall, whose
+    /// message must redirect the operator to `/model` (the sole atomic
+    /// provider+model switch entry point since this node).
+    #[tokio::test]
+    async fn provider_switch_subcommand_no_longer_supported() {
+        let ctrl: SharedSessionController = Arc::new(NullSessionController::new());
+        let (ctx, _tmp) = make_test_ctx(Some(ctrl), None);
+
+        let args = ProviderArgs {
+            cmd: Some("switch anthropic".to_owned()),
+        };
+        let result = super::provider(&ctx, args).await;
+
+        match result {
+            Err(OpError::InvalidArguments(msg)) => {
+                assert!(
+                    msg.contains("switch"),
+                    "message must echo the rejected 'switch' sub-command: {msg}"
+                );
+                assert!(
+                    msg.contains("/model"),
+                    "message must point the operator to /model: {msg}"
+                );
+            }
+            other => panic!("Expected OpError::InvalidArguments, got: {other:?}"),
+        }
+    }
+
+    /// Same as [`provider_switch_subcommand_no_longer_supported`] but for
+    /// `/uia-provider`, whose message must point to `/uia-model` instead.
+    #[tokio::test]
+    async fn uia_provider_switch_subcommand_no_longer_supported() {
+        let ctrl: SharedSessionController = Arc::new(NullSessionController::new());
+        let (ctx, _tmp) = make_test_ctx(Some(ctrl), None);
+
+        let args = ProviderArgs {
+            cmd: Some("switch anthropic".to_owned()),
+        };
+        let result = super::uia_provider(&ctx, args).await;
+
+        match result {
+            Err(OpError::InvalidArguments(msg)) => {
+                assert!(
+                    msg.contains("switch"),
+                    "message must echo the rejected 'switch' sub-command: {msg}"
+                );
+                assert!(
+                    msg.contains("/uia-model"),
+                    "message must point the operator to /uia-model: {msg}"
+                );
+            }
+            other => panic!("Expected OpError::InvalidArguments, got: {other:?}"),
         }
     }
 }

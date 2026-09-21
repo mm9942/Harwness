@@ -39,8 +39,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use harw_config::ResolvedConfig;
-use harw_core::{EchoModelProvider, ModelError, ModelFuture, ModelProvider, ModelRequest};
+use harw_core::{
+    EchoModelProvider, ModelError, ModelFuture, ModelProvider, ModelRequest, PinnedModelProvider,
+};
 use harw_provider_http::SecretResolver;
+use harw_types::ModelId;
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::spec::RuntimeSpec;
@@ -267,6 +270,246 @@ fn resolve_default_model(config: &ResolvedConfig) -> DefaultModelResolution {
     DefaultModelResolution::NoneUsable
 }
 
+/// Ergebnis der UIA-Provider/-Modell-Auflösung (siehe [`resolve_uia_model`]).
+enum UiaModelResolution {
+    /// `uia_provider`/`uia_model` sind nicht beide nutzbar gesetzt — die
+    /// UIA-Sitzung nutzt das bereits gebaute Vorgabe-Modell des Laufs
+    /// unverändert (kein zweiter HTTP-Client).
+    UsesDefault,
+    /// `uia_provider` bezeichnet einen vorhandenen, aktivierten Provider und
+    /// `uia_model` ist gesetzt — ein eigenständiger HTTP-Client wird dafür
+    /// gebaut.
+    Explicit { provider: String, model: String },
+}
+
+/// Löst das effektive UIA-Provider/-Modell-Paar auf.
+///
+/// # Beschreibung
+/// Spiegelt [`resolve_default_model`], allerdings ohne Fallback-Kette: ist
+/// das konfigurierte `uia_provider`/`uia_model`-Paar nicht nutzbar, liefert
+/// diese Funktion `UsesDefault` — die UIA-Sitzung fällt dann auf das bereits
+/// gebaute Vorgabe-Modell des Laufs zurück (`default_provider`/
+/// `default_model`, ggf. bereits selbst per [`resolve_default_model`]
+/// ausgewichen), statt eine eigene Katalog-Suche zu betreiben.
+///
+/// `UsesDefault` gilt, wenn `uia_provider` fehlt, keinen vorhandenen,
+/// aktivierten Provider bezeichnet, oder wenn `uia_model` fehlt.
+///
+/// # Arguments
+/// - `config` (`&ResolvedConfig`): die bereits validierte Konfiguration
+///   dieses Laufs.
+///
+/// # Returns
+/// [`UiaModelResolution`] — siehe dort für die beiden Fälle.
+fn resolve_uia_model(config: &ResolvedConfig) -> UiaModelResolution {
+    match (
+        config.harness.uia_provider.as_deref(),
+        config.harness.uia_model.as_deref(),
+    ) {
+        (Some(provider_id), Some(model_id)) if provider_is_usable(config, provider_id) => {
+            UiaModelResolution::Explicit {
+                provider: provider_id.to_owned(),
+                model: model_id.to_owned(),
+            }
+        }
+        _ => UiaModelResolution::UsesDefault,
+    }
+}
+
+/// Baut das Modell der interaktiven UIA-Sitzung.
+///
+/// # Description
+/// Entspricht [`build_root_model`], nur für die UIA-Rolle: existiert, weil
+/// `harw-config::HarnessConfig::uia_provider`/`uia_model` das Modell der
+/// UIA-Sitzung unabhängig von `default_provider`/`default_model` pinnen
+/// können (siehe `harw-config/src/harness_config.rs`). Löst `resolver` nicht
+/// selbst auf — siehe [`build_uia_model_with_resolver`] für den Weg mit
+/// injiziertem `secrets:`-Resolver.
+///
+/// # Arguments
+/// - `spec` (`&RuntimeSpec`): siehe [`build_root_model`].
+/// - `config` (`&ResolvedConfig`): siehe [`build_root_model`].
+/// - `source_is_configured` (`bool`): vom Aufrufer **vor** dem Verbrauch des
+///   [`ModelSource`] per `matches!(source, ModelSource::Configured)`
+///   ermittelt (`ModelSource` wird by-value konsumiert). Bei `false`
+///   (Echo/Override) berührt die UIA-Sitzung `harw-provider-http` nie und
+///   erhält unverändert `default_tree_model` zurück.
+/// - `default_tree_model` (`&Arc<dyn ModelProvider>`): das bereits gebaute
+///   Vorgabe-Modell des Laufs ([`build_root_model`]); Rückgabewert, wenn
+///   `source_is_configured` `false` ist oder [`resolve_uia_model`]
+///   `UiaModelResolution::UsesDefault` liefert.
+///
+/// # Returns
+/// `Arc<dyn ModelProvider>` — entweder `Arc::clone(default_tree_model)` oder
+/// ein eigenständig gebauter HTTP-Client für `uia_provider`/`uia_model`.
+///
+/// # Errors
+/// Wie [`build_root_model`]: [`RuntimeError::Provider`], wenn der
+/// konfigurierte UIA-Provider nicht gebaut werden kann.
+pub fn build_uia_model(
+    spec: &RuntimeSpec,
+    config: &ResolvedConfig,
+    source_is_configured: bool,
+    default_tree_model: &Arc<dyn ModelProvider>,
+) -> RuntimeResult<Arc<dyn ModelProvider>> {
+    build_uia_model_with_resolver(spec, config, source_is_configured, default_tree_model, None)
+}
+
+/// Wie [`build_uia_model`], zusätzlich mit injiziertem `secrets:`-Resolver.
+///
+/// # Description
+/// Existiert aus demselben Grund wie
+/// [`build_root_model_with_resolver`] (siehe Modul-Dokumentation, Abschnitt
+/// „Geheimnisse"): dieses Crate kann den versiegelten Speicher nicht selbst
+/// öffnen. Der Aufrufer baut den Resolver wie bisher und reicht ihn hier
+/// herein.
+///
+/// Im `Explicit`-Zweig folgt diese Funktion exakt dem Fallback-Muster aus
+/// [`build_root_model_with_resolver`]: eine Kopie der Konfiguration erhält
+/// `default_provider`/`default_model` auf das UIA-Paar gesetzt und wird
+/// unverändert an [`harw_provider_http::build_provider_with_home`]
+/// weitergereicht — das baut einen zweiten, unabhängigen HTTP-Client, ohne
+/// `harw-provider-http` selbst anzufassen.
+///
+/// # Arguments
+/// Wie [`build_uia_model`], zusätzlich:
+/// - `resolver` (`Option<&dyn SecretResolver>`): siehe
+///   [`build_root_model_with_resolver`].
+///
+/// # Returns
+/// Wie [`build_uia_model`].
+///
+/// # Errors
+/// Wie [`build_uia_model`].
+pub fn build_uia_model_with_resolver(
+    spec: &RuntimeSpec,
+    config: &ResolvedConfig,
+    source_is_configured: bool,
+    default_tree_model: &Arc<dyn ModelProvider>,
+    resolver: Option<&dyn SecretResolver>,
+) -> RuntimeResult<Arc<dyn ModelProvider>> {
+    if !source_is_configured {
+        // Echo/Override: kein konfigurierter Root-Provider, also auch kein
+        // eigener UIA-Client — `harw-provider-http` bleibt unberührt.
+        return Ok(Arc::clone(default_tree_model));
+    }
+
+    match resolve_uia_model(config) {
+        UiaModelResolution::UsesDefault => Ok(Arc::clone(default_tree_model)),
+        UiaModelResolution::Explicit { provider, model } => {
+            let mut effective = config.clone();
+            effective.harness.default_provider = Some(provider);
+            effective.harness.default_model = Some(model);
+            let provider = harw_provider_http::build_provider_with_home(
+                &effective,
+                spec.home.as_path(),
+                resolver,
+            )
+            .map_err(|error| RuntimeError::Provider {
+                detail: error.to_string(),
+            })?;
+            Ok(Arc::from(provider))
+        }
+    }
+}
+
+/// Löst die Modell-Kennung der uia-worker-Rollenfamilie auf.
+///
+/// # Beschreibung
+/// `None`, wenn `uia_worker_model` nicht gesetzt ist, nicht im
+/// Modell-Katalog (`config.models`) steht, oder wenn das Katalog-Modell
+/// einen Provider trägt, der nicht mit dem effektiven UIA-Provider
+/// übereinstimmt. Der effektive UIA-Provider ist dieselbe Or-Kette wie an
+/// anderer Stelle im Harness (`harw-cli/src/models.rs`:
+/// `harness.uia_provider.as_deref().or(default_provider)`):
+/// `uia_provider`, falls gesetzt, sonst `default_provider`.
+///
+/// Diese Kopplung ist bewusst streng — `uia_worker_model` pinnt **nur** die
+/// Modell-Kennung, nie den Provider (siehe [`build_uia_worker_model`]); ein
+/// Katalog-Modell mit abweichendem Provider würde sonst an den falschen
+/// HTTP-Client geschickt und dort am `selected_model()`-Provider-Abgleich
+/// scheitern (`harw-provider-http/src/lib.rs` `selected_model`).
+///
+/// Bei Ablehnung wird eine `tracing::warn!` mit den beteiligten Katalog-IDs
+/// (keine Geheimnisse) protokolliert.
+///
+/// # Arguments
+/// - `config` (`&ResolvedConfig`): die bereits validierte Konfiguration
+///   dieses Laufs.
+///
+/// # Returns
+/// `Some(model_id)`, wenn die Kopplungsregel erfüllt ist, sonst `None`.
+fn resolve_uia_worker_model(config: &ResolvedConfig) -> Option<String> {
+    let worker_model_id = config.harness.uia_worker_model.as_deref()?;
+
+    let Some(catalog_entry) = config.models.get(worker_model_id) else {
+        tracing::warn!(
+            uia_worker_model = worker_model_id,
+            "configured uia_worker_model is not present in the model catalog — falling back to \
+             the uia session model for the uia-worker role family"
+        );
+        return None;
+    };
+
+    let effective_uia_provider = config
+        .harness
+        .uia_provider
+        .as_deref()
+        .or(config.harness.default_provider.as_deref());
+
+    if Some(catalog_entry.provider.as_str()) != effective_uia_provider {
+        tracing::warn!(
+            uia_worker_model = worker_model_id,
+            catalog_provider = catalog_entry.provider.as_str(),
+            effective_uia_provider = effective_uia_provider.unwrap_or("<none>"),
+            "configured uia_worker_model's catalog provider does not match the effective uia \
+             provider — falling back to the uia session model for the uia-worker role family"
+        );
+        return None;
+    }
+
+    Some(worker_model_id.to_owned())
+}
+
+/// Baut das Modell der uia-worker-Rollenfamilie (`uia-worker`,
+/// `uia-explorer`, `uia-writer`, `uia-shell-worker`).
+///
+/// # Description
+/// Kann nicht fehlschlagen — degradiert nur: liefert
+/// [`resolve_uia_worker_model`] eine Modell-Kennung, wird sie über
+/// [`PinnedModelProvider`] **nur** als `model_id` auf `uia_client` gepinnt.
+/// Die `provider_id` wird nie umgebogen — ein Request mit falscher
+/// `provider_id` würde von `selected_model()` im HTTP-Client abgelehnt
+/// (siehe [`resolve_uia_worker_model`]). Liefert [`resolve_uia_worker_model`]
+/// `None`, wird `uia_client` unverändert durchgereicht — die
+/// uia-worker-Rollenfamilie nutzt dann das Modell, das `uia_client` bereits
+/// trägt (`uia_model`).
+///
+/// # Arguments
+/// - `config` (`&ResolvedConfig`): die bereits validierte Konfiguration
+///   dieses Laufs.
+/// - `uia_client` (`&Arc<dyn ModelProvider>`): der bereits gebaute
+///   UIA-Client ([`build_uia_model`]), auf dem `uia_worker_model` ggf.
+///   gepinnt wird.
+///
+/// # Returns
+/// `Arc<dyn ModelProvider>` — entweder ein [`PinnedModelProvider`] um
+/// `uia_client`, oder `Arc::clone(uia_client)` unverändert.
+#[must_use]
+pub fn build_uia_worker_model(
+    config: &ResolvedConfig,
+    uia_client: &Arc<dyn ModelProvider>,
+) -> Arc<dyn ModelProvider> {
+    match resolve_uia_worker_model(config) {
+        Some(model_id) => Arc::new(PinnedModelProvider::new(
+            Arc::clone(uia_client),
+            None,
+            Some(ModelId::from(model_id)),
+        )),
+        None => Arc::clone(uia_client),
+    }
+}
+
 /// Ein Modell-Provider ohne funktionierende Konfiguration.
 ///
 /// # Beschreibung
@@ -304,7 +547,7 @@ mod tests {
     use harw_config::{HarnessConfig, OriginAllowlistToml, ProviderToml};
     use harw_core::{ModelRequest, ModelResponse};
     use harw_extension_api::types::LoadedInstructions;
-    use harw_types::{IngressSurface, PermissionTier, Principal, PrincipalKind};
+    use harw_types::{IngressSurface, PermissionTier, Principal, PrincipalKind, ProviderId};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
@@ -357,6 +600,61 @@ mod tests {
                 originator: None,
             },
         );
+        config
+    }
+
+    /// Fügt einen weiteren netzlosen Loopback-Provider unter `name` ein
+    /// (gleiches Muster wie der `"local"`-Provider in [`loopback_config`]).
+    fn insert_loopback_provider(config: &mut ResolvedConfig, name: &str) {
+        config.providers.insert(
+            name.to_owned(),
+            ProviderToml {
+                name: name.to_owned(),
+                api: "openai-chat".to_owned(),
+                base_url: "http://127.0.0.1:11434/v1".to_owned(),
+                auth: None,
+                auth_header: Some("none".to_owned()),
+                api_key: None,
+                headers: HashMap::new(),
+                models: Vec::new(),
+                enabled: true,
+                origin_allowlist: OriginAllowlistToml::default(),
+                rate_limit: None,
+                max_concurrency: None,
+                originator: None,
+            },
+        );
+    }
+
+    /// Minimale Katalog-Modell-Fixtur für `config.models`.
+    fn model_toml(id: &str, provider: &str) -> harw_config::ModelToml {
+        harw_config::ModelToml {
+            id: id.to_owned(),
+            name: None,
+            provider: provider.to_owned(),
+            aliases: Vec::new(),
+            context_window: None,
+            max_tokens: None,
+            prompt_caching: None,
+            reasoning: false,
+            input_types: Vec::new(),
+            capabilities: harw_config::ModelCapabilitiesToml::default(),
+        }
+    }
+
+    /// Konfiguration mit zwei baubaren, netzlosen Loopback-Providern
+    /// (`"local-a"` als Vorgabe, `"local-b"` als abweichender UIA-Provider).
+    fn two_provider_config() -> ResolvedConfig {
+        let mut config = ResolvedConfig {
+            harness: HarnessConfig {
+                default_provider: Some("local-a".to_owned()),
+                default_model: Some("local-a-model".to_owned()),
+                ..HarnessConfig::default()
+            },
+            ..ResolvedConfig::default()
+        };
+        insert_loopback_provider(&mut config, "local-a");
+        insert_loopback_provider(&mut config, "local-b");
         config
     }
 
@@ -542,5 +840,182 @@ mod tests {
         let over = ModelSource::Override(Arc::new(EchoModelProvider::new("x")));
         assert_eq!(format!("{over:?}"), "Override(<dyn ModelProvider>)");
         assert_eq!(over.label(), "override");
+    }
+
+    // ── resolve_uia_model / build_uia_model ─────────────────────────────
+
+    #[test]
+    fn resolve_uia_model_prefers_the_configured_pair_when_usable() {
+        let mut config = loopback_config();
+        config.harness.uia_provider = Some("local".to_owned());
+        config.harness.uia_model = Some("uia-model".to_owned());
+
+        match resolve_uia_model(&config) {
+            UiaModelResolution::Explicit { provider, model } => {
+                assert_eq!(provider, "local");
+                assert_eq!(model, "uia-model");
+            }
+            UiaModelResolution::UsesDefault => panic!("expected an explicit uia pair"),
+        }
+    }
+
+    #[test]
+    fn resolve_uia_model_falls_back_to_default_when_uia_provider_is_disabled() {
+        let mut config = loopback_config();
+        insert_loopback_provider(&mut config, "uia-only");
+        config
+            .providers
+            .get_mut("uia-only")
+            .expect("provider")
+            .enabled = false;
+        config.harness.uia_provider = Some("uia-only".to_owned());
+        config.harness.uia_model = Some("uia-model".to_owned());
+
+        assert!(matches!(
+            resolve_uia_model(&config),
+            UiaModelResolution::UsesDefault
+        ));
+    }
+
+    #[test]
+    fn resolve_uia_model_falls_back_to_default_when_uia_model_is_unset() {
+        let mut config = loopback_config();
+        config.harness.uia_provider = Some("local".to_owned());
+
+        assert!(matches!(
+            resolve_uia_model(&config),
+            UiaModelResolution::UsesDefault
+        ));
+    }
+
+    #[test]
+    fn build_uia_model_returns_the_default_tree_model_unchanged_for_echo_source() {
+        let spec = spec_for(Path::new("/nonexistent-home"));
+        let config = loopback_config();
+        let default_tree_model: Arc<dyn ModelProvider> =
+            Arc::new(EchoModelProvider::new("echo: hallo"));
+
+        let uia_model = build_uia_model(&spec, &config, false, &default_tree_model)
+            .expect("echo/override path never fails to build");
+
+        assert!(Arc::ptr_eq(&default_tree_model, &uia_model));
+    }
+
+    /// Beweistest: `uia_provider` weicht von `default_provider` ab — der
+    /// gebaute UIA-Client ist ein eigenständiger HTTP-Client, dessen
+    /// `respond()` mit `provider_id = "local-b"` nicht am
+    /// `selected_model()`-Provider-Abgleich scheitert (im Unterschied zum
+    /// Verhalten, wenn man `local-b` fälschlich an den `local-a`-Client
+    /// schicken würde).
+    #[test]
+    fn build_uia_model_builds_a_dedicated_client_when_uia_provider_differs_from_default() {
+        let spec = spec_for(Path::new("/nonexistent-home"));
+        let mut config = two_provider_config();
+        config.harness.uia_provider = Some("local-b".to_owned());
+        config.harness.uia_model = Some("local-b-model".to_owned());
+        config
+            .models
+            .insert("local-b-model".to_owned(), model_toml("local-b-model", "local-b"));
+
+        let default_tree_model = build_root_model(&spec, &config, ModelSource::Configured)
+            .expect("default provider (local-a) must build");
+        let uia_model = build_uia_model(&spec, &config, true, &default_tree_model)
+            .expect("uia provider (local-b) must build as a dedicated client");
+
+        assert!(
+            !Arc::ptr_eq(&default_tree_model, &uia_model),
+            "the uia client must be a second, independent provider instance"
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let request = empty_request().with_provider_id(Some(ProviderId::from("local-b")));
+        let result = runtime.block_on(uia_model.respond(request));
+        if let Err(error) = result {
+            let message = error.to_string();
+            assert!(
+                !message.contains("this HTTP provider is configured for"),
+                "a provider_id matching the dedicated uia client's own provider must not be \
+                 rejected by selected_model(): {message}"
+            );
+        }
+    }
+
+    // ── resolve_uia_worker_model / build_uia_worker_model ───────────────
+
+    #[test]
+    fn resolve_uia_worker_model_uses_none_when_unset() {
+        let config = loopback_config();
+        assert_eq!(resolve_uia_worker_model(&config), None);
+    }
+
+    #[test]
+    fn resolve_uia_worker_model_uses_none_when_model_is_dangling_in_catalog() {
+        let mut config = loopback_config();
+        config.harness.uia_worker_model = Some("nonexistent-model".to_owned());
+
+        assert_eq!(resolve_uia_worker_model(&config), None);
+    }
+
+    #[test]
+    fn resolve_uia_worker_model_rejects_mismatched_provider_and_falls_back_to_none() {
+        let mut config = loopback_config();
+        insert_loopback_provider(&mut config, "other");
+        config.harness.uia_worker_model = Some("other-model".to_owned());
+        config
+            .models
+            .insert("other-model".to_owned(), model_toml("other-model", "other"));
+        // uia_provider unset -> effective uia provider falls back to default_provider ("local"),
+        // but the catalog model belongs to "other" -> must be rejected.
+
+        assert_eq!(resolve_uia_worker_model(&config), None);
+    }
+
+    #[test]
+    fn build_uia_worker_model_pins_only_model_id_never_provider_id() {
+        let mut config = loopback_config();
+        config.harness.uia_worker_model = Some("local-model".to_owned());
+        config
+            .models
+            .insert("local-model".to_owned(), model_toml("local-model", "local"));
+
+        let recorder = harw_core::testing::RecordingModelProvider::new();
+        let uia_client: Arc<dyn ModelProvider> = Arc::new(recorder.clone());
+
+        let worker_model = build_uia_worker_model(&config, &uia_client);
+        assert!(
+            !Arc::ptr_eq(&uia_client, &worker_model),
+            "an accepted choice must wrap uia_client, not pass it through unchanged"
+        );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        let caller_provider_id = ProviderId::from("whatever-the-caller-already-set");
+        let request = empty_request().with_provider_id(Some(caller_provider_id.clone()));
+        runtime
+            .block_on(worker_model.respond(request))
+            .expect("recording provider never fails");
+
+        let recorded = recorder.last().expect("request must have been forwarded");
+        assert_eq!(recorded.model_id, Some(ModelId::from("local-model")));
+        assert_eq!(
+            recorded.provider_id,
+            Some(caller_provider_id),
+            "provider_id must pass through untouched — only model_id may be pinned"
+        );
+    }
+
+    #[test]
+    fn build_uia_worker_model_falls_back_to_uia_client_when_choice_is_rejected() {
+        let mut config = loopback_config();
+        // "dangling-model" is not present in config.models -> rejected.
+        config.harness.uia_worker_model = Some("dangling-model".to_owned());
+
+        let uia_client: Arc<dyn ModelProvider> = Arc::new(EchoModelProvider::new("uia says hi"));
+        let worker_model = build_uia_worker_model(&config, &uia_client);
+
+        assert!(Arc::ptr_eq(&uia_client, &worker_model));
     }
 }

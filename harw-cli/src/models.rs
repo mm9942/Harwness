@@ -388,8 +388,9 @@ fn run_scan(
 /// [`fmt::Display`] liefert den in der CLI-Ausgabe verwendeten Text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProtectionReason {
-    /// Aktiv als `default_model`, `uia_model`, `session.title_model` oder
-    /// eine interne Modellstelle (`internal_models.*`) in Verwendung.
+    /// Aktiv als `default_model`, `uia_model`, `uia_worker_model`,
+    /// `session.title_model` oder eine interne Modellstelle
+    /// (`internal_models.*`) in Verwendung.
     InUse,
     /// Von einem anderen geladenen Provider oder einer Agent-Definition
     /// referenziert, obwohl die Modell-ID formal einem anderen Provider
@@ -414,9 +415,10 @@ impl fmt::Display for ProtectionReason {
 ///
 /// Zwei Quellen werden zusammengeführt:
 /// 1. **In Verwendung**: `default_model` (unter `default_provider`),
-///    `uia_model` (unter `uia_provider`, sonst `default_provider`), das
-///    veraltete `session.title_model` (Fallback auf `default_provider`)
-///    sowie jede gesetzte interne Modellstelle (`internal_models.*`, siehe
+///    `uia_model` sowie `uia_worker_model` (beide unter `uia_provider`,
+///    sonst `default_provider`), das veraltete `session.title_model`
+///    (Fallback auf `default_provider`) sowie jede gesetzte interne
+///    Modellstelle (`internal_models.*`, siehe
 ///    [`harw_config::InternalModelPoint::ALL`]).
 /// 2. **Cross-Referenz**: jede Modell-ID, die ein *anderer* geladener
 ///    Provider in seiner eigenen `models`-Auswahl führt, oder die eine
@@ -448,6 +450,20 @@ fn protected_model_ids(
     let uia_provider = harness.uia_provider.as_deref().or(default_provider);
     if uia_provider == Some(provider_name) {
         if let Some(id) = &harness.uia_model {
+            protected.insert(id.clone(), ProtectionReason::InUse);
+        }
+    }
+
+    // uia_worker_model ist an uia_provider gekoppelt (dieselbe Or-Kette wie
+    // beim uia_model-Block oben, nicht default_provider direkt): geschützt
+    // wird die ID nur, wenn ihr im Katalog geführter Provider (der gerade
+    // gescannte `provider_name`) mit dem effektiven `uia_provider`
+    // übereinstimmt. Zeigt `uia_worker_model` inkonsistent auf ein anderes
+    // Provider-Katalog-Modell, greift dieser Block nicht — das ist reine
+    // Prune-Schutzlogik, die Ablehnung der Inkonsistenz selbst passiert an
+    // anderer Stelle.
+    if uia_provider == Some(provider_name) {
+        if let Some(id) = &harness.uia_worker_model {
             protected.insert(id.clone(), ProtectionReason::InUse);
         }
     }
@@ -1500,6 +1516,7 @@ mod tests {
         config.harness.session.title_model = Some("gpt-5.6-nano".to_owned());
         config.harness.uia_provider = Some("other".to_owned());
         config.harness.uia_model = Some("uia-only-model".to_owned());
+        config.harness.uia_worker_model = Some("uia-worker-only-model".to_owned());
         config.harness.internal_models.set_choice(
             harw_config::InternalModelPoint::Explorer,
             Some(harw_config::InternalModelChoice {
@@ -1520,6 +1537,7 @@ mod tests {
         assert!(acme_protected.contains_key("gpt-5.6-nano"));
         assert!(acme_protected.contains_key("explorer-model"));
         assert!(!acme_protected.contains_key("uia-only-model"));
+        assert!(!acme_protected.contains_key("uia-worker-only-model"));
         assert!(!acme_protected.contains_key("research-model"));
         assert_eq!(
             acme_protected.get("gpt-5.6-terra"),
@@ -1528,8 +1546,51 @@ mod tests {
 
         let other_protected = protected_model_ids(&config, "other");
         assert!(other_protected.contains_key("uia-only-model"));
+        assert!(other_protected.contains_key("uia-worker-only-model"));
         assert!(other_protected.contains_key("research-model"));
         assert!(!other_protected.contains_key("gpt-5.6-terra"));
+        assert_eq!(
+            other_protected.get("uia-worker-only-model"),
+            Some(&ProtectionReason::InUse)
+        );
+    }
+
+    #[test]
+    fn test_protected_model_ids_ignores_uia_worker_model_when_its_provider_does_not_match_uia_provider(
+    ) {
+        // `uia_worker_model` hat kein eigenes Provider-Feld (siehe
+        // `harw-config/src/harness_config.rs`: "Der Provider ist hier
+        // bewusst nicht separat wählbar — er muss zwingend mit dem
+        // effektiven `uia_provider` übereinstimmen"). Im Katalog gehört die
+        // ID hier formal zu Provider `mismatch` (dort in `models` gelistet),
+        // während der effektive `uia_provider` `other` ist — eine
+        // inkonsistente Konfiguration. Die eigentliche
+        // Kopplungsprüfung/Ablehnung dafür passiert an anderer Stelle; diese
+        // Katalog-Schutzlogik darf die ID beim Scan von `mismatch` aber
+        // nicht fälschlich vor Löschung schützen, sonst bleibt ein
+        // verwaistes Modell für immer im Katalog von `mismatch` hängen.
+        let mut config = harw_config::ResolvedConfig::default();
+        config.harness.uia_provider = Some("other".to_owned());
+        config.harness.uia_worker_model = Some("mismatched-worker-model".to_owned());
+        config.providers.insert(
+            "mismatch".to_owned(),
+            test_provider_toml(
+                "https://mismatch.example.com/v1",
+                &["mismatched-worker-model"],
+            ),
+        );
+
+        let mismatch_protected = protected_model_ids(&config, "mismatch");
+        assert!(!mismatch_protected.contains_key("mismatched-worker-model"));
+
+        // Gegenprobe: beim Scan des tatsächlich effektiven `uia_provider`
+        // ("other") greift der Block wie vorgesehen und schützt die ID.
+        let other_protected = protected_model_ids(&config, "other");
+        assert!(other_protected.contains_key("mismatched-worker-model"));
+        assert_eq!(
+            other_protected.get("mismatched-worker-model"),
+            Some(&ProtectionReason::InUse)
+        );
     }
 
     /// Baut eine minimale `ProviderToml` für Tests, die nur die `models`-Auswahl

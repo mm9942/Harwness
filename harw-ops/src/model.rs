@@ -14,8 +14,12 @@
 //!   erreichbar ausschließlich über die vom Menschen bediente TUI.
 //! - Es darf **kein** `ModelTool`-Variant erstellt werden, der diesen Code-Pfad
 //!   über eine automatische Tool-Call-Kette aufruft.
-//! - `switch` ruft [`harw_operations::SessionController::set_active_model`] auf und gibt
-//!   [`harw_operations::OpError::Execution`] zurück, wenn der Controller fehlt oder scheitert.
+//! - `switch` löst den konfigurierten Provider des Ziel-Modells auf und delegiert
+//!   vollständig an [`crate::provider::handle_switch_core`] (Welle 2, 2d) — das
+//!   wechselt Provider+Modell **atomar** in einem Aufruf, auch wenn das
+//!   Ziel-Modell zu einem anderen Provider gehört als der aktuell aktive.
+//!   Gibt [`harw_operations::OpError::Execution`] zurück, wenn der Controller
+//!   fehlt oder die Mutation scheitert.
 //!
 //! # Runtime-Wahrheit vs. Config-Default
 //! `show` und `list` lesen zuerst den Live-Controller-Snapshot.  Nur wenn kein
@@ -31,10 +35,12 @@
 //! # Fehlertypen
 //! - [`harw_operations::OpError::Execution`]: `SessionController` nicht verfügbar.
 //! - [`harw_operations::OpError::InvalidArguments`]: Unbekanntes Sub-Kommando,
-//!   unbekannte Modell-ID, Modell inkompatibel mit aktivem Provider.
+//!   unbekannte Modell-ID, oder der aufgelöste Zielprovider ist unbekannt,
+//!   deaktiviert oder ohne Zugangsdaten (siehe [`crate::provider::handle_switch_core`]).
 //!
 //! # Spec
-//! harwness Plan v2 — `/model`-Operation, Tasks A–E.
+//! harwness Plan v2 — `/model`-Operation, Tasks A–E; Welle 2 (2d) — atomarer
+//! Provider+Modell-Wechsel via Delegation an `harw-ops::provider`.
 //!
 //! # Beispiel
 //! ```no_run
@@ -313,7 +319,7 @@ pub(crate) fn effective_uia_selection(
 /// |---|---|
 /// | `show` (Standard) | Liest Live-Controller-Snapshot; fällt auf Config-Default zurück |
 /// | `list` | Enumeriert den konfigurierten Katalog; markiert aktives Modell und Provider-Kompatibilität |
-/// | `switch <id>` | Validiert ID gegen den konfigurierten Katalog + Provider-Kompatibilität; mutiert Session-Zustand |
+/// | `switch <id>` | Validiert ID gegen den konfigurierten Katalog; delegiert an [`crate::provider::handle_switch_core`] — wechselt Provider+Modell atomar |
 /// | *(sonstiges)* | Gibt [`OpError::InvalidArguments`] zurück |
 ///
 /// # Sicherheitsregel — kein ModelTool
@@ -328,7 +334,8 @@ pub(crate) fn effective_uia_selection(
 ///
 /// # Fehler
 /// - [`OpError::Execution`]: `SessionController` nicht verfügbar.
-/// - [`OpError::InvalidArguments`]: Unbekannte ID, Provider-Mismatch, unbekanntes Sub-Kommando.
+/// - [`OpError::InvalidArguments`]: Unbekannte ID, aufgelöster Zielprovider
+///   unbekannt/deaktiviert/ohne Zugangsdaten, unbekanntes Sub-Kommando.
 ///
 /// # Panics
 /// Nie.
@@ -350,7 +357,7 @@ pub(crate) fn effective_uia_selection(
     domain = "catalog_config",
     permission = "operator",
     category = "model",
-    command(path = "/model", visibility = "tui_only"),
+    command(path = "/model", visibility = "tui_only", busy = "immediate"),
 )]
 async fn model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError> {
     let action = args.action.as_deref().unwrap_or("show");
@@ -400,15 +407,21 @@ async fn model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError> {
 ///
 /// # Beschreibung
 /// Extracted from `/model switch` so both `/model switch` and
-/// `/uia-model switch` share the exact same validation/mutation sequence —
-/// they differ only in which config key the resulting selection persists to.
-/// `/model switch` passes [`crate::config_util::persist_default_selection`];
-/// `/uia-model switch` passes [`crate::config_util::persist_uia_selection`].
+/// `/uia-model switch` share the exact same delegation — they differ only in
+/// which config key the resulting selection persists to. `/model switch`
+/// passes [`crate::config_util::persist_default_selection`]; `/uia-model
+/// switch` passes [`crate::config_util::persist_uia_selection`].
 ///
-/// Validates `target` against the configured model catalog (never the static
-/// bootstrap catalog), checks provider compatibility against the live active
-/// provider (falling back to `default_provider`), mutates the controller only
-/// once both checks pass, then persists via `persist`.
+/// Resolves `target` against the configured model catalog (never the static
+/// bootstrap catalog) to find its canonical ID and configured provider, then
+/// delegates **fully** to [`crate::provider::handle_switch_core`] — passing
+/// the resolved provider and model together — so `/model switch <id>`
+/// atomically switches provider+model in one call, even when the target
+/// model belongs to a different provider than the one currently active. This
+/// node (Welle 2, 2d) replaced the previous behaviour, which validated the
+/// target model's provider against the *currently* active provider here and
+/// rejected the switch on mismatch with a `/provider switch ... first` hint;
+/// `provider::handle_switch_core` now performs that atomic switch itself.
 ///
 /// # Argumente
 /// - `ctx` (`&OpContext`): Ausführungskontext.
@@ -424,127 +437,93 @@ async fn model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError> {
 /// # Fehler
 /// - [`OpError::Execution`]: `SessionController` nicht verfügbar, Katalog leer,
 ///   oder Config-Discovery fehlgeschlagen.
-/// - [`OpError::InvalidArguments`]: unbekannte Modell-ID, Provider-Mismatch.
+/// - [`OpError::InvalidArguments`]: unbekannte Modell-ID, oder der aufgelöste
+///   Zielprovider ist unbekannt/deaktiviert/ohne Zugangsdaten
+///   ([`crate::provider::handle_switch_core`] validiert dies vollständig,
+///   bevor irgendetwas mutiert wird).
 ///
 /// # Spec
-/// harwness Plan v2 — Task C; `/uia-model`-Folgeauftrag (UIA-spezifische gepinnte Auswahl).
+/// harwness Plan v2 — Task C; `/uia-model`-Folgeauftrag (UIA-spezifische gepinnte Auswahl);
+/// Welle 2 (2d) — atomarer Provider+Modell-Wechsel via Delegation.
 fn handle_switch_core(
     ctx: &OpContext,
     target: String,
     persist: impl FnOnce(Option<&str>, Option<&str>) -> Option<String>,
 ) -> Result<OpOutput, OpError> {
-    let config = crate::config_util::load_default_config("Config-Discovery fehlgeschlagen")?;
+    // Context-scoped-first resolution (see `crate::provider::resolved_config`
+    // doc comment) — matches the authority `provider::handle_switch_core`
+    // itself resolves against below, so a config injected into `ctx` for
+    // testing or by the runtime is what both validation steps agree on.
+    let config = crate::provider::resolved_config(ctx)?;
     if config.models.is_empty() {
         return Err(OpError::Execution(
             "configured model catalog is unavailable; refusing to switch models".into(),
         ));
     }
 
-    // Step a: validate against the configured catalog, never the static bootstrap.
+    // Resolve the target model against the configured catalog (id or alias,
+    // never the static bootstrap catalog) to find its configured provider.
     let configured = configured_model(&config, &target)
         .ok_or_else(|| OpError::InvalidArguments(format!("unknown model: {target}")))?;
-    let configured_id = configured.id.clone();
 
-    // Step b: check provider compatibility if an active provider is set.
-    let controller = ctx
-        .service::<harw_operations::SharedSessionController>()
-        .ok_or_else(|| OpError::Execution("SessionController not available".into()))?;
-
-    let snap = controller.snapshot();
-    if let Some(active_p) = snap
-        .active_provider
-        .as_deref()
-        .or(config.harness.default_provider.as_deref())
-    {
-        if configured.provider != active_p {
-            let model_provider = configured.provider.as_str();
-            return Err(OpError::InvalidArguments(format!(
-                "model {target} requires provider {model_provider}, \
-                 but active provider is {active_p}; \
-                 use `/provider switch {model_provider}` first"
-            )));
-        }
-    }
-
-    // Step c: only mutate if compatible.
-    controller
-        .set_active_model(configured_id.clone())
-        .map_err(|e| OpError::Execution(e.to_string()))?;
-
-    // Step d: persist, best-effort. The active provider is read back from the
-    // controller (rather than re-derived) so a still-unknown provider never
-    // gets written as a stale default.
-    let snap_after = controller.snapshot();
-    let mut text = format!("model switched to {configured_id}; next turn will use it");
-    match persist(
-        snap_after.active_provider.as_deref(),
-        Some(configured_id.as_str()),
-    ) {
-        Some(note) => {
-            text.push('\n');
-            text.push_str(&note);
-        }
-        None => text.push_str("\n(als Standard für künftige Sitzungen gespeichert)"),
-    }
-
-    Ok(OpOutput::from(text))
+    // Delegate fully to the provider switch core: validates the resolved
+    // provider (existence, enabled, credentials) and the model together,
+    // mutates the controller only once every check passes, then persists.
+    crate::provider::handle_switch_core(
+        ctx,
+        configured.provider.clone(),
+        Some(configured.id.clone()),
+        persist,
+    )
 }
 
-/// Wechselt ausschließlich das UIA-Modell und validiert gegen den effektiven
-/// UIA-Provider (Live-Auswahl, sonst `harness.uia_provider`).
+/// Wechselt atomar UIA-Provider+Modell: löst den konfigurierten Provider des
+/// Ziel-Modells auf und delegiert vollständig an
+/// [`crate::provider::handle_uia_switch_core`] (inklusive
+/// [`crate::config_util::persist_uia_selection`] als `persist`-Abschluss) —
+/// dieselbe Delegation wie [`handle_switch_core`] auf der generischen Achse.
+///
+/// # Beschreibung
+/// Im Gegensatz zur vorherigen Implementierung validiert diese Funktion den
+/// Zielprovider nicht mehr gegen den aktuell effektiven UIA-Provider und
+/// lehnt bei Mismatch ab (mit einem `/uia-provider switch ... first`-Hinweis)
+/// — stattdessen wechselt `provider::handle_uia_switch_core` Provider und
+/// Modell gemeinsam, atomar, auch wenn das Ziel-Modell zu einem anderen
+/// Provider gehört als der aktuell effektive UIA-Provider.
+///
+/// # Fehler
+/// - [`OpError::Execution`]: Katalog leer oder Config-Discovery fehlgeschlagen.
+/// - [`OpError::InvalidArguments`]: unbekannte Modell-ID, oder der aufgelöste
+///   Zielprovider ist unbekannt/deaktiviert/ohne Zugangsdaten (siehe
+///   [`crate::provider::handle_uia_switch_core`]).
+///
+/// # Spec
+/// harwness Plan v2 — UIA-spezifische gepinnte Provider-/Modell-Auswahl;
+/// Welle 2 (2d) — atomarer UIA-Provider+Modell-Wechsel via Delegation.
 fn handle_uia_model_switch(ctx: &OpContext, target: String) -> Result<OpOutput, OpError> {
-    let config = crate::config_util::load_default_config("Config-Discovery fehlgeschlagen")?;
+    let config = crate::provider::resolved_config(ctx)?;
     if config.models.is_empty() {
         return Err(OpError::Execution(
             "configured model catalog is unavailable; refusing to switch UIA models".into(),
         ));
     }
 
-    let controller = ctx
-        .service::<harw_operations::SharedSessionController>()
-        .ok_or_else(|| OpError::Execution("SessionController not available".into()))?;
-    let selection = effective_uia_selection(Some(controller), &config);
+    // Resolve the target model against the configured catalog (id or alias)
+    // to find its configured provider.
     let configured = configured_model(&config, &target)
         .ok_or_else(|| OpError::InvalidArguments(format!("unknown model: {target}")))?;
 
-    if let Some(uia_provider) = selection.provider() {
-        let model_provider = config
-            .providers
-            .iter()
-            .find(|(key, provider)| {
-                key.as_str() == configured.provider || provider.name == configured.provider
-            })
-            .map(|(_, provider)| provider.name.as_str())
-            .unwrap_or(configured.provider.as_str());
-        if model_provider != uia_provider {
-            return Err(OpError::InvalidArguments(format!(
-                "UIA model {target} requires provider {model_provider}, but effective UIA provider is {uia_provider}; \
-                 use `/uia-provider switch {model_provider}` first"
-            )));
-        }
-    }
-
-    let configured_id = configured.id.clone();
-    controller
-        .set_uia_model(configured_id.clone())
-        .map_err(|e| OpError::Execution(e.to_string()))?;
-
-    let after = controller.uia_selection();
-    let mut text = format!(
-        "UIA model switched to {configured_id}; next UIA turn will use it"
-    );
-    match crate::config_util::persist_uia_selection(
-        after.provider.as_deref().or(selection.provider()),
-        Some(configured_id.as_str()),
-    ) {
-        Some(note) => {
-            text.push('\n');
-            text.push_str(&note);
-        }
-        None => text.push_str("\n(UIA-Auswahl für künftige Sitzungen gespeichert)"),
-    }
-
-    Ok(OpOutput::from(text))
+    // Delegate fully to the UIA provider switch core: validates the resolved
+    // provider and mutates provider+model together, atomically. `persist` is
+    // passed explicitly (rather than hardcoded inside `handle_uia_switch_core`)
+    // purely so tests can inject a no-op closure — production behavior is
+    // unchanged, this is always `persist_uia_selection` here.
+    crate::provider::handle_uia_switch_core(
+        ctx,
+        configured.provider.clone(),
+        Some(configured.id.clone()),
+        crate::config_util::persist_uia_selection,
+    )
 }
 
 /// Formatiert das `/uia-model show`-Sub-Kommando: zeigt das für die UIA
@@ -702,6 +681,265 @@ async fn uia_model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError
     Ok(OpOutput::from(text))
 }
 
+/// Wechselt ausschließlich das für UIA-Worker-Sitzungen gepinnte Modell
+/// (`uia_worker_model`) und validiert es gegen den EFFEKTIVEN UIA-Provider
+/// (Live-Auswahl, sonst `harness.uia_provider` — via
+/// [`effective_uia_selection`], genau wie [`handle_uia_model_switch`]). Es
+/// gibt bewusst **kein** eigenes `uia_worker_provider`-Konzept: der Worker
+/// teilt sich den Provider mit der UIA.
+///
+/// # Beschreibung
+/// Im Gegensatz zu [`handle_uia_model_switch`] mutiert dieser Pfad **keinen**
+/// Live-`SessionController`-Zustand — `uia_worker_model` wird ausschließlich
+/// über [`crate::config_util::persist_uia_worker_model`] in der
+/// Profil-`config.toml` verankert und wirkt erst beim nächsten
+/// Sitzungsstart, analog zu anderen `internal_models.*`-Punkten.
+///
+/// `persist` mirrors [`handle_switch_core`]'s injected-closure design: the
+/// production caller ([`uia_worker_model`]) always passes
+/// [`crate::config_util::persist_uia_worker_model`], so runtime behavior is
+/// unchanged from a hardcoded call — the injection exists purely so tests
+/// can supply a no-op closure and never touch the real, `HARW_HOME`-resolving
+/// persistence path (this crate declares `#![forbid(unsafe_code)]`, so a
+/// testing-only `HARW_HOME` env-isolation helper, which would need `unsafe
+/// fn std::env::set_var`/`remove_var`, is not available here).
+///
+/// # Argumente
+/// - `ctx` (`&OpContext`): Ausführungskontext (nur zum Lesen der effektiven
+///   UIA-Provider-Auswahl über einen optionalen `SharedSessionController` —
+///   keine Mutation).
+/// - `target` (`String`): die zu setzende Modell-ID oder ein konfigurierter Alias.
+/// - `persist` (`impl FnOnce(Option<&str>) -> Option<String>`): wird nach
+///   erfolgreicher Validierung einmal mit `Some(canonical_model_id)`
+///   aufgerufen. `None` bei Erfolg, `Some(note)` mit einer Fehlernotiz.
+///
+/// # Rückgabe
+/// [`OpOutput`] mit Bestätigungstext ("… für die nächste Sitzung
+/// gespeichert"), inklusive Persistenz-Notiz.
+///
+/// # Fehler
+/// - [`OpError::Execution`]: Config-Discovery fehlgeschlagen, oder der
+///   konfigurierte Modellkatalog ist leer.
+/// - [`OpError::InvalidArguments`]: unbekannte Modell-ID, oder das Ziel-Modell
+///   gehört zu einem anderen Provider als dem effektiven UIA-Provider.
+///
+/// # Spec
+/// harwness Plan v2 — Welle 2 (2d), Teil 2 — `/uia-worker-model`.
+fn handle_uia_worker_model_switch(
+    ctx: &OpContext,
+    target: String,
+    persist: impl FnOnce(Option<&str>) -> Option<String>,
+) -> Result<OpOutput, OpError> {
+    // Context-scoped-first resolution — see `crate::provider::resolved_config`
+    // doc comment; same authority `handle_switch_core`/`handle_uia_model_switch`
+    // already resolve against.
+    let config = crate::provider::resolved_config(ctx)?;
+    if config.models.is_empty() {
+        return Err(OpError::Execution(
+            "configured model catalog is unavailable; refusing to switch the UIA worker model"
+                .into(),
+        ));
+    }
+
+    let controller = ctx.service::<harw_operations::SharedSessionController>();
+    let selection = effective_uia_selection(controller, &config);
+    let configured = configured_model(&config, &target)
+        .ok_or_else(|| OpError::InvalidArguments(format!("unknown model: {target}")))?;
+
+    if let Some(uia_provider) = selection.provider() {
+        let model_provider = config
+            .providers
+            .iter()
+            .find(|(key, provider)| {
+                key.as_str() == configured.provider || provider.name == configured.provider
+            })
+            .map(|(_, provider)| provider.name.as_str())
+            .unwrap_or(configured.provider.as_str());
+        if model_provider != uia_provider {
+            return Err(OpError::InvalidArguments(format!(
+                "UIA worker model {target} requires provider {model_provider}, but effective UIA provider is {uia_provider}; \
+                 use `/uia-provider switch {model_provider}` first"
+            )));
+        }
+    }
+
+    let configured_id = configured.id.clone();
+    let mut text = format!("UIA worker model set to {configured_id}");
+    match persist(Some(configured_id.as_str())) {
+        Some(note) => {
+            text.push('\n');
+            text.push_str(&note);
+        }
+        None => text.push_str("\n(gespeichert für die nächste Sitzung)"),
+    }
+
+    Ok(OpOutput::from(text))
+}
+
+/// Formatiert das `/uia-worker-model show`-Sub-Kommando: zeigt das für
+/// UIA-Worker-Sitzungen gepinnte Modell (`config.harness.uia_worker_model`)
+/// und den effektiven UIA-Provider (geteilt mit `/uia-model`).
+///
+/// # Beschreibung
+/// Im Unterschied zu [`format_uia_show`] liest "aktiv" hier **direkt** aus
+/// `config.harness.uia_worker_model` statt aus einer Live-Selection — der
+/// UIA-Worker-Pin hat keinen Live-`SessionController`-Gegenpart.
+///
+/// # Argumente
+/// - `uia_provider` (`Option<&str>`): effektiver UIA-Provider (aus
+///   [`effective_uia_selection`]), oder `None`, wenn keiner konfiguriert ist.
+/// - `config` (`&harw_config::ResolvedConfig`): geladene Config.
+///
+/// # Rückgabe
+/// Fertig formatierter `String`.
+fn format_uia_worker_show(uia_provider: Option<&str>, config: &harw_config::ResolvedConfig) -> String {
+    let model_line = match config.harness.uia_worker_model.as_deref() {
+        Some(id) => {
+            let display = configured_model(config, id)
+                .and_then(|model| model.name.as_deref())
+                .map(str::to_owned)
+                .unwrap_or_else(|| id.to_owned());
+            format!("UIA worker model     : {display} [{id}]")
+        }
+        None => "UIA worker model     : (nicht gesetzt)".to_owned(),
+    };
+    let provider_line = uia_provider
+        .map(|provider| format!("UIA provider (shared): {provider}"))
+        .unwrap_or_else(|| "UIA provider (shared): (nicht gesetzt)".to_owned());
+    format!("{model_line}\n{provider_line}")
+}
+
+/// Formatiert das `/uia-worker-model list`-Sub-Kommando: Katalog gefiltert
+/// auf den effektiven UIA-Provider, "aktiv" markiert anhand
+/// `config.harness.uia_worker_model` (siehe [`format_uia_worker_show`]).
+fn format_uia_worker_list(uia_provider: Option<&str>, config: &harw_config::ResolvedConfig) -> String {
+    let active_model = config.harness.uia_worker_model.as_deref();
+    let mut models: Vec<_> = config.models.values().collect();
+    models.sort_by(|left, right| left.id.cmp(&right.id));
+
+    let mut lines = vec![
+        format!(
+            "UIA worker model      : {}",
+            active_model.unwrap_or("(none)")
+        ),
+        format!(
+            "UIA provider (shared) : {}",
+            uia_provider.unwrap_or("(none)")
+        ),
+        String::new(),
+        "Catalog:".to_owned(),
+    ];
+    for model in models {
+        if uia_provider.is_some_and(|provider| model.provider != provider) {
+            continue;
+        }
+        let marker = if active_model == Some(model.id.as_str()) {
+            " *"
+        } else {
+            "  "
+        };
+        let compat = match uia_provider {
+            None => "unfiltered",
+            Some(provider) if model.provider == provider => "compatible",
+            Some(_) => "other-provider",
+        };
+        lines.push(format!(
+            "{marker} {} / {}  [{compat}]",
+            model.provider, model.id
+        ));
+    }
+    lines.push("  (* = current UIA worker model)".to_owned());
+    lines.join("\n")
+}
+
+/// Verarbeitet die `/uia-worker-model`-Operation — zeigt/wechselt das für
+/// UIA-Worker-Sitzungen gepinnte Modell (`uia_worker_model`), unabhängig von
+/// `default_model`/`uia_model`.
+///
+/// # Beschreibung
+/// Wiederverwendet [`ModelArgs`] und dieselbe `show|list|switch`-Grammatik
+/// wie `/model`/`/uia-model`:
+///
+/// | Sub-Kommando | Verhalten |
+/// |---|---|
+/// | `show` (Standard) | Meldet `uia_worker_model` + effektiven UIA-Provider |
+/// | `list` | Listet den Katalog, gefiltert auf den effektiven UIA-Provider |
+/// | `switch <id>` | Persistiert `uia_worker_model` — **kein** Live-Wechsel |
+/// | *(sonstiges)* | [`OpError::InvalidArguments`] |
+///
+/// # Sicherheitsregel — kein ModelTool
+/// Diese Funktion darf niemals als LLM-aufrufbares Tool exponiert werden.
+///
+/// # Argumente
+/// - `ctx` (`&OpContext`): Ausführungskontext.
+/// - `args` (`ModelArgs`): geparstes Sub-Kommando.
+///
+/// # Rückgabe
+/// `Ok(OpOutput)` mit menschenlesbarem Text.
+///
+/// # Fehler
+/// - [`OpError::Execution`]: Config-Discovery fehlgeschlagen, konfigurierter
+///   Modellkatalog leer (nur `switch`).
+/// - [`OpError::InvalidArguments`]: unbekannte ID, Provider-Mismatch gegen
+///   den effektiven UIA-Provider, unbekanntes Sub-Kommando.
+///
+/// # Spec
+/// harwness Plan v2 — Welle 2 (2d), Teil 2 — `/uia-worker-model`.
+#[operation(
+    name = "uia-worker-model",
+    summary = "Zeigt/setzt das für UIA-Worker-Sitzungen gepinnte Modell (uia_worker_model); wirkt erst ab der nächsten Sitzung.",
+    domain = "catalog_config",
+    permission = "operator",
+    category = "model",
+    command(path = "/uia-worker-model", visibility = "tui_only"),
+)]
+async fn uia_worker_model(ctx: &OpContext, args: ModelArgs) -> Result<OpOutput, OpError> {
+    let action = args.action.as_deref().unwrap_or("show");
+
+    match action {
+        "show" | "list" | "switch" => {}
+        other => {
+            return Err(OpError::InvalidArguments(format!(
+                "Unknown /uia-worker-model subcommand: '{other}'. \
+                 Valid subcommands: show, list, switch <model-id>."
+            )));
+        }
+    }
+
+    if action == "switch" {
+        let target = match args.target.as_deref().map(str::trim) {
+            Some(t) if !t.is_empty() => t.to_owned(),
+            _ => {
+                return Err(OpError::InvalidArguments(
+                    "switch requires a model id: /uia-worker-model switch <id>".into(),
+                ));
+            }
+        };
+
+        return handle_uia_worker_model_switch(
+            ctx,
+            target,
+            crate::config_util::persist_uia_worker_model,
+        );
+    }
+
+    let controller = ctx.service::<harw_operations::SharedSessionController>();
+    // Context-scoped-first resolution — see `crate::provider::resolved_config`
+    // doc comment; used consistently across every branch of this brand-new
+    // operation (unlike `model`/`uia_model`, whose show/list paths predate
+    // this node and were intentionally left untouched).
+    let config = crate::provider::resolved_config(ctx)?;
+
+    let selection = effective_uia_selection(controller, &config);
+    let text = if action == "list" {
+        format_uia_worker_list(selection.provider(), &config)
+    } else {
+        format_uia_worker_show(selection.provider(), &config)
+    };
+
+    Ok(OpOutput::from(text))
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -748,16 +986,25 @@ mod tests {
 
     // ── Test-Kontext-Builder ──────────────────────────────────────────────────
 
-    /// Erstellt einen minimalen `OpContext` mit optionalem `SharedSessionController`.
+    /// Erstellt einen minimalen `OpContext` mit optionalem `SharedSessionController`
+    /// und optionaler context-gescopter `Arc<ResolvedConfig>`.
     ///
     /// # Description
     /// Erzeugt ein temporäres Workspace-Verzeichnis und bindet es in eine
     /// [`SandboxSpec`] ein. Falls `ctrl` Some ist, wird der Controller in die
-    /// `ServiceMap` eingetragen.
+    /// `ServiceMap` eingetragen. Falls `config` Some ist, wird sie ebenfalls
+    /// eingetragen — [`crate::provider::resolved_config`] (und damit
+    /// [`handle_switch_core`]/[`handle_uia_model_switch`]) liest sie dann
+    /// bevorzugt statt echter `HARW_HOME`-Config-Discovery, genau wie es die
+    /// Laufzeit (`harw-tui::command_exec::build_services`) für `/model`- und
+    /// `/provider`-Ops tut.
     ///
     /// # Spec
-    /// harwness Plan v2 — Tests Task E.
-    fn make_test_ctx(ctrl: Option<SharedSessionController>) -> (OpContext, std::path::PathBuf) {
+    /// harwness Plan v2 — Tests Task E; Welle 2 (2d) — atomarer Provider+Modell-Wechsel.
+    fn make_test_ctx(
+        ctrl: Option<SharedSessionController>,
+        config: Option<Arc<harw_config::ResolvedConfig>>,
+    ) -> (OpContext, std::path::PathBuf) {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -787,8 +1034,67 @@ mod tests {
         if let Some(c) = ctrl {
             services.insert(c);
         }
+        if let Some(config) = config {
+            services.insert(config);
+        }
         let ctx = OpContext::new(SessionId::new(), TurnId::new(), sandbox, services);
         (ctx, tmp)
+    }
+
+    /// Baut eine [`harw_config::ResolvedConfig`] mit zwei vollständig
+    /// konfigurierten, aktivierten Providern (je Zugangsdaten via
+    /// [`harw_config::SecretRef::Env`]) und je einem Modell — die
+    /// Testgrundlage für die atomaren Provider+Modell-Wechsel-Tests unten
+    /// (Welle 2, 2d, Teil 1).
+    fn two_provider_config() -> harw_config::ResolvedConfig {
+        fn provider(name: &str, env_key: &str, model_id: &str) -> harw_config::ProviderToml {
+            harw_config::ProviderToml {
+                name: name.to_owned(),
+                api: "openai-chat".to_owned(),
+                base_url: format!("https://api.example.test/{name}"),
+                auth: Some(harw_config::SecretRef::Env(env_key.to_owned())),
+                auth_header: None,
+                api_key: None,
+                headers: Default::default(),
+                models: vec![model_id.to_owned()],
+                enabled: true,
+                origin_allowlist: Default::default(),
+                rate_limit: None,
+                max_concurrency: None,
+                originator: None,
+            }
+        }
+        fn model(model_id: &str, provider_name: &str) -> harw_config::ModelToml {
+            harw_config::ModelToml {
+                id: model_id.to_owned(),
+                name: None,
+                provider: provider_name.to_owned(),
+                aliases: Vec::new(),
+                context_window: None,
+                max_tokens: None,
+                reasoning: false,
+                input_types: Vec::new(),
+                capabilities: harw_config::ModelCapabilitiesToml::default(),
+                prompt_caching: None,
+            }
+        }
+
+        let mut config = harw_config::ResolvedConfig::default();
+        config.providers.insert(
+            "provider-a".to_owned(),
+            provider("provider-a", "HARW_TEST_PROVIDER_A_KEY", "model-a"),
+        );
+        config.providers.insert(
+            "provider-b".to_owned(),
+            provider("provider-b", "HARW_TEST_PROVIDER_B_KEY", "model-b"),
+        );
+        config
+            .models
+            .insert("model-a".to_owned(), model("model-a", "provider-a"));
+        config
+            .models
+            .insert("model-b".to_owned(), model("model-b", "provider-b"));
+        config
     }
 
     // ── FromRawArgs ───────────────────────────────────────────────────────────
@@ -840,7 +1146,7 @@ mod tests {
     #[tokio::test]
     async fn model_unknown_subcommand_rejected() {
         let ctrl: SharedSessionController = Arc::new(NullSessionController::new());
-        let (ctx, _tmp) = make_test_ctx(Some(ctrl));
+        let (ctx, _tmp) = make_test_ctx(Some(ctrl), None);
         let args = ModelArgs {
             action: Some("frobnicate".to_owned()),
             target: None,
@@ -878,7 +1184,7 @@ mod tests {
             .expect("set_active_provider must succeed");
 
         let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
-        let (ctx, _tmp) = make_test_ctx(Some(shared));
+        let (ctx, _tmp) = make_test_ctx(Some(shared), None);
 
         let args = ModelArgs {
             action: Some("show".to_owned()),
@@ -1011,5 +1317,265 @@ mod tests {
         let selection = super::effective_uia_selection(Some(&shared), &config);
         assert_eq!(selection.provider(), Some("fireworks"));
         assert_eq!(selection.model(), None);
+    }
+
+    // ── Welle 2 (2d), Teil 1: atomarer Provider+Modell-Wechsel via Delegation ──
+    //
+    // Die beiden `*_switches_both_atomically`-Tests unten rufen die private
+    // `handle_switch_core`/`handle_uia_switch_core`-Kernfunktion direkt mit
+    // einem No-op-`persist`-Abschluss auf, statt über `super::model`/
+    // `super::uia_model` zu gehen (die den echten, `HARW_HOME`-auflösenden
+    // `persist_default_selection`/`persist_uia_selection` fest verdrahten).
+    // Diese Crate deklariert `#![forbid(unsafe_code)]`, daher steht eine
+    // `unsafe fn std::env::set_var`-basierte `HARW_HOME`-Isolation (wie sie
+    // `config_util`/`permissions` bewusst vermeiden, siehe deren
+    // Modul-Kommentare) hier nicht zur Verfügung — der No-op-`persist` prüft
+    // exakt die unter Test stehende Eigenschaft (die atomare
+    // Controller-Mutation) ohne jemals das Dateisystem zu berühren.
+
+    /// `/model switch <id>` muss Provider+Modell atomar wechseln, auch wenn
+    /// das Ziel-Modell zu einem anderen Provider gehört als der aktuell
+    /// aktive — die zentrale Verhaltensänderung dieses Knotens gegenüber der
+    /// vorherigen Provider-Mismatch-Ablehnung.
+    #[test]
+    fn model_switch_to_different_provider_switches_both_atomically() {
+        let ctrl = Arc::new(NullSessionController::new());
+        ctrl.set_active_provider("provider-a".to_owned())
+            .expect("seed active provider");
+        ctrl.set_active_model("model-a".to_owned())
+            .expect("seed active model");
+
+        let config = Arc::new(two_provider_config());
+        let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
+        let (ctx, _tmp) = make_test_ctx(Some(shared), Some(config));
+
+        let output = super::handle_switch_core(&ctx, "model-b".to_owned(), |_, _| None)
+            .expect("switching to a different provider's model must succeed");
+        assert!(
+            output.text.contains("model-b"),
+            "confirmation must mention the new model: {}",
+            output.text
+        );
+
+        let snap = ctrl.snapshot();
+        assert_eq!(
+            snap.active_provider.as_deref(),
+            Some("provider-b"),
+            "provider must have switched atomically alongside the model"
+        );
+        assert_eq!(
+            snap.active_model.as_deref(),
+            Some("model-b"),
+            "model must have switched to the requested target"
+        );
+    }
+
+    /// UIA-Achse von [`model_switch_to_different_provider_switches_both_atomically`]:
+    /// `/uia-model switch <id>` muss die UIA-Auswahl (Provider+Modell) atomar
+    /// wechseln, ohne die generische `active_*`-Achse zu berühren.
+    #[test]
+    fn uia_model_switch_to_different_provider_switches_both_atomically() {
+        let ctrl = Arc::new(NullSessionController::new());
+        ctrl.set_uia_selection(harw_operations::session_control::UiaSelection::new(
+            Some("provider-a".to_owned()),
+            Some("model-a".to_owned()),
+        ))
+        .expect("seed UIA selection");
+
+        let config = Arc::new(two_provider_config());
+        let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
+        let (ctx, _tmp) = make_test_ctx(Some(shared), Some(config));
+
+        let output = crate::provider::handle_uia_switch_core(
+            &ctx,
+            "provider-b".to_owned(),
+            Some("model-b".to_owned()),
+            |_, _| None,
+        )
+        .expect("switching the UIA to a different provider's model must succeed");
+        assert!(
+            output.text.contains("model-b"),
+            "confirmation must mention the new UIA model: {}",
+            output.text
+        );
+
+        let after = ctrl.uia_selection();
+        assert_eq!(
+            after.provider.as_deref(),
+            Some("provider-b"),
+            "UIA provider must have switched atomically alongside the UIA model"
+        );
+        assert_eq!(after.model.as_deref(), Some("model-b"));
+    }
+
+    /// Ein `/model switch` auf ein Modell, dessen Provider deaktiviert ist,
+    /// muss vollständig fehlschlagen (`InvalidArguments`) und darf **nichts**
+    /// mutiert haben — der Controller-Snapshot vor und nach dem Aufruf muss
+    /// identisch sein. Die Ablehnung geschieht in
+    /// `provider::handle_switch_core`s Step 2 (enabled-Prüfung), bevor der
+    /// Controller überhaupt berührt wird — kein `HARW_HOME`-Zugriff nötig,
+    /// weil `persist` nie erreicht wird.
+    #[tokio::test]
+    async fn model_switch_to_disabled_target_provider_is_atomic_on_failure() {
+        let ctrl = Arc::new(NullSessionController::new());
+        ctrl.set_active_provider("provider-a".to_owned())
+            .expect("seed active provider");
+        ctrl.set_active_model("model-a".to_owned())
+            .expect("seed active model");
+
+        let mut config = two_provider_config();
+        config
+            .providers
+            .get_mut("provider-b")
+            .expect("provider-b must exist in the test fixture")
+            .enabled = false;
+        let config = Arc::new(config);
+
+        let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
+        let (ctx, _tmp) = make_test_ctx(Some(shared), Some(config));
+
+        let before = ctrl.snapshot();
+
+        let args = ModelArgs {
+            action: Some("switch".to_owned()),
+            target: Some("model-b".to_owned()),
+            value: None,
+        };
+        let result = super::model(&ctx, args).await;
+
+        match result {
+            Err(OpError::InvalidArguments(_)) => {}
+            other => panic!(
+                "Expected InvalidArguments for a disabled target provider, got: {other:?}"
+            ),
+        }
+
+        let after = ctrl.snapshot();
+        assert_eq!(
+            before.active_provider, after.active_provider,
+            "a failed switch must not change the active provider"
+        );
+        assert_eq!(
+            before.active_model, after.active_model,
+            "a failed switch must not change the active model"
+        );
+    }
+
+    // ── Welle 2 (2d), Teil 2: `/uia-worker-model` ──────────────────────────────
+
+    /// Ein Ziel-Modell, dessen konfigurierter Provider nicht dem effektiven
+    /// UIA-Provider entspricht, muss `InvalidArguments` liefern. Validation
+    /// fails before any persistence is attempted, so no `HARW_HOME` isolation
+    /// is needed.
+    #[test]
+    fn handle_uia_worker_model_switch_rejects_a_model_from_a_different_provider() {
+        let ctrl = Arc::new(NullSessionController::new());
+        ctrl.set_uia_selection(harw_operations::session_control::UiaSelection::new(
+            Some("provider-a".to_owned()),
+            None,
+        ))
+        .expect("seed effective UIA provider");
+
+        let config = Arc::new(two_provider_config());
+        let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
+        let (ctx, _tmp) = make_test_ctx(Some(shared), Some(config));
+
+        let result =
+            super::handle_uia_worker_model_switch(&ctx, "model-b".to_owned(), |_| None);
+
+        match result {
+            Err(OpError::InvalidArguments(msg)) => {
+                assert!(
+                    msg.contains("model-b") && msg.contains("provider-a"),
+                    "message must name both the rejected model and the effective UIA provider: {msg}"
+                );
+            }
+            other => panic!("Expected InvalidArguments, got: {other:?}"),
+        }
+    }
+
+    /// A compatible switch must persist `uia_worker_model` and confirm with
+    /// the "next session" wording — while leaving **every** live
+    /// `SessionController` field untouched (no `set_uia_model`/
+    /// `set_uia_selection` call exists on this path, unlike `/uia-model
+    /// switch`). Uses a no-op `persist` closure (see the `handle_uia_worker_model_switch`
+    /// doc comment) rather than the real, `HARW_HOME`-resolving
+    /// `persist_uia_worker_model`, so this test never touches the filesystem.
+    #[test]
+    fn handle_uia_worker_model_switch_persists_and_confirms() {
+        let ctrl = Arc::new(NullSessionController::new());
+        ctrl.set_uia_selection(harw_operations::session_control::UiaSelection::new(
+            Some("provider-a".to_owned()),
+            Some("model-a".to_owned()),
+        ))
+        .expect("seed UIA selection");
+
+        let config = Arc::new(two_provider_config());
+        let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
+        let (ctx, _tmp) = make_test_ctx(Some(shared), Some(config));
+
+        let before = ctrl.uia_selection();
+
+        let output = super::handle_uia_worker_model_switch(&ctx, "model-a".to_owned(), |_| None)
+            .expect("switching to a compatible UIA worker model must succeed");
+
+        assert!(
+            output.text.contains("für die nächste Sitzung"),
+            "confirmation must state the pin only takes effect next session, not \
+             'wirkt ab dem nächsten Turn': {}",
+            output.text
+        );
+        assert!(
+            output.text.contains("model-a"),
+            "confirmation must mention the switched model: {}",
+            output.text
+        );
+
+        let after = ctrl.uia_selection();
+        assert_eq!(
+            before, after,
+            "handle_uia_worker_model_switch must never mutate live SessionController state"
+        );
+    }
+
+    /// `/uia-worker-model show` must report `config.harness.uia_worker_model`
+    /// — not any live selection. A live generic UIA model ("model-b") is
+    /// seeded on the controller to prove it does not leak into the
+    /// worker-model output, which has no live counterpart of its own.
+    #[tokio::test]
+    async fn uia_worker_model_show_reports_config_value_without_a_live_override() {
+        let ctrl = Arc::new(NullSessionController::new());
+        ctrl.set_uia_selection(harw_operations::session_control::UiaSelection::new(
+            Some("provider-a".to_owned()),
+            Some("model-b".to_owned()),
+        ))
+        .expect("seed live UIA selection (must not leak into the worker-model show)");
+
+        let mut config = two_provider_config();
+        config.harness.uia_worker_model = Some("model-a".to_owned());
+        let config = Arc::new(config);
+
+        let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
+        let (ctx, _tmp) = make_test_ctx(Some(shared), Some(config));
+
+        let args = ModelArgs {
+            action: Some("show".to_owned()),
+            target: None,
+            value: None,
+        };
+        let result = super::uia_worker_model(&ctx, args)
+            .await
+            .expect("show must not fail");
+
+        assert!(
+            result.text.contains("model-a"),
+            "show must report config.harness.uia_worker_model: {}",
+            result.text
+        );
+        assert!(
+            !result.text.contains("model-b"),
+            "show must not leak the live generic UIA model selection: {}",
+            result.text
+        );
     }
 }

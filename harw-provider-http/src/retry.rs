@@ -52,7 +52,7 @@
 
 use crate::error::HttpProviderError;
 use harw_core::cancel::CancelToken;
-use harw_core::{ModelError, ModelFuture, ModelProvider, ModelRequest};
+use harw_core::{ModelError, ModelFuture, ModelProvider, ModelRequest, ModelResponse};
 use std::collections::hash_map::RandomState;
 use std::future::Future;
 use std::hash::{BuildHasher, Hasher};
@@ -367,6 +367,38 @@ impl<P: ModelProvider> RetryingProvider<P> {
         })
         .await
     }
+
+    // Racet einen einzelnen Versuch (`self.inner.respond(request)`) gegen
+    // BEIDE Abbruchsignale: den Hüllen-Token (`self.cancel`, i. d. R. nie
+    // gesetzt — siehe `with_cancel`) und den Request-eigenen Token
+    // (`request.cancel`, W3/C-CANCEL). Bislang lief nur `wait()` zwischen
+    // Versuchen gegen `self.cancel`; der eigentliche Modell-Aufruf racete
+    // gegen nichts. Kein `tokio::select!`, weil dieses Crate `tokio` ohne
+    // das Feature `macros` einbindet — manuelles `poll_fn`-Racing wie schon
+    // bei `wait()`.
+    async fn race_respond(&self, request: ModelRequest) -> Result<ModelResponse, ModelError> {
+        let request_cancel = request.cancel.clone();
+        let mut respond = self.inner.respond(request);
+        let self_cancelled = self.cancel.cancelled();
+        let mut self_cancelled = std::pin::pin!(self_cancelled);
+        let request_cancelled = async move {
+            match request_cancel {
+                Some(token) => token.cancelled().await,
+                None => std::future::pending().await,
+            }
+        };
+        let mut request_cancelled = std::pin::pin!(request_cancelled);
+        std::future::poll_fn(move |cx| {
+            if self_cancelled.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Err(ModelError::Cancelled));
+            }
+            if request_cancelled.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(Err(ModelError::Cancelled));
+            }
+            respond.as_mut().poll(cx)
+        })
+        .await
+    }
 }
 
 impl<P: ModelProvider> ModelProvider for RetryingProvider<P> {
@@ -389,7 +421,7 @@ impl<P: ModelProvider> ModelProvider for RetryingProvider<P> {
                         "retry state lost the pending request".to_owned(),
                     ));
                 };
-                let error = match self.inner.respond(current).await {
+                let error = match self.race_respond(current).await {
                     Ok(response) => return Ok(response),
                     Err(error) => error,
                 };
@@ -562,5 +594,65 @@ mod tests {
             provider.respond(request).await,
             Err(ModelError::Cancelled)
         ));
+    }
+
+    // Provider, der `delay` lang "arbeitet" bevor er erfolgreich antwortet —
+    // nur für den Race-Test unten: simuliert einen laufenden
+    // `inner.respond`-Aufruf, gegen den ein Cancel racen muss.
+    struct SlowProvider {
+        delay: Duration,
+    }
+
+    impl ModelProvider for SlowProvider {
+        fn respond<'a>(&'a self, _request: ModelRequest) -> ModelFuture<'a> {
+            let delay = self.delay;
+            Box::pin(async move {
+                ThreadSleeper
+                    .sleep(delay)
+                    .await
+                    .map_err(|error| ModelError::RequestFailed(error.to_string()))?;
+                Ok(ModelResponse::text("slow-done"))
+            })
+        }
+    }
+
+    // Deckt den bislang toten Pfad ab: das Cancel-Signal kommt über
+    // `ModelRequest.cancel` (nicht über `RetryingProvider::with_cancel`) und
+    // schlägt während der laufende `inner.respond(...)`-Aufruf noch läuft
+    // ein (Provider braucht 150ms, Cancel nach 20ms) — muss den Aufruf mit
+    // `Err(ModelError::Cancelled)` abbrechen statt die vollen 150ms
+    // abzuwarten.
+    #[tokio::test]
+    async fn test_respond_cancelled_via_request_cancel_token_during_inner_call() {
+        let request_cancel = CancelToken::new();
+        let mut request = harw_core::ModelRequest::new(
+            Default::default(),
+            Vec::new(),
+            harw_core::ConversationHistory::new(),
+            Vec::new(),
+        );
+        request.cancel = Some(request_cancel.clone());
+
+        let provider = RetryingProvider::new(
+            SlowProvider {
+                delay: Duration::from_millis(150),
+            },
+            policy(),
+        );
+
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            request_cancel.cancel(CancelReason::User);
+        });
+
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            provider.respond(request).await,
+            Err(ModelError::Cancelled)
+        ));
+        // Muss deutlich vor Ablauf der vollen 150ms zurückkommen — sonst hat
+        // das Cancel nicht gegen den `inner.respond`-Aufruf gerennt, sondern
+        // ist wirkungslos verpufft.
+        assert!(started.elapsed() < Duration::from_millis(150));
     }
 }

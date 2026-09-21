@@ -10,9 +10,16 @@
 //!   `AgentSession::{reasoning_effort,active_model,active_provider}()` →
 //!   `ModelRequest::{reasoning_effort,model_id,provider_id}` (mirroring turn_loop.rs ~815-822)
 //!
-//! Handler invocation (via `Operation::run`) is used in test 5 only, where the
-//! atomic-refuse logic lives exclusively inside the handler and cannot be reached
-//! through the controller setters.
+//! Handler invocation (via `Operation::run`) is used in tests 5
+//! (`slice9_model_switch_to_different_provider_is_atomic`, `#[ignore]`d — see
+//! its doc comment for why) and 5b
+//! (`slice9b_model_switch_to_disabled_target_provider_is_atomic_on_failure`)
+//! only, where the atomic provider+model switch logic lives exclusively
+//! inside the `/model switch` handler and cannot be reached through the
+//! controller setters. `/provider switch <id>` no longer exists as a text
+//! sub-command; `/model switch <id>` is now the sole atomic switch entry
+//! point, even when the target model belongs to a different provider than
+//! the one currently active.
 
 use std::sync::Arc;
 
@@ -243,25 +250,40 @@ fn slice8_provider_switch_influences_next_turn() {
     );
 }
 
-// ── Test 5: slice9_incompatible_provider_switch_is_atomic ────────────────────
+// ── Test 5: slice9_model_switch_to_different_provider_is_atomic ─────────────
+//
+// `/provider switch <id>` no longer exists as a text sub-command (its
+// catch-all now points operators at `/model`). The atomic-refuse behaviour
+// this slice used to prove on `/provider switch` moved entirely onto
+// `/model switch <id>`: harw-ops/src/model.rs's `handle_switch_core` resolves
+// the target model's configured provider and delegates fully to
+// harw-ops/src/provider.rs's `handle_switch_core`, which now switches
+// provider+model together in one atomic call, even when the target model
+// belongs to a different provider than the one currently active — it no
+// longer rejects with a "/provider switch ... first" hint on mismatch.
 
-/// Proves the handler-level atomicity guard: when the active model belongs to
-/// "anthropic" and the operator tries to switch provider to "openai", the
-/// ProviderOperation must return InvalidArguments AND leave the controller
-/// snapshot unchanged.
+/// Builds the shared fixture for both `slice9*` tests below: a temp
+/// workspace/sandbox, a `TuiSessionController` seeded with active
+/// provider "anthropic" / active model "claude-opus-4-8", and a
+/// context-scoped `ResolvedConfig` with two providers — "anthropic" (holding
+/// "claude-opus-4-8") and "openai" (holding "gpt-test-slice9", whose
+/// `enabled` flag is controlled by `openai_enabled` so the same builder
+/// serves both the atomic-success case and the atomic-failure/atomicity-
+/// preserved case).
 ///
-/// This test invokes `ProviderOperation::run()` via the `Operation` trait so
-/// the actual atomic-refuse code path in `handle_switch` is exercised.
-/// It composes a minimal resolved provider configuration into the operation
-/// context before switching.
-///
-/// Precondition: active_provider = "anthropic", active_model = "claude-opus-4-8"
-/// Action:       /provider switch openai
-/// Assert:       Err(InvalidArguments) AND snapshot.active_provider is still "anthropic"
-#[tokio::test]
-async fn slice9_incompatible_provider_switch_is_atomic() {
+/// # Returns
+/// `(OpContext, tmp_dir, controller)`. The caller is responsible for
+/// removing `tmp_dir` (best effort) once done, and for snapshotting
+/// `controller` directly (the context only holds a type-erased clone of it).
+fn build_slice9_fixture(
+    openai_enabled: bool,
+) -> (
+    harw_operations::OpContext,
+    std::path::PathBuf,
+    Arc<TuiSessionController>,
+) {
     use harw_config::{ModelToml, ProviderToml, ResolvedConfig, SecretRef};
-    use harw_operations::{OpInput, Operation, SharedSessionController, context::ServiceMap};
+    use harw_operations::{SharedSessionController, context::ServiceMap};
     use harw_authority::{Permission, PermissionSet, SandboxSpec, WorkspaceRegistration, WorkspaceRegistry};
     use harw_types::{SessionId, TenantId, TurnId, WorkspaceId};
 
@@ -296,8 +318,7 @@ async fn slice9_incompatible_provider_switch_is_atomic() {
 
     // ── Compose the resolved provider configuration for this operation ───────
     // SecretRef values are references only; no credential material is stored in
-    // the test fixture. Both providers are enabled so the switch reaches the
-    // active-model compatibility guard.
+    // the test fixture.
     let mut config = ResolvedConfig::default();
     config.providers.insert(
         "openai".to_owned(),
@@ -310,7 +331,7 @@ async fn slice9_incompatible_provider_switch_is_atomic() {
             api_key: None,
             headers: Default::default(),
             models: vec!["gpt-test-slice9".to_owned()],
-            enabled: true,
+            enabled: openai_enabled,
             origin_allowlist: Default::default(),
             rate_limit: None,
             max_concurrency: None,
@@ -373,8 +394,6 @@ async fn slice9_incompatible_provider_switch_is_atomic() {
     ctrl.set_active_model("claude-opus-4-8".to_owned())
         .expect("set_active_model must succeed");
 
-    let snapshot_before = ctrl.snapshot();
-
     // ── Build OpContext with the controller ───────────────────────────────────
     let shared: SharedSessionController = Arc::clone(&ctrl) as SharedSessionController;
     let mut services = ServiceMap::new();
@@ -382,24 +401,133 @@ async fn slice9_incompatible_provider_switch_is_atomic() {
     services.insert(Arc::new(config));
     let ctx = harw_operations::OpContext::new(SessionId::new(), TurnId::new(), sandbox, services);
 
-    // ── Invoke ProviderOperation::run() with ["switch", "openai"] ─────────────
-    let op = harw_ops::provider::ProviderOperation;
-    let input = OpInput::command("/provider", vec!["switch".to_owned(), "openai".to_owned()]);
+    (ctx, tmp, ctrl)
+}
+
+/// Proves the atomic-switch success path: `/model switch <id>`, invoked via
+/// `ModelOperation::run()` (the `Operation` trait — the actual handler code
+/// path, not the controller setters already covered by slice7/8), switches
+/// provider+model together in a single call when the target model
+/// ("gpt-test-slice9") belongs to a *different* configured provider
+/// ("openai") than the one currently active ("anthropic").
+///
+/// Precondition: active_provider = "anthropic", active_model = "claude-opus-4-8"
+/// Action:       /model switch gpt-test-slice9   (target provider "openai" enabled)
+/// Assert:       Ok(...) AND snapshot_after.active_provider == "openai" AND
+///               snapshot_after.active_model == "gpt-test-slice9"
+///
+/// # Ignored — real, non-injectable filesystem I/O
+/// A successful switch through `ModelOperation::run()` always reaches
+/// `harw-ops::provider::handle_switch_core`'s Step 5, which calls
+/// `harw-ops::config_util::persist_default_selection` — hardcoded at the
+/// `/model switch` call site in `harw-ops/src/model.rs`, with no
+/// test-injectable seam through the public `Operation` surface (unlike
+/// `resolved_config`, which *does* prefer a context-scoped config — see
+/// `build_slice9_fixture` above). `persist_default_selection` resolves
+/// `$HARW_HOME` (default `~/.harw`) via `harw_home::home_dir()` and, on a
+/// successful switch, always writes `default_provider`/`default_model` into
+/// the *active profile's real* `config.toml` — even on failure to persist it
+/// swallows the error into a text note rather than an `Err`, so this is not
+/// observable as a test failure, only as a live side effect.
+///
+/// In-crate unit tests avoid this by calling the private
+/// `handle_switch_core`/`handle_uia_switch_core` core functions directly
+/// with a no-op `persist` closure (see
+/// `harw-ops/src/model.rs::tests::model_switch_to_different_provider_switches_both_atomically`);
+/// that seam is `pub(crate)`/private and unreachable from this external
+/// `harw-tui` integration-test crate. Redirecting `$HARW_HOME` into this
+/// test's own tmp dir via `std::env::set_var` is also unavailable: this
+/// workspace declares `[workspace.lints.rust] unsafe_code = "forbid"`
+/// (root `Cargo.toml`), inherited by `harw-tui` via `[lints] workspace =
+/// true`, and `std::env::set_var`/`remove_var` require an `unsafe` block on
+/// current Rust.
+///
+/// Run unignored, this test would silently overwrite `default_provider`/
+/// `default_model` in the developer's real, active harwness profile on every
+/// local `cargo test` — a live-filesystem side effect this project's own
+/// Rust testing rules forbid outside `#[ignore]` ("Tests must not rely on
+/// ... the filesystem unless marked `#[ignore]` with a comment explaining
+/// the requirement"). Run explicitly via `cargo test -- --ignored` only with
+/// `HARW_HOME` pointed at a throwaway directory.
+#[tokio::test]
+#[ignore = "reaches the real, non-injectable persist_default_selection and would \
+            overwrite the developer's live ~/.harw profile config.toml; see doc comment"]
+async fn slice9_model_switch_to_different_provider_is_atomic() {
+    use harw_operations::{OpInput, Operation};
+
+    let (ctx, tmp, ctrl) = build_slice9_fixture(true);
+
+    // ── Invoke ModelOperation::run() with ["switch", "gpt-test-slice9"] ───────
+    let op = harw_ops::model::ModelOperation;
+    let input = OpInput::command(
+        "/model",
+        vec!["switch".to_owned(), "gpt-test-slice9".to_owned()],
+    );
+    let result = op.run(&ctx, input).await;
+
+    match result {
+        Ok(_) => {}
+        other => panic!(
+            "Expected Ok for a cross-provider atomic /model switch, got: {other:?}"
+        ),
+    }
+
+    // ATOMIC SUCCESS: both provider and model must have switched together.
+    let snapshot_after = ctrl.snapshot();
+    assert_eq!(
+        snapshot_after.active_provider.as_deref(),
+        Some("openai"),
+        "active_provider must have switched atomically alongside the model"
+    );
+    assert_eq!(
+        snapshot_after.active_model.as_deref(),
+        Some("gpt-test-slice9"),
+        "active_model must be the requested target"
+    );
+
+    // Cleanup tmp dir (best effort).
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Proves the handler-level atomicity guard still holds on the *failure*
+/// side of `/model switch <id>`: when the target model's configured provider
+/// is disabled, the switch must be rejected with `InvalidArguments` *before*
+/// touching the controller — the rejection happens in
+/// `provider::handle_switch_core`'s Step 2 (enabled check), ahead of Step 4
+/// (controller mutation) and Step 5 (persist), so this path never reaches
+/// the filesystem and needs no `#[ignore]`.
+///
+/// Precondition: active_provider = "anthropic", active_model = "claude-opus-4-8"
+/// Action:       /model switch gpt-test-slice9   (target provider "openai" DISABLED)
+/// Assert:       Err(InvalidArguments) AND snapshot is byte-for-byte unchanged
+#[tokio::test]
+async fn slice9b_model_switch_to_disabled_target_provider_is_atomic_on_failure() {
+    use harw_operations::{OpInput, Operation};
+
+    let (ctx, tmp, ctrl) = build_slice9_fixture(false);
+    let snapshot_before = ctrl.snapshot();
+
+    // ── Invoke ModelOperation::run() with ["switch", "gpt-test-slice9"] ───────
+    let op = harw_ops::model::ModelOperation;
+    let input = OpInput::command(
+        "/model",
+        vec!["switch".to_owned(), "gpt-test-slice9".to_owned()],
+    );
     let result = op.run(&ctx, input).await;
 
     match result {
         Err(harw_operations::OpError::InvalidArguments(msg)) => {
             assert!(
-                msg.contains("claude-opus-4-8") || msg.contains("anthropic"),
-                "error must mention the incompatible model or provider: {msg}"
+                msg.contains("openai") || msg.contains("disabled"),
+                "error must mention the disabled target provider: {msg}"
             );
         }
         other => {
-            panic!("Expected InvalidArguments for incompatible provider switch, got: {other:?}")
+            panic!("Expected InvalidArguments for a disabled target provider, got: {other:?}")
         }
     }
 
-    // ATOMICITY: controller snapshot must be unchanged.
+    // ATOMICITY ON FAILURE: controller snapshot must be unchanged.
     let snapshot_after = ctrl.snapshot();
     assert_eq!(
         snapshot_after.active_provider, snapshot_before.active_provider,
