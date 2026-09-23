@@ -2577,6 +2577,7 @@ dependencies = [
  "harw-config",
  "harw-core",
  "harw-core-bridge",
+ "harw-explorer",
  "harw-extension-api",
  "harw-home",
  "harw-job-runtime",

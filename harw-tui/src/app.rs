@@ -7483,13 +7483,20 @@ fn render_viewport(
     };
     // Kontexthinweis für das fokussierte Agenten-Panel.
     let agents_hint = if app.panels.focus == crate::panes::PaneFocus::Agents {
-        if app.agent_detail.is_some() {
-            " · Esc: Liste | j/k/Bild↑↓: scrollen | g/G: Anfang/Ende | r: Reasoning"
-        } else {
-            " · Enter: Agentendetails"
+        match app.agent_detail.as_ref() {
+            Some(detail) => {
+                let entries = app
+                    .agent_monitor
+                    .trace(&detail.agent)
+                    .map_or(0, crate::agent_monitor::AgentTrace::len);
+                format!(
+                    " · {entries} Spureinträge · Esc: Liste | j/k/Bild↑↓: scrollen | g/G: Anfang/Ende | r: Reasoning"
+                )
+            }
+            None => " · Enter: Agentendetails".to_owned(),
         }
     } else {
-        ""
+        String::new()
     };
     let pending_permission_suffix = app
         .pending_permission_stage()
@@ -7857,6 +7864,94 @@ mod tests {
         let mut app = ChatApp::new(Vec::new(), test_sandbox()?, SessionId::new());
         app.command_registry = CommandRegistry::built_in().map_err(ctx("built_in"))?;
         Ok(app)
+    }
+
+    /// Enter im Agenten-Panel öffnet die Detailansicht (Panel maximiert),
+    /// Tasten scrollen/schalten dort, Esc kehrt zur Liste zurück, ohne den
+    /// Fokus an den Chat abzugeben, und stellt den Vollbild-Zustand wieder her.
+    #[test]
+    fn agents_panel_enter_opens_detail_and_esc_closes_it() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.agent_monitor
+            .seed_usage("agent-1", "explorer", TokenUsage::default());
+        app.panels.agents_visible = true;
+        app.panels.focus = crate::panes::PaneFocus::Agents;
+        assert!(!app.panels.maximized);
+
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert_eq!(handle_panel_key(&mut app, key(KeyCode::Enter)), Some(true));
+        let detail = app
+            .agent_detail
+            .clone()
+            .ok_or(TestError::Missing("agent detail"))?;
+        assert_eq!(detail.agent.as_str(), "agent-1");
+        assert_eq!(detail.scroll, 0);
+        assert!(app.panels.maximized, "Detailansicht maximiert das Panel");
+
+        assert_eq!(
+            handle_panel_key(&mut app, key(KeyCode::Char('k'))),
+            Some(true)
+        );
+        assert_eq!(handle_panel_key(&mut app, key(KeyCode::PageUp)), Some(true));
+        assert_eq!(app.agent_detail.as_ref().map(|d| d.scroll), Some(11));
+        assert_eq!(
+            handle_panel_key(&mut app, key(KeyCode::Char('j'))),
+            Some(true)
+        );
+        assert_eq!(app.agent_detail.as_ref().map(|d| d.scroll), Some(10));
+        assert_eq!(handle_panel_key(&mut app, key(KeyCode::Home)), Some(true));
+        assert_eq!(app.agent_detail.as_ref().map(|d| d.scroll), Some(u16::MAX));
+        assert_eq!(handle_panel_key(&mut app, key(KeyCode::End)), Some(true));
+        assert_eq!(app.agent_detail.as_ref().map(|d| d.scroll), Some(0));
+        let before = app.agent_detail.as_ref().map(|d| d.show_reasoning);
+        assert_eq!(
+            handle_panel_key(&mut app, key(KeyCode::Char('r'))),
+            Some(true)
+        );
+        assert_ne!(app.agent_detail.as_ref().map(|d| d.show_reasoning), before);
+
+        assert_eq!(handle_panel_key(&mut app, key(KeyCode::Esc)), Some(true));
+        assert!(app.agent_detail.is_none());
+        assert_eq!(app.panels.focus, crate::panes::PaneFocus::Agents);
+        assert!(!app.panels.maximized, "vorheriger Vollbild-Zustand zurück");
+
+        // Ein zweites Esc gibt den Fokus wie bisher an den Chat zurück.
+        assert_eq!(handle_panel_key(&mut app, key(KeyCode::Esc)), Some(true));
+        assert_eq!(app.panels.focus, crate::panes::PaneFocus::Chat);
+        Ok(())
+    }
+
+    /// Ctrl+O klappt auch Reasoning-Zellen auf und zu.
+    #[test]
+    fn toggle_tool_cells_expands_reasoning_cells() -> TestResult {
+        let mut app = test_chat_app()?;
+        app.push_reasoning_cell("erste Zeile\nzweite Zeile".to_owned(), None);
+        assert!(app.has_collapsed_tool_cells());
+        assert!(app.toggle_tool_cells());
+        assert!(!app.has_collapsed_tool_cells());
+        Ok(())
+    }
+
+    /// Live-Reasoning zeigt höchstens drei umbrochene Zeilen, die neuesten.
+    #[test]
+    fn live_reasoning_shows_last_three_wrapped_lines() {
+        let text = (0..40)
+            .map(|index| format!("wort{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let lines = live_reasoning_lines(&text, 24, style::Theme::Dark);
+        assert_eq!(lines.len(), 3);
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert!(rendered[0].starts_with("  ∴ "));
+        assert!(rendered[2].contains("wort39"));
     }
 
     /// Baut einen Session-Store-Sidecar mit festem `created_at`/`last_opened_at`
