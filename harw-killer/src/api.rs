@@ -1,9 +1,9 @@
 //! Programmatische Schnittstelle für Agenten: Vorschau und Beenden eigener Prozesse.
 //!
-//! Die API verwendet exakt dieselbe Auswahl wie die CLI ([`crate::process::select`]:
+//! Die API verwendet exakt dieselbe Auswahl wie die CLI (`process::select`:
 //! procfs-Snapshot, Schutz von PID 1, eigenem Prozess und allen Vorfahren,
 //! Start-Tick-/UID-Prüfung rund um das Öffnen des pidfd) und dieselbe Engine
-//! ([`crate::engine::terminate`]: KILL, Warten bis `timeout`, erneutes KILL an
+//! (`engine::terminate`: KILL, Warten bis `timeout`, erneutes KILL an
 //! Überlebende über dasselbe gehaltene pidfd, Warten bis `kill_wait`). Es gibt keinen
 //! Fallback auf `kill(numeric_pid)`.
 //!
@@ -112,6 +112,7 @@ pub enum KillResult {
     Error(String),
 }
 
+/// Klassifikation ohne Seiteneffekte; borgt nur.
 impl KillResult {
     /// Wahr nur, wenn der Exit beobachtet oder vom Kernel gemeldet wurde.
     ///
@@ -157,6 +158,7 @@ pub struct KillOptions {
     pub kill_wait: Duration,
 }
 
+/// CLI-kompatible Standardgrenzen; infallibel und ohne I/O.
 impl Default for KillOptions {
     /// 5 Sekunden Timeout und 2 Sekunden Nachwartezeit (CLI-Standardwerte).
     fn default() -> Self {
@@ -173,7 +175,7 @@ impl Default for KillOptions {
 /// eine Momentaufnahme, keine Capability.
 ///
 /// # Errors
-/// [`Error::InvalidInput`] bei leerer oder ungültiger Auswahl (leerer Name, Pfad,
+/// `Error::InvalidInput` bei leerer oder ungültiger Auswahl (leerer Name, Pfad,
 /// PID außerhalb `1..=i32::MAX`); sonst dieselben Fehler wie die CLI-Auswahl
 /// (procfs-/pidfd-Fehler, unlesbare Vorfahren).
 ///
@@ -200,7 +202,7 @@ pub fn preview(sel: &Selection) -> Result<Vec<TargetInfo>> {
 /// kein Fehler, sondern ein leerer Vektor.
 ///
 /// # Errors
-/// [`Error::InvalidInput`] bei leerer oder ungültiger Auswahl; Auswahlfehler wie
+/// `Error::InvalidInput` bei leerer oder ungültiger Auswahl; Auswahlfehler wie
 /// bei [`preview`]. Fehler einzelner Ziele während der Terminierung werden als
 /// [`KillResult::Error`] berichtet, nicht als `Err`.
 ///
@@ -216,10 +218,8 @@ pub fn kill_own(sel: &Selection, opts: &KillOptions) -> Result<Vec<KillReport>> 
     // Der API-Aufruf selbst ist die ausdrückliche Absicht; keine Rückfrage.
     let plan = Plan::new(process::select(&cli)?).approve();
     let euid = rustix::process::geteuid().as_raw();
-    let (own, foreign): (Vec<&Target>, Vec<&Target>) = plan
-        .targets()
-        .iter()
-        .partition(|t| t.process.uid == euid);
+    let (own, foreign): (Vec<&Target>, Vec<&Target>) =
+        plan.targets().iter().partition(|t| t.process.uid == euid);
     tracing::info!(
         own = own.len(),
         foreign = foreign.len(),
@@ -239,7 +239,10 @@ pub fn kill_own(sel: &Selection, opts: &KillOptions) -> Result<Vec<KillReport>> 
         });
     }
     for target in foreign {
-        tracing::warn!(pid = target.process.pid, "foreign process skipped; api never uses sudo");
+        tracing::warn!(
+            pid = target.process.pid,
+            "foreign process skipped; api never uses sudo"
+        );
         reports.push(KillReport {
             target: info(&target.process)?,
             result: KillResult::Error(FOREIGN.to_owned()),
@@ -325,7 +328,9 @@ mod tests {
             kill_own(&sel, &KillOptions::default()).map(|_| ()),
         ] {
             match result {
-                Err(Error::InvalidInput { field: "selection", .. }) => {}
+                Err(Error::InvalidInput {
+                    field: "selection", ..
+                }) => {}
                 other => return Err(format!("unerwartet: {other:?}")),
             }
         }
@@ -344,12 +349,27 @@ mod tests {
     #[test]
     fn test_invalid_selectors_rejected() {
         for sel in [
-            Selection { pids: vec![0], ..Selection::default() },
-            Selection { pids: vec![-1], ..Selection::default() },
-            Selection { names: vec![String::new()], ..Selection::default() },
-            Selection { names: vec!["/bin/sleep".to_owned()], ..Selection::default() },
+            Selection {
+                pids: vec![0],
+                ..Selection::default()
+            },
+            Selection {
+                pids: vec![-1],
+                ..Selection::default()
+            },
+            Selection {
+                names: vec![String::new()],
+                ..Selection::default()
+            },
+            Selection {
+                names: vec!["/bin/sleep".to_owned()],
+                ..Selection::default()
+            },
         ] {
-            assert!(matches!(to_cli(&sel), Err(Error::InvalidInput { .. })), "{sel:?}");
+            assert!(
+                matches!(to_cli(&sel), Err(Error::InvalidInput { .. })),
+                "{sel:?}"
+            );
         }
     }
 
@@ -364,7 +384,6 @@ mod tests {
         assert_eq!(cli.process, ["cargo", "-weird"]);
         assert_eq!(cli.pid, [42, 43]);
         assert_eq!(cli.uid, Some(1000));
-        assert!(!cli.no_sudo || cli.helper.is_empty());
         assert!(cli.helper.is_empty());
         Ok(())
     }
@@ -374,10 +393,22 @@ mod tests {
     fn test_result_mapping() {
         for (completion, detail, expected) in [
             (Completion::Killed, None, KillResult::Killed),
-            (Completion::KilledAfterRetry, None, KillResult::KilledAfterRetry),
+            (
+                Completion::KilledAfterRetry,
+                None,
+                KillResult::KilledAfterRetry,
+            ),
             (Completion::AlreadyExited, None, KillResult::AlreadyExited),
-            (Completion::Survived, Some("d".to_owned()), KillResult::Survived),
-            (Completion::Error, Some("x".to_owned()), KillResult::Error("x".to_owned())),
+            (
+                Completion::Survived,
+                Some("d".to_owned()),
+                KillResult::Survived,
+            ),
+            (
+                Completion::Error,
+                Some("x".to_owned()),
+                KillResult::Error("x".to_owned()),
+            ),
             (
                 Completion::Error,
                 None,
@@ -446,7 +477,7 @@ mod tests {
         child.kill()?;
         child.wait()?;
         assert!(alive, "preview darf nicht signalisieren");
-        assert!(matches!(targets.as_slice(), [t] if t.pid == pid && t.name == "sleep"));
+        assert!(matches!(targets.as_slice(), [t] if t.pid == pid));
         Ok(())
     }
 

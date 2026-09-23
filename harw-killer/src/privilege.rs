@@ -304,12 +304,13 @@ mod tests {
         ));
     }
 
-    // Stub proves the boundary accepts substitute subprocess implementations.
-    struct Stub;
+    // Stub proves the boundary accepts substitute subprocess implementations
+    // and receives exactly the expected helper protocol.
+    struct Stub(Vec<OsString>);
     impl CommandRunner for Stub {
         fn output(&self, program: &Path, args: &[OsString]) -> Result<Output> {
             assert_eq!(program, Path::new("/usr/bin/sudo"));
-            assert_eq!(args, [OsString::from("--")]);
+            assert_eq!(args, self.0.as_slice());
             Ok(Output {
                 status: std::process::ExitStatus::from_raw(0),
                 stdout: b"[]".to_vec(),
@@ -317,12 +318,59 @@ mod tests {
             })
         }
     }
+    // Helper cli with deterministic wait options for protocol assertions.
+    fn helper_cli() -> std::result::Result<Cli, clap::Error> {
+        use clap::Parser;
+        Cli::try_parse_from(["killer", "-p", "cargo", "-t", "3", "--kill-wait", "0.5"])
+    }
+    fn os(items: &[&str]) -> Vec<OsString> {
+        items.iter().map(OsString::from).collect()
+    }
     #[test]
-    fn test_decode_validates_helper_protocol() {
-        let output = Stub
-            .output(Path::new("/usr/bin/sudo"), &[OsString::from("--")])
-            .unwrap();
-        assert!(decode(output, &[]).unwrap().is_empty());
+    fn test_helper_args_standalone() -> std::result::Result<(), clap::Error> {
+        let cli = helper_cli()?;
+        let args = helper_args(
+            OsString::from("/opt/killer"),
+            &HelperInvocation::Standalone,
+            &cli,
+            (42, 900),
+            [OsString::from("43:3")],
+        );
+        let expected = os(&[
+            "--", "/opt/killer", "--timeout", "3", "--kill-wait", "0.5", "--log", "INFO",
+            "--helper", "42", "900", "43:3",
+        ]);
+        assert_eq!(args, expected);
+        Ok(())
+    }
+    #[test]
+    fn test_helper_args_subcommand_prefix_precedes_options() -> std::result::Result<(), clap::Error>
+    {
+        let cli = helper_cli()?;
+        let invocation = HelperInvocation::Subcommand(os(&["kill"]));
+        let args = helper_args(
+            OsString::from("/usr/bin/harw"),
+            &invocation,
+            &cli,
+            (42, 900),
+            os(&["43:3", "44:4"]),
+        );
+        let expected = os(&[
+            "--", "/usr/bin/harw", "kill", "--timeout", "3", "--kill-wait", "0.5", "--log",
+            "INFO", "--helper", "42", "900", "43:3", "44:4",
+        ]);
+        assert_eq!(args, expected);
+        // The re-executed helper line parses again as a valid helper invocation.
+        use clap::Parser;
+        let reparsed = Cli::try_parse_from(&args[2..]).map(|c| c.helper);
+        assert_eq!(reparsed?, ["42", "900", "43:3", "44:4"]);
+        Ok(())
+    }
+    #[test]
+    fn test_decode_validates_helper_protocol() -> Result<()> {
+        let expected = os(&["--", "/opt/killer", "--helper", "42", "900"]);
+        let output = Stub(expected.clone()).output(Path::new("/usr/bin/sudo"), &expected)?;
+        assert!(decode(output, &[])?.is_empty());
         let output = Output {
             status: std::process::ExitStatus::from_raw(256),
             stdout: b"[]".to_vec(),
@@ -333,5 +381,6 @@ mod tests {
             number::<u32>("bad", "pid"),
             Err(Error::Parse { field: "pid", .. })
         ));
+        Ok(())
     }
 }
